@@ -340,19 +340,18 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 // with shell metachars could make the copy-paste hint
                 // a remote-execution vector for an unwary developer.
                 if is_safe_session_id(id) {
-                    s.push_str(&format!("    journal: ~/.astra/sessions/{id}.jsonl\n"));
-                    // Filter to llm_round events first, then project
-                    // out the nested tool_calls[].name. Without the
-                    // `select(.type==\"llm_round\")` the hint would
-                    // mix tool names with `null` from every
-                    // llm_request_full / llm_response_full line that
-                    // has no tool_calls.
-                    s.push_str(&format!(
-                        "    hint:    jq -r 'select(.type==\"llm_round\") | .tool_calls[]?.name' ~/.astra/sessions/{id}.jsonl\n"
-                    ));
-                    s.push_str(&format!(
-                        "    hint-steps: jq -r 'select(.event_type==\"ToolCallCompleted\") | .payload.tool_name' ~/.astra/sessions/{id}/step_events.jsonl 2>/dev/null\n"
-                    ));
+                    // Reuse the writer's owner-scoped path resolver. Both the
+                    // old flat location and the old jq field shape became
+                    // stale when session artifacts gained envelopes.
+                    let journal = astra_services::session_journal::journal_file_path(id);
+                    let steps = journal
+                        .parent()
+                        .expect("journal path always has a parent")
+                        .join(id)
+                        .join("step_events.jsonl");
+                    s.push_str(&format!("    journal: {}\n", journal.display()));
+                    s.push_str(&format!("    steps:   {}\n", steps.display()));
+                    s.push_str(&format!("    hint:    astra journal digest {id}\n"));
                 } else {
                     // Report the anomaly so the reviewer sees SOMETHING,
                     // just never in a shell-splice position.
@@ -763,12 +762,10 @@ mod tests {
         r.runs[0].passed = false;
         r.runs[0].reproducer = Some("/path/to/astra chat -m 'say ok' --model m --json -y".into());
         let out = render(&r, Format::Text, false);
-        assert!(out.contains("journal: ~/.astra/sessions/sess.jsonl"));
-        assert!(out.contains("jq "));
-        // Step-events layout hint is offered alongside the legacy
-        // jsonl-file hint so post-G3 runs (which live under
-        // <id>/step_events.jsonl) point at the right file.
+        let journal = astra_services::session_journal::journal_file_path("sess");
+        assert!(out.contains(&format!("journal: {}", journal.display())));
         assert!(out.contains("step_events.jsonl"));
+        assert!(out.contains("astra journal digest sess"));
         assert!(out.contains("rerun:"));
         assert!(out.contains("/path/to/astra chat"));
     }
@@ -791,10 +788,8 @@ mod tests {
             r.runs[0].outcome.session_id = Some(injection.to_string());
             let out = render(&r, Format::Text, false);
             assert!(
-                !out.contains(&format!(
-                    "jq -r '.tool_calls[]?.name' ~/.astra/sessions/{injection}"
-                )),
-                "jq hint must NOT splice the suspicious id: {out}"
+                !out.contains(&format!("astra journal digest {injection}")),
+                "diagnostic command must NOT splice the suspicious id: {out}"
             );
             assert!(
                 out.contains("unexpected characters"),

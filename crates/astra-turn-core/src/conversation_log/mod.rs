@@ -68,9 +68,9 @@ impl CslEntry {
 ///
 /// CSL materializes conversation continuity; it is not an execution-policy
 /// checkpoint. Runtime controls such as tool restrictions, approvals,
-/// interruption state, budgets, and compaction pressure remain deserializable
-/// for older logs, but new writers should treat them as legacy/advisory and
-/// restore authoritative runtime state from explicit heavy checkpoints.
+/// interruption state, budgets, and compaction pressure remain storage-only
+/// legacy fields. Live writers clear them and prompt assembly ignores them;
+/// restore authoritative runtime state from explicit runtime records.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStateCompact {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -83,8 +83,10 @@ pub struct SessionStateCompact {
     pub approval_overrides: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_tracker: Option<Value>,
+    /// Legacy CSL storage only. Never use as live execution policy.
     #[serde(default)]
     pub budget_remaining_tokens: u64,
+    /// Legacy CSL storage only. Never use as live execution policy.
     #[serde(default)]
     pub budget_remaining_rounds: u32,
     #[serde(default)]

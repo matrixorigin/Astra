@@ -163,7 +163,7 @@ async fn assert_active_legacy_schema_blocks_upgrade(db: &IsolatedDatabase) -> Re
         .await
         .expect_err("active legacy edge dispatch row must block upgrade");
     let detail = error.to_string();
-    if !detail.contains("contains 1 active rows")
+    if !detail.contains("contains active rows")
         || !detail.contains("without session/run/turn identity")
     {
         return Err(format!("active legacy schema error = {detail}"));

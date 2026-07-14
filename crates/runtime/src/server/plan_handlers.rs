@@ -1402,6 +1402,15 @@ pub(super) async fn finish_step_run_handler(
         .get_step_run(&user.user_id, &plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
+    // Duplicate finalization is an identity lookup failure, not a plan-state
+    // transition error. Check the append-only attempt before mutating the
+    // canonical subtask so a completed -> failed retry cannot leak a 400 and
+    // bypass the repository's owner-safe 404 contract.
+    if existing.finished_at.is_some() {
+        return Err(map_plan_load_err(PlanLoadError::NotFound(format!(
+            "step_run {run_id} not found in plan {plan_id} or already finalized"
+        ))));
+    }
     set_plan_step_status(&mut plan_state.plan, &existing.subtask_id, req.status)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let expected_version = plan_state.version;

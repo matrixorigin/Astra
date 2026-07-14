@@ -56,6 +56,25 @@ impl AgentMailbox {
         self.router.clone()
     }
 
+    /// Resolve an agent inside this mailbox's own delegation namespace.
+    ///
+    /// Callers should not reach through the mailbox to its router for direct
+    /// addressing: the mailbox owns the namespace boundary and transports own
+    /// the authoritative lookup implementation.
+    pub async fn resolve_delegation_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError> {
+        let delegation_id = self
+            .delegation_id
+            .as_deref()
+            .filter(|delegation_id| !delegation_id.is_empty())
+            .ok_or_else(|| {
+                MailboxError::Protocol("mailbox is not part of a delegation namespace".to_string())
+            })?;
+        self.router.resolve_agent(delegation_id, agent_id).await
+    }
+
     /// Non-blocking: get the next available message, if any.
     pub fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
         if let Some(msg) = self.buffered.get_mut().pop_front() {
@@ -783,7 +802,7 @@ mod tests {
 
         let first = addr("run-a", "worker");
         let second = addr("run-b", "worker");
-        let _first_mailbox = router
+        let first_mailbox = router
             .register(first.clone(), Some("delegation-a".into()))
             .await
             .unwrap();
@@ -805,6 +824,14 @@ mod tests {
                 .await
                 .unwrap(),
             second
+        );
+        assert_eq!(
+            first_mailbox
+                .resolve_delegation_agent("worker")
+                .await
+                .unwrap(),
+            first,
+            "mailbox-level resolution must stay inside its delegation namespace"
         );
         assert_eq!(
             router.list_registered_agents("delegation-a").await.unwrap(),

@@ -59,7 +59,7 @@ impl CaseExecutor for AstraCliExecutor {
     fn reproducer(&self, case: &Case, model: &str) -> String {
         // Mirrors the args assembled below. Quote the prompt so it
         // survives a copy-paste.
-        let has_session_id_in_extras = case.extra_cli_args.iter().any(|a| a == "--session-id");
+        let has_session_id_in_extras = has_session_id(&case.extra_cli_args);
         let mut parts = vec![
             shell_escape(self.cfg.astra_bin.display().to_string()),
             "chat".into(),
@@ -67,8 +67,7 @@ impl CaseExecutor for AstraCliExecutor {
             shell_escape(case.prompt.clone()),
         ];
         if !has_session_id_in_extras {
-            parts.push("--session-id".into());
-            parts.push(shell_escape(uuid::Uuid::new_v4().to_string()));
+            parts.push("--no-resume".into());
         }
         parts.extend([
             "--model".into(),
@@ -105,24 +104,41 @@ fn shell_escape(s: String) -> String {
     }
 }
 
+fn has_session_id(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--session-id" || arg.starts_with("--session-id="))
+}
+
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::process::Command;
 
+    // Step-event files are append-only for a session. A continuation command
+    // must report only the events it added, otherwise SuiteRunner sums the
+    // entire prior transcript once per follow-up turn.
+    let prior_step_stats = explicit_session_id(&case.extra_cli_args)
+        .and_then(crate::session_capture::load_step_event_stats);
     let start = Instant::now();
     let mut cmd = Command::new(&cfg.astra_bin);
     if let Some(ref profile) = cfg.profile {
         cmd.arg("--profile").arg(profile);
     }
     cmd.arg("chat").arg("-m").arg(&case.prompt);
-    // Only add --session-id if the caller hasn't already provided one in extra_cli_args.
-    // Multi-turn step cases inject --session-id via extra_cli_args to thread the parent's
-    // session id across steps; we must not emit a second --session-id there.
-    let has_session_id_in_extras = case.extra_cli_args.iter().any(|a| a == "--session-id");
-    if !has_session_id_in_extras {
-        cmd.arg("--session-id")
-            .arg(uuid::Uuid::new_v4().to_string());
+    // A missing --session-id deliberately means "create a session".  The
+    // server, not the harness, owns session identity: inventing a UUID here
+    // turns the first turn into an explicit resume request, which a correctly
+    // strict server must reject because that session does not exist yet.
+    //
+    // SuiteRunner reads the server-issued id from this turn's JSON envelope
+    // and adds --session-id only to follow-up turns.  Keep that one protocol
+    // for every provider and transport rather than relying on a local session
+    // creation side effect or a permissive server fallback.
+    // `astra chat` normally resumes the most recent one-shot session, so make
+    // the root run explicitly isolated as well.  Do not add this on follow-up
+    // turns: there `--session-id` is the authoritative continuation request.
+    if !has_session_id(&case.extra_cli_args) {
+        cmd.arg("--no-resume");
     }
     cmd.arg("--model").arg(model).arg("--json").arg("-y");
     if let Some(ref wd) = cfg.working_dir {
@@ -190,6 +206,10 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             if let Some(ref sid) = out.session_id
                 && let Some(stats) = crate::session_capture::load_step_event_stats(sid)
             {
+                let stats = match prior_step_stats.as_ref() {
+                    Some(prior) => stats.since(prior),
+                    None => stats,
+                };
                 out.turn_rounds = stats.turn_rounds;
                 out.cache_hits = stats.cache_hits;
                 out.total_tool_calls = stats.total_tool_calls;
@@ -250,6 +270,22 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             ttft_ms: 0,
         },
     }
+}
+
+fn explicit_session_id(args: &[String]) -> Option<&str> {
+    let id = args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--session-id" {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix("--session-id=")
+        }
+    })?;
+    // Do not let a malformed extra argument turn observability into a panic:
+    // the child CLI will report the user-facing argument error, while the
+    // harness simply has no prior-session snapshot to subtract.
+    astra_services::session_journal::validate_session_id(id)
+        .ok()
+        .map(|_| id)
 }
 
 // ── External command executor adapter ────────────────────────────────
@@ -481,10 +517,15 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
-        assert!(repro.contains("--session-id"));
+        assert!(
+            !repro.contains("--session-id"),
+            "the first turn must let the server create the session: {repro}"
+        );
+        assert!(repro.contains("--no-resume"));
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
@@ -495,6 +536,57 @@ mod tests {
         assert!(
             repro.contains(r"'say '\''hello'\'''"),
             "POSIX single-quote escape expected: {repro}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_turn_does_not_invent_a_session_id_but_follow_up_preserves_one() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let args_path = tmp.path().join("args");
+        let shim = tmp.path().join("fake-astra");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HARNESS_ARGS_PATH\"\nprintf '%s\\n' '{\"session_id\":\"server-issued\"}'\n",
+        )
+        .expect("write shim");
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+
+        let mut case = simple_case();
+        case.env.insert(
+            "HARNESS_ARGS_PATH".into(),
+            args_path.to_string_lossy().into_owned(),
+        );
+        let exec = AstraCliExecutor::new(RunnerConfig::new(shim));
+        let root = exec.execute(&case, "m").await;
+        assert_eq!(root.session_id.as_deref(), Some("server-issued"));
+        let root_args = std::fs::read_to_string(&args_path).expect("root args");
+        assert!(
+            !root_args.lines().any(|arg| arg == "--session-id"),
+            "root turn must not fabricate a resumable id: {root_args:?}"
+        );
+        assert!(root_args.lines().any(|arg| arg == "--no-resume"));
+
+        case.extra_cli_args = vec!["--session-id".into(), "server-issued".into()];
+        let follow_up = exec.execute(&case, "m").await;
+        assert_eq!(follow_up.session_id.as_deref(), Some("server-issued"));
+        let follow_up_args = std::fs::read_to_string(&args_path).expect("follow-up args");
+        assert!(
+            follow_up_args
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| { pair == ["--session-id", "server-issued"] }),
+            "follow-up must preserve the server-issued id: {follow_up_args:?}"
+        );
+        assert!(
+            !follow_up_args.lines().any(|arg| arg == "--no-resume"),
+            "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
         );
     }
 
@@ -526,6 +618,20 @@ mod tests {
         // Otherwise a `''` argument collapses into "nothing" on a
         // shell line.
         assert_eq!(shell_escape(String::new()), "''");
+    }
+
+    #[test]
+    fn explicit_session_id_ignores_invalid_values_without_panicking() {
+        let valid = vec![
+            "--session-id".to_string(),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        ];
+        assert_eq!(
+            explicit_session_id(&valid),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        let invalid = vec!["--session-id=../not-a-session".to_string()];
+        assert_eq!(explicit_session_id(&invalid), None);
     }
 
     #[test]
@@ -586,6 +692,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let start = std::time::Instant::now();
         let outcome = exec.execute(&case, "ignored").await;
@@ -661,6 +768,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let out = fe.execute(&case, "qwen-flash").await;
         assert_eq!(out.text, "hello");
@@ -692,6 +800,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         }
     }
 

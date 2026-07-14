@@ -2,7 +2,13 @@ use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
 
-use ratatui::text::{Line, Span};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::Style,
+    text::{Line, Span},
+    widgets::{Paragraph, Widget, Wrap},
+};
 
 const MAX_STRING_ESCAPE_SCAN_CHARS: usize = 256;
 
@@ -139,12 +145,77 @@ pub(crate) fn push_owned_lines(src: &[Line<'_>], out: &mut Vec<Line<'static>>) {
     }
 }
 
+/// A [`Paragraph`] that treats `Line.style.bg` as semantic ownership of the
+/// complete physical row.
+///
+/// Ratatui applies a line style only to cells occupied by text. That is the
+/// right default for ordinary prose, but not for user-message and diff
+/// surfaces: their background denotes the whole row, including the terminal
+/// tail after the final glyph. Painting the buffer first preserves that
+/// contract without padding content to the viewport width, which would arm a
+/// real terminal's auto-wrap state at the right edge.
+pub(crate) struct FullRowParagraph<'a> {
+    lines: Vec<Line<'a>>,
+    wrap: Option<Wrap>,
+}
+
+impl<'a> FullRowParagraph<'a> {
+    pub(crate) fn new(lines: Vec<Line<'a>>) -> Self {
+        Self { lines, wrap: None }
+    }
+
+    pub(crate) fn wrap(mut self, wrap: Wrap) -> Self {
+        self.wrap = Some(wrap);
+        self
+    }
+}
+
+impl Widget for FullRowParagraph<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let mut y = area.y;
+        for line in &self.lines {
+            if y >= area.bottom() {
+                break;
+            }
+            let physical_rows = self.wrap.map_or(1, |wrap| {
+                Paragraph::new(line.clone())
+                    .wrap(wrap)
+                    .line_count(area.width)
+                    .max(1) as u16
+            });
+            if let Some(background) = line.style.bg {
+                let row_area = Rect::new(
+                    area.x,
+                    y,
+                    area.width,
+                    physical_rows.min(area.bottom().saturating_sub(y)),
+                );
+                buf.set_style(row_area, Style::default().bg(background));
+            }
+            y = y.saturating_add(physical_rows);
+        }
+
+        let mut paragraph = Paragraph::new(self.lines);
+        if let Some(wrap) = self.wrap {
+            paragraph = paragraph.wrap(wrap);
+        }
+        paragraph.render(area, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_line_for_terminal, sanitize_terminal_text};
+    use super::{FullRowParagraph, sanitize_line_for_terminal, sanitize_terminal_text};
+    use ratatui::buffer::Buffer;
     use ratatui::layout::Alignment;
+    use ratatui::layout::Rect;
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Widget, Wrap};
 
     #[test]
     fn sanitize_terminal_text_strips_control_sequences_but_keeps_newlines_and_tabs() {
@@ -182,5 +253,25 @@ mod tests {
     fn sanitize_terminal_text_preserves_newline_after_unterminated_string_escape() {
         let text = "prefix\x1b]0;title\nvisible";
         assert_eq!(sanitize_terminal_text(text), "prefix\nvisible");
+    }
+
+    #[test]
+    fn full_row_paragraph_paints_wrapped_rows_without_leaking_into_the_next_line() {
+        let area = Rect::new(0, 0, 8, 4);
+        let mut buffer = Buffer::empty(area);
+        let lines = vec![
+            Line::from("123456789").style(Style::default().bg(Color::Red)),
+            Line::from("next").style(Style::default().bg(Color::Blue)),
+            Line::from("plain"),
+        ];
+
+        FullRowParagraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buffer);
+
+        assert!((0..8).all(|x| buffer[(x, 0)].bg == Color::Red));
+        assert!((0..8).all(|x| buffer[(x, 1)].bg == Color::Red));
+        assert!((0..8).all(|x| buffer[(x, 2)].bg == Color::Blue));
+        assert!((0..8).all(|x| buffer[(x, 3)].bg == Color::Reset));
     }
 }

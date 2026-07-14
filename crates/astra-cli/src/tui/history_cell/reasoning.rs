@@ -153,10 +153,14 @@ impl ReasoningCell {
             .duration_label()
             .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
             .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
+        // The normal conversation projection has no tree affordance: a
+        // leading bullet made a collapsed Thought sit two columns to the
+        // right of adjacent assistant content. The transcript navigator keeps
+        // an arrow only when the item is actually interactive.
         let marker = if transcript && self.has_transcript_details(width) {
             if expanded { "▼ " } else { "▶ " }
         } else {
-            "• "
+            ""
         };
         let header_line = Line::from(vec![
             Span::styled(marker, dim),
@@ -168,7 +172,7 @@ impl ReasoningCell {
 
         if expanded {
             for row in body_rows {
-                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
+                lines.push(Line::from(vec![Span::raw("  "), Span::styled(row, body)]));
             }
         } else if self.live {
             let total = body_rows.len();
@@ -176,7 +180,7 @@ impl ReasoningCell {
                 let tail = LIVE_PREVIEW_MAX_ROWS - 1;
                 let hidden = total - tail;
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw("  "),
                     Span::styled(format!("… {hidden} earlier lines"), dim),
                 ]));
                 total - tail
@@ -184,7 +188,7 @@ impl ReasoningCell {
                 0
             };
             for row in body_rows.into_iter().skip(visible) {
-                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
+                lines.push(Line::from(vec![Span::raw("  "), Span::styled(row, body)]));
             }
         }
 
@@ -354,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn live_body_rows_are_indented_under_bullet() {
+    fn live_body_rows_are_indented_under_header() {
         // Live cells render their body so the user sees progress
         // during long thinks. Each body row is indented under the
         // header for visual alignment. Finalised cells collapse
@@ -368,8 +372,25 @@ mod tests {
             .collect();
         assert!(!body_rows.is_empty(), "live cell must render body: {out}");
         for row in &body_rows {
-            assert!(row.starts_with("    "), "body row must indent: {row:?}");
+            assert!(row.starts_with("  "), "body row must indent: {row:?}");
+            assert!(
+                !row.starts_with("    "),
+                "body row is over-indented: {row:?}"
+            );
         }
+    }
+
+    #[test]
+    fn normal_header_has_no_decorative_bullet() {
+        let mut c = ReasoningCell::new_streaming();
+        c.push_delta("analysis");
+        let out = render(&c, 60, 3);
+        let header = out.lines().next().unwrap_or_default();
+        assert!(
+            header.starts_with("Thought"),
+            "misaligned header: {header:?}"
+        );
+        assert!(!header.contains("• Thought"));
     }
 
     #[test]

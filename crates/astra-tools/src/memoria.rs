@@ -6,8 +6,8 @@
 //! This module is shared between CLI and server — both use HTTP proxy
 //! calls to the Memoria service.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -380,6 +380,84 @@ pub fn enrich_store_payload_with_views(payload: &mut Value) {
 
 pub use astra_memoria::RecallSnapshot;
 
+/// Small availability circuit shared by memory entry points.
+///
+/// Caller/content failures are deliberately classified outside this type. It
+/// only tracks consecutive service failures and grants one half-open probe
+/// after a cooldown.
+pub struct MemoryCircuitBreaker {
+    fail_count: AtomicU32,
+    next_probe_at_unix_ms: AtomicU64,
+    max_failures: u32,
+    cooldown: Duration,
+}
+
+impl MemoryCircuitBreaker {
+    pub fn new(max_failures: u32, cooldown: Duration) -> Self {
+        Self {
+            fail_count: AtomicU32::new(0),
+            next_probe_at_unix_ms: AtomicU64::new(0),
+            max_failures: max_failures.max(1),
+            cooldown,
+        }
+    }
+
+    pub fn record_service_failure(&self) {
+        let previous = self
+            .fail_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or_else(|value| value);
+        if previous.saturating_add(1) >= self.max_failures {
+            let cooldown_ms: u64 = self.cooldown.as_millis().try_into().unwrap_or(u64::MAX);
+            self.next_probe_at_unix_ms.store(
+                unix_time_ms().saturating_add(cooldown_ms),
+                Ordering::Release,
+            );
+        }
+    }
+
+    pub fn record_service_success(&self) {
+        self.fail_count.store(0, Ordering::Release);
+        self.next_probe_at_unix_ms.store(0, Ordering::Release);
+    }
+
+    /// A side-effect-free degradation check for optional background work that
+    /// must not consume the foreground half-open probe lease.
+    pub fn is_degraded(&self) -> bool {
+        self.fail_count.load(Ordering::Acquire) >= self.max_failures
+    }
+
+    /// Return true while open. Once the cooldown expires, exactly one caller
+    /// receives `false` and owns the half-open probe lease.
+    pub fn is_open(&self) -> bool {
+        if !self.is_degraded() {
+            return false;
+        }
+        let now = unix_time_ms();
+        let next_probe = self.next_probe_at_unix_ms.load(Ordering::Acquire);
+        if now < next_probe {
+            return true;
+        }
+        let cooldown_ms: u64 = self.cooldown.as_millis().try_into().unwrap_or(u64::MAX);
+        self.next_probe_at_unix_ms
+            .compare_exchange(
+                next_probe,
+                now.saturating_add(cooldown_ms),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    }
+}
+
+impl Default for MemoryCircuitBreaker {
+    fn default() -> Self {
+        Self::new(MAX_FAILS, CIRCUIT_COOLDOWN)
+    }
+}
+
 /// Prompt-facing Memoria tool transport with a small failure circuit breaker.
 ///
 /// This gateway translates LLM cognitive verbs to the Memoria wire protocol.
@@ -388,7 +466,7 @@ pub use astra_memoria::RecallSnapshot;
 pub struct MemoriaToolGateway {
     pub cloud_base: Option<String>,
     pub cloud_token: Option<String>,
-    fail_count: AtomicU32,
+    circuit: MemoryCircuitBreaker,
 }
 
 /// Result of draining recall snapshots into Memoria feedback calls.
@@ -407,6 +485,108 @@ fn memoria_output_is_error(output: &str) -> bool {
         .ok()
         .and_then(|value| value.get("error").cloned())
         .is_some()
+}
+
+fn memory_status_counts_toward_circuit(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// Whether a prompt-facing memory response represents service availability,
+/// rather than a caller/validation/content error.
+///
+/// The CLI owns a longer-lived breaker than the per-request gateway. Keeping
+/// this classification here prevents a valid 4xx such as `memory_not_found`
+/// from disabling memory for the rest of a session.
+pub fn memory_output_indicates_service_failure(output: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    if let Some(object) = error.as_object() {
+        if let Some(status) = object.get("http_status").and_then(Value::as_u64) {
+            return status == 408 || status == 429 || status >= 500;
+        }
+        return object.get("code").and_then(Value::as_str) == Some("memory_service_failure");
+    }
+    let Some(message) = error.as_str() else {
+        return false;
+    };
+    message.starts_with("memoria request failed:")
+        || message.starts_with("read response:")
+        || message == "Memory service unavailable (circuit open)"
+}
+
+/// Whether an output proves that the remote memory service answered.
+/// Local validation/configuration errors return false and therefore neither
+/// open nor close the availability circuit.
+pub fn memory_output_proves_service_reachable(output: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        // Non-JSON output can only be the body of a successful HTTP response.
+        return true;
+    };
+    let Some(error) = value.get("error") else {
+        return true;
+    };
+    error
+        .as_object()
+        .and_then(|object| object.get("http_status"))
+        .and_then(Value::as_u64)
+        .is_some()
+}
+
+fn format_memory_http_error(
+    op: &str,
+    args: &Value,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+    let detail = body
+        .trim()
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>();
+    let memory_id = args
+        .get("memory_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let (code, message, recovery) = if status == reqwest::StatusCode::NOT_FOUND {
+        (
+            "memory_not_found",
+            "The requested memory identity does not exist or is not visible to this caller.",
+            "Use an exact memory_id returned by recall/inventory, or use query-based update when selecting by meaning. Do not invent an ID.",
+        )
+    } else if status.is_client_error() {
+        (
+            "memory_request_rejected",
+            "The memory service rejected this request without indicating a service outage.",
+            "Correct the request using the returned status/detail; retrying the same arguments will not help.",
+        )
+    } else {
+        (
+            "memory_service_failure",
+            "The memory service could not complete the request.",
+            "Preserve the current turn state and retry only when useful; do not treat this as evidence that the memory content is absent.",
+        )
+    };
+    json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "operation": op,
+            "http_status": status.as_u16(),
+            "memory_id": memory_id,
+            "backend_detail": detail,
+            "recovery": recovery,
+        }
+    })
+    .to_string()
 }
 
 fn validate_strict_recall_response(raw_text: &str, args: &Value) -> Result<(), String> {
@@ -433,13 +613,23 @@ fn validate_strict_recall_response(raw_text: &str, args: &Value) -> Result<(), S
 }
 
 const MAX_FAILS: u32 = 2;
+const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 impl MemoriaToolGateway {
     pub fn new(cloud_base: Option<String>, cloud_token: Option<String>) -> Self {
         Self {
             cloud_base,
             cloud_token,
-            fail_count: AtomicU32::new(0),
+            circuit: MemoryCircuitBreaker::default(),
         }
     }
 
@@ -791,9 +981,24 @@ impl MemoriaToolGateway {
         }
     }
 
+    fn record_service_failure(&self) {
+        self.circuit.record_service_failure();
+    }
+
+    fn record_service_success(&self) {
+        // A valid HTTP response, including a deterministic 4xx, proves the
+        // service is reachable. Clear both the failure streak and any stale
+        // half-open lease so an earlier outage cannot poison later turns.
+        self.circuit.record_service_success();
+    }
+
     /// Check if the circuit breaker is open (too many consecutive failures).
+    ///
+    /// After a bounded cooldown exactly one caller receives a half-open probe.
+    /// Its success closes the circuit; its failure starts a fresh cooldown.
+    /// This keeps an outage from becoming a permanent process-wide failure.
     pub fn is_circuit_open(&self) -> bool {
-        self.fail_count.load(Ordering::Relaxed) >= MAX_FAILS
+        self.circuit.is_open()
     }
 
     /// Whitelist of agent_type values the client will forward to the
@@ -888,12 +1093,15 @@ impl MemoriaToolGateway {
             return self.focus_set(sid, args);
         }
 
-        if self.is_circuit_open() {
-            return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
-        }
-
+        // Argument errors belong to the current call, not service health. Keep
+        // them actionable even while the remote circuit is open and never let
+        // them contribute to opening that circuit.
         if let Some(validation_error) = Self::validate_before_side_effects(op, args) {
             return validation_error.to_string();
+        }
+
+        if self.is_circuit_open() {
+            return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
         // `remember`: run a client-side conflict pre-check so the LLM
@@ -988,30 +1196,32 @@ impl MemoriaToolGateway {
                         match resp.text().await {
                             Ok(text) => {
                                 if !status.is_success() {
-                                    self.fail_count.fetch_add(1, Ordering::Relaxed);
-                                    json!({
-                                        "error": format!(
-                                            "memoria request failed: status={status}, body={}",
-                                            text.trim()
-                                        )
-                                    })
-                                    .to_string()
+                                    if memory_status_counts_toward_circuit(status) {
+                                        self.record_service_failure();
+                                    } else {
+                                        // A deterministic 4xx proves the
+                                        // service is reachable. It must not
+                                        // inherit or amplify an earlier
+                                        // transient outage streak.
+                                        self.record_service_success();
+                                    }
+                                    format_memory_http_error(op, args, status, &text)
                                 } else if text.trim().is_empty() {
-                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    self.record_service_success();
                                     Self::empty_success_response(op, args).to_string()
                                 } else {
-                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    self.record_service_success();
                                     text
                                 }
                             }
                             Err(e) => {
-                                self.fail_count.fetch_add(1, Ordering::Relaxed);
+                                self.record_service_failure();
                                 json!({"error": format!("read response: {e}")}).to_string()
                             }
                         }
                     }
                     Err(e) => {
-                        self.fail_count.fetch_add(1, Ordering::Relaxed);
+                        self.record_service_failure();
                         json!({"error": format!("memoria request failed: {e}")}).to_string()
                     }
                 }
@@ -1231,12 +1441,28 @@ impl MemoriaToolGateway {
             .await
         {
             Ok(resp) => {
-                self.fail_count.store(0, Ordering::Relaxed);
-                let text = resp.text().await.unwrap_or_default();
-                parse_memory_search_hits(&text)
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) if status.is_success() => {
+                        self.record_service_success();
+                        parse_memory_search_hits(&text)
+                    }
+                    Ok(_) if memory_status_counts_toward_circuit(status) => {
+                        self.record_service_failure();
+                        vec![]
+                    }
+                    Ok(_) => {
+                        self.record_service_success();
+                        vec![]
+                    }
+                    Err(_) => {
+                        self.record_service_failure();
+                        vec![]
+                    }
+                }
             }
             Err(_) => {
-                self.fail_count.fetch_add(1, Ordering::Relaxed);
+                self.record_service_failure();
                 vec![]
             }
         }
@@ -1727,7 +1953,10 @@ impl MemoriaToolGateway {
         }
     }
 
-    fn validate_before_side_effects(op: &str, args: &Value) -> Option<Value> {
+    /// Validate caller-owned arguments without consulting service health.
+    /// Entry points with a longer-lived circuit should run this first so an
+    /// open circuit cannot hide a deterministic, actionable request error.
+    pub fn validate_before_side_effects(op: &str, args: &Value) -> Option<Value> {
         match op {
             "remember" => {
                 let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -1932,7 +2161,7 @@ fn format_remember_conflict(arr: &[Value], floor: f64) -> Option<String> {
                 "similarity": score,
                 "abstract": abs_text,
             })).collect::<Vec<_>>(),
-            "retry_hint": "Call memory(action=update, memory_id=<chosen_id>, content=<new_content>) \
+            "retry_hint": "Call memory(action=update, memory_id=<chosen_id>, content=<new_content>, reason=<why>) \
                            to supersede, OR retry remember with skip_conflict_check=true if the \
                            new memory is intentionally distinct.",
         })
@@ -2105,6 +2334,93 @@ pub async fn memoria_health() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_errors_do_not_count_as_memory_service_outages() {
+        assert!(!memory_status_counts_toward_circuit(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!memory_status_counts_toward_circuit(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(memory_status_counts_toward_circuit(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(memory_status_counts_toward_circuit(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(memory_status_counts_toward_circuit(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn only_availability_errors_feed_the_long_lived_memory_circuit() {
+        let missing = format_memory_http_error(
+            "update",
+            &json!({"memory_id": "missing"}),
+            reqwest::StatusCode::NOT_FOUND,
+            "not found",
+        );
+        let outage = format_memory_http_error(
+            "recall",
+            &json!({"query": "q"}),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        );
+        assert!(!memory_output_indicates_service_failure(&missing));
+        assert!(memory_output_indicates_service_failure(&outage));
+        assert!(memory_output_indicates_service_failure(
+            &json!({"error": "memoria request failed: timeout"}).to_string()
+        ));
+        assert!(!memory_output_indicates_service_failure(
+            &json!({"error": "validation failed"}).to_string()
+        ));
+        assert!(memory_output_proves_service_reachable(&missing));
+        assert!(memory_output_proves_service_reachable(&outage));
+        assert!(!memory_output_proves_service_reachable(
+            &json!({"error": "validation failed"}).to_string()
+        ));
+    }
+
+    #[test]
+    fn memory_circuit_recovers_through_one_half_open_probe() {
+        let gateway = MemoriaToolGateway::new(None, None);
+        gateway.record_service_failure();
+        gateway.record_service_failure();
+        assert!(gateway.is_circuit_open());
+
+        // Simulate expiry without making the unit test sleep for the real
+        // production cooldown. Exactly one caller obtains the probe lease.
+        gateway
+            .circuit
+            .next_probe_at_unix_ms
+            .store(0, Ordering::Release);
+        assert!(!gateway.is_circuit_open());
+        assert!(gateway.is_circuit_open());
+
+        gateway.record_service_success();
+        assert!(!gateway.is_circuit_open());
+    }
+
+    #[test]
+    fn missing_memory_id_error_is_structured_and_actionable() {
+        let output = format_memory_http_error(
+            "update",
+            &json!({"memory_id": "invented-session-state"}),
+            reqwest::StatusCode::NOT_FOUND,
+            "not found",
+        );
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["error"]["code"], "memory_not_found");
+        assert_eq!(parsed["error"]["memory_id"], "invented-session-state");
+        assert!(
+            parsed["error"]["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("Do not invent an ID")
+        );
+    }
     use serde_json::json;
 
     #[test]

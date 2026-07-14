@@ -968,7 +968,11 @@ impl BottomPaneView for TranscriptView {
             } else if i == self.cursor {
                 line.style = cursor_style;
             }
-            Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
+            Widget::render(
+                crate::tui::render::line_utils::FullRowParagraph::new(vec![line]),
+                Rect::new(area.x, y, area.width, 1),
+                buf,
+            );
             y = next_y(y);
         }
 

@@ -9,13 +9,15 @@ use axum::extract::Extension;
 
 use super::*;
 
-use astra_services::session_journal::validate_session_id;
+use astra_services::session_journal::{
+    ApprovalDecisionAppendOutcome, append_approval_decision_for_run_if_absent, validate_session_id,
+};
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use serde::Deserialize;
 use serde_json::Value;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, tool_callback_key};
+use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
@@ -92,6 +94,37 @@ pub(crate) fn insert_ledger_entry(
     }
     if ledger.len() >= LEDGER_MAX_ENTRIES {
         return Err(LedgerInsertError::CapacityExceeded);
+    }
+    ledger.insert(key.clone(), value);
+    astra_turn_core::edge_ledger::on_ledger_insert(&key);
+    Ok(true)
+}
+
+/// Insert an approval response into the process-local delivery lane.
+///
+/// The session journal is written before this function is called, so a full
+/// local ledger is not a lost response: the edge-tool waiter can recover the
+/// same immutable decision from the journal. Divergent retries remain a hard
+/// conflict in both stores.
+fn insert_approval_ledger_entry(
+    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+    durable_fallback_ready: bool,
+) -> Result<bool, LedgerInsertError> {
+    if let Some(existing) = ledger.get(&key) {
+        return if existing == &value {
+            Ok(false)
+        } else {
+            Err(LedgerInsertError::DuplicateKey)
+        };
+    }
+    if ledger.len() >= LEDGER_MAX_ENTRIES {
+        return if durable_fallback_ready {
+            Ok(false)
+        } else {
+            Err(LedgerInsertError::CapacityExceeded)
+        };
     }
     ledger.insert(key.clone(), value);
     astra_turn_core::edge_ledger::on_ledger_insert(&key);
@@ -402,6 +435,141 @@ pub(crate) async fn post_approval_respond_handler(
             "Approval response does not match the requested approval kind",
         ));
     }
+
+    // The request fact, rather than the mutable current run status, owns the
+    // delivery protocol. This matters for idempotent HTTP retries: a durable
+    // approval has already resumed its run by the time the retry arrives and
+    // must not be reclassified as an edge-ledger response.
+    let delivery = required_data
+        .get("delivery")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
+                registry.as_ref(),
+                "invalid_required_request",
+            );
+            error_response(
+                StatusCode::CONFLICT,
+                "Approval request is missing canonical delivery protocol",
+            )
+        })?;
+    if delivery == "edge_ledger" {
+        if target.status != astra_core::STATUS_RUNNING {
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
+                registry.as_ref(),
+                "edge_run_not_active",
+            );
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Approval request is no longer active",
+            ));
+        }
+
+        let approval_turn = required_data
+            .get("turn")
+            .and_then(Value::as_u64)
+            .and_then(|turn| u32::try_from(turn).ok());
+        match append_approval_decision_for_run_if_absent(
+            session_id,
+            approval_turn,
+            &body.request_id,
+            run_id,
+            Some(required_tool),
+            Some(required_kind),
+            decision,
+            body.reason.as_deref(),
+        ) {
+            Ok(ApprovalDecisionAppendOutcome::Appended) => {
+                crate::server::interaction_metrics::record_approval_interaction_lookup(
+                    registry.as_ref(),
+                    "edge_decision",
+                    "miss",
+                );
+            }
+            Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+                crate::server::interaction_metrics::record_approval_interaction_lookup(
+                    registry.as_ref(),
+                    "edge_decision",
+                    "hit",
+                );
+            }
+            Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+                crate::server::interaction_metrics::record_approval_interaction_resolution(
+                    registry.as_ref(),
+                    "conflict",
+                );
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "approval decision already recorded for request {} run {} as {}",
+                        existing.request_id, run_id, existing.decision
+                    ),
+                ));
+            }
+            Err(error) => {
+                crate::server::interaction_metrics::record_approval_interaction_resolution(
+                    registry.as_ref(),
+                    "edge_journal_error",
+                );
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("approval decision persistence failed: {error}"),
+                ));
+            }
+        }
+
+        let key = approval_callback_key(&user.user_id, session_id, run_id, &body.request_id);
+        let ledger_value = serde_json::json!({
+            "kind": "approval_respond",
+            "user_id": user.user_id,
+            "edge_id": edge_id,
+            "body": serde_json::to_value(&body).map_err(|error| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to serialize approval response: {error}"),
+                )
+            })?,
+        });
+        let ledger_enqueued = {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            insert_approval_ledger_entry(&mut ledger, key.clone(), ledger_value, true)
+                .map_err(|error| ledger_insert_error_response(&key, error))?
+        };
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
+            registry.as_ref(),
+            if ledger_enqueued {
+                "edge_delivered"
+            } else {
+                "edge_durable_replay"
+            },
+        );
+        tracing::info!(
+            target: "astra_runtime::edge_callback",
+            request_id = %trace.request_id,
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            callback_request_id = %body.request_id,
+            ledger_enqueued,
+            "edge approval callback committed"
+        );
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "request_id": body.request_id,
+            "durable": true,
+            "ledger_enqueued": ledger_enqueued,
+        })));
+    }
+    if delivery != "durable" {
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
+            registry.as_ref(),
+            "invalid_required_request",
+        );
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Approval request has an unknown delivery protocol",
+        ));
+    }
+
     let response_data = serde_json::json!({
         "request_id": body.request_id,
         "outcome": match decision { "allow" | "allow_session" => "approved", _ => "denied" },
@@ -937,6 +1105,8 @@ mod edge_callback_insert_tests {
     struct ApprovalTargetRunLifecycle {
         run_id: String,
         session_id: String,
+        status: Arc<Mutex<String>>,
+        waiting_for: Arc<Mutex<Option<String>>>,
         required: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
         resolved: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     }
@@ -946,6 +1116,8 @@ mod edge_callback_insert_tests {
             Self {
                 run_id: run_id.into(),
                 session_id: session_id.into(),
+                status: Arc::new(Mutex::new(astra_core::STATUS_WAITING.to_string())),
+                waiting_for: Arc::new(Mutex::new(Some("tool_approval".to_string()))),
                 required: Arc::new(Mutex::new(HashMap::new())),
                 resolved: Arc::new(Mutex::new(HashMap::new())),
             }
@@ -961,6 +1133,12 @@ mod edge_callback_insert_tests {
                 (request_id.to_string(), event_type.to_string()),
                 json!({"event_type": event_type, "data": data}),
             );
+            self
+        }
+
+        fn with_running_edge_wait(self) -> Self {
+            *self.status.lock().unwrap() = astra_core::STATUS_RUNNING.to_string();
+            *self.waiting_for.lock().unwrap() = None;
             self
         }
     }
@@ -997,8 +1175,8 @@ mod edge_callback_insert_tests {
             Ok(RunStatusRecord {
                 run_id,
                 session_id: self.session_id.clone(),
-                status: "waiting".into(),
-                waiting_for: Some("tool_approval".into()),
+                status: self.status.lock().unwrap().clone(),
+                waiting_for: self.waiting_for.lock().unwrap().clone(),
                 events_count: 1,
                 workspace: None,
                 executor: None,
@@ -1071,6 +1249,8 @@ mod edge_callback_insert_tests {
                 "data": response_data,
             });
             resolved.insert(request_id, event.clone());
+            *self.status.lock().unwrap() = astra_core::STATUS_RUNNING.to_string();
+            *self.waiting_for.lock().unwrap() = None;
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
         }
 
@@ -1121,6 +1301,21 @@ mod edge_callback_insert_tests {
             .with_run_lifecycle_service(Arc::new(
                 ApprovalTargetRunLifecycle::new(run_id, session_id)
                     .with_required(request_id, event_type, data),
+            ))
+    }
+
+    fn approval_callback_state_with_edge_required(
+        run_id: &str,
+        session_id: &str,
+        request_id: &str,
+        data: serde_json::Value,
+    ) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(Arc::new(
+                ApprovalTargetRunLifecycle::new(run_id, session_id)
+                    .with_required(request_id, "approval_required", data)
+                    .with_running_edge_wait(),
             ))
     }
 
@@ -1296,6 +1491,7 @@ mod edge_callback_insert_tests {
                 "request_id": "req-approval",
                 "tool": "write_file",
                 "approval_kind": "explicit",
+                "delivery": "durable",
             }),
         );
         {
@@ -1327,12 +1523,89 @@ mod edge_callback_insert_tests {
         assert_eq!(response.0["ok"], true);
         assert_eq!(response.0["durable"], true);
 
+        let replay = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval-replay".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "req-approval".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: Some("approved in another pod".into()),
+                session_id: "sess-approval".into(),
+                run_id: "run-approval".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
+            }),
+        )
+        .await
+        .expect("identical durable approval retry must remain idempotent");
+        assert_eq!(replay.0["durable"], true);
+        assert!(replay.0.get("ledger_enqueued").is_none());
+
         let ledger = state.edge_callback_ledger.lock().await;
         assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
         assert!(
             ledger.keys().all(|key| !key.contains("req-approval")),
             "durable interactions must not depend on the process-local tool-result ledger"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn edge_approval_uses_durable_identity_before_waking_local_waiter() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let state = approval_callback_state_with_edge_required(
+            "run-edge-approval",
+            "sess-edge-approval",
+            "req-edge-approval",
+            json!({
+                "request_id": "req-edge-approval",
+                "tool": "write_file",
+                "approval_kind": "standard",
+                "delivery": "edge_ledger",
+            }),
+        );
+
+        let response = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-edge-approval".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "req-edge-approval".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "sess-edge-approval".into(),
+                run_id: "run-edge-approval".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Standard),
+            }),
+        )
+        .await
+        .expect("canonical edge approval should be delivered");
+
+        assert_eq!(response.0["durable"], true);
+        assert_eq!(response.0["ledger_enqueued"], true);
+        let key = astra_turn_core::edge_ledger::approval_callback_key(
+            "u-approval",
+            "sess-edge-approval",
+            "run-edge-approval",
+            "req-edge-approval",
+        );
+        assert!(state.edge_callback_ledger.lock().await.contains_key(&key));
+        let decision = astra_services::session_journal::find_latest_approval_decision_for_run(
+            "sess-edge-approval",
+            "req-edge-approval",
+            "run-edge-approval",
+        )
+        .unwrap()
+        .expect("edge approval decision must survive local-ledger loss");
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1578,6 +1851,7 @@ mod edge_callback_insert_tests {
                 "request_id": "request-tool-match",
                 "tool": "bash",
                 "approval_kind": "standard",
+                "delivery": "durable",
             }),
         );
 

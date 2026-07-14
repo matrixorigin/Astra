@@ -3,6 +3,7 @@
 //! Provides HTTP client for storing, retrieving, and managing memories
 //! via the Memoria API, with circuit breaker for resilience.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -310,6 +311,27 @@ pub async fn memoria_consolidate_fire_and_forget() {
 }
 
 impl ToolExecutor {
+    fn memoria_record_service_failure(&self) {
+        self.memoria_circuit.record_service_failure();
+    }
+
+    fn memoria_record_service_success(&self) {
+        self.memoria_circuit.record_service_success();
+        if self.memoria_notified_down.swap(false, Ordering::AcqRel) {
+            eprintln!(
+                "  {} Memoria memory service reconnected.",
+                crossterm::style::Stylize::green("✓"),
+            );
+        }
+    }
+
+    /// Returns true while degraded. After the cooldown, one caller receives a
+    /// half-open probe lease so a transient outage cannot disable memory for
+    /// the lifetime of the CLI process.
+    fn memoria_circuit_open(&self) -> bool {
+        self.memoria_circuit.is_open()
+    }
+
     pub(super) async fn memoria_call(&self, op: &str, args: &Value) -> String {
         self.memoria_call_with_timeout(op, args, Duration::from_secs(10))
             .await
@@ -321,20 +343,39 @@ impl ToolExecutor {
         args: &Value,
         timeout: Duration,
     ) -> String {
-        // CLI-specific circuit breaker with user notification.
-        const MAX_FAILS: u32 = 2;
-        if self
-            .memoria_fail_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= MAX_FAILS
+        // Local focus state and deterministic argument errors do not depend on
+        // remote availability. Keep them usable/actionable during an outage.
+        if op == "focus" {
+            return astra_tools::memoria::MemoriaToolGateway::new(
+                self.cloud_base.clone(),
+                self.cloud_token(),
+            )
+            .call_with_timeout(op, args, timeout)
+            .await;
+        }
+        if let Some(error) =
+            astra_tools::memoria::MemoriaToolGateway::validate_before_side_effects(op, args)
         {
-            if !self
-                .memoria_notified_down
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
+            return error.to_string();
+        }
+
+        let cloud_token = match self.cloud_token() {
+            Some(token) => token,
+            None => {
+                return json!({
+                    "error": "Memory unavailable: login required because CLI memory calls must go through the Astra server",
+                    "hint": "Run `astra login` so the memory tool can use the authenticated server proxy"
+                })
+                .to_string();
+            }
+        };
+
+        // CLI-specific, process-lived circuit breaker with user notification.
+        if self.memoria_circuit_open() {
+            if !self.memoria_notified_down.swap(true, Ordering::AcqRel) {
                 eprintln!(
-                    "  {} Memoria memory service is unreachable — memory features \
-                     disabled for this session. Check MEMORIA_BASE_URL or /info.",
+                    "  {} Memoria memory service is temporarily unreachable — calls \
+                     will probe again after a short cooldown. Check /info if it persists.",
                     crossterm::style::Stylize::yellow("⚠"),
                 );
             }
@@ -343,34 +384,19 @@ impl ToolExecutor {
 
         // Delegate to the shared MemoriaPort (single source of truth for
         // build_direct_request, type normalization, and HTTP method routing).
-        let cloud_token = self.cloud_token();
-        if cloud_token.is_none() {
-            return json!({
-                "error": "Memory unavailable: login required because CLI memory calls must go through the Astra server",
-                "hint": "Run `astra login` so the memory tool can use the authenticated server proxy"
-            })
-            .to_string();
-        }
-        let client =
-            astra_tools::memoria::MemoriaToolGateway::new(self.cloud_base.clone(), cloud_token);
+        let client = astra_tools::memoria::MemoriaToolGateway::new(
+            self.cloud_base.clone(),
+            Some(cloud_token),
+        );
         let result = client.call_with_timeout(op, args, timeout).await;
 
-        // CLI-specific: update circuit breaker + user notification
-        if result.contains("\"error\"") {
-            self.memoria_fail_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.memoria_fail_count
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            if self
-                .memoria_notified_down
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
-                eprintln!(
-                    "  {} Memoria memory service reconnected.",
-                    crossterm::style::Stylize::green("✓"),
-                );
-            }
+        // Only availability failures feed the circuit. Validation, auth, and
+        // content errors remain visible to the caller without being amplified
+        // into a session-wide memory outage.
+        if astra_tools::memoria::memory_output_indicates_service_failure(&result) {
+            self.memoria_record_service_failure();
+        } else if astra_tools::memoria::memory_output_proves_service_reachable(&result) {
+            self.memoria_record_service_success();
         }
         result
     }
@@ -379,11 +405,7 @@ impl ToolExecutor {
         if query.trim().is_empty() {
             return vec![];
         }
-        if self
-            .memoria_fail_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= 2
-        {
+        if self.memoria_circuit_open() {
             return vec![];
         }
         let cloud_base = match self.cloud_base.as_deref() {
@@ -414,14 +436,35 @@ impl ToolExecutor {
             .await
         {
             Ok(resp) => {
-                self.memoria_fail_count
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                let text = resp.text().await.unwrap_or_default();
-                filter_memory_boost_hits_for_prompt(parse_memory_search_hits(&text))
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) if status.is_success() => {
+                        self.memoria_record_service_success();
+                        filter_memory_boost_hits_for_prompt(parse_memory_search_hits(&text))
+                    }
+                    Ok(_)
+                        if status.is_server_error()
+                            || matches!(
+                                status,
+                                reqwest::StatusCode::REQUEST_TIMEOUT
+                                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                            ) =>
+                    {
+                        self.memoria_record_service_failure();
+                        vec![]
+                    }
+                    Ok(_) => {
+                        self.memoria_record_service_success();
+                        vec![]
+                    }
+                    Err(_) => {
+                        self.memoria_record_service_failure();
+                        vec![]
+                    }
+                }
             }
             Err(_) => {
-                self.memoria_fail_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.memoria_record_service_failure();
                 vec![]
             }
         }
@@ -435,11 +478,7 @@ impl ToolExecutor {
         if memory_ids.is_empty() {
             return;
         }
-        if self
-            .memoria_fail_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= 2
-        {
+        if self.memoria_circuit.is_degraded() {
             return;
         }
         let Some(cloud_base) = self.cloud_base.clone() else {
@@ -475,6 +514,69 @@ impl ToolExecutor {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod circuit_contract_tests {
+    use super::*;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn missing_memory_ids_remain_visible_without_poisoning_cli_service_health() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/snapshots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/memory/correct/missing-[12]$"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "not found"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/memory/correct/real-memory-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "completed"})))
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(temp.path()).with_cloud(server.uri(), "test-token");
+        for attempt in 1..=2 {
+            let output = executor
+                .memoria_call_with_timeout(
+                    "update",
+                    &json!({
+                        "memory_id": format!("missing-{attempt}"),
+                        "content": "replacement",
+                        "reason": "exercise missing identity contract",
+                    }),
+                    Duration::from_secs(2),
+                )
+                .await;
+            let value: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["error"]["code"], "memory_not_found");
+            assert!(!executor.memoria_circuit.is_degraded());
+        }
+
+        let output = executor
+            .memoria_call_with_timeout(
+                "update",
+                &json!({
+                    "memory_id": "real-memory-id",
+                    "content": "replacement",
+                    "reason": "prove the next valid call remains available",
+                }),
+                Duration::from_secs(2),
+            )
+            .await;
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert!(value.get("error").is_none(), "valid update failed: {value}");
+        assert!(!executor.memoria_circuit.is_degraded());
     }
 }
 

@@ -113,8 +113,12 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
             }
         }
         _ => {
-            let Some(delegation_id) = mailbox.delegation_id.as_deref().filter(|s| !s.is_empty())
-            else {
+            if mailbox
+                .delegation_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
                 return SendResult {
                     display: format!(
                         "Error: cannot send to agent '{normalized_target}' — current agent is not part of a delegation group."
@@ -123,11 +127,7 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
                     tracked_message: None,
                 };
             };
-            let address = match mailbox
-                .router()
-                .resolve_agent(delegation_id, normalized_target)
-                .await
-            {
+            let address = match mailbox.resolve_delegation_agent(normalized_target).await {
                 Ok(address) => address,
                 Err(error) => {
                     return SendResult {

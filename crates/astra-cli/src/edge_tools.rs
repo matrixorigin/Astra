@@ -894,8 +894,8 @@ pub struct ToolExecutor {
     budget_pressure: std::sync::Mutex<f64>,
     /// Build/test iteration tracker — tracks error deltas across fix cycles.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
-    /// Circuit breaker: skip Memoria calls after consecutive failures.
-    memoria_fail_count: std::sync::atomic::AtomicU32,
+    /// Shared-state circuit breaker for process-lived Memoria availability.
+    memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker,
     /// Whether the user has been notified about Memoria being down.
     /// Prevents spamming the same warning every turn.
     memoria_notified_down: std::sync::atomic::AtomicBool,
@@ -1115,7 +1115,7 @@ impl ToolExecutor {
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
-            memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
+            memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker::default(),
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),

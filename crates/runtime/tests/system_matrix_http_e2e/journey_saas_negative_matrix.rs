@@ -14,13 +14,13 @@ use uuid::Uuid;
 
 use super::harness::{
     E2E_PASSWORD, bootstrap, build_e2e_access_token, cleanup_task_rows, get_json,
-    grant_astra_admin_role, maybe_tool_result_payload_from_sse, post_empty, post_json,
-    post_json_with_headers, put_json, revoke_astra_admin_role, seeded_model_name, selected_model,
+    grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
+    post_empty, post_json, post_json_with_headers, put_json, revoke_astra_admin_role,
+    seed_pending_approval, seeded_model_name, selected_model,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
 };
-use astra_services::session_journal::{JournalEventType, read_journal};
 
 fn parse_sse_events(raw: &str) -> Vec<Value> {
     raw.lines()
@@ -985,13 +985,15 @@ pub async fn run_saas_edges_status_smoke() {
     ctx.pool.close().await;
 }
 
-/// Valid approval respond records a single journal decision (positive callback path).
+/// Valid approval respond commits one owner-scoped durable interaction decision.
 pub async fn run_saas_approval_respond_success_path() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let request_id = format!("tc-saas-appr-{}", ctx.suffix);
+    let run_id = format!("run-saas-appr-{}", ctx.suffix);
+    seed_pending_approval(ctx, &run_id, &request_id, "write_file", "standard").await;
 
     let (st_appr, appr_j) = post_json(
         app,
@@ -1002,7 +1004,7 @@ pub async fn run_saas_approval_respond_success_path() {
             "decision": "allow",
             "reason": "saas e2e allow",
             "session_id": ctx.session_id,
-            "run_id": format!("run-saas-appr-{}", ctx.suffix),
+            "run_id": run_id,
             "tool_name": "write_file",
             "approval_kind": "standard"
         }),
@@ -1010,21 +1012,10 @@ pub async fn run_saas_approval_respond_success_path() {
     .await;
     assert_eq!(st_appr, StatusCode::OK, "approval/respond allow: {appr_j}");
 
-    let decisions = read_journal(&ctx.session_id)
-        .expect("read approval journal")
-        .into_iter()
-        .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
-        .filter(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("approval"))
-                .and_then(|approval| approval.get("request_id"))
-                .and_then(|v| v.as_str())
-                == Some(request_id.as_str())
-        })
-        .count();
-    assert_eq!(decisions, 1, "expected one approval decision recorded");
+    let decision =
+        load_durable_interaction_event(ctx, &run_id, &request_id, "approval_resolved").await;
+    assert_eq!(decision.pointer("/data/decision"), Some(&json!("allow")));
+    assert_eq!(decision.pointer("/data/outcome"), Some(&json!("approved")));
 
     ctx.pool.close().await;
 }

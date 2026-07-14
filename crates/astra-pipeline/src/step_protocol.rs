@@ -698,7 +698,11 @@ pub struct HeavyCheckpoint {
     pub light: LightCheckpoint,
     /// Full conversation messages (for LLM resume)
     pub messages: Vec<serde_json::Value>,
-    /// Token budget state
+    /// Recovery diagnostics only. Despite the legacy field names these are
+    /// not a shared execution budget: tokens describe assembled input-context
+    /// headroom and rounds describe remaining agent-loop iterations. They must
+    /// never be promoted into prompt policy or used as a cross-layer stop
+    /// signal.
     pub budget_remaining_tokens: u64,
     pub budget_remaining_rounds: u32,
     /// Session state

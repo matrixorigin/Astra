@@ -18,7 +18,10 @@ fn recovery_user_id(state: &SessionState) -> String {
         .unwrap_or_else(cli_user_id)
 }
 
-fn budget_remaining_tokens_from_state(state: &SessionState) -> u64 {
+/// Diagnostic input headroom for crash recovery. This is deliberately not an
+/// execution budget: exhausting the assembled context calls for compaction or
+/// a fresh assembly, not terminating the user's task.
+fn context_input_headroom_tokens_from_state(state: &SessionState) -> u64 {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
         let limit = u64::from(trace.token_budget.max_tokens);
         if limit > 0 {
@@ -26,12 +29,10 @@ fn budget_remaining_tokens_from_state(state: &SessionState) -> u64 {
         }
     }
 
-    let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
-    if limit == 0 {
-        0
-    } else {
-        limit.saturating_sub(state.total_prompt_tokens)
-    }
+    // `total_prompt_tokens` is cumulative session usage, not the size of the
+    // latest assembled input. Mixing those clocks produces a plausible but
+    // meaningless headroom value. Unknown is represented explicitly as zero.
+    0
 }
 
 pub(crate) fn delegation_from_heavy_checkpoint(
@@ -118,7 +119,6 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
 
     let messages = history_as_messages(&state.history);
 
-    let max_turns = state.cli_context.max_turns.unwrap_or(50u32);
     let now_ms = epoch_ms();
     let total_tok = state.total_prompt_tokens + state.total_completion_tokens;
 
@@ -167,9 +167,13 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         light,
         messages,
         budget_remaining_tokens: previous_budget_tokens
-            .unwrap_or_else(|| budget_remaining_tokens_from_state(state)),
-        budget_remaining_rounds: previous_budget_rounds
-            .unwrap_or_else(|| max_turns.saturating_sub(state.turn)),
+            .unwrap_or_else(|| context_input_headroom_tokens_from_state(state)),
+        // A manual REPL checkpoint is outside an active agentic loop. Session
+        // turn count and agentic iteration count are different clocks; using
+        // `max_turns - session_turn` fabricated values such as 270 remaining
+        // rounds. Zero here means "no active loop snapshot", and this legacy
+        // diagnostic is never promoted into prompt or stop policy.
+        budget_remaining_rounds: previous_budget_rounds.unwrap_or(0),
         blocked_tools: interrupted_blocked_tools,
         recent_tools: state.recent_tools.clone(),
         memory_context: previous_heavy.and_then(|heavy| heavy.memory_context.clone()),

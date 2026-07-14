@@ -1230,6 +1230,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
                     "tool": "bash",
                     "args": {"command": "git status"},
                     "approval_kind": "standard",
+                    "delivery": "durable",
                 }
             }),
         )
@@ -1505,7 +1506,8 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
                     "request_id": expired_request_id,
                     "tool": "bash",
                     "args": {"command": "git status"},
-                    "approval_kind": "standard"
+                    "approval_kind": "standard",
+                    "delivery": "durable"
                 }
             }),
         )

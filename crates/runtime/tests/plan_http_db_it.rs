@@ -594,6 +594,13 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed");
 
+    let version_after_first_finish: i64 =
+        sqlx::query_scalar("SELECT version FROM plans WHERE plan_id = ?")
+            .bind(&plan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
     // Second finish of the same run_id must be rejected (append-only).
     let (s, _) = request_json(
         app.clone(),
@@ -603,6 +610,27 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "second finish must 404");
+
+    let version_after_rejected_finish: i64 =
+        sqlx::query_scalar("SELECT version FROM plans WHERE plan_id = ?")
+            .bind(&plan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        version_after_rejected_finish, version_after_first_finish,
+        "a rejected duplicate finish must not advance the plan projection"
+    );
+    let persisted_status: String =
+        sqlx::query_scalar("SELECT status FROM plan_step_runs WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted_status, "completed",
+        "a rejected duplicate finish must not rewrite append-only attempt evidence"
+    );
 
     // GET /plans/{id}/step-runs lists the attempt.
     let (s, body) = request_json(
@@ -980,63 +1008,17 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
          was still {active_after_approve:?}"
     );
 
-    let todo_row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT title, status, metadata, subtasks FROM session_todos \
-         WHERE session_id = ? AND user_id = ? ORDER BY ordinal ASC LIMIT 1",
-    )
-    .bind(&session_id)
-    .bind(auth_bearer())
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-    let Some((title, status, metadata, subtasks)) = todo_row else {
-        panic!("approved HTTP plan should be mirrored into session_todos task board");
-    };
-    assert_eq!(title, "step s1");
-    assert_eq!(status, "in_progress");
-    let metadata: Value = serde_json::from_str(metadata.as_deref().unwrap_or("{}")).unwrap();
-    assert_eq!(metadata["source"], "approved_plan");
-    assert_eq!(metadata["plan_id"], plan_id);
-    assert_eq!(metadata["plan_goal"], "http-exit-clears");
-    assert_eq!(metadata["plan_subtask_id"], "s1");
-    let subtasks: Value = serde_json::from_str(subtasks.as_deref().unwrap_or("[]")).unwrap();
-    assert_eq!(
-        subtasks.as_array().map(Vec::len),
-        Some(0),
-        "approved HTTP plan step should be a top-level task, not a hidden subtask tree"
-    );
-
-    let (s, body) = request_json(
-        app.clone(),
-        "POST",
-        &format!("/plans/{plan_id}/step-runs/completed"),
-        Some(json!({
-            "subtask_id": "s1",
-            "attempt": 1,
-            "status": "completed",
-            "session_id": session_id,
-            "request_id": "req-task-board-sync"
-        })),
-    )
-    .await;
-    assert_eq!(s, StatusCode::CREATED, "{body}");
-
-    let synced_row: (String, Option<String>) = sqlx::query_as(
-        "SELECT status, subtasks FROM session_todos \
-         WHERE session_id = ? AND user_id = ? ORDER BY ordinal ASC LIMIT 1",
+    let todo_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND user_id = ?",
     )
     .bind(&session_id)
     .bind(auth_bearer())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(synced_row.0, "completed");
-    let synced_subtasks: Value =
-        serde_json::from_str(synced_row.1.as_deref().unwrap_or("[]")).unwrap();
     assert_eq!(
-        synced_subtasks.as_array().map(Vec::len),
-        Some(0),
-        "step completion should update the top-level approved-plan task"
+        todo_count, 0,
+        "the durable plan is projected directly; approval must not create a duplicate task-board tree"
     );
 
     cleanup_plan(&pool, &plan_id).await;

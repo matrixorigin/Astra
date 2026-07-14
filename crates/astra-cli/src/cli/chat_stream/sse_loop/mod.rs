@@ -895,6 +895,7 @@ pub(crate) async fn stream_chat_sse(
             llm_token_service: None,
             task_board_monitor: p.task_manager.clone(),
             task_board_snapshot: Default::default(),
+            completion_settlement: Default::default(),
         },
         messaging: MessagingState {
             mailbox: root_mailbox,

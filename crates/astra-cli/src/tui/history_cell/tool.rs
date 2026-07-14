@@ -860,8 +860,9 @@ fn mark_full_row_background(mut line: Line<'static>) -> Line<'static> {
     // Full-row colour is presentation metadata, not content. Padding a line
     // with spaces to the terminal width leaves a real terminal in auto-wrap
     // pending state; the next CRLF can then create a phantom blank row. Each
-    // renderer owns the physical surface (Paragraph via Line.style, scrollback
-    // via erase-to-end-of-line), while wrapping continues to see only content.
+    // renderer owns the physical surface (FullRowParagraph for buffers,
+    // erase-to-end-of-line for scrollback), while wrapping continues to see
+    // only content.
     line.style = line.style.bg(bg);
     line
 }
@@ -1704,8 +1705,8 @@ mod tests {
 
         let width = 80;
         let lines = sanitize_lines_for_terminal(t.display_lines(width));
-        let paragraph =
-            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let paragraph = crate::tui::render::line_utils::FullRowParagraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 12);
         let added_row = (0..12)
             .find(|&y| {
@@ -1733,8 +1734,8 @@ mod tests {
 
         let width = 96;
         let lines = sanitize_lines_for_terminal(t.display_lines(width));
-        let paragraph =
-            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let paragraph = crate::tui::render::line_utils::FullRowParagraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 10);
         let added_row = (0..10)
             .find(|&y| {

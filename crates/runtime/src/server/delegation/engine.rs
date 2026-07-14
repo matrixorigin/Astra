@@ -68,8 +68,62 @@ use astra_prompts::team_prompts;
 /// Grace period for cooperative children to publish a canonical terminal
 /// result after their parent is cancelled. Keep this comfortably above a
 /// scheduler tick, but below the interactive cancellation latency budget.
+/// 500ms allows time for durable state persistence (DB write + fsync).
 const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(250);
+    std::time::Duration::from_millis(500);
+
+/// After `abort_all()`, bound the final drain of join handles so a task stuck
+/// in uninterruptible blocking I/O cannot hold the parent turn indefinitely.
+const FANOUT_ABORT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound the total time spent reconciling missing children through the
+/// durable authority after an abort drain. A slow durable store must not
+/// hold the parent turn indefinitely. On timeout, children remain explicitly
+/// unfinished so recovery can still observe the eventual durable winner.
+const DELEGATION_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await one operation within a deadline shared by the whole reconciliation
+/// batch. Once the budget is exhausted, later operations are not polled. This
+/// prevents fanout width from multiplying cancellation latency.
+async fn await_with_shared_deadline<T>(
+    deadline: &mut Option<tokio::time::Instant>,
+    budget: std::time::Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + budget);
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    tokio::time::timeout_at(deadline, future).await.ok()
+}
+
+/// Abort once, then drain as many join results as become available within one
+/// shared deadline. A per-handle timeout multiplies cancellation latency by
+/// fanout width; waiting for only one handle loses settlement evidence for the
+/// rest. Returning `None` means the bounded projection drain ended, not that
+/// every child reached a durable terminal state.
+async fn abort_and_join_next_bounded<T: Send + 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    deadline: &mut Option<tokio::time::Instant>,
+    scope: &'static str,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let deadline = *deadline.get_or_insert_with(|| {
+        tasks.abort_all();
+        tokio::time::Instant::now() + FANOUT_ABORT_DRAIN_TIMEOUT
+    });
+    match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                target: "astra_runtime::delegation",
+                scope,
+                timeout_ms = FANOUT_ABORT_DRAIN_TIMEOUT.as_millis(),
+                "aborted child join drain reached its shared deadline; durable reconciliation remains authoritative"
+            );
+            None
+        }
+    }
+}
 
 /// State projection is an observability aid, not a copy of the full run tree.
 /// Keep the source, its nearest ancestors, and the root within this write
@@ -249,6 +303,25 @@ fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
     }
 }
 
+fn cancellation_reconciliation_pending_result(attempted: &AgentResult) -> AgentResult {
+    AgentResult {
+        agent_id: attempted.agent_id.clone(),
+        run_id: attempted.run_id.clone(),
+        status: STATUS_WAITING.to_string(),
+        output: None,
+        error: Some(format!(
+            "durable cancellation reconciliation exceeded the shared {}ms deadline; authoritative child state is still unknown",
+            DELEGATION_RECONCILIATION_TIMEOUT.as_millis()
+        )),
+        // Terminal authority is unknown, but work already observed by the
+        // parent is still a fact. Keep it visible so a reconciliation timeout
+        // cannot turn into silent usage under-counting.
+        prompt_tokens: attempted.prompt_tokens,
+        completion_tokens: attempted.completion_tokens,
+        tool_calls: attempted.tool_calls,
+    }
+}
+
 /// Convert the richer delegated-agent outcome taxonomy to the canonical
 /// durable run lifecycle. Details such as timeout/partial/verification failure
 /// remain on `AgentResult`; the run row intentionally stores only lifecycle
@@ -361,6 +434,40 @@ async fn reconcile_agent_result_with_durable_authority(
         }
     }
     result
+}
+
+/// Reconcile a parent-cancelled child without allowing durable storage latency
+/// to hold the parent indefinitely. Timeout is an unknown fact, not evidence
+/// that cancellation committed: project the child as recoverably waiting so a
+/// later durable recovery can still supply the authoritative terminal state.
+async fn reconcile_after_parent_cancellation_bounded(
+    run_engine: &RunEngine,
+    user_id: &str,
+    result: AgentResult,
+    deadline: &mut Option<tokio::time::Instant>,
+    scope: &'static str,
+) -> AgentResult {
+    let run_id = result.run_id.clone();
+    let pending = cancellation_reconciliation_pending_result(&result);
+    let result = await_with_shared_deadline(
+        deadline,
+        DELEGATION_RECONCILIATION_TIMEOUT,
+        reconcile_agent_result_with_durable_authority(run_engine, user_id, result),
+    )
+    .await;
+    match result {
+        Some(result) => result,
+        None => {
+            tracing::error!(
+                target: "astra_runtime::delegation",
+                scope,
+                run_id,
+                timeout_ms = DELEGATION_RECONCILIATION_TIMEOUT.as_millis(),
+                "durable cancellation reconciliation timed out; preserving an unfinished projection for recovery"
+            );
+            pending
+        }
+    }
 }
 
 fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
@@ -3053,8 +3160,13 @@ impl DelegationEngine {
         // abort. This wait is bounded so a stuck persistence/executor path
         // cannot hold the parent turn indefinitely.
         let mut cancellation_drain_deadline = None;
+        let mut abort_drain_deadline = None;
+        let mut cancellation_reconciliation_deadline = None;
         while let Some(join_result) = {
-            if let Some(deadline) = cancellation_drain_deadline {
+            if abort_drain_deadline.is_some() {
+                abort_and_join_next_bounded(&mut join_set, &mut abort_drain_deadline, "fanout")
+                    .await
+            } else if let Some(deadline) = cancellation_drain_deadline {
                 match tokio::time::timeout_at(deadline, join_set.join_next()).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -3063,8 +3175,12 @@ impl DelegationEngine {
                             timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
                             "fanout cancellation drain timed out; aborting unacknowledged children"
                         );
-                        join_set.abort_all();
-                        join_set.join_next().await
+                        abort_and_join_next_bounded(
+                            &mut join_set,
+                            &mut abort_drain_deadline,
+                            "fanout",
+                        )
+                        .await
                     }
                 }
             } else if let Some(token) = cancel_token {
@@ -3082,8 +3198,12 @@ impl DelegationEngine {
                                     timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
                                     "fanout cancellation drain timed out; aborting unacknowledged children"
                                 );
-                                join_set.abort_all();
-                                join_set.join_next().await
+                                abort_and_join_next_bounded(
+                                    &mut join_set,
+                                    &mut abort_drain_deadline,
+                                    "fanout",
+                                )
+                                .await
                             }
                         }
                     }
@@ -3116,6 +3236,24 @@ impl DelegationEngine {
                         tool_calls: 0,
                     });
                 }
+            }
+        }
+
+        // A shared abort deadline can expire before every JoinSet entry yields
+        // a projection result. Do not silently shrink result cardinality: use
+        // the spawn identity map to reconcile each missing child through the
+        // durable run authority. This keeps parent aggregation complete even
+        // when local task cleanup is only partially observable.
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            let mut settled_run_ids = results
+                .iter()
+                .map(|result| result.run_id.clone())
+                .collect::<HashSet<_>>();
+            for (agent_id, run_id) in id_map.values() {
+                if !settled_run_ids.insert(run_id.clone()) {
+                    continue;
+                }
+                results.push(cancelled_agent_result(agent_id, run_id));
             }
         }
 
@@ -3186,12 +3324,23 @@ impl DelegationEngine {
 
         let mut authoritative_results = Vec::with_capacity(results.len());
         for result in results {
-            let result = reconcile_agent_result_with_durable_authority(
-                &self.run_engine,
-                &request.user_id,
-                result,
-            )
-            .await;
+            let result = if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                reconcile_after_parent_cancellation_bounded(
+                    &self.run_engine,
+                    &request.user_id,
+                    result,
+                    &mut cancellation_reconciliation_deadline,
+                    "fanout",
+                )
+                .await
+            } else {
+                reconcile_agent_result_with_durable_authority(
+                    &self.run_engine,
+                    &request.user_id,
+                    result,
+                )
+                .await
+            };
             let final_state = agent_result_status_to_subrun_state(&result.status);
             self.tracker
                 .apply_sub_run_result_state(
@@ -4200,8 +4349,12 @@ impl DelegationEngine {
         // children and only force-abort after a finite acknowledgement window.
         let mut results = Vec::with_capacity(tasks.len());
         let mut cancellation_drain_deadline = None;
+        let mut abort_drain_deadline = None;
+        let mut cancellation_reconciliation_deadline = None;
         while let Some(join_result) = {
-            if let Some(deadline) = cancellation_drain_deadline {
+            if abort_drain_deadline.is_some() {
+                abort_and_join_next_bounded(&mut handles, &mut abort_drain_deadline, "fork").await
+            } else if let Some(deadline) = cancellation_drain_deadline {
                 match tokio::time::timeout_at(deadline, handles.join_next()).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -4210,8 +4363,8 @@ impl DelegationEngine {
                             timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
                             "fork cancellation drain timed out; aborting unacknowledged children"
                         );
-                        handles.abort_all();
-                        handles.join_next().await
+                        abort_and_join_next_bounded(&mut handles, &mut abort_drain_deadline, "fork")
+                            .await
                     }
                 }
             } else if let Some(token) = cancel_token {
@@ -4229,8 +4382,12 @@ impl DelegationEngine {
                                     timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
                                     "fork cancellation drain timed out; aborting unacknowledged children"
                                 );
-                                handles.abort_all();
-                                handles.join_next().await
+                                abort_and_join_next_bounded(
+                                    &mut handles,
+                                    &mut abort_drain_deadline,
+                                    "fork",
+                                )
+                                .await
                             }
                         }
                     }
@@ -4247,21 +4404,23 @@ impl DelegationEngine {
                         .cloned()
                         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                     if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
-                        let cancelled = reconcile_agent_result_with_durable_authority(
+                        let reconciled = reconcile_after_parent_cancellation_bounded(
                             &self.run_engine,
                             &request.user_id,
                             cancelled_agent_result(&panic_agent_id, &panic_run_id),
+                            &mut cancellation_reconciliation_deadline,
+                            "fork",
                         )
                         .await;
                         self.tracker
                             .apply_sub_run_result_state(
                                 &panic_run_id,
-                                agent_result_status_to_subrun_state(&cancelled.status),
-                                cancelled.error.as_deref(),
-                                cancelled.output.as_deref(),
+                                agent_result_status_to_subrun_state(&reconciled.status),
+                                reconciled.error.as_deref(),
+                                reconciled.output.as_deref(),
                             )
                             .await;
-                        results.push(cancelled);
+                        results.push(reconciled);
                         continue;
                     }
                     let panic_error = format!("fork task panicked: {e}");
@@ -4290,6 +4449,35 @@ impl DelegationEngine {
                         .await;
                     results.push(panic_result);
                 }
+            }
+        }
+
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            let mut settled_run_ids = results
+                .iter()
+                .map(|result| result.run_id.clone())
+                .collect::<HashSet<_>>();
+            for (agent_id, run_id) in fork_id_map.values() {
+                if !settled_run_ids.insert(run_id.clone()) {
+                    continue;
+                }
+                let reconciled = reconcile_after_parent_cancellation_bounded(
+                    &self.run_engine,
+                    &request.user_id,
+                    cancelled_agent_result(agent_id, run_id),
+                    &mut cancellation_reconciliation_deadline,
+                    "fork",
+                )
+                .await;
+                self.tracker
+                    .apply_sub_run_result_state(
+                        run_id,
+                        agent_result_status_to_subrun_state(&reconciled.status),
+                        reconciled.error.as_deref(),
+                        reconciled.output.as_deref(),
+                    )
+                    .await;
+                results.push(reconciled);
             }
         }
 
@@ -4595,6 +4783,64 @@ mod tests {
         assert_eq!(
             agent_result_status_to_subrun_state(&result.status),
             SubRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_reconciliation_timeout_preserves_recoverable_unknown_state() {
+        let attempted = AgentResult {
+            agent_id: "reviewer".to_string(),
+            run_id: "run-reconcile-pending".to_string(),
+            status: STATUS_COMPLETED.to_string(),
+            output: Some("locally observed output".to_string()),
+            error: None,
+            prompt_tokens: 12,
+            completion_tokens: 4,
+            tool_calls: 1,
+        };
+        let result = cancellation_reconciliation_pending_result(&attempted);
+
+        assert_eq!(result.status, STATUS_WAITING);
+        assert!(result.is_unfinished());
+        assert_eq!(result.output, None, "uncommitted output must not leak");
+        assert_eq!(result.prompt_tokens, 12);
+        assert_eq!(result.completion_tokens, 4);
+        assert_eq!(result.tool_calls, 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("authoritative child state is still unknown"))
+        );
+        assert_eq!(
+            agent_result_status_to_subrun_state(&result.status),
+            SubRunState::Waiting
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_deadline_is_shared_across_the_whole_batch() {
+        let budget = std::time::Duration::from_secs(2);
+        let mut deadline = None;
+        let started = tokio::time::Instant::now();
+
+        assert!(
+            await_with_shared_deadline(&mut deadline, budget, std::future::pending::<()>(),)
+                .await
+                .is_none()
+        );
+        assert_eq!(tokio::time::Instant::now() - started, budget);
+
+        let exhausted_at = tokio::time::Instant::now();
+        assert!(
+            await_with_shared_deadline(&mut deadline, budget, std::future::pending::<()>(),)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            exhausted_at,
+            "a shared deadline must not restart for each child"
         );
     }
 
@@ -5649,6 +5895,64 @@ mod tests {
                 .await
                 .expect("durable record loads")
                 .expect("child durable record exists")
+                .status,
+            STATUS_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_cancellation_preserves_the_childs_canonical_cancelled_result() {
+        use std::time::Duration;
+
+        let (registry, run_engine, tracker) = setup();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(BlockingCancelExecutor {
+                started_tx,
+                cancel_observed: cancel_observed.clone(),
+                release: release.clone(),
+            }),
+        ));
+        let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = fork_request("delegation-fork-parent-cancel", vec!["inspect"], "writer");
+
+        let execution = {
+            let engine = engine.clone();
+            let parent_cancel = parent_cancel.clone();
+            tokio::spawn(async move { engine.execute(request, "orch", Some(parent_cancel)).await })
+        };
+        let child_run_id = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("fork child should begin promptly")
+            .expect("test executor reports the run id");
+
+        parent_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
+            .await
+            .expect("fork child should observe parent cancellation promptly");
+        release.notify_one();
+
+        let result = execution
+            .await
+            .expect("fork delegation task joins")
+            .expect("fork delegation completes");
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, STATUS_CANCELLED);
+        assert_eq!(
+            tracker.get_sub_run_state(&child_run_id).await,
+            Some(SubRunState::Cancelled)
+        );
+        assert_eq!(
+            run_engine
+                .load_run("user-1", &child_run_id)
+                .await
+                .expect("durable record loads")
+                .expect("fork child durable record exists")
                 .status,
             STATUS_CANCELLED
         );

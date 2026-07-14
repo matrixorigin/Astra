@@ -11893,3 +11893,79 @@ fn durable_run_event_batch_metrics_record_rows_bytes_and_compaction() {
         "metrics must stay low-cardinality: {rendered}"
     );
 }
+
+#[test]
+fn edge_approval_persistence_normalizes_single_and_batch_requests() {
+    let single = json!({
+        "type": "approval_required",
+        "request_id": "approval-1",
+        "tool": "bash",
+        "approval_kind": "explicit",
+        "detail": "printf ok",
+        "display_label": "$ printf ok",
+    });
+    let single_facts = canonical_edge_approval_requests(&single);
+    assert_eq!(single_facts.len(), 1);
+    assert_eq!(single_facts[0]["event_type"], "approval_required");
+    assert_eq!(single_facts[0]["data"]["request_id"], "approval-1");
+    assert_eq!(single_facts[0]["data"]["tool"], "bash");
+    assert_eq!(single_facts[0]["data"]["delivery"], "edge_ledger");
+    assert_eq!(single_facts[0]["data"]["detail"], "printf ok");
+    assert_eq!(
+        single_facts[0]["idempotency_key"],
+        "edge-approval-required:approval-1"
+    );
+
+    let batch = json!({
+        "type": "approval_batch_required",
+        "requests": [
+            {
+                "request_id": "approval-a",
+                "tool": "write_file",
+                "approval_kind": "standard",
+                "path": "/tmp/a",
+            },
+            {
+                "request_id": "approval-b",
+                "tool": "write_file",
+                "approval_kind": "standard",
+                "path": "/tmp/b",
+            },
+        ],
+    });
+    let batch_facts = canonical_edge_approval_requests(&batch);
+    assert_eq!(batch_facts.len(), 2);
+    assert_eq!(batch_facts[0]["data"]["request_id"], "approval-a");
+    assert_eq!(batch_facts[1]["data"]["request_id"], "approval-b");
+    assert_eq!(batch_facts[0]["data"]["path"], "/tmp/a");
+    assert_eq!(batch_facts[1]["data"]["path"], "/tmp/b");
+    assert!(incrementally_persisted_edge_approval_event(&single));
+    assert!(incrementally_persisted_edge_approval_event(&batch));
+}
+
+#[test]
+fn edge_approval_persistence_rejects_unaddressable_items() {
+    let malformed = json!({
+        "type": "approval_batch_required",
+        "requests": [
+            {"request_id": "", "tool": "bash"},
+            {"request_id": "missing-tool"},
+            "not-an-object",
+        ],
+    });
+    assert!(canonical_edge_approval_requests(&malformed).is_empty());
+    let already_durable = json!({
+        "type": "approval_required",
+        "request_id": "durable-approval",
+        "tool": "bash",
+        "approval_kind": "standard",
+        "delivery": "durable",
+    });
+    assert!(canonical_edge_approval_requests(&already_durable).is_empty());
+    assert!(!incrementally_persisted_edge_approval_event(
+        &already_durable
+    ));
+    assert!(!incrementally_persisted_edge_approval_event(&json!({
+        "type": "tool_request"
+    })));
+}

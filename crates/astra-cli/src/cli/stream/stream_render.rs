@@ -337,7 +337,14 @@ fn persist_scoped_allow_rule(
 /// is observable and durable state remains authoritative.
 fn try_send_stream_event(tx: &chat_stream::StreamEventTx, event: chat_stream::StreamEvent) {
     if let Err(error) = tx.try_send(event) {
-        tracing::warn!(%error, "stream event queue unavailable");
+        // Never enqueue a warning into the same queue that just rejected the
+        // original event: under saturation that warning is lost too and gives
+        // a false sense of observability. Lifecycle callers also publish to
+        // the direct sink when one exists; the bounded channel remains a
+        // best-effort projection, while this structured error makes the gap
+        // explicit to telemetry without blocking a Tokio worker or spawning an
+        // unbounded retry task.
+        tracing::error!(%error, "bounded stream projection dropped a lifecycle event");
     }
 }
 
@@ -3633,12 +3640,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                         "permission",
                                                         "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
                                                     );
+                                                    let event = chat_stream::StreamEvent::StatusLine(
+                                                        format!(
+                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
+                                                        ),
+                                                    );
                                                     if let Some(tx) = &self.stream_event_tx {
-                                                        try_send_stream_event(tx, chat_stream::StreamEvent::StatusLine(
-                                                            format!(
-                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                            ),
-                                                        ));
+                                                        try_send_stream_event(tx, event.clone());
+                                                    }
+                                                    if let Some(sink) = &self.stream_event_sink {
+                                                        sink.send(event);
                                                     }
                                                 }
                                                 pm.trust_sandbox_root(expand_dir.clone());
@@ -3664,12 +3675,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                         "permission",
                                                         "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
                                                     );
+                                                    let event = chat_stream::StreamEvent::StatusLine(
+                                                        format!(
+                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
+                                                        ),
+                                                    );
                                                     if let Some(tx) = &self.stream_event_tx {
-                                                        try_send_stream_event(tx, chat_stream::StreamEvent::StatusLine(
-                                                            format!(
-                                                                "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                            ),
-                                                        ));
+                                                        try_send_stream_event(tx, event.clone());
+                                                    }
+                                                    if let Some(sink) = &self.stream_event_sink {
+                                                        sink.send(event);
                                                     }
                                                 }
                                                 pm.trust_sandbox_root(expand_dir.clone());
@@ -8792,9 +8807,12 @@ mod tests {
         assert_eq!(rows[1].trim(), "1 - old");
         assert_eq!(rows[2].trim(), "1 + new");
         assert!(
-            rows[1].len() > rows[1].trim_end().len(),
-            "edit diff rows own the full terminal width: {:?}",
-            rows[1]
+            rendered
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .contains("\x1b[K"),
+            "edit diff rows must erase through the physical terminal edge: {rendered:?}"
         );
         assert!(
             !rows[1].starts_with("       1 -"),
@@ -8813,9 +8831,16 @@ mod tests {
         let rendered = format_terminal_tool_summary("git", &summary, false);
         let plain = crate::cli::theme::strip_ansi(&rendered);
         let rows = plain.lines().collect::<Vec<_>>();
-        assert_eq!(rows[0].trim_end(), "    +21 -18 in 1 file(s)");
-        assert!(rows[0].len() > rows[0].trim_end().len(), "{rows:?}");
+        assert_eq!(rows[0], "    +21 -18 in 1 file(s)");
         assert_eq!(rows[1], "          pkg/frontend/plan_cache.go");
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("\x1b[K"),
+            "git diff stat must erase through the physical terminal edge: {rendered:?}"
+        );
     }
 
     #[test]

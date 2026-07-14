@@ -150,6 +150,7 @@ impl E2eRunLifecycle {
                     "request_id": request_id,
                     "tool": tool,
                     "approval_kind": approval_kind,
+                    "delivery": "durable",
                 }
             }),
         );

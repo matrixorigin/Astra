@@ -134,12 +134,13 @@ pub fn runtime_recap_message(state: &SessionStateCompact) -> Option<Value> {
             state.activated_deferred_tool_names.join(", ")
         ));
     }
-    if state.budget_remaining_tokens > 0 || state.budget_remaining_rounds > 0 {
-        lines.push(format!(
-            "Last checkpoint budget: tokens={}, rounds={}",
-            state.budget_remaining_tokens, state.budget_remaining_rounds
-        ));
-    }
+    // Checkpoint headroom is recovery diagnostics, not model policy. In
+    // particular, `budget_remaining_tokens` historically measured assembled
+    // context headroom while `budget_remaining_rounds` measured agent-loop
+    // rounds. Rendering those unrelated values as one "budget" made a normal
+    // `tokens=0, rounds=N` checkpoint look like an execution stop signal and
+    // allowed a local accounting mismatch to steer the next turn. Runtime
+    // budget guidance is injected from live authoritative state instead.
     if state.consecutive_ctx_errors > 0 {
         lines.push(format!(
             "Context-window recovery attempts: {}",
@@ -590,7 +591,8 @@ mod tests {
         assert!(content.starts_with("[Session runtime recap]"));
         assert!(content.contains("Recent tools: read_file, grep"));
         assert!(content.contains("Activated deferred tools awaiting schema injection: write_file"));
-        assert!(content.contains("Last checkpoint budget: tokens=1234, rounds=7"));
+        assert!(!content.contains("checkpoint budget"));
+        assert!(!content.contains("tokens=1234"));
         assert!(content.contains("Context-window recovery attempts: 2"));
         assert!(content.contains("Delegation: id=del-1, pattern=fanout, completed_sub_runs=0"));
         assert!(!content.contains("stale_block"));

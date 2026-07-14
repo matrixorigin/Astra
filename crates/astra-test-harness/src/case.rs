@@ -13,6 +13,7 @@ use std::path::Path;
 
 /// A single test case. One YAML file == one `Case`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Case {
     /// Human-readable id. Appears in report lines. Unique per suite.
     pub name: String,
@@ -102,10 +103,20 @@ pub struct Case {
     /// even on failure.
     #[serde(default)]
     pub teardown_cmd: Option<String>,
+
+    /// Remove only memory records that this case demonstrably created.
+    ///
+    /// The harness derives exact IDs from the case session's structured
+    /// `ToolCallCompleted` events, then invokes the normal authenticated
+    /// `astra memory forget` command. This deliberately avoids broad topic
+    /// purges and avoids a separate privileged Memoria credential.
+    #[serde(default)]
+    pub cleanup_memory_records: bool,
 }
 
 /// A follow-up turn in a multi-turn case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseStep {
     /// Prompt for this turn.
     pub prompt: String,
@@ -432,6 +443,54 @@ mod tests {
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
         assert!(!c.debug_log);
+    }
+
+    #[test]
+    fn bundled_introspection_reflection_case_keeps_durable_checks_strict() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/introspection_reflection_source_boundary.yaml");
+        let case = Case::from_path(&path).expect("bundled diagnostic case must parse");
+
+        assert!(case.debug_log, "journal criteria require session capture");
+        assert!(case
+            .criteria
+            .iter()
+            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCalled { name, optional: false } if name == "introspect")));
+        assert!(case
+            .criteria
+            .iter()
+            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCalled { name, optional: false } if name == "reflect")));
+    }
+
+    #[test]
+    fn bundled_memory_lifecycle_requires_purge_verification() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/memory_full_lifecycle.yaml");
+        let case = Case::from_path(&path).expect("bundled memory lifecycle case must parse");
+
+        assert!(matches!(
+            case.steps[1].criteria.last(),
+            Some(crate::criteria::Criterion::HardJudger { .. })
+        ));
+        assert!(case.cleanup_memory_records);
+    }
+
+    #[test]
+    fn case_rejects_unknown_fields_instead_of_ignoring_a_misspelled_contract() {
+        let error = serde_yaml_ng::from_str::<Case>(
+            "name: strict\nprompt: hello\ncleanup_memory_record: true\n",
+        )
+        .expect_err("unknown case fields must fail at load time");
+        assert!(
+            error.to_string().contains("cleanup_memory_record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_bundled_case_parses_with_the_strict_criterion_schema() {
+        let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+        let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
+        assert!(!cases.is_empty());
     }
 
     #[test]

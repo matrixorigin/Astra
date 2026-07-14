@@ -675,7 +675,8 @@ fn coding_discipline_section() -> &'static str {
 fn turn_discipline_section() -> &'static str {
     "\n## Turn Discipline\n\
      - **Announce once, briefly**: before your first tool call, write ONE sentence saying what you're about to do. Don't narrate every step.\n\
-     - **End with a short summary**: close the turn with 1-2 sentences stating what changed and what's next. This is the deliverable — not a list of tools you ran.\n\
+     - **End with a short summary**: close the turn with 1-2 sentences stating what changed and its verification status. This is the deliverable — not a list of tools you ran.\n\
+     - **Stop when the requested outcome is complete**: end with the result; do not append an optional \"what next?\" question or ask permission for unrelated follow-up work. Ask only when a concrete missing decision blocks the current request.\n\
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
      - **Match depth to task**: short question → short answer.\n\
@@ -2353,6 +2354,11 @@ mod tests {
         assert!(p.contains("user's language"));
         assert!(p.contains("Code changes"));
         assert!(p.contains("Build/test output"));
+
+        // Turn completion must not manufacture another user decision.
+        assert!(p.contains("Stop when the requested outcome is complete"));
+        assert!(p.contains("do not append an optional \"what next?\" question"));
+        assert!(p.contains("concrete missing decision blocks the current request"));
 
         // Error recovery
         assert!(p.contains("Tool Error Recovery"));

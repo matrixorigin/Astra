@@ -94,13 +94,18 @@ pub async fn evaluate_judger(
     criterion: &Criterion,
     outcome: &RunOutcome,
 ) -> Option<CriterionResult> {
-    let Criterion::Judger {
-        question,
-        threshold,
-        model,
-    } = criterion
-    else {
-        return None;
+    let (question, threshold, model) = match criterion {
+        Criterion::Judger {
+            question,
+            threshold,
+            model,
+        }
+        | Criterion::HardJudger {
+            question,
+            threshold,
+            model,
+        } => (question, threshold, model),
+        _ => return None,
     };
 
     let result = judger.score(question, model.as_deref(), outcome).await;
@@ -129,7 +134,7 @@ pub async fn evaluate_judger(
                 format!(" votes=[{}]", rendered.join(", "))
             };
             Some(CriterionResult {
-                severity: crate::criteria::CriterionSeverity::Quality,
+                severity: crate::criteria::criterion_severity(criterion),
                 criterion: criterion.clone(),
                 passed,
                 detail: format!(
@@ -142,7 +147,7 @@ pub async fn evaluate_judger(
         }
         Err(e) => Some(CriterionResult {
             criterion: criterion.clone(),
-            severity: crate::criteria::CriterionSeverity::Quality,
+            severity: crate::criteria::criterion_severity(criterion),
             passed: false,
             detail: format!("judger call failed: {e}"),
             full_detail: None,

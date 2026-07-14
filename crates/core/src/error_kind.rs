@@ -668,6 +668,18 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     let lower = error_str.to_lowercase();
 
+    // A structured memory conflict is an intentional write guard, not a
+    // transport failure. Its repair is semantic (select/update the existing
+    // memory, or explicitly opt out when distinct), so retrying the same call
+    // can only repeat the conflict. Match this before generic retry words such
+    // as `network`/`timeout`: recovery layers may append those words to an
+    // already-produced tool result, and must not turn a deterministic conflict
+    // into a retryable outage by doing so.
+    if lower.contains("\"status\":\"conflict\"") && lower.contains("\"action_required\":\"update\"")
+    {
+        return ErrorKind::ToolInvalidArgs;
+    }
+
     if lower.contains("model selection is required")
         || lower.contains("missing model selection")
         || lower.contains("no concrete model was selected")
@@ -1371,6 +1383,14 @@ mod tests {
             ),
             ("", ErrorKind::Unknown),
             ("   \n\t  ", ErrorKind::Unknown),
+            (
+                r#"{"status":"conflict","action_required":"update","retry_hint":"retry remember only when distinct"}"#,
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                r#"{"status":"conflict","action_required":"update"}\n⚠ memory failed with a transient error (network/timeout)."#,
+                ErrorKind::ToolInvalidArgs,
+            ),
         ];
         for &(input, expected) in cases {
             assert_eq!(

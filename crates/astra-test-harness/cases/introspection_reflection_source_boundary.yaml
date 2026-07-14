@@ -1,0 +1,50 @@
+name: introspection_reflection_source_boundary
+description: |
+  **What**: In one real session, inspect live execution state and then reflect on durable
+  session evidence.
+  **Tests**: The agent can invoke both diagnostic tools, their calls are present in both the
+  CLI envelope and the persisted step-event trace, and the model is asked not to conflate a
+  fresh process snapshot with the session journal.
+  **Why**: `introspect` and `reflect` answer adjacent but different questions. Treating a
+  process-local zero as a durable-session zero hides history and produces misleading diagnosis.
+  **Pass means**: Both tools execute in order and their durable tool records are readable after
+  the turn; the reply distinguishes live-process evidence from durable-session evidence.
+  **Fail means**: Either diagnostic path is unavailable, its journal projection is missing, or
+  the model collapses the two evidence scopes into one claim.
+prompt: |
+  Do exactly two read-only diagnostic tool calls, in this order:
+
+  1. Call `introspect` with topic `execution`, facet `trace`, and depth `diagnostic`.
+  2. Call `reflect` with topic `execution`, facet `tools`, and depth `diagnostic`.
+
+  Then give a concise answer that explicitly distinguishes live-process evidence from
+  durable-session evidence. Do not say their counts are identical unless the tool outputs
+  establish that. Do not call any other tool.
+capability: "custom:diagnostic_observability"
+difficulty: 4
+weight: 2.0
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_sequence
+    tools: [introspect, reflect]
+  - type: tools_count_between
+    min: 2
+    max: 2
+  - type: journal_tool_called
+    name: introspect
+  - type: journal_tool_called
+    name: reflect
+  - type: session_event_count
+    event_type: ToolCallCompleted
+    min: 2
+  - type: judger
+    question: |
+      Did the response accurately distinguish the scopes of the two diagnostics?
+      `introspect` is allowed to report only the current process/runtime, while `reflect`
+      may inspect durable session artifacts. Score 1.0 only when the answer states that
+      distinction without inventing equivalence; 0.5 when it is vague but not misleading;
+      0.0 when it asserts a false equivalence or fabricates evidence.
+    threshold: 0.8

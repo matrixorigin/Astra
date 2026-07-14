@@ -667,7 +667,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory evidence. Recall is advisory; correct or delete by stable ID.",
+                "description": "Memory evidence. Recall is advisory. Copy exact returned memory_id; never invent it. Update by query without ID.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -678,7 +678,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "content": {"type": "string", "description": "Fact to store or replacement content."},
                         "query": {"type": "string", "description": "Search query or update selector."},
-                        "memory_id": {"type": "string", "description": "Stable recalled ID for precise update, feedback, expand, or forget."},
+                        "memory_id": {"type": "string", "description": "Exact opaque ID from recall, evidence, inventory, or conflict; never invent."},
                         "memory_type": {
                             "type": "string",
                             "enum": ["semantic","profile","procedural","working","episodic"],

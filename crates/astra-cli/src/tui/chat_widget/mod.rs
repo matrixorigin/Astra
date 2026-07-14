@@ -6807,7 +6807,9 @@ mod tests {
             },
         })));
 
-        let rows = widget.agent_monitor_snapshot(0);
+        // Keep the just-completed first run alongside the still-live second
+        // run. `0` intentionally means active/uncertain rows only.
+        let rows = widget.agent_monitor_snapshot(1);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|row| {
             row.run_id.as_deref() == Some("run-one")

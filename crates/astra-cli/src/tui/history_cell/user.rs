@@ -67,7 +67,7 @@ impl UserCell {
 }
 
 impl HistoryCell for UserCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default().fg(if theme.is_light {
@@ -79,7 +79,10 @@ impl HistoryCell for UserCell {
         // The transcript separator intentionally gives UserCell no extra
         // blank line. Keep its compact, symmetric breathing room here so the
         // visual boundary survives both live rendering and persisted replay.
-        let blank_row = || Line::from(Span::raw(" ".repeat(usize::from(width.max(1))))).style(bg);
+        // Background ownership is semantic metadata on the Line. Encoding a
+        // viewport-sized blank row as spaces would leave a real terminal in
+        // auto-wrap pending state at the right edge.
+        let blank_row = || Line::default().style(bg);
         let mut lines: Vec<Line<'static>> = vec![blank_row()];
 
         if self.text.is_empty() {
@@ -258,14 +261,21 @@ mod tests {
         assert_eq!(lines.len(), 4);
         let expected = crate::tui::style::user_message_style().bg;
         assert!(lines.iter().all(|line| line.style.bg == expected));
+        assert_eq!(
+            lines[0].width(),
+            0,
+            "breathing rows must not encode the viewport width as spaces"
+        );
+        assert_eq!(lines[3].width(), 0);
     }
 
     #[test]
     fn user_input_surface_spans_the_full_rendered_width_with_breathing_rows() {
         let width = 48;
         let cell = UserCell::new("review these changes");
-        let paragraph = ratatui::widgets::Paragraph::new(cell.display_lines(width))
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let paragraph =
+            crate::tui::render::line_utils::FullRowParagraph::new(cell.display_lines(width))
+                .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 3);
         let expected = crate::tui::style::user_message_style()
             .bg

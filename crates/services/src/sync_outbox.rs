@@ -26,6 +26,11 @@ pub const SYNC_OUTBOX_IN_FLIGHT_LEASE_MS: u64 = 5 * 60 * 1000;
 pub const SYNC_OUTBOX_ACKED_RETAINED_RECORDS: usize = 128;
 pub const SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS: usize = 4096;
 pub const SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS: usize = 128;
+/// Backlog level at which the outbox reports explicit degraded health. This is
+/// intentionally a high-water mark, not an eviction limit: the canonical
+/// journal and its at-least-once projection must never lose events merely
+/// because cloud delivery is slow or unavailable.
+pub const SYNC_OUTBOX_PENDING_HIGH_WATERMARK: usize = 8192;
 const SYNC_OUTBOX_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_OUTBOX_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -203,6 +208,12 @@ pub struct SyncOutboxStatus {
     pub skipped: u64,
     pub poisoned: u64,
     pub retry_deferred: u64,
+    /// Configured soft backlog threshold. Crossing it is visible degradation,
+    /// not permission to delete or reject canonical events.
+    #[serde(default)]
+    pub pending_high_watermark: u64,
+    #[serde(default)]
+    pub pending_high_watermark_exceeded: bool,
     pub ack_watermark: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_created_at_unix_ms: Option<u64>,
@@ -1018,6 +1029,7 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
         ack_watermark: state.ack_watermark,
         ack_tombstones: state.acked_tombstones.len() as u64,
         skipped: state.skipped_records.len() as u64,
+        pending_high_watermark: SYNC_OUTBOX_PENDING_HIGH_WATERMARK as u64,
         last_skipped_reason: state
             .skipped_records
             .last()
@@ -1077,10 +1089,13 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
             status.last_error = record.last_error.clone();
         }
     }
+    let open_backlog = status.pending.saturating_add(status.in_flight);
+    status.pending_high_watermark_exceeded = open_backlog > status.pending_high_watermark;
     status.degraded = status.poisoned > 0
         || status.retry_deferred > 0
         || status.stale_in_flight > 0
-        || status.skipped > 0;
+        || status.skipped > 0
+        || status.pending_high_watermark_exceeded;
     status
 }
 
@@ -1314,6 +1329,31 @@ mod tests {
         let status = store.status().expect("status after batch enqueue");
         assert_eq!(status.total, 2);
         assert_eq!(status.pending, 2);
+    }
+
+    #[test]
+    fn pending_high_watermark_degrades_health_without_discarding_records() {
+        let template = build_record(&event("backlog"), 1, 100).unwrap();
+        let state = SyncOutboxFile {
+            records: (0..=SYNC_OUTBOX_PENDING_HIGH_WATERMARK)
+                .map(|index| {
+                    let mut record = template.clone();
+                    record.sequence = index as u64 + 1;
+                    record.record_id = format!("record-{index}");
+                    record
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let status = status_from_state(&state, 100);
+        assert_eq!(
+            status.pending,
+            SYNC_OUTBOX_PENDING_HIGH_WATERMARK as u64 + 1
+        );
+        assert!(status.pending_high_watermark_exceeded);
+        assert!(status.degraded);
+        assert_eq!(state.records.len(), SYNC_OUTBOX_PENDING_HIGH_WATERMARK + 1);
     }
 
     #[test]

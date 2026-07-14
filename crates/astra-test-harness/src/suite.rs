@@ -312,54 +312,30 @@ impl<'a> SuiteRunner<'a> {
         }
 
         // Run setup command if specified. Non-zero exit aborts the case.
-        if let Some(ref cmd) = case.setup_cmd {
-            let mut setup_cmd = tokio::process::Command::new("sh");
-            if let Some(ref wd) = self.runner_cfg.working_dir {
-                setup_cmd.current_dir(wd);
-            }
-            setup_cmd.arg("-c").arg(cmd).kill_on_drop(true);
-            let status = tokio::time::timeout(Duration::from_secs(30), setup_cmd.status()).await;
-            let failed = match status {
-                Ok(Ok(s)) => !s.success(),
-                Ok(Err(_)) => true,
-                Err(_) => {
-                    eprintln!(
-                        "[astra-test] setup_cmd timed out (30s) for case={}",
-                        case.name
-                    );
-                    true
-                }
+        if let Some(ref cmd) = case.setup_cmd
+            && let Err(error) = self.run_shell_hook("setup_cmd", case, cmd).await
+        {
+            eprintln!("[astra-test] {error}");
+            return CaseRunReport {
+                case_name: case.name.clone(),
+                model: model.to_string(),
+                passed: false,
+                run_index: 0,
+                capability: case.capability.clone(),
+                weight: case.weight,
+                difficulty: case.difficulty,
+                outcome: RunOutcome::new(model)
+                    .with_text("setup_cmd failed")
+                    .with_stderr(format!("[astra-test] {error}")),
+                criteria: vec![],
+                steps: vec![],
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+                failure_class: Some(crate::classify::FailureClass::PlatformSetupFailed),
+                has_warnings: false,
             };
-            if failed {
-                let exit = status
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1);
-                eprintln!(
-                    "[astra-test] setup_cmd failed for case={}; aborting (exit {})",
-                    case.name, exit
-                );
-                return CaseRunReport {
-                    case_name: case.name.clone(),
-                    model: model.to_string(),
-                    passed: false,
-                    run_index: 0,
-                    capability: case.capability.clone(),
-                    weight: case.weight,
-                    difficulty: case.difficulty,
-                    outcome: RunOutcome::new(model)
-                        .with_text(format!("setup_cmd failed: exit {exit}")),
-                    criteria: vec![],
-                    steps: vec![],
-                    session: None,
-                    reproducer: None,
-                    digest: None,
-                    digest_error: None,
-                    failure_class: Some(crate::classify::FailureClass::PlatformSetupFailed),
-                    has_warnings: false,
-                };
-            }
         }
 
         let mut outcome = self.executor.execute(case, model).await;
@@ -400,15 +376,49 @@ impl<'a> SuiteRunner<'a> {
                     env: case.env.clone(),
                     setup_cmd: None,
                     teardown_cmd: None,
+                    cleanup_memory_records: false,
                 };
                 let step_outcome = self.executor.execute(&step_case, model).await;
 
                 // Evaluate step-level criteria against this step's outcome.
-                let step_criteria_results = if !step.criteria.is_empty() {
+                let mut step_criteria_results = if !step.criteria.is_empty() {
                     evaluate_deterministic_with_session(&step.criteria, &step_outcome, None)
                 } else {
                     vec![]
                 };
+                // Step criteria are first-class assertions. In particular, a
+                // required judger on the final step must be evaluated rather
+                // than left as the deterministic placeholder (which would
+                // otherwise make every hard_judger step fail regardless of
+                // the model's actual result).
+                if !self.no_judger {
+                    for (criterion_index, criterion) in step.criteria.iter().enumerate() {
+                        if matches!(
+                            criterion,
+                            Criterion::Judger { .. } | Criterion::HardJudger { .. }
+                        ) && let Some(result) =
+                            evaluate_judger(self.judger, criterion, &step_outcome).await
+                        {
+                            step_criteria_results[criterion_index] = result;
+                        }
+                    }
+                } else {
+                    for (criterion_index, criterion) in step.criteria.iter().enumerate() {
+                        match criterion {
+                            Criterion::Judger { .. } => {
+                                step_criteria_results[criterion_index].passed = true;
+                                step_criteria_results[criterion_index].detail =
+                                    "judger skipped (--no-judger)".into();
+                            }
+                            Criterion::HardJudger { .. } => {
+                                step_criteria_results[criterion_index].passed = false;
+                                step_criteria_results[criterion_index].detail =
+                                    "required judger unavailable (--no-judger)".into();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let step_passed = step_criteria_results
                     .iter()
                     .filter(|r| r.severity == CriterionSeverity::Hard)
@@ -469,7 +479,7 @@ impl<'a> SuiteRunner<'a> {
         }
 
         // Load session.
-        let session = if self.session_mode.should_load(case) {
+        let session = if self.session_mode.should_load(case) || case.cleanup_memory_records {
             outcome
                 .session_id
                 .as_deref()
@@ -485,7 +495,7 @@ impl<'a> SuiteRunner<'a> {
         if !self.no_judger
             && !criteria
                 .iter()
-                .any(|c| matches!(c, Criterion::Judger { .. }))
+                .any(|c| matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. }))
         {
             let question = if case.steps.is_empty() {
                 let preview: String = case.prompt.trim().chars().take(500).collect();
@@ -519,7 +529,7 @@ impl<'a> SuiteRunner<'a> {
         // score is useful for diagnostics even when Hard criteria fail.
         if !self.no_judger {
             for (i, c) in criteria.iter().enumerate() {
-                if let Criterion::Judger { .. } = c
+                if matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. })
                     && let Some(res) = evaluate_judger(self.judger, c, &outcome).await
                 {
                     det[i] = res;
@@ -527,9 +537,16 @@ impl<'a> SuiteRunner<'a> {
             }
         } else {
             for (i, c) in criteria.iter().enumerate() {
-                if let Criterion::Judger { .. } = c {
-                    det[i].passed = true;
-                    det[i].detail = "judger skipped (--no-judger)".into();
+                match c {
+                    Criterion::Judger { .. } => {
+                        det[i].passed = true;
+                        det[i].detail = "judger skipped (--no-judger)".into();
+                    }
+                    Criterion::HardJudger { .. } => {
+                        det[i].passed = false;
+                        det[i].detail = "required judger unavailable (--no-judger)".into();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -543,10 +560,10 @@ impl<'a> SuiteRunner<'a> {
             .filter(|c| c.severity == crate::criteria::CriterionSeverity::Hard)
             .all(|c| c.passed);
         let all_passed = det.iter().all(|c| c.passed) && steps_passed;
-        let passed = hard_passed && steps_passed;
+        let product_passed = hard_passed && steps_passed;
 
         // Classify failure.
-        let failure_class = if !passed {
+        let product_failure_class = if !product_passed {
             Some(classify(&outcome, &det))
         } else {
             None
@@ -558,7 +575,7 @@ impl<'a> SuiteRunner<'a> {
         };
 
         // Digest on FAIL.
-        let (digest, digest_error) = if !passed
+        let (digest, digest_error) = if !product_passed
             && let Some(collector) = self.digest_collector
             && let Some(sid) = outcome.session_id.as_deref()
         {
@@ -574,28 +591,34 @@ impl<'a> SuiteRunner<'a> {
         // still verify artifacts (files, DB state) created during the
         // case. Previously teardown ran before the judger, destroying
         // evidence that the judger tried to independently verify.
-        if let Some(ref cmd) = case.teardown_cmd {
-            let mut teardown_cmd = tokio::process::Command::new("sh");
-            if let Some(ref wd) = self.runner_cfg.working_dir {
-                teardown_cmd.current_dir(wd);
+        let teardown_error = if let Some(ref cmd) = case.teardown_cmd {
+            self.run_shell_hook("teardown_cmd", case, cmd).await.err()
+        } else {
+            None
+        };
+        let mut cleanup_errors: Vec<String> = teardown_error.into_iter().collect();
+        cleanup_errors.extend(
+            self.cleanup_session_owned_memories(case, session.as_ref())
+                .await,
+        );
+        for error in &cleanup_errors {
+            if !outcome.stderr.is_empty() {
+                outcome.stderr.push('\n');
             }
-            teardown_cmd.arg("-c").arg(cmd).kill_on_drop(true);
-            match tokio::time::timeout(Duration::from_secs(30), teardown_cmd.status()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "[astra-test] teardown_cmd error for case={}: {e}",
-                        case.name
-                    );
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[astra-test] teardown_cmd timed out (30s) for case={}, continuing",
-                        case.name
-                    );
-                }
-            }
+            outcome.stderr.push_str("[astra-test] ");
+            outcome.stderr.push_str(error);
         }
+
+        // A run whose cleanup did not complete cannot certify its result: it
+        // may contaminate every later case. Keep the product criteria intact
+        // in the report, but make the harness failure explicit rather than
+        // presenting a green result with an easily missed warning.
+        let passed = product_passed && cleanup_errors.is_empty();
+        let failure_class = if cleanup_errors.is_empty() {
+            product_failure_class
+        } else {
+            Some(FailureClass::HarnessCleanupFailed)
+        };
 
         // Progress: emit per-case result to stderr so long runs show
         // streaming progress even when stdout is buffered.
@@ -624,6 +647,101 @@ impl<'a> SuiteRunner<'a> {
             digest_error,
             failure_class,
             has_warnings: passed && !all_passed,
+        }
+    }
+
+    /// Remove records that a case created, using only structured session
+    /// evidence and the normal user-authorized CLI path. Never use a topic
+    /// purge here: a topic can overlap concurrent cases or user data.
+    async fn cleanup_session_owned_memories(
+        &self,
+        case: &Case,
+        session: Option<&SessionCapture>,
+    ) -> Vec<String> {
+        if !case.cleanup_memory_records {
+            return Vec::new();
+        }
+        let Some(session) = session else {
+            return vec![format!(
+                "memory cleanup unavailable for case={}: no session capture",
+                case.name
+            )];
+        };
+        if session.skipped_lines != 0 || session.dropped_lines != 0 {
+            return vec![format!(
+                "memory cleanup unavailable for case={}: session capture is incomplete (skipped_lines={}, dropped_lines={})",
+                case.name, session.skipped_lines, session.dropped_lines
+            )];
+        }
+
+        let mut errors = Vec::new();
+        for memory_id in session.created_memory_ids() {
+            let mut command = tokio::process::Command::new(&self.runner_cfg.astra_bin);
+            if let Some(profile) = &self.runner_cfg.profile {
+                command.arg("--profile").arg(profile);
+            }
+            if let Some(working_dir) = &self.runner_cfg.working_dir {
+                command.current_dir(working_dir);
+            }
+            command
+                .arg("memory")
+                .arg("forget")
+                .arg(&memory_id)
+                .arg("--reason")
+                .arg(format!("Astra harness cleanup for case {}", case.name))
+                .kill_on_drop(true);
+            match tokio::time::timeout(Duration::from_secs(30), command.output()).await {
+                Ok(Ok(output)) if output.status.success() => {}
+                Ok(Ok(output)) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    errors.push(format!(
+                        "memory cleanup failed for case={} memory_id={} status={}: {}",
+                        case.name,
+                        memory_id,
+                        output.status,
+                        if stderr.is_empty() {
+                            "no stderr"
+                        } else {
+                            &stderr
+                        }
+                    ));
+                }
+                Ok(Err(error)) => errors.push(format!(
+                    "memory cleanup error for case={} memory_id={}: {error}",
+                    case.name, memory_id
+                )),
+                Err(_) => errors.push(format!(
+                    "memory cleanup timed out after 30s for case={} memory_id={}",
+                    case.name, memory_id
+                )),
+            }
+        }
+        errors
+    }
+
+    /// Execute a case setup/teardown hook without losing the command's first
+    /// failure or its diagnostic output. Hooks are part of test validity, not
+    /// best-effort convenience: `sh -e` prevents a later successful command
+    /// from masking an earlier failed cleanup/setup operation.
+    async fn run_shell_hook(&self, hook: &str, case: &Case, script: &str) -> Result<(), String> {
+        let mut command = tokio::process::Command::new("sh");
+        if let Some(working_dir) = &self.runner_cfg.working_dir {
+            command.current_dir(working_dir);
+        }
+        command.arg("-e").arg("-c").arg(script).kill_on_drop(true);
+        match tokio::time::timeout(Duration::from_secs(30), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = hook_output_detail(&stderr, &stdout);
+                Err(format!(
+                    "{hook} failed for case={} with status={}: {detail}",
+                    case.name, output.status
+                ))
+            }
+            Ok(Err(error)) => Err(format!("{hook} error for case={}: {error}", case.name)),
+            Err(_) => Err(format!("{hook} timed out after 30s for case={}", case.name)),
         }
     }
 
@@ -679,6 +797,24 @@ impl<'a> SuiteRunner<'a> {
     }
 }
 
+fn hook_output_detail(stderr: &str, stdout: &str) -> String {
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    }
+    .trim();
+    if text.is_empty() {
+        return "no command output".into();
+    }
+    const MAX_CHARS: usize = 4_000;
+    let mut clipped: String = text.chars().take(MAX_CHARS).collect();
+    if text.chars().count() > MAX_CHARS {
+        clipped.push_str("… [truncated]");
+    }
+    clipped
+}
+
 fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
     let s = &outcome.stderr;
     s.contains("Too many requests")
@@ -718,6 +854,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         }
     }
 
@@ -1028,6 +1165,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_judger_cannot_pass_a_required_judger() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", outcome_ok("m", "hello", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let case = case_with(
+            "c1",
+            vec![Criterion::HardJudger {
+                question: "did the required side effect succeed?".into(),
+                threshold: 0.7,
+                model: None,
+            }],
+        );
+
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.failed(), 1);
+        assert!(
+            report.runs[0].criteria[0]
+                .detail
+                .contains("required judger unavailable")
+        );
+    }
+
+    #[tokio::test]
     async fn skips_case_when_no_model_source() {
         let exec = FakeExecutor::new();
         let judger = FixedJudger { score: 1.0 };
@@ -1106,6 +1281,7 @@ mod tests {
                     journal_path: PathBuf::from("/fake"),
                     events: vec![],
                     skipped_lines: 0,
+                    dropped_lines: 0,
                 })
             }
         }
@@ -1152,7 +1328,7 @@ mod tests {
             cancel_flag: None,
         };
         let mut case = case_with("c1", vec![]);
-        case.setup_cmd = Some("exit 1".into());
+        case.setup_cmd = Some("false\nprintf 'must-not-run\\n'".into());
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
         assert!(
@@ -1164,11 +1340,126 @@ mod tests {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         );
         assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("setup_cmd failed for case=c1"),
+            "the artifact must retain setup diagnostics"
+        );
+        assert!(
             exec.calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
             "executor must NOT be called when setup fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_cmd_failure_fails_the_harness_run() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", outcome_ok("m", "text", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("c1", vec![]);
+        case.teardown_cmd = Some("false\ntrue".into());
+
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        assert!(
+            !report.runs[0].passed,
+            "a contaminated environment must not be reported as a passing harness run"
+        );
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(FailureClass::HarnessCleanupFailed)
+        );
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("teardown_cmd failed for case=c1"),
+            "the persisted artifact must retain the cleanup failure reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_cleanup_uses_only_the_current_sessions_store_record() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("cleanup-args.txt");
+        let shim = dir.path().join("astra-cleanup-shim");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).unwrap();
+
+        let exec = FakeExecutor::new();
+        exec.seed("cleanup", "m", outcome_ok("m", "text", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        struct StoreLoader;
+        impl SessionLoader for StoreLoader {
+            fn load(&self, session_id: &str) -> Option<SessionCapture> {
+                Some(SessionCapture {
+                    session_id: session_id.to_string(),
+                    journal_path: PathBuf::from("/fake"),
+                    skipped_lines: 0,
+                    dropped_lines: 0,
+                    events: vec![crate::session_capture::JournalEvent {
+                        event_type: "ToolCallCompleted".into(),
+                        raw: serde_json::json!({"payload": {
+                            "tool_name": "memory", "is_error": false,
+                            "output": format!(
+                                r#"{{"memory_id":"created-by-case","session_id":"{}","created_at":null,"retrieval_score":null}}"#,
+                                session_id
+                            )
+                        }}),
+                    }],
+                })
+            }
+        }
+        let loader = StoreLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(shim).with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("cleanup", vec![]);
+        case.cleanup_memory_records = true;
+
+        let report = runner.run_all(&[case]).await;
+        assert!(report.runs[0].passed, "{:#?}", report.runs[0]);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "memory\nforget\ncreated-by-case\n--reason\nAstra harness cleanup for case cleanup\n"
         );
     }
 
@@ -1255,6 +1546,49 @@ mod tests {
         assert!(!report.runs[0].steps[0].passed);
         assert_eq!(report.runs[0].steps[0].criteria.len(), 1);
         assert!(!report.runs[0].steps[0].criteria[0].passed);
+    }
+
+    #[tokio::test]
+    async fn required_step_judger_is_evaluated_not_left_as_a_placeholder() {
+        let exec = FakeExecutor::new();
+        exec.seed("mt", "m", outcome_ok("m", "step0-text", &[]));
+        exec.seed(
+            "mt__step0",
+            "m",
+            outcome_ok("m", "purge confirmed", &["memory"]),
+        );
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: false,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("mt", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "purge the record".into(),
+            criteria: vec![Criterion::HardJudger {
+                question: "did the purge succeed?".into(),
+                threshold: 0.7,
+                model: None,
+            }],
+            timeout_seconds: None,
+        }];
+
+        let report = runner.run_all(&[case]).await;
+        assert!(report.runs[0].passed, "{:#?}", report.runs[0]);
+        assert!(report.runs[0].steps[0].criteria[0].passed);
+        assert_eq!(report.runs[0].steps[0].criteria[0].score, Some(1.0));
     }
 
     #[tokio::test]

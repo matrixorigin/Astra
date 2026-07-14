@@ -1617,11 +1617,62 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(e);
         }
         AgenticIngestIterationControl::BreakLoop => {
-            // Final-answer relevance is evaluated post-mortem only. Runtime
-            // must not act as a semantic judge that deletes a model answer,
-            // injects a synthetic retry prompt, or terminates with a synthetic
-            // interruption. If the answer is imperfect, preserve it and let
-            // the next user turn correct course.
+            // Reconcile durable unfinished-work evidence once before accepting
+            // a candidate final answer. This is independent of task type and
+            // mutation heuristics, but respects the board's domain semantics:
+            // only claimed, dependency-free work is currently actionable;
+            // queued or blocked work is evidence, not a completion gate. The
+            // candidate is preserved so a failed/empty follow-up cannot erase
+            // useful output.
+            // The snapshot was refreshed immediately before this LLM call.
+            // A text-only BreakLoop cannot have changed the board, so a second
+            // store read here would only add latency/failure exposure to the
+            // final-answer path.
+            let board = &state.hooks.task_board_snapshot;
+            let should_reconcile_completion = board.reconcilable_in_progress_count > 0
+                && state.hooks.completion_settlement.reconciliation_attempts == 0
+                && state.remaining_turns > 0
+                && state.interruption.is_none();
+            if should_reconcile_completion {
+                state.hooks.completion_settlement.reconciliation_attempts = 1;
+                if !state.final_text.trim().is_empty() {
+                    state
+                        .hooks
+                        .completion_settlement
+                        .deferred_candidate_text
+                        .get_or_insert_with(|| state.final_text.clone());
+                }
+                let summary = board.short_summary();
+                let active_tasks = board.active_tasks.clone();
+                state.push_volatile_payload(
+                    super::host::VolatileKind::TaskBoardAdvisory,
+                    serde_json::json!({
+                        "schema": "task_board_settlement.v1",
+                        "signal": "candidate_answer_with_unfinished_work",
+                        "evidence": {
+                            "summary": summary,
+                            "active_tasks": active_tasks,
+                        },
+                        "instruction": "Reconcile the tracked work once before ending. The candidate answer is preserved. If work is complete, update its durable task state. If work remains and can proceed within the user's authority, continue it. Otherwise preserve the open state and report concrete evidence or a concrete blocker. Do not ask the user to choose a next step merely because tracked work remains, and do not repeat the preserved candidate answer unless correcting it.",
+                        "authority": "single_soft_reconciliation",
+                    }),
+                );
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("task_board_reconcile"),
+                );
+                state.step_recorder.end_turn(false);
+                state.final_text.clear();
+                state.final_text_streamed = false;
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
+            // Outside the single bounded reconciliation above, unfinished
+            // state remains visible settlement evidence. It cannot create an
+            // unbounded retry loop or suppress the best answer we already have.
 
             // Record the LLM round even for text-only responses (no tool calls).
             // Without this, simple Q&A turns have llm_rounds=0 in the

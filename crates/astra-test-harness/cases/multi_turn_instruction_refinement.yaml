@@ -16,6 +16,7 @@ capability: instruction_following
 difficulty: 3
 weight: 2.0
 timeout_seconds: 180
+cleanup_memory_records: true
 steps:
   - prompt: "Now change it to return a String instead of printing, and add a /// doc comment above it. Show the updated version in a code block. Don't create any files."
     criteria:
@@ -27,11 +28,6 @@ steps:
     criteria:
       - type: tool_called
         name: memory
-teardown_cmd: |
-  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
-    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
-    -H "Content-Type: application/json" \
-    -d '{"topic":"doc comments","reason":"harness teardown"}' 2>/dev/null || true
 criteria:
   - type: exit_code
     code: 0

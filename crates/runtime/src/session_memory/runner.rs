@@ -1029,12 +1029,21 @@ async fn update_memory_with_llm(
             detail: None,
         });
     }
-    let patch = parse_session_narrative_patch(content).map_err(|error| LlmExtractionFailure {
-        reason: SessionMemoryExtractionErrorReason::LlmError,
-        detail: Some(summarize_llm_detail(&format!(
-            "invalid session-memory patch: {error}"
-        ))),
-    })?;
+    let (patch, normalized_scalar_lists) =
+        parse_session_narrative_patch(content).map_err(|error| LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: Some(summarize_llm_detail(&format!(
+                "invalid session-memory patch: {error}"
+            ))),
+        })?;
+    if !normalized_scalar_lists.is_empty() {
+        tracing::warn!(
+            target: "astra_runtime::session_memory",
+            selector_model = %params.model_name,
+            fields = %normalized_scalar_lists.join(","),
+            "normalized scalar session-memory fields to singleton lists"
+        );
+    }
     if patch.is_empty() {
         return Err(LlmExtractionFailure {
             reason: SessionMemoryExtractionErrorReason::EmptyResponse,
@@ -1051,7 +1060,9 @@ async fn update_memory_with_llm(
     Ok(snapshot.to_markdown())
 }
 
-fn parse_session_narrative_patch(raw: &str) -> Result<SessionNarrativePatch, serde_json::Error> {
+fn parse_session_narrative_patch(
+    raw: &str,
+) -> Result<(SessionNarrativePatch, Vec<&'static str>), serde_json::Error> {
     let trimmed = raw.trim();
     let json = trimmed
         .strip_prefix("```json")
@@ -1059,7 +1070,25 @@ fn parse_session_narrative_patch(raw: &str) -> Result<SessionNarrativePatch, ser
         .and_then(|body| body.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    serde_json::from_str(json)
+    let mut value = serde_json::from_str::<Value>(json)?;
+    let mut normalized_scalar_lists = Vec::new();
+    if let Some(object) = value.as_object_mut() {
+        for field in [
+            "current_state",
+            "active_goals",
+            "pending_todos",
+            "corrections",
+            "learnings",
+        ] {
+            if object.get(field).is_some_and(Value::is_string)
+                && let Some(scalar) = object.remove(field)
+            {
+                object.insert(field.to_string(), Value::Array(vec![scalar]));
+                normalized_scalar_lists.push(field);
+            }
+        }
+    }
+    serde_json::from_value(value).map(|patch| (patch, normalized_scalar_lists))
 }
 
 fn summarize_llm_detail(text: &str) -> String {
@@ -1946,6 +1975,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_extraction_normalizes_realistic_scalar_list_response_without_fallback() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"current_state\":\"review complete; awaiting verification\"}"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-scalar-selector",
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("review complete; awaiting verification"));
+            }
+            _ => panic!("expected normalized LLM persistence without rule fallback"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn run_extraction_selector_prompt_keeps_user_corrections_as_evidence() {
         let (server_url, server_handle) = spawn_json_server(
             Arc::new(|request: &str| {
@@ -2707,7 +2787,8 @@ mod tests {
         let patch = parse_session_narrative_patch(
             r#"{"current_state":["typed lane is wired"],"pending_todos":[]}"#,
         )
-        .expect("valid sparse patch");
+        .expect("valid sparse patch")
+        .0;
 
         snapshot.narrative.apply_patch(patch);
         let canonical = snapshot.to_markdown();
@@ -2724,8 +2805,26 @@ mod tests {
         assert!(
             parse_session_narrative_patch("{}")
                 .expect("empty JSON object is structurally valid")
+                .0
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn narrative_patch_normalizes_scalar_list_fields_but_keeps_strict_types() {
+        let (patch, normalized) = parse_session_narrative_patch(
+            r#"{"current_state":"review complete","pending_todos":"verify online"}"#,
+        )
+        .expect("scalar strings are losslessly normalizable");
+
+        assert_eq!(
+            patch.current_state,
+            Some(vec!["review complete".to_string()])
+        );
+        assert_eq!(patch.pending_todos, Some(vec!["verify online".to_string()]));
+        assert_eq!(normalized, vec!["current_state", "pending_todos"]);
+        assert!(parse_session_narrative_patch(r#"{"current_state":42}"#).is_err());
+        assert!(parse_session_narrative_patch(r#"{"current_state":["valid",42]}"#).is_err());
     }
 
     #[test]

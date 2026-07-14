@@ -1662,6 +1662,8 @@ fn apply_in_memory_status_transition(
     error_message: Option<&str>,
     terminal_error_code: Option<&str>,
 ) -> Result<(), String> {
+    ensure_terminal_status_immutable(run, status)?;
+
     sync_in_memory_execution_slot(slots, run, status, waiting_for)?;
     run.status = status.to_string();
     run.waiting_for = waiting_for.map(ToString::to_string);
@@ -1672,6 +1674,22 @@ fn apply_in_memory_status_transition(
         run.error_code = Some(code.to_string());
     }
     run.updated_at = chrono::Utc::now().to_rfc3339();
+    Ok(())
+}
+
+/// Enforce one terminal-state contract across in-memory and database stores.
+/// Same-status replay remains idempotent; changing a terminal fact does not.
+fn ensure_terminal_status_immutable(
+    run: &DurableRunRecord,
+    requested_status: &str,
+) -> Result<(), String> {
+    let current_status = run.status.as_str();
+    if durable_run_status_is_terminal(current_status) && requested_status != current_status {
+        return Err(format!(
+            "terminal state immutability violated: run {} is already {}, cannot transition to {}",
+            run.run_id, current_status, requested_status
+        ));
+    }
     Ok(())
 }
 
@@ -4094,6 +4112,17 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
+        if let Err(error) = ensure_terminal_status_immutable(&run, status) {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "update_run_status_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -4182,6 +4211,19 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
+        if expected_statuses.contains(&run.status.as_str())
+            && let Err(error) = ensure_terminal_status_immutable(&run, status)
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "update_run_status_if_current_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -4290,6 +4332,19 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
+        if expected_statuses.contains(&run.status.as_str())
+            && let Err(error) = ensure_terminal_status_immutable(&run, status)
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_event_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
         let session_id = run.session_id.clone();
         let agent_id = run.agent_id.clone();
         let last_event_idx = run.last_event_idx;
@@ -4502,6 +4557,19 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(GuardedRunStatusTransition::StatusConflict);
         }
+        if expected_statuses.contains(&run.status.as_str())
+            && let Err(error) = ensure_terminal_status_immutable(&run, status)
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
         let last_event_idx = run.last_event_idx;
         let event_idx = last_event_idx + 1;
 
@@ -4689,6 +4757,19 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
+        if expected_statuses.contains(&run.status.as_str())
+            && let Err(error) = ensure_terminal_status_immutable(&run, status)
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_terminal_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Err(error);
+        }
         let session_id = run.session_id.clone();
         let agent_id = run.agent_id.clone();
         let last_event_idx = run.last_event_idx;
@@ -4943,12 +5024,17 @@ impl RunStateStore for DatabaseRunStateStore {
         let result = sqlx::query(
             "UPDATE agent_runs
              SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND run_id = ? AND status NOT IN ('completed', 'failed')",
+             WHERE user_id = ? AND run_id = ?
+               AND status NOT IN (?, ?, ?, ?)",
         )
         .bind(&checkpoint_version)
         .bind(checkpoint_json)
         .bind(user_id)
         .bind(run_id)
+        .bind(STATUS_COMPLETED)
+        .bind(STATUS_DELEGATED)
+        .bind(STATUS_FAILED)
+        .bind(STATUS_CANCELLED)
         .execute(&mut *tx)
         .await
         .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
@@ -8033,6 +8119,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_memory_terminal_status_is_immutable_including_delegated() {
+        for terminal in [
+            STATUS_COMPLETED,
+            STATUS_DELEGATED,
+            STATUS_FAILED,
+            STATUS_CANCELLED,
+        ] {
+            let mut slots = std::collections::HashMap::new();
+            let mut run = durable_run_record(&format!("{terminal}-terminal"));
+            run.status = terminal.into();
+
+            apply_in_memory_status_transition(&mut slots, &mut run, terminal, None, None, None)
+                .expect("idempotent terminal replay must succeed");
+            let error = apply_in_memory_status_transition(
+                &mut slots,
+                &mut run,
+                STATUS_RUNNING,
+                None,
+                None,
+                None,
+            )
+            .expect_err("terminal run must not resurrect");
+            assert!(error.contains("terminal state immutability violated"));
+            assert_eq!(run.status, terminal);
+        }
+
+        let mut active = durable_run_record("active");
+        ensure_terminal_status_immutable(&active, STATUS_COMPLETED)
+            .expect("non-terminal runs remain transitionable");
+        active.status = STATUS_WAITING.into();
+        ensure_terminal_status_immutable(&active, STATUS_FAILED)
+            .expect("waiting recovery can still settle terminally");
+    }
+
     #[tokio::test]
     async fn in_memory_store_allows_new_root_run_when_existing_run_is_paused_without_waiting() {
         let store = InMemoryRunStateStore::new();
@@ -8672,6 +8793,137 @@ mod tests {
         for run_id in [&active_id, &delegated_id, &completed_id] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_state_is_immutable_across_all_transition_paths() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-terminal-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-terminal-session-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-terminal-run-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert terminal fixture");
+        assert!(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    STATUS_DELEGATED,
+                    None,
+                    None,
+                )
+                .await
+                .expect("settle fixture as delegated")
+        );
+
+        let assert_terminal_conflict = |error: String| {
+            assert!(
+                error.contains("terminal state immutability violated"),
+                "unexpected transition error: {error}"
+            );
+        };
+        assert_terminal_conflict(
+            store
+                .update_run_status(&user_id, &run_id, STATUS_RUNNING, None, None)
+                .await
+                .expect_err("unguarded transition must not resurrect a terminal run"),
+        );
+        assert_terminal_conflict(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_DELEGATED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("CAS transition must not resurrect a terminal run"),
+        );
+        assert_terminal_conflict(
+            store
+                .update_run_status_with_event_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_DELEGATED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    make_event("run_resumed", json!({})),
+                )
+                .await
+                .expect_err("event transition must not resurrect a terminal run"),
+        );
+        assert_terminal_conflict(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_DELEGATED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    &[make_event("run_resumed", json!({}))],
+                )
+                .await
+                .expect_err("event batch must not resurrect a terminal run"),
+        );
+        assert_terminal_conflict(
+            store
+                .update_run_status_with_event_if_current_unless_session_blocked(
+                    GuardedRunStatusTransitionRequest {
+                        user_id: &user_id,
+                        run_id: &run_id,
+                        session_id: &session_id,
+                        expected_statuses: &[STATUS_DELEGATED],
+                        status: STATUS_RUNNING,
+                        waiting_for: None,
+                        error_message: None,
+                        event: make_event("run_resumed", json!({})),
+                    },
+                )
+                .await
+                .expect_err("guarded transition must not resurrect a terminal run"),
+        );
+
+        assert!(
+            !store
+                .save_checkpoint(
+                    &user_id,
+                    &run_id,
+                    r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#,
+                )
+                .await
+                .expect("terminal checkpoint attempt should be a visible no-op")
+        );
+        let loaded = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load terminal fixture")
+            .expect("terminal fixture exists");
+        assert_eq!(loaded.status, STATUS_DELEGATED);
+        assert!(loaded.events.is_empty());
+        assert!(loaded.checkpoint_json.is_none());
+        assert!(loaded.checkpoint_version.is_none());
+        assert!(
+            store
+                .load_latest_checkpoint(&user_id, &run_id, None)
+                .await
+                .expect("load checkpoint projection")
+                .is_none()
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
 
     #[tokio::test]

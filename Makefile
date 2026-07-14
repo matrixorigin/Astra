@@ -49,6 +49,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
 	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
 	@echo "  make test-server-edge   - Focused tests for edge provider protocol and routing"
@@ -1145,6 +1146,11 @@ test-online:
 	else \
 		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
 	fi
+	@if [ "$${ASTRA_MEMORIA_ONLINE:-}" = "1" ]; then \
+		$(MAKE) test-memoria-online-contract; \
+	else \
+		echo "Skipping real Memoria contract (set ASTRA_MEMORIA_ONLINE=1, or: make test-memoria-online-contract)"; \
+	fi
 	@echo ""
 	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
 	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
@@ -1152,6 +1158,16 @@ test-online:
 # Explicit cleanup pressure probes. This is intentionally not part of
 # test-online because pressure timings are operational evidence, not a normal
 # per-case correctness budget.
+.PHONY: test-memoria-online-contract
+test-memoria-online-contract:
+	@if [ ! -f .env ]; then echo "❌ .env is required for the real Memoria contract"; exit 2; fi
+	@set -a; . ./.env; set +a; \
+		if [ -z "$$MEMORIA_MASTER_KEY" ]; then \
+			echo "❌ MEMORIA_MASTER_KEY is required for the real Memoria contract"; exit 2; \
+		fi; \
+		ASTRA_MEMORIA_ONLINE=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-tools \
+			--test memoria_online_contract -- --ignored
+
 .PHONY: test-cleanup-pressure
 test-cleanup-pressure:
 	@python3 scripts/load/cleanup_pressure_probe.py \

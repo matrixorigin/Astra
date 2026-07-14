@@ -2344,6 +2344,11 @@ mod tests {
             snapshot.environment.discovered_skills,
             vec!["goal-driven-evolution".to_string()]
         );
+        assert_eq!(
+            snapshot.run.totals.total_tool_calls, 1,
+            "durable turn tool records must project into the self snapshot"
+        );
+        assert_eq!(snapshot.run.totals.failure_events, 0);
         assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);

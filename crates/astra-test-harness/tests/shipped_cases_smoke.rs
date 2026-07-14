@@ -113,75 +113,28 @@ fn fork_prefix_spawn_inherits_uses_spawn_agent_not_delegate() {
 }
 
 #[test]
-fn shipped_cases_reference_only_known_criterion_variants() {
-    // Positive sanity: when the serde tag on `Criterion` changes
-    // (say, `fork_cache_outcome` → `fork_cache_class_v2`), every
-    // case using the old tag fails to deserialize. `every_shipped_case_
-    // yaml_loads_cleanly` above would already catch that. This test
-    // adds an explicit-names check so a rename that kept the new
-    // name in use is surfaced with a clearer error.
-    //
-    // Ground truth: the YAML `type:` values currently shipped. If
-    // this list drifts the first test already fails; this test just
-    // names the expected vocabulary for greppers.
-    let known = [
-        "exit_code",
-        "tool_called",
-        "tools_count_between",
-        "stderr_matches",
-        "text_contains",
-        "session_event_count",
-        "journal_tool_called",
-        "fork_cache_outcome",
-        "judger",
-        "tokens_between",
-        "duration_between",
-        "tool_sequence",
-        "turn_rounds_between",
-        "cache_rate_above",
-        "prompt_cache_tokens",
-        "pipeline_alert_count",
-        "pipeline_avg_cache_hit_ratio",
-        "any_of",
-        "all_of",
-    ];
-    // Concatenate every shipped YAML body and grep for `type:` tag
-    // occurrences at column-1-after-indent. Cheap + doesn't require
-    // reparsing.
-    let dir = shipped_cases_dir();
-    for entry in std::fs::read_dir(&dir).expect("read_dir") {
-        let entry = entry.expect("entry");
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml")
-            && path.extension().and_then(|e| e.to_str()) != Some("yml")
-        {
-            continue;
-        }
-        let body = std::fs::read_to_string(&path).expect("read");
-        for (lineno, line) in body.lines().enumerate() {
-            // Match `- type: <name>` or `type: <name>` inside a list item.
-            let trimmed = line
-                .trim_start_matches(|c: char| c.is_whitespace() || c == '-')
-                .trim();
-            let Some(rest) = trimmed.strip_prefix("type:") else {
-                continue;
-            };
-            let tag: String = rest
-                .trim()
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if tag.is_empty() {
-                continue;
-            }
-            assert!(
-                known.contains(&tag.as_str()),
-                "{}:{} references unknown criterion tag {tag:?}. \
-                 Known vocabulary: {known:?}. Update the test if the \
-                 Criterion enum gained a legitimate new variant.",
-                path.file_name().unwrap().to_string_lossy(),
-                lineno + 1,
-            );
+fn shipped_case_criteria_round_trip_through_real_serde() {
+    // Criterion's Serde definition is the only variant vocabulary. A second
+    // string whitelist inevitably rejects the next legitimate variant (as it
+    // did for hard_judger) or accepts a removed one. Round-tripping every real
+    // shipped instance also checks that the read and write contracts agree,
+    // without treating YAML layout or unrelated `type:` fields as criteria.
+    let cases = Case::load_dir(&shipped_cases_dir()).expect("load shipped cases");
+    for case in cases {
+        let criteria = case
+            .criteria
+            .iter()
+            .chain(case.steps.iter().flat_map(|step| step.criteria.iter()));
+        for criterion in criteria {
+            let yaml = serde_yaml_ng::to_string(criterion)
+                .unwrap_or_else(|error| panic!("{}: serialize criterion: {error}", case.name));
+            serde_yaml_ng::from_str::<astra_test_harness::criteria::Criterion>(&yaml)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}: deserialize serialized criterion: {error}\n{yaml}",
+                        case.name
+                    )
+                });
         }
     }
 }

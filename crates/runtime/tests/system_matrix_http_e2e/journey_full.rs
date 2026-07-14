@@ -11,8 +11,8 @@ use tower::util::ServiceExt;
 use super::harness::{
     MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
     get_json, maybe_tool_result_payload_from_sse, post_empty, post_json, post_json_with_headers,
-    put_json, row_get_opt_i64, row_get_opt_str, row_get_str, seeded_selected_model,
-    tool_result_payload, wait_for_agent_event_types,
+    put_json, row_get_opt_i64, row_get_opt_str, row_get_str, seed_pending_approval,
+    seeded_selected_model, tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -799,6 +799,15 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_tool, StatusCode::OK, "tools/result: {tool_j}");
     assert_eq!(tool_j["ok"], true);
 
+    let approval_run_id = format!("matrix-appr-run-{suffix}");
+    seed_pending_approval(
+        ctx,
+        &approval_run_id,
+        "matrix-appr-1",
+        "write_file",
+        "standard",
+    )
+    .await;
     let (st_appr, appr_j) = post_json(
         app,
         "/approval/respond",
@@ -808,7 +817,7 @@ pub async fn run_product_matrix_full_journey(
             "decision": "allow",
             "reason": "e2e",
             "session_id": session_id,
-            "run_id": format!("matrix-appr-run-{suffix}")
+            "run_id": approval_run_id
         }),
     )
     .await;

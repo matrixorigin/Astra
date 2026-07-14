@@ -12,13 +12,12 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role, post_empty, post_json,
-    put_json, revoke_astra_admin_role, seeded_model_name, selected_model,
-    wait_for_agent_event_types,
+    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role,
+    load_durable_interaction_event, post_empty, post_json, put_json, revoke_astra_admin_role,
+    seed_pending_approval, seeded_model_name, selected_model, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
 use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
-use astra_services::session_journal::{JournalEventType, read_journal};
 
 struct E2eUserAuth {
     auth_header: String,
@@ -999,13 +998,15 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
     ctx.pool.close().await;
 }
 
-/// Approval deny decision is recorded (§4.2 negative callback path).
+/// Approval deny decision is committed to the durable run (§4.2 negative callback path).
 pub async fn run_saas_approval_respond_deny_path() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let request_id = format!("tc-saas-deny-{}", ctx.suffix);
+    let run_id = format!("run-saas-deny-{}", ctx.suffix);
+    seed_pending_approval(ctx, &run_id, &request_id, "bash", "standard").await;
 
     let (st, body) = post_json(
         app,
@@ -1016,7 +1017,7 @@ pub async fn run_saas_approval_respond_deny_path() {
             "decision": "deny",
             "reason": "saas e2e deny",
             "session_id": ctx.session_id,
-            "run_id": format!("run-saas-deny-{}", ctx.suffix),
+            "run_id": run_id,
             "tool_name": "bash",
             "approval_kind": "standard"
         }),
@@ -1024,20 +1025,10 @@ pub async fn run_saas_approval_respond_deny_path() {
     .await;
     assert_eq!(st, StatusCode::OK, "approval deny: {body}");
 
-    let decisions = read_journal(&ctx.session_id)
-        .expect("journal")
-        .into_iter()
-        .filter(|e| e.event_type == JournalEventType::ApprovalDecision)
-        .filter(|e| {
-            e.metadata
-                .as_ref()
-                .and_then(|m| m.get("approval"))
-                .and_then(|a| a.get("request_id"))
-                .and_then(|v| v.as_str())
-                == Some(request_id.as_str())
-        })
-        .count();
-    assert_eq!(decisions, 1, "deny should record one approval decision");
+    let decision =
+        load_durable_interaction_event(ctx, &run_id, &request_id, "approval_resolved").await;
+    assert_eq!(decision.pointer("/data/decision"), Some(&json!("deny")));
+    assert_eq!(decision.pointer("/data/outcome"), Some(&json!("denied")));
 
     ctx.pool.close().await;
 }

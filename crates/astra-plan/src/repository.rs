@@ -1006,8 +1006,10 @@ impl PlanRepository for CloudPlanRepository {
             artifact_ref,
         } = command;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
-            .await?;
+        // Lock/finalize the append-only attempt before advancing the plan
+        // version. Concurrent duplicate finishes then converge on the same
+        // owner-safe NotFound result instead of racing into a version conflict.
+        // Any later plan CAS failure rolls this update back with the transaction.
         let result = sqlx::query(
             "UPDATE plan_step_runs \
              SET status = ?, finished_at = NOW(6), error = ?, artifact_ref = ? \
@@ -1027,6 +1029,8 @@ impl PlanRepository for CloudPlanRepository {
                 "step_run {run_id} not found in plan {plan_id} or already finalized"
             )));
         }
+        Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
+            .await?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(())
     }
@@ -1680,18 +1684,18 @@ impl PlanRepository for InMemoryPlanRepository {
         ensure_state_owner(user_id, state)?;
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         let plan_key = (user_id.to_string(), plan_id.to_string());
-        let Some(actual) = guard.plans.get(&plan_key).map(|stored| stored.version) else {
-            return Err(PlanLoadError::conflict(expected_version, 0));
-        };
-        if actual != expected_version {
-            return Err(PlanLoadError::conflict(expected_version, actual));
-        }
         let run_key = (user_id.to_string(), run_id.to_string());
         let Some(run) = guard.step_runs.get(&run_key) else {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         };
         if run.plan_id != plan_id || run.finished_at.is_some() {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        let Some(actual) = guard.plans.get(&plan_key).map(|stored| stored.version) else {
+            return Err(PlanLoadError::conflict(expected_version, 0));
+        };
+        if actual != expected_version {
+            return Err(PlanLoadError::conflict(expected_version, actual));
         }
         state.version = expected_version + 1;
         guard.plans.insert(plan_key, state.clone());
@@ -2002,6 +2006,27 @@ mod tests {
             .unwrap();
         assert_eq!(completed_run.status, TaskStatus::Completed);
         assert!(completed_run.finished_at.is_some());
+
+        let mut duplicate = repo.load("u-1", "plan-atomic").await.unwrap();
+        let duplicate_error = repo
+            .save_existing_and_finalize_step_run(FinalizeStepRun {
+                user_id: "u-1",
+                plan_id: "plan-atomic",
+                state: &mut duplicate,
+                expected_version: 4,
+                run_id: &run_id,
+                status: TaskStatus::Failed,
+                error: Some("late duplicate"),
+                artifact_ref: None,
+            })
+            .await
+            .expect_err("an append-only attempt must not be finalized twice");
+        assert!(matches!(duplicate_error, PlanLoadError::NotFound(_)));
+        assert_eq!(
+            repo.load("u-1", "plan-atomic").await.unwrap().version,
+            4,
+            "duplicate finalization must not advance the canonical plan"
+        );
     }
 
     #[tokio::test]

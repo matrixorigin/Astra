@@ -358,10 +358,10 @@ fn task_board_truth_line(
         TaskBoardTruthState::Unbound => return None,
         TaskBoardTruthState::Loading => ("Checklist · syncing", theme.dim),
         TaskBoardTruthState::Confirmed => return None,
-        TaskBoardTruthState::Refreshing => (
-            "Checklist · syncing · showing last confirmed checklist",
-            theme.accent,
-        ),
+        // A normal background refresh does not change the last confirmed
+        // truth and must not add a transient row. Adding/removing this line on
+        // every poll changed the viewport height and produced a blue flash.
+        TaskBoardTruthState::Refreshing => return None,
         TaskBoardTruthState::Stale => match store_health {
             TaskStoreHealth::AuthenticationRequired => (
                 "Checklist sync needs sign-in · showing last confirmed checklist",
@@ -613,16 +613,10 @@ pub(crate) fn active_viewport(
     let mut cached_lines = if has_tasks && !hidden {
         match projection.as_ref() {
             Some(TaskBoardProjection::Single { snapshot, .. }) if resolved_expanded => {
-                let fresh_task_ids = board
-                    .map(TaskBoardObserver::fresh_task_id_set)
-                    .unwrap_or_default();
-                task_list::render_with_fresh_predicate(
-                    &snapshot.tasks,
-                    width,
-                    row_budget,
-                    true,
-                    |task_id| fresh_task_ids.contains(task_id),
-                )
+                // Status/title changes are already visible in the canonical
+                // row. Do not add a transient accent glyph: it makes ordinary
+                // observer reconciliation look like unstable content.
+                task_list::render(&snapshot.tasks, width, row_budget, true)
             }
             Some(TaskBoardProjection::All { snapshot, .. }) if resolved_expanded => {
                 task_list::render_multi(&snapshot.per_session, width, row_budget)
@@ -1020,7 +1014,7 @@ struct LiveFramedCell {
 
 impl super::render::renderable::Renderable for LiveFramedCell {
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        use ratatui::widgets::{Paragraph, Widget};
+        use ratatui::widgets::Widget;
 
         // Need at least 3 cols: `█` + space + 1 col of content.
         if area.width < 3 || area.height == 0 {
@@ -1035,7 +1029,7 @@ impl super::render::renderable::Renderable for LiveFramedCell {
             height: area.height,
         };
 
-        let para = Paragraph::new(ratatui::text::Text::from(self.lines.clone()));
+        let para = crate::tui::render::line_utils::FullRowParagraph::new(self.lines.clone());
         Widget::render(para, inner, buf);
 
         let theme = crate::tui::theme::current();
@@ -1366,7 +1360,6 @@ mod task_board_draw_tests {
 
         for state in [
             TaskBoardTruthState::Loading,
-            TaskBoardTruthState::Refreshing,
             TaskBoardTruthState::Stale,
             TaskBoardTruthState::Unavailable,
         ] {
@@ -1386,6 +1379,10 @@ mod task_board_draw_tests {
         );
         assert!(
             task_board_truth_line(TaskBoardTruthState::Confirmed, TaskStoreHealth::Ready, 12)
+                .is_none()
+        );
+        assert!(
+            task_board_truth_line(TaskBoardTruthState::Refreshing, TaskStoreHealth::Ready, 12)
                 .is_none()
         );
         assert!(
@@ -1650,8 +1647,8 @@ mod task_board_draw_tests {
         )
         .await;
         // Let the create notification settle, then reconcile once so this
-        // test measures the confirmed short-terminal layout rather than the
-        // intentionally visible Refreshing state.
+        // test measures the confirmed short-terminal layout rather than an
+        // observer transition that may still be in flight.
         tokio::time::sleep(Duration::from_millis(20)).await;
         obs.maybe_refresh();
         wait_for_truth(

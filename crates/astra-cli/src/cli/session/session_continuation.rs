@@ -123,8 +123,6 @@ fn heavy_checkpoint_prompt_state(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: cp.recent_tools.clone(),
-        budget_remaining_tokens: cp.budget_remaining_tokens,
-        budget_remaining_rounds: cp.budget_remaining_rounds,
         consecutive_ctx_errors: cp.consecutive_context_window_errors,
         delegation: cp.delegation_id.as_ref().map(|id| {
             astra_turn_core::conversation_log::DelegationCompact {
@@ -252,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn load_session_messages_returns_checkpoint_messages() {
+    fn load_session_messages_returns_only_prompt_facing_checkpoint_messages() {
         let session_id = format!("test-session-cont-{}", uuid::Uuid::new_v4());
         let mut checkpoint = StepCheckpoint::heavy(
             "s1".to_string(),
@@ -267,8 +265,6 @@ mod tests {
             json!({"role": "user", "content": "Remember: code is ZEBRA-99"}),
             json!({"role": "assistant", "content": "OK, noted."}),
         ];
-        heavy.budget_remaining_tokens = 100000;
-        heavy.budget_remaining_rounds = 50;
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -285,17 +281,14 @@ mod tests {
         );
 
         let messages = messages.expect("should load messages from checkpoint");
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "OK, noted.");
-        assert_eq!(messages[2]["role"], "system");
         assert!(
-            messages[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Last checkpoint budget: tokens=100000, rounds=50")
+            messages.iter().all(|message| message["role"] != "system"),
+            "runtime checkpoint budgets are recovery metadata, not conversation history"
         );
     }
 

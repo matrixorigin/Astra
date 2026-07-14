@@ -11,7 +11,9 @@ use std::sync::OnceLock;
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
 use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
-use astra_services::{DatabaseSessionService, SessionService};
+use astra_services::{
+    DatabaseRunStateStore, DatabaseSessionService, DurableRunRecord, RunStateStore, SessionService,
+};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -620,6 +622,108 @@ pub struct BootstrapResult {
     pub ctx: MatrixE2eCtx,
     pub auth_header: String,
     pub refresh_token: String,
+}
+
+/// Seed the durable precondition for `/approval/respond` through the same run
+/// store used by production. A callback is not a free-standing journal write:
+/// it must resolve an existing owner-scoped run interaction.
+pub async fn seed_pending_approval(
+    ctx: &MatrixE2eCtx,
+    run_id: &str,
+    request_id: &str,
+    tool: &str,
+    approval_kind: &str,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let store = DatabaseRunStateStore::new(ctx.shared_pool.clone());
+    store
+        .insert_run(DurableRunRecord {
+            run_id: run_id.to_string(),
+            user_id: ctx.user_id.clone(),
+            session_id: ctx.session_id.clone(),
+            parent_run_id: None,
+            root_run_id: Some(run_id.to_string()),
+            ancestor_path: Some(run_id.to_string()),
+            depth: 0,
+            delegation_id: None,
+            agent_id: Some("system-matrix-approval-fixture".to_string()),
+            retry_of: None,
+            retry_scope: Some("node".to_string()),
+            status: "waiting".to_string(),
+            waiting_for: Some("tool_approval".to_string()),
+            owner_pod_id: None,
+            owner_lease_expires_at: None,
+            run_generation: 0,
+            last_event_idx: -1,
+            checkpoint_version: None,
+            checkpoint_json: None,
+            error_code: None,
+            error_message: None,
+            retry_count: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+            agent_binding_id: None,
+            agent_binding_name: None,
+            agent_binding_schema_version: None,
+            selected_model_json: None,
+            selected_model_name: None,
+            selected_model_gateway: None,
+            capability_server_refs_json: None,
+            runtime_profile: None,
+            events: vec![
+                json!({"event_type": "run_started", "data": {}}),
+                json!({
+                    "event_type": "approval_required",
+                    "data": {
+                        "request_id": request_id,
+                        "tool": tool,
+                        "approval_kind": approval_kind,
+                        "delivery": "durable",
+                    }
+                }),
+            ],
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .expect("seed durable pending approval");
+}
+
+pub async fn load_durable_interaction_event(
+    ctx: &MatrixE2eCtx,
+    run_id: &str,
+    request_id: &str,
+    event_type: &str,
+) -> Value {
+    DatabaseRunStateStore::new(ctx.shared_pool.clone())
+        .load_run_interaction_event(&ctx.user_id, run_id, request_id, event_type)
+        .await
+        .expect("load durable interaction event")
+        .unwrap_or_else(|| {
+            panic!(
+                "missing durable interaction event type={event_type} run={run_id} request={request_id}"
+            )
+        })
+}
+
+pub async fn durable_interaction_event_count(
+    ctx: &MatrixE2eCtx,
+    run_id: &str,
+    request_id: &str,
+    event_type: &str,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events \
+         WHERE user_id = ? AND run_id = ? AND interaction_request_id = ? AND event_type = ?",
+    )
+    .bind(&ctx.user_id)
+    .bind(run_id)
+    .bind(request_id)
+    .bind(event_type)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("count durable interaction events")
 }
 
 pub const E2E_PASSWORD: &str = "E2e-matrix-pass-9";

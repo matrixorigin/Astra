@@ -396,6 +396,7 @@ mod tests {
             journal_path: std::path::PathBuf::from("/tmp/test.jsonl"),
             events,
             skipped_lines: 0,
+            dropped_lines: 0,
         }
     }
 

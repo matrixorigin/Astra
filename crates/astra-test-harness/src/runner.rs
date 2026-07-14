@@ -438,6 +438,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let cfg = RunnerConfig::new("astra").with_fallback_models(vec!["sonnet".into()]);
         assert_eq!(resolve_models(&case, &cfg).unwrap(), vec!["opus"]);
@@ -462,6 +463,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let cfg = RunnerConfig::new("astra")
             .with_fallback_models(vec!["sonnet".into(), "minimax".into()]);
@@ -488,6 +490,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
+            cleanup_memory_records: false,
         };
         let cfg = RunnerConfig::new("astra");
         assert!(resolve_models(&case, &cfg).is_err());

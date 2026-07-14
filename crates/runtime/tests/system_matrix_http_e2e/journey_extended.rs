@@ -8,11 +8,11 @@ use sqlx::Row;
 use std::time::Duration;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content, get_json,
-    grant_astra_admin_role, maybe_tool_result_payload_from_sse, post_empty, post_json, put_json,
+    E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
+    durable_interaction_event_count, get_json, grant_astra_admin_role,
+    maybe_tool_result_payload_from_sse, post_empty, post_json, put_json, seed_pending_approval,
     seeded_selected_model, tool_result_payload,
 };
-use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
 use tower::util::ServiceExt;
 
@@ -514,6 +514,7 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let run_id = format!("run-dup-appr-{}", ctx.suffix);
+    seed_pending_approval(ctx, &run_id, "tc-dup-appr-1", "write_file", "standard").await;
     for _ in 0..2 {
         let (status, body) = post_json(
             &ctx.app,
@@ -537,23 +538,11 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
         );
     }
 
-    let approval_decisions = read_journal(&ctx.session_id)
-        .expect("read approval journal")
-        .into_iter()
-        .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
-        .filter(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("approval"))
-                .and_then(|approval| approval.get("request_id"))
-                .and_then(Value::as_str)
-                == Some("tc-dup-appr-1")
-        })
-        .count();
+    let approval_decisions =
+        durable_interaction_event_count(ctx, &run_id, "tc-dup-appr-1", "approval_resolved").await;
     assert_eq!(
         approval_decisions, 1,
-        "duplicate /approval/respond should record a single approval decision"
+        "duplicate /approval/respond should commit one durable terminal decision"
     );
 
     ctx.pool.close().await;

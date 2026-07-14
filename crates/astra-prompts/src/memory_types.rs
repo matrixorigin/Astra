@@ -239,6 +239,10 @@ silence is cheaper than noise.
 surface near-duplicates. Just call `memory(action=remember, ...)`.
 - If the gate redirects you to an existing memory, follow the redirect: call \
 `memory(action=update, memory_id=..., reason=...)` instead of writing a duplicate.
+- `memory_id` is an opaque identity, not a name. Use only an exact ID present in \
+recalled/injected memory evidence or returned by a conflict response. If no exact ID is \
+available, select an existing memory with `query=...`; never invent labels such as \
+`session-state` or treat a failed ID update as a service outage.
 - Negative preferences (\"不喜欢\", \"don't want\", \"stop using\") count as durable \
 corrections — store them and respect in future decisions.
 - If a recalled memory seems outdated, call `memory(action=update, ...)` with the \
@@ -281,7 +285,7 @@ appear on each memory in the `<session_memory>` block — respect them:
 - If it names a function or flag: grep for it.
 - If the suffix says `stale — verify first` (past the tier half-life) OR the memory \
   conflicts with current state: trust what you observe now and call \
-  `memory(action=update, memory_id=..., content=...)` to correct the stale record.
+  `memory(action=update, memory_id=..., content=..., reason=...)` to correct the stale record.
 - A memory that cites `[project]` or `[episode]` content is a snapshot of past work; \
   prefer `git log` / reading current files for anything about *current* repo state.\n";
 
@@ -460,6 +464,8 @@ mod tests {
 
         // Destructive ops require reason
         assert!(prompt.contains("reason"));
+        assert!(prompt.contains("memory_id` is an opaque identity"));
+        assert!(prompt.contains("never invent labels"));
 
         // New freshness vocabulary
         assert!(prompt.contains("stale — verify first"));

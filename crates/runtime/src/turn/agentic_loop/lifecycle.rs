@@ -2129,6 +2129,7 @@ mod tests {
             tracked_count: 1,
             pending_count: 1,
             in_progress_count: 0,
+            reconcilable_in_progress_count: 0,
             paused_count: 0,
             completed_count: 0,
             terminal_non_success_count: 0,

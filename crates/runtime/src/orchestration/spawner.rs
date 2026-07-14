@@ -1207,6 +1207,12 @@ impl DynamicAgentSpawner {
 
     /// Set the executor for running spawned agents.
     pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
+        // Builder ordering must not decide whether child transcript state is
+        // session-bound. Keep the callback outside the session lock just like
+        // late binding below.
+        if let Some(session_id) = self.current_session_id() {
+            executor.bind_parent_session(&session_id);
+        }
         self.executor = Some(executor);
         self
     }
@@ -1873,21 +1879,46 @@ impl DynamicAgentSpawner {
         if session_id.trim().is_empty() {
             return;
         }
-        {
+        let changed = {
             let mut guard = self
                 .session_id
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if guard.as_deref() == Some(session_id.as_str()) {
-                if let Some(executor) = self.executor.as_ref() {
-                    executor.bind_parent_session(&session_id);
-                }
+                false
+            } else {
+                *guard = Some(session_id.clone());
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        // Never invoke executor-owned code while holding the session lock.
+        // Besides keeping the synchronous critical section bounded, this
+        // permits implementations to re-enter spawner-adjacent setup safely.
+        if let Some(executor) = self.executor.as_ref() {
+            self.bind_executor_to_latest_session(executor, session_id);
+        }
+    }
+
+    fn bind_executor_to_latest_session(
+        &self,
+        executor: &Arc<dyn SpawnAgentExecutor>,
+        mut session_id: String,
+    ) {
+        loop {
+            executor.bind_parent_session(&session_id);
+            let Some(latest) = self.current_session_id() else {
+                return;
+            };
+            if latest == session_id {
                 return;
             }
-            *guard = Some(session_id.clone());
-        }
-        if let Some(executor) = self.executor.as_ref() {
-            executor.bind_parent_session(&session_id);
+            // A concurrent rebind won after this callback started. Reconcile
+            // the executor to the authoritative value so callback scheduling
+            // cannot leave it attached to an older session.
+            session_id = latest;
         }
     }
 
@@ -4161,6 +4192,106 @@ mod tests {
 
     struct CapturingPermissionExecutor {
         captured: std::sync::Mutex<Option<crate::orchestration::permission_sync::PermissionMode>>,
+    }
+
+    #[derive(Default)]
+    struct SessionBindingExecutor {
+        sessions: std::sync::Mutex<Vec<String>>,
+    }
+
+    struct ReorderedSessionBindingExecutor {
+        sessions: std::sync::Mutex<Vec<String>>,
+        first_callback_entered: std::sync::Barrier,
+        release_first_callback: std::sync::Barrier,
+        delay_first_callback: std::sync::atomic::AtomicBool,
+    }
+
+    impl ReorderedSessionBindingExecutor {
+        fn new() -> Self {
+            Self {
+                sessions: std::sync::Mutex::new(Vec::new()),
+                first_callback_entered: std::sync::Barrier::new(2),
+                release_first_callback: std::sync::Barrier::new(2),
+                delay_first_callback: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for SessionBindingExecutor {
+        fn bind_parent_session(&self, session_id: &str) {
+            self.sessions.lock().unwrap().push(session_id.to_string());
+        }
+
+        async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Err("session binding test executor does not execute runs".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for ReorderedSessionBindingExecutor {
+        fn bind_parent_session(&self, session_id: &str) {
+            if session_id == "session-old"
+                && self
+                    .delay_first_callback
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.first_callback_entered.wait();
+                self.release_first_callback.wait();
+            }
+            self.sessions.lock().unwrap().push(session_id.to_string());
+        }
+
+        async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Err("session binding test executor does not execute runs".to_string())
+        }
+    }
+
+    #[test]
+    fn session_binding_is_idempotent_and_builder_order_independent() {
+        let executor = Arc::new(SessionBindingExecutor::default());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(executor.clone())
+            .with_session("session-a".to_string());
+
+        spawner.bind_session("session-a");
+        spawner.bind_session("session-b");
+        assert_eq!(
+            *executor.sessions.lock().unwrap(),
+            ["session-a", "session-b"],
+            "same-session rebinding must not repeat executor side effects"
+        );
+
+        let late_executor = Arc::new(SessionBindingExecutor::default());
+        let _spawner = DynamicAgentSpawner::new(mock_router())
+            .with_session("session-before-executor".to_string())
+            .with_executor(late_executor.clone());
+        assert_eq!(
+            *late_executor.sessions.lock().unwrap(),
+            ["session-before-executor"],
+            "installing an executor after the session must still bind it exactly once"
+        );
+    }
+
+    #[test]
+    fn concurrent_session_binding_reconciles_executor_to_the_latest_identity() {
+        let executor = Arc::new(ReorderedSessionBindingExecutor::new());
+        let spawner =
+            Arc::new(DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone()));
+        let first_spawner = Arc::clone(&spawner);
+        let first = std::thread::spawn(move || first_spawner.bind_session("session-old"));
+
+        executor.first_callback_entered.wait();
+        spawner.bind_session("session-new");
+        executor.release_first_callback.wait();
+        first.join().unwrap();
+
+        assert_eq!(spawner.current_session_id().as_deref(), Some("session-new"));
+        assert_eq!(
+            executor.sessions.lock().unwrap().last().map(String::as_str),
+            Some("session-new"),
+            "a delayed stale callback must reconcile back to the latest session"
+        );
     }
 
     impl CapturingDepthExecutor {

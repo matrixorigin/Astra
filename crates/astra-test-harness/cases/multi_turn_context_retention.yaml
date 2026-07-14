@@ -6,8 +6,8 @@ description: |
   **Tests**: Session state (--session-id), explicit memory_store, and LLM-driven preference recognition.
   **Why**: If context is lost between turns, multi-turn workflows break. If the agent can't persist
   facts to Memoria or recognize implicit preferences, the memory system degrades.
-  **Pass means**: All 4 turns succeed — recall, store, and implicit preference surfacing.
-  **Fail means**: Session state dropped, memory_store not called, or preference not recognized.
+  **Pass means**: All 4 turns succeed — establish context, recall it, store it, and surface a preference.
+  **Fail means**: Session state dropped, memory not called, or preference not recognized.
 prompt: |
   The secret code is ALPHA-7742. Acknowledge with a short sentence.
   Do not use any tools — just reply in text.
@@ -15,6 +15,7 @@ capability: memory
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240
+cleanup_memory_records: true
 steps:
   - prompt: "What was the secret code I told you earlier? Reply in text only, no tools."
     criteria:
@@ -37,15 +38,6 @@ steps:
           Did the agent recall the specific preference (small/focused, one concern per PR)?
           Score 1.0 if accurately recalled, 0.5 if vague, 0.0 if not mentioned.
         threshold: 0.7
-teardown_cmd: |
-  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
-    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
-    -H "Content-Type: application/json" \
-    -d '{"topic":"ALPHA-7742","reason":"harness teardown"}' 2>/dev/null || true
-  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
-    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
-    -H "Content-Type: application/json" \
-    -d '{"topic":"focused PRs","reason":"harness teardown"}' 2>/dev/null || true
 criteria:
   - type: exit_code
     code: 0

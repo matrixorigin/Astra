@@ -6,7 +6,6 @@
 use crossterm::style::{Color, Stylize, style};
 use serde_json::Value;
 use std::borrow::Cow;
-use unicode_width::UnicodeWidthStr;
 
 use crate::diff_utils::parse_hunk_header;
 
@@ -159,20 +158,23 @@ fn render_terminal_diff_change(
     truecolor_bg: Color,
     ansi_fg: Color,
 ) -> String {
-    let padded = pad_terminal_row(body);
+    // EL executes while this row's style is active. Unlike width-sized space
+    // padding, it works without a queryable TTY and never arms auto-wrap at
+    // the terminal's final column.
+    let row = format!("{body}\x1b[K");
     if terminal_supports_truecolor() {
-        format!("{}", style(padded).with(truecolor_fg).on(truecolor_bg))
+        format!("{}", style(row).with(truecolor_fg).on(truecolor_bg))
     } else {
-        format!("{}", style(padded).with(ansi_fg))
+        format!("{}", style(row).with(ansi_fg))
     }
 }
 
 fn render_terminal_diff_stat_row(body: String) -> String {
-    let padded = pad_terminal_row(body);
+    let row = format!("{body}\x1b[K");
     if terminal_supports_truecolor() {
         format!(
             "{}",
-            style(padded)
+            style(row)
                 .with(Color::Rgb {
                     r: 204,
                     g: 215,
@@ -185,7 +187,7 @@ fn render_terminal_diff_stat_row(body: String) -> String {
                 })
         )
     } else {
-        format!("{}", style(padded).with(Color::Cyan))
+        format!("{}", style(row).with(Color::Cyan))
     }
 }
 
@@ -197,18 +199,6 @@ fn terminal_supports_truecolor() -> bool {
                 value.contains("truecolor") || value.contains("24bit")
             })
             .unwrap_or(false)
-}
-
-fn pad_terminal_row(mut text: String) -> String {
-    let Ok((width, _)) = crossterm::terminal::size() else {
-        return text;
-    };
-    let width = usize::from(width);
-    let used = UnicodeWidthStr::width(text.as_str());
-    if used < width {
-        text.push_str(&" ".repeat(width - used));
-    }
-    text
 }
 
 fn is_diff_change_line(line: &str) -> bool {
@@ -633,11 +623,22 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let rendered = colorize_git_diff_stat_summary(
             "+21 -18 in 1 file(s)\n      pkg/frontend/plan_cache.go",
         );
-        let stripped = strip_ansi(&rendered);
+        // `strip_ansi` intentionally strips SGR styling only. EL is a
+        // terminal geometry command, so remove it separately when asserting
+        // visible cells while retaining the explicit geometry assertion below.
+        let visible = rendered.replace("\x1b[K", "");
+        let stripped = strip_ansi(&visible);
         let rows = stripped.lines().collect::<Vec<_>>();
-        assert_eq!(rows[0].trim_end(), "    +21 -18 in 1 file(s)");
-        assert!(rows[0].len() > rows[0].trim_end().len(), "{rows:?}");
+        assert_eq!(rows[0], "    +21 -18 in 1 file(s)");
         assert_eq!(rows[1], "          pkg/frontend/plan_cache.go");
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("\x1b[K"),
+            "the neutral stat surface must erase through the physical row edge: {rendered:?}"
+        );
     }
 
     #[test]

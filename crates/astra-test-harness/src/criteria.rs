@@ -21,7 +21,7 @@ use crate::session_capture::SessionCapture;
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Criterion {
     /// Passes if the tool with `name` appears in the run's
     /// `tools_used` list. Cheapest possible check.
@@ -129,6 +129,18 @@ pub enum Criterion {
         threshold: f64,
         /// Optional model override for the judger. Defaults to
         /// whatever the harness's `--judger-model` CLI flag says.
+        #[serde(default)]
+        model: Option<String>,
+    },
+
+    /// LLM judger whose result is a required product assertion rather than
+    /// advisory quality feedback. Use this when a remote side effect has no
+    /// deterministic receipt in the chat envelope (for example a memory
+    /// purge) and a failed judgement must fail the case.
+    HardJudger {
+        question: String,
+        #[serde(default = "default_judger_threshold")]
+        threshold: f64,
         #[serde(default)]
         model: Option<String>,
     },
@@ -283,6 +295,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::TextContains { .. }
         | Criterion::ToolSequence { .. }
         | Criterion::ForkCacheOutcome { .. }
+        | Criterion::HardJudger { .. }
         | Criterion::AnyOf { .. }
         | Criterion::AllOf { .. } => CriterionSeverity::Hard,
 
@@ -661,7 +674,7 @@ fn evaluate_one(
                 score: None,
             }
         }
-        Criterion::Judger { .. } => CriterionResult {
+        Criterion::Judger { .. } | Criterion::HardJudger { .. } => CriterionResult {
             criterion: c.clone(),
             severity: criterion_severity(c),
             passed: false,
@@ -999,7 +1012,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
-        Criterion::Judger { threshold, .. } => {
+        Criterion::Judger { threshold, .. } | Criterion::HardJudger { threshold, .. } => {
             if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
                 return Err(format!(
                     "Judger.threshold must be finite in [0.0, 1.0]; got {threshold}"
@@ -1164,7 +1177,10 @@ fn validate_composite_criteria(
         return Err(format!("{label}.criteria must not be empty"));
     }
     for (idx, criterion) in criteria.iter().enumerate() {
-        if matches!(criterion, Criterion::Judger { .. }) {
+        if matches!(
+            criterion,
+            Criterion::Judger { .. } | Criterion::HardJudger { .. }
+        ) {
             return Err(format!(
                 "{label}.criteria[{idx}]: Judger is evaluated by the runner and cannot be nested"
             ));
@@ -1447,12 +1463,35 @@ mod tests {
         assert!(r[0].detail.contains("judger"));
     }
 
+    #[test]
+    fn hard_judger_is_a_required_assertion() {
+        let criterion = Criterion::HardJudger {
+            question: "did the remote purge succeed?".into(),
+            threshold: 0.8,
+            model: None,
+        };
+        assert_eq!(criterion_severity(&criterion), CriterionSeverity::Hard);
+        let results = evaluate_deterministic(&[criterion], &outcome_with_tools(&[]));
+        assert!(!results[0].passed, "runner must evaluate required judges");
+        assert_eq!(results[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn criterion_rejects_unknown_fields_instead_of_silently_weakening_a_case() {
+        let error = serde_yaml_ng::from_str::<Criterion>(
+            "type: judger\nquestion: did it work?\nthreshold: 0.7\nseverity: Hard\n",
+        )
+        .expect_err("unsupported criterion fields must fail at suite load");
+        assert!(error.to_string().contains("severity"), "{error}");
+    }
+
     fn mk_session(events: &[(&str, serde_json::Value)]) -> SessionCapture {
         use crate::session_capture::JournalEvent;
         SessionCapture {
             session_id: "s".into(),
             journal_path: std::path::PathBuf::from("/x"),
             skipped_lines: 0,
+            dropped_lines: 0,
             events: events
                 .iter()
                 .map(|(t, raw)| JournalEvent {

@@ -58,6 +58,7 @@ pub async fn run_delegate_http_boundaries() {
         Some(auth.as_str()),
         json!({
             "delegation_id": format!("del-e2e-{}", ctx.suffix),
+            "session_id": session_id,
             "parent_run_id": run_id,
             "task": "noop delegation probe",
             "pattern": {

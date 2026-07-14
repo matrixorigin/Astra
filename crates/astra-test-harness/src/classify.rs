@@ -19,7 +19,9 @@ pub enum FailureClass {
     InfraModelInactive,
     InfraProviderError { provider: String },
     InfraRateLimit,
+    InfraVerificationUnavailable,
     PlatformSetupFailed,
+    HarnessCleanupFailed,
     ModelInstructionFollowing,
     ModelCapability,
     ModelQualityLow,
@@ -36,7 +38,9 @@ impl fmt::Display for FailureClass {
             Self::InfraModelInactive => write!(f, "InfraModelInactive"),
             Self::InfraProviderError { provider } => write!(f, "InfraProviderError({provider})"),
             Self::InfraRateLimit => write!(f, "InfraRateLimit"),
+            Self::InfraVerificationUnavailable => write!(f, "InfraVerificationUnavailable"),
             Self::PlatformSetupFailed => write!(f, "PlatformSetupFailed"),
+            Self::HarnessCleanupFailed => write!(f, "HarnessCleanupFailed"),
             Self::ModelInstructionFollowing => write!(f, "ModelInstructionFollowing"),
             Self::ModelCapability => write!(f, "ModelCapability"),
             Self::ModelQualityLow => write!(f, "ModelQualityLow"),
@@ -141,14 +145,31 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     }
 
     // Judger-only failure: deterministic checks passed but judger scored low.
-    let judger_failed = criteria_results
+    let judger_failed = criteria_results.iter().any(|r| {
+        !r.passed
+            && matches!(
+                r.criterion,
+                crate::criteria::Criterion::Judger { .. }
+                    | crate::criteria::Criterion::HardJudger { .. }
+            )
+    });
+    let hard_non_judger_pass = criteria_results
         .iter()
-        .any(|r| !r.passed && matches!(r.criterion, crate::criteria::Criterion::Judger { .. }));
-    let hard_all_pass = criteria_results
-        .iter()
-        .filter(|r| r.severity == crate::criteria::CriterionSeverity::Hard)
+        .filter(|r| {
+            r.severity == crate::criteria::CriterionSeverity::Hard
+                && !matches!(r.criterion, Criterion::HardJudger { .. })
+        })
         .all(|r| r.passed);
-    if judger_failed && hard_all_pass {
+    let judger_unavailable = criteria_results.iter().any(|r| {
+        !r.passed
+            && matches!(r.criterion, Criterion::HardJudger { .. })
+            && (r.detail.contains("required judger unavailable")
+                || r.detail.starts_with("judger call failed:"))
+    });
+    if judger_unavailable {
+        return FailureClass::InfraVerificationUnavailable;
+    }
+    if judger_failed && hard_non_judger_pass {
         return FailureClass::ModelQualityLow;
     }
 
@@ -156,7 +177,7 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     let soft_failed = criteria_results
         .iter()
         .any(|r| !r.passed && r.severity == crate::criteria::CriterionSeverity::Soft);
-    if soft_failed && hard_all_pass {
+    if soft_failed && hard_non_judger_pass {
         return FailureClass::EfficiencyBoundsExceeded;
     }
 
@@ -175,8 +196,14 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
             "Provider returned an error; check provider status page or retry later"
         }
         FailureClass::InfraRateLimit => "Back off and retry, or request a rate-limit increase",
+        FailureClass::InfraVerificationUnavailable => {
+            "Required verification was unavailable; restore the judger and re-run before trusting this result"
+        }
         FailureClass::PlatformSetupFailed => {
             "Case setup_cmd failed; check the command and working directory"
+        }
+        FailureClass::HarnessCleanupFailed => {
+            "Harness cleanup could not prove the environment was restored; inspect the recorded cleanup error"
         }
         FailureClass::ModelInstructionFollowing => {
             "Model ignored constraints; consider a stronger model or refine the prompt"
@@ -314,6 +341,26 @@ mod tests {
     fn exit_3_empty_text_is_auth() {
         let outcome = make_outcome().with_exit_code(3);
         assert_eq!(classify(&outcome, &[]), FailureClass::InfraAuth);
+    }
+
+    #[test]
+    fn unavailable_required_judger_is_infrastructure_not_unknown() {
+        let result = CriterionResult {
+            criterion: Criterion::HardJudger {
+                question: "did the purge succeed?".into(),
+                threshold: 0.7,
+                model: None,
+            },
+            severity: crate::criteria::CriterionSeverity::Hard,
+            passed: false,
+            detail: "required judger unavailable (--no-judger)".into(),
+            full_detail: None,
+            score: None,
+        };
+        assert_eq!(
+            classify(&make_outcome(), &[result]),
+            FailureClass::InfraVerificationUnavailable
+        );
     }
 
     #[test]

@@ -286,12 +286,23 @@ pub(crate) fn append_one_shot_journal_events(
         }
     };
 
-    let mut prompt_events = existing_events.clone();
-    prompt_events.extend_from_slice(&result.turn_observability_events);
-    let turn = journal_prompt_turns(&prompt_events).len() as u32;
-    if turn == 0 {
-        return Ok(());
-    }
+    // A completed user turn is the primary durable fact. LLM request/response
+    // snapshots are optional diagnostics, so their absence must not suppress
+    // turn persistence. A user turn can also span several model rounds, making
+    // the number of model requests the wrong sequence source.
+    let turn = existing_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                session_journal::JournalEventType::Turn
+                    | session_journal::JournalEventType::TurnError
+            )
+        })
+        .filter_map(|event| event.turn)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     if existing_events.iter().any(|event| {
         event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
     }) {
@@ -306,6 +317,18 @@ pub(crate) fn append_one_shot_journal_events(
         model_id.unwrap_or("unknown"),
         &result.turn_observability_events,
     )?;
+    // The stream keeps context assembly as a deferred sidecar so it is only
+    // made durable alongside a settled turn. The interactive commit path does
+    // this already; one-shot chat must preserve the same evidence or a later
+    // `self trace` / resume inspection incorrectly reports that no context was
+    // assembled.
+    if let Some((_, trace_json)) = &result.pending_context_assembly_trace {
+        append_events.push(session_journal::JournalEvent::context_assembly_recorded(
+            Some(session_id),
+            turn,
+            trace_json.clone(),
+        ));
+    }
     append_events.push(
         session_journal::JournalEvent::turn(
             Some(session_id),
@@ -324,6 +347,7 @@ pub(crate) fn append_one_shot_journal_events(
             result.tools_used.clone(),
             result.budget_used,
         )
+        .with_tool_calls(result.tool_call_records.clone())
         .with_run_id(result.run_id.as_deref())
         .with_budget_pressure(result.budget_pressure)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens),
@@ -509,6 +533,130 @@ mod tests {
         .expect_err("directory journal path should surface an error");
 
         assert!(error.contains("failed to read session journal"), "{error}");
+    }
+
+    #[test]
+    fn append_one_shot_journal_events_persists_turns_without_full_llm_observability() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("one-shot-primary-turn-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("test-model"),
+            ))
+            .unwrap();
+
+        let mut first = crate::tests::stub_stream_result_with_records(
+            "first answer",
+            vec![session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 4,
+                ..Default::default()
+            }],
+        );
+        first.prompt_tokens = 11;
+        first.completion_tokens = 7;
+        first.pending_context_assembly_trace = Some((
+            41,
+            serde_json::json!({
+                "turn_id": "runtime-round-41",
+                "token_budget": {"max_tokens": 128000, "total_used": 2048},
+                "tools": {"visible_tools": [{"tool_name": "read_file"}]}
+            }),
+        ));
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "first question",
+            &first,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let second = crate::tests::stub_stream_result("second answer");
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "second question",
+            &second,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.event_type,
+                session_journal::JournalEventType::LlmRequestFull
+                    | session_journal::JournalEventType::LlmResponseFull
+            )
+        }));
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn, Some(1));
+        assert_eq!(turns[0].user_input.as_deref(), Some("first question"));
+        assert_eq!(turns[0].assistant_output.as_deref(), Some("first answer"));
+        assert_eq!(turns[0].tokens_in, Some(11));
+        assert_eq!(turns[0].tokens_out, Some(7));
+        assert_eq!(
+            turns[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().filter(|call| call.was_executed()).count()),
+            Some(1)
+        );
+        assert_eq!(turns[1].turn, Some(2));
+        assert_eq!(turns[1].user_input.as_deref(), Some("second question"));
+        assert_eq!(turns[1].assistant_output.as_deref(), Some("second answer"));
+        let traces: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .collect();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].turn, Some(1));
+        assert_eq!(
+            traces[0]
+                .context_assembly_trace
+                .as_ref()
+                .and_then(|trace| trace.get("turn_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("runtime-round-41")
+        );
+
+        // Tool events may carry an internal agentic-round number. They must
+        // not advance the externally visible user-turn sequence.
+        let mut tool_event = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::ToolCallError,
+            Some(&sid),
+        );
+        tool_event.turn = Some(99);
+        session_journal::JournalWriter::new(&sid)
+            .unwrap()
+            .append(&tool_event)
+            .unwrap();
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "third question",
+            &crate::tests::stub_stream_result("third answer"),
+            Instant::now(),
+        )
+        .unwrap();
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .collect();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].turn, Some(3));
     }
 
     #[cfg(unix)]

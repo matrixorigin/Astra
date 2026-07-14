@@ -414,11 +414,20 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         astra_turn_core::runtime_scaffolding::sanitize_recoverable_runtime_messages(
             state.messages.clone(),
         );
+    let context_input_headroom_tokens = match (
+        state.max_turn_input_tokens,
+        state.last_measured_prompt_tokens,
+    ) {
+        (limit, Some(measured)) if limit > 0 => limit.saturating_sub(measured),
+        // Do not turn a missing measurement into an apparently full budget.
+        // Zero is the legacy checkpoint sentinel for an unavailable diagnostic.
+        _ => 0,
+    };
     let Some(mut heavy) = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
             &checkpoint_messages,
-            0,
+            context_input_headroom_tokens,
             state.remaining_turns as u32,
             &checkpoint_blocked_tools,
             &state.recent_tools,
@@ -790,6 +799,18 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             "unfinished task-board state retained as settlement evidence"
         );
     }
+    if let Some(candidate) = state
+        .hooks
+        .completion_settlement
+        .deferred_candidate_text
+        .take()
+        && state.final_text.trim().is_empty()
+    {
+        state.final_text = candidate;
+        // The candidate was normally streamed before settlement started. Do
+        // not render it twice; only later annotations need a fresh render.
+        state.final_text_streamed = true;
+    }
     if !state.final_text.trim().is_empty() {
         // ── Truncation marker: finish_reason == "length" ─────────────
         // The model produced output but the API cut it off at max_tokens.
@@ -967,6 +988,7 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     state.stall.exploration_family_advisory_emitted = false;
     state.stall.stronger_exploration_family_advisory_emitted = false;
     state.stall.intent_drift_advisory_emitted = false;
+    state.hooks.completion_settlement = Default::default();
     // NOTE: drift_nudge_count and last_drift_correction_round persist across turns
     state.stall.exploration_family_advisory_family = None;
     // Hard tool restrictions are owned by capability/permission boundaries.
@@ -1608,6 +1630,8 @@ mod tests {
         state.recursion_depth = 1;
         state.delegation_chain = vec!["orchestrator".to_string()];
         state.self_agent_id = "headline-agent".to_string();
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(24_000);
         state.step_recorder.begin_turn(0);
 
         try_write_heavy_checkpoint(&mut state);
@@ -1616,6 +1640,7 @@ mod tests {
             astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
                 .expect("read checkpoint")
                 .expect("delegated heavy checkpoint");
+        assert_eq!(heavy.budget_remaining_tokens, 76_000);
         assert_eq!(heavy.budget_remaining_rounds, state.remaining_turns as u32);
 
         let index =

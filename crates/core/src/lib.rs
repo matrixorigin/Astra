@@ -514,7 +514,8 @@ pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 /// ```text
 /// Created ──► Running ──┬──► Completed
 ///                       ├──► Failed
-///                       ├──► Waiting ──► Running (dependency resolved)
+///                       ├──► Waiting ──┬──► Running (dependency resolved)
+///                       │              └──► terminal (durable recovery settles)
 ///                       ├──► Paused ───► Running (explicit resume)
 ///                       ├──► Cancelled
 ///                       └──► VerificationFailed
@@ -560,7 +561,10 @@ impl SubRunState {
                 | (SubRunState::Running, SubRunState::VerificationFailed)
                 | (SubRunState::Waiting, SubRunState::Running)
                 | (SubRunState::Waiting, SubRunState::Paused)
+                | (SubRunState::Waiting, SubRunState::Completed)
+                | (SubRunState::Waiting, SubRunState::Failed)
                 | (SubRunState::Waiting, SubRunState::Cancelled)
+                | (SubRunState::Waiting, SubRunState::VerificationFailed)
                 | (SubRunState::Paused, SubRunState::Running)
                 | (SubRunState::Paused, SubRunState::Cancelled)
         )
@@ -1299,6 +1303,21 @@ mod tests {
                     to
                 );
             }
+        }
+    }
+
+    #[test]
+    fn waiting_projection_can_settle_from_durable_authority() {
+        for terminal in [
+            SubRunState::Completed,
+            SubRunState::Failed,
+            SubRunState::Cancelled,
+            SubRunState::VerificationFailed,
+        ] {
+            let settled = SubRunState::Waiting
+                .try_transition(terminal)
+                .expect("waiting projection must accept durable terminal state");
+            assert_eq!(settled, terminal);
         }
     }
 

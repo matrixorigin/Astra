@@ -12287,9 +12287,16 @@ mod tests {
         let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![Arc::new(user)];
         let lines = render_history_batch_lines(&cells, 80);
 
-        assert!(
-            lines.last().is_some_and(|line| !line.spans.is_empty()),
+        let bottom_breathing_row = lines.last().expect("user card owns a bottom breathing row");
+        assert_eq!(
+            bottom_breathing_row.style.bg,
+            crate::tui::style::user_message_style().bg,
             "the user card's bottom breathing row is part of the card, not a detached separator"
+        );
+        assert_eq!(
+            bottom_breathing_row.width(),
+            0,
+            "card ownership must be semantic metadata, not viewport-width space padding"
         );
         assert_eq!(
             lines.len(),

@@ -44,6 +44,11 @@ pub struct SessionCapture {
     /// Count of jsonl lines that failed to parse. Surfaced in the
     /// report so we don't silently hide corruption.
     pub skipped_lines: u32,
+    /// Count of older events discarded because a configured capture cap was
+    /// reached. A non-zero value means the capture is not complete and must
+    /// not drive destructive, session-scoped cleanup.
+    #[serde(default)]
+    pub dropped_lines: u32,
 }
 
 impl SessionCapture {
@@ -119,14 +124,117 @@ impl SessionCapture {
         }
         out
     }
+
+    /// Exact memory records created by this session according to the store
+    /// response contract. This is intentionally stricter than merely looking
+    /// for `memory_id`: recall results also carry IDs and must never become
+    /// deletion candidates.
+    ///
+    /// A qualifying record is a successful `memory` ToolCallCompleted event
+    /// whose JSON-object response names this capture's session, has a newly
+    /// assigned `memory_id`, and retains the store-only null values for
+    /// `created_at` and `retrieval_score`. Results are de-duplicated in first
+    /// seen order.
+    pub fn created_memory_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for event in &self.events {
+            if event.event_type != "ToolCallCompleted" {
+                continue;
+            }
+            let Some(payload) = event.raw.get("payload") else {
+                continue;
+            };
+            if payload.get("tool_name").and_then(|v| v.as_str()) != Some("memory")
+                || payload.get("is_error").and_then(|v| v.as_bool()) != Some(false)
+            {
+                continue;
+            }
+            let Some(output) = payload.get("output").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(output) else {
+                continue;
+            };
+            let Some(record) = record.as_object() else {
+                continue;
+            };
+            let Some(id) = record
+                .get("memory_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty())
+            else {
+                continue;
+            };
+            if record.get("session_id").and_then(|v| v.as_str()) != Some(&self.session_id)
+                || !record
+                    .get("created_at")
+                    .is_some_and(serde_json::Value::is_null)
+                || !record
+                    .get("retrieval_score")
+                    .is_some_and(serde_json::Value::is_null)
+            {
+                continue;
+            }
+            if !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+        ids
+    }
 }
 
-/// Default session directory — mirrors astra's `~/.astra/sessions/`.
+/// Legacy flat session directory (`~/.astra/sessions/`).
+///
+/// Newer Astra versions place artifacts below an owner-scoped `v1/` layout;
+/// use [`session_artifact_paths`] for production reads. This stays public for
+/// tests and for callers that intentionally inspect legacy fixtures.
 pub fn default_sessions_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(".astra").join("sessions")
     } else {
         PathBuf::from(".astra").join("sessions")
+    }
+}
+
+/// Resolve current owner-scoped artifact paths, then the historic flat paths.
+///
+/// The journal writer owns this layout decision. Reusing its public path API
+/// keeps the harness in lock-step with storage migrations instead of copying a
+/// directory convention that will eventually drift again.
+fn session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
+    let scoped_journal = astra_services::session_journal::journal_file_path(session_id);
+    let scoped_steps = scoped_journal
+        .parent()
+        .expect("session journal path always has a parent")
+        .join(session_id)
+        .join("step_events.jsonl");
+    let legacy_dir = default_sessions_dir();
+    let candidates = [
+        scoped_journal,
+        scoped_steps,
+        legacy_dir.join(format!("{session_id}.jsonl")),
+        legacy_dir.join(session_id).join("step_events.jsonl"),
+    ];
+    let mut unique = Vec::with_capacity(candidates.len());
+    for path in candidates {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+/// Return the logical event carried by a storage envelope.
+///
+/// `step_events.jsonl` moved from a direct `{event_type, payload}` shape to
+/// `{artifact_kind: "step_event", payload: {event_type, payload}}`. Consumers
+/// reason about the logical event in both cases, so unwrap only the explicit
+/// artifact envelope and leave all legacy journal records unchanged.
+fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
+    if value.get("artifact_kind").and_then(|kind| kind.as_str()) == Some("step_event") {
+        value.get("payload").unwrap_or(value)
+    } else {
+        value
     }
 }
 
@@ -153,32 +261,18 @@ pub fn default_sessions_dir() -> PathBuf {
 /// preferred for backward-compatible user-facing hints); the actual
 /// events are the union.
 pub fn load_session(session_id: &str) -> Option<SessionCapture> {
-    let dir = default_sessions_dir();
-    let legacy = dir.join(format!("{session_id}.jsonl"));
-    let step_events = dir.join(session_id).join("step_events.jsonl");
-
-    let legacy_cap = if legacy.is_file() {
-        load_session_from_path(session_id, &legacy)
-    } else {
-        None
-    };
-    let step_cap = if step_events.is_file() {
-        load_session_from_path(session_id, &step_events)
-    } else {
-        None
-    };
-
-    match (legacy_cap, step_cap) {
-        (None, None) => None,
-        (Some(c), None) | (None, Some(c)) => Some(c),
-        (Some(mut legacy_c), Some(step_c)) => {
-            // Legacy's path wins as the primary identifier (the jq
-            // hint points there); events are the union.
-            legacy_c.events.extend(step_c.events);
-            legacy_c.skipped_lines = legacy_c.skipped_lines.saturating_add(step_c.skipped_lines);
-            Some(legacy_c)
-        }
+    let mut captures = session_artifact_paths(session_id)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter_map(|path| load_session_from_path(session_id, &path));
+    let mut capture = captures.next()?;
+    for additional in captures {
+        capture.events.extend(additional.events);
+        capture.skipped_lines = capture
+            .skipped_lines
+            .saturating_add(additional.skipped_lines);
     }
+    Some(capture)
 }
 
 /// Maximum journal file size the loader will read. Long-running
@@ -253,17 +347,21 @@ pub fn load_session_from_path_with_caps(
         }
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => {
-                let event_type = v
+                let logical = logical_event(&v);
+                let event_type = logical
                     .get("type")
                     .and_then(|t| t.as_str())
-                    .or_else(|| v.get("event_type").and_then(|t| t.as_str()))
+                    .or_else(|| logical.get("event_type").and_then(|t| t.as_str()))
                     .unwrap_or("")
                     .to_string();
                 if events.len() >= max_events {
                     events.pop_front();
                     dropped_from_head = dropped_from_head.saturating_add(1);
                 }
-                events.push_back(JournalEvent { event_type, raw: v });
+                events.push_back(JournalEvent {
+                    event_type,
+                    raw: logical.clone(),
+                });
             }
             Err(_) => skipped = skipped.saturating_add(1),
         }
@@ -280,6 +378,7 @@ pub fn load_session_from_path_with_caps(
         journal_path: path.to_path_buf(),
         events: events.into(),
         skipped_lines: skipped,
+        dropped_lines: dropped_from_head,
     })
 }
 
@@ -519,6 +618,86 @@ mod tests {
         assert_eq!(stats.total_tool_calls, 2);
         assert_eq!(stats.cache_hits, 1);
     }
+
+    #[test]
+    fn current_step_event_envelope_is_unwrapped_for_capture_and_stats() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step_events.jsonl");
+        let body = [
+            r#"{"schema_version":1,"artifact_kind":"step_event","payload":{"event_type":"StepStarted","payload":{"trace_context":{"round_index":0}}}}"#,
+            r#"{"schema_version":1,"artifact_kind":"step_event","payload":{"event_type":"ToolCallCompleted","payload":{"tool_name":"memory","cached":true}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let capture = load_session_from_path("current", &path).unwrap();
+        assert_eq!(capture.count_events("StepStarted"), 1);
+        assert_eq!(capture.tools_invoked(), vec!["memory"]);
+
+        let stats = super::load_step_event_stats_from_path(&path, 1024 * 1024).unwrap();
+        assert_eq!(stats.turn_rounds, 1);
+        assert_eq!(stats.total_tool_calls, 1);
+        assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn created_memory_ids_selects_only_session_owned_store_responses() {
+        let capture = SessionCapture {
+            session_id: "case-session".into(),
+            journal_path: PathBuf::from("/tmp/case.jsonl"),
+            skipped_lines: 0,
+            dropped_lines: 0,
+            events: vec![
+                JournalEvent {
+                    event_type: "ToolCallCompleted".into(),
+                    raw: serde_json::json!({
+                        "payload": {
+                            "tool_name": "memory", "is_error": false,
+                            "output": r#"{"memory_id":"created","session_id":"case-session","created_at":null,"retrieval_score":null}"#
+                        }
+                    }),
+                },
+                JournalEvent {
+                    event_type: "ToolCallCompleted".into(),
+                    raw: serde_json::json!({
+                        "payload": {
+                            "tool_name": "memory", "is_error": false,
+                            "output": r#"[{"memory_id":"recalled","session_id":"case-session","created_at":"2026-07-14T00:00:00Z","retrieval_score":0.9}]"#
+                        }
+                    }),
+                },
+                JournalEvent {
+                    event_type: "ToolCallCompleted".into(),
+                    raw: serde_json::json!({
+                        "payload": {
+                            "tool_name": "memory", "is_error": false,
+                            "output": r#"{"memory_id":"other-session","session_id":"other","created_at":null,"retrieval_score":null}"#
+                        }
+                    }),
+                },
+            ],
+        };
+
+        assert_eq!(capture.created_memory_ids(), vec!["created"]);
+    }
+
+    #[test]
+    fn step_event_stats_since_returns_only_append_delta() {
+        let before = super::StepEventStats {
+            turn_rounds: 3,
+            cache_hits: 1,
+            total_tool_calls: 4,
+        };
+        let after = super::StepEventStats {
+            turn_rounds: 5,
+            cache_hits: 2,
+            total_tool_calls: 7,
+        };
+        let delta = after.since(&before);
+        assert_eq!(delta.turn_rounds, 2);
+        assert_eq!(delta.cache_hits, 1);
+        assert_eq!(delta.total_tool_calls, 3);
+    }
 }
 
 /// Metrics extracted from `step_events.jsonl`.
@@ -529,6 +708,30 @@ pub struct StepEventStats {
     pub total_tool_calls: u32,
 }
 
+impl StepEventStats {
+    /// Events added since an earlier snapshot of the same session.
+    ///
+    /// Multi-turn harness cases execute separate CLI processes against one
+    /// session. Stats files are append-only, so reporting the full file for
+    /// every process would multiply earlier rounds in the aggregate. Treat a
+    /// decreased counter as a rotation/reset rather than underflowing.
+    pub fn since(&self, before: &Self) -> Self {
+        Self {
+            turn_rounds: self.turn_rounds.saturating_sub(before.turn_rounds),
+            cache_hits: self.cache_hits.saturating_sub(before.cache_hits),
+            total_tool_calls: self
+                .total_tool_calls
+                .saturating_sub(before.total_tool_calls),
+        }
+    }
+
+    fn saturating_add_assign(&mut self, other: &Self) {
+        self.turn_rounds = self.turn_rounds.saturating_add(other.turn_rounds);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.total_tool_calls = self.total_tool_calls.saturating_add(other.total_tool_calls);
+    }
+}
+
 /// Maximum step_events.jsonl file size the stats loader will read.
 /// Guards against a pathological file OOM-ing the harness process.
 pub const DEFAULT_MAX_STEP_EVENTS_BYTES: u64 = 64 * 1024 * 1024;
@@ -537,10 +740,18 @@ pub const DEFAULT_MAX_STEP_EVENTS_BYTES: u64 = 64 * 1024 * 1024;
 /// turn rounds and cache hit counts. Returns `None` if the file doesn't
 /// exist, is unreadable, or exceeds the size cap.
 pub fn load_step_event_stats(session_id: &str) -> Option<StepEventStats> {
-    let path = default_sessions_dir()
-        .join(session_id)
-        .join("step_events.jsonl");
-    load_step_event_stats_from_path(&path, DEFAULT_MAX_STEP_EVENTS_BYTES)
+    let mut stats = StepEventStats::default();
+    let mut found = false;
+    for path in session_artifact_paths(session_id)
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("step_events.jsonl"))
+    {
+        if let Some(part) = load_step_event_stats_from_path(&path, DEFAULT_MAX_STEP_EVENTS_BYTES) {
+            stats.saturating_add_assign(&part);
+            found = true;
+        }
+    }
+    found.then_some(stats)
 }
 
 /// Cap-configurable version — test seam.
@@ -559,11 +770,12 @@ pub fn load_step_event_stats_from_path(path: &Path, max_bytes: u64) -> Option<St
     let mut stats = StepEventStats::default();
     for line in content.lines() {
         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-            match ev.get("event_type").and_then(|e| e.as_str()) {
+            let logical = logical_event(&ev);
+            match logical.get("event_type").and_then(|e| e.as_str()) {
                 Some("StepStarted") => stats.turn_rounds += 1,
                 Some("ToolCallCompleted") => {
                     stats.total_tool_calls += 1;
-                    if ev
+                    if logical
                         .get("payload")
                         .and_then(|p| p.get("cached"))
                         .and_then(|c| c.as_bool())

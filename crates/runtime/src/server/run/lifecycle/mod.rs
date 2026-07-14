@@ -143,6 +143,78 @@ const MAX_USER_INTENT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
+
+/// Normalize edge-ledger approval presentation events into individually
+/// addressable durable interaction facts. A batch is one UI event but each
+/// response has its own request identity, so storing only the outer batch
+/// would make secure callback lookup impossible (and encourages accepting
+/// arbitrary request ids).
+fn canonical_edge_approval_requests(event: &Value) -> Vec<Value> {
+    let event_type = event.get("type").and_then(Value::as_str);
+    let requests: Vec<&Map<String, Value>> = match event_type {
+        Some("approval_required") => event.as_object().into_iter().collect(),
+        Some("approval_batch_required") => event
+            .get("requests")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .collect(),
+        _ => return Vec::new(),
+    };
+    requests
+        .into_iter()
+        .filter_map(|request| {
+            if request
+                .get("delivery")
+                .and_then(Value::as_str)
+                .is_some_and(|delivery| delivery != "edge_ledger")
+            {
+                // DurableRunApprovalGate already committed this request
+                // atomically with the run wait before emitting its SSE view.
+                return None;
+            }
+            let request_id = request.get("request_id")?.as_str()?.trim();
+            let tool = request.get("tool")?.as_str()?.trim();
+            let approval_kind = request
+                .get("approval_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("standard");
+            if request_id.is_empty() || tool.is_empty() {
+                return None;
+            }
+            let mut data = Map::from_iter([
+                (
+                    "request_id".to_string(),
+                    Value::String(request_id.to_string()),
+                ),
+                ("tool".to_string(), Value::String(tool.to_string())),
+                (
+                    "approval_kind".to_string(),
+                    Value::String(approval_kind.to_string()),
+                ),
+                (
+                    "delivery".to_string(),
+                    Value::String("edge_ledger".to_string()),
+                ),
+            ]);
+            for field in ["path", "detail", "display_label"] {
+                if let Some(value) = request.get(field).cloned() {
+                    data.insert(field.to_string(), value);
+                }
+            }
+            Some(json!({
+                "event_type": "approval_required",
+                "idempotency_key": format!("edge-approval-required:{request_id}"),
+                "data": data,
+            }))
+        })
+        .collect()
+}
+
+fn incrementally_persisted_edge_approval_event(event: &Value) -> bool {
+    !canonical_edge_approval_requests(event).is_empty()
+}
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
@@ -7533,6 +7605,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let live_tx_for_fanout = live_tx.clone();
         let client_event_tx_for_fanout = client_event_tx.clone();
         let fanout_runs = self.runs_handle();
+        let fanout_run_engine = self.run_engine.clone();
+        let fanout_user_id = user_id.clone();
         let fanout_run_id = run_id.clone();
         let fanout_gap_tracker = agent_live_gap_tracker.clone();
         spawn_observed(
@@ -7549,6 +7623,41 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                                 break;
                             };
+                            let approval_requests = canonical_edge_approval_requests(&event);
+                            if !approval_requests.is_empty()
+                                && let Err(error) = fanout_run_engine
+                                    .append_events_batch(
+                                        &fanout_user_id,
+                                        &fanout_run_id,
+                                        &approval_requests,
+                                    )
+                                    .await
+                            {
+                                // Never expose an approval button whose identity
+                                // cannot be authenticated by the callback path.
+                                // Cancel the live executor and surface the
+                                // persistence failure instead of waiting for a
+                                // response that can only be rejected.
+                                if let Some(run) = fanout_runs.write().await.get_mut(&fanout_run_id) {
+                                    run.cancel_flag.store(true, Ordering::SeqCst);
+                                    run.llm_cancel_token.cancel();
+                                }
+                                let failure = json!({
+                                    "type": "run_error",
+                                    "error": "approval request could not be recorded durably",
+                                    "error_code": "approval_persistence_failed",
+                                });
+                                tracing::error!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    user_id = %fanout_user_id,
+                                    run_id = %fanout_run_id,
+                                    error = %error,
+                                    "edge approval request persistence failed before delivery"
+                                );
+                                let _ = live_tx_for_fanout.send(failure.clone());
+                                let _ = client_event_tx_for_fanout.send(failure).await;
+                                break;
+                            }
                             if live_delta_event_for_persistence(&event) {
                                 if let Some(run) = fanout_runs.write().await.get_mut(&fanout_run_id) {
                                     push_active_run_live_event(run, event.clone());
@@ -8220,12 +8329,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     streaming_final_events.clone(),
                 );
-                let streaming_events_for_durable = enforce_durable_run_event_batch_budget(
-                    merge_agent_lifecycle_before_terminal_events(
-                        &final_events,
-                        &archived_lifecycle_events,
-                    ),
-                );
+                let terminal_persistence_events = merge_agent_lifecycle_before_terminal_events(
+                    &final_events,
+                    &archived_lifecycle_events,
+                )
+                .into_iter()
+                .filter(|event| !incrementally_persisted_edge_approval_event(event))
+                .collect();
+                let streaming_events_for_durable =
+                    enforce_durable_run_event_batch_budget(terminal_persistence_events);
                 record_durable_run_event_batch_metrics(
                     bg_metrics_registry.as_ref(),
                     "streaming_terminal",

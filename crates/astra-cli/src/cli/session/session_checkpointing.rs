@@ -453,14 +453,8 @@ mod tests {
             .unwrap()
             .expect("restored session");
         assert!(restored.blocked_tools.is_empty());
-        let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
-        let expected_tokens = if limit == 0 {
-            0
-        } else {
-            limit.saturating_sub(state.total_prompt_tokens)
-        };
-        assert_eq!(restored.budget_remaining_tokens, expected_tokens);
-        assert_eq!(restored.budget_remaining_rounds, 50);
+        assert_eq!(restored.budget_remaining_tokens, 0);
+        assert_eq!(restored.budget_remaining_rounds, 0);
         assert!(restored.interruption.is_none());
         assert!(restored.approval_overrides.is_none());
         assert_eq!(restored.consecutive_context_window_errors, 0);

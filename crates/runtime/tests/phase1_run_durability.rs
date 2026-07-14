@@ -1035,10 +1035,15 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         client_indexes, client_visible_indexes,
         "client-side HTTP SSE replay should receive every externally visible event exactly once"
     );
+    // One run_started + 17 streamed fragments + one restart resume, then two
+    // cycles of pause, approval_required, and one typed guidance intent.
+    // Guidance intentionally no longer synthesizes the old user_input +
+    // run_resumed pair.
+    const EXPECTED_EVENT_COUNT: i64 = 1 + 17 + 1 + (2 * 3);
     assert_eq!(
         indexes,
-        (0..27).collect::<Vec<_>>(),
-        "run_started + 17 reconnect fragments + restart resume + 2 approval cycles stay monotonic"
+        (0..EXPECTED_EVENT_COUNT).collect::<Vec<_>>(),
+        "restart recovery and typed guidance cycles stay gap-free and monotonic"
     );
 }
 

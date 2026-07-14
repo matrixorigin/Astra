@@ -14,7 +14,7 @@
 //! - **`e2e_matrix_chat_stream_session_info`** — `POST /chat/stream` buffered SSE; first `session_info`
 //!   event contains `run_id`.
 //! - **`e2e_matrix_approval_respond_invalid_session_id`** — `POST /approval/respond` rejects unsafe
-//!   `session_id` values with `400` instead of writing approval journal data for an invalid path.
+//!   `session_id` values with `400` instead of writing durable approval data for an invalid path.
 //! - **`e2e_matrix_edge_callback_http_boundary_failures`** — callback routes reject unauthenticated and
 //!   malformed `/tools/result` / `/approval/respond` requests with client/auth errors instead of
 //!   accepting transport-boundary garbage.
@@ -22,7 +22,7 @@
 //!   `request_id` during a live handoff; assert the initial `chat/turn` SSE still emits one
 //!   `tool_request` and ends with `has_tool_calls=true`.
 //! - **`e2e_matrix_duplicate_approval_response_idempotency`** — `POST /approval/respond` twice for the
-//!   same `request_id`; assert the session journal records one `approval_decision`.
+//!   same `request_id`; assert the run event log records one terminal decision.
 //! - **`e2e_matrix_chat_turn_partial_batch_failure`** — one `chat/turn` round emits two `tool_request`
 //!   callbacks; post one success and one failure and assert the initial SSE handoff still ends with
 //!   `has_tool_calls=true`.

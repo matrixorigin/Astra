@@ -402,7 +402,7 @@ pub struct AgentResult {
     /// Run ID for this agent's execution.
     pub run_id: String,
     /// Status taxonomy for a delegated sub-run result:
-    /// `completed`, `failed`, `timeout`, `waiting`, `paused`,
+    /// `completed`, `delegated`, `failed`, `timeout`, `waiting`, `paused`,
     /// `cancelled`, `partial`, or `verification_failed`.
     pub status: String,
     /// The agent's output/response.
@@ -471,6 +471,11 @@ impl DelegationResult {
 
         Self {
             delegation_id: delegation_id.to_string(),
+            // Execution settlement and result synthesis are deliberately
+            // separate. A successful agent is allowed to produce no text;
+            // absence of an aggregate must not rewrite completed work as a
+            // partial execution failure. Strategy-specific synthesis status
+            // should be surfaced separately by the caller.
             status: if all_ok {
                 DELEGATION_RESULT_STATUS_COMPLETED.to_string()
             } else if any_unfinished {
@@ -639,19 +644,51 @@ pub fn aggregate_results(
     match strategy {
         AggregationStrategy::FirstSuccess => results
             .iter()
-            .find(|r| r.is_success())
-            .and_then(|r| r.output.clone()),
+            .filter(|result| result.is_success())
+            .find_map(|result| {
+                result
+                    .output
+                    .as_deref()
+                    .filter(|output| !output.trim().is_empty())
+                    .map(str::to_string)
+            }),
 
         AggregationStrategy::AllResults => {
             let outputs: Vec<String> = results
                 .iter()
                 .filter(|r| r.is_success())
                 .filter_map(|r| r.output.clone())
+                .filter(|output| !output.trim().is_empty())
                 .collect();
             if outputs.is_empty() {
                 None
             } else {
-                Some(outputs.join("\n---\n"))
+                // Cap aggregated output to prevent unbounded concatenation.
+                // 64KB allows ~1000 typical agent responses while preventing
+                // memory exhaustion in pathological cases.
+                const MAX_AGGREGATED_BYTES: usize = 65_536;
+                let mut joined = String::new();
+                for (i, output) in outputs.iter().enumerate() {
+                    let separator = if i == 0 { "" } else { "\n---\n" };
+                    if joined.len() + separator.len() + output.len() > MAX_AGGREGATED_BYTES {
+                        let marker = format!(
+                            "\n... ({} more results truncated, {} total exceeded {} byte cap)",
+                            outputs.len() - i,
+                            outputs.len(),
+                            MAX_AGGREGATED_BYTES
+                        );
+                        let content_limit = MAX_AGGREGATED_BYTES.saturating_sub(marker.len());
+                        while joined.len() > content_limit {
+                            joined.pop();
+                        }
+                        joined.push_str(&marker);
+                        debug_assert!(joined.len() <= MAX_AGGREGATED_BYTES);
+                        break;
+                    }
+                    joined.push_str(separator);
+                    joined.push_str(output);
+                }
+                Some(joined)
             }
         }
 
@@ -1272,6 +1309,31 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_all_results_enforces_strict_byte_cap_without_invalid_utf8() {
+        let results = vec![
+            make_result("a1", &"界".repeat(30_000)),
+            make_result("a2", &"second".repeat(20_000)),
+        ];
+        let out = aggregate_results(&AggregationStrategy::AllResults, &results).unwrap();
+        assert!(out.len() <= 65_536);
+        assert!(out.contains("results truncated"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn aggregation_ignores_blank_success_output() {
+        let results = vec![make_result("a1", "  \n"), make_result("a2", "answer")];
+        assert_eq!(
+            aggregate_results(&AggregationStrategy::FirstSuccess, &results).as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            aggregate_results(&AggregationStrategy::AllResults, &results).as_deref(),
+            Some("answer")
+        );
+    }
+
+    #[test]
     fn aggregate_consensus() {
         let results = vec![
             make_result("a1", "yes"),
@@ -1314,6 +1376,15 @@ mod tests {
         assert_eq!(dr.total_completion_tokens, 100);
         assert_eq!(dr.total_tool_calls, 6);
         assert_eq!(dr.aggregated_output.as_deref(), Some("merged"));
+    }
+
+    #[test]
+    fn successful_execution_without_synthesized_text_remains_completed() {
+        let mut result = make_result("a1", "ignored");
+        result.output = None;
+        let delegation = DelegationResult::from_results("d1", vec![result], None);
+        assert_eq!(delegation.status, DELEGATION_RESULT_STATUS_COMPLETED);
+        assert!(delegation.aggregated_output.is_none());
     }
 
     #[test]
@@ -1387,6 +1458,9 @@ mod tests {
         ));
         assert!(agent_result_status_is_unfinished(
             AGENT_RESULT_STATUS_PAUSED
+        ));
+        assert!(!agent_result_status_is_unfinished(
+            AGENT_RESULT_STATUS_DELEGATED
         ));
         assert!(!agent_result_status_is_failure(AGENT_RESULT_STATUS_PAUSED));
         assert!(make_unfinished("a2").is_unfinished());
@@ -1485,6 +1559,45 @@ mod tests {
         assert_eq!(
             delegation_result_status_kind(&empty.status),
             DelegationResultStatusKind::Failed
+        );
+    }
+
+    #[test]
+    fn delegated_child_resolves_parent_to_completed() {
+        // Regression: Delegated is a terminal-success status (maps to
+        // SubRunState::Completed). A child that terminated as Delegated
+        // must NOT classify the parent delegation as unfinished.
+        let make_delegated = |agent_id: &str| AgentResult {
+            agent_id: agent_id.into(),
+            run_id: format!("run-{agent_id}"),
+            status: AGENT_RESULT_STATUS_DELEGATED.into(),
+            output: Some("nested delegation completed".into()),
+            error: None,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            tool_calls: 3,
+        };
+
+        // All-Delegated: parent should be Completed
+        let all_delegated =
+            DelegationResult::from_results("d-del", vec![make_delegated("a1")], None);
+        assert_eq!(
+            delegation_result_status_kind(&all_delegated.status),
+            DelegationResultStatusKind::Completed,
+            "Delegated children must aggregate to Completed, not Unfinished"
+        );
+        assert!(all_delegated.is_success());
+        assert!(!all_delegated.is_unfinished());
+
+        // Mixed completed + delegated: still all-success → Completed
+        let mixed = DelegationResult::from_results(
+            "d-mix",
+            vec![make_result("a1", "one"), make_delegated("a2")],
+            None,
+        );
+        assert_eq!(
+            delegation_result_status_kind(&mixed.status),
+            DelegationResultStatusKind::Completed,
         );
     }
 

@@ -845,6 +845,17 @@ async fn post_approval_respond(
     request_id: &str,
     decision: &str,
 ) -> StatusCode {
+    post_approval_respond_with_body(app, identity, request_id, decision)
+        .await
+        .0
+}
+
+async fn post_approval_respond_with_body(
+    app: &Router,
+    identity: &ApprovalIdentity,
+    request_id: &str,
+    decision: &str,
+) -> (StatusCode, String) {
     let body = json!({
         "request_id": request_id,
         "decision": decision,
@@ -858,7 +869,12 @@ async fn post_approval_respond(
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    app.clone().oneshot(req).await.unwrap().status()
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("approval response body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read SSE events incrementally from a streaming response body.
@@ -1557,7 +1573,7 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     init_env();
     let (app, _) = build_test_app();
 
-    let events = chat_stream_collect(
+    let response = chat_stream_start(
         &app,
         json!({
             "message": "Run a command in the workspace",
@@ -1586,6 +1602,25 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
         }),
     )
     .await;
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
+    assert_eq!(approval["tool"].as_str(), Some("bash"));
+    let approval_request_id = approval["request_id"]
+        .as_str()
+        .expect("canonical approval request id");
+    let (status, response_body) =
+        post_approval_respond_with_body(&app, &approval_identity, approval_request_id, "allow")
+            .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "server-owned bash approval: {response_body}"
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out after approval")
+        .expect("reader task failed");
 
     let tool_call = find_event(&events, "tool_call")
         .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
@@ -3217,7 +3252,7 @@ async fn tool_result_for_unknown_request_id_does_not_crash() {
 }
 
 #[tokio::test]
-async fn approval_for_unknown_request_id_does_not_crash() {
+async fn approval_for_unknown_request_id_is_rejected_without_side_effects() {
     init_env();
     let (app, _) = build_test_app();
 
@@ -3226,7 +3261,7 @@ async fn approval_for_unknown_request_id_does_not_crash() {
         run_id: "web-e2e-unknown-approval-run".to_string(),
     };
     let st = post_approval_respond(&app, &identity, "nonexistent-approval-id", "allow").await;
-    assert_eq!(st, 200);
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -3660,23 +3660,29 @@ mod tests {
             },
         ]);
 
-        persist_server_loop_core_events_impl(
-            &matrixone,
-            Some(&pool),
-            None,
-            &user_id,
-            &session_id,
-            &run_id,
-            None,
-            None,
-            None,
-            None,
-            "initial one",
-            &state,
-            Some("test-model"),
-        )
-        .await
-        .expect("persist core events");
+        let persist = PostLoopPersistContext {
+            matrixone,
+            shared_pool: Some(pool.clone()),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            model_name: Some("test-model".to_string()),
+            user_message: "initial one".to_string(),
+            hook_db_writer: None,
+            observer_worker: None,
+            tool_event_writer: None,
+            metrics_registry: None,
+            csl_manager: None,
+        };
+        persist
+            .persist_core_and_trace_in_transaction(&state)
+            .await
+            .expect("persist atomic core, trace, and transcript prefix");
+        persist
+            .materialize_run_transcript_evidence(&state)
+            .await
+            .expect("materialize terminal assistant transcript evidence");
 
         let event_rows = sqlx::query(
             "SELECT event_id, event_type, content, parent_event_id

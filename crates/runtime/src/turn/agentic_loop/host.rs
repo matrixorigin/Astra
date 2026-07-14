@@ -275,7 +275,10 @@ pub trait AgenticLoopHost: Send {
     /// Notify the host that the runtime has a canonical session id for this
     /// turn. Streams can discover this after host construction; interactive
     /// hosts use the hook to late-bind session-scoped executors before tool
-    /// execution starts.
+    /// execution starts. The terminal-control and ordinary-ingest call sites
+    /// are mutually exclusive for one LLM round, but later rounds can repeat
+    /// the same identity; implementations must therefore be idempotent for an
+    /// unchanged session id.
     fn on_session_bound(&mut self, _session_id: &str) {}
 
     /// Headless round terminal output.
@@ -1340,6 +1343,9 @@ pub struct TaskBoardSnapshot {
     pub tracked_count: usize,
     pub pending_count: usize,
     pub in_progress_count: usize,
+    /// In-progress tasks without an unresolved dependency edge. These are
+    /// current owned work that can be reconciled without inventing authority.
+    pub reconcilable_in_progress_count: usize,
     pub paused_count: usize,
     pub completed_count: usize,
     pub terminal_non_success_count: usize,
@@ -1368,6 +1374,9 @@ impl TaskBoardSnapshot {
             match task.status {
                 astra_tools::task_mgmt::SessionTaskStatusKind::InProgress => {
                     snapshot.in_progress_count += 1;
+                    if task.blocked_by.is_empty() {
+                        snapshot.reconcilable_in_progress_count += 1;
+                    }
                 }
                 astra_tools::task_mgmt::SessionTaskStatusKind::Pending => {
                     snapshot.pending_count += 1;
@@ -1485,6 +1494,21 @@ pub struct StopHookState {
     pub task_board_monitor: Option<Arc<TaskManager>>,
     /// Cached view of unfinished task-board work for completion gating.
     pub task_board_snapshot: TaskBoardSnapshot,
+    /// Bounded settlement state for evidence discovered after a candidate
+    /// answer has already been produced.
+    pub completion_settlement: CompletionSettlementState,
+}
+
+/// Recovery state for post-answer settlement.
+///
+/// A candidate answer may already have been streamed when durable state shows
+/// that the turn is not fully reconciled. Preserve that answer before asking
+/// for one bounded reconciliation so a store failure, empty follow-up, or
+/// exhausted budget cannot erase useful output or turn evidence into a loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionSettlementState {
+    pub reconciliation_attempts: u32,
+    pub deferred_candidate_text: Option<String>,
 }
 
 /// Cancellation state for the agentic loop.
@@ -4005,6 +4029,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 1);
+        assert_eq!(snapshot.reconcilable_in_progress_count, 1);
         assert_eq!(snapshot.paused_count, 0);
         assert_eq!(snapshot.completed_count, 1);
         assert_eq!(snapshot.terminal_non_success_count, 0);
@@ -4095,6 +4120,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 0);
+        assert_eq!(snapshot.reconcilable_in_progress_count, 0);
         assert_eq!(snapshot.paused_count, 0);
         assert_eq!(snapshot.completed_count, 1);
         assert_eq!(snapshot.terminal_non_success_count, 1);
@@ -4127,6 +4153,7 @@ pub(crate) mod tests {
         }]);
 
         assert!(snapshot.has_unfinished_tasks());
+        assert_eq!(snapshot.reconcilable_in_progress_count, 1);
         assert!(!snapshot.has_paused_or_blocked_tasks());
     }
 
@@ -4479,6 +4506,63 @@ pub(crate) mod tests {
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn claimed_unblocked_work_gets_one_bounded_settlement_round() {
+        let mut host = MockHost::new(vec![
+            text_result("candidate answer", 10, 3, Some(10)),
+            text_result("settlement correction", 8, 2, Some(8)),
+            text_result("must not run", 8, 2, Some(8)),
+        ]);
+        let mut state = make_state();
+        state.hooks.task_board_snapshot = TaskBoardSnapshot {
+            tracked_count: 1,
+            in_progress_count: 1,
+            reconcilable_in_progress_count: 1,
+            active_tasks: vec!["task-1 claimed work [in_progress]".into()],
+            ..Default::default()
+        };
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("bounded settlement should complete");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(host.turn_count(), 2, "settlement must run exactly once");
+        assert!(state.final_text.contains("settlement correction"));
+    }
+
+    #[tokio::test]
+    async fn queued_or_blocked_work_does_not_gate_a_candidate_answer() {
+        for snapshot in [
+            TaskBoardSnapshot {
+                tracked_count: 1,
+                pending_count: 1,
+                active_tasks: vec!["task-1 queued work [pending]".into()],
+                ..Default::default()
+            },
+            TaskBoardSnapshot {
+                tracked_count: 1,
+                in_progress_count: 1,
+                blocked_count: 1,
+                active_tasks: vec!["task-1 blocked work [in_progress]".into()],
+                ..Default::default()
+            },
+        ] {
+            let mut host = MockHost::new(vec![
+                text_result("candidate answer", 10, 3, Some(10)),
+                text_result("must not run", 8, 2, Some(8)),
+            ]);
+            let mut state = make_state();
+            state.hooks.task_board_snapshot = snapshot;
+
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .expect("non-reconcilable task state should not gate completion");
+            assert_eq!(host.turn_count(), 1);
+            assert!(state.final_text.contains("candidate answer"));
+        }
     }
 
     #[tokio::test]
