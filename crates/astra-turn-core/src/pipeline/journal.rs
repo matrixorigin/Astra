@@ -32,6 +32,16 @@ pub struct PipelineJournalEvent {
     pub kind: PipelineEventKind,
     pub turn: u32,
 
+    /// Per-call round key shared by the Metrics/Feedback/Alert events of one
+    /// LLM call, so consumers can join them exactly instead of relying on
+    /// emission order. Needed because `turn` lives in two different spaces:
+    /// Metrics events carry the per-call round counter while Feedback/Alert
+    /// events carry the coarser session-level turn. Absent on events written
+    /// before this field existed (consumers fall back to positional pairing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub round: Option<u32>,
+
     // Metrics fields (plan-phase, pre-call)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -112,6 +122,7 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::Metrics,
             turn: metrics.turn_index,
+            round: Some(metrics.turn_index),
             raw_pressure: Some(metrics.raw_pressure),
             predictive_pressure: Some(metrics.predictive_pressure),
             tier: Some(metrics.compact_tier),
@@ -142,6 +153,7 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::Feedback,
             turn,
+            round: None,
             raw_pressure: None,
             predictive_pressure: None,
             tier: None,
@@ -181,12 +193,21 @@ impl PipelineJournalEvent {
         self
     }
 
+    /// Stamp the per-call round key so this event joins exactly with the
+    /// Metrics event of the same LLM call (see the `round` field docs).
+    #[must_use]
+    pub fn with_round(mut self, round: Option<u32>) -> Self {
+        self.round = round;
+        self
+    }
+
     /// Create an alert event from a trace alert.
     #[must_use]
     pub fn from_alert(alert: &TraceAlert) -> Self {
         Self {
             kind: PipelineEventKind::Alert,
             turn: alert.turn,
+            round: None,
             raw_pressure: None,
             predictive_pressure: None,
             tier: None,
@@ -222,6 +243,7 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::CompactionAudit,
             turn,
+            round: None,
             raw_pressure: None,
             predictive_pressure: None,
             tier: None,
@@ -276,6 +298,11 @@ mod tests {
         assert!((evt.raw_pressure.unwrap() - 0.2665).abs() < 1e-9);
         assert!((evt.predictive_pressure.unwrap() - 0.2985).abs() < 1e-9);
         assert_eq!(evt.tier, Some(CompactionTier::TrimSchemas));
+        assert_eq!(
+            evt.round,
+            Some(evt.turn),
+            "metrics events must self-stamp the shared round key"
+        );
         assert_eq!(evt.spilled, Some(1));
         assert_eq!(evt.output_reserve_tokens, Some(4_000));
         assert_eq!(evt.reserve_source.as_deref(), Some("memory"));
@@ -304,8 +331,11 @@ mod tests {
     #[test]
     fn feedback_event_carries_api_call_counter() {
         let fb = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        let evt = PipelineJournalEvent::from_feedback(3, "claude", &fb).with_api_calls_total(42);
+        let evt = PipelineJournalEvent::from_feedback(3, "claude", &fb)
+            .with_api_calls_total(42)
+            .with_round(Some(7));
         assert_eq!(evt.api_calls_total, Some(42));
+        assert_eq!(evt.round, Some(7));
     }
 
     #[test]

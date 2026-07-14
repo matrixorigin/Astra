@@ -2553,6 +2553,10 @@ impl InProcessChatTurnBridge {
                     pipeline_stats_seed: Some(bridge_pipeline_baseline.stats.clone()),
                 },
             );
+            // Per-call round key: joins this call's Feedback/Alert events to
+            // its Metrics event exactly. Positional pairing broke on the last
+            // row when emission order differed between the two event kinds.
+            let pipeline_round_key = pipeline_outcome.metrics.as_ref().map(|m| m.turn_index);
             // Per-call pressure trace: the greppable ground truth that tier
             // selection is operating on real inputs (the PR559 pilot showed
             // 353/353 decisions at raw_pressure=0.0 because the estimate was
@@ -4221,7 +4225,8 @@ impl InProcessChatTurnBridge {
                             capture_model,
                             &feedback,
                         )
-                        .with_api_calls_total(bridge_pipeline_baseline.stats.api_calls);
+                        .with_api_calls_total(bridge_pipeline_baseline.stats.api_calls)
+                        .with_round(pipeline_round_key);
                     if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                         if let Some(buf) = turn_event_buffer.as_mut() {
                             buf.record(
@@ -4248,7 +4253,8 @@ impl InProcessChatTurnBridge {
                         let alert_evt =
                             astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
                                 &alert,
-                            );
+                            )
+                            .with_round(pipeline_round_key);
                         if let Ok(payload) = serde_json::to_value(&alert_evt) {
                             if let Some(buf) = turn_event_buffer.as_mut() {
                                 buf.record(

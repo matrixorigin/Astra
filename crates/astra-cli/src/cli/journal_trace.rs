@@ -9,11 +9,15 @@
 //! one row per call, and renders the result with the same
 //! `render_markdown`/`render_csv` used for paper trace tables.
 //!
-//! Positional pairing, not `turn`-field matching: `PipelineMetrics.turn` is a
-//! live per-call round counter, but `PipelineFeedback`/`PipelineAlert` events
-//! carry the coarser session-level turn number (often constant across every
-//! call in a session), so grouping by `.turn` would silently merge every row
-//! in a session into one. Emission order is the only reliable join key.
+//! Join strategy: events stamped with the shared per-call `round` key join
+//! exactly, regardless of emission order — the key exists precisely because
+//! `turn` lives in two spaces (Metrics carry the per-call round counter;
+//! Feedback/Alert carry the coarser session-level turn, often constant for a
+//! whole session). Events without the key (journals written before it
+//! existed) fall back to positional pairing: attach to the most recent
+//! metrics row. Positional pairing alone mis-attributed hit ratios when the
+//! two event kinds arrived in different orders (last row's cache-hit showed
+//! `-` while its feedback value had been absorbed by the previous row).
 
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
@@ -22,11 +26,31 @@ use astra_turn_core::pipeline_trace_export::{TraceRow, render_csv, render_markdo
 use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
 
+/// Feedback/alert data that arrived before its own metrics event
+/// (emission-order inversion); applied when the matching row opens.
+#[derive(Default)]
+struct HeldRoundData {
+    cache_hit_ratio: Option<f64>,
+    alert_rules: Vec<String>,
+}
+
+fn append_alert_rule(event: &mut String, rule: &str) {
+    if event.is_empty() {
+        event.push_str(rule);
+    } else {
+        event.push_str(", ");
+        event.push_str(rule);
+    }
+}
+
 /// Build one `TraceRow` per LLM call from a session's journaled pipeline
-/// events, in emission order.
+/// events: exact join on the shared `round` key when present, positional
+/// (most-recent-metrics-row) fallback for legacy events without it.
 fn rows_from_journal(events: &[JournalEvent]) -> Vec<TraceRow> {
-    let mut rows = Vec::new();
-    let mut pending: Option<TraceRow> = None;
+    let mut rows: Vec<TraceRow> = Vec::new();
+    let mut index_by_round: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    let mut held: std::collections::HashMap<u32, HeldRoundData> = std::collections::HashMap::new();
 
     for evt in events {
         if !matches!(
@@ -47,10 +71,10 @@ fn rows_from_journal(events: &[JournalEvent]) -> Vec<TraceRow> {
 
         match pipeline_evt.kind {
             PipelineEventKind::Metrics => {
-                if let Some(row) = pending.take() {
-                    rows.push(row);
-                }
-                pending = Some(TraceRow {
+                // Metrics events always carry the per-call counter in `turn`;
+                // `round` (when stamped) duplicates it for uniformity.
+                let round = pipeline_evt.round.unwrap_or(pipeline_evt.turn);
+                let mut row = TraceRow {
                     turn: pipeline_evt.turn.saturating_add(1),
                     raw_pressure: pipeline_evt.raw_pressure.unwrap_or(0.0),
                     predictive_pressure: pipeline_evt.predictive_pressure.unwrap_or(0.0),
@@ -62,28 +86,48 @@ fn rows_from_journal(events: &[JournalEvent]) -> Vec<TraceRow> {
                     cache_hit_ratio: None,
                     event: String::new(),
                     spilled: pipeline_evt.spilled.unwrap_or(0),
-                });
-            }
-            PipelineEventKind::Feedback => {
-                if let Some(row) = pending.as_mut() {
-                    row.cache_hit_ratio = pipeline_evt.cache_hit_ratio;
+                };
+                if let Some(early) = held.remove(&round) {
+                    row.cache_hit_ratio = early.cache_hit_ratio;
+                    for rule in &early.alert_rules {
+                        append_alert_rule(&mut row.event, rule);
+                    }
                 }
+                index_by_round.insert(round, rows.len());
+                rows.push(row);
             }
+            PipelineEventKind::Feedback => match pipeline_evt.round {
+                Some(round) => match index_by_round.get(&round) {
+                    Some(&idx) => rows[idx].cache_hit_ratio = pipeline_evt.cache_hit_ratio,
+                    None => {
+                        held.entry(round).or_default().cache_hit_ratio =
+                            pipeline_evt.cache_hit_ratio;
+                    }
+                },
+                None => {
+                    if let Some(row) = rows.last_mut() {
+                        row.cache_hit_ratio = pipeline_evt.cache_hit_ratio;
+                    }
+                }
+            },
             PipelineEventKind::Alert => {
-                if let (Some(row), Some(rule)) = (pending.as_mut(), pipeline_evt.alert_rule) {
-                    if row.event.is_empty() {
-                        row.event = rule;
-                    } else {
-                        row.event.push_str(", ");
-                        row.event.push_str(&rule);
+                let Some(rule) = pipeline_evt.alert_rule else {
+                    continue;
+                };
+                match pipeline_evt.round {
+                    Some(round) => match index_by_round.get(&round) {
+                        Some(&idx) => append_alert_rule(&mut rows[idx].event, &rule),
+                        None => held.entry(round).or_default().alert_rules.push(rule),
+                    },
+                    None => {
+                        if let Some(row) = rows.last_mut() {
+                            append_alert_rule(&mut row.event, &rule);
+                        }
                     }
                 }
             }
             PipelineEventKind::CompactionAudit => {}
         }
-    }
-    if let Some(row) = pending.take() {
-        rows.push(row);
     }
     rows
 }
@@ -270,6 +314,105 @@ mod tests {
             ),
         ];
         assert_eq!(rows_from_journal(&events).len(), 1);
+    }
+
+    fn keyed(mut payload: serde_json::Value, round: u32) -> serde_json::Value {
+        payload["round"] = json!(round);
+        payload
+    }
+
+    #[test]
+    fn keyed_join_survives_feedback_before_metrics_order() {
+        // The systematic inversion: every feedback event lands BEFORE its own
+        // metrics event. Positional pairing shifted every hit value by one
+        // round and dropped the first; the round key must pair exactly.
+        let events = vec![
+            evt(
+                JournalEventType::PipelineFeedback,
+                1,
+                keyed(feedback_payload(0.20), 0),
+            ),
+            evt(
+                JournalEventType::PipelineMetrics,
+                0,
+                keyed(metrics_payload(0, 0.10, "normal"), 0),
+            ),
+            evt(
+                JournalEventType::PipelineFeedback,
+                1,
+                keyed(feedback_payload(0.90), 1),
+            ),
+            evt(
+                JournalEventType::PipelineMetrics,
+                1,
+                keyed(metrics_payload(1, 0.30, "normal"), 1),
+            ),
+        ];
+        let rows = rows_from_journal(&events);
+        assert_eq!(rows.len(), 2);
+        assert!((rows[0].cache_hit_ratio.unwrap() - 0.20).abs() < 1e-9);
+        assert!((rows[1].cache_hit_ratio.unwrap() - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keyed_join_fixes_last_row_pair_inversion() {
+        // The reported symptom: 26 metrics + 26 feedback events, but the
+        // final pair arrives inverted — positionally the last feedback
+        // overwrote the previous row and the last row rendered `-`.
+        let events = vec![
+            evt(
+                JournalEventType::PipelineMetrics,
+                0,
+                keyed(metrics_payload(0, 0.10, "normal"), 0),
+            ),
+            evt(
+                JournalEventType::PipelineFeedback,
+                1,
+                keyed(feedback_payload(0.98), 0),
+            ),
+            evt(
+                JournalEventType::PipelineFeedback,
+                1,
+                keyed(feedback_payload(0.66), 1),
+            ),
+            evt(
+                JournalEventType::PipelineMetrics,
+                1,
+                keyed(metrics_payload(1, 0.30, "normal"), 1),
+            ),
+        ];
+        let rows = rows_from_journal(&events);
+        assert_eq!(rows.len(), 2);
+        assert!((rows[0].cache_hit_ratio.unwrap() - 0.98).abs() < 1e-9);
+        assert!(
+            (rows[1].cache_hit_ratio.unwrap() - 0.66).abs() < 1e-9,
+            "last row must get its own feedback, not `-`"
+        );
+    }
+
+    #[test]
+    fn keyed_late_alert_attaches_to_its_round_after_next_metrics_opened() {
+        let events = vec![
+            evt(
+                JournalEventType::PipelineMetrics,
+                0,
+                keyed(metrics_payload(0, 0.55, "trim_schemas"), 0),
+            ),
+            evt(
+                JournalEventType::PipelineMetrics,
+                1,
+                keyed(metrics_payload(1, 0.60, "trim_schemas"), 1),
+            ),
+            evt(
+                JournalEventType::PipelineAlert,
+                1,
+                keyed(alert_payload("pressure_spike"), 0),
+            ),
+        ];
+        let rows = rows_from_journal(&events);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event, "pressure_spike");
+        assert_eq!(rows[1].event, "");
     }
 
     #[test]
