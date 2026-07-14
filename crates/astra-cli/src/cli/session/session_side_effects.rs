@@ -39,7 +39,7 @@ pub(crate) fn enqueue_ingestion_events(events: &[session_journal::JournalEvent])
     }
     let scheduled = !source_sessions.is_empty()
         && source_sessions.iter().all(|session_id| {
-            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion(session_id)
+            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion(session_id).accepted()
         });
     if !scheduled {
         // Non-interactive one-shot/tests can append journals without a Tokio
@@ -450,7 +450,7 @@ fn journal_prompt_snapshot_from_messages(
         tools,
         provider,
         model,
-        cache_eligible_tokens as usize,
+        usize::try_from(cache_eligible_tokens).unwrap_or(usize::MAX),
     )
 }
 

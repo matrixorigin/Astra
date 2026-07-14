@@ -22,8 +22,9 @@ pub(crate) use params::{
     ApprovalRequest, ApprovalRequestTx, ApprovalResponse, AskUserAnnotation, AskUserAnswers,
     AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer, AskUserRequest, AskUserRequestTx,
     AskUserResponse, INTERACTIVE_REQUEST_CHANNEL_CAPACITY, PlanReviewDecision, PlanReviewRequest,
-    PlanReviewRequestTx, SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventSink,
-    StreamEventTx, ToolProgressSink, enqueue_interactive_request, stream_event_channel,
+    PlanReviewRequestTx, STREAM_EVENT_CHANNEL_CAPACITY, SharedStreamEventSink, StreamEvent,
+    StreamEventRx, StreamEventSink, StreamEventTx, ToolProgressSink, enqueue_interactive_request,
+    stream_event_channel,
 };
 pub(crate) use sse_loop::stream_chat_sse;
 pub(crate) use sse_loop::turn_policy_from_payload_edge_tools;

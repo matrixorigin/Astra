@@ -47,16 +47,18 @@ MATRIXONE_PORT=6601 \
 MATRIXONE_USER=user \
 MATRIXONE_PASSWORD=secret \
 "$client_script" -e 'SELECT 1'
-assert_args "$tmp_dir/default.args.2" "${base_args[@]}" --ssl-mode=PREFERRED -e 'SELECT 1'
+assert_args "$tmp_dir/default.args.2" "${base_args[@]}" --ssl-mode=REQUIRED -e 'SELECT 1'
 
-ARGS_FILE="$tmp_dir/legacy-default.args" \
-ASTRA_MYSQL_CLIENT="$stub" \
-MATRIXONE_HOST=db.example \
-MATRIXONE_PORT=6601 \
-MATRIXONE_USER=user \
-MATRIXONE_PASSWORD=secret \
-"$client_script" -e 'SELECT 1'
-assert_args "$tmp_dir/legacy-default.args.2" "${base_args[@]}" -e 'SELECT 1'
+if ARGS_FILE="$tmp_dir/legacy-default.args" \
+    ASTRA_MYSQL_CLIENT="$stub" \
+    MATRIXONE_HOST=db.example \
+    MATRIXONE_PORT=6601 \
+    MATRIXONE_USER=user \
+    MATRIXONE_PASSWORD=secret \
+    "$client_script" -e 'SELECT 1' >/dev/null 2>&1; then
+    echo "expected remote auto mode to reject a client that cannot require TLS" >&2
+    exit 1
+fi
 
 ARGS_FILE="$tmp_dir/disabled.args" \
 ASTRA_MYSQL_CLIENT="$stub" \
@@ -81,19 +83,19 @@ MATRIXONE_PASSWORD=secret \
 assert_args "$tmp_dir/required.args.1" "${base_args[@]}" --ssl-mode=REQUIRED -e 'SELECT 1'
 
 # A client can advertise modern TLS flags while an endpoint (or ambient client
-# configuration) still rejects the TLS-preferred connection. Auto mode must
+# configuration) still rejects the TLS-preferred connection. Local auto mode must
 # establish its deliberate plaintext policy with a harmless probe and execute
 # the caller's SQL exactly once.
 ARGS_FILE="$tmp_dir/fallback.args" \
 MYSQL_STUB_SUPPORTS_SSL_MODE=1 \
 MYSQL_STUB_REJECT_PREFERRED=1 \
 ASTRA_MYSQL_CLIENT="$stub" \
-MATRIXONE_HOST=db.example \
+MATRIXONE_HOST=127.0.0.1 \
 MATRIXONE_PORT=6601 \
 MATRIXONE_USER=user \
 MATRIXONE_PASSWORD=secret \
 "$client_script" -e 'DROP DATABASE test_db'
-assert_args "$tmp_dir/fallback.args.3" "${base_args[@]}" --ssl-mode=DISABLED -e 'DROP DATABASE test_db'
+assert_args "$tmp_dir/fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser -psecret --ssl-mode=DISABLED -e 'DROP DATABASE test_db'
 if [[ $(<"$tmp_dir/fallback.args.count") != 3 ]]; then
     echo "auto TLS fallback must make two probes and one caller request" >&2
     exit 1
@@ -106,12 +108,12 @@ ARGS_FILE="$tmp_dir/legacy-fallback.args" \
 MYSQL_STUB_SUPPORTS_SKIP_SSL=1 \
 MYSQL_STUB_REJECT_UNSET_TLS=1 \
 ASTRA_MYSQL_CLIENT="$stub" \
-MATRIXONE_HOST=db.example \
+MATRIXONE_HOST=127.0.0.1 \
 MATRIXONE_PORT=6601 \
 MATRIXONE_USER=user \
 MATRIXONE_PASSWORD=secret \
 "$client_script" -e 'SELECT 1'
-assert_args "$tmp_dir/legacy-fallback.args.3" "${base_args[@]}" --skip-ssl -e 'SELECT 1'
+assert_args "$tmp_dir/legacy-fallback.args.3" --protocol=TCP -h127.0.0.1 -P6601 -uuser -psecret --skip-ssl -e 'SELECT 1'
 
 if ARGS_FILE="$tmp_dir/unsupported.args" \
     ASTRA_MYSQL_CLIENT="$stub" \

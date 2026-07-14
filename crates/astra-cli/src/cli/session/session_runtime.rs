@@ -237,13 +237,10 @@ async fn connect_mcp_configs(
     let mut results = Vec::with_capacity(configs.len());
     for config in configs {
         let name = config.name.clone();
-        let result = {
-            let mut manager = manager.write().await;
-            mcp_client::connect_and_discover_skills(&mut manager, config, registry)
-                .await
-                .map(|_| ())
-                .map_err(|error| format_mcp_error(&error))
-        };
+        let result = mcp_client::connect_and_discover_skills(manager, config, registry)
+            .await
+            .map(|_| ())
+            .map_err(|error| format_mcp_error(&error));
         results.push((name, result));
     }
     results

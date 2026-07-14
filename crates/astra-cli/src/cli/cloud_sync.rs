@@ -39,6 +39,7 @@ const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
+const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY: Duration = Duration::from_millis(250);
 const SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY: Duration = Duration::from_secs(4);
@@ -53,8 +54,49 @@ static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 /// never lives only in this queue.
 static SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER: LazyLock<Mutex<Option<mpsc::Sender<String>>>> =
     LazyLock::new(|| Mutex::new(None));
-static SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW: LazyLock<Mutex<BTreeSet<String>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+static SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW: LazyLock<Mutex<JournalIngestOverflow>> =
+    LazyLock::new(|| Mutex::new(JournalIngestOverflow::default()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalIngestScheduleOutcome {
+    Scheduled,
+    Coalesced,
+    RecoveryScanQueued,
+    RuntimeUnavailable,
+    InvalidSession,
+}
+
+impl JournalIngestScheduleOutcome {
+    pub(crate) fn accepted(self) -> bool {
+        matches!(
+            self,
+            Self::Scheduled | Self::Coalesced | Self::RecoveryScanQueued
+        )
+    }
+}
+
+#[derive(Default)]
+struct JournalIngestOverflow {
+    sessions: BTreeSet<String>,
+    reconcile_all: bool,
+}
+
+fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome {
+    let mut overflow = recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW);
+    if overflow.sessions.contains(&session_id) {
+        return JournalIngestScheduleOutcome::Coalesced;
+    }
+    if overflow.sessions.len() < SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
+        overflow.sessions.insert(session_id);
+        return JournalIngestScheduleOutcome::Coalesced;
+    }
+
+    // The canonical journals and their source offsets are durable. Once the
+    // bounded hint set saturates, one full reconciliation marker represents
+    // every further session without retaining attacker-controlled IDs.
+    overflow.reconcile_all = true;
+    JournalIngestScheduleOutcome::RecoveryScanQueued
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalIngestFailureDisposition {
@@ -167,9 +209,11 @@ where
 /// durable records. This never performs an outbox fsync on the initiating
 /// turn. The notification is merely a latency hint: durable source offsets
 /// plus startup reconciliation make a full process crash recoverable.
-pub(crate) fn schedule_sync_outbox_journal_ingestion(session_id: &str) -> bool {
+pub(crate) fn schedule_sync_outbox_journal_ingestion(
+    session_id: &str,
+) -> JournalIngestScheduleOutcome {
     if session_id.trim().is_empty() {
-        return false;
+        return JournalIngestScheduleOutcome::InvalidSession;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
@@ -177,22 +221,19 @@ pub(crate) fn schedule_sync_outbox_journal_ingestion(session_id: &str) -> bool {
             session_id,
             "journal outbox projection was deferred because no Tokio runtime is active"
         );
-        return false;
+        return JournalIngestScheduleOutcome::RuntimeUnavailable;
     };
     let sender = journal_ingest_sender(&handle);
     match sender.try_send(session_id.to_string()) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(session_id)) => {
-            recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW).insert(session_id);
-            true
-        }
+        Ok(()) => JournalIngestScheduleOutcome::Scheduled,
+        Err(mpsc::error::TrySendError::Full(session_id)) => defer_journal_ingest_hint(session_id),
         Err(mpsc::error::TrySendError::Closed(session_id)) => {
             // Runtime teardown can close a previously global sender. Keep the
             // source in the overflow set; the next active runtime recreates
             // the worker and reconciles it from the canonical journal.
-            recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW).insert(session_id);
+            let outcome = defer_journal_ingest_hint(session_id);
             *recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER) = None;
-            false
+            outcome
         }
     }
 }
@@ -296,11 +337,33 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
                 _ = &mut deadline => break,
             }
         }
-        for session_id in std::mem::take(&mut *recover_mutex_lock(
+        let overflow = std::mem::take(&mut *recover_mutex_lock(
             &SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW,
-        )) {
+        ));
+        for session_id in overflow.sessions {
             if !delayed_sessions.contains_key(&session_id) {
                 pending_sessions.insert(session_id);
+            }
+        }
+        if overflow.reconcile_all {
+            match tokio::task::spawn_blocking(session_journal::list_sessions).await {
+                Ok(Ok(sessions)) => {
+                    for session_id in sessions {
+                        if !delayed_sessions.contains_key(&session_id) {
+                            pending_sessions.insert(session_id);
+                        }
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    "bounded journal-ingest overflow recovery scan failed"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    "bounded journal-ingest overflow recovery task stopped"
+                ),
             }
         }
 
@@ -341,7 +404,7 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
 async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io::Error> {
     const STALE_OFFSET_RETRIES: usize = 3;
     let store = SyncOutboxStore::local();
-    for _ in 0..STALE_OFFSET_RETRIES {
+    for attempt in 0..STALE_OFFSET_RETRIES {
         let source_session_id = session_id.to_string();
         let offset = run_sync_outbox_io(store.clone(), move |store| {
             store.journal_source_offset(&source_session_id)
@@ -349,7 +412,7 @@ async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io
         .await?;
         let read_session_id = session_id.to_string();
         let delta = tokio::task::spawn_blocking(move || {
-            session_journal::read_journal_append_delta(&read_session_id, offset)
+            session_journal::read_durable_journal_append_delta(&read_session_id, offset)
         })
         .await
         .map_err(|error| {
@@ -365,7 +428,11 @@ async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io
         .await?;
         match outcome {
             astra_services::SyncOutboxJournalDeltaOutcome::Appended { .. } => return Ok(true),
-            astra_services::SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => continue,
+            astra_services::SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
+                if attempt + 1 < STALE_OFFSET_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+                }
+            }
         }
     }
     Err(std::io::Error::other(
@@ -1169,9 +1236,11 @@ mod tests {
 
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
-        SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES, SyncOutboxDrainReport,
-        claim_sync_outbox_retry_wake_deadline, cloud_pull_warrants_sync_marker,
-        next_sync_outbox_drain_delay, reconcile_sync_outbox_journal, record_settlement_result,
+        JournalIngestScheduleOutcome, SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES,
+        SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW, SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY,
+        SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
+        cloud_pull_warrants_sync_marker, defer_journal_ingest_hint, next_sync_outbox_drain_delay,
+        reconcile_sync_outbox_journal, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
         run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
         should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
@@ -1202,6 +1271,31 @@ mod tests {
             budget.observe_failure("session-a"),
             JournalIngestFailureDisposition::RetryAfter(_)
         ));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn journal_ingest_overflow_is_bounded_and_escalates_to_one_recovery_scan() {
+        super::recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW)
+            .sessions
+            .clear();
+        for index in 0..SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
+            assert_eq!(
+                defer_journal_ingest_hint(format!("session-{index}")),
+                JournalIngestScheduleOutcome::Coalesced
+            );
+        }
+        assert_eq!(
+            defer_journal_ingest_hint("session-over-capacity".to_string()),
+            JournalIngestScheduleOutcome::RecoveryScanQueued
+        );
+        let mut overflow = super::recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW);
+        assert_eq!(
+            overflow.sessions.len(),
+            SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY
+        );
+        assert!(overflow.reconcile_all);
+        *overflow = Default::default();
     }
 
     #[test]
@@ -1301,18 +1395,18 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn journal_projection_recovers_and_advances_only_its_durable_source_delta() {
+    async fn journal_projection_establishes_durability_before_advancing_its_cursor() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = ProcessJournalDirGuard::new(temp.path());
         let session_id = format!("sync-projector-{}", uuid::Uuid::new_v4());
         let writer = JournalWriter::new(&session_id).expect("journal writer");
         writer
-            .append(&JournalEvent::config_change(
+            .append_bulk_no_sync(&[JournalEvent::config_change(
                 Some(&session_id),
                 "model",
                 "gpt-5",
-            ))
-            .expect("append canonical journal event");
+            )])
+            .expect("append unsynced canonical journal event");
 
         assert!(
             reconcile_sync_outbox_journal(&session_id)
@@ -1333,12 +1427,12 @@ mod tests {
         );
 
         writer
-            .append(&JournalEvent::config_change(
+            .append_bulk_no_sync(&[JournalEvent::config_change(
                 Some(&session_id),
                 "mode",
                 "auto",
-            ))
-            .expect("append second canonical event");
+            )])
+            .expect("append second unsynced canonical event");
         assert!(
             reconcile_sync_outbox_journal(&session_id)
                 .await
@@ -1374,7 +1468,7 @@ mod tests {
                 .await
                 .expect("blocking turn worker should finish")
         };
-        assert!(scheduled_from_blocking_turn_worker);
+        assert!(scheduled_from_blocking_turn_worker.accepted());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if SyncOutboxStore::local()

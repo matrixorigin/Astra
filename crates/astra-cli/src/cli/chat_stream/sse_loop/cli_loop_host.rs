@@ -245,6 +245,11 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
+    /// Ordered control-state overflow for synchronous host callbacks. Textual
+    /// progress may be sampled under pressure, but lifecycle start/finish
+    /// pairs are drained before the terminal output boundary.
+    pub pending_ordered_stream_events:
+        std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
     /// Request-scoped live lane for every child run, including `delegate`
     /// coordination. This is distinct from parent stream events so
     /// child activity cannot delay parent completion.
@@ -377,14 +382,67 @@ impl CliAgenticLoopHost<'_> {
     /// Synchronous host callbacks cannot await UI backpressure. Stream events
     /// are observational (durable state lives elsewhere), so preserve bounded
     /// memory and make saturation visible instead of blocking a Tokio worker.
-    fn try_emit_stream_event(&self, event: crate::cli::chat_stream::StreamEvent) {
-        let Some(tx) = &self.stream_event_tx else {
+    fn try_emit_stream_event(&mut self, event: crate::cli::chat_stream::StreamEvent) {
+        let Some(tx) = self.stream_event_tx.clone() else {
             return;
         };
-        if let Err(error) = tx.try_send(event) {
-            tracing::warn!(%error, "stream event queue unavailable");
+        while let Some(pending) = self.pending_ordered_stream_events.pop_front() {
+            match tx.try_send(pending) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(pending)) => {
+                    self.pending_ordered_stream_events.push_front(pending);
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_ordered_stream_events.clear();
+                    return;
+                }
+            }
+        }
+        if !self.pending_ordered_stream_events.is_empty() {
+            self.retain_ordered_stream_event(event);
+            return;
+        }
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                self.retain_ordered_stream_event(event);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("stream event receiver closed");
+            }
         }
     }
+
+    fn retain_ordered_stream_event(&mut self, event: crate::cli::chat_stream::StreamEvent) {
+        if !stream_event_requires_ordered_delivery(&event) {
+            tracing::debug!("sampled non-stateful stream event under UI backpressure");
+            return;
+        }
+        if self.pending_ordered_stream_events.len()
+            >= crate::cli::chat_stream::STREAM_EVENT_CHANNEL_CAPACITY
+        {
+            tracing::error!(
+                retained = self.pending_ordered_stream_events.len(),
+                "ordered stream-event overflow exhausted; terminal state will reconcile at turn completion"
+            );
+            return;
+        }
+        self.pending_ordered_stream_events.push_back(event);
+    }
+}
+
+fn stream_event_requires_ordered_delivery(event: &crate::cli::chat_stream::StreamEvent) -> bool {
+    matches!(
+        event,
+        crate::cli::chat_stream::StreamEvent::ToolStarted { .. }
+            | crate::cli::chat_stream::StreamEvent::ToolCompleted { .. }
+            | crate::cli::chat_stream::StreamEvent::AgentControlStarted { .. }
+            | crate::cli::chat_stream::StreamEvent::AgentControlCompleted { .. }
+            | crate::cli::chat_stream::StreamEvent::AskUserPrompted { .. }
+            | crate::cli::chat_stream::StreamEvent::AskUserResolved { .. }
+            | crate::cli::chat_stream::StreamEvent::UserIntentApplied { .. }
+    )
 }
 
 fn user_intent_stream_event(
@@ -400,10 +458,20 @@ fn user_intent_stream_event(
     })
 }
 
-async fn emit_final_output_ready(stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>) {
+async fn emit_final_output_ready(
+    stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
+    pending_ordered: &mut std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+) {
     let Some(tx) = stream_event_tx else {
         return;
     };
+    while let Some(event) = pending_ordered.pop_front() {
+        if let Err(error) = tx.send(event).await {
+            tracing::debug!(%error, "ordered stream receiver closed during terminal drain");
+            pending_ordered.clear();
+            return;
+        }
+    }
     if let Err(error) = tx
         .send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled)
         .await
@@ -998,7 +1066,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     async fn recover_missing_control_tool_result(
         &mut self,
-        _parent_run_id: Option<&str>,
+        parent_run_id: Option<&str>,
         tool_call_id: &str,
         tool_name: &str,
         args: &Value,
@@ -1015,10 +1083,25 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return ControlToolRecovery::Missing;
         };
 
-        // The server run id and the local spawn-context id are issued by
-        // different runtimes and are not a comparable identity namespace.
-        // This host/executor instance is already bound to exactly one spawn
-        // context, which is the authority for the control operation.
+        let Some(parent_run_id) = parent_run_id else {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "control-tool recovery skipped: missing parent run identity"
+            );
+            return ControlToolRecovery::Missing;
+        };
+        if parent_run_id != spawn_context.run_id {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                parent_run_id,
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "control-tool recovery skipped: parent run does not own the active spawn context"
+            );
+            return ControlToolRecovery::Missing;
+        }
 
         if tool_name == "agent" {
             let started_at = std::time::Instant::now();
@@ -1171,7 +1254,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
-        emit_final_output_ready(self.stream_event_tx.as_ref()).await;
+        emit_final_output_ready(
+            self.stream_event_tx.as_ref(),
+            &mut self.pending_ordered_stream_events,
+        )
+        .await;
     }
 
     fn on_turn_completed(
@@ -1340,12 +1427,59 @@ mod tests {
     async fn final_output_ready_reaches_the_typed_stream_lane() {
         let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
 
-        emit_final_output_ready(Some(&tx)).await;
+        emit_final_output_ready(Some(&tx), &mut std::collections::VecDeque::new()).await;
 
         assert!(matches!(
             rx.recv().await,
             Some(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled)
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_drain_preserves_ordered_control_events_after_backpressure() {
+        use crate::cli::chat_stream::StreamEvent;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(StreamEvent::StatusLine("already buffered".into()))
+            .await
+            .unwrap();
+        let mut pending = std::collections::VecDeque::from([
+            StreamEvent::ToolStarted {
+                name: "agent_fanout".into(),
+                description: "Review".into(),
+                tool_use_id: "call-1".into(),
+                parent_tool_use_id: None,
+            },
+            StreamEvent::ToolCompleted {
+                name: "agent_fanout".into(),
+                description: "Review".into(),
+                status: "completed".into(),
+                duration_ms: 10,
+                output_summary: None,
+                output: None,
+                tool_use_id: "call-1".into(),
+                parent_tool_use_id: None,
+            },
+        ]);
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(event) = rx.recv().await {
+                let settled = matches!(event, StreamEvent::AssistantOutputSettled);
+                received.push(event);
+                if settled {
+                    break;
+                }
+            }
+            received
+        });
+
+        emit_final_output_ready(Some(&tx), &mut pending).await;
+        let received = consumer.await.unwrap();
+
+        assert!(matches!(received[0], StreamEvent::StatusLine(_)));
+        assert!(matches!(received[1], StreamEvent::ToolStarted { .. }));
+        assert!(matches!(received[2], StreamEvent::ToolCompleted { .. }));
+        assert!(matches!(received[3], StreamEvent::AssistantOutputSettled));
     }
 
     struct ScriptedSummaryClient {

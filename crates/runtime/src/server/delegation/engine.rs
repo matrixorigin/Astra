@@ -68,8 +68,7 @@ use astra_prompts::team_prompts;
 /// Grace period for cooperative children to publish a canonical terminal
 /// result after their parent is cancelled. Keep this comfortably above a
 /// scheduler tick, but below the interactive cancellation latency budget.
-const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(500);
+const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// State projection is an observability aid, not a copy of the full run tree.
 /// Keep the source, its nearest ancestors, and the root within this write
@@ -188,20 +187,52 @@ fn verification_retry_delay(retry_attempt: u32, run_id: &str) -> std::time::Dura
     )
 }
 
-fn ancestry_from_parents(parents: &HashMap<String, String>, run_id: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AncestryTermination {
+    RootReached,
+    Cycle { repeated_run_id: String },
+    TraversalLimit { next_run_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AncestryWalk {
+    ancestors: Vec<String>,
+    termination: AncestryTermination,
+}
+
+fn ancestry_from_parents(parents: &HashMap<String, String>, run_id: &str) -> AncestryWalk {
     let mut chain = Vec::new();
     let mut current = run_id.to_string();
     let mut visited = HashSet::from([current.clone()]);
-    while chain.len() < MAX_ANCESTRY_TRAVERSAL
-        && let Some(parent) = parents.get(&current)
-    {
+    while chain.len() < MAX_ANCESTRY_TRAVERSAL {
+        let Some(parent) = parents.get(&current) else {
+            return AncestryWalk {
+                ancestors: chain,
+                termination: AncestryTermination::RootReached,
+            };
+        };
         if !visited.insert(parent.clone()) {
-            break;
+            return AncestryWalk {
+                ancestors: chain,
+                termination: AncestryTermination::Cycle {
+                    repeated_run_id: parent.clone(),
+                },
+            };
         }
         chain.push(parent.clone());
         current = parent.clone();
     }
-    chain
+    let termination = parents
+        .get(&current)
+        .map_or(AncestryTermination::RootReached, |next| {
+            AncestryTermination::TraversalLimit {
+                next_run_id: next.clone(),
+            }
+        });
+    AncestryWalk {
+        ancestors: chain,
+        termination,
+    }
 }
 
 fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
@@ -366,7 +397,23 @@ async fn bubble_up_critical_finding_from_tracker(
     summary: String,
 ) {
     let (source_depth, ancestry) = tracker.finding_lineage_snapshot(&run_id).await;
-    let targets = finding_bubble_targets(&session_id, &run_id, source_depth, &ancestry);
+    match &ancestry.termination {
+        AncestryTermination::RootReached => {}
+        AncestryTermination::Cycle { repeated_run_id } => tracing::warn!(
+            target: "astra_runtime::delegation",
+            run_id,
+            repeated_run_id,
+            "delegated finding ancestry is cyclic; publishing the complete acyclic prefix"
+        ),
+        AncestryTermination::TraversalLimit { next_run_id } => tracing::error!(
+            target: "astra_runtime::delegation",
+            run_id,
+            next_run_id,
+            traversal_limit = MAX_ANCESTRY_TRAVERSAL,
+            "delegated finding ancestry exceeded the corruption guard; root projection is incomplete"
+        ),
+    }
+    let targets = finding_bubble_targets(&session_id, &run_id, source_depth, &ancestry.ancestors);
     if let Err(error) = projection_store
         .bubble_up_finding(
             &user_id,
@@ -761,6 +808,8 @@ struct DelegationTrackerState {
     runs: HashMap<String, SubRunRecord>,
     delegation_runs: HashMap<String, Vec<String>>,
     parents: HashMap<String, String>,
+    pause_flags: HashMap<String, Arc<AtomicBool>>,
+    cancel_tokens: HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
 }
 
 /// Process-local projection for live delegation controls.
@@ -770,10 +819,6 @@ struct DelegationTrackerState {
 /// source of truth for recovery.
 pub struct DelegationTracker {
     state: RwLock<DelegationTrackerState>,
-    /// run_id → cooperative pause flag (shared with the sub-run's loop)
-    pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
-    /// run_id → cancellation token (shared with the sub-run's loop)
-    cancel_tokens: RwLock<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     /// Optional session ID for journal persistence.
     session_id: Option<String>,
     /// Real-time progress per delegation.
@@ -786,8 +831,6 @@ impl DelegationTracker {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(DelegationTrackerState::default()),
-            pause_flags: RwLock::new(HashMap::new()),
-            cancel_tokens: RwLock::new(HashMap::new()),
             session_id: None,
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -798,8 +841,6 @@ impl DelegationTracker {
     pub fn with_session(session_id: String) -> Self {
         Self {
             state: RwLock::new(DelegationTrackerState::default()),
-            pause_flags: RwLock::new(HashMap::new()),
-            cancel_tokens: RwLock::new(HashMap::new()),
             session_id: Some(session_id),
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -863,7 +904,6 @@ impl DelegationTracker {
     /// Only records with `parent_run_id` set are considered (sub-runs).
     pub async fn load_from_run_records(&self, records: &[astra_services::runs::DurableRunRecord]) {
         let mut state = self.state.write().await;
-        let mut pause_flags = self.pause_flags.write().await;
 
         for rec in records {
             let (Some(parent_run_id), Some(delegation_id)) =
@@ -908,7 +948,7 @@ impl DelegationTracker {
             // Re-create pause flags for paused sub-runs
             if rec.status == STATUS_PAUSED {
                 let flag = Arc::new(AtomicBool::new(true));
-                pause_flags.insert(rec.run_id.clone(), flag);
+                state.pause_flags.insert(rec.run_id.clone(), flag);
             }
         }
     }
@@ -998,7 +1038,7 @@ impl DelegationTracker {
     }
 
     /// Read depth and ancestry from one atomic hierarchy snapshot.
-    async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, Vec<String>) {
+    async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, AncestryWalk) {
         let state = self.state.read().await;
         let depth = state
             .runs
@@ -1044,7 +1084,7 @@ impl DelegationTracker {
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
         let state = self.state.read().await;
-        ancestry_from_parents(&state.parents, run_id)
+        ancestry_from_parents(&state.parents, run_id).ancestors
     }
 
     // ── Pause / Resume ──────────────────────────────────────────────────────
@@ -1054,22 +1094,23 @@ impl DelegationTracker {
     /// Returns the flag so the caller can pass it into [`SubRunConfig::pause_flag`].
     pub async fn register_pause_flag(&self, run_id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
-        self.pause_flags
+        self.state
             .write()
             .await
+            .pause_flags
             .insert(run_id.to_string(), flag.clone());
         flag
     }
 
     /// Get the pause flag for a sub-run, if registered.
     pub async fn get_pause_flag(&self, run_id: &str) -> Option<Arc<AtomicBool>> {
-        self.pause_flags.read().await.get(run_id).cloned()
+        self.state.read().await.pause_flags.get(run_id).cloned()
     }
 
     /// Set the pause flag for a single sub-run.
     /// Returns `true` if the flag existed and was set.
     pub async fn pause_sub_run(&self, run_id: &str) -> bool {
-        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+        if let Some(flag) = self.state.read().await.pause_flags.get(run_id) {
             flag.store(true, Ordering::SeqCst);
             self.persist_event(
                 astra_services::session_journal::JournalEventType::SyncMarker,
@@ -1084,7 +1125,7 @@ impl DelegationTracker {
     /// Clear the pause flag for a single sub-run.
     /// Returns `true` if the flag existed and was cleared.
     pub async fn resume_sub_run(&self, run_id: &str) -> bool {
-        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+        if let Some(flag) = self.state.read().await.pause_flags.get(run_id) {
             flag.store(false, Ordering::SeqCst);
             self.persist_event(
                 astra_services::session_journal::JournalEventType::SyncMarker,
@@ -1099,11 +1140,15 @@ impl DelegationTracker {
     /// Pause ALL sub-runs belonging to a delegation.
     /// Returns the number of sub-runs paused.
     pub async fn pause_delegation(&self, delegation_id: &str) -> usize {
-        let records = self.get_sub_runs(delegation_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut count = 0;
-        for record in &records {
-            if let Some(flag) = flags.get(&record.run_id) {
+        for run_id in run_ids {
+            if let Some(flag) = state.pause_flags.get(run_id) {
                 flag.store(true, Ordering::SeqCst);
                 count += 1;
             }
@@ -1114,11 +1159,15 @@ impl DelegationTracker {
     /// Resume ALL sub-runs belonging to a delegation.
     /// Returns the number of sub-runs resumed.
     pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
-        let records = self.get_sub_runs(delegation_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut count = 0;
-        for record in &records {
-            if let Some(flag) = flags.get(&record.run_id) {
+        for run_id in run_ids {
+            if let Some(flag) = state.pause_flags.get(run_id) {
                 flag.store(false, Ordering::SeqCst);
                 count += 1;
             }
@@ -1129,11 +1178,14 @@ impl DelegationTracker {
     /// Pause ALL sub-runs that have a given parent run ID.
     /// Returns the number of sub-runs paused.
     pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
         let mut count = 0;
-        for child_id in &children {
-            if let Some(flag) = flags.get(child_id) {
+        for child_id in state
+            .parents
+            .iter()
+            .filter_map(|(child, parent)| (parent == parent_run_id).then_some(child))
+        {
+            if let Some(flag) = state.pause_flags.get(child_id) {
                 flag.store(true, Ordering::SeqCst);
                 count += 1;
             }
@@ -1144,11 +1196,14 @@ impl DelegationTracker {
     /// Resume ALL sub-runs that have a given parent run ID.
     /// Returns the number of sub-runs resumed.
     pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
         let mut count = 0;
-        for child_id in &children {
-            if let Some(flag) = flags.get(child_id) {
+        for child_id in state
+            .parents
+            .iter()
+            .filter_map(|(child, parent)| (parent == parent_run_id).then_some(child))
+        {
+            if let Some(flag) = state.pause_flags.get(child_id) {
                 flag.store(false, Ordering::SeqCst);
                 count += 1;
             }
@@ -1162,9 +1217,10 @@ impl DelegationTracker {
         run_id: &str,
         token: Arc<tokio_util::sync::CancellationToken>,
     ) {
-        self.cancel_tokens
+        self.state
             .write()
             .await
+            .cancel_tokens
             .insert(run_id.to_string(), token);
     }
 
@@ -1187,7 +1243,7 @@ impl DelegationTracker {
             return false;
         }
 
-        let Some(cancel_token) = self.cancel_tokens.read().await.get(run_id).cloned() else {
+        let Some(cancel_token) = self.state.read().await.cancel_tokens.get(run_id).cloned() else {
             return false;
         };
         cancel_token.cancel();
@@ -1257,9 +1313,10 @@ impl DelegationTracker {
 
     /// Check if a sub-run is currently paused.
     pub async fn is_paused(&self, run_id: &str) -> bool {
-        self.pause_flags
+        self.state
             .read()
             .await
+            .pause_flags
             .get(run_id)
             .is_some_and(|f| f.load(Ordering::Acquire))
     }
@@ -1364,19 +1421,44 @@ impl DelegationTracker {
         let mut agent_id = None;
         let mut parent_run_id = None;
         let mut final_state = result_state;
+        let mut transition_applied = false;
         {
             let mut state = self.state.write().await;
             if let Some(record) = state.runs.get_mut(run_id) {
-                // Best-effort: if transition fails, force the requested result state.
-                record.state = record
-                    .state
-                    .try_transition(result_state)
-                    .unwrap_or(result_state);
+                if record.state == result_state {
+                    // Executor completion can race recovery/replay. The
+                    // already-projected state is the idempotent authority; do
+                    // not emit a duplicate terminal event.
+                    return;
+                }
+                let previous_state = record.state;
+                let Ok(next_state) = previous_state.try_transition(result_state) else {
+                    tracing::error!(
+                        target: "astra_runtime::delegation",
+                        run_id,
+                        from = previous_state.as_str(),
+                        to = result_state.as_str(),
+                        "rejected illegal delegated sub-run result transition"
+                    );
+                    return;
+                };
+                record.state = next_state;
                 final_state = record.state;
+                transition_applied = true;
                 delegation_id = Some(record.delegation_id.clone());
                 agent_id = Some(record.agent_id.clone());
                 parent_run_id = Some(record.parent_run_id.clone());
             }
+        }
+
+        if !transition_applied {
+            tracing::warn!(
+                target: "astra_runtime::delegation",
+                run_id,
+                to = result_state.as_str(),
+                "ignored result for an untracked delegated sub-run"
+            );
+            return;
         }
 
         // Note: pause flags are NOT removed here — they are cleaned up
@@ -1488,16 +1570,12 @@ impl DelegationTracker {
         for run_id in &run_ids {
             state.runs.remove(run_id);
             state.parents.remove(run_id);
+            state.pause_flags.remove(run_id);
+            state.cancel_tokens.remove(run_id);
         }
         drop(state);
 
-        let mut pause_flags = self.pause_flags.write().await;
-        let mut cancel_tokens = self.cancel_tokens.write().await;
         let mut progress_map = self.progress.write().await;
-        for run_id in &run_ids {
-            pause_flags.remove(run_id);
-            cancel_tokens.remove(run_id);
-        }
         progress_map.remove(delegation_id);
         Ok(())
     }
@@ -2014,7 +2092,7 @@ impl DelegationEngine {
                             .await;
                         astra_core::log_persist!(
                             self.run_engine
-                                .persist_status(
+                                .persist_delegation_outcome_status(
                                     user_id,
                                     &current.run_id,
                                     STATUS_VERIFICATION_FAILED,
@@ -2051,7 +2129,7 @@ impl DelegationEngine {
                                 .await;
                             astra_core::log_persist!(
                                 self.run_engine
-                                    .persist_status(
+                                    .persist_delegation_outcome_status(
                                         user_id,
                                         &original_run_id,
                                         STATUS_FAILED,
@@ -2103,7 +2181,7 @@ impl DelegationEngine {
                             .await;
                         astra_core::log_persist!(
                             self.run_engine
-                                .persist_status(
+                                .persist_delegation_outcome_status(
                                     user_id,
                                     &original_run_id,
                                     STATUS_CANCELLED,
@@ -2257,7 +2335,7 @@ impl DelegationEngine {
                                 .await;
                             astra_core::log_persist!(
                                 self.run_engine
-                                    .persist_status(
+                                    .persist_delegation_outcome_status(
                                         user_id,
                                         &r.run_id,
                                         &r.status,
@@ -2687,7 +2765,7 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &sub_run_id,
                     STATUS_RUNNING,
@@ -2920,7 +2998,7 @@ impl DelegationEngine {
                     Ok(r) => {
                         astra_core::log_persist!(
                             run_engine
-                                .persist_status(
+                                .persist_delegation_outcome_status(
                                     &request_user_id,
                                     &run_id,
                                     &r.status,
@@ -2937,7 +3015,7 @@ impl DelegationEngine {
                     Err(e) => {
                         astra_core::log_persist!(
                             run_engine
-                                .persist_status(
+                                .persist_delegation_outcome_status(
                                     &request_user_id,
                                     &run_id,
                                     STATUS_FAILED,
@@ -3033,7 +3111,7 @@ impl DelegationEngine {
                         let cancelled = cancelled_agent_result(&panic_agent_id, &panic_run_id);
                         astra_core::log_persist!(
                             self.run_engine
-                                .persist_status(
+                                .persist_delegation_outcome_status(
                                     &request.user_id,
                                     &panic_run_id,
                                     STATUS_CANCELLED,
@@ -3058,7 +3136,7 @@ impl DelegationEngine {
                     }
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &panic_run_id,
                                 STATUS_FAILED,
@@ -3241,7 +3319,7 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &sub_run_id,
                     STATUS_RUNNING,
@@ -3353,7 +3431,7 @@ impl DelegationEngine {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &sub_run_id,
                                 &r.status,
@@ -3379,7 +3457,7 @@ impl DelegationEngine {
                 Err(e) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &sub_run_id,
                                 STATUS_FAILED,
@@ -3566,7 +3644,7 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &prod_run_id,
                     STATUS_RUNNING,
@@ -3672,7 +3750,7 @@ impl DelegationEngine {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &prod_run_id,
                                 &r.status,
@@ -3698,7 +3776,7 @@ impl DelegationEngine {
                 Err(e) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &prod_run_id,
                                 STATUS_FAILED,
@@ -3819,7 +3897,7 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &rev_run_id,
                     STATUS_RUNNING,
@@ -3913,7 +3991,7 @@ impl DelegationEngine {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &rev_run_id,
                                 &r.status,
@@ -3939,7 +4017,7 @@ impl DelegationEngine {
                 Err(e) => {
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &rev_run_id,
                                 STATUS_FAILED,
@@ -4068,7 +4146,13 @@ impl DelegationEngine {
             }
             if let Err(e) = self
                 .run_engine
-                .persist_status(&request.user_id, &run_id, "running", Some("fork"), None)
+                .persist_delegation_outcome_status(
+                    &request.user_id,
+                    &run_id,
+                    STATUS_RUNNING,
+                    Some("fork"),
+                    None,
+                )
                 .await
             {
                 astra_core::agent_warn!(
@@ -4218,7 +4302,7 @@ impl DelegationEngine {
                 let final_state = match &result {
                     Ok(r) => {
                         if let Err(e) = run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request_user_id,
                                 &run_id,
                                 &r.status,
@@ -4236,7 +4320,13 @@ impl DelegationEngine {
                     }
                     Err(e) => {
                         if let Err(pe) = run_engine
-                            .persist_status(&request_user_id, &run_id, "failed", None, Some(e))
+                            .persist_delegation_outcome_status(
+                                &request_user_id,
+                                &run_id,
+                                STATUS_FAILED,
+                                None,
+                                Some(e),
+                            )
                             .await
                         {
                             astra_core::agent_warn!(
@@ -4323,7 +4413,7 @@ impl DelegationEngine {
                         let cancelled = cancelled_agent_result(&panic_agent_id, &panic_run_id);
                         if let Err(error) = self
                             .run_engine
-                            .persist_status(
+                            .persist_delegation_outcome_status(
                                 &request.user_id,
                                 &panic_run_id,
                                 STATUS_CANCELLED,
@@ -4350,7 +4440,7 @@ impl DelegationEngine {
                     }
                     if let Err(e2) = self
                         .run_engine
-                        .persist_status(
+                        .persist_delegation_outcome_status(
                             &request.user_id,
                             &panic_run_id,
                             STATUS_FAILED,
@@ -4430,7 +4520,7 @@ impl DelegationEngine {
             .transition_status_with_event_if_current(
                 user_id,
                 run_id,
-                &[STATUS_RUNNING, STATUS_WAITING],
+                &[STATUS_RUNNING],
                 STATUS_PAUSED,
                 Some(waiting_for),
                 None,
@@ -5023,6 +5113,23 @@ mod tests {
         assert_eq!(ancestry.len(), 32);
         assert_eq!(ancestry.first().map(String::as_str), Some("run-31"));
         assert_eq!(ancestry.last().map(String::as_str), Some("run-0"));
+    }
+
+    #[test]
+    fn ancestry_corruption_guard_reports_truncation_instead_of_looking_complete() {
+        let parents = (1..=MAX_ANCESTRY_TRAVERSAL + 1)
+            .map(|depth| (format!("run-{depth}"), format!("run-{}", depth - 1)))
+            .collect::<HashMap<_, _>>();
+
+        let walk = ancestry_from_parents(&parents, &format!("run-{}", MAX_ANCESTRY_TRAVERSAL + 1));
+
+        assert_eq!(walk.ancestors.len(), MAX_ANCESTRY_TRAVERSAL);
+        assert_eq!(
+            walk.termination,
+            AncestryTermination::TraversalLimit {
+                next_run_id: "run-0".to_string()
+            }
+        );
     }
 
     #[test]
@@ -6667,6 +6774,57 @@ mod tests {
         assert_eq!(resumed.status, STATUS_RUNNING);
         assert!(resumed.waiting_for.is_none());
         assert_eq!(resumed.events.last().unwrap()["event_type"], "run_resumed");
+    }
+
+    #[tokio::test]
+    async fn waiting_sub_run_retains_its_required_context_when_parent_pauses() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        engine
+            .start_run_ext(
+                "sub-waiting",
+                "user-1",
+                "session-live",
+                Some("parent-live"),
+                Some("delegation-live"),
+                Some("coder"),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "sub-waiting".into(),
+                parent_run_id: "parent-live".into(),
+                delegation_id: "delegation-live".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+                state: SubRunState::Waiting,
+                retry_of: None,
+            })
+            .await;
+        tracker.register_pause_flag("sub-waiting").await;
+        assert!(
+            engine
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    "sub-waiting",
+                    STATUS_WAITING,
+                    Some("user_input"),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(de.pause_children_of("user-1", "parent-live").await, 0);
+        assert!(!tracker.is_paused("sub-waiting").await);
+        let durable = engine
+            .load_run("user-1", "sub-waiting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_WAITING);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
     }
 
     // ─── Verification Gate Tests ────────────────────────────────────────────
@@ -8889,7 +9047,7 @@ mod tests {
 
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
         tracker.register_cancel_token(child, token.clone()).await;
-        assert!(tracker.cancel_tokens.read().await.contains_key(child));
+        assert!(tracker.state.read().await.cancel_tokens.contains_key(child));
 
         // Complete the sub-run so cleanup_delegation can proceed
         tracker
@@ -8898,7 +9056,7 @@ mod tests {
 
         tracker.cleanup_delegation(deleg_id).await.unwrap();
         assert!(
-            !tracker.cancel_tokens.read().await.contains_key(child),
+            !tracker.state.read().await.cancel_tokens.contains_key(child),
             "cancel_tokens must be cleaned up after delegation cleanup"
         );
     }

@@ -99,6 +99,7 @@ fn initial_delegate_transcript_identity(session_id: &str, run_id: &str) -> SubRu
         run_id: run_id.to_string(),
         next_item_seq: 1,
         last_assistant_source_event_id: None,
+        persistence_blocked: false,
     }
 }
 

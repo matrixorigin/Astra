@@ -67,7 +67,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::{MySql, Pool, Row, query};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tracing::Instrument;
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
@@ -132,6 +133,8 @@ pub struct TransportMetrics {
     pub send_errors: std::sync::atomic::AtomicU64,
     pub poll_cycles: std::sync::atomic::AtomicU64,
     pub idle_poll_cycles: std::sync::atomic::AtomicU64,
+    pub directory_lease_lost: std::sync::atomic::AtomicU64,
+    pub directory_lease_renewal_errors: std::sync::atomic::AtomicU64,
 }
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
@@ -332,13 +335,19 @@ pub struct DatabaseTransport {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Active poll task abort handles — aborted on shutdown for clean drain.
-    poll_abort_handles: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    poll_abort_handles: Arc<std::sync::Mutex<HashMap<String, PollTaskControl>>>,
     /// Observable metrics.
     metrics: Arc<TransportMetrics>,
     /// Lazily started maintenance task for reclaiming stale claims and pruning
     /// expired rows.
     cleanup_scheduler: Mutex<Option<CleanupScheduler>>,
     instance_id: String,
+}
+
+#[derive(Clone)]
+struct PollTaskControl {
+    subscription_id: String,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 /// Default visibility timeout (how long before an unclaimed message reappears).
@@ -361,7 +370,7 @@ impl DatabaseTransport {
             registrations: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx,
-            poll_abort_handles: std::sync::Mutex::new(HashMap::new()),
+            poll_abort_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(TransportMetrics::default()),
             cleanup_scheduler: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4().to_string(),
@@ -651,21 +660,20 @@ impl MessageTransport for DatabaseTransport {
 
     async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
         let delegation_id = self.registrations.write().await.remove(addr).flatten();
-        let mut first_error = if let Some(delegation_id) = delegation_id.as_deref() {
-            self.unregister_directory_entry(delegation_id, addr)
-                .await
-                .err()
-        } else {
-            None
-        };
+        let mut errors = Vec::new();
+        if let Some(delegation_id) = delegation_id.as_deref()
+            && let Err(error) = self.unregister_directory_entry(delegation_id, addr).await
+        {
+            errors.push(error.to_string());
+        }
         let consumer_id = format!("{}@{}", addr.agent_id, addr.run_id);
-        if let Some(handle) = self
+        if let Some(control) = self
             .poll_abort_handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&consumer_id)
         {
-            handle.abort();
+            control.abort_handle.abort();
         }
         if let Err(error) = release_claimed_for_consumer_in_pool(
             &self.pool,
@@ -673,19 +681,21 @@ impl MessageTransport for DatabaseTransport {
             self.max_delivery_attempts,
         )
         .await
-            && first_error.is_none()
         {
-            first_error = Some(error);
+            errors.push(error.to_string());
         }
         if let Err(error) =
             release_claimed_broadcast_for_consumer_in_pool(&self.pool, &consumer_id).await
-            && first_error.is_none()
         {
-            first_error = Some(error);
+            errors.push(error.to_string());
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(MailboxError::Transport(format!(
+                "mailbox unregister completed with cleanup failures: {}",
+                errors.join("; ")
+            )))
         }
     }
 
@@ -701,34 +711,82 @@ impl MessageTransport for DatabaseTransport {
         drop(regs);
 
         let consumer_id = format!("{}@{}", addr.agent_id, addr.run_id);
-        let (tx, rx) = mpsc::channel(LOCAL_DELIVERY_BUFFER_CAPACITY);
-        let poll_task = tokio::spawn(poll_loop(
-            self.pool.clone(),
-            Arc::clone(&self.registrations),
-            addr.clone(),
-            delegation_id,
-            self.poll_interval,
-            self.max_delivery_attempts,
-            tx,
-            self.shutdown_rx.clone(),
-            Arc::clone(&self.metrics),
-            consumer_id.clone(),
-            self.instance_id.clone(),
-        ));
-        if let Some(previous) = self
+        let previous = self
             .poll_abort_handles
             .lock()
-            .unwrap()
-            .insert(consumer_id.clone(), poll_task.abort_handle())
-        {
-            previous.abort();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&consumer_id);
+        if let Some(previous) = previous {
+            previous.abort_handle.abort();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !previous.abort_handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                MailboxError::Transport(format!(
+                    "previous mailbox subscriber did not stop for {consumer_id}"
+                ))
+            })?;
+            release_claimed_for_consumer_in_pool(
+                &self.pool,
+                &consumer_id,
+                self.max_delivery_attempts,
+            )
+            .await?;
+            release_claimed_broadcast_for_consumer_in_pool(&self.pool, &consumer_id).await?;
         }
+        let (tx, rx) = mpsc::channel(LOCAL_DELIVERY_BUFFER_CAPACITY);
+        let (start_tx, start_rx) = oneshot::channel();
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let span_delegation_id = delegation_id.clone().unwrap_or_default();
+        let poll_task = tokio::spawn(
+            poll_loop(
+                self.pool.clone(),
+                Arc::clone(&self.registrations),
+                addr.clone(),
+                delegation_id,
+                self.poll_interval,
+                self.max_delivery_attempts,
+                tx,
+                self.shutdown_rx.clone(),
+                Arc::clone(&self.metrics),
+                consumer_id.clone(),
+                self.instance_id.clone(),
+                subscription_id.clone(),
+                Arc::clone(&self.poll_abort_handles),
+                start_rx,
+            )
+            .instrument(tracing::info_span!(
+                "database_mailbox_poll",
+                consumer_id = %consumer_id,
+                agent_id = %addr.agent_id,
+                run_id = %addr.run_id,
+                delegation_id = %span_delegation_id,
+                subscription_id = %subscription_id,
+            )),
+        );
+        self.poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                consumer_id.clone(),
+                PollTaskControl {
+                    subscription_id,
+                    abort_handle: poll_task.abort_handle(),
+                },
+            );
+        let _ = start_tx.send(());
 
         Ok(Box::new(DatabaseMessageStream {
             buffer_rx: rx,
             pool: self.pool.clone(),
             consumer_id,
-            _poll_task: AbortOnDrop(poll_task),
+            // Dropping a stream closes `buffer_rx`; the poll loop observes the
+            // closed sender and performs its asynchronous route/claim cleanup.
+            // Dropping a JoinHandle detaches the task instead of aborting it.
+            _poll_task: poll_task,
         }))
     }
 
@@ -857,7 +915,7 @@ impl MessageTransport for DatabaseTransport {
             );
         }
         // Abort any poll tasks that haven't noticed the signal yet.
-        for (_, h) in self
+        for (_, control) in self
             .poll_abort_handles
             .lock()
             .unwrap_or_else(|poisoned| {
@@ -869,7 +927,7 @@ impl MessageTransport for DatabaseTransport {
             })
             .drain()
         {
-            h.abort();
+            control.abort_handle.abort();
         }
         // Release all claimed messages back to pending.
         let consumer_ids: Vec<String> = self
@@ -917,13 +975,20 @@ async fn poll_loop(
     metrics: Arc<TransportMetrics>,
     consumer_id: String,
     instance_id: String,
+    subscription_id: String,
+    poll_abort_handles: Arc<std::sync::Mutex<HashMap<String, PollTaskControl>>>,
+    start_rx: oneshot::Receiver<()>,
 ) {
+    if start_rx.await.is_err() {
+        return;
+    }
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_idle_cycles: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
     let mut next_directory_renewal = tokio::time::Instant::now();
 
-    loop {
+    let mut lease_ownership_lost = false;
+    'poll: loop {
         // Check shutdown signal or receiver drop.
         if *shutdown_rx.borrow() || tx.is_closed() {
             break;
@@ -960,16 +1025,23 @@ async fn poll_loop(
                     next_directory_renewal = tokio::time::Instant::now() + DIRECTORY_RENEW_INTERVAL;
                 }
                 Ok(_) => {
+                    metrics
+                        .directory_lease_lost
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "astra_runtime::messaging::db_transport",
                         %delegation_id,
                         addr = %addr,
                         "mailbox directory lease ownership was lost; stopping subscriber"
                     );
+                    lease_ownership_lost = true;
                     break;
                 }
                 Err(error) => {
                     had_error = true;
+                    metrics
+                        .directory_lease_renewal_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     metrics
                         .poll_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1102,7 +1174,7 @@ async fn poll_loop(
                                             addr.agent_id, addr.run_id, e
                                         );
                                     }
-                                    return;
+                                    break 'poll;
                                 }
                                 metrics
                                     .messages_received
@@ -1274,7 +1346,7 @@ async fn poll_loop(
                                         message_id, consumer_id, e
                                     );
                                 }
-                                return;
+                                break 'poll;
                             }
                             metrics
                                 .messages_received
@@ -1347,6 +1419,51 @@ async fn poll_loop(
                 break;
             }
         }
+    }
+
+    let owns_subscription_slot = {
+        let mut controls = poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if controls
+            .get(&consumer_id)
+            .is_some_and(|control| control.subscription_id == subscription_id)
+        {
+            controls.remove(&consumer_id);
+            true
+        } else {
+            false
+        }
+    };
+    if !owns_subscription_slot {
+        return;
+    }
+
+    if lease_ownership_lost {
+        let mut registered = registrations.write().await;
+        if registered.get(&addr) == Some(&delegation_id) {
+            registered.remove(&addr);
+        }
+    }
+    let direct_release =
+        release_claimed_for_consumer_in_pool(&pool, &consumer_id, max_delivery_attempts).await;
+    let broadcast_release =
+        release_claimed_broadcast_for_consumer_in_pool(&pool, &consumer_id).await;
+    if let Err(error) = direct_release {
+        tracing::error!(
+            target: "astra_runtime::messaging::db_transport",
+            %consumer_id,
+            %error,
+            "subscriber stopped but direct claims could not be released"
+        );
+    }
+    if let Err(error) = broadcast_release {
+        tracing::error!(
+            target: "astra_runtime::messaging::db_transport",
+            %consumer_id,
+            %error,
+            "subscriber stopped but broadcast claims could not be released"
+        );
     }
 }
 
@@ -1531,7 +1648,7 @@ struct DatabaseMessageStream {
     buffer_rx: mpsc::Receiver<Arc<AgentMessage>>,
     pool: Pool<MySql>,
     consumer_id: String,
-    _poll_task: AbortOnDrop,
+    _poll_task: tokio::task::JoinHandle<()>,
 }
 
 #[async_trait]
@@ -2113,6 +2230,105 @@ mod tests {
         assert_eq!(recovered.id, direct.id);
         recovered_stream.acknowledge(&recovered).await.unwrap();
         assert_eq!(queue_message_status(&pool, &direct.id).await, "acked");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_replacing_subscriber_releases_claim_without_visibility_delay() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let receiver = AgentAddress::new("run-replace", "reviewer");
+        let sender = AgentAddress::new("run-sender", "coder");
+        let delegation_id = format!("delegation-{}", uuid::Uuid::new_v4());
+        let transport = DatabaseTransport::new(pool.clone())
+            .with_poll_interval(Duration::from_millis(10))
+            .with_visibility_timeout(Duration::from_secs(60));
+        transport
+            .register(receiver.clone(), Some(delegation_id))
+            .await
+            .unwrap();
+        let mut first_stream = transport.subscribe(&receiver).await.unwrap();
+        let direct = Arc::new(AgentMessage::new(
+            sender,
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "replace subscriber".into(),
+                summary: None,
+            },
+        ));
+        transport.send(Arc::clone(&direct)).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), first_stream.recv())
+            .await
+            .expect("first delivery timeout")
+            .expect("first delivery");
+        assert_eq!(first.id, direct.id);
+
+        let mut replacement = transport.subscribe(&receiver).await.unwrap();
+        let redelivered = tokio::time::timeout(Duration::from_secs(2), replacement.recv())
+            .await
+            .expect("replacement must not wait for the 60s visibility timeout")
+            .expect("replacement delivery");
+        assert_eq!(redelivered.id, direct.id);
+        replacement.acknowledge(&redelivered).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_lost_directory_lease_removes_local_route_and_stops_claiming() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let receiver = AgentAddress::new("run-lease", "reviewer");
+        let delegation_id = format!("delegation-{}", uuid::Uuid::new_v4());
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(10));
+        transport
+            .register(receiver.clone(), Some(delegation_id.clone()))
+            .await
+            .unwrap();
+        query(
+            "UPDATE agent_mailbox_directory SET owner_instance_id = ?
+             WHERE delegation_id = ? AND agent_id = ? AND run_id = ?",
+        )
+        .bind("replacement-instance")
+        .bind(&delegation_id)
+        .bind(&receiver.agent_id)
+        .bind(&receiver.run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let _stream = transport.subscribe(&receiver).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.agent_count().await == 0
+                    && transport
+                        .metrics()
+                        .directory_lease_lost
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lease loss must retire the local route promptly");
+        assert!(
+            transport
+                .poll_abort_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]

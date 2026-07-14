@@ -47,8 +47,8 @@ use astra_services::{
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
 
 const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
@@ -720,6 +720,122 @@ impl RunEngine {
             }
         }
         Ok(updated)
+    }
+
+    /// Persist an executor-produced delegation outcome without allowing a
+    /// stale child completion to overwrite a concurrent pause or cancel.
+    ///
+    /// The durable run state is authoritative. Terminal outcomes are committed
+    /// with their replay events in the same CAS; a lost CAS is reported as
+    /// `Ok(false)` and the winning durable state remains untouched.
+    pub async fn persist_delegation_outcome_status(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        let (canonical_status, expected_statuses, terminal) = match durable_run_status_kind(status)
+        {
+            DurableRunStatusKind::Running => (STATUS_RUNNING, vec![STATUS_RUNNING], false),
+            DurableRunStatusKind::Waiting => {
+                (STATUS_WAITING, vec![STATUS_RUNNING, STATUS_WAITING], false)
+            }
+            DurableRunStatusKind::Paused => {
+                (STATUS_PAUSED, vec![STATUS_RUNNING, STATUS_PAUSED], false)
+            }
+            DurableRunStatusKind::Completed => (
+                STATUS_COMPLETED,
+                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_COMPLETED],
+                true,
+            ),
+            DurableRunStatusKind::Delegated => (
+                STATUS_DELEGATED,
+                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_DELEGATED],
+                true,
+            ),
+            DurableRunStatusKind::Failed => (
+                STATUS_FAILED,
+                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_FAILED],
+                true,
+            ),
+            DurableRunStatusKind::Cancelled => (
+                STATUS_CANCELLED,
+                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_CANCELLED],
+                true,
+            ),
+            // Verification failure is an AgentResult detail, not a
+            // separate durable lifecycle state.
+            DurableRunStatusKind::Other if status == "verification_failed" => (
+                STATUS_FAILED,
+                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_FAILED],
+                true,
+            ),
+            DurableRunStatusKind::Other => {
+                return Err(format!(
+                    "unsupported delegation outcome status '{status}' for run {run_id}"
+                ));
+            }
+        };
+
+        if !terminal {
+            return self
+                .persist_status_if_current(
+                    user_id,
+                    run_id,
+                    &expected_statuses,
+                    canonical_status,
+                    waiting_for,
+                    error_message,
+                )
+                .await;
+        }
+
+        let mut events = Vec::with_capacity(2);
+        if let Some(error) = error_message {
+            events.push(serde_json::json!({
+                "event_type": "run_error",
+                "data": {
+                    "error": error,
+                    "error_code": "delegation_error",
+                    "error_kind": "delegation_error",
+                }
+            }));
+        }
+        events.push(serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "status": canonical_status,
+                "error": error_message,
+            }
+        }));
+
+        match self
+            .commit_terminal_status_with_events_if_current(
+                user_id,
+                run_id,
+                &expected_statuses,
+                canonical_status,
+                waiting_for,
+                error_message,
+                &events,
+            )
+            .await?
+        {
+            TerminalTransitionOutcome::Committed => Ok(true),
+            TerminalTransitionOutcome::Superseded(durable) => {
+                tracing::info!(
+                    target: "astra_runtime::delegation",
+                    user_id,
+                    run_id,
+                    attempted_status = canonical_status,
+                    durable_status = %durable.status,
+                    "delegation outcome lost its status CAS; preserving durable authority"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Atomically persist a status transition and its durable audit event.
@@ -1832,6 +1948,11 @@ impl UserIntentProvider for RunEngine {
                 .filter(|event_index| !already_applied.contains(event_index))
                 .collect::<Vec<_>>();
             if pending.is_empty() {
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_intent_apply",
+                    "already_applied",
+                );
                 return Ok(UserIntentApplyAck::Applied);
             }
             if matches!(
@@ -1841,6 +1962,11 @@ impl UserIntentProvider for RunEngine {
                     | DurableRunStatusKind::Delegated
                     | DurableRunStatusKind::Failed
             ) {
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_intent_apply",
+                    "run_terminal",
+                );
                 return Ok(UserIntentApplyAck::RunTerminal);
             }
 
@@ -1897,12 +2023,36 @@ impl UserIntentProvider for RunEngine {
                 )
                 .await
             {
-                Ok(true) => return Ok(UserIntentApplyAck::Applied),
+                Ok(true) => {
+                    record_control_poll_attempt(
+                        self.metrics_registry.as_ref(),
+                        "user_intent_apply",
+                        "applied",
+                    );
+                    return Ok(UserIntentApplyAck::Applied);
+                }
                 Ok(false) if attempt < USER_INTENT_APPLY_MAX_ATTEMPTS => {
+                    record_control_poll_attempt(
+                        self.metrics_registry.as_ref(),
+                        "user_intent_apply_retry",
+                        "cas_conflict",
+                    );
+                    tracing::debug!(
+                        target: "astra_runtime::run_control",
+                        run_id,
+                        attempt,
+                        max_attempts = USER_INTENT_APPLY_MAX_ATTEMPTS,
+                        "user intent apply CAS lost; retrying with a fresh durable snapshot"
+                    );
                     tokio::time::sleep(user_intent_apply_retry_delay(attempt)).await;
                 }
                 Ok(false) => break,
                 Err(error) => {
+                    record_control_poll_error(
+                        self.metrics_registry.as_ref(),
+                        "user_intent_apply",
+                        "store_error",
+                    );
                     let after = self.store.load_run(user_id, run_id).await?;
                     if after.as_ref().is_some_and(|run| {
                         let applied = applied_user_intent_indices(run);
@@ -1938,8 +2088,25 @@ impl UserIntentProvider for RunEngine {
                 | DurableRunStatusKind::Delegated
                 | DurableRunStatusKind::Failed
         ) {
+            record_control_poll_attempt(
+                self.metrics_registry.as_ref(),
+                "user_intent_apply",
+                "run_terminal",
+            );
             return Ok(UserIntentApplyAck::RunTerminal);
         }
+        record_control_poll_error(
+            self.metrics_registry.as_ref(),
+            "user_intent_apply",
+            "cas_exhausted",
+        );
+        tracing::warn!(
+            target: "astra_runtime::run_control",
+            run_id,
+            status = %run.status,
+            attempts = USER_INTENT_APPLY_MAX_ATTEMPTS,
+            "user intent apply exhausted its CAS retry budget"
+        );
         Err(format!(
             "user intent apply CAS exhausted for run {run_id} while status remained {}",
             run.status
@@ -2066,6 +2233,69 @@ mod tests {
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
+    }
+
+    #[tokio::test]
+    async fn delegation_completion_cannot_overwrite_pause_or_cancel() {
+        for (run_id, winning_status) in [
+            ("delegation-pause-wins", STATUS_PAUSED),
+            ("delegation-cancel-wins", STATUS_CANCELLED),
+        ] {
+            let engine = test_engine();
+            engine
+                .start_run(run_id, "user-1", "session-1")
+                .await
+                .unwrap();
+            engine
+                .persist_status("user-1", run_id, winning_status, Some("control"), None)
+                .await
+                .unwrap();
+
+            let committed = engine
+                .persist_delegation_outcome_status("user-1", run_id, STATUS_COMPLETED, None, None)
+                .await
+                .unwrap();
+
+            assert!(!committed, "the stale child result must lose its CAS");
+            let durable = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+            assert_eq!(durable.status, winning_status);
+            assert!(!durable.events.iter().any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_finished")
+                    && event["data"]["status"] == STATUS_COMPLETED
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_verification_failure_uses_canonical_failed_status() {
+        let engine = test_engine();
+        engine
+            .start_run("delegation-verification", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        assert!(
+            engine
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    "delegation-verification",
+                    "verification_failed",
+                    None,
+                    Some("evidence did not satisfy the gate"),
+                )
+                .await
+                .unwrap()
+        );
+        let durable = engine
+            .load_run("user-1", "delegation-verification")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_FAILED);
+        assert!(durable.events.iter().any(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_finished")
+                && event["data"]["status"] == STATUS_FAILED
+        }));
     }
 
     #[test]

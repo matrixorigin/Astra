@@ -2733,7 +2733,7 @@ fn local_transcript_tool_result(
 
 fn local_transcript_item(
     session_id: &str,
-    payload: astra_services::session_journal::SessionTranscriptItem,
+    payload: astra_services::session_journal::JournalTranscriptItem,
     item_seq: i64,
     created_at: String,
 ) -> Option<astra_thin_client::SessionTranscriptItem> {

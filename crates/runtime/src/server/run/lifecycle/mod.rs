@@ -7181,11 +7181,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     persist_status_update = false;
                     persisted_status = RunStatus::Paused;
                     if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                        run.status = RunStatus::Paused;
-                        run.pause_flag.store(true, Ordering::SeqCst);
-                        run.waiting_for
-                            .get_or_insert_with(|| "user_resume".to_string());
-                        run.live_tx = None;
+                        if run.status == RunStatus::Paused
+                            || run.status.try_transition(&RunStatus::Paused).is_ok()
+                        {
+                            run.status = RunStatus::Paused;
+                            run.pause_flag.store(true, Ordering::SeqCst);
+                            run.waiting_for
+                                .get_or_insert_with(|| "user_resume".to_string());
+                            run.live_tx = None;
+                        } else {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                current_status = %run.status.as_str(),
+                                "durable pause projection arrived after an incompatible local terminal state"
+                            );
+                        }
                     }
                 }
 
@@ -8269,11 +8280,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     persist_status_update = false;
                     persisted_status = RunStatus::Paused;
                     if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                        run.status = RunStatus::Paused;
-                        run.pause_flag.store(true, Ordering::SeqCst);
-                        run.waiting_for
-                            .get_or_insert_with(|| "user_resume".to_string());
-                        run.live_tx = None;
+                        if run.status == RunStatus::Paused
+                            || run.status.try_transition(&RunStatus::Paused).is_ok()
+                        {
+                            run.status = RunStatus::Paused;
+                            run.pause_flag.store(true, Ordering::SeqCst);
+                            run.waiting_for
+                                .get_or_insert_with(|| "user_resume".to_string());
+                            run.live_tx = None;
+                        } else {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                current_status = %run.status.as_str(),
+                                "durable pause projection arrived after an incompatible local terminal state"
+                            );
+                        }
                     }
                 }
 

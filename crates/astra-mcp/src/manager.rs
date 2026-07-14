@@ -49,6 +49,25 @@ pub struct McpClientManager {
     roots: Arc<RwLock<Vec<Root>>>,
 }
 
+/// A fully established MCP connection that has not yet been published into a
+/// shared manager. Connection handshakes may involve process startup and
+/// network I/O, so callers can prepare one without holding the manager lock and
+/// then install it with a short synchronous mutation.
+pub struct PreparedMcpConnection {
+    name: String,
+    connection: Arc<McpConnection>,
+}
+
+impl PreparedMcpConnection {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn connection(&self) -> Arc<McpConnection> {
+        self.connection.clone()
+    }
+}
+
 impl Default for McpClientManager {
     fn default() -> Self {
         Self {
@@ -69,6 +88,38 @@ impl McpClientManager {
     /// Get a reference to the shared roots list.
     pub fn roots(&self) -> &Arc<RwLock<Vec<Root>>> {
         &self.roots
+    }
+
+    /// Establish a connection without mutating (or requiring a lock on) a
+    /// shared manager.
+    pub async fn prepare_connection(
+        config: McpServerConfig,
+        roots: Arc<RwLock<Vec<Root>>>,
+    ) -> Result<Option<PreparedMcpConnection>, McpError> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let name = config.name.clone();
+        let connection = connection::connect_to_server(config, roots).await?;
+        Ok(Some(PreparedMcpConnection {
+            name,
+            connection: Arc::new(connection),
+        }))
+    }
+
+    /// Atomically publish a prepared connection into this manager.
+    pub fn install_prepared_connection(&mut self, prepared: PreparedMcpConnection) -> usize {
+        let tool_count = prepared.connection.tools().len();
+        self.states
+            .insert(prepared.name.clone(), ConnectionState::Connected);
+        self.connections.insert(prepared.name, prepared.connection);
+        self.rebuild_tool_route_index();
+        tool_count
+    }
+
+    /// Record a failed detached connection attempt for status surfaces.
+    pub fn record_connection_failure(&mut self, name: impl Into<String>) {
+        self.states.insert(name.into(), ConnectionState::Failed);
     }
 
     /// Connect to an MCP server with retry. Returns the number of tools discovered.
@@ -491,6 +542,7 @@ fn public_tool_name(server_name: &str, tool: &Tool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{RetryConfig, Transport};
     use std::sync::Arc;
 
     fn empty_schema() -> Arc<serde_json::Map<String, serde_json::Value>> {
@@ -504,6 +556,30 @@ mod tests {
         assert!(manager.all_tools().is_empty());
         assert!(manager.find_tool("any_tool").is_none());
         assert!(manager.tool_collisions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_connection_can_be_prepared_without_mutating_shared_manager() {
+        let manager = McpClientManager::new();
+        let config = McpServerConfig {
+            name: "disabled".to_string(),
+            transport: Transport::Stdio {
+                command: vec!["must-not-run".to_string()],
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+            description: String::new(),
+            enabled: false,
+            retry: RetryConfig::default(),
+        };
+
+        let prepared = McpClientManager::prepare_connection(config, manager.roots().clone())
+            .await
+            .expect("disabled configuration is a no-op");
+
+        assert!(prepared.is_none());
+        assert_eq!(manager.connection_count(), 0);
+        assert!(manager.server_state("disabled").is_none());
     }
 
     #[test]

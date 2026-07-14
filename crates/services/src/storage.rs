@@ -863,21 +863,16 @@ async fn migrate_legacy_edge_pending_dispatch_if_needed(
     }
 
     let active_row = query(
-        "SELECT COUNT(*) AS active_rows FROM edge_pending_dispatch \
-         WHERE status IN ('pending', 'dispatched')",
+        "SELECT 1 AS active_row FROM edge_pending_dispatch \
+         WHERE status IN ('pending', 'dispatched') LIMIT 1",
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    let active_rows: i64 = active_row.try_get("active_rows")?;
-    if active_rows != 0 {
+    if active_row.is_some() {
         return Err(sqlx::Error::Protocol(format!(
-            "legacy edge_pending_dispatch contains {active_rows} active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
+            "legacy edge_pending_dispatch contains active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
         )));
     }
-    let row = query("SELECT COUNT(*) AS total_rows FROM edge_pending_dispatch")
-        .fetch_one(pool)
-        .await?;
-    let total_rows: i64 = row.try_get("total_rows")?;
     query(&format!(
         "RENAME TABLE {} TO {}",
         crate::snapshot_sql::quote_mysql_identifier("edge_pending_dispatch"),
@@ -888,7 +883,6 @@ async fn migrate_legacy_edge_pending_dispatch_if_needed(
     tracing::info!(
         legacy_table = "edge_pending_dispatch",
         archive_table = EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE,
-        total_rows,
         "archived terminal legacy edge dispatch rows before turn-scoped schema creation"
     );
     Ok(())

@@ -431,6 +431,13 @@ impl PlanOutputSink for ChannelSink {
 pub struct PlanExecutorHandle {
     pub update_rx: tokio::sync::mpsc::UnboundedReceiver<PlanUpdate>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
+    execution_cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for PlanExecutorHandle {
+    fn drop(&mut self) {
+        self.execution_cancel.cancel();
+    }
 }
 
 /// Create a linked pair of channels for plan executor ↔ plan monitor communication.
@@ -908,7 +915,16 @@ pub fn create_plan_channels() -> (
 ) {
     let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    (PlanExecutorHandle { update_rx, cmd_tx }, update_tx, cmd_rx)
+    let execution_cancel = tokio_util::sync::CancellationToken::new();
+    (
+        PlanExecutorHandle {
+            update_rx,
+            cmd_tx,
+            execution_cancel,
+        },
+        update_tx,
+        cmd_rx,
+    )
 }
 
 impl PlanExecutorHandle {
@@ -921,7 +937,9 @@ impl PlanExecutorHandle {
     pub fn send_command(&self, cmd: PlanCommand) -> Result<(), String> {
         self.cmd_tx
             .send(cmd)
-            .map_err(|e| format!("plan executor channel closed: {e}"))
+            .map_err(|e| format!("plan executor channel closed: {e}"))?;
+        self.execution_cancel.cancel();
+        Ok(())
     }
 
     /// True when all update senders were dropped (executor task ended) and no more
@@ -1128,10 +1146,11 @@ pub(crate) struct BackgroundPlanContext {
 /// be returned via `PlanUpdate::PlanFinished` when execution finishes.
 pub(crate) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
     let (handle, update_tx, cmd_rx) = create_plan_channels();
+    let execution_cancel = handle.execution_cancel.clone();
 
     tokio::spawn(async move {
         let mut ctx = ctx;
-        plan_executor_task(&mut ctx, update_tx, cmd_rx).await;
+        plan_executor_task(&mut ctx, update_tx, cmd_rx, execution_cancel).await;
         cleanup_plan_root_mailbox(&mut ctx).await;
     });
 
@@ -1167,6 +1186,7 @@ async fn plan_executor_task(
     ctx: &mut BackgroundPlanContext,
     update_tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
+    execution_cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::cli::chat_stream::stream_chat_sse;
 
@@ -1208,6 +1228,12 @@ async fn plan_executor_task(
 
     loop {
         // ── Check for commands before starting next round ─────────────
+        if execution_cancel.is_cancelled() && cmd_rx.is_empty() {
+            let _ = update_tx.send(PlanUpdate::PlanError {
+                error: "Plan stopped because its session owner was released".into(),
+            });
+            return;
+        }
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 PlanCommand::Pause => {
@@ -1487,7 +1513,7 @@ async fn plan_executor_task(
             let subtask_start = std::time::Instant::now();
 
             // Create cancellation token for this subtask
-            let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+            let cancel_token = Arc::new(execution_cancel.child_token());
 
             // Create stream event channel for real-time LLM/tool visibility
             let (stream_tx, mut stream_rx) = chat_stream::stream_event_channel();
@@ -1613,9 +1639,49 @@ async fn plan_executor_task(
                 })
                 .await;
 
-            // The stream_chat_sse call is done; drop the senders by ending the forwarders.
-            stream_forwarder.abort();
-            approval_forwarder.abort();
+            // `stream_chat_sse` has dropped its senders. Drain buffered UI and
+            // approval events before completing the subtask; aborting here
+            // used to discard up to a full bounded channel, including
+            // approval oneshots. The timeout is only a shutdown guard for a
+            // leaked sender, not the normal completion path.
+            for (name, mut forwarder) in [
+                ("stream", stream_forwarder),
+                ("approval", approval_forwarder),
+            ] {
+                if tokio::time::timeout(Duration::from_secs(1), &mut forwarder)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        target: "astra_cli::plan_executor",
+                        forwarder = name,
+                        "plan subtask forwarder did not close after its producer; aborting leaked task"
+                    );
+                    forwarder.abort();
+                    let _ = forwarder.await;
+                }
+            }
+
+            if execution_cancel.is_cancelled() {
+                match cmd_rx.try_recv().ok() {
+                    Some(PlanCommand::Pause) => {
+                        let pct = ctx.plan.progress_pct();
+                        let remaining = ctx
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|subtask| subtask.status == TaskStatus::Pending)
+                            .count();
+                        sink.interrupted_pause(pct, remaining);
+                    }
+                    Some(PlanCommand::Cancel) | None => {
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: "Plan cancelled by user or session shutdown".into(),
+                        });
+                    }
+                }
+                return;
+            }
 
             match turn_result {
                 Ok(result) => {

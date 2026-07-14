@@ -6,10 +6,8 @@
 # portable "disable TLS" argument. `ASTRA_MYSQL_TLS_MODE` describes the
 # endpoint policy instead of exposing one client's command-line syntax:
 #
-#   auto (default) - probe the endpoint with a harmless authenticated request,
-#                    prefer TLS when it is usable, otherwise use plaintext.
-#                    This is appropriate for local MatrixOne and does not let
-#                    ambient client defaults silently force TLS.
+#   auto (default) - local endpoints may fall back to plaintext after a harmless
+#                    probe; remote endpoints require TLS and never downgrade.
 #   disabled       - require plaintext. Use this only for a known non-TLS
 #                    development endpoint.
 #   required       - require TLS.
@@ -22,6 +20,7 @@ set -euo pipefail
 
 mysql_client="${ASTRA_MYSQL_CLIENT:-mysql}"
 tls_mode="${ASTRA_MYSQL_TLS_MODE:-auto}"
+mysql_host="${MATRIXONE_HOST:-127.0.0.1}"
 
 case "$tls_mode" in
     auto|disabled|required) ;;
@@ -47,7 +46,7 @@ fi
 
 args=(
     --protocol=TCP
-    "-h${MATRIXONE_HOST:-127.0.0.1}"
+    "-h${mysql_host}"
     "-P${MATRIXONE_PORT:-6001}"
     "-u${MATRIXONE_USER:-root}"
     "-p${MATRIXONE_PASSWORD:-111}"
@@ -83,12 +82,22 @@ case "$tls_mode" in
         # caller's command runs, so an SQL mutation is never retried merely to
         # work around a TLS handshake. Prefer encrypted transport when it is
         # available, then make a deliberate plaintext fallback.
-        if [[ "$supports_ssl_mode" == true ]]; then
-            candidates=(--ssl-mode=PREFERRED --ssl-mode=DISABLED)
-        elif [[ "$supports_skip_ssl" == true ]]; then
-            candidates=("" --skip-ssl)
+        if [[ "$mysql_host" == "127.0.0.1" || "$mysql_host" == "localhost" || "$mysql_host" == "::1" ]]; then
+            if [[ "$supports_ssl_mode" == true ]]; then
+                candidates=(--ssl-mode=PREFERRED --ssl-mode=DISABLED)
+            elif [[ "$supports_skip_ssl" == true ]]; then
+                candidates=("" --skip-ssl)
+            else
+                candidates=("")
+            fi
+        elif [[ "$supports_ssl_mode" == true ]]; then
+            candidates=(--ssl-mode=REQUIRED)
+        elif [[ "$supports_ssl" == true ]]; then
+            candidates=(--ssl)
         else
-            candidates=("")
+            echo "Auto TLS mode will not downgrade remote endpoint ${mysql_host} to plaintext." >&2
+            echo "Use ASTRA_MYSQL_TLS_MODE=disabled only when plaintext is explicitly intended." >&2
+            exit 2
         fi
         for candidate in "${candidates[@]}"; do
             probe_args=("${args[@]}")

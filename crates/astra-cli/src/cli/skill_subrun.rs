@@ -119,6 +119,10 @@ pub(crate) struct SubRunJournalIdentity {
     /// envelopes also use the assistant role, so only visible model content
     /// advances this acknowledgement identity.
     pub(crate) last_assistant_source_event_id: Option<String>,
+    /// A failed canonical append stops the child at its next model boundary.
+    /// Continuing to accumulate transcript data in memory while the journal
+    /// is permanently unavailable is neither durable nor bounded.
+    pub(crate) persistence_blocked: bool,
 }
 
 impl SubRunHost {
@@ -166,12 +170,14 @@ impl SubRunHost {
         match journal.append_bulk_no_sync(&events) {
             Ok(()) => {
                 identity.next_item_seq = next_item_seq;
+                identity.persistence_blocked = false;
                 if assistant_source_event_id.is_some() {
                     identity.last_assistant_source_event_id = assistant_source_event_id;
                 }
                 true
             }
             Err(error) => {
+                identity.persistence_blocked = true;
                 state.restore_run_transcript_capture_front(accepted_messages);
                 tracing::warn!(
                     %error,
@@ -347,6 +353,16 @@ impl AgenticLoopHost for SubRunHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        if self
+            .journal_identity
+            .as_ref()
+            .is_some_and(|identity| identity.persistence_blocked)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ResourceLimit,
+                "Child transcript persistence is unavailable; the sub-run stopped before accumulating non-durable conversation history.",
+            ));
+        }
         self.executor
             .set_send_message_context(state.messaging.mailbox.as_ref().map(|mailbox| {
                 let run_id = state
@@ -566,7 +582,13 @@ impl AgenticLoopHost for SubRunHost {
             );
         }
 
-        let _ = self.flush_agent_transcript(state);
+        if !self.flush_agent_transcript(state) {
+            tracing::error!(
+                target: "astra_cli::subrun_transcript",
+                agent_id = %self.agent_id,
+                "child transcript persistence failed; next model boundary will stop"
+            );
+        }
 
         // Unified timeline: emit the LATEST round event tagged with
         // agent_id to the parent's journal so the timeline renderer
@@ -1170,6 +1192,7 @@ mod tests {
                 run_id: "child-run".into(),
                 next_item_seq,
                 last_assistant_source_event_id,
+                persistence_blocked: false,
             }),
             max_completion_tokens: None,
             effort: None,
@@ -1304,6 +1327,10 @@ mod tests {
         {
             let identity = host.journal_identity.as_ref().unwrap();
             assert_eq!(identity.next_item_seq, 7);
+            assert!(
+                identity.persistence_blocked,
+                "a failed durable boundary must stop further transcript growth"
+            );
             assert_eq!(
                 identity.last_assistant_source_event_id.as_deref(),
                 Some("older-assistant-item")

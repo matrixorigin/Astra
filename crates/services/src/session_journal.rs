@@ -936,7 +936,7 @@ pub struct CoordinationMeta {
 /// monotonic within it. `source_event_id` is immutable across retries, replay
 /// and pagination; consumers must never use message text as an identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionTranscriptItem {
+pub struct JournalTranscriptItem {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_event_id: String,
     pub run_id: String,
@@ -1375,7 +1375,7 @@ pub struct JournalEvent {
     pub coordination: Option<CoordinationMeta>,
     /// Canonical conversation item for a local root or delegated run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript_item: Option<SessionTranscriptItem>,
+    pub transcript_item: Option<JournalTranscriptItem>,
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
@@ -2119,7 +2119,7 @@ pub struct JournalAppendDelta {
     pub next_offset: u64,
 }
 
-pub fn read_journal_append_delta(
+pub fn read_durable_journal_append_delta(
     session_id: &str,
     offset: u64,
 ) -> std::io::Result<JournalAppendDelta> {
@@ -2128,16 +2128,18 @@ pub fn read_journal_append_delta(
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_file_path(session_id);
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && offset == 0 => {
-            return Ok(JournalAppendDelta {
-                events: Vec::new(),
-                next_offset: 0,
-            });
-        }
-        Err(error) => return Err(error),
-    };
+    if offset == 0 && !path.exists() {
+        return Ok(JournalAppendDelta {
+            events: Vec::new(),
+            next_offset: 0,
+        });
+    }
+    // Hold the same exclusive file lock used by appenders while establishing
+    // the durability barrier and reading the suffix. Without this, an appender
+    // could add no-sync bytes after sync_data but before read_to_end, allowing
+    // a derived outbox cursor to advance beyond the crash-durable journal.
+    let mut file = open_locked_journal_file(&path)?;
+    file.sync_data()?;
     let len = file.metadata()?.len();
     if offset > len {
         return Err(std::io::Error::new(
@@ -3765,7 +3767,7 @@ impl JournalEvent {
             message.clone()
         };
         let mut event = Self::base(JournalEventType::TranscriptItem, Some(session_id));
-        event.transcript_item = Some(SessionTranscriptItem {
+        event.transcript_item = Some(JournalTranscriptItem {
             source_event_id: local_transcript_source_event_id(
                 session_id, run_id, agent_id, item_seq,
             ),

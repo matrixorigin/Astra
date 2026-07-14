@@ -2686,6 +2686,22 @@ mod tests {
     }
 
     #[test]
+    fn bypass_allows_read_only_cd_git_pipeline_without_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "cd /workspace && git diff origin/main...HEAD --stat | awk '{print $1}'"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+    }
+
+    #[test]
     fn structured_git_force_push_feature_branch_is_soft_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2770,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
+    fn git_worktree_destructive_bash_is_advisory_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
@@ -2782,16 +2798,14 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(
-            matches!(envelope.source, DecisionSource::GitSafety { ref violation } if violation.contains("git restore")),
-            "{:?}",
-            envelope.source
-        );
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+        assert!(
+            envelope
+                .trace
+                .iter()
+                .any(|step| step.note.contains("soft git risk retained as advisory"))
+        );
     }
 
     #[test]
@@ -2819,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_destructive_broad_session_override_does_not_fall_through() {
+    fn git_worktree_destructive_broad_session_override_remains_advisory() {
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
@@ -2835,11 +2849,7 @@ mod tests {
 
         let envelope = evaluate_permission("bash", &args, &ctx);
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(
             envelope.trace.iter().any(|step| step
                 .note
@@ -2850,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_destructive_prefix_session_override_does_not_fall_through() {
+    fn git_worktree_destructive_prefix_session_override_remains_advisory() {
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
@@ -2869,11 +2879,7 @@ mod tests {
 
         let envelope = evaluate_permission("bash", &args, &ctx);
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(
             envelope.trace.iter().any(|step| step
                 .note

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{HashMap, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Maximum text copied from one delegated result into session-state
@@ -131,26 +132,52 @@ impl DelegatedFindingEnvelope {
     }
 
     pub fn critical_summary(self) -> Option<String> {
-        let summaries = self
+        let mut merged = Vec::<(String, Vec<String>)>::new();
+        let mut summary_index = HashMap::<String, usize>::new();
+        let mut evidence_seen = Vec::<HashSet<String>>::new();
+        for finding in self
             .findings
             .into_iter()
             .filter(|finding| finding.severity == DelegatedFindingSeverity::Critical)
-            .filter_map(|finding| {
-                let summary = finding.summary.trim();
-                if summary.is_empty() {
-                    return None;
+        {
+            let summary = finding.summary.trim();
+            if summary.is_empty() {
+                continue;
+            }
+            let summary_key = summary
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let index = *summary_index.entry(summary_key).or_insert_with(|| {
+                let index = merged.len();
+                merged.push((summary.to_string(), Vec::new()));
+                evidence_seen.push(HashSet::new());
+                index
+            });
+            for evidence in finding.evidence {
+                let evidence = evidence.trim();
+                if evidence.is_empty() {
+                    continue;
                 }
-                let evidence = finding
-                    .evidence
-                    .into_iter()
-                    .map(|item| item.trim().to_string())
-                    .filter(|item| !item.is_empty())
-                    .collect::<Vec<_>>();
-                Some(if evidence.is_empty() {
-                    summary.to_string()
+                let key = evidence
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                if evidence_seen[index].insert(key) {
+                    merged[index].1.push(evidence.to_string());
+                }
+            }
+        }
+        let summaries = merged
+            .into_iter()
+            .map(|(summary, evidence)| {
+                if evidence.is_empty() {
+                    summary
                 } else {
                     format!("{summary}\nEvidence:\n- {}", evidence.join("\n- "))
-                })
+                }
             })
             .collect::<Vec<_>>();
         if summaries.is_empty() {
@@ -239,6 +266,23 @@ mod tests {
             DelegatedFindingSeverity::Unknown
         );
         assert_eq!(envelope.critical_summary().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn critical_summary_merges_duplicate_findings_and_evidence() {
+        let parsed = DelegatedFindingEnvelope::parse(
+            r#"{"findings":[
+                {"severity":"critical","summary":"Lost update race","evidence":["CAS missing","same row"]},
+                {"severity":"CRITICAL","summary":"  lost   update race ","evidence":["cas missing","second trace"]}
+            ]}"#,
+        );
+        let DelegatedFindingParse::Structured(envelope) = parsed else {
+            panic!("expected structured envelope");
+        };
+        assert_eq!(
+            envelope.critical_summary().as_deref(),
+            Some("Lost update race\nEvidence:\n- CAS missing\n- same row\n- second trace")
+        );
     }
 
     #[test]

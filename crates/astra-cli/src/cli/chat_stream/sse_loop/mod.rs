@@ -684,6 +684,7 @@ pub(crate) async fn stream_chat_sse(
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx.clone(),
+        pending_ordered_stream_events: std::collections::VecDeque::new(),
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,

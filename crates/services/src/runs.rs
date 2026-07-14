@@ -5214,14 +5214,19 @@ impl RunStateStore for DatabaseRunStateStore {
                 .collect::<DbStoreResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?;
             let last_event_idx = first_event_idx + event_rows.len() as i64 - 1;
+            let owner_lease_expires_at = self.lease_expires_at();
             let updated = sqlx::query(
                 "UPDATE agent_runs
-                 SET status = ?, waiting_for = NULL, last_event_idx = ?, updated_at = NOW(6)
+                 SET status = ?, waiting_for = NULL, last_event_idx = ?,
+                     owner_pod_id = ?, owner_lease_expires_at = ?,
+                     run_generation = run_generation + 1, updated_at = NOW(6)
                  WHERE user_id = ? AND run_id = ? AND status = ? AND waiting_for = ?
                    AND last_event_idx = ?",
             )
             .bind(STATUS_RUNNING)
             .bind(last_event_idx)
+            .bind(&self.owner_pod_id)
+            .bind(owner_lease_expires_at)
             .bind(user_id)
             .bind(run_id)
             .bind(STATUS_WAITING)
@@ -8981,6 +8986,12 @@ mod tests {
         let durable = fixture.load_run(&user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_RUNNING);
         assert_eq!(durable.waiting_for, None);
+        assert!(matches!(
+            durable.owner_pod_id.as_deref(),
+            Some("interaction-pod-a" | "interaction-pod-b")
+        ));
+        assert!(durable.owner_lease_expires_at.is_some());
+        assert_eq!(durable.run_generation, 1);
         assert_eq!(
             durable
                 .events

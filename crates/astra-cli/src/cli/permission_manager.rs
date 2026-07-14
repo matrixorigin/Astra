@@ -3093,9 +3093,9 @@ impl PermissionManager {
         let side_effect = Self::classify_with_args(name, args);
 
         // Step 2: Git safety approval gate.
-        // Broad overrides cannot skip this gate. Auto/Bypass can resolve soft
-        // findings without prompting; hard findings remain denied/prompted by
-        // mode policy.
+        // Broad overrides cannot skip this gate. Bypass suppresses approval
+        // interaction for every Git finding; true execution/path boundaries
+        // are enforced by the independent safety and sandbox gates below.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -3113,10 +3113,6 @@ impl PermissionManager {
                     return false;
                 }
                 if self.mode.skips_human_approval_prompts() {
-                    if has_hard {
-                        eprintln!("  {}", "  Git safety hard violation — blocked".red());
-                        return false;
-                    }
                     return true;
                 }
                 // Soft-only violations: respect auto mode and session overrides.
@@ -3130,8 +3126,8 @@ impl PermissionManager {
                         return allowed;
                     }
                 }
-                // Hard git findings still require explicit approval in Auto.
-                // Bypass is the explicit "do not interrupt me" mode.
+                // Execution-redirection Git findings still require explicit
+                // approval in Auto. Bypass is the explicit no-prompt mode.
                 if self.mode == PermissionMode::Auto && has_hard {
                     eprintln!(
                         "  {}",
@@ -5670,28 +5666,25 @@ mod tests {
         assert!(pm.recent_rejections().is_empty());
     }
 
-    // ── Security: session overrides cannot bypass safety checks ──────────────
+    // ── Risk evidence remains separate from true safety boundaries ──────────
 
     #[test]
-    fn broad_session_override_cannot_bypass_git_safety() {
-        // CRITICAL: a broad "bash" approval must not cover destructive git.
-        // Only an exact command approval can reuse this gate.
+    fn auto_mode_keeps_worktree_destructive_as_advisory() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Auto);
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
-        // Must NOT be Allow in Auto; broad overrides are too wide here.
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, GateOutcome::NeedApproval { .. }),
-            "broad session override must not bypass git safety: got {decision:?}"
+            matches!(decision, GateOutcome::Allow),
+            "worktree mutation is risk evidence, not a hard boundary: got {decision:?}"
         );
     }
 
     #[test]
-    fn exact_session_override_allows_same_bounded_git_safety_request_only() {
+    fn auto_mode_does_not_require_per_path_approvals_for_worktree_mutation() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Auto);
         let args = serde_json::json!({
@@ -5710,8 +5703,8 @@ mod tests {
         });
         let sibling_decision = pm.check_nonblocking("bash", &sibling);
         assert!(
-            matches!(sibling_decision, GateOutcome::NeedApproval { .. }),
-            "exact git approval must not widen to sibling commands: got {sibling_decision:?}"
+            matches!(sibling_decision, GateOutcome::Allow),
+            "Auto mode should not interrupt for another workspace path: got {sibling_decision:?}"
         );
     }
 
@@ -7117,6 +7110,14 @@ mod tests {
 
         assert!(matches!(
             pm.check_nonblocking("bash", &args),
+            GateOutcome::Allow
+        ));
+
+        let read_only_compound = serde_json::json!({
+            "command": "cd /home/xupeng/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
+        });
+        assert!(matches!(
+            pm.check_nonblocking("bash", &read_only_compound),
             GateOutcome::Allow
         ));
     }

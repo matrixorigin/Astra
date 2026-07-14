@@ -725,6 +725,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id: config.run_id.clone(),
                     next_item_seq: 1,
                     last_assistant_source_event_id: None,
+                    persistence_blocked: false,
                 });
             } else {
                 tracing::warn!(

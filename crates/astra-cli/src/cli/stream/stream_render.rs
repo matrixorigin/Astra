@@ -61,8 +61,8 @@ pub(crate) fn agent_id_from_args(args: &Value) -> Option<String> {
 
 fn agent_fanout_slot_from_args(args: &Value) -> Option<AgentFanoutSlotIdentity> {
     let group_id = args.get("fanout_group_id")?.as_str()?;
-    let target_count = args.get("fanout_target_count")?.as_u64()? as usize;
-    let slot_index = args.get("fanout_slot_index")?.as_u64()? as usize;
+    let target_count = usize::try_from(args.get("fanout_target_count")?.as_u64()?).ok()?;
+    let slot_index = usize::try_from(args.get("fanout_slot_index")?.as_u64()?).ok()?;
     let slot_id = args
         .get("fanout_slot_id")
         .and_then(Value::as_str)

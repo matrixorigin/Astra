@@ -17,8 +17,6 @@ pub enum GitSafetyViolation {
     ForcePush,
     /// Force push to a protected branch (main, master, develop).
     ForcePushProtectedBranch { branch: String },
-    /// Compound command chains `cd` with `git` (bare repo attack vector).
-    CdGitCompound,
     /// `git -c` used (arbitrary config = code execution via core.fsmonitor, diff.external, etc.).
     GitConfigFlag,
     /// `git --exec-path` or `--config-env` used (execution path manipulation).
@@ -65,12 +63,6 @@ impl std::fmt::Display for GitSafetyViolation {
             Self::ForcePush => write!(f, "force push requires explicit user approval"),
             Self::ForcePushProtectedBranch { branch } => {
                 write!(f, "force push to protected branch '{branch}' blocked")
-            }
-            Self::CdGitCompound => {
-                write!(
-                    f,
-                    "cd + git compound command blocked (bare repo attack vector)"
-                )
             }
             Self::GitConfigFlag => {
                 write!(f, "git -c flag blocked (arbitrary config = code execution)")
@@ -129,15 +121,16 @@ impl std::fmt::Display for GitSafetyViolation {
 
 /// Whether a violation is "soft" — respects auto-run mode and session overrides.
 ///
-/// Soft violations are common legitimate operations (e.g. `cd repo && git status`)
-/// that should not repeatedly prompt the user after they chose auto-run.
-/// Hard violations (injection, config manipulation) always require explicit approval.
+/// Soft violations are legitimate repository mutations. They remain structured
+/// risk evidence, but are not permission or capability boundaries by themselves.
+/// Findings that can redirect execution or escape the selected repository remain
+/// hard boundaries and are handled independently of destructive intent.
 pub fn is_soft_violation(v: &GitSafetyViolation) -> bool {
     matches!(
         v,
         GitSafetyViolation::ForcePush
-            | GitSafetyViolation::CdGitCompound
             | GitSafetyViolation::CommitAmend
+            | GitSafetyViolation::WorktreeDestructive { .. }
             | GitSafetyViolation::BranchForceDelete
             | GitSafetyViolation::StashDestructive { .. }
             | GitSafetyViolation::TagDelete
@@ -159,7 +152,6 @@ pub fn validate_git_command(command: &str) -> Vec<GitSafetyViolation> {
     check_commit_message(command, &mut violations);
     check_hook_skip_flags(&lower, &mut violations);
     check_force_push(&lower, &mut violations);
-    check_cd_git_compound(&lower, &mut violations);
     check_git_config_flags(command, &mut violations);
     check_rebase_exec(command, &lower, &mut violations);
     check_clone_recurse_submodules(&lower, &mut violations);
@@ -476,16 +468,6 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
                 }
             }
         }
-    }
-}
-
-fn check_cd_git_compound(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
-    let has_cd = shell_words(lower).any(|word| word == "cd");
-    let has_git = contains_git_invocation(lower);
-    let is_compound = lower.contains("&&") || lower.contains("||") || lower.contains(';');
-
-    if has_cd && has_git && is_compound {
-        violations.push(GitSafetyViolation::CdGitCompound);
     }
 }
 
@@ -1043,19 +1025,18 @@ EOF
     }
 
     #[test]
-    fn cd_git_compound_behavior() {
-        let v = validate_git_command("cd /tmp/evil && git status");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
-        );
-        let v = validate_git_command("cd /tmp/evil&&git status");
-        assert!(
-            v.iter()
-                .any(|v| matches!(v, GitSafetyViolation::CdGitCompound))
-        );
-        let v = validate_git_command("git status");
-        assert!(v.is_empty());
+    fn ordinary_cd_git_compounds_are_not_safety_boundaries() {
+        for command in [
+            "cd /workspace && git status",
+            "cd /workspace && git diff origin/main...HEAD --stat | awk '{print $1}'",
+            "cd /workspace; git log -1",
+        ] {
+            let violations = validate_git_command(command);
+            assert!(
+                violations.is_empty(),
+                "working-directory selection is enforced by the sandbox, not a syntax heuristic: {violations:?}"
+            );
+        }
     }
 
     // --- git -c config injection ---
@@ -1085,6 +1066,7 @@ EOF
     fn git_global_flag_scan_stops_at_subcommand_and_shell_boundary() {
         for cmd in [
             "git grep -c needle",
+            "git status -c core.fsmonitor=not-a-global-option",
             "git diff origin/main...HEAD --stat | awk -c '{print $1}'",
             "cd /workspace && git diff --stat | python -c 'print(1)'",
             "git status && head -c 10 file",
@@ -1281,7 +1263,6 @@ EOF
             GitSafetyViolation::ForcePushProtectedBranch {
                 branch: "main".into(),
             },
-            GitSafetyViolation::CdGitCompound,
             GitSafetyViolation::GitConfigFlag,
             GitSafetyViolation::GitExecPathFlag,
             GitSafetyViolation::CommitAmend,
