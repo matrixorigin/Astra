@@ -249,6 +249,16 @@ impl DeferredTurnSidecarWork {
     /// Executes all derived local persistence after the primary journal event
     /// is durable. Callers must serialize work for a session to preserve the
     /// workspace/checkpoint order.
+    #[tracing::instrument(
+        target = "astra_cli::turn_commit",
+        skip_all,
+        fields(
+            session_id = %self.session_id,
+            turn = self.turn,
+            projection_id = %self.projection_id,
+            reconcile_existing
+        )
+    )]
     pub(crate) fn execute(&self, reconcile_existing: bool) -> Result<(), DeferredTurnSidecarError> {
         let _journal_dir_guard = self
             .journal_dir_override

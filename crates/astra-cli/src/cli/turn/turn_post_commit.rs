@@ -141,10 +141,19 @@ pub(crate) fn attach_deferred_sidecars(
     job.deferred_sidecars = deferred_sidecars;
 }
 
+#[tracing::instrument(
+    target = "astra_cli::turn_post_commit",
+    skip_all,
+    fields(session_id = ?job.session_id, turn = job.turn)
+)]
 pub(crate) async fn execute_turn_post_commit_job(
     mut job: TurnPostCommitJob,
 ) -> TurnPostCommitCompletion {
+    let started = Instant::now();
+    let session_id = job.session_id.clone();
+    let turn = job.turn;
     let mut errors = Vec::new();
+    let sidecar_started = Instant::now();
     if let Some(sidecars) = job.deferred_sidecars.take() {
         let sidecars = std::sync::Arc::new(sidecars);
         for attempt in 0..SIDECAR_PROJECTION_MAX_ATTEMPTS {
@@ -168,7 +177,9 @@ pub(crate) async fn execute_turn_post_commit_job(
             }
         }
     }
+    let sidecar_ms = sidecar_started.elapsed().as_millis() as u64;
 
+    let csl_started = Instant::now();
     let csl_manager = match job.csl_manager.take() {
         None => None,
         Some(mut manager) => match manager
@@ -186,7 +197,9 @@ pub(crate) async fn execute_turn_post_commit_job(
             }
         },
     };
+    let csl_ms = csl_started.elapsed().as_millis() as u64;
 
+    let plan_mirror_started = Instant::now();
     let plan_mirror = match job.plan_mirror.take() {
         None => None,
         Some(refresh) => Some(
@@ -208,12 +221,14 @@ pub(crate) async fn execute_turn_post_commit_job(
             },
         ),
     };
+    let plan_mirror_ms = plan_mirror_started.elapsed().as_millis() as u64;
     if let Some(Err(error)) = plan_mirror.as_ref() {
         errors.push(format!(
             "plan mirror refresh failed; local plan remains usable: {error}"
         ));
     }
 
+    let notification_started = Instant::now();
     if let Some((config, elapsed)) = job.notification.take() {
         if tokio::time::timeout(
             Duration::from_millis(250),
@@ -225,8 +240,37 @@ pub(crate) async fn execute_turn_post_commit_job(
             tracing::debug!("completion notification exceeded deferred post-commit budget");
         }
     }
+    let notification_ms = notification_started.elapsed().as_millis() as u64;
+    let total_ms = started.elapsed().as_millis() as u64;
+    if total_ms >= 5_000 {
+        tracing::warn!(
+            target: "astra_cli::turn_post_commit",
+            session_id = ?session_id,
+            turn,
+            total_ms,
+            sidecar_ms,
+            csl_ms,
+            plan_mirror_ms,
+            notification_ms,
+            error_count = errors.len(),
+            "deferred turn projection completed slowly"
+        );
+    } else {
+        tracing::debug!(
+            target: "astra_cli::turn_post_commit",
+            session_id = ?session_id,
+            turn,
+            total_ms,
+            sidecar_ms,
+            csl_ms,
+            plan_mirror_ms,
+            notification_ms,
+            error_count = errors.len(),
+            "deferred turn projection completed"
+        );
+    }
     TurnPostCommitCompletion {
-        session_id: job.session_id,
+        session_id,
         csl_manager,
         plan_mirror,
         errors,

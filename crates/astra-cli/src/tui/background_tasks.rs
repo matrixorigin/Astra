@@ -301,6 +301,8 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const OUTPUT_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const OUTPUT_PREVIEW_INTERVAL: Duration = Duration::from_millis(500);
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const OUTPUT_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 fn output_cap_error() -> String {
     format!(
         "background shell output exceeded {} bytes; shell was terminated",
@@ -1286,7 +1288,15 @@ async fn run_shell_task(
         }
         _ = cancel.cancelled() => {
             let reason = BgTaskCancelReason::from_atomic(&cancel_reason);
-            kill_child_tree(&mut child).await;
+            if let Err(error) = kill_child_tree(&mut child).await {
+                return TaskCompletion {
+                    id: task_id.to_string(),
+                    status: BgTaskStatus::Failed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: Some(error),
+                };
+            }
             process_group_guard.disarm();
             // Status is set by poll_completions via CAS — single writer.
             let _ = &status;
@@ -1399,25 +1409,31 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
         seed_adopted_output(&stderr_path, partial_stderr.as_bytes()),
     );
     if let Err(error) = seeded {
-        kill_child_tree(&mut child).await;
-        process_group_guard.disarm();
+        let stop_error = kill_child_tree(&mut child).await.err();
+        if stop_error.is_none() {
+            process_group_guard.disarm();
+        }
         return TaskCompletion {
             id: task_id,
             status: BgTaskStatus::Failed,
             exit_code: None,
             summary: String::new(),
-            error: Some(format!("cannot seed detached shell output: {error}")),
+            error: Some(match stop_error {
+                Some(stop_error) => format!(
+                    "cannot seed detached shell output: {error}; process cleanup failed: {stop_error}"
+                ),
+                None => format!("cannot seed detached shell output: {error}"),
+            }),
         };
     }
-    let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
-    let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
+    let mut stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
+    let mut stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
 
     let result = tokio::select! {
         exit = child.wait() => {
             process_group_guard.disarm();
             // Drain remaining buffered output before reporting status.
-            let _ = stdout_drain.await;
-            let _ = stderr_drain.await;
+            finish_adopted_output_drains(&mut stdout_drain, &mut stderr_drain).await;
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
@@ -1467,11 +1483,18 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
         }
         _ = cancel.cancelled() => {
             let reason = BgTaskCancelReason::from_atomic(&cancel_reason);
-            kill_child_tree(&mut child).await;
+            let stop_result = kill_child_tree(&mut child).await;
+            finish_adopted_output_drains(&mut stdout_drain, &mut stderr_drain).await;
+            if let Err(error) = stop_result {
+                return TaskCompletion {
+                    id: task_id.clone(),
+                    status: BgTaskStatus::Failed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: Some(error),
+                };
+            }
             process_group_guard.disarm();
-            // Reader tasks complete on stream-close after kill.
-            let _ = stdout_drain.await;
-            let _ = stderr_drain.await;
             match reason {
                 BgTaskCancelReason::OutputCap => TaskCompletion {
                     id: task_id.clone(),
@@ -1540,19 +1563,66 @@ impl ProcessGroupKillGuard {
     fn disarm(&mut self) {}
 }
 
-async fn kill_child_tree(child: &mut tokio::process::Child) {
+async fn finish_adopted_output_drains(
+    stdout_drain: &mut tokio::task::JoinHandle<()>,
+    stderr_drain: &mut tokio::task::JoinHandle<()>,
+) {
+    let finished = tokio::time::timeout(OUTPUT_DRAIN_AFTER_EXIT_TIMEOUT, async {
+        let _ = tokio::join!(&mut *stdout_drain, &mut *stderr_drain);
+    })
+    .await
+    .is_ok();
+    if finished {
+        return;
+    }
+    stdout_drain.abort();
+    stderr_drain.abort();
+    let _ = tokio::join!(&mut *stdout_drain, &mut *stderr_drain);
+    tracing::warn!(
+        timeout_ms = OUTPUT_DRAIN_AFTER_EXIT_TIMEOUT.as_millis(),
+        "background shell output drains exceeded their post-exit deadline"
+    );
+}
+
+async fn kill_child_tree(child: &mut tokio::process::Child) -> Result<(), String> {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            let _ = nix::sys::signal::killpg(
+            if let Err(group_error) = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
-            );
-            let _ = child.wait().await;
-            return;
+            ) {
+                child.start_kill().map_err(|child_error| {
+                    format!(
+                        "failed to stop background process group ({group_error}) or child ({child_error})"
+                    )
+                })?;
+            }
+            return match tokio::time::timeout(PROCESS_STOP_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(format!(
+                    "failed to reap stopped background process: {error}"
+                )),
+                Err(_) => Err(format!(
+                    "background process did not stop within {}ms",
+                    PROCESS_STOP_TIMEOUT.as_millis()
+                )),
+            };
         }
     }
-    let _ = child.kill().await;
+    child
+        .start_kill()
+        .map_err(|error| format!("failed to stop background process: {error}"))?;
+    match tokio::time::timeout(PROCESS_STOP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "failed to reap stopped background process: {error}"
+        )),
+        Err(_) => Err(format!(
+            "background process did not stop within {}ms",
+            PROCESS_STOP_TIMEOUT.as_millis()
+        )),
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

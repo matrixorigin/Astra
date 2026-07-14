@@ -7453,7 +7453,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_preflight_reuses_engine_for_hard_git_policy() {
+    fn cloud_preflight_keeps_git_risk_advisory_in_bypass() {
         let dir = tempfile::tempdir().unwrap();
         let mut auto = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
 
@@ -7480,18 +7480,25 @@ mod tests {
             "quiet Auto cannot prompt for hard git, so it must fail closed"
         );
 
-        let mut bypass = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
-        let bypass_decision = bypass.preflight_cloud_approval_decision(
-            "bash",
-            Some("git push --force origin main"),
-            ApprovalKind::Standard,
-            false,
-        );
-        assert_eq!(
-            bypass_decision,
-            Some(astra_thin_client::ApprovalDecision::Deny),
-            "Bypass skips approval prompts, but hard git policy still applies"
-        );
+        for (command, quiet) in [
+            ("git push --force origin main", false),
+            ("git -c core.fsmonitor=/tmp/hook status", false),
+            ("git restore --staged --worktree .", true),
+        ] {
+            let mut bypass =
+                PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+            let bypass_decision = bypass.preflight_cloud_approval_decision(
+                "bash",
+                Some(command),
+                ApprovalKind::Standard,
+                quiet,
+            );
+            assert_eq!(
+                bypass_decision,
+                Some(astra_thin_client::ApprovalDecision::Allow),
+                "cloud Bypass must match local Bypass for {command}: explicit Git risk is evidence, not a hidden deny"
+            );
+        }
     }
 
     #[test]

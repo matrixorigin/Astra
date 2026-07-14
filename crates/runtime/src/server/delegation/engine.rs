@@ -1235,18 +1235,24 @@ impl DelegationTracker {
     /// every active child, and a cancel request must never turn into a paused
     /// run in an executor that observes only one of the two signals.
     pub async fn request_cancel_sub_run(&self, run_id: &str) -> bool {
-        if self
-            .get_sub_run_state(run_id)
-            .await
-            .is_none_or(SubRunState::is_terminal)
         {
-            return false;
+            // Completion needs the state write lock. Validate liveness and
+            // signal the token under one read guard so a terminal transition
+            // cannot slip between the two operations and acquire a spurious
+            // post-completion cancellation marker.
+            let state = self.state.read().await;
+            let Some(record) = state
+                .runs
+                .get(run_id)
+                .filter(|record| !record.state.is_terminal())
+            else {
+                return false;
+            };
+            let Some(cancel_token) = state.cancel_tokens.get(&record.run_id) else {
+                return false;
+            };
+            cancel_token.cancel();
         }
-
-        let Some(cancel_token) = self.state.read().await.cancel_tokens.get(run_id).cloned() else {
-            return false;
-        };
-        cancel_token.cancel();
         self.persist_event(
             astra_services::session_journal::JournalEventType::SyncMarker,
             serde_json::json!({ "action": "cancel_requested", "run_id": run_id }),
@@ -8775,6 +8781,29 @@ mod tests {
             Some(SubRunState::Running),
             "the executor owns the terminal cancelled outcome"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_sub_run_rejects_late_cancellation_without_signalling_token() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "child-complete".into(),
+                parent_run_id: "parent-run".into(),
+                delegation_id: "deleg-1".into(),
+                agent_id: "reviewer".into(),
+                depth: 1,
+                state: SubRunState::Completed,
+                retry_of: None,
+            })
+            .await;
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker
+            .register_cancel_token("child-complete", cancel_token.clone())
+            .await;
+
+        assert!(!tracker.request_cancel_sub_run("child-complete").await);
+        assert!(!cancel_token.is_cancelled());
     }
 
     /// Regression: the SSE Failed event for a non-Completed/Paused/Cancelled
