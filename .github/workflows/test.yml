@@ -155,8 +155,10 @@ jobs:
           --features bridge-e2e-hooks --profile ci
           -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
 
-  # Online tests use their own two-thread profile and run beside the offline
-  # shards instead of waiting for an unrelated compile-only job.
+  # Online tests run beside the offline shards instead of waiting for an
+  # unrelated compile-only job. CI keeps each live-DB lane serial; the
+  # Makefile assigns services to core and runtime/plan to integration so the
+  # two jobs share test-binary link and live-DB work more evenly.
   test-online:
     name: "Test: online (${{ matrix.lane }})"
     runs-on: ubuntu-latest

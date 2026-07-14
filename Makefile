@@ -1028,11 +1028,10 @@ test-runtime-bridge-hooks: sweep
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
 #
-# Single `cargo nextest run` covers every `#[ignore]` integration binary
-# across astra-runtime / astra-services / astra-plan. nextest itself
-# tracks TIMEOUT/FAIL per-case, emits per-case status lines during the
-# run, and prints the standard `Summary [ … ]` at the end — same UX as
-# `make test-offline`. No per-suite tee/log bookkeeping needed.
+# This helper owns the astra-runtime / astra-plan integration binaries.
+# astra-services integration binaries run in test-online's core lane, beside
+# the astra-services ignored lib tests, so their test-binary linking and live-DB
+# time are charged to core. `make test-online` remains the complete online suite.
 #
 # Optional serial mode: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> -j 1
 .PHONY: test-ignored-integration
@@ -1049,23 +1048,32 @@ test-ignored-integration:
 		else \
 			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
-		FAILED=""; \
 		PERF_FAILED=""; \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
-			-p astra-runtime -p astra-services -p astra-plan \
-			--features astra-runtime/bridge-e2e-hooks \
-			--tests --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			-E 'not test(/perf_benchmark_/)' \
-				|| FAILED="$$FAILED integration"; \
-		echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
-			-p astra-runtime \
-			--features astra-runtime/bridge-e2e-hooks \
-			--tests --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) -j 1 \
-			-E 'test(/perf_benchmark_/)' \
-			|| PERF_FAILED=1; \
+		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
+			echo "Running runtime/plan integration and performance tests in one serial build..."; \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime -p astra-plan \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+					|| FAILED="$$FAILED runtime-plan-perf"; \
+		else \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime -p astra-plan \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+				-E 'not test(/perf_benchmark_/)' \
+					|| FAILED="$$FAILED integration"; \
+			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) -j 1 \
+				-E 'test(/perf_benchmark_/)' \
+					|| PERF_FAILED=1; \
+		fi; \
 		if [ -n "$$FAILED" ]; then \
 			echo "❌ test-ignored-integration: failed lanes:$$FAILED"; \
 			exit 1; \
@@ -1094,6 +1102,8 @@ test-online:
 	RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_runtime_ignored"; \
 	INTEGRATION_DB="$${TEST_DB_BASE}_integration"; \
 	ONLINE_LANE=$${ASTRA_ONLINE_LANE:-all}; \
+	ONLINE_JOBS_FLAG=""; \
+	if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then ONLINE_JOBS_FLAG="-j 1"; fi; \
 	case "$$ONLINE_LANE" in \
 		all) DB_NAMES="$$RUNTIME_IGNORED_DB $$INTEGRATION_DB" ;; \
 		core) DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
@@ -1111,21 +1121,22 @@ test-online:
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E 'not test(/durable_run_event_pressure_probe/)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
-				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				|| FAILED="$$FAILED astra-turn-core-db-store"; \
-		echo "Running astra-services ignored lib tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
-				--lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-				|| FAILED="$$FAILED astra-services-db-store"; \
+				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				|| FAILED="$$FAILED astra-services-online"; \
 	fi; \
 	if [ "$$ONLINE_LANE" != "core" ]; then \
 		echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \

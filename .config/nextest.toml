@@ -52,9 +52,9 @@ test-threads = 2
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
-# Online suites share one live MatrixOne instance. Keep CI at the same
-# concurrency as local test-online so connection pressure cannot turn
-# healthy DB tests into EOF/timeouts.
+# Direct invocations retain bounded two-way concurrency. The CI workflow sets
+# ASTRA_TEST_DB_IT_TEST_THREADS=1, and test-online translates that into `-j 1`
+# for both lanes so shared-DB pressure cannot turn healthy tests into failures.
 test-threads = 2
 
 # ── Parallelism caps for heavy integration suites ────────────────────────
