@@ -2478,7 +2478,11 @@ impl RuntimeToolExecutor {
                 invocation_id = %identity.invocation_id,
                 "governed tool result exceeds the inline ledger boundary but no session artifact store is configured"
             );
-            return result;
+            return durable_result_persistence_failure(
+                identity,
+                &result,
+                "session artifact store is not configured",
+            );
         };
         if result.output.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
             tracing::warn!(
@@ -2489,7 +2493,11 @@ impl RuntimeToolExecutor {
                 max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
                 "governed tool result output exceeds the artifact persistence boundary"
             );
-            return result;
+            return durable_result_persistence_failure(
+                identity,
+                &result,
+                "result exceeds the artifact persistence boundary",
+            );
         }
 
         let content = serde_json::json!({
@@ -2512,7 +2520,11 @@ impl RuntimeToolExecutor {
                     %error,
                     "governed tool result artifact could not be serialized"
                 );
-                return result;
+                return durable_result_persistence_failure(
+                    identity,
+                    &result,
+                    "result artifact serialization failed",
+                );
             }
         };
         if encoded.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
@@ -2524,7 +2536,11 @@ impl RuntimeToolExecutor {
                 max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
                 "governed tool result exceeds the artifact persistence boundary"
             );
-            return result;
+            return durable_result_persistence_failure(
+                identity,
+                &result,
+                "encoded result exceeds the artifact persistence boundary",
+            );
         }
         let content_hash = format!("sha256:{:x}", Sha256::digest(&encoded));
         let record = astra_services::session_artifact_store::SessionArtifactJsonRecord {
@@ -2565,7 +2581,11 @@ impl RuntimeToolExecutor {
                     %error,
                     "governed tool result artifact persistence failed"
                 );
-                return result;
+                return durable_result_persistence_failure(
+                    identity,
+                    &result,
+                    "result artifact persistence failed",
+                );
             }
             Err(_) => {
                 tracing::warn!(
@@ -2575,7 +2595,11 @@ impl RuntimeToolExecutor {
                     timeout_ms = TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT.as_millis(),
                     "governed tool result artifact persistence timed out"
                 );
-                return result;
+                return durable_result_persistence_failure(
+                    identity,
+                    &result,
+                    "result artifact persistence timed out",
+                );
             }
         };
         result.metadata.get_or_insert_with(Map::new).insert(
@@ -3184,6 +3208,40 @@ fn mcp_call_error_result(
     result
 }
 
+fn durable_result_persistence_failure(
+    identity: &astra_turn_types::ToolInvocationIdentity,
+    acknowledged_result: &astra_tools::ToolResult,
+    reason: &'static str,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(
+        serde_json::json!({
+            "status": "failed",
+            "error": "tool execution completed but its durable result evidence could not be persisted",
+            "reason": reason,
+            "invocationId": identity.invocation_id,
+        })
+        .to_string(),
+    );
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String("durable_result_persistence".to_string()),
+        ),
+        ("retryable".to_string(), Value::Bool(false)),
+        ("side_effects_maybe".to_string(), Value::Bool(false)),
+        (
+            "provider_outcome_acknowledged".to_string(),
+            Value::Bool(true),
+        ),
+        (
+            "provider_result_was_error".to_string(),
+            Value::Bool(acknowledged_result.is_error),
+        ),
+        ("durable_result_complete".to_string(), Value::Bool(false)),
+    ]));
+    result
+}
+
 fn tool_result_from_provider_payload(
     payload: ProviderCallPayload,
     is_error: bool,
@@ -3276,6 +3334,7 @@ mod tests {
                 referenced_by_manifest_count: 0,
                 referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
+                referenced_by_durable_count: 0,
                 created_at: None,
             })
         }
@@ -3606,7 +3665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_failure_is_explicit_but_does_not_reclassify_acknowledged_tool_success() {
+    async fn artifact_failure_is_a_non_retryable_durability_failure_not_truncated_success() {
         let (exec, _dir) = test_executor();
         let store = Arc::new(RecordingResultArtifactStore {
             seen: StdMutex::new(None),
@@ -3631,22 +3690,28 @@ mod tests {
         let attached = exec
             .attach_governed_result_artifact_if_needed(&identity, governed)
             .await;
-        assert!(!attached.is_error);
+        assert!(attached.is_error);
         assert!(attached.metadata.as_ref().is_none_or(|metadata| {
             !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         }));
+        let metadata = attached.metadata.as_ref().unwrap();
+        assert_eq!(metadata["error_kind"], "durable_result_persistence");
+        assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["provider_outcome_acknowledged"], true);
+        assert_eq!(metadata["provider_result_was_error"], false);
+        assert_eq!(metadata["durable_result_complete"], false);
         assert!(store.seen.lock().unwrap().is_none());
 
         let outcome =
             crate::server::tool_invocation_runtime::terminal_outcome_from_result(&attached);
         assert!(matches!(
             outcome,
-            astra_turn_types::ToolInvocationTerminalOutcome::Succeeded { .. }
+            astra_turn_types::ToolInvocationTerminalOutcome::Failed {
+                retryable: false,
+                ..
+            }
         ));
-        assert_eq!(
-            outcome.result().metadata["astraResultProjection"]["artifactRequired"],
-            true
-        );
+        assert_eq!(outcome.result().metadata["durable_result_complete"], false);
     }
 
     #[tokio::test]

@@ -131,54 +131,59 @@ async fn release_expired_archive_references(
     pool: &SharedPool,
     limit: i64,
 ) -> Result<usize, sqlx::Error> {
-    let due = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT chunks.user_id, chunks.session_id, chunks.artifact_id, chunks.run_id
+    let due = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT chunks.user_id, chunks.session_id, chunks.run_id
          FROM tool_invocation_archive_chunks chunks
          JOIN session_artifacts artifacts
            ON artifacts.user_id = chunks.user_id
           AND artifacts.session_id = chunks.session_id
           AND artifacts.artifact_id = chunks.artifact_id
-         WHERE artifacts.retention_until IS NOT NULL
-           AND artifacts.retention_until <= CURRENT_TIMESTAMP(6)
-           AND EXISTS (
-               SELECT 1 FROM session_artifact_references refs
-               WHERE refs.user_id = chunks.user_id
-                 AND refs.session_id = chunks.session_id
-                 AND refs.artifact_id = chunks.artifact_id
-                 AND refs.reference_kind = 'invocation_ledger'
-                 AND refs.reference_id = chunks.run_id
-           )
-         ORDER BY artifacts.retention_until, chunks.user_id, chunks.run_id, chunks.chunk_index
+         WHERE EXISTS (
+             SELECT 1 FROM session_artifact_references refs
+             WHERE refs.user_id = chunks.user_id
+               AND refs.session_id = chunks.session_id
+               AND refs.reference_kind = 'invocation_ledger'
+               AND refs.reference_id = chunks.run_id
+         )
+         GROUP BY chunks.user_id, chunks.session_id, chunks.run_id
+         HAVING COUNT(artifacts.retention_until) = COUNT(*)
+            AND MAX(artifacts.retention_until) <= CURRENT_TIMESTAMP(6)
+         ORDER BY MAX(artifacts.retention_until), chunks.user_id, chunks.run_id
          LIMIT ?",
     )
     .bind(limit)
     .fetch_all(pool.get())
     .await?;
-    let mut released = 0;
-    for (user_id, session_id, artifact_id, run_id) in due {
-        released += usize::from(
-            sqlx::query(
-                "DELETE FROM session_artifact_references
-                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-                   AND reference_kind = 'invocation_ledger' AND reference_id = ?
-                   AND EXISTS (
-                       SELECT 1 FROM session_artifacts artifacts
-                       WHERE artifacts.user_id = session_artifact_references.user_id
-                         AND artifacts.session_id = session_artifact_references.session_id
-                         AND artifacts.artifact_id = session_artifact_references.artifact_id
-                         AND artifacts.retention_until IS NOT NULL
-                         AND artifacts.retention_until <= CURRENT_TIMESTAMP(6)
-                   )",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(artifact_id)
-            .bind(run_id)
-            .execute(pool.get())
-            .await?
-            .rows_affected()
-                > 0,
-        );
+    let mut released: usize = 0;
+    for (user_id, session_id, run_id) in due {
+        let rows = sqlx::query(
+            "DELETE FROM session_artifact_references
+             WHERE user_id = ? AND session_id = ?
+               AND reference_kind = 'invocation_ledger' AND reference_id = ?
+               AND EXISTS (
+                   SELECT 1
+                   FROM tool_invocation_archive_chunks chunks
+                   JOIN session_artifacts artifacts
+                     ON artifacts.user_id = chunks.user_id
+                    AND artifacts.session_id = chunks.session_id
+                    AND artifacts.artifact_id = chunks.artifact_id
+                   WHERE chunks.user_id = ? AND chunks.session_id = ?
+                     AND chunks.run_id = ?
+                   GROUP BY chunks.user_id, chunks.session_id, chunks.run_id
+                   HAVING COUNT(artifacts.retention_until) = COUNT(*)
+                      AND MAX(artifacts.retention_until) <= CURRENT_TIMESTAMP(6)
+               )",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await?
+        .rows_affected();
+        released = released.saturating_add(usize::try_from(rows).unwrap_or(usize::MAX));
     }
     Ok(released)
 }
@@ -301,17 +306,74 @@ mod tests {
         .execute(pool.get())
         .await
         .unwrap();
+        let result_artifact_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO session_artifacts
+             (artifact_id, session_id, user_id, artifact_kind, content_json,
+              retention_until, status, created_at)
+             VALUES (?, ?, ?, 'tool_result_evidence_v1', '{}',
+                     TIMESTAMPADD(DAY, -1, CURRENT_TIMESTAMP(6)), 'active', CURRENT_TIMESTAMP(6))",
+        )
+        .bind(&result_artifact_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO session_artifact_references
+             (user_id, session_id, artifact_id, reference_kind, reference_id)
+             VALUES (?, ?, ?, 'invocation_ledger', ?)",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&result_artifact_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 
-        let first = release_expired_archive_references(&pool, 10).await.unwrap();
-        assert!(first >= 1);
-        let _ = release_expired_archive_references(&pool, 10).await.unwrap();
-        let references: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_artifact_references
+        let deadline_before: String = sqlx::query_scalar(
+            "SELECT CAST(retention_until AS CHAR) FROM session_artifacts
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
         )
         .bind(&user_id)
         .bind(&session_id)
         .bind(&artifact_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        crate::server::artifact_retention_sweeper::run_artifact_retention_gc_once(
+            pool.clone(),
+            100,
+        )
+        .await
+        .unwrap();
+        let deadline_after: String = sqlx::query_scalar(
+            "SELECT CAST(retention_until AS CHAR) FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            deadline_after, deadline_before,
+            "the generic retention sweep must not postpone archive-owner release"
+        );
+        let first = release_expired_archive_references(&pool, 10).await.unwrap();
+        assert!(first >= 2);
+        let _ = release_expired_archive_references(&pool, 10).await.unwrap();
+        let references: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_artifact_references
+             WHERE user_id = ? AND session_id = ?
+               AND reference_kind = 'invocation_ledger' AND reference_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
         .fetch_one(pool.get())
         .await
         .unwrap();

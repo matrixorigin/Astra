@@ -10,7 +10,7 @@ pub struct ArtifactRetentionSweepOutcome {
     pub scanned: usize,
     pub corrupt_rows_skipped: usize,
     pub marked_expiring: usize,
-    pub referenced_extended: usize,
+    pub referenced_retained: usize,
     pub extended: usize,
     pub expired: usize,
     pub backlog_overflow_warning: bool,
@@ -74,6 +74,20 @@ pub async fn run_artifact_retention_gc_once(
            AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY)
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_policy <> 'permanent'
+           AND (
+               retention_policy = 'project_long_term'
+               OR (
+                   referenced_by_manifest_count = 0
+                   AND referenced_by_state_items_count = 0
+                   AND referenced_by_citation_count = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_artifact_references refs
+                       WHERE refs.user_id = session_artifacts.user_id
+                         AND refs.session_id = session_artifacts.session_id
+                         AND refs.artifact_id = session_artifacts.artifact_id
+                   )
+               )
+           )
          ORDER BY retention_until ASC
          LIMIT ?",
     )
@@ -114,7 +128,7 @@ pub async fn run_artifact_retention_gc_once(
         };
         match apply_artifact_retention_policy(&pool, &artifact).await? {
             ArtifactRetentionAction::MarkedExpiring => outcome.marked_expiring += 1,
-            ArtifactRetentionAction::ReferencedExtended => outcome.referenced_extended += 1,
+            ArtifactRetentionAction::ReferencedRetained => outcome.referenced_retained += 1,
             ArtifactRetentionAction::Extended => outcome.extended += 1,
             ArtifactRetentionAction::Expired => outcome.expired += 1,
             ArtifactRetentionAction::Noop => {}
@@ -180,7 +194,7 @@ async fn record_artifact_retention_backlog_warning(
 enum ArtifactRetentionAction {
     Noop,
     MarkedExpiring,
-    ReferencedExtended,
+    ReferencedRetained,
     Extended,
     Expired,
 }
@@ -220,36 +234,12 @@ async fn apply_artifact_retention_policy(
         .saturating_add(artifact.referenced_by_citation_count)
         .saturating_add(artifact.referenced_by_durable_count);
     if refs > 0 {
-        let rows_affected = sqlx::query(
-            "UPDATE session_artifacts
-             SET status = 'active',
-                 retention_until = DATE_ADD(NOW(6), INTERVAL 365 DAY),
-                 updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-               AND (status <=> 'active' OR status <=> 'expiring')
-               AND (
-                   referenced_by_manifest_count > 0
-                   OR referenced_by_state_items_count > 0
-                   OR referenced_by_citation_count > 0
-                   OR EXISTS (
-                       SELECT 1 FROM session_artifact_references refs
-                       WHERE refs.user_id = session_artifacts.user_id
-                         AND refs.session_id = session_artifacts.session_id
-                         AND refs.artifact_id = session_artifacts.artifact_id
-                   )
-               )",
-        )
-        .bind(&artifact.user_id)
-        .bind(&artifact.session_id)
-        .bind(&artifact.artifact_id)
-        .execute(pool.get())
-        .await?
-        .rows_affected();
-        return Ok(if rows_affected > 0 {
-            ArtifactRetentionAction::ReferencedExtended
-        } else {
-            ArtifactRetentionAction::Noop
-        });
+        // A durable reference is a reachability edge, not permission to
+        // rewrite the owner's retention policy. Owner-specific lifecycle
+        // code releases the edge; only then may the ordinary sweeper expire
+        // the artifact at its original deadline. This branch closes a race
+        // where a reference is added after the candidate query.
+        return Ok(ArtifactRetentionAction::ReferencedRetained);
     }
 
     let expired_rows = sqlx::query(

@@ -1646,6 +1646,7 @@ fn session_artifact_response(
         referenced_by_manifest_count: artifact.referenced_by_manifest_count,
         referenced_by_state_items_count: artifact.referenced_by_state_items_count,
         referenced_by_citation_count: artifact.referenced_by_citation_count,
+        referenced_by_durable_count: artifact.referenced_by_durable_count,
         created_at: artifact.created_at,
     }
 }
@@ -2942,6 +2943,7 @@ mod tests {
             referenced_by_manifest_count: 0,
             referenced_by_state_items_count: 0,
             referenced_by_citation_count: 0,
+            referenced_by_durable_count: 0,
             created_at: Some("2026-05-18T00:01:00Z".to_string()),
         };
 

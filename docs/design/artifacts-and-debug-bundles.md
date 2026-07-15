@@ -1,7 +1,7 @@
 # Artifacts and debug bundles
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-07-16.
 
 Artifacts and debug bundles define how Astra stores large outputs, raw captures, manifests, and support diagnostics without polluting normal trace or learning data.
 
@@ -53,9 +53,31 @@ Requirements:
 
 Large or unsafe tool output should be stored as artifact and summarized through the tool result quality firewall.
 
+Artifact retention and reachability are separate facts:
+
+- retention policy defines when otherwise-unreachable content becomes eligible
+  for reclamation;
+- a durable reference blocks reclamation but never manufactures a later policy
+  deadline;
+- every reference has an owner kind and owner identity and supports bounded
+  forward and reverse lookup;
+- ownership transfer and deletion of the source record occur in one durable
+  transaction;
+- a sweeper releases references only when the owning evidence expires, then lets
+  ordinary retention GC decide whether the artifact can be reclaimed;
+- large-result persistence failure is explicit durability failure, never
+  success with an unusable or missing artifact reference.
+
 ## Test obligations
 
 - Large tool output does not enter prompt raw.
+- Large tool output cannot be recorded as complete success unless its required
+  artifact is durable.
+- Invocation-to-archive compaction preserves result-artifact reachability and
+  archive expiry releases it.
+- A durable reference blocks collection without extending the configured
+  retention deadline.
+- Forward and reverse reference lookup agree on owner and artifact identity.
 - Debug bundle expires or is deletable.
 - Artifact access is auditable.
 - Learning pipeline cannot consume C4 debug bundle without opt-in.

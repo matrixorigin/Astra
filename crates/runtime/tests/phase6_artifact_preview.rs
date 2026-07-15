@@ -21,16 +21,28 @@ fn strict_online_perf_enabled() -> bool {
     std::env::var("ASTRA_STRICT_ONLINE_PERF").as_deref() != Ok("0")
 }
 
+static SHARED_POOL: tokio::sync::OnceCell<astra_core::SharedPool> =
+    tokio::sync::OnceCell::const_new();
+
 async fn setup_pool() -> astra_core::SharedPool {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    astra_services::ensure_core_schema(&settings, &catalog)
+    SHARED_POOL
+        .get_or_init(|| async {
+            let mut settings = require_db_it_env();
+            settings.db_pool_max_connections = settings.db_pool_max_connections.clamp(1, 8);
+            settings.db_pool_min_connections = settings
+                .db_pool_min_connections
+                .min(settings.db_pool_max_connections);
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
+            astra_services::ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            astra_core::SharedPool::new(&settings)
+                .await
+                .expect("SharedPool::new")
+        })
         .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    astra_core::SharedPool::new(&settings)
-        .await
-        .expect("SharedPool::new")
+        .clone()
 }
 
 fn ids() -> (String, String, String) {
@@ -114,9 +126,27 @@ async fn artifact_status(
     )
 }
 
+async fn artifact_retention_until(
+    pool: &astra_core::SharedPool,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT CAST(retention_until AS CHAR) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_50_gc_extends_artifacts_with_active_references_without_fake_cold_storage() {
+async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_storage() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -136,12 +166,14 @@ async fn l2_50_gc_extends_artifacts_with_active_references_without_fake_cold_sto
     )
     .await;
 
-    let outcome = run_artifact_retention_gc_once(pool.clone(), 100)
+    let deadline_before =
+        artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+    let _outcome = run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
     let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
-    assert!(outcome.scanned >= 1);
-    assert_eq!(outcome.referenced_extended, 1);
+    let deadline_after = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+    assert_eq!(deadline_after, deadline_before);
     assert_eq!(status, "active");
     assert_eq!(
         cold_ref, None,
@@ -183,11 +215,14 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     .await
     .unwrap();
 
-    let outcome = run_artifact_retention_gc_once(pool.clone(), 100)
+    let deadline_before =
+        artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+    let _outcome = run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
     let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
-    assert_eq!(outcome.referenced_extended, 1);
+    let deadline_after = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+    assert_eq!(deadline_after, deadline_before);
     assert_eq!(status, "active");
     assert_eq!(cold_ref, None);
 }
@@ -546,11 +581,15 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
         "indexed artifact/tool queries took {query_ms}ms; limit={max_query_ms}ms"
     );
 
-    let retention = run_artifact_retention_gc_once(pool.clone(), 100)
+    let deadline_before =
+        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
+    let _retention = run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
     let (_, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    assert!(retention.referenced_extended >= 1);
+    let deadline_after =
+        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
+    assert_eq!(deadline_after, deadline_before);
     assert_eq!(cold_ref, None, "sweeper must not fabricate cold storage");
 }
 

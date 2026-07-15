@@ -321,6 +321,7 @@ pub struct SessionArtifactResponse {
     pub referenced_by_manifest_count: u32,
     pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
+    pub referenced_by_durable_count: u32,
     pub created_at: Option<String>,
 }
 

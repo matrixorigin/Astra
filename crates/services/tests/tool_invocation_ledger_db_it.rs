@@ -149,6 +149,42 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
                 .unwrap(),
         );
     }
+    let result_artifact_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO session_artifacts
+         (artifact_id, session_id, user_id, artifact_kind, content_json,
+          retention_until, status, created_at)
+         VALUES (?, ?, ?, 'tool_result_evidence_v1', '{}',
+                 TIMESTAMPADD(DAY, 1, CURRENT_TIMESTAMP(6)), 'active', CURRENT_TIMESTAMP(6))",
+    )
+    .bind(&result_artifact_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result_retention_before: String = sqlx::query_scalar(
+        "SELECT CAST(retention_until AS CHAR) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO session_artifact_references
+         (user_id, session_id, artifact_id, reference_kind, reference_id)
+         VALUES (?, ?, ?, 'invocation_ledger', ?)",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .bind(identities[0].storage_key())
+    .execute(&pool)
+    .await
+    .unwrap();
     assert!(matches!(
         ledger
             .compact_terminal_run_batch(
@@ -222,6 +258,28 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     assert_eq!(compacted.archived_records, 3);
     assert_eq!(compacted.remaining_records, 0);
     assert!(compacted.artifact_id.is_some());
+    let result_reference: (String, String) = sqlx::query_as(
+        "SELECT refs.reference_id,
+                CAST(artifacts.retention_until AS CHAR)
+         FROM session_artifact_references refs
+         JOIN session_artifacts artifacts
+           ON artifacts.user_id = refs.user_id
+          AND artifacts.session_id = refs.session_id
+          AND artifacts.artifact_id = refs.artifact_id
+         WHERE refs.user_id = ? AND refs.session_id = ? AND refs.artifact_id = ?
+           AND refs.reference_kind = 'invocation_ledger'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(result_reference.0, identities[0].run_id);
+    assert_eq!(
+        result_reference.1, result_retention_before,
+        "reachability transfer must not rewrite the artifact retention policy"
+    );
     let hot_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tool_invocation_ledger
          WHERE user_id = ? AND session_id = ? AND run_id = ?",

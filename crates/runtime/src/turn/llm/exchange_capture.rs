@@ -514,6 +514,7 @@ mod tests {
                 referenced_by_manifest_count: 0,
                 referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
+                referenced_by_durable_count: 0,
                 created_at: None,
             })
         }

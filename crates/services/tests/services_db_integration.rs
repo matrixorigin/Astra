@@ -2154,6 +2154,29 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
     .await
     .unwrap();
     assert_eq!(retained_count, 1);
+    let loaded = store
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.referenced_by_durable_count, 2);
+    let references = store
+        .list_json_artifact_references(&user_id, &session_id, &artifact_id, 100)
+        .await
+        .unwrap();
+    assert_eq!(references.len(), 2);
+    assert!(references.contains(&replayable_reference));
+    assert!(references.contains(&SessionArtifactReference {
+        kind: SessionArtifactReferenceKind::InvocationLedger,
+        reference_id: "sha256:logical-invocation".to_string(),
+    }));
+    assert_eq!(
+        store
+            .list_json_artifacts_for_reference(&user_id, &session_id, &replayable_reference, 100,)
+            .await
+            .unwrap(),
+        vec![artifact_id.clone()]
+    );
     let retention_days: i64 = sqlx::query_scalar(
         "SELECT TIMESTAMPDIFF(DAY, CURRENT_TIMESTAMP(6), retention_until)
          FROM session_artifacts
@@ -2205,6 +2228,13 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
             .await
             .unwrap(),
         "release replay must be idempotent"
+    );
+    assert!(
+        store
+            .list_json_artifacts_for_reference(&user_id, &session_id, &replayable_reference, 100,)
+            .await
+            .unwrap()
+            .is_empty()
     );
 
     sqlx::query(

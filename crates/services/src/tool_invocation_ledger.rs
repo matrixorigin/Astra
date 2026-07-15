@@ -316,6 +316,48 @@ impl DatabaseToolInvocationLedger {
         .bind(run_id)
         .execute(&mut *tx)
         .await?;
+        // The hot invocation identity ceases to own large-result evidence in
+        // the same transaction that removes its ledger row. Transfer that
+        // reachability to the run archive without rewriting the artifact's
+        // retention policy; otherwise per-invocation references grow forever
+        // in long-lived sessions.
+        for record in &chunk.records {
+            let invocation_key = record.identity.storage_key();
+            let result_artifact_ids = sqlx::query_scalar::<_, String>(
+                "SELECT artifact_id FROM session_artifact_references
+                 WHERE user_id = ? AND session_id = ?
+                   AND reference_kind = 'invocation_ledger' AND reference_id = ?
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(&invocation_key)
+            .fetch_all(&mut *tx)
+            .await?;
+            for result_artifact_id in result_artifact_ids {
+                sqlx::query(
+                    "INSERT IGNORE INTO session_artifact_references
+                     (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+                     VALUES (?, ?, ?, 'invocation_ledger', ?, CURRENT_TIMESTAMP(6))",
+                )
+                .bind(user_id)
+                .bind(session_id)
+                .bind(&result_artifact_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "DELETE FROM session_artifact_references
+                 WHERE user_id = ? AND session_id = ?
+                   AND reference_kind = 'invocation_ledger' AND reference_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(invocation_key)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO tool_invocation_archive_chunks
              (user_id, session_id, run_id, chunk_index, artifact_id,

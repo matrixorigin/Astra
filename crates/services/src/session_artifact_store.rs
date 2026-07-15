@@ -45,6 +45,12 @@ pub enum SessionArtifactStoreError {
     #[error("artifact reference mutation is not supported by this store")]
     ReferenceMutationUnsupported,
 
+    #[error("artifact reference query is not supported by this store")]
+    ReferenceQueryUnsupported,
+
+    #[error("stored artifact reference kind is invalid: {0}")]
+    InvalidStoredReferenceKind(String),
+
     #[error("artifact {artifact_id} was not found in session {session_id} for user {user_id}")]
     ArtifactNotFound {
         artifact_id: String,
@@ -240,6 +246,18 @@ impl SessionArtifactReferenceKind {
             Self::Citation => "citation",
         }
     }
+
+    fn from_wire_name(value: &str) -> Result<Self, SessionArtifactStoreError> {
+        match value {
+            "invocation_ledger" => Ok(Self::InvocationLedger),
+            "manifest" => Ok(Self::Manifest),
+            "state_item" => Ok(Self::StateItem),
+            "citation" => Ok(Self::Citation),
+            other => Err(SessionArtifactStoreError::InvalidStoredReferenceKind(
+                other.to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +283,7 @@ pub struct StoredSessionArtifact {
     pub referenced_by_manifest_count: u32,
     pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
+    pub referenced_by_durable_count: u32,
     pub created_at: Option<String>,
 }
 
@@ -335,6 +354,29 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         _reference: &SessionArtifactReference,
     ) -> Result<bool, SessionArtifactStoreError> {
         Err(SessionArtifactStoreError::ReferenceMutationUnsupported)
+    }
+
+    /// Lists the exact durable owners keeping one artifact reachable.
+    async fn list_json_artifact_references(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _artifact_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<SessionArtifactReference>, SessionArtifactStoreError> {
+        Err(SessionArtifactStoreError::ReferenceQueryUnsupported)
+    }
+
+    /// Reverse lookup for reconciliation and introspection. The result is a
+    /// bounded list of artifact IDs owned by the exact reference.
+    async fn list_json_artifacts_for_reference(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _reference: &SessionArtifactReference,
+        _limit: usize,
+    ) -> Result<Vec<String>, SessionArtifactStoreError> {
+        Err(SessionArtifactStoreError::ReferenceQueryUnsupported)
     }
 }
 
@@ -602,6 +644,11 @@ fn stored_artifact_from_row(
             &artifact_id,
             "referenced_by_citation_count",
         )?,
+        referenced_by_durable_count: artifact_row_u32(
+            row,
+            &artifact_id,
+            "referenced_by_durable_count",
+        )?,
         created_at: artifact_row_optional_string(row, "created_at")?,
     })
 }
@@ -618,7 +665,13 @@ pub(crate) async fn load_latest_json_artifact_from_pool(
                  content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                  CAST(retention_until AS CHAR) AS retention_until, status, \
                  referenced_by_manifest_count, referenced_by_state_items_count, \
-                 referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
+                 referenced_by_citation_count, \
+                 (SELECT COUNT(*) FROM session_artifact_references refs \
+                  WHERE refs.user_id = session_artifacts.user_id \
+                    AND refs.session_id = session_artifacts.session_id \
+                    AND refs.artifact_id = session_artifacts.artifact_id) \
+                    AS referenced_by_durable_count, \
+                 CAST(created_at AS CHAR) AS created_at \
           FROM session_artifacts \
           WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
           ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
@@ -700,7 +753,13 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
                     referenced_by_manifest_count, referenced_by_state_items_count, \
-                    referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
+                    referenced_by_citation_count, \
+                    (SELECT COUNT(*) FROM session_artifact_references refs \
+                     WHERE refs.user_id = session_artifacts.user_id \
+                       AND refs.session_id = session_artifacts.session_id \
+                       AND refs.artifact_id = session_artifacts.artifact_id) \
+                       AS referenced_by_durable_count, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
         )
@@ -822,6 +881,92 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         Ok(deleted)
     }
 
+    async fn list_json_artifact_references(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionArtifactReference>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let exists: Option<i8> = sqlx::query_scalar(
+            "SELECT 1 FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await?;
+        if exists.is_none() {
+            return Err(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: artifact_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+            });
+        }
+        let rows = query(
+            "SELECT reference_kind, reference_id
+             FROM session_artifact_references
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+             ORDER BY reference_kind, reference_id LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(validate_artifact_list_limit(limit) as i64)
+        .fetch_all(&pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SessionArtifactReference {
+                    kind: SessionArtifactReferenceKind::from_wire_name(
+                        &row.string_column("reference_kind")?,
+                    )?,
+                    reference_id: row.string_column("reference_id")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_json_artifacts_for_reference(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        reference: &SessionArtifactReference,
+        limit: usize,
+    ) -> Result<Vec<String>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        validate_artifact_references(std::slice::from_ref(reference))?;
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let rows = query(
+            "SELECT artifact_id FROM session_artifact_references
+             WHERE user_id = ? AND session_id = ?
+               AND reference_kind = ? AND reference_id = ?
+             ORDER BY artifact_id LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(reference.kind.wire_name())
+        .bind(reference.reference_id.trim())
+        .bind(validate_artifact_list_limit(limit) as i64)
+        .fetch_all(&pool)
+        .await?;
+        rows.iter()
+            .map(|row| row.string_column("artifact_id").map_err(Into::into))
+            .collect()
+    }
+
     async fn load_json_artifact(
         &self,
         user_id: &str,
@@ -840,7 +985,13 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
                     referenced_by_manifest_count, referenced_by_state_items_count, \
-                    referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
+                    referenced_by_citation_count, \
+                    (SELECT COUNT(*) FROM session_artifact_references refs \
+                     WHERE refs.user_id = session_artifacts.user_id \
+                       AND refs.session_id = session_artifacts.session_id \
+                       AND refs.artifact_id = session_artifacts.artifact_id) \
+                       AS referenced_by_durable_count, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
         )
@@ -881,6 +1032,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     CAST(retention_until AS CHAR) AS retention_until, status, \
                     referenced_by_manifest_count, referenced_by_state_items_count, \
                     referenced_by_citation_count, \
+                    (SELECT COUNT(*) FROM session_artifact_references refs \
+                     WHERE refs.user_id = session_artifacts.user_id \
+                       AND refs.session_id = session_artifacts.session_id \
+                       AND refs.artifact_id = session_artifacts.artifact_id) \
+                       AS referenced_by_durable_count, \
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM session_artifacts \
              WHERE user_id = ",
@@ -1150,6 +1306,7 @@ mod tests {
                 "referenced_by_manifest_count" => 1,
                 "referenced_by_state_items_count" => 2,
                 "referenced_by_citation_count" => 3,
+                "referenced_by_durable_count" => 4,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -1306,6 +1463,7 @@ mod tests {
         assert_eq!(artifact.referenced_by_manifest_count, 1);
         assert_eq!(artifact.referenced_by_state_items_count, 2);
         assert_eq!(artifact.referenced_by_citation_count, 3);
+        assert_eq!(artifact.referenced_by_durable_count, 4);
         assert_eq!(artifact.created_at.as_deref(), Some("2026-06-26 10:00:00"));
 
         for column in [
@@ -1324,6 +1482,7 @@ mod tests {
             "referenced_by_manifest_count",
             "referenced_by_state_items_count",
             "referenced_by_citation_count",
+            "referenced_by_durable_count",
             "created_at",
         ] {
             assert_database_error_mentions(
@@ -1377,6 +1536,13 @@ mod tests {
                 -1,
             )),
             "referenced_by_citation_count",
+        );
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_i64(
+                "referenced_by_durable_count",
+                -1,
+            )),
+            "referenced_by_durable_count",
         );
     }
 

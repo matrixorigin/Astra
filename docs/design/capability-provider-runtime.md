@@ -481,6 +481,22 @@ Model, client, trace, and learning surfaces receive bounded projections derived
 from the same envelope. A client event limit applies to the entire event, not a
 few known fields.
 
+Persisting the required raw result is part of the durable result contract. If
+artifact materialization fails after the provider has acknowledged an outcome,
+the invocation is recorded as a non-retryable durability failure with
+`NotDispatched` false and provider acknowledgement preserved; Astra must not
+record a truncated projection as a successful, complete result or retry a
+possibly effectful provider call.
+
+Artifact reachability has one durable edge authority. Invocation completion
+owns result-artifact edges by invocation identity. Ledger compaction transfers
+those edges transactionally to the retained run archive before deleting hot
+rows; archive expiry releases every run-owned edge before ordinary artifact GC
+may reclaim content. A reference prevents collection while it exists but does
+not silently extend or rewrite the artifact's retention policy. Forward and
+reverse edge queries must expose exactly which durable owner keeps an artifact
+reachable.
+
 ## Resource context
 
 Provider resources, request attachments, catalog files, and authoring resources
