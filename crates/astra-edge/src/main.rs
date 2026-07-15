@@ -21,13 +21,17 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
     tungstenite::Message,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// Astra remote edge agent — execute tool calls locally for web sessions.
@@ -68,6 +72,67 @@ struct EdgeConfig {
     workspace_dir: PathBuf,
     edge_id: String,
     reconnect: bool,
+}
+
+struct CompletedEdgeInvocation {
+    request_id: String,
+    generation: u64,
+    result: astra_tools::ToolResult,
+    duration_ms: u64,
+}
+
+struct InFlightEdgeInvocation {
+    generation: u64,
+    cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct EdgeInvocationTracker {
+    in_flight: HashMap<String, InFlightEdgeInvocation>,
+    next_generation: u64,
+}
+
+impl EdgeInvocationTracker {
+    fn begin(&mut self, request_id: &str) -> Result<(u64, CancellationToken), u64> {
+        if let Some(active) = self.in_flight.get(request_id) {
+            return Err(active.generation);
+        }
+        self.next_generation = self.next_generation.saturating_add(1).max(1);
+        let generation = self.next_generation;
+        let cancel = CancellationToken::new();
+        self.in_flight.insert(
+            request_id.to_string(),
+            InFlightEdgeInvocation {
+                generation,
+                cancel: cancel.clone(),
+            },
+        );
+        Ok((generation, cancel))
+    }
+
+    fn cancel(&self, request_id: &str) -> Option<u64> {
+        let active = self.in_flight.get(request_id)?;
+        active.cancel.cancel();
+        Some(active.generation)
+    }
+
+    fn finish_if_current(&mut self, request_id: &str, generation: u64) -> bool {
+        if self
+            .in_flight
+            .get(request_id)
+            .is_none_or(|active| active.generation != generation)
+        {
+            return false;
+        }
+        self.in_flight.remove(request_id);
+        true
+    }
+
+    fn cancel_all(self) {
+        for active in self.in_flight.into_values() {
+            active.cancel.cancel();
+        }
+    }
 }
 
 fn normalized_hostname() -> String {
@@ -471,13 +536,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     }
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+    let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
         &workspace,
         config.edge_id.clone(),
         session_id,
         "astra-edge/0.1",
         Duration::from_secs(30),
-    );
+    ));
+    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(128);
+    let mut invocations = EdgeInvocationTracker::default();
 
     // Heartbeat ticker
     let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
@@ -502,45 +569,65 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 request_id,
                                 tool,
                                 args: tool_args,
-                                timeout_secs: _,
+                                timeout_secs,
                             }) => {
-                                tracing::info!(tool = %tool, request_id = %request_id, "Executing tool");
-                                let start = Instant::now();
-                                let result = astra_tools::ToolExecutor::execute(
-                                    &executor,
-                                    &tool,
-                                    &tool_args,
-                                )
-                                .await;
-                                let output = result.output;
-                                let is_error = result.is_error;
-                                let tool_result_fields = result.metadata;
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                tracing::info!(
-                                    tool = %tool,
-                                    request_id = %request_id,
-                                    duration_ms = duration_ms,
-                                    is_error = is_error,
-                                    output_len = output.len(),
-                                    "Tool execution complete"
-                                );
-                                let result_msg = EdgeClientMessage::ToolResult {
-                                    request_id,
-                                    output,
-                                    is_error,
-                                    duration_ms: Some(duration_ms),
-                                    tool_result_fields,
+                                let (generation, cancel) = match invocations.begin(&request_id) {
+                                    Ok(started) => started,
+                                    Err(generation) => {
+                                        tracing::warn!(
+                                            request_id = %request_id,
+                                            generation,
+                                            "Duplicate edge delivery joined the existing invocation"
+                                        );
+                                        continue;
+                                    }
                                 };
-                                write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
+                                let executor = executor.clone();
+                                let completed_tx = completed_tx.clone();
+                                tracing::info!(tool = %tool, request_id = %request_id, generation, "Executing tool");
+                                tokio::spawn(async move {
+                                    let start = Instant::now();
+                                    let execution = astra_tools::ToolExecutor::execute_with_cancel(
+                                        executor.as_ref(),
+                                        &tool,
+                                        &tool_args,
+                                        Some(&cancel),
+                                    );
+                                    let result = tokio::select! {
+                                        _ = cancel.cancelled() => astra_tools::ToolResult::error(
+                                            format!("Tool '{tool}' cancelled before completion")
+                                        ),
+                                        result = tokio::time::timeout(Duration::from_secs(timeout_secs), execution) => {
+                                            match result {
+                                                Ok(result) => result,
+                                                Err(_) => astra_tools::ToolResult::error(
+                                                    format!("Tool '{tool}' timed out after {timeout_secs}s")
+                                                ),
+                                            }
+                                        }
+                                    };
+                                    let completion = CompletedEdgeInvocation {
+                                        request_id,
+                                        generation,
+                                        result,
+                                        duration_ms: start.elapsed().as_millis() as u64,
+                                    };
+                                    let _ = completed_tx.send(completion).await;
+                                });
                             }
                             Ok(EdgeServerMessage::Pong) => {
                                 // heartbeat ack
                             }
                             Ok(EdgeServerMessage::ToolCancel { request_id }) => {
-                                tracing::warn!(
-                                    request_id = %request_id,
-                                    "Server cancelled tool request, but edge has no in-flight cancellation hook yet; ignoring"
-                                );
+                                if let Some(generation) = invocations.cancel(&request_id) {
+                                    tracing::info!(
+                                        request_id = %request_id,
+                                        generation,
+                                        "Cancelled in-flight edge invocation"
+                                    );
+                                } else {
+                                    tracing::debug!(request_id = %request_id, "Ignoring cancellation for non-active edge invocation");
+                                }
                             }
                             Ok(EdgeServerMessage::Closing { reason }) => {
                                 tracing::info!(reason = %reason, "Server closing connection");
@@ -564,6 +651,33 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                     _ => {}
                 }
             }
+            Some(completed) = completed_rx.recv() => {
+                if !invocations.finish_if_current(&completed.request_id, completed.generation) {
+                    tracing::warn!(
+                        request_id = %completed.request_id,
+                        generation = completed.generation,
+                        "Discarding stale edge invocation completion"
+                    );
+                    continue;
+                }
+                let result = completed.result;
+                tracing::info!(
+                    request_id = %completed.request_id,
+                    generation = completed.generation,
+                    duration_ms = completed.duration_ms,
+                    is_error = result.is_error,
+                    output_len = result.output.len(),
+                    "Tool execution complete"
+                );
+                let result_msg = EdgeClientMessage::ToolResult {
+                    request_id: completed.request_id,
+                    output: result.output,
+                    is_error: result.is_error,
+                    duration_ms: Some(completed.duration_ms),
+                    tool_result_fields: result.metadata,
+                };
+                write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
+            }
             _ = heartbeat.tick() => {
                 let ping = EdgeClientMessage::Ping;
                 if write.send(Message::Text(serde_json::to_string(&ping)?.into())).await.is_err() {
@@ -573,6 +687,8 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             }
         }
     }
+
+    invocations.cancel_all();
 
     Ok(())
 }
@@ -662,6 +778,33 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_tracker_deduplicates_and_fences_stale_completions() {
+        let mut tracker = EdgeInvocationTracker::default();
+        let (generation, _) = tracker.begin("request-1").unwrap();
+        assert_eq!(tracker.begin("request-1").unwrap_err(), generation);
+        assert!(!tracker.finish_if_current("request-1", generation + 1));
+        assert_eq!(tracker.begin("request-1").unwrap_err(), generation);
+        assert!(tracker.finish_if_current("request-1", generation));
+
+        let (next_generation, _) = tracker.begin("request-1").unwrap();
+        assert!(next_generation > generation);
+        assert!(!tracker.finish_if_current("request-1", generation));
+        assert!(tracker.finish_if_current("request-1", next_generation));
+    }
+
+    #[test]
+    fn invocation_tracker_routes_cancellation_to_the_exact_active_request() {
+        let mut tracker = EdgeInvocationTracker::default();
+        let (first_generation, first_cancel) = tracker.begin("request-1").unwrap();
+        let (_, second_cancel) = tracker.begin("request-2").unwrap();
+
+        assert_eq!(tracker.cancel("request-1"), Some(first_generation));
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        assert_eq!(tracker.cancel("missing"), None);
+    }
 
     #[test]
     fn edge_runtime_environment_capabilities_describe_local_edge_runtime() {

@@ -168,6 +168,27 @@ pub trait ToolExecutor: Send + Sync {
     /// Execute a tool by name with the given JSON arguments.
     async fn execute(&self, name: &str, args: &Value) -> ToolResult;
 
+    /// Execute one invocation under a caller-owned cancellation boundary.
+    /// Implementations with stronger native cancellation may override this;
+    /// the default never waits for a cancelled future to finish and preserves
+    /// the ordinary `execute` contract for existing providers.
+    async fn execute_with_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> ToolResult {
+        let Some(cancel_token) = cancel_token else {
+            return self.execute(name, args).await;
+        };
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+            }
+            result = self.execute(name, args) => result,
+        }
+    }
+
     /// Return the JSON schemas for all available tools (OpenAI function-calling format).
     fn tool_schemas(&self) -> Vec<Value>;
 
