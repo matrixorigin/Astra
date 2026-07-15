@@ -2054,6 +2054,7 @@ pub async fn ensure_core_schema(
             dispatch_owner      VARCHAR(64) NULL,
             dispatch_lease_expires_at DATETIME(6) NULL,
             outcome_json        JSON NULL,
+            completion_source_json JSON NULL,
             created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
@@ -2092,6 +2093,14 @@ pub async fn ensure_core_schema(
         "tool_invocation_ledger",
         "outcome_json",
         "ALTER TABLE tool_invocation_ledger ADD COLUMN outcome_json JSON NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "completion_source_json",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN completion_source_json JSON NULL",
     )
     .await?;
 

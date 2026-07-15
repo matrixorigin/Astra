@@ -7,9 +7,10 @@
 use std::collections::BTreeMap;
 
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationDecision, ToolInvocationDispatchLease,
-    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
-    ToolInvocationRecord, ToolInvocationState, ToolInvocationTerminalOutcome,
+    DispatchCertainty, ToolInvocationCompletionSource, ToolInvocationDecision,
+    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
+    ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use thiserror::Error;
 
@@ -44,6 +45,7 @@ impl InMemoryInvocationLedger {
             attempt_count: 0,
             dispatch_lease: None,
             outcome: None,
+            completion_source: None,
         };
         self.entries.insert(identity, entry.clone());
         Ok(ToolInvocationPrepareOutcome::Prepared(entry))
@@ -177,6 +179,35 @@ impl InMemoryInvocationLedger {
         entry.state = next;
         entry.dispatch_certainty = DispatchCertainty::Dispatched;
         entry.outcome = Some(outcome);
+        entry.completion_source = None;
+        Ok(entry.clone())
+    }
+
+    /// Atomically complete a prepared invocation from a trusted semantic read
+    /// observation without claiming or crossing the provider route boundary.
+    pub fn complete_from_semantic_read_cache(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        result: ToolInvocationResultPayload,
+        completion_source: ToolInvocationCompletionSource,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if entry.state != ToolInvocationState::Prepared {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity: identity.clone(),
+                expected: ToolInvocationState::Prepared,
+                actual: entry.state,
+            });
+        }
+        entry.state = ToolInvocationState::Succeeded;
+        entry.dispatch_certainty = DispatchCertainty::NotDispatched;
+        entry.outcome = Some(ToolInvocationTerminalOutcome::Succeeded { result });
+        entry.completion_source = Some(completion_source);
+        entry.validate()?;
         Ok(entry.clone())
     }
 
@@ -260,6 +291,8 @@ pub enum InvocationLedgerError {
         current_expiry_epoch_ms: u64,
         proposed_expiry_epoch_ms: u64,
     },
+    #[error(transparent)]
+    Contract(#[from] astra_turn_types::ToolInvocationContractError),
 }
 
 #[cfg(test)]
@@ -301,6 +334,22 @@ mod tests {
         }
     }
 
+    fn result(output: &str) -> ToolInvocationResultPayload {
+        ToolInvocationResultPayload {
+            output: output.to_string(),
+            metadata: BTreeMap::new(),
+            exit_semantics: None,
+        }
+    }
+
+    fn cache_completion() -> ToolInvocationCompletionSource {
+        ToolInvocationCompletionSource::semantic_read_cache(
+            format!("sha256:{}", "a".repeat(64)),
+            format!("sha256:{}", "b".repeat(64)),
+        )
+        .unwrap()
+    }
+
     fn lease(owner_id: &str, expires_at_epoch_ms: u64) -> ToolInvocationDispatchLease {
         ToolInvocationDispatchLease::new(owner_id, expires_at_epoch_ms).unwrap()
     }
@@ -321,6 +370,44 @@ mod tests {
                 .prepare(identity("call-2"), shared, decision())
                 .unwrap(),
             ToolInvocationPrepareOutcome::Prepared(_)
+        ));
+    }
+
+    #[test]
+    fn semantic_cache_completion_never_claims_provider_dispatch() {
+        let mut ledger = InMemoryInvocationLedger::default();
+        let identity = identity("call-cache");
+        ledger
+            .prepare(identity.clone(), fingerprint("read"), decision())
+            .unwrap();
+
+        let completed = ledger
+            .complete_from_semantic_read_cache(
+                &identity,
+                result("cached observation"),
+                cache_completion(),
+            )
+            .unwrap();
+
+        assert_eq!(completed.state, ToolInvocationState::Succeeded);
+        assert_eq!(
+            completed.dispatch_certainty,
+            DispatchCertainty::NotDispatched
+        );
+        assert_eq!(completed.attempt_count, 0);
+        assert!(completed.dispatch_lease.is_none());
+        assert!(completed.completion_source.is_some());
+        assert_eq!(
+            completed.outcome.unwrap().result().output,
+            "cached observation"
+        );
+        assert!(matches!(
+            ledger.claim_dispatch(&identity, lease("owner", 10)),
+            Err(InvocationLedgerError::StateMismatch {
+                expected: ToolInvocationState::Prepared,
+                actual: ToolInvocationState::Succeeded,
+                ..
+            })
         ));
     }
 

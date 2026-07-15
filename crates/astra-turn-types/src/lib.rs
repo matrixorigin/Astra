@@ -69,8 +69,9 @@ pub use semantic_read_cache::{
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
-    DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CONTRACT_VERSION,
-    TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES, ToolInvocationContractError, ToolInvocationDecision,
+    DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
+    TOOL_INVOCATION_CONTRACT_VERSION, TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES,
+    ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
     ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
     ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,

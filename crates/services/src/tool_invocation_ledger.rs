@@ -5,9 +5,10 @@
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationDecision, ToolInvocationDispatchLease,
-    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
-    ToolInvocationRecord, ToolInvocationState, ToolInvocationTerminalOutcome,
+    DispatchCertainty, ToolInvocationCompletionSource, ToolInvocationDecision,
+    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
+    ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
@@ -286,6 +287,7 @@ impl DatabaseToolInvocationLedger {
         let query = format!(
             "UPDATE tool_invocation_ledger
              SET state = ?, dispatch_certainty = 'dispatched', outcome_json = ?,
+                 completion_source_json = NULL,
                  updated_at = CURRENT_TIMESTAMP(6)
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ? AND state = ?{owner_predicate}"
@@ -339,6 +341,74 @@ impl DatabaseToolInvocationLedger {
         tx.commit().await?;
         Ok(record)
     }
+
+    /// Complete a prepared invocation from a semantic read observation. This
+    /// CAS deliberately leaves dispatch certainty as `not_dispatched` and the
+    /// provider attempt count at zero.
+    pub async fn complete_from_semantic_read_cache(
+        &self,
+        identity: &ToolInvocationIdentity,
+        result: &ToolInvocationResultPayload,
+        completion_source: &ToolInvocationCompletionSource,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        let outcome = ToolInvocationTerminalOutcome::Succeeded {
+            result: result.clone(),
+        };
+        let outcome_json = serde_json::to_string(&outcome).map_err(|source| {
+            ToolInvocationLedgerStoreError::Serialization {
+                field: "outcome_json",
+                source,
+            }
+        })?;
+        let completion_source_json =
+            serde_json::to_string(completion_source).map_err(|source| {
+                ToolInvocationLedgerStoreError::Serialization {
+                    field: "completion_source_json",
+                    source,
+                }
+            })?;
+        let mut tx = self.pool.get().begin().await?;
+        let updated = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'succeeded', dispatch_certainty = 'not_dispatched',
+                 outcome_json = ?, completion_source_json = ?,
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'prepared' AND attempt_count = 0
+               AND dispatch_owner IS NULL AND dispatch_lease_expires_at IS NULL",
+        )
+        .bind(outcome_json)
+        .bind(completion_source_json)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let record = load_record_in_tx(&mut tx, identity).await?;
+        if updated != 1 {
+            let error = match record {
+                Some(actual) => ToolInvocationLedgerStoreError::StateMismatch {
+                    identity: identity.clone(),
+                    expected: ToolInvocationState::Prepared,
+                    actual: actual.state,
+                },
+                None => ToolInvocationLedgerStoreError::NotFound {
+                    identity: identity.clone(),
+                },
+            };
+            rollback(tx, "semantic-cache-completion mismatch").await;
+            return Err(error);
+        }
+        let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
+            identity: identity.clone(),
+        })?;
+        tx.commit().await?;
+        Ok(record)
+    }
 }
 
 fn select_record_query(
@@ -348,6 +418,7 @@ fn select_record_query(
         "SELECT CAST(fingerprint_json AS CHAR) AS fingerprint_json,
                 CAST(decision_json AS CHAR) AS decision_json,
                 CAST(outcome_json AS CHAR) AS outcome_json,
+                CAST(completion_source_json AS CHAR) AS completion_source_json,
                 state, dispatch_certainty, attempt_count, dispatch_owner,
                 CAST(
                     UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000
@@ -412,6 +483,17 @@ fn decode_record(
             })
         })
         .transpose()?;
+    let completion_source_json: Option<String> = row.try_get("completion_source_json")?;
+    let completion_source = completion_source_json
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|source| {
+                ToolInvocationLedgerStoreError::InvalidStoredJson {
+                    field: "completion_source_json",
+                    source,
+                }
+            })
+        })
+        .transpose()?;
     if attempt_count > u64::from(u32::MAX) {
         return Err(ToolInvocationLedgerStoreError::InvalidAttemptCount(
             attempt_count,
@@ -427,7 +509,11 @@ fn decode_record(
         (None, None) => None,
         _ => return Err(ToolInvocationLedgerStoreError::IncompleteDispatchLease),
     };
-    let required = state.required_dispatch_certainty();
+    let required = if completion_source.is_some() {
+        DispatchCertainty::NotDispatched
+    } else {
+        state.required_dispatch_certainty()
+    };
     if dispatch_certainty != required {
         return Err(ToolInvocationLedgerStoreError::CertaintyMismatch {
             state,
@@ -444,6 +530,7 @@ fn decode_record(
         attempt_count: attempt_count as u32,
         dispatch_lease,
         outcome,
+        completion_source,
     };
     record.validate()?;
     Ok(record)

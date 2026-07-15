@@ -10,9 +10,10 @@ use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationLedgerStoreError,
 };
 use astra_turn_types::{
-    DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
-    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome,
+    DispatchCertainty, DurableToolReference, ToolInvocationCompletionSource,
+    ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationResultPayload, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -92,6 +93,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     let first = identity(&prefix, "call-1");
     let second = identity(&prefix, "call-2");
     let abandoned = identity(&prefix, "call-abandoned");
+    let cached = identity(&prefix, "call-cached");
     cleanup(&pool, &first).await;
     let ledger = DatabaseToolInvocationLedger::new(shared);
     let original = fingerprint("deploy");
@@ -137,6 +139,43 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
             .await
             .unwrap(),
         ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+
+    ledger
+        .prepare(&cached, &original, &decision())
+        .await
+        .unwrap();
+    let cached_record = ledger
+        .complete_from_semantic_read_cache(
+            &cached,
+            &ToolInvocationResultPayload {
+                output: "cached observation".to_string(),
+                metadata: BTreeMap::new(),
+                exit_semantics: None,
+            },
+            &ToolInvocationCompletionSource::semantic_read_cache(
+                format!("sha256:{}", "a".repeat(64)),
+                format!("sha256:{}", "b".repeat(64)),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached_record.state, ToolInvocationState::Succeeded);
+    assert_eq!(
+        cached_record.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(cached_record.attempt_count, 0);
+    assert!(cached_record.dispatch_lease.is_none());
+    assert!(cached_record.completion_source.is_some());
+    assert_eq!(ledger.get(&cached).await.unwrap().unwrap(), cached_record);
+    assert!(matches!(
+        ledger.claim_dispatch(&cached, "worker-cache", 90_000).await,
+        Err(ToolInvocationLedgerStoreError::StateMismatch {
+            actual: ToolInvocationState::Succeeded,
+            ..
+        })
     ));
 
     let dispatch = |ledger: DatabaseToolInvocationLedger,

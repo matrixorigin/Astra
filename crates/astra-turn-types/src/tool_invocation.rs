@@ -13,8 +13,10 @@ use thiserror::Error;
 
 use crate::ResolvedToolDescriptorRef;
 
-pub const TOOL_INVOCATION_CONTRACT_VERSION: &str = "tool-invocation-v1";
+pub const TOOL_INVOCATION_CONTRACT_VERSION: &str = "tool-invocation-v2";
 pub const TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES: usize = 64;
+pub const TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION: &str =
+    "tool-invocation-cache-completion-v1";
 
 const INTERNAL_TRANSPORT_ARGUMENTS: [&str; 3] = ["_run_id", "_tool_call_id", "_turn_chain_id"];
 
@@ -444,6 +446,85 @@ pub enum ToolInvocationTerminalOutcome {
     },
 }
 
+/// Provenance for a terminal invocation that did not cross the selected
+/// provider route boundary. Absence means the terminal outcome followed a
+/// provider dispatch, preserving compatibility with pre-cache ledger rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolInvocationCompletionSource {
+    SemanticReadCache {
+        contract_version: String,
+        cache_key_id: String,
+        observation_id: String,
+    },
+}
+
+impl ToolInvocationCompletionSource {
+    pub fn semantic_read_cache(
+        cache_key_id: impl Into<String>,
+        observation_id: impl Into<String>,
+    ) -> Result<Self, ToolInvocationContractError> {
+        let source = Self::SemanticReadCache {
+            contract_version: TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION.to_string(),
+            cache_key_id: cache_key_id.into(),
+            observation_id: observation_id.into(),
+        };
+        source.validate()?;
+        Ok(source)
+    }
+
+    fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        match self {
+            Self::SemanticReadCache {
+                contract_version,
+                cache_key_id,
+                observation_id,
+            } => {
+                if contract_version != TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION {
+                    return Err(
+                        ToolInvocationContractError::UnsupportedCacheCompletionContractVersion(
+                            contract_version.clone(),
+                        ),
+                    );
+                }
+                validate_sha256_content_id("cache_key_id", cache_key_id)?;
+                validate_sha256_content_id("observation_id", observation_id)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum RawSource {
+            SemanticReadCache {
+                contract_version: String,
+                cache_key_id: String,
+                observation_id: String,
+            },
+        }
+
+        let source = match RawSource::deserialize(deserializer)? {
+            RawSource::SemanticReadCache {
+                contract_version,
+                cache_key_id,
+                observation_id,
+            } => Self::SemanticReadCache {
+                contract_version,
+                cache_key_id,
+                observation_id,
+            },
+        };
+        source.validate().map_err(serde::de::Error::custom)?;
+        Ok(source)
+    }
+}
+
 impl ToolInvocationTerminalOutcome {
     pub fn state(&self) -> ToolInvocationState {
         match self {
@@ -476,6 +557,8 @@ pub struct ToolInvocationRecord {
     pub dispatch_lease: Option<ToolInvocationDispatchLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ToolInvocationTerminalOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_source: Option<ToolInvocationCompletionSource>,
 }
 
 impl ToolInvocationRecord {
@@ -487,7 +570,15 @@ impl ToolInvocationRecord {
                 durable_decision_id: self.decision.decision_id.clone(),
             });
         }
-        let required_certainty = self.state.required_dispatch_certainty();
+        if let Some(source) = &self.completion_source {
+            source.validate()?;
+        }
+        let cache_completion = self.completion_source.is_some();
+        let required_certainty = if cache_completion {
+            DispatchCertainty::NotDispatched
+        } else {
+            self.state.required_dispatch_certainty()
+        };
         if self.dispatch_certainty != required_certainty {
             return Err(ToolInvocationContractError::RecordCertaintyMismatch {
                 state: self.state,
@@ -503,6 +594,23 @@ impl ToolInvocationRecord {
                 return Err(ToolInvocationContractError::UnexpectedDispatchLease);
             }
             _ => {}
+        }
+        if cache_completion {
+            if self.state != ToolInvocationState::Succeeded {
+                return Err(ToolInvocationContractError::InvalidCacheCompletionState {
+                    state: self.state,
+                });
+            }
+            if self.attempt_count != 0 {
+                return Err(
+                    ToolInvocationContractError::InvalidCacheCompletionAttemptCount {
+                        attempt_count: self.attempt_count,
+                    },
+                );
+            }
+            if self.dispatch_lease.is_some() {
+                return Err(ToolInvocationContractError::CacheCompletionHasDispatchLease);
+            }
         }
         match (&self.outcome, self.state) {
             (Some(outcome), state) if outcome.state() == state => Ok(()),
@@ -538,6 +646,8 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
             dispatch_lease: Option<ToolInvocationDispatchLease>,
             #[serde(default)]
             outcome: Option<ToolInvocationTerminalOutcome>,
+            #[serde(default)]
+            completion_source: Option<ToolInvocationCompletionSource>,
         }
 
         let raw = RawRecord::deserialize(deserializer)?;
@@ -550,6 +660,7 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
             attempt_count: raw.attempt_count,
             dispatch_lease: raw.dispatch_lease,
             outcome: raw.outcome,
+            completion_source: raw.completion_source,
         };
         record.validate().map_err(serde::de::Error::custom)?;
         Ok(record)
@@ -593,6 +704,23 @@ fn canonical_json(value: &Value) -> Value {
             Value::Object(sorted.into_iter().collect())
         }
         _ => value.clone(),
+    }
+}
+
+fn validate_sha256_content_id(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ToolInvocationContractError> {
+    let valid = value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ToolInvocationContractError::InvalidCompletionContentId { field })
     }
 }
 
@@ -649,6 +777,16 @@ pub enum ToolInvocationContractError {
     MissingDispatchLease,
     #[error("a prepared tool invocation must not already have a dispatch lease")]
     UnexpectedDispatchLease,
+    #[error("unsupported tool invocation cache-completion contract version '{0}'")]
+    UnsupportedCacheCompletionContractVersion(String),
+    #[error("tool invocation cache-completion {field} is not a canonical SHA-256 content ID")]
+    InvalidCompletionContentId { field: &'static str },
+    #[error("semantic cache completion cannot produce ledger state {state:?}")]
+    InvalidCacheCompletionState { state: ToolInvocationState },
+    #[error("semantic cache completion cannot have {attempt_count} provider dispatch attempts")]
+    InvalidCacheCompletionAttemptCount { attempt_count: u32 },
+    #[error("semantic cache completion cannot retain a provider dispatch lease")]
+    CacheCompletionHasDispatchLease,
 }
 
 #[cfg(test)]
@@ -840,6 +978,7 @@ mod tests {
             attempt_count: 1,
             dispatch_lease: None,
             outcome: Some(outcome),
+            completion_source: None,
         };
 
         let restored: ToolInvocationRecord =
@@ -849,6 +988,57 @@ mod tests {
             restored.outcome.unwrap().result().output,
             "permission denied"
         );
+    }
+
+    #[test]
+    fn cache_completion_is_successful_without_provider_dispatch() {
+        let decision = decision();
+        let record = ToolInvocationRecord {
+            identity: identity("call-cache"),
+            fingerprint: ToolInvocationFingerprint::new(
+                tool_ref(),
+                &json!({"command": "read"}),
+                &decision.decision_id,
+            )
+            .unwrap(),
+            decision,
+            state: ToolInvocationState::Succeeded,
+            dispatch_certainty: DispatchCertainty::NotDispatched,
+            attempt_count: 0,
+            dispatch_lease: None,
+            outcome: Some(ToolInvocationTerminalOutcome::Succeeded {
+                result: ToolInvocationResultPayload {
+                    output: "cached observation".to_string(),
+                    metadata: BTreeMap::new(),
+                    exit_semantics: None,
+                },
+            }),
+            completion_source: Some(
+                ToolInvocationCompletionSource::semantic_read_cache(
+                    format!("sha256:{}", "a".repeat(64)),
+                    format!("sha256:{}", "b".repeat(64)),
+                )
+                .unwrap(),
+            ),
+        };
+        record.validate().unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolInvocationRecord>(encoded.clone()).unwrap(),
+            record
+        );
+
+        let mut dispatched = encoded.clone();
+        dispatched["dispatch_certainty"] = json!("dispatched");
+        assert!(serde_json::from_value::<ToolInvocationRecord>(dispatched).is_err());
+
+        let mut attempted = encoded.clone();
+        attempted["attempt_count"] = json!(1);
+        assert!(serde_json::from_value::<ToolInvocationRecord>(attempted).is_err());
+
+        let mut forged = encoded;
+        forged["completion_source"]["cache_key_id"] = json!("sha256:short");
+        assert!(serde_json::from_value::<ToolInvocationRecord>(forged).is_err());
     }
 
     #[test]

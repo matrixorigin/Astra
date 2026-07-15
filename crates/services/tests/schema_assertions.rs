@@ -1664,6 +1664,12 @@ async fn phase2_web_hydration_schema_contract() {
             .any(|column| column == "dispatch_lease_expires_at"),
         "abandoned provider dispatches require a durable liveness deadline"
     );
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "completion_source_json"),
+        "non-dispatched cache completion requires durable, typed provenance"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [
