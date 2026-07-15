@@ -426,6 +426,13 @@ Execution rules:
 - never retry a non-idempotent call after ambiguous dispatch;
 - represent a lost acknowledgement after possible external application as
   `OutcomeUnknown`;
+- at an independent execution edge, persist `Prepared` before crossing the
+  local executor boundary and distinguish it from `Running` during recovery:
+  `Prepared` is safe to resume under the same identity, while `Running`
+  becomes `OutcomeUnknown` and is never implicitly redispatched;
+- keep the independent Edge inbox/outbox crash-safe with a bounded append-only
+  WAL and periodic atomic snapshots. Capacity exhaustion is an explicit
+  retryable `NotDispatched` admission result, not a fabricated tool outcome;
 - reconcile through the provider when supported; otherwise expose uncertainty
   and require an explicit decision.
 

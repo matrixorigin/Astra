@@ -558,7 +558,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         "astra-edge/0.1",
         Duration::from_secs(30),
     ));
-    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(128);
+    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
     let mut invocations = EdgeInvocationTracker::default();
     let journal_path = edge_invocation_journal_path(&config.edge_id, &workspace);
     let mut journal = EdgeInvocationJournal::open(journal_path).await?;
@@ -631,10 +631,22 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         continue;
                                     }
                                     Ok(PrepareOutcome::Execute) => {}
-                                    Err(error @ (JournalError::Full | JournalError::IdentityConflict { .. })) => {
+                                    Err(error @ (JournalError::Full | JournalError::WalFull)) => {
+                                        let result = DurableEdgeResult::not_dispatched_rejection(
+                                            format!("Edge invocation admission is temporarily saturated: {error}"),
+                                        );
+                                        let message = result.client_message(
+                                            request_id,
+                                            identity,
+                                            delivery_generation,
+                                        );
+                                        write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
+                                        continue;
+                                    }
+                                    Err(error @ JournalError::IdentityConflict { .. }) => {
                                         let result = DurableEdgeResult::from_tool_result(
                                             astra_tools::ToolResult::error(format!(
-                                                "Edge invocation rejected before dispatch: {error}"
+                                                "Edge invocation identity conflict before dispatch: {error}"
                                             )),
                                             0,
                                         );
