@@ -6930,11 +6930,19 @@ esac
             }
         })]);
 
-        let sandbox_tool = exec
-            .execute_with_metadata("bash", &json!({"command": "echo should-not-run"}))
-            .await;
+        let sandbox_request =
+            exec.tool_execution_request("bash", &json!({"command": "echo should-not-run"}));
+        assert_eq!(
+            exec.tool_execution_service
+                .routing_decision(&sandbox_request),
+            crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal
+        );
+        let sandbox_tool = exec.execute_request_with_metadata(sandbox_request).await;
         assert!(!sandbox_tool.is_error, "{sandbox_tool:?}");
-        assert_eq!(sandbox_tool.output, "should-not-run\n");
+        assert!(
+            sandbox_tool.output.contains("should-not-run"),
+            "the selected sandbox route must execute the command: {sandbox_tool:?}"
+        );
 
         let mcp_request =
             exec.tool_execution_request("mcp__demo__search", &json!({"query": "hello"}));

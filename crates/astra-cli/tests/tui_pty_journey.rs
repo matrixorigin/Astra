@@ -15,6 +15,10 @@ const CPR_REQUEST: &[u8] = b"\x1b[6n";
 const CPR_RESPONSE: &[u8] = b"\x1b[1;1R";
 const DA1_REQUEST: &[u8] = b"\x1b[c";
 const DA1_RESPONSE_WITHOUT_SIXEL: &[u8] = b"\x1b[?1;2c";
+// Full-workspace nextest runs contend for CPU and linker I/O even though each
+// PTY and mock server is isolated. Keep UI transitions bounded, but do not use
+// a sub-suite timing assumption as the product contract.
+const UI_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A PTY journey owns a controlling terminal and flips the child into raw
 /// mode. Keep those process-level terminal journeys serial even though their
@@ -404,14 +408,14 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     // ratatui positions separately styled words with cursor movement codes.
     let draft = "draft_survives_transcript_round_trip";
     astra.write(draft.as_bytes());
-    astra.wait_for(draft, Duration::from_secs(5));
+    astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O
-    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("filter:", Duration::from_secs(2));
 
     astra.write(&[0x0f]); // Ctrl+O
-    astra.wait_for(draft, Duration::from_secs(5));
+    astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x15]); // Ctrl+U clears the restored draft.
     astra.write(b"/exit\r");
@@ -433,10 +437,10 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"complete_this_live_transcript_journey\r");
-    astra.wait_for("Sending", Duration::from_secs(5));
+    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O while the HTTP turn is still pending.
-    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
@@ -460,7 +464,7 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"/allow prompt\r");
-    astra.wait_for("Mode → Ask", Duration::from_secs(5));
+    astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
     astra.write(b"exercise_tool_history_in_transcript\r");
     // The second mock response is only reachable after the real host has
     // accepted and executed the first response's tool request.
@@ -469,11 +473,11 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
 
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
-    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
-    astra.wait_for("Ran Write file", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Ran Write file", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
-    astra.wait_for("Enter send", Duration::from_secs(5));
+    astra.wait_for("Enter send", UI_TRANSITION_TIMEOUT);
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -493,16 +497,16 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"/allow prompt\r");
-    astra.wait_for("Mode → Ask", Duration::from_secs(5));
+    astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
     astra.write(b"request_a_write_and_wait_for_my_approval\r");
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
 
     astra.write(&[0x0f]); // Ctrl+O while approval owns the bottom pane.
-    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
-    astra.wait_for("write_file", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("write_file", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
-    astra.wait_for("Approval · Write File", Duration::from_secs(5));
+    astra.wait_for("Approval · Write File", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r"); // The focused Yes action approves exactly this request.
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
 
@@ -525,14 +529,14 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"delegate_one_child_and_keep_it_observable\r");
-    wait_for_agent_journey_child_request(&mock, &mut astra, Duration::from_secs(5)).await;
+    wait_for_agent_journey_child_request(&mock, &mut astra, UI_TRANSITION_TIMEOUT).await;
 
     astra.write(&[0x07]); // Ctrl+G while the child response is still pending.
-    astra.wait_for("Conversations", Duration::from_secs(5));
-    astra.wait_for("Mock child review", Duration::from_secs(5));
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
 
     astra.write(b"1\r"); // Numeric selection addresses the first child, not the root tab.
-    astra.wait_for("Transcript", Duration::from_secs(5));
+    astra.wait_for("Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("child_evidence_visible", Duration::from_secs(10));
 
     // Ctrl+O always focuses the retained root conversation without destroying
@@ -547,11 +551,11 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     // navigator. Reopening must hydrate the stored transcript prefix rather
     // than showing only events emitted after the view was opened.
     astra.write(&[0x07]);
-    astra.wait_for("Conversations", Duration::from_secs(5));
-    astra.wait_for("Mock child review", Duration::from_secs(5));
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
     astra.write(b"1\r");
-    astra.wait_for("Transcript", Duration::from_secs(5));
-    astra.wait_for("child_evidence_visible", Duration::from_secs(5));
+    astra.wait_for("Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     assert_eq!(
         mock.received_requests()
             .iter()
