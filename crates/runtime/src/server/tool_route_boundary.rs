@@ -324,9 +324,6 @@ pub(crate) fn copy_result_routing_metadata(
     }
 }
 
-const RESULT_STRUCTURED_OUTPUT_METADATA_FIELDS: &[&str] =
-    &["structuredContent", "artifacts", "artifact"];
-
 fn copy_result_structured_output_metadata(
     event: &mut Map<String, Value>,
     result: &astra_tools::ToolResult,
@@ -334,16 +331,9 @@ fn copy_result_structured_output_metadata(
     let Some(metadata) = result.metadata.as_ref() else {
         return;
     };
-    for key in RESULT_STRUCTURED_OUTPUT_METADATA_FIELDS {
-        if let Some(value) = metadata.get(*key) {
-            event
-                .entry((*key).to_string())
-                .or_insert_with(|| value.clone());
-        }
-    }
     if let Some(value) = metadata.get("structuredContent") {
         event
-            .entry("output".to_string())
+            .entry("structuredContent".to_string())
             .or_insert_with(|| value.clone());
     }
 }

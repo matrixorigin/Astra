@@ -356,6 +356,7 @@ impl SemanticReadObservation {
             ));
         }
         self.key.validate()?;
+        self.result.validate()?;
         validate_content_id("observation_id", &self.observation_id)?;
         let expected = observation_content_id(self)?;
         if self.observation_id != expected {
@@ -403,6 +404,8 @@ impl<'de> Deserialize<'de> for SemanticReadObservation {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SemanticReadCacheContractError {
+    #[error(transparent)]
+    ResultContract(#[from] crate::ToolInvocationContractError),
     #[error("semantic read-cache {field} must not be empty")]
     EmptyComponent { field: &'static str },
     #[error("semantic read-cache {field} exceeds {max_bytes} bytes (actual {actual_bytes} bytes)")]
@@ -948,9 +951,14 @@ mod tests {
         assert!(matches!(
             SemanticReadObservation::from_terminal_outcome(
                 cache_key(),
-                &success("x".repeat(SEMANTIC_READ_OBSERVATION_MAX_BYTES)),
+                &success("x".repeat(crate::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1)),
             ),
-            Err(SemanticReadCacheContractError::ObservationTooLarge { .. })
+            Err(SemanticReadCacheContractError::ResultContract(
+                crate::ToolInvocationContractError::ResultFieldTooLarge {
+                    field: "output",
+                    ..
+                }
+            ))
         ));
 
         let observation = SemanticReadObservation::from_terminal_outcome(

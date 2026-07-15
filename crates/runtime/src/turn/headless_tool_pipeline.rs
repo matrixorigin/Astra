@@ -80,6 +80,8 @@ pub(crate) struct HeadlessResolvedExecution {
     args: Value,
     result_str: String,
     tool_result_fields: Option<Map<String, Value>>,
+    pending_runtime_completion:
+        Option<crate::server::runtime_tool_executor::PendingRuntimeToolCompletion>,
     edge_duration_ms: u64,
     is_edge_tool: bool,
     early_exit_ms: u64,
@@ -367,6 +369,7 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
         args,
         result_str,
         tool_result_fields,
+        pending_runtime_completion: None,
         edge_duration_ms,
         is_edge_tool,
         early_exit_ms,
@@ -729,6 +732,9 @@ mod tests {
         term: NoopHeadlessTerminal,
         repeated_cache_hit_suppression: u32,
         max_consecutive_empty_name: u32,
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
     }
 
     impl PipelineHarness {
@@ -765,6 +771,9 @@ mod tests {
                 // Production runs derive these from the per-model policy.
                 repeated_cache_hit_suppression: 2,
                 max_consecutive_empty_name: 3,
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-turn-chain".to_string(),
             }
         }
 
@@ -784,6 +793,19 @@ mod tests {
                 turn_index,
                 session_turn.max(1),
                 runtime_tool_executor,
+                false,
+            )
+        }
+
+        fn durable_pipeline_with_server_executor<'a>(
+            &'a mut self,
+            runtime_tool_executor: &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
+        ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
+            self.pipeline_with_server_executor_for_session_turn(
+                0,
+                1,
+                Some(runtime_tool_executor),
+                true,
             )
         }
 
@@ -794,6 +816,7 @@ mod tests {
             runtime_tool_executor: Option<
                 &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
+            durable_scope: bool,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             HeadlessToolExecutionPipeline::new(
                 HeadlessToolExecutionCtx {
@@ -802,10 +825,10 @@ mod tests {
                     quiet: true,
                     api: &self.api,
                     token: "",
-                    current_user_id: None,
-                    current_session_id: None,
-                    current_run_id: None,
-                    current_turn_chain_id: None,
+                    current_user_id: durable_scope.then_some("test-user"),
+                    current_session_id: durable_scope.then_some(&self.session_id),
+                    current_run_id: durable_scope.then_some(self.run_id.as_str()),
+                    current_turn_chain_id: durable_scope.then_some(self.turn_chain_id.as_str()),
                     tool_calls: &self.tool_calls,
                     edge_tool_round: &self.edge_tool_round,
                     by_sig: &self.by_sig,
@@ -1786,6 +1809,7 @@ mod tests {
                         args: args.clone(),
                         result_str: "mutation succeeded".into(),
                         tool_result_fields: None,
+                        pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
                         early_exit_ms: 0,
@@ -1854,6 +1878,7 @@ mod tests {
                         args: args.clone(),
                         result_str: "mutation succeeded".into(),
                         tool_result_fields: None,
+                        pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
                         early_exit_ms: 0,
@@ -1946,6 +1971,7 @@ mod tests {
                         args: args.clone(),
                         result_str: "mutation succeeded".into(),
                         tool_result_fields: None,
+                        pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
                         early_exit_ms: 0,
@@ -2051,6 +2077,87 @@ mod tests {
                 .to_string()
                 .contains("hooked result")
         );
+    }
+
+    #[tokio::test]
+    async fn durable_completion_waits_for_post_tool_governance_and_redaction() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        configure_server_read_file(&mut harness, "call-governed", "governed.txt");
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"output":"hooked AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}'"#
+                    .into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("governed.txt"),
+            "raw provider AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF",
+        )
+        .unwrap();
+        let mut executor =
+            server_executor_for_test_workspace(workspace.path(), harness.session_id.as_str());
+        executor.enable_durable_invocations();
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            &harness.session_id,
+            &harness.run_id,
+            &harness.turn_chain_id,
+            "call-governed",
+        )
+        .unwrap();
+
+        let mut pipeline = harness.durable_pipeline_with_server_executor(&executor);
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated durable read"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted durable read"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.execution.pending_runtime_completion.is_some());
+        let dispatched = executor
+            .durable_invocation_record_for_test(&identity)
+            .await
+            .expect("prepared invocation");
+        assert_eq!(
+            dispatched.state,
+            astra_turn_types::ToolInvocationState::Dispatched
+        );
+        assert!(dispatched.outcome.is_none());
+
+        pipeline.record_execution(executed).await;
+        let completed = executor
+            .durable_invocation_record_for_test(&identity)
+            .await
+            .expect("completed invocation");
+        assert_eq!(
+            completed.state,
+            astra_turn_types::ToolInvocationState::Succeeded
+        );
+        let outcome = completed.outcome.unwrap();
+        let durable_output = &outcome.result().output;
+        assert!(durable_output.contains("hooked"), "{durable_output}");
+        assert!(durable_output.contains("[REDACTED:"), "{durable_output}");
+        assert!(!durable_output.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!durable_output.contains("AKIA1234567890ABCDEF"));
+        let cached = pipeline
+            .ctx
+            .idempotency_cache
+            .check(&read_cache_key_at_epoch("governed.txt", 0))
+            .expect("successful read should populate the observation cache");
+        assert!(cached.output.contains("[REDACTED:"), "{}", cached.output);
+        assert!(!cached.output.contains("AKIA1234567890ABCDEF"));
     }
 
     #[tokio::test]
@@ -2246,7 +2353,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline =
-            harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec));
+            harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec), false);
         let args = json!({"path": "turn.txt", "content": "hello"});
         let permitted = PermittedExecution {
             execution: HeadlessResolvedExecution {
@@ -2255,6 +2362,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,
@@ -2305,6 +2413,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,
@@ -2348,6 +2457,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,
@@ -2408,6 +2518,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,
@@ -2456,6 +2567,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,
@@ -2502,6 +2614,7 @@ mod tests {
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
+                pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
                 early_exit_ms: 0,

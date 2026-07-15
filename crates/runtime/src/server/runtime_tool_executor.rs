@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use astra_core::SharedPool;
 use astra_mcp::McpToolCallResult;
 use astra_runtime_env::WorkspaceRecord;
+use astra_services::session_artifact_store::SessionArtifactJsonStore;
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::task_mgmt::{
     InMemoryTaskStore, MAX_CREATE_SUBTASKS, SessionTask, TaskManager, TaskManagerSnapshot,
@@ -42,6 +43,9 @@ use astra_turn_core::tool::schema::{
 };
 use astra_turn_types::{ProviderCallOutcome, ProviderCallPayload};
 use async_trait::async_trait;
+
+const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::orchestration::AgentToolContext;
 use crate::server::semantic_read_freshness::{
@@ -61,8 +65,8 @@ use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
 use crate::server::tool_route_runtime::{
-    ToolRouteRuntimeContext, execute_tool_route_with_events,
-    execute_tool_route_with_events_at_route,
+    ToolRouteRuntimeContext, emit_tool_route_completion_events,
+    execute_tool_route_before_completion_events,
 };
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
@@ -121,6 +125,74 @@ struct PendingSemanticReadFill {
     claim: Box<crate::server::semantic_read_observation_runtime::SemanticReadFillClaim>,
     decision: crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
     arguments: Value,
+}
+
+struct PendingDurableToolCompletion {
+    ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
+    identity: astra_turn_types::ToolInvocationIdentity,
+    owner_id: String,
+    cache_fill: Option<PendingSemanticReadFill>,
+    lease_heartbeat: crate::server::tool_invocation_runtime::DispatchLeaseHeartbeat,
+}
+
+pub(crate) struct PendingRuntimeToolCompletion {
+    boundary: crate::server::tool_route_boundary::ToolRouteBoundary,
+    duration_ms: u64,
+    binding_fields: Map<String, Value>,
+    durable: Option<PendingDurableToolCompletion>,
+}
+
+pub(crate) struct GovernableRuntimeToolResult {
+    pub(crate) result: astra_tools::ToolResult,
+    pub(crate) pending: Option<PendingRuntimeToolCompletion>,
+}
+
+impl GovernableRuntimeToolResult {
+    fn completed(result: astra_tools::ToolResult) -> Self {
+        Self {
+            result,
+            pending: None,
+        }
+    }
+}
+
+pub(crate) struct GovernedRuntimeToolResult(astra_tools::ToolResult);
+
+impl GovernedRuntimeToolResult {
+    pub(crate) fn into_inner(self) -> astra_tools::ToolResult {
+        self.0
+    }
+}
+
+pub(crate) fn govern_runtime_tool_result(
+    mut result: astra_tools::ToolResult,
+    post_tool_modified: bool,
+) -> GovernedRuntimeToolResult {
+    let sanitization =
+        astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&result.output);
+    let mut stripped_lines = sanitization.stripped_lines;
+    let mut credential_redactions = sanitization.credential_redactions;
+    result.output = sanitization.content;
+    if let Some(metadata) = result.metadata.take() {
+        let sanitization =
+            astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(metadata);
+        stripped_lines = stripped_lines.saturating_add(sanitization.stripped_lines);
+        credential_redactions =
+            credential_redactions.saturating_add(sanitization.credential_redactions);
+        result.metadata = Some(sanitization.metadata);
+    }
+    if post_tool_modified || stripped_lines > 0 || credential_redactions > 0 {
+        result.metadata.get_or_insert_with(Map::new).insert(
+            "astraResultGovernance".to_string(),
+            serde_json::json!({
+                "contractVersion": "tool-result-governance-v1",
+                "postToolModified": post_tool_modified,
+                "promptInjectionLinesStripped": stripped_lines,
+                "credentialRedactions": credential_redactions,
+            }),
+        );
+    }
+    GovernedRuntimeToolResult(result)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,8 +352,9 @@ pub struct RuntimeToolExecutor {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
 
     // ── Persistence ───────────────────────────────────────────────────────────
-    /// Optional remote workspace artifact store for publishing workspace metadata.
-    workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
+    /// Owner-checked remote artifact store shared by workspace snapshots and
+    /// governed tool-result evidence.
+    session_artifact_store: Option<Arc<dyn SessionArtifactJsonStore>>,
 
     // ── Publish (work surface events) ─────────────────────────────────────────
     /// Optional live event channel used by the web-agent work surface.
@@ -434,7 +507,7 @@ impl RuntimeToolExecutor {
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             session_config: SessionConfigState::new(),
             cancel_token: None,
-            workspace_artifact_store: None,
+            session_artifact_store: None,
             context_manifest_pool: None,
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
@@ -506,6 +579,19 @@ impl RuntimeToolExecutor {
                 self.context_manifest_pool.clone(),
             ),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn durable_invocation_record_for_test(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+    ) -> Option<astra_turn_types::ToolInvocationRecord> {
+        self.invocation_ledger
+            .as_ref()?
+            .get(identity)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Enable semantic read reuse only after the deployment has established
@@ -1449,11 +1535,20 @@ impl RuntimeToolExecutor {
         self
     }
 
-    pub fn with_workspace_artifact_store(
+    pub fn with_session_artifact_store(
         mut self,
         store: astra_services::DatabaseSessionArtifactStore,
     ) -> Self {
-        self.workspace_artifact_store = Some(store);
+        self.session_artifact_store = Some(Arc::new(store));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_session_artifact_store(
+        mut self,
+        store: Arc<dyn SessionArtifactJsonStore>,
+    ) -> Self {
+        self.session_artifact_store = Some(store);
         self
     }
 
@@ -1709,7 +1804,7 @@ impl RuntimeToolExecutor {
     }
 
     pub(crate) fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
-        let Some(store) = self.workspace_artifact_store.clone() else {
+        let Some(store) = self.session_artifact_store.clone() else {
             return Ok(());
         };
         let workspace = astra_services::session_workspace::read_workspace(&self.session_id)
@@ -1718,7 +1813,9 @@ impl RuntimeToolExecutor {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle.block_on(async {
                 astra_services::session_workspace::persist_remote_workspace(
-                    &workspace, &user_id, &store,
+                    &workspace,
+                    &user_id,
+                    store.as_ref(),
                 )
                 .await
                 .map(|_| ())
@@ -1730,7 +1827,9 @@ impl RuntimeToolExecutor {
                 .map_err(|error| error.to_string())?
                 .block_on(async {
                     astra_services::session_workspace::persist_remote_workspace(
-                        &workspace, &user_id, &store,
+                        &workspace,
+                        &user_id,
+                        store.as_ref(),
                     )
                     .await
                     .map(|_| ())
@@ -1760,7 +1859,6 @@ impl RuntimeToolExecutor {
     /// Execute a tool call and preserve structured metadata for route-bound execution paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         let request = self.tool_execution_request(name, args);
-
         self.execute_request_with_metadata(request).await
     }
 
@@ -1806,18 +1904,69 @@ impl RuntimeToolExecutor {
         self.execute_request_with_metadata(request).await
     }
 
+    pub(crate) async fn execute_invocation_before_governance(
+        &self,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
+        name: &str,
+        args: &Value,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
+        permission_grant: Option<
+            &crate::server::tool_execution_binding::ToolPermissionGrantSnapshot,
+        >,
+    ) -> GovernableRuntimeToolResult {
+        let identity = match astra_turn_types::ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": error.to_string(),
+                        "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                        "retryable": false,
+                    })
+                    .to_string(),
+                ));
+            }
+        };
+        let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
+        request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
+        request.policy.permission_grant = permission_grant.cloned();
+        self.execute_request_before_governance(request).await
+    }
+
     async fn execute_request_with_metadata(
         &self,
-        mut request: ToolExecutionRequest,
+        request: ToolExecutionRequest,
     ) -> astra_tools::ToolResult {
+        let deferred = self.execute_request_before_governance(request).await;
+        let governed = govern_runtime_tool_result(deferred.result, false);
+        self.finish_governed_tool_result(governed, deferred.pending)
+            .await
+    }
+
+    async fn execute_request_before_governance(
+        &self,
+        mut request: ToolExecutionRequest,
+    ) -> GovernableRuntimeToolResult {
         // Cancellation before the durable prepare boundary is known not to
         // have dispatched and must not leave a stranded ledger row.
         if let Some(token) = self.cancel_token.as_ref()
             && token.is_cancelled()
         {
-            return self
-                .tool_execution_service
-                .cancelled_before_route_result(&request);
+            return GovernableRuntimeToolResult::completed(
+                self.tool_execution_service
+                    .cancelled_before_route_result(&request),
+            );
         }
 
         request.policy.admission_snapshot = Some(
@@ -1834,7 +1983,7 @@ impl RuntimeToolExecutor {
             ) {
                 Ok(decision) => decision,
                 Err(error) => {
-                    return astra_tools::ToolResult::error(
+                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
                         serde_json::json!({
                             "status": "failed",
                             "error": error.to_string(),
@@ -1842,13 +1991,13 @@ impl RuntimeToolExecutor {
                             "retryable": false,
                         })
                         .to_string(),
-                    );
+                    ));
                 }
             };
             let fingerprint = match decision.fingerprint(&request.args) {
                 Ok(fingerprint) => fingerprint,
                 Err(error) => {
-                    return astra_tools::ToolResult::error(
+                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
                         serde_json::json!({
                             "status": "failed",
                             "error": error.to_string(),
@@ -1856,13 +2005,13 @@ impl RuntimeToolExecutor {
                             "retryable": false,
                         })
                         .to_string(),
-                    );
+                    ));
                 }
             };
             let durable_decision = match decision.durable() {
                 Ok(decision) => decision,
                 Err(error) => {
-                    return astra_tools::ToolResult::error(
+                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
                         serde_json::json!({
                             "status": "failed",
                             "error": error.to_string(),
@@ -1870,7 +2019,7 @@ impl RuntimeToolExecutor {
                             "retryable": false,
                         })
                         .to_string(),
-                    );
+                    ));
                 }
             };
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
@@ -1882,7 +2031,7 @@ impl RuntimeToolExecutor {
             ) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    return astra_tools::ToolResult::error(
+                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
                         serde_json::json!({
                             "status": "failed",
                             "error": error.to_string(),
@@ -1890,13 +2039,15 @@ impl RuntimeToolExecutor {
                             "retryable": false,
                         })
                         .to_string(),
-                    );
+                    ));
                 }
             };
             let Some(ledger) = self.invocation_ledger.as_ref() else {
-                return crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                    &identity,
-                    "runtime ledger is not configured",
+                return GovernableRuntimeToolResult::completed(
+                    crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                        &identity,
+                        "runtime ledger is not configured",
+                    ),
                 );
             };
             let frozen_decision = match ledger
@@ -1910,18 +2061,24 @@ impl RuntimeToolExecutor {
                 Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Prepared {
                     decision,
                 }) => decision,
-                Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Return(result)) => return result,
+                Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Return(result)) => {
+                    return GovernableRuntimeToolResult::completed(result);
+                }
                 Err(error) => {
-                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                        &identity, error,
+                    return GovernableRuntimeToolResult::completed(
+                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                            &identity, error,
+                        ),
                     );
                 }
             };
             let frozen = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&frozen_decision) {
                 Ok(frozen) => frozen,
                 Err(error) => {
-                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                        &identity, error,
+                    return GovernableRuntimeToolResult::completed(
+                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                            &identity, error,
+                        ),
                     );
                 }
             };
@@ -1968,7 +2125,9 @@ impl RuntimeToolExecutor {
             .await
             {
                 crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(fill) => fill,
-                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => return result,
+                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => {
+                    return GovernableRuntimeToolResult::completed(result);
+                }
             };
             let cache_fill = cache_fill.map(|claim| PendingSemanticReadFill {
                 claim,
@@ -1991,12 +2150,14 @@ impl RuntimeToolExecutor {
                             )
                             .await;
                         }
-                        return crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                            &identity,
-                            "dispatch returned a different frozen decision",
+                        return GovernableRuntimeToolResult::completed(
+                            crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                                &identity,
+                                "dispatch returned a different frozen decision",
+                            ),
                         );
                     }
-                    Some((ledger, identity, frozen.route, owner_id, cache_fill))
+                    Some((ledger.clone(), identity, frozen.route, owner_id, cache_fill))
                 }
                 Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
                     result,
@@ -2009,7 +2170,7 @@ impl RuntimeToolExecutor {
                         )
                         .await;
                     }
-                    return result;
+                    return GovernableRuntimeToolResult::completed(result);
                 }
                 Err(error) => {
                     if let Some(fill) = cache_fill.as_ref() {
@@ -2020,8 +2181,10 @@ impl RuntimeToolExecutor {
                         )
                         .await;
                     }
-                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
-                        &identity, error,
+                    return GovernableRuntimeToolResult::completed(
+                        crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                            &identity, error,
+                        ),
                     );
                 }
             }
@@ -2035,73 +2198,277 @@ impl RuntimeToolExecutor {
             execution_service: &self.tool_execution_service,
             local_transport: self,
             work_surface_events: &self.work_surface_events,
-            session_id: &self.session_id,
             binding_fields: route_binding_fields,
             cancel_token: self.cancel_token.clone(),
         };
+        let route = durable_invocation
+            .as_ref()
+            .map(|(_, _, route, _, _)| *route)
+            .unwrap_or_else(|| self.tool_execution_service.routing_decision(&request));
         let lease_heartbeat =
             durable_invocation
                 .as_ref()
                 .map(|(ledger, identity, _, owner_id, _)| {
                     ledger.start_lease_heartbeat(identity.clone(), owner_id.clone())
                 });
-        let result = match durable_invocation.as_ref() {
-            Some((_, _, route, _, _)) => {
-                execute_tool_route_with_events_at_route(route_context, request, *route).await
+        let executed =
+            execute_tool_route_before_completion_events(&route_context, request, route).await;
+        let durable = durable_invocation.map(|(ledger, identity, _, owner_id, cache_fill)| {
+            PendingDurableToolCompletion {
+                ledger,
+                identity,
+                owner_id,
+                cache_fill,
+                lease_heartbeat: lease_heartbeat
+                    .expect("durable invocation must start a lease heartbeat"),
             }
-            None => execute_tool_route_with_events(route_context, request).await,
-        };
-        match durable_invocation {
-            Some((ledger, identity, _, owner_id, cache_fill)) => {
-                let route_outcome = cache_fill.as_ref().map(|_| {
-                    crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result)
-                });
-                let result = ledger.finish(&identity, &owner_id, result).await;
-                if let Some(heartbeat) = lease_heartbeat {
-                    heartbeat.stop().await;
-                }
-                if let (Some(fill), Some(outcome)) = (cache_fill, route_outcome) {
-                    let revalidated_key = self
-                        .resolve_current_semantic_read_freshness(
-                            &fill.decision,
-                            &identity,
-                            &fill.arguments,
-                        )
-                        .as_ref()
-                        .and_then(|freshness| {
-                            match fill
-                                .decision
-                                .semantic_read_cache_key(&fill.arguments, freshness)
-                            {
-                                Ok(key) => key,
-                                Err(error) => {
-                                    tracing::warn!(
-                                        user_id = %identity.user_id,
-                                        session_id = %identity.session_id,
-                                        run_id = %identity.run_id,
-                                        turn_chain_id = %identity.turn_chain_id,
-                                        invocation_id = %identity.invocation_id,
-                                        semantic_read_cache_state = "revalidation_key_failed",
-                                        %error,
-                                        "semantic read freshness revalidation could not build a cache key"
-                                    );
-                                    None
-                                }
-                            }
-                        });
-                    crate::server::semantic_read_observation_runtime::settle_fill(
-                        ledger,
-                        &identity,
-                        fill.claim,
-                        outcome,
-                        revalidated_key.as_ref(),
-                    )
-                    .await;
-                }
-                result
-            }
-            None => result,
+        });
+        GovernableRuntimeToolResult {
+            result: executed.result,
+            pending: Some(PendingRuntimeToolCompletion {
+                boundary: executed.boundary,
+                duration_ms: executed.duration_ms,
+                binding_fields: route_context.binding_fields,
+                durable,
+            }),
         }
+    }
+
+    pub(crate) async fn finish_governed_tool_result(
+        &self,
+        result: GovernedRuntimeToolResult,
+        pending: Option<PendingRuntimeToolCompletion>,
+    ) -> astra_tools::ToolResult {
+        let result = result.into_inner();
+        let Some(pending) = pending else {
+            return result;
+        };
+        let PendingRuntimeToolCompletion {
+            boundary,
+            duration_ms,
+            binding_fields,
+            durable,
+        } = pending;
+        let result = match durable {
+            Some(durable) => self.finish_durable_tool_result(result, durable).await,
+            None => result,
+        };
+        emit_tool_route_completion_events(
+            &self.work_surface_events,
+            &binding_fields,
+            &self.session_id,
+            &boundary,
+            &result,
+            duration_ms,
+        )
+        .await;
+        result
+    }
+
+    async fn finish_durable_tool_result(
+        &self,
+        result: astra_tools::ToolResult,
+        pending: PendingDurableToolCompletion,
+    ) -> astra_tools::ToolResult {
+        let PendingDurableToolCompletion {
+            ledger,
+            identity,
+            owner_id,
+            cache_fill,
+            lease_heartbeat,
+        } = pending;
+        let result = self
+            .attach_governed_result_artifact_if_needed(&identity, result)
+            .await;
+        let route_outcome = cache_fill
+            .as_ref()
+            .map(|_| crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result));
+        let result = ledger.finish(&identity, &owner_id, result).await;
+        lease_heartbeat.stop().await;
+        if let (Some(fill), Some(outcome)) = (cache_fill, route_outcome) {
+            let revalidated_key = self
+                .resolve_current_semantic_read_freshness(&fill.decision, &identity, &fill.arguments)
+                .as_ref()
+                .and_then(|freshness| {
+                    match fill
+                        .decision
+                        .semantic_read_cache_key(&fill.arguments, freshness)
+                    {
+                        Ok(key) => key,
+                        Err(error) => {
+                            tracing::warn!(
+                                user_id = %identity.user_id,
+                                session_id = %identity.session_id,
+                                run_id = %identity.run_id,
+                                turn_chain_id = %identity.turn_chain_id,
+                                invocation_id = %identity.invocation_id,
+                                semantic_read_cache_state = "revalidation_key_failed",
+                                %error,
+                                "semantic read freshness revalidation could not build a cache key"
+                            );
+                            None
+                        }
+                    }
+                });
+            crate::server::semantic_read_observation_runtime::settle_fill(
+                &ledger,
+                &identity,
+                fill.claim,
+                outcome,
+                revalidated_key.as_ref(),
+            )
+            .await;
+        }
+        result
+    }
+
+    async fn attach_governed_result_artifact_if_needed(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        mut result: astra_tools::ToolResult,
+    ) -> astra_tools::ToolResult {
+        if result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("side_effects_maybe"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return result;
+        }
+        let exit_semantics = result.exit_semantics.and_then(|semantics| {
+            serde_json::to_value(semantics)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+        });
+        let metadata = result
+            .metadata
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if astra_turn_types::ToolInvocationResultPayload::new(
+            result.output.clone(),
+            metadata,
+            exit_semantics.clone(),
+        )
+        .is_ok()
+        {
+            return result;
+        }
+        let Some(store) = self.session_artifact_store.as_ref() else {
+            tracing::warn!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                run_id = %identity.run_id,
+                turn_chain_id = %identity.turn_chain_id,
+                invocation_id = %identity.invocation_id,
+                "governed tool result exceeds the inline ledger boundary but no session artifact store is configured"
+            );
+            return result;
+        };
+        if result.output.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
+            tracing::warn!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                invocation_id = %identity.invocation_id,
+                output_bytes = result.output.len(),
+                max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
+                "governed tool result output exceeds the artifact persistence boundary"
+            );
+            return result;
+        }
+
+        let content = serde_json::json!({
+            "contractVersion": "tool-result-artifact-v1",
+            "identity": identity,
+            "result": {
+                "output": result.output.clone(),
+                "metadata": result.metadata.clone(),
+                "isError": result.is_error,
+                "exitSemantics": exit_semantics,
+            }
+        });
+        let encoded = match serde_json::to_vec(&content) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %identity.user_id,
+                    session_id = %identity.session_id,
+                    invocation_id = %identity.invocation_id,
+                    %error,
+                    "governed tool result artifact could not be serialized"
+                );
+                return result;
+            }
+        };
+        if encoded.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
+            tracing::warn!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                invocation_id = %identity.invocation_id,
+                artifact_bytes = encoded.len(),
+                max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
+                "governed tool result exceeds the artifact persistence boundary"
+            );
+            return result;
+        }
+        let content_hash = format!("sha256:{:x}", Sha256::digest(&encoded));
+        let record = astra_services::session_artifact_store::SessionArtifactJsonRecord {
+            artifact_id: String::new(),
+            session_id: identity.session_id.clone(),
+            user_id: identity.user_id.clone(),
+            artifact_kind: "tool_result_evidence_v1".to_string(),
+            source: Some("runtime_tool_invocation".to_string()),
+            turn: Some(self.journal_turn_index.load(Ordering::Acquire)),
+            round: None,
+            content,
+            metadata: Some(serde_json::json!({
+                "runId": &identity.run_id,
+                "turnChainId": &identity.turn_chain_id,
+                "invocationId": &identity.invocation_id,
+                "contentHash": &content_hash,
+                "encodedBytes": encoded.len(),
+            })),
+        };
+        let stored = match tokio::time::timeout(
+            TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT,
+            store.persist_json_artifact(record),
+        )
+        .await
+        {
+            Ok(Ok(stored)) => stored,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    user_id = %identity.user_id,
+                    session_id = %identity.session_id,
+                    invocation_id = %identity.invocation_id,
+                    %error,
+                    "governed tool result artifact persistence failed"
+                );
+                return result;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    user_id = %identity.user_id,
+                    session_id = %identity.session_id,
+                    invocation_id = %identity.invocation_id,
+                    timeout_ms = TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT.as_millis(),
+                    "governed tool result artifact persistence timed out"
+                );
+                return result;
+            }
+        };
+        result.metadata.get_or_insert_with(Map::new).insert(
+            astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "artifactId": stored.artifact_id,
+                "artifactKind": stored.artifact_kind,
+                "contentHash": content_hash,
+                "encodedBytes": encoded.len(),
+            }),
+        );
+        result
     }
 
     fn resolve_current_semantic_read_freshness(
@@ -2654,14 +3021,10 @@ fn tool_result_from_provider_payload(
         astra_tools::ToolResult::text(payload.text)
     };
     if let Some(structured_content) = payload.structured_content {
-        let metadata = tool_result.metadata.get_or_insert_with(Map::new);
-        if let Some(artifacts) = structured_content.get("artifacts") {
-            metadata.insert("artifacts".to_string(), artifacts.clone());
-        }
-        if let Some(artifact) = structured_content.get("artifact") {
-            metadata.insert("artifact".to_string(), artifact.clone());
-        }
-        metadata.insert("structuredContent".to_string(), structured_content);
+        tool_result
+            .metadata
+            .get_or_insert_with(Map::new)
+            .insert("structuredContent".to_string(), structured_content);
     }
     if let Some(protocol_metadata) = payload.protocol_metadata {
         let encoded = protocol_metadata.to_string().into_bytes();
@@ -2702,6 +3065,90 @@ mod tests {
     use crate::server::tool_workspace_path_guard::{
         server_sandbox_local_path_mismatch, server_sandbox_tool_path_mismatch,
     };
+
+    #[derive(Default)]
+    struct RecordingResultArtifactStore {
+        seen: StdMutex<Option<astra_services::SessionArtifactJsonRecord>>,
+        fail_persist: bool,
+    }
+
+    #[async_trait]
+    impl SessionArtifactJsonStore for RecordingResultArtifactStore {
+        async fn persist_json_artifact(
+            &self,
+            record: astra_services::SessionArtifactJsonRecord,
+        ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
+        {
+            if self.fail_persist {
+                return Err(
+                    astra_services::SessionArtifactStoreError::InvalidArtifactId(
+                        "injected artifact failure".to_string(),
+                    ),
+                );
+            }
+            *self.seen.lock().unwrap() = Some(record.clone());
+            Ok(astra_services::StoredSessionArtifact {
+                artifact_id: "artifact-result-1".to_string(),
+                session_id: record.session_id,
+                user_id: record.user_id,
+                artifact_kind: record.artifact_kind,
+                source: record.source,
+                turn: record.turn,
+                round: record.round,
+                content: record.content,
+                metadata: record.metadata,
+                retention_policy: Some("default".to_string()),
+                retention_until: None,
+                status: Some("active".to_string()),
+                referenced_by_manifest_count: 0,
+                referenced_by_state_items_count: 0,
+                referenced_by_citation_count: 0,
+                created_at: None,
+            })
+        }
+
+        async fn load_json_artifact(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            _artifact_id: &str,
+        ) -> Result<
+            Option<astra_services::StoredSessionArtifact>,
+            astra_services::SessionArtifactStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn load_latest_json_artifact(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            _artifact_kind: &str,
+        ) -> Result<
+            Option<astra_services::StoredSessionArtifact>,
+            astra_services::SessionArtifactStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_json_artifacts(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            _artifact_kind: Option<&str>,
+            _limit: usize,
+            _cursor: Option<astra_services::SessionArtifactListCursor>,
+        ) -> Result<
+            astra_services::SessionArtifactListPage,
+            astra_services::SessionArtifactStoreError,
+        > {
+            Ok(astra_services::SessionArtifactListPage {
+                artifacts: Vec::new(),
+                limit: 0,
+                next_cursor: None,
+            })
+        }
+    }
 
     fn schema_name_set(schemas: Vec<Value>) -> std::collections::HashSet<String> {
         schemas
@@ -2791,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tool_call_result_conversion_preserves_structured_artifact_metadata() {
+    fn mcp_tool_call_result_conversion_keeps_one_canonical_structured_projection() {
         let structured_content = json!({
             "artifact": {
                 "artifact_id": "artifact_file_1",
@@ -2815,11 +3262,138 @@ mod tests {
         assert_eq!(result.output, "created file");
         let metadata = result.metadata.as_ref().expect("mcp result metadata");
         assert_eq!(metadata.get("structuredContent"), Some(&structured_content));
-        assert_eq!(metadata.get("artifact"), structured_content.get("artifact"));
         assert_eq!(
-            metadata.get("artifacts"),
-            structured_content.get("artifacts")
+            metadata.len(),
+            1,
+            "structured output must not be duplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_governed_result_persists_owner_artifact_before_ledger_projection() {
+        let (exec, _dir) = test_executor();
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let exec = exec.with_test_session_artifact_store(store.clone());
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "turn",
+            "call-large",
+        )
+        .unwrap();
+        let raw_output = format!(
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n{}",
+            "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES)
+        );
+        let governed = govern_runtime_tool_result(astra_tools::ToolResult::text(raw_output), false)
+            .into_inner();
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+        let reference = &attached.metadata.as_ref().unwrap()
+            [astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY];
+        assert_eq!(reference["artifactId"], "artifact-result-1");
+        assert_eq!(reference["artifactKind"], "tool_result_evidence_v1");
+
+        let stored = store.seen.lock().unwrap().clone().expect("stored artifact");
+        assert_eq!(stored.user_id, identity.user_id);
+        assert_eq!(stored.session_id, identity.session_id);
+        let encoded = stored.content.to_string();
+        assert!(encoded.contains("[REDACTED:"));
+        assert!(!encoded.contains("AKIAIOSFODNN7EXAMPLE"));
+
+        let outcome =
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&attached);
+        outcome.validate().unwrap();
+        assert_eq!(
+            outcome.result().metadata["astraResultProjection"]["artifactRequired"],
+            false
+        );
+        assert_eq!(
+            outcome.result().metadata
+                [astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY]["artifactId"],
+            "artifact-result-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_failure_is_explicit_but_does_not_reclassify_acknowledged_tool_success() {
+        let (exec, _dir) = test_executor();
+        let store = Arc::new(RecordingResultArtifactStore {
+            seen: StdMutex::new(None),
+            fail_persist: true,
+        });
+        let exec = exec.with_test_session_artifact_store(store.clone());
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "turn",
+            "call-artifact-failure",
+        )
+        .unwrap();
+        let governed = govern_runtime_tool_result(
+            astra_tools::ToolResult::text(
+                "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+            ),
+            false,
+        )
+        .into_inner();
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+        assert!(!attached.is_error);
+        assert!(attached.metadata.as_ref().is_none_or(|metadata| {
+            !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
+        }));
+        assert!(store.seen.lock().unwrap().is_none());
+
+        let outcome =
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&attached);
+        assert!(matches!(
+            outcome,
+            astra_turn_types::ToolInvocationTerminalOutcome::Succeeded { .. }
+        ));
+        assert_eq!(
+            outcome.result().metadata["astraResultProjection"]["artifactRequired"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_payload_is_not_persisted_as_acknowledged_result_evidence() {
+        let (exec, _dir) = test_executor();
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let exec = exec.with_test_session_artifact_store(store.clone());
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user",
+            "session",
+            "run",
+            "turn",
+            "call-unknown",
+        )
+        .unwrap();
+        let mut ambiguous = astra_tools::ToolResult::text(
+            "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+        );
+        ambiguous.metadata = Some(Map::from_iter([(
+            "side_effects_maybe".to_string(),
+            Value::Bool(true),
+        )]));
+        let governed = govern_runtime_tool_result(ambiguous, false).into_inner();
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+        assert!(store.seen.lock().unwrap().is_none());
+        assert!(
+            attached.metadata.as_ref().is_some_and(
+                |metadata| metadata.get("side_effects_maybe") == Some(&Value::Bool(true))
+            )
+        );
+        assert!(attached.metadata.as_ref().is_none_or(|metadata| {
+            !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
+        }));
     }
 
     #[test]

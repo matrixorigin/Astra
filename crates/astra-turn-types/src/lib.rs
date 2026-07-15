@@ -73,10 +73,14 @@ pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
     TOOL_INVOCATION_CONTRACT_VERSION, TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES,
-    ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
-    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
+    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH, TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
+    TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, ToolInvocationCompletionSource,
+    ToolInvocationContractError, ToolInvocationDecision, ToolInvocationDispatchLease,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationRecord, ToolInvocationResultPayload, ToolInvocationState,
+    ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
     canonical_public_tool_arguments,
 };
 pub use user_intent::{UserIntentDelivery, UserIntentStatus};

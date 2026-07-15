@@ -6972,7 +6972,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // the write-tool guard can check `active_plan_id`.
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
-                executor = executor.with_workspace_artifact_store(
+                executor = executor.with_session_artifact_store(
                     astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
                         .with_pool(shared.clone()),
                 );
@@ -8088,7 +8088,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
-                executor = executor.with_workspace_artifact_store(
+                executor = executor.with_session_artifact_store(
                     astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
                         .with_pool(shared.clone()),
                 );
@@ -10811,7 +10811,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
             if let Some(pool) = self.shared_pool.as_ref() {
                 executor.set_context_manifest_pool(pool.clone());
-                executor = executor.with_workspace_artifact_store(
+                executor = executor.with_session_artifact_store(
                     astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
                         .with_pool(pool.clone()),
                 );

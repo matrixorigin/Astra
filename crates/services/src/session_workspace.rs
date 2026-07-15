@@ -633,7 +633,7 @@ pub fn to_remote_artifact_record(
 pub async fn persist_remote_workspace(
     metadata: &WorkspaceMetadata,
     user_id: &str,
-    store: &impl SessionArtifactJsonStore,
+    store: &(impl SessionArtifactJsonStore + ?Sized),
 ) -> Result<StoredSessionArtifact, String> {
     let record = to_remote_artifact_record(metadata, user_id).map_err(|error| error.to_string())?;
     store

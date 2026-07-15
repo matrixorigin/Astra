@@ -596,20 +596,20 @@ fn disposition_for_existing_record(
 pub(crate) fn terminal_outcome_from_result(
     result: &astra_tools::ToolResult,
 ) -> ToolInvocationTerminalOutcome {
-    let payload = ToolInvocationResultPayload {
-        output: result.output.clone(),
-        metadata: result
+    let payload = ToolInvocationResultPayload::bounded_projection(
+        result.output.clone(),
+        result
             .metadata
             .clone()
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeMap<_, _>>(),
-        exit_semantics: result.exit_semantics.and_then(|semantics| {
+        result.exit_semantics.and_then(|semantics| {
             serde_json::to_value(semantics)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_string))
         }),
-    };
+    );
     if !result.is_error {
         return ToolInvocationTerminalOutcome::Succeeded { result: payload };
     }
@@ -1375,6 +1375,30 @@ mod tests {
                 ..
             } if code == "tenant_policy"
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_acknowledged_result_completes_with_explicit_bounded_projection() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-large-result");
+        let fingerprint = fingerprint(&json!({"command": "verbose"}));
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
+        let raw = astra_tools::ToolResult::text(
+            "界".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES),
+        );
+
+        let projected = ledger.finish(&identity, &owner, raw).await;
+        assert!(!projected.is_error, "{projected:?}");
+        assert!(
+            projected
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("astraResultProjection"))
+                .is_some()
+        );
+        let record = ledger.get(&identity).await.unwrap().unwrap();
+        assert_eq!(record.state, ToolInvocationState::Succeeded);
+        record.outcome.as_ref().unwrap().validate().unwrap();
     }
 
     #[tokio::test]

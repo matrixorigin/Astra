@@ -74,8 +74,8 @@ pub(crate) async fn execute_tool_pure(
                     run_id,
                     turn_chain_id,
                 } => {
-                    executor
-                        .execute_invocation_with_metadata(
+                    let deferred = executor
+                        .execute_invocation_before_governance(
                             run_id,
                             turn_chain_id,
                             &execution.id,
@@ -84,7 +84,9 @@ pub(crate) async fn execute_tool_pure(
                             resolved_provider_policy,
                             permission_grant,
                         )
-                        .await
+                        .await;
+                    execution.pending_runtime_completion = deferred.pending;
+                    deferred.result
                 }
                 HeadlessInvocationScope::LegacyUnscoped => {
                     executor
@@ -192,7 +194,7 @@ pub(super) fn execution_result_is_error(
     }
 }
 
-fn execution_error_kind(
+pub(super) fn execution_error_kind(
     result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> Option<astra_core::ErrorKind> {

@@ -149,6 +149,7 @@ impl InMemoryInvocationLedger {
         owner_id: Option<&str>,
         outcome: ToolInvocationTerminalOutcome,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        outcome.validate()?;
         let next = outcome.state();
         let entry = self.entries.get_mut(identity).ok_or_else(|| {
             InvocationLedgerError::MissingInvocation {
@@ -191,6 +192,8 @@ impl InMemoryInvocationLedger {
         result: ToolInvocationResultPayload,
         completion_source: ToolInvocationCompletionSource,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        result.validate()?;
+        completion_source.validate()?;
         let entry = self.entries.get_mut(identity).ok_or_else(|| {
             InvocationLedgerError::MissingInvocation {
                 identity: identity.clone(),
@@ -409,6 +412,40 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn invalid_terminal_payload_is_rejected_before_ledger_state_changes() {
+        let mut ledger = InMemoryInvocationLedger::default();
+        let identity = identity("call-bounded-result");
+        ledger
+            .prepare(identity.clone(), fingerprint("read"), decision())
+            .unwrap();
+        ledger
+            .claim_dispatch(&identity, lease("owner-a", 10_000))
+            .unwrap();
+        let oversized = ToolInvocationTerminalOutcome::Succeeded {
+            result: ToolInvocationResultPayload {
+                output: "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+                metadata: BTreeMap::new(),
+                exit_semantics: None,
+            },
+        };
+
+        let error = ledger
+            .compare_and_complete(
+                &identity,
+                ToolInvocationState::Dispatched,
+                Some("owner-a"),
+                oversized,
+            )
+            .unwrap_err();
+        assert!(matches!(error, InvocationLedgerError::Contract(_)));
+        assert_eq!(
+            ledger.get(&identity).unwrap().state,
+            ToolInvocationState::Dispatched
+        );
+        assert!(ledger.get(&identity).unwrap().outcome.is_none());
     }
 
     #[test]

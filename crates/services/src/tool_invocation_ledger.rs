@@ -269,6 +269,7 @@ impl DatabaseToolInvocationLedger {
         owner_id: Option<&str>,
         outcome: &ToolInvocationTerminalOutcome,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        outcome.validate()?;
         let next = outcome.state();
         if !expected.can_transition_to(next) {
             return Err(ToolInvocationLedgerStoreError::IllegalTransition {
@@ -351,6 +352,8 @@ impl DatabaseToolInvocationLedger {
         result: &ToolInvocationResultPayload,
         completion_source: &ToolInvocationCompletionSource,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        result.validate()?;
+        completion_source.validate()?;
         let outcome = ToolInvocationTerminalOutcome::Succeeded {
             result: result.clone(),
         };

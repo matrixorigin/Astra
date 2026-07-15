@@ -15,6 +15,18 @@ use crate::ResolvedToolDescriptorRef;
 
 pub const TOOL_INVOCATION_CONTRACT_VERSION: &str = "tool-invocation-v2";
 pub const TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES: usize = 64;
+/// Maximum durable projection of one acknowledged result. Raw provider bodies
+/// above this boundary belong in an owner-scoped artifact, never inline in the
+/// replay ledger.
+pub const TOOL_INVOCATION_RESULT_MAX_BYTES: usize = 256 * 1024;
+pub const TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES: usize = 192 * 1024;
+pub const TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES: usize = 64 * 1024;
+pub const TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH: usize = 16;
+pub const TOOL_INVOCATION_RESULT_METADATA_MAX_NODES: usize = 4_096;
+pub const TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES: usize = 256;
+pub const TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY: &str = "astraResultArtifact";
+const TOOL_INVOCATION_RESULT_PROJECTED_OUTPUT_BYTES: usize = 180 * 1024;
+const TOOL_INVOCATION_RESULT_PROJECTION_CONTRACT_VERSION: &str = "tool-result-projection-v1";
 pub const TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION: &str =
     "tool-invocation-cache-completion-v1";
 
@@ -415,7 +427,7 @@ impl<'de> Deserialize<'de> for ToolInvocationDispatchLease {
 /// payload is the bounded runtime projection, not an unbounded provider body;
 /// large raw evidence belongs in an owner-scoped artifact referenced by
 /// metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ToolInvocationResultPayload {
     pub output: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -424,9 +436,201 @@ pub struct ToolInvocationResultPayload {
     pub exit_semantics: Option<String>,
 }
 
+impl ToolInvocationResultPayload {
+    pub fn new(
+        output: impl Into<String>,
+        metadata: BTreeMap<String, Value>,
+        exit_semantics: Option<String>,
+    ) -> Result<Self, ToolInvocationContractError> {
+        let result = Self {
+            output: output.into(),
+            metadata,
+            exit_semantics,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        validate_bounded_string(
+            "output",
+            &self.output,
+            TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES,
+        )?;
+        if let Some(exit_semantics) = &self.exit_semantics {
+            validate_bounded_string(
+                "exit_semantics",
+                exit_semantics,
+                TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES,
+            )?;
+        }
+        validate_result_metadata(&self.metadata)?;
+        let encoded_bytes = serde_json::to_vec(self)
+            .map_err(|error| ToolInvocationContractError::ResultSerialization(error.to_string()))?
+            .len();
+        if encoded_bytes > TOOL_INVOCATION_RESULT_MAX_BYTES {
+            return Err(ToolInvocationContractError::ResultPayloadTooLarge {
+                actual_bytes: encoded_bytes,
+                max_bytes: TOOL_INVOCATION_RESULT_MAX_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Build the replay-safe inline projection of an arbitrary provider
+    /// result. Any omitted evidence is explicit and content-addressed; the
+    /// caller can persist the original body as an owner-scoped artifact and
+    /// replace `artifactRequired` with a concrete reference.
+    pub fn bounded_projection(
+        output: String,
+        metadata: BTreeMap<String, Value>,
+        exit_semantics: Option<String>,
+    ) -> Self {
+        if let Ok(payload) = Self::new(output.clone(), metadata.clone(), exit_semantics.clone()) {
+            return payload;
+        }
+
+        let artifact_reference = metadata
+            .get(TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
+            .cloned();
+        let output_too_large = output.len() > TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES;
+        let metadata_error = validate_result_metadata(&metadata).err();
+        let exit_too_large = exit_semantics
+            .as_ref()
+            .is_some_and(|value| value.len() > TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES);
+        let projected_output = if output_too_large {
+            truncate_utf8_head_tail(
+                &output,
+                TOOL_INVOCATION_RESULT_PROJECTED_OUTPUT_BYTES,
+                "\n[… durable result projection omitted bytes; see astraResultProjection …]\n",
+            )
+        } else {
+            output.clone()
+        };
+
+        let mut projection = serde_json::Map::new();
+        projection.insert(
+            "contractVersion".to_string(),
+            Value::String(TOOL_INVOCATION_RESULT_PROJECTION_CONTRACT_VERSION.to_string()),
+        );
+        projection.insert(
+            "artifactRequired".to_string(),
+            Value::Bool(artifact_reference.is_none()),
+        );
+        if output_too_large {
+            projection.insert(
+                "output".to_string(),
+                projection_evidence(
+                    output.len(),
+                    digest_bytes(output.as_bytes()),
+                    "too_large",
+                    "utf8",
+                ),
+            );
+        }
+        if let Some(error) = metadata_error.as_ref() {
+            let (observed_bytes, size_kind) = metadata_observed_size(&metadata, error);
+            projection.insert(
+                "metadata".to_string(),
+                projection_evidence(
+                    observed_bytes,
+                    stable_metadata_digest(&metadata),
+                    result_metadata_error_code(error),
+                    size_kind,
+                ),
+            );
+        }
+        if exit_too_large {
+            let exit = exit_semantics.as_deref().unwrap_or_default();
+            projection.insert(
+                "exitSemantics".to_string(),
+                projection_evidence(
+                    exit.len(),
+                    digest_bytes(exit.as_bytes()),
+                    "too_large",
+                    "utf8",
+                ),
+            );
+        }
+
+        let mut projected_metadata = if metadata_error.is_some() {
+            BTreeMap::new()
+        } else {
+            metadata
+        };
+        if let Some(reference) = artifact_reference.clone() {
+            projected_metadata.insert(
+                TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY.to_string(),
+                reference,
+            );
+        }
+        projected_metadata.insert(
+            "astraResultProjection".to_string(),
+            Value::Object(projection.clone()),
+        );
+        let projected_exit = (!exit_too_large).then_some(exit_semantics).flatten();
+        let candidate = Self {
+            output: projected_output.clone(),
+            metadata: projected_metadata,
+            exit_semantics: projected_exit.clone(),
+        };
+        if candidate.validate().is_ok() {
+            return candidate;
+        }
+
+        // Near-limit valid metadata may no longer fit after adding the
+        // mandatory projection evidence. Replace it with its content address
+        // rather than silently dropping the explanation.
+        projection.entry("metadata".to_string()).or_insert_with(|| {
+            projection_evidence(
+                stable_metadata_size_hint(&candidate.metadata),
+                stable_metadata_digest(&candidate.metadata),
+                "projection_budget",
+                "structural",
+            )
+        });
+        let mut fallback_metadata = BTreeMap::from([(
+            "astraResultProjection".to_string(),
+            Value::Object(projection),
+        )]);
+        if let Some(reference) = artifact_reference {
+            fallback_metadata.insert(
+                TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY.to_string(),
+                reference,
+            );
+        }
+        let fallback = Self {
+            output: projected_output,
+            metadata: fallback_metadata,
+            exit_semantics: projected_exit,
+        };
+        debug_assert!(fallback.validate().is_ok());
+        fallback
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawResultPayload {
+            output: String,
+            #[serde(default)]
+            metadata: BTreeMap<String, Value>,
+            #[serde(default)]
+            exit_semantics: Option<String>,
+        }
+
+        let raw = RawResultPayload::deserialize(deserializer)?;
+        Self::new(raw.output, raw.metadata, raw.exit_semantics).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Typed acknowledged outcome. Transport ambiguity is represented by the
 /// ledger's `OutcomeUnknown` state and therefore has no fabricated payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolInvocationTerminalOutcome {
     Succeeded {
@@ -473,7 +677,7 @@ impl ToolInvocationCompletionSource {
         Ok(source)
     }
 
-    fn validate(&self) -> Result<(), ToolInvocationContractError> {
+    pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
         match self {
             Self::SemanticReadCache {
                 contract_version,
@@ -526,6 +730,19 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
 }
 
 impl ToolInvocationTerminalOutcome {
+    pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        self.result().validate()?;
+        match self {
+            Self::Succeeded { .. } => Ok(()),
+            Self::Failed { error_kind, .. } => {
+                validate_optional_classifier("error_kind", error_kind)
+            }
+            Self::Rejected { rejection_code, .. } => {
+                validate_optional_classifier("rejection_code", rejection_code)
+            }
+        }
+    }
+
     pub fn state(&self) -> ToolInvocationState {
         match self {
             Self::Succeeded { .. } => ToolInvocationState::Succeeded,
@@ -540,6 +757,57 @@ impl ToolInvocationTerminalOutcome {
             | Self::Failed { result, .. }
             | Self::Rejected { result, .. } => result,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationTerminalOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum RawTerminalOutcome {
+            Succeeded {
+                result: ToolInvocationResultPayload,
+            },
+            Failed {
+                result: ToolInvocationResultPayload,
+                #[serde(default)]
+                error_kind: Option<String>,
+                retryable: bool,
+            },
+            Rejected {
+                result: ToolInvocationResultPayload,
+                #[serde(default)]
+                rejection_code: Option<String>,
+                retryable: bool,
+            },
+        }
+
+        let outcome = match RawTerminalOutcome::deserialize(deserializer)? {
+            RawTerminalOutcome::Succeeded { result } => Self::Succeeded { result },
+            RawTerminalOutcome::Failed {
+                result,
+                error_kind,
+                retryable,
+            } => Self::Failed {
+                result,
+                error_kind,
+                retryable,
+            },
+            RawTerminalOutcome::Rejected {
+                result,
+                rejection_code,
+                retryable,
+            } => Self::Rejected {
+                result,
+                rejection_code,
+                retryable,
+            },
+        };
+        outcome.validate().map_err(serde::de::Error::custom)?;
+        Ok(outcome)
     }
 }
 
@@ -611,6 +879,9 @@ impl ToolInvocationRecord {
             if self.dispatch_lease.is_some() {
                 return Err(ToolInvocationContractError::CacheCompletionHasDispatchLease);
             }
+        }
+        if let Some(outcome) = &self.outcome {
+            outcome.validate()?;
         }
         match (&self.outcome, self.state) {
             (Some(outcome), state) if outcome.state() == state => Ok(()),
@@ -724,6 +995,236 @@ fn validate_sha256_content_id(
     }
 }
 
+fn validate_optional_classifier(
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<(), ToolInvocationContractError> {
+    value.as_ref().map_or(Ok(()), |value| {
+        validate_bounded_string(field, value, TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES)
+    })
+}
+
+fn truncate_utf8_head_tail(value: &str, max_bytes: usize, marker: &str) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let content_budget = max_bytes.saturating_sub(marker.len());
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget.saturating_sub(head_budget);
+    let mut head_end = head_budget.min(value.len());
+    while !value.is_char_boundary(head_end) {
+        head_end = head_end.saturating_sub(1);
+    }
+    let mut tail_start = value.len().saturating_sub(tail_budget);
+    while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+        tail_start = tail_start.saturating_add(1);
+    }
+    let mut projected = String::with_capacity(max_bytes);
+    projected.push_str(&value[..head_end]);
+    projected.push_str(marker);
+    projected.push_str(&value[tail_start..]);
+    projected
+}
+
+fn projection_evidence(
+    observed_bytes: usize,
+    content_hash: String,
+    reason: &'static str,
+    size_kind: &'static str,
+) -> Value {
+    serde_json::json!({
+        "contentHash": content_hash,
+        "observedBytes": observed_bytes,
+        "sizeKind": size_kind,
+        "reason": reason,
+        "inline": false,
+    })
+}
+
+fn result_metadata_error_code(error: &ToolInvocationContractError) -> &'static str {
+    match error {
+        ToolInvocationContractError::ResultMetadataTooLarge { .. } => "too_large",
+        ToolInvocationContractError::ResultMetadataTooDeep { .. } => "too_deep",
+        ToolInvocationContractError::ResultMetadataTooManyNodes { .. } => "too_many_nodes",
+        ToolInvocationContractError::ResultSerialization(_) => "serialization_failed",
+        _ => "payload_budget",
+    }
+}
+
+fn metadata_observed_size(
+    metadata: &BTreeMap<String, Value>,
+    error: &ToolInvocationContractError,
+) -> (usize, &'static str) {
+    match error {
+        ToolInvocationContractError::ResultMetadataTooLarge { actual_bytes, .. } => {
+            (*actual_bytes, "json")
+        }
+        _ => (stable_metadata_size_hint(metadata), "structural"),
+    }
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn stable_metadata_digest(metadata: &BTreeMap<String, Value>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"astra-tool-result-metadata-v1\0");
+    update_len(&mut digest, metadata.len());
+    for (key, value) in metadata {
+        update_tagged_bytes(&mut digest, b'K', key.as_bytes());
+        update_json_value_digest(&mut digest, value);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn stable_metadata_size_hint(metadata: &BTreeMap<String, Value>) -> usize {
+    metadata.iter().fold(0_usize, |size, (key, value)| {
+        size.saturating_add(key.len())
+            .saturating_add(json_value_structural_size(value))
+    })
+}
+
+enum JsonDigestFrame<'a> {
+    Value(&'a Value),
+    Key(&'a str),
+}
+
+fn update_json_value_digest(digest: &mut Sha256, root: &Value) {
+    let mut pending = vec![JsonDigestFrame::Value(root)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            JsonDigestFrame::Key(key) => update_tagged_bytes(digest, b'K', key.as_bytes()),
+            JsonDigestFrame::Value(value) => match value {
+                Value::Null => digest.update(b"N"),
+                Value::Bool(value) => digest.update(if *value { b"T" } else { b"F" }),
+                Value::Number(value) => {
+                    update_tagged_bytes(digest, b'D', value.to_string().as_bytes());
+                }
+                Value::String(value) => update_tagged_bytes(digest, b'S', value.as_bytes()),
+                Value::Array(values) => {
+                    digest.update(b"A");
+                    update_len(digest, values.len());
+                    pending.extend(values.iter().rev().map(JsonDigestFrame::Value));
+                }
+                Value::Object(object) => {
+                    digest.update(b"O");
+                    update_len(digest, object.len());
+                    let mut entries = object.iter().collect::<Vec<_>>();
+                    entries.sort_unstable_by_key(|(key, _)| *key);
+                    for (key, value) in entries.into_iter().rev() {
+                        pending.push(JsonDigestFrame::Value(value));
+                        pending.push(JsonDigestFrame::Key(key));
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn json_value_structural_size(root: &Value) -> usize {
+    let mut size = 0_usize;
+    let mut pending = vec![root];
+    while let Some(value) = pending.pop() {
+        size = size.saturating_add(1);
+        match value {
+            Value::Null | Value::Bool(_) => {}
+            Value::Number(value) => size = size.saturating_add(value.to_string().len()),
+            Value::String(value) => size = size.saturating_add(value.len()),
+            Value::Array(values) => pending.extend(values),
+            Value::Object(object) => {
+                size = object
+                    .keys()
+                    .fold(size, |size, key| size.saturating_add(key.len()));
+                pending.extend(object.values());
+            }
+        }
+    }
+    size
+}
+
+fn update_tagged_bytes(digest: &mut Sha256, tag: u8, bytes: &[u8]) {
+    digest.update([tag]);
+    update_len(digest, bytes.len());
+    digest.update(bytes);
+}
+
+fn update_len(digest: &mut Sha256, len: usize) {
+    digest.update(u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+fn validate_bounded_string(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ToolInvocationContractError> {
+    if value.len() > max_bytes {
+        return Err(ToolInvocationContractError::ResultFieldTooLarge {
+            field,
+            actual_bytes: value.len(),
+            max_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_result_metadata(
+    metadata: &BTreeMap<String, Value>,
+) -> Result<(), ToolInvocationContractError> {
+    let mut nodes = metadata.len();
+    let mut pending = metadata
+        .values()
+        .map(|value| (value, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((value, depth)) = pending.pop() {
+        if depth > TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH {
+            return Err(ToolInvocationContractError::ResultMetadataTooDeep {
+                actual_depth: depth,
+                max_depth: TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH,
+            });
+        }
+        nodes = nodes.saturating_add(1);
+        if nodes > TOOL_INVOCATION_RESULT_METADATA_MAX_NODES {
+            return Err(ToolInvocationContractError::ResultMetadataTooManyNodes {
+                actual_nodes: nodes,
+                max_nodes: TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
+            });
+        }
+        match value {
+            Value::Array(values) => pending.extend(
+                values
+                    .iter()
+                    .map(|nested| (nested, depth.saturating_add(1))),
+            ),
+            Value::Object(object) => {
+                nodes = nodes.saturating_add(object.len());
+                if nodes > TOOL_INVOCATION_RESULT_METADATA_MAX_NODES {
+                    return Err(ToolInvocationContractError::ResultMetadataTooManyNodes {
+                        actual_nodes: nodes,
+                        max_nodes: TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
+                    });
+                }
+                pending.extend(
+                    object
+                        .values()
+                        .map(|nested| (nested, depth.saturating_add(1))),
+                );
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    let encoded_bytes = serde_json::to_vec(metadata)
+        .map_err(|error| ToolInvocationContractError::ResultSerialization(error.to_string()))?
+        .len();
+    if encoded_bytes > TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES {
+        return Err(ToolInvocationContractError::ResultMetadataTooLarge {
+            actual_bytes: encoded_bytes,
+            max_bytes: TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToolInvocationContractError {
     #[error("tool invocation identity field '{field}' must not be empty")]
@@ -787,6 +1288,44 @@ pub enum ToolInvocationContractError {
     InvalidCacheCompletionAttemptCount { attempt_count: u32 },
     #[error("semantic cache completion cannot retain a provider dispatch lease")]
     CacheCompletionHasDispatchLease,
+    #[error("serialize tool invocation result payload: {0}")]
+    ResultSerialization(String),
+    #[error(
+        "tool invocation result field '{field}' is too large: {actual_bytes} bytes exceeds {max_bytes}"
+    )]
+    ResultFieldTooLarge {
+        field: &'static str,
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error(
+        "tool invocation result metadata is too large: {actual_bytes} bytes exceeds {max_bytes}"
+    )]
+    ResultMetadataTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error(
+        "tool invocation result metadata is too deep: depth {actual_depth} exceeds {max_depth}"
+    )]
+    ResultMetadataTooDeep {
+        actual_depth: usize,
+        max_depth: usize,
+    },
+    #[error(
+        "tool invocation result metadata has too many nodes: {actual_nodes} exceeds {max_nodes}"
+    )]
+    ResultMetadataTooManyNodes {
+        actual_nodes: usize,
+        max_nodes: usize,
+    },
+    #[error(
+        "tool invocation result payload is too large: {actual_bytes} bytes exceeds {max_bytes}"
+    )]
+    ResultPayloadTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
 }
 
 #[cfg(test)]
@@ -987,6 +1526,163 @@ mod tests {
         assert_eq!(
             restored.outcome.unwrap().result().output,
             "permission denied"
+        );
+    }
+
+    #[test]
+    fn durable_result_bounds_are_utf8_byte_exact_and_rechecked_on_decode() {
+        let exact = "界".repeat(TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES / 3);
+        let payload = ToolInvocationResultPayload::new(exact, BTreeMap::new(), None).unwrap();
+        assert_eq!(
+            payload.output.len(),
+            TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES
+        );
+
+        let oversized = "界".repeat(TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES / 3 + 1);
+        let error =
+            ToolInvocationResultPayload::new(oversized.clone(), BTreeMap::new(), None).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolInvocationContractError::ResultFieldTooLarge {
+                field: "output",
+                ..
+            }
+        ));
+
+        let forged = json!({"output": oversized});
+        let decode_error =
+            serde_json::from_value::<ToolInvocationResultPayload>(forged).unwrap_err();
+        assert!(
+            decode_error.to_string().contains("output"),
+            "{decode_error}"
+        );
+    }
+
+    #[test]
+    fn durable_result_rejects_deep_and_high_cardinality_metadata() {
+        let mut nested = Value::String("leaf".to_string());
+        for _ in 0..=TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH {
+            nested = json!({"nested": nested});
+        }
+        let deep = ToolInvocationResultPayload::new(
+            "ok",
+            BTreeMap::from([("root".to_string(), nested)]),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            deep,
+            ToolInvocationContractError::ResultMetadataTooDeep { .. }
+        ));
+
+        let many = Value::Array(
+            (0..TOOL_INVOCATION_RESULT_METADATA_MAX_NODES)
+                .map(|_| Value::Null)
+                .collect(),
+        );
+        let high_cardinality = ToolInvocationResultPayload::new(
+            "ok",
+            BTreeMap::from([("items".to_string(), many)]),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            high_cardinality,
+            ToolInvocationContractError::ResultMetadataTooManyNodes { .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_outcome_rejects_unbounded_classifier_without_a_record_wrapper() {
+        let encoded = json!({
+            "kind": "failed",
+            "result": {"output": "failed"},
+            "error_kind": "x".repeat(TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES + 1),
+            "retryable": false
+        });
+        let error = serde_json::from_value::<ToolInvocationTerminalOutcome>(encoded).unwrap_err();
+        assert!(error.to_string().contains("error_kind"), "{error}");
+    }
+
+    #[test]
+    fn bounded_projection_is_valid_explicit_and_content_addressed() {
+        let raw_output = "界".repeat(TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES);
+        let raw_metadata = BTreeMap::from([(
+            "payload".to_string(),
+            Value::Array(
+                (0..TOOL_INVOCATION_RESULT_METADATA_MAX_NODES)
+                    .map(|_| Value::Null)
+                    .collect(),
+            ),
+        )]);
+
+        let projected = ToolInvocationResultPayload::bounded_projection(
+            raw_output.clone(),
+            raw_metadata.clone(),
+            None,
+        );
+        projected.validate().unwrap();
+        assert!(projected.output.len() <= TOOL_INVOCATION_RESULT_PROJECTED_OUTPUT_BYTES);
+        assert!(projected.output.contains("durable result projection"));
+        let evidence = &projected.metadata["astraResultProjection"];
+        assert_eq!(evidence["artifactRequired"], true);
+        assert_eq!(evidence["output"]["observedBytes"], raw_output.len());
+        assert_eq!(evidence["output"]["sizeKind"], "utf8");
+        assert_eq!(
+            evidence["output"]["contentHash"],
+            digest_bytes(raw_output.as_bytes())
+        );
+        assert_eq!(evidence["metadata"]["reason"], "too_many_nodes");
+        assert_eq!(
+            evidence["metadata"]["contentHash"],
+            stable_metadata_digest(&raw_metadata)
+        );
+    }
+
+    #[test]
+    fn bounded_projection_preserves_already_valid_payload_exactly() {
+        let metadata = BTreeMap::from([("trace".to_string(), json!({"request": "r-1"}))]);
+        let projected = ToolInvocationResultPayload::bounded_projection(
+            "ok".to_string(),
+            metadata.clone(),
+            Some("success".to_string()),
+        );
+        assert_eq!(projected.output, "ok");
+        assert_eq!(projected.metadata, metadata);
+        assert_eq!(projected.exit_semantics.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn bounded_projection_preserves_owner_artifact_reference_when_metadata_is_replaced() {
+        let artifact = json!({
+            "artifactId": "artifact-1",
+            "artifactKind": "tool_result_evidence_v1",
+            "contentHash": format!("sha256:{}", "a".repeat(64)),
+        });
+        let metadata = BTreeMap::from([
+            (
+                "payload".to_string(),
+                Value::Array(
+                    (0..TOOL_INVOCATION_RESULT_METADATA_MAX_NODES)
+                        .map(|_| Value::Null)
+                        .collect(),
+                ),
+            ),
+            (
+                TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY.to_string(),
+                artifact.clone(),
+            ),
+        ]);
+        let projected =
+            ToolInvocationResultPayload::bounded_projection("ok".to_string(), metadata, None);
+        projected.validate().unwrap();
+        assert_eq!(
+            projected.metadata[TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY],
+            artifact
+        );
+        assert_eq!(
+            projected.metadata["astraResultProjection"]["artifactRequired"],
+            false
         );
     }
 

@@ -20,27 +20,21 @@ where
     pub(crate) execution_service: &'a ToolExecutionService,
     pub(crate) local_transport: &'a L,
     pub(crate) work_surface_events: &'a WorkSurfaceEventEmitter,
-    pub(crate) session_id: &'a str,
     pub(crate) binding_fields: Map<String, Value>,
     pub(crate) cancel_token: Option<Arc<CancellationToken>>,
 }
 
-pub(crate) async fn execute_tool_route_with_events<L>(
-    context: ToolRouteRuntimeContext<'_, L>,
-    request: ToolExecutionRequest,
-) -> astra_tools::ToolResult
-where
-    L: ServerLocalToolTransport + ?Sized,
-{
-    let route = context.execution_service.routing_decision(&request);
-    execute_tool_route_with_events_at_route(context, request, route).await
+pub(crate) struct ExecutedToolRoute {
+    pub(crate) boundary: ToolRouteBoundary,
+    pub(crate) result: astra_tools::ToolResult,
+    pub(crate) duration_ms: u64,
 }
 
-pub(crate) async fn execute_tool_route_with_events_at_route<L>(
-    context: ToolRouteRuntimeContext<'_, L>,
+pub(crate) async fn execute_tool_route_before_completion_events<L>(
+    context: &ToolRouteRuntimeContext<'_, L>,
     request: ToolExecutionRequest,
     route: ToolExecutionRouteKind,
-) -> astra_tools::ToolResult
+) -> ExecutedToolRoute
 where
     L: ServerLocalToolTransport + ?Sized,
 {
@@ -72,30 +66,43 @@ where
 
     boundary.attach_binding_metadata(&mut result, context.execution_service.tool_registry());
     let duration_ms = boundary.elapsed_ms();
+    ExecutedToolRoute {
+        boundary,
+        result,
+        duration_ms,
+    }
+}
+
+pub(crate) async fn emit_tool_route_completion_events(
+    work_surface_events: &WorkSurfaceEventEmitter,
+    binding_fields: &Map<String, Value>,
+    session_id: &str,
+    boundary: &ToolRouteBoundary,
+    result: &astra_tools::ToolResult,
+    duration_ms: u64,
+) {
     emit_optional_work_surface_event(
-        context.work_surface_events,
-        &context.binding_fields,
-        boundary.transport_finished_event(&result, duration_ms),
+        work_surface_events,
+        binding_fields,
+        boundary.transport_finished_event(result, duration_ms),
         "work-surface tool transport completion event channel unavailable",
     )
     .await;
     emit_tool_result_status_events(
-        context.work_surface_events,
-        &context.binding_fields,
-        context.session_id,
+        work_surface_events,
+        binding_fields,
+        session_id,
         boundary.request(),
-        &result,
+        result,
     )
     .await;
     emit_optional_work_surface_event(
-        context.work_surface_events,
-        &context.binding_fields,
-        boundary.tool_call_end_event(&result, duration_ms),
+        work_surface_events,
+        binding_fields,
+        boundary.tool_call_end_event(result, duration_ms),
         "work-surface tool completion event channel unavailable",
     )
     .await;
-
-    result
 }
 
 pub(crate) async fn emit_tool_result_status_events(

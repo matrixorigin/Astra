@@ -873,7 +873,7 @@ impl ToolHandler<RuntimeToolExecutor> for PublishArtifactToolHandler {
         }
         execute_publish_artifact(
             args,
-            context.workspace_artifact_store.as_ref(),
+            context.session_artifact_store.as_deref(),
             &context.workspace_root,
             &context.session_id,
             &context.user_id,

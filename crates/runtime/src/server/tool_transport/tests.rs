@@ -941,14 +941,12 @@ fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
     assert_eq!(end_event["type"], "tool_call_end");
     assert_eq!(end_event["result"], "created main.go");
     assert_eq!(
-        end_event["output"]["artifacts"][0]["artifact_id"],
-        "artifact_file_1"
-    );
-    assert_eq!(
         end_event["structuredContent"]["artifacts"][0]["artifact_id"],
         "artifact_file_1"
     );
-    assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
+    assert!(end_event.get("output").is_none());
+    assert!(end_event.get("artifacts").is_none());
+    assert!(end_event.get("artifact").is_none());
 }
 
 #[test]
