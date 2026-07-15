@@ -15,6 +15,7 @@ mod memory_writability;
 mod provider_contract;
 mod result_quality;
 mod runtime_scaffolding;
+mod semantic_read_cache;
 pub mod session_facts;
 mod tool_idempotency;
 mod tool_invocation;
@@ -48,18 +49,22 @@ pub use provider_contract::{
     DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
     ProviderClaim, ProviderClaimSource, ProviderClaimTrust, ProviderContractError,
     ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderRejection,
-    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticDiagnostic,
-    ProviderSemanticDiagnosticCode, ProviderTaskSupport, ProviderToolClaims,
-    ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline, ResolvedProviderClaim,
-    ResolvedProviderSnapshot, ResolvedProviderSnapshotRef, ResolvedProviderToolClaims,
-    ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
-    ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
-    ToolIdentity,
+    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
+    ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
+    ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,
+    ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,
+    ResolvedProviderToolClaims, ResolvedSemanticCacheBaseline, ResolvedToolDescriptor,
+    ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
+    ResolvedToolIdempotency, ResolvedToolSemantics, ToolIdentity,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use runtime_scaffolding::{
     SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message,
     scaffolding_body_prefixes_for_filtering,
+};
+pub use semantic_read_cache::{
+    SEMANTIC_READ_CACHE_CONTRACT_VERSION, SemanticFreshnessFact, SemanticFreshnessScope,
+    SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadFreshnessContext,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

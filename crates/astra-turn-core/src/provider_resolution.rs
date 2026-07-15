@@ -252,6 +252,7 @@ fn resolve_claims(
         destructive: resolve_claim(claims.destructive.as_ref(), trust_policy),
         idempotent: resolve_claim(claims.idempotent.as_ref(), trust_policy),
         open_world: resolve_claim(claims.open_world.as_ref(), trust_policy),
+        semantic_cache: resolve_claim(claims.semantic_cache.as_ref(), trust_policy),
     }
 }
 
@@ -321,6 +322,30 @@ fn resolve_semantics(claims: &ResolvedProviderToolClaims) -> ResolvedToolSemanti
         }
     };
 
+    let semantic_cache = match claims.semantic_cache.as_ref() {
+        None => ResolvedSemanticCacheBaseline::Disabled,
+        Some(claim) if claim.trust != ProviderClaimTrust::Trusted => {
+            diagnostics.push(diagnostic(
+                ProviderSemanticDiagnosticCode::InsufficientSemanticCacheTrust,
+                "provider semantic-cache contract is insufficiently trusted",
+            ));
+            ResolvedSemanticCacheBaseline::Disabled
+        }
+        Some(_)
+            if effect == ResolvedToolEffect::ReadOnly
+                && idempotency == ResolvedToolIdempotency::PureRead =>
+        {
+            ResolvedSemanticCacheBaseline::FreshnessBound
+        }
+        Some(_) => {
+            diagnostics.push(diagnostic(
+                ProviderSemanticDiagnosticCode::SemanticCacheWithoutPureRead,
+                "a semantic-cache contract cannot make a non-pure-read tool cacheable",
+            ));
+            ResolvedSemanticCacheBaseline::Disabled
+        }
+    };
+
     ResolvedToolSemantics {
         effect,
         idempotency,
@@ -329,8 +354,8 @@ fn resolve_semantics(claims: &ResolvedProviderToolClaims) -> ResolvedToolSemanti
         } else {
             ResolvedConcurrencyBaseline::Serial
         },
-        // Provider effect/idempotency hints do not define freshness identity.
-        semantic_cache: ResolvedSemanticCacheBaseline::Disabled,
+        // Eligibility never substitutes for the per-invocation revision fact.
+        semantic_cache,
         diagnostics,
     }
 }
@@ -362,7 +387,8 @@ mod tests {
     use super::*;
     use astra_turn_types::{
         ProviderBindingRef, ProviderClaimSource, ProviderIdentity, ProviderProtocolId,
-        ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
+        ProviderSemanticCacheContract, ProviderTaskSupport, ProviderToolClaims,
+        ProviderToolDeclaration,
     };
     use serde_json::{Map, Value, json};
 
@@ -372,6 +398,26 @@ mod tests {
             ProviderClaimSource::StandardProtocol {
                 protocol: ProviderProtocolId::new("mcp").unwrap(),
                 field: field.to_string(),
+            },
+        )
+    }
+
+    fn protocol_cache_claim(field: &str) -> ProviderClaim<ProviderSemanticCacheContract> {
+        ProviderClaim::new(
+            ProviderSemanticCacheContract::RevisionBound,
+            ProviderClaimSource::StandardProtocol {
+                protocol: ProviderProtocolId::new("mcp").unwrap(),
+                field: field.to_string(),
+            },
+        )
+    }
+
+    fn extension_cache_claim() -> ProviderClaim<ProviderSemanticCacheContract> {
+        ProviderClaim::new(
+            ProviderSemanticCacheContract::RevisionBound,
+            ProviderClaimSource::ProviderExtension {
+                namespace: "example.cache".to_string(),
+                field: "revisionBound".to_string(),
             },
         )
     }
@@ -483,6 +529,79 @@ mod tests {
             semantics.semantic_cache,
             ResolvedSemanticCacheBaseline::Disabled
         );
+    }
+
+    #[test]
+    fn trusted_revision_contract_marks_only_pure_reads_cache_eligible() {
+        let tool = declaration(
+            "read",
+            ProviderToolClaims {
+                read_only: Some(protocol_claim(true, "readOnlyHint")),
+                semantic_cache: Some(protocol_cache_claim("revisionBound")),
+                ..ProviderToolClaims::default()
+            },
+        );
+        let snapshot =
+            resolve_provider_snapshot(&discovery(vec![tool]), &trusted_mcp(), &aliases(&["read"]))
+                .unwrap();
+        let semantics = &snapshot.descriptors[0].semantic_baseline;
+
+        assert_eq!(semantics.effect, ResolvedToolEffect::ReadOnly);
+        assert_eq!(semantics.idempotency, ResolvedToolIdempotency::PureRead);
+        assert_eq!(
+            semantics.semantic_cache,
+            ResolvedSemanticCacheBaseline::FreshnessBound
+        );
+    }
+
+    #[test]
+    fn untrusted_revision_contract_does_not_enable_cache() {
+        let tool = declaration(
+            "read",
+            ProviderToolClaims {
+                read_only: Some(protocol_claim(true, "readOnlyHint")),
+                semantic_cache: Some(extension_cache_claim()),
+                ..ProviderToolClaims::default()
+            },
+        );
+        let snapshot =
+            resolve_provider_snapshot(&discovery(vec![tool]), &trusted_mcp(), &aliases(&["read"]))
+                .unwrap();
+        let semantics = &snapshot.descriptors[0].semantic_baseline;
+
+        assert_eq!(semantics.effect, ResolvedToolEffect::ReadOnly);
+        assert_eq!(
+            semantics.semantic_cache,
+            ResolvedSemanticCacheBaseline::Disabled
+        );
+        assert!(semantics.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ProviderSemanticDiagnosticCode::InsufficientSemanticCacheTrust
+        }));
+    }
+
+    #[test]
+    fn trusted_revision_contract_cannot_make_mutation_cacheable() {
+        let tool = declaration(
+            "write",
+            ProviderToolClaims {
+                read_only: Some(protocol_claim(false, "readOnlyHint")),
+                semantic_cache: Some(protocol_cache_claim("revisionBound")),
+                ..ProviderToolClaims::default()
+            },
+        );
+        let snapshot =
+            resolve_provider_snapshot(&discovery(vec![tool]), &trusted_mcp(), &aliases(&["write"]))
+                .unwrap();
+        let semantics = &snapshot.descriptors[0].semantic_baseline;
+
+        assert_eq!(semantics.effect, ResolvedToolEffect::Mutating);
+        assert_eq!(
+            semantics.semantic_cache,
+            ResolvedSemanticCacheBaseline::Disabled
+        );
+        assert!(semantics.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ProviderSemanticDiagnosticCode::SemanticCacheWithoutPureRead
+        }));
     }
 
     #[test]

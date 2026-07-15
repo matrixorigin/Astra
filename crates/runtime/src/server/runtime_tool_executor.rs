@@ -1762,6 +1762,20 @@ impl RuntimeToolExecutor {
                     );
                 }
             };
+            let semantic_cache_key = match decision.semantic_read_cache_key(&request.args) {
+                Ok(key) => key,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
             let durable_decision = match decision.durable() {
                 Ok(decision) => decision,
                 Err(error) => {
@@ -1783,6 +1797,8 @@ impl RuntimeToolExecutor {
                     turn_chain_id = %request.turn_chain_id,
                     invocation_id = %request.tool_call_id,
                     policy_decision_id = %fingerprint.policy_decision_id,
+                    semantic_read_cache = decision.semantic_cache.trace_state(),
+                    semantic_read_cache_key_id = semantic_cache_key.as_ref().map(|key| key.key_id.as_str()),
                     "resolved exact tool invocation decision"
             );
             let identity = match astra_turn_types::ToolInvocationIdentity::new(

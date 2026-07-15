@@ -211,6 +211,10 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Concrete, trusted revision facts for one semantic pure-read decision.
+    /// Eligibility in the provider descriptor is insufficient without this.
+    #[serde(skip)]
+    pub semantic_read_freshness: Option<astra_turn_types::SemanticReadFreshnessContext>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +679,38 @@ mod tests {
         assert!(projected.get("_tool_call_id").is_none(), "{projected:?}");
         assert!(projected.get("_run_id").is_none(), "{projected:?}");
         assert!(projected.get("_turn_chain_id").is_none(), "{projected:?}");
+    }
+
+    #[test]
+    fn semantic_freshness_is_internal_decision_input_not_provider_transport() {
+        let state = ExecutionBindingState::server_sandbox("/tmp/astra-workspace");
+        let mut request = state.tool_execution_request(
+            "user-1",
+            "session-1",
+            "provider_read",
+            &json!({"query": "status"}),
+        );
+        request.policy.semantic_read_freshness = Some(
+            astra_turn_types::SemanticReadFreshnessContext::new(
+                "tenant:user-1",
+                vec![
+                    astra_turn_types::SemanticFreshnessFact::new(
+                        astra_turn_types::SemanticFreshnessScope::Provider,
+                        "provider-1",
+                        "revision-7",
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(
+            encoded["policy"].get("semantic_read_freshness").is_none(),
+            "internal cache authority must not be sent to providers: {encoded}"
+        );
+        assert!(!encoded.to_string().contains("revision-7"));
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub fn mcp_tool_to_provider_declaration(
             annotations.and_then(|value| value.open_world_hint),
             "annotations.openWorldHint",
         ),
+        // Standard MCP annotations do not define a revision-token contract.
+        semantic_cache: None,
     };
     let task_support = match tool
         .execution

@@ -135,6 +135,8 @@ pub struct ResolvedProviderToolClaims {
     pub idempotent: Option<ResolvedProviderClaim<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_world: Option<ResolvedProviderClaim<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_cache: Option<ResolvedProviderClaim<ProviderSemanticCacheContract>>,
 }
 
 /// Side-effect baseline resolved from trusted declaration facts. `Unknown` is
@@ -167,6 +169,15 @@ pub enum ResolvedSemanticCacheBaseline {
     FreshnessBound,
 }
 
+/// Provider capability required before Astra may consider semantic result
+/// reuse. This is eligibility only: every invocation still needs a concrete
+/// trusted revision fact for the resource it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSemanticCacheContract {
+    RevisionBound,
+}
+
 /// Provider-neutral idempotency semantics. This intentionally does not reuse
 /// the legacy built-in `IdempotentWrite` label: a remote idempotent effect is
 /// not necessarily an overwrite, and retry still depends on dispatch certainty
@@ -188,6 +199,8 @@ pub enum ProviderSemanticDiagnosticCode {
     ContradictoryEffectClaims,
     InsufficientIdempotencyTrust,
     IdempotencyWithoutKnownEffect,
+    InsufficientSemanticCacheTrust,
+    SemanticCacheWithoutPureRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +377,8 @@ pub struct ProviderToolClaims {
     pub idempotent: Option<ProviderClaim<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_world: Option<ProviderClaim<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_cache: Option<ProviderClaim<ProviderSemanticCacheContract>>,
 }
 
 /// Provider-declared support for asynchronous/task-augmented execution.
