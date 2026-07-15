@@ -365,6 +365,27 @@ policy/context snapshot version where relevant
 Only successful typed pure-read outcomes are eligible. Errors, timeouts,
 rejections, and unknown outcomes are never cached as success.
 
+The durable invocation decision freezes cache eligibility and the exact policy
+and descriptor versions, but it does not freeze a resource revision as current
+truth. Freshness facts are transient evidence and must be resolved again for
+every delivery attempt, including resume of an existing `Prepared` invocation.
+A restored checkpoint, a serialized cache key, or a process-local mutation
+counter is not proof that the current workspace/resource still has the same
+revision.
+
+A cache hit may complete a prepared invocation only when the observation's
+full key exactly matches the key built from current evidence. Matching only
+tool, arguments, and policy is insufficient. A newly executed read may be
+published as an observation only when one of these conditions holds:
+
+- the provider executed a conditional read bound to the claimed revision; or
+- Astra resolves the same freshness key again after the provider outcome and
+  before publication.
+
+If revalidation changes, fails, or becomes unavailable, Astra retains the
+durable invocation result but abandons the cache fill. This is an observable
+uncached/degraded path, not a tool failure and not a session stop.
+
 ## Durable invocation ledger
 
 ```text
