@@ -36,6 +36,7 @@ static AGENT_BINDING_MCP_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new(
 pub(crate) struct RuntimeMcpBundle {
     pub schemas: Vec<Value>,
     pub provider_snapshots: Vec<ResolvedProviderSnapshot>,
+    pub provider_policy_index: astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex,
     pub control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
     pub stop_after_success_tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     pub manager: Option<Arc<RwLock<McpClientManager>>>,
@@ -624,9 +625,21 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
         provider_snapshots.push(resolved_snapshot);
     }
 
+    let provider_policy_index =
+        astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
+            &provider_snapshots,
+        )
+        .map_err(|error| {
+            mcp_error(
+                StatusCode::CONFLICT,
+                error.to_string(),
+                "mcp_provider_policy_conflict",
+            )
+        })?;
     Ok(Some(RuntimeMcpBundle {
         schemas,
         provider_snapshots,
+        provider_policy_index,
         control_tools: Default::default(),
         stop_after_success_tools: Default::default(),
         manager: Some(Arc::new(RwLock::new(manager))),
@@ -1086,9 +1099,22 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
         authorization: authorization.to_string(),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
     };
+    let provider_snapshots = vec![resolved_snapshot];
+    let provider_policy_index =
+        astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
+            &provider_snapshots,
+        )
+        .map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "agent_binding_provider_policy_invalid",
+            )
+        })?;
     Ok(RuntimeMcpBundle {
         schemas,
-        provider_snapshots: vec![resolved_snapshot],
+        provider_snapshots,
+        provider_policy_index,
         control_tools,
         stop_after_success_tools,
         manager: None,
@@ -1444,6 +1470,13 @@ mod tests {
             Some(&descriptor.descriptor_ref()),
             "the model-visible schema alias must resolve to the exact carried descriptor"
         );
+        let invocation_policy = bundle
+            .provider_policy_index
+            .resolve("mcp__tools__query")
+            .expect("visible provider alias must have one invocation policy");
+        assert_eq!(invocation_policy.descriptor, descriptor.descriptor_ref());
+        assert!(invocation_policy.requires_approval());
+        assert!(!invocation_policy.parallelizable);
 
         let output = bundle
             .agent_binding_mcp

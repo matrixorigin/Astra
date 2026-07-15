@@ -10,14 +10,110 @@ use astra_turn_types::{
     ProviderDiscoverySnapshot, ProviderResolverVersion, ProviderSemanticDiagnostic,
     ProviderSemanticDiagnosticCode, PublicToolAlias, ResolvedConcurrencyBaseline,
     ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderToolClaims,
-    ResolvedSemanticCacheBaseline, ResolvedToolDescriptorDraft, ResolvedToolEffect,
-    ResolvedToolIdempotency, ResolvedToolSemantics,
+    ResolvedSemanticCacheBaseline, ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef,
+    ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const RESOLVER_VERSION: &str = "provider-semantic-resolver-v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApprovalBaseline {
+    NoAdditionalApproval,
+    RequiresApproval,
+}
+
+/// One immutable policy object consumed by provider-tool admission,
+/// permission, batching, retry and cache layers. Arguments may refine this in
+/// later phases, but consumers must never reinterpret the raw claims.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedInvocationPolicy {
+    pub descriptor: ResolvedToolDescriptorRef,
+    pub effect: ResolvedToolEffect,
+    pub parallelizable: bool,
+    pub approval: ProviderApprovalBaseline,
+    pub idempotency: ResolvedToolIdempotency,
+    pub semantic_cache: ResolvedSemanticCacheBaseline,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ProviderSemanticDiagnostic>,
+}
+
+impl ResolvedInvocationPolicy {
+    pub fn requires_approval(&self) -> bool {
+        self.approval == ProviderApprovalBaseline::RequiresApproval
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.effect == ResolvedToolEffect::ReadOnly
+    }
+}
+
+/// Request/session-scoped alias index. It is deliberately not process-global:
+/// identical public aliases in concurrent sessions cannot overwrite each
+/// other's descriptor version or execution policy.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedProviderPolicyIndex {
+    by_alias: BTreeMap<String, ResolvedInvocationPolicy>,
+}
+
+impl ResolvedProviderPolicyIndex {
+    pub fn from_snapshots(
+        snapshots: &[ResolvedProviderSnapshot],
+    ) -> Result<Self, ProviderResolutionError> {
+        let mut by_alias = BTreeMap::new();
+        for snapshot in snapshots {
+            let descriptors = snapshot
+                .descriptors
+                .iter()
+                .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
+                .collect::<BTreeMap<_, _>>();
+            for (alias, descriptor_ref) in &snapshot.alias_index {
+                let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+                    ProviderResolutionError::MissingResolvedDescriptor {
+                        alias: alias.to_string(),
+                        native_tool_id: descriptor_ref.identity.native_tool_id.to_string(),
+                    }
+                })?;
+                let semantics = &descriptor.semantic_baseline;
+                let policy = ResolvedInvocationPolicy {
+                    descriptor: descriptor_ref.clone(),
+                    effect: semantics.effect,
+                    parallelizable: semantics.concurrency
+                        == ResolvedConcurrencyBaseline::ParallelReadOnly,
+                    approval: if semantics.effect == ResolvedToolEffect::ReadOnly {
+                        ProviderApprovalBaseline::NoAdditionalApproval
+                    } else {
+                        ProviderApprovalBaseline::RequiresApproval
+                    },
+                    idempotency: semantics.idempotency,
+                    semantic_cache: semantics.semantic_cache,
+                    diagnostics: semantics.diagnostics.clone(),
+                };
+                if by_alias.insert(alias.to_string(), policy).is_some() {
+                    return Err(ProviderResolutionError::CrossSnapshotAliasCollision {
+                        alias: alias.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(Self { by_alias })
+    }
+
+    pub fn resolve(&self, public_alias: &str) -> Option<&ResolvedInvocationPolicy> {
+        self.by_alias.get(public_alias)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_alias.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_alias.is_empty()
+    }
+}
 
 /// Host-owned authority configuration. Absence is untrusted; adapters cannot
 /// add entries to this policy while decoding their own wire declarations.
@@ -65,6 +161,13 @@ pub enum ProviderResolutionError {
     Contract(#[from] ProviderContractError),
     #[error("failed to serialize provider resolution input: {0}")]
     Serialization(String),
+    #[error("resolved alias '{alias}' references missing descriptor '{native_tool_id}'")]
+    MissingResolvedDescriptor {
+        alias: String,
+        native_tool_id: String,
+    },
+    #[error("public provider alias '{alias}' collides across resolved snapshots")]
+    CrossSnapshotAliasCollision { alias: String },
 }
 
 /// Resolve one complete discovery snapshot. `aliases` is supplied by Astra's
@@ -281,9 +384,16 @@ mod tests {
     }
 
     fn discovery(tools: Vec<ProviderToolDeclaration>) -> ProviderDiscoverySnapshot {
+        discovery_for_binding("binding", tools)
+    }
+
+    fn discovery_for_binding(
+        binding: &str,
+        tools: Vec<ProviderToolDeclaration>,
+    ) -> ProviderDiscoverySnapshot {
         ProviderDiscoverySnapshot::new(
-            ProviderIdentity::new("provider").unwrap(),
-            ProviderBindingRef::new("binding").unwrap(),
+            ProviderIdentity::new(format!("provider-{binding}")).unwrap(),
+            ProviderBindingRef::new(binding).unwrap(),
             ProviderProtocolId::new("mcp").unwrap(),
             tools,
         )
@@ -464,6 +574,114 @@ mod tests {
         );
         assert_ne!(first.alias_index, renamed.alias_index);
         assert_ne!(first.content_hash, renamed.content_hash);
+    }
+
+    #[test]
+    fn policy_index_preserves_exact_descriptor_and_conservative_decisions() {
+        let read_claims = ProviderToolClaims {
+            read_only: Some(protocol_claim(true, "readOnlyHint")),
+            ..ProviderToolClaims::default()
+        };
+        let snapshot = resolve_provider_snapshot(
+            &discovery(vec![
+                declaration("read", read_claims),
+                declaration("unknown", ProviderToolClaims::default()),
+            ]),
+            &trusted_mcp(),
+            &aliases(&["read", "unknown"]),
+        )
+        .unwrap();
+        let index =
+            ResolvedProviderPolicyIndex::from_snapshots(std::slice::from_ref(&snapshot)).unwrap();
+        let read = index.resolve("provider__read").unwrap();
+        let unknown = index.resolve("provider__unknown").unwrap();
+
+        assert_eq!(index.len(), 2);
+        assert!(read.is_read_only());
+        assert!(read.parallelizable);
+        assert!(!read.requires_approval());
+        assert_eq!(
+            read.descriptor,
+            snapshot.alias_index[&PublicToolAlias::new("provider__read").unwrap()]
+        );
+        assert_eq!(unknown.effect, ResolvedToolEffect::Unknown);
+        assert!(!unknown.parallelizable);
+        assert!(unknown.requires_approval());
+        assert_eq!(
+            unknown.semantic_cache,
+            ResolvedSemanticCacheBaseline::Disabled
+        );
+    }
+
+    #[test]
+    fn policy_index_rejects_cross_snapshot_alias_collisions() {
+        let resolve = |binding: &str| {
+            resolve_provider_snapshot(
+                &discovery_for_binding(
+                    binding,
+                    vec![declaration("native", ProviderToolClaims::default())],
+                ),
+                &ProviderClaimTrustPolicy::default(),
+                &BTreeMap::from([(
+                    NativeToolId::new("native").unwrap(),
+                    PublicToolAlias::new("shared_alias").unwrap(),
+                )]),
+            )
+            .unwrap()
+        };
+        let error =
+            ResolvedProviderPolicyIndex::from_snapshots(&[resolve("a"), resolve("b")]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderResolutionError::CrossSnapshotAliasCollision { .. }
+        ));
+    }
+
+    #[test]
+    fn policy_indexes_isolate_the_same_alias_across_sessions() {
+        let discovery = discovery(vec![declaration(
+            "read",
+            ProviderToolClaims {
+                read_only: Some(protocol_claim(true, "readOnlyHint")),
+                ..ProviderToolClaims::default()
+            },
+        )]);
+        let aliases = aliases(&["read"]);
+        let trusted = resolve_provider_snapshot(&discovery, &trusted_mcp(), &aliases).unwrap();
+        let advisory = resolve_provider_snapshot(
+            &discovery,
+            &ProviderClaimTrustPolicy {
+                standard_protocols: BTreeMap::from([(
+                    "mcp".to_string(),
+                    ProviderClaimTrust::Advisory,
+                )]),
+                ..Default::default()
+            },
+            &aliases,
+        )
+        .unwrap();
+        let trusted_index = ResolvedProviderPolicyIndex::from_snapshots(&[trusted]).unwrap();
+        let advisory_index = ResolvedProviderPolicyIndex::from_snapshots(&[advisory]).unwrap();
+
+        assert!(
+            trusted_index
+                .resolve("provider__read")
+                .unwrap()
+                .parallelizable
+        );
+        assert!(
+            !advisory_index
+                .resolve("provider__read")
+                .unwrap()
+                .parallelizable
+        );
+        assert!(
+            advisory_index
+                .resolve("provider__read")
+                .unwrap()
+                .requires_approval()
+        );
     }
 
     #[test]

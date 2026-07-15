@@ -1011,18 +1011,47 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let args_str = serde_json::to_string(&execution.args).ok();
             let permission_context = self.ctx.permission_context;
             let effective_permission_timeout = self.ctx.effective_permission_timeout;
-            let mailbox = self.ctx.mailbox.as_deref_mut();
             let plan_mode_active = self.ctx.plan_mode_active;
-            match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
-                &execution.name,
-                args_str.as_deref(),
-                permission_context,
-                mailbox,
-                effective_permission_timeout,
-                plan_mode_active,
-            )
-            .await
-            {
+            let provider_lookup = self.ctx.runtime_tool_executor.map_or(
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider,
+                |executor| executor.provider_policy_lookup(&execution.name),
+            );
+            let provider_policy = match &provider_lookup {
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => {
+                    Some(policy)
+                }
+                _ => None,
+            };
+            let permission_result = match &provider_lookup {
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
+                    public_alias,
+                } => {
+                    let reason = format!(
+                        "provider tool '{public_alias}' is visible but has no resolved invocation policy"
+                    );
+                    if let Some(context) = permission_context {
+                        context
+                            .write()
+                            .await
+                            .record_blocked_tool_with_reason(&execution.name, Some(&reason));
+                    }
+                    PermissionCheckResult::Denied { reason }
+                }
+                _ => {
+                    let mailbox = self.ctx.mailbox.as_deref_mut();
+                    crate::turn::permission_gate::check_tool_permission_in_plan_mode_with_provider_policy(
+                        &execution.name,
+                        args_str.as_deref(),
+                        permission_context,
+                        mailbox,
+                        effective_permission_timeout,
+                        plan_mode_active,
+                        provider_policy,
+                    )
+                    .await
+                }
+            };
+            match permission_result {
                 PermissionCheckResult::Allowed => {}
                 PermissionCheckResult::AllowedImplicit { reason } => {
                     if !self.ctx.quiet {

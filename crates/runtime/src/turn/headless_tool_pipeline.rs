@@ -2503,6 +2503,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn visible_provider_tool_without_policy_fails_loudly_before_execution() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "mcp__weather");
+        harness.valid_tool_names.insert("mcp__weather".to_string());
+        begin_recorded_turn(&mut harness, 1);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = server_executor_for_test_workspace(workspace.path(), "missing-policy");
+        executor.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather",
+                "description": "Weather",
+                "parameters": {"type": "object"}
+            }
+        })]);
+        executor.set_agent_binding_mcp(std::sync::Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "weather",
+                &["mcp__weather"],
+            ),
+        ));
+
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("visible provider tool should reach policy admission"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let body = serde_json::to_string(&harness.tool_results).unwrap();
+        assert!(body.contains("no resolved invocation policy"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_read_policy_reaches_permission_and_batching_unchanged() {
+        let mut harness = PipelineHarness::new();
+        harness.permission_context =
+            Some(PermissionSyncContext::shared_root(PermissionMode::Prompt));
+        push_unknown_server_tool_call(&mut harness, "mcp__weather");
+        harness.valid_tool_names.insert("mcp__weather".to_string());
+        begin_recorded_turn(&mut harness, 1);
+
+        let protocol = astra_turn_types::ProviderProtocolId::new("mcp").unwrap();
+        let discovery = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("weather-provider").unwrap(),
+            astra_turn_types::ProviderBindingRef::new("weather-binding").unwrap(),
+            protocol.clone(),
+            vec![astra_turn_types::ProviderToolDeclaration {
+                native_tool_id: astra_turn_types::NativeToolId::new("weather").unwrap(),
+                native_tool_name: "weather".to_string(),
+                title: None,
+                description: Some("Weather".to_string()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                claims: astra_turn_types::ProviderToolClaims {
+                    read_only: Some(astra_turn_types::ProviderClaim::new(
+                        true,
+                        astra_turn_types::ProviderClaimSource::StandardProtocol {
+                            protocol,
+                            field: "annotations.readOnlyHint".to_string(),
+                        },
+                    )),
+                    ..Default::default()
+                },
+                task_support: Default::default(),
+                extension_fields: Default::default(),
+            }],
+        )
+        .unwrap();
+        let resolved = astra_turn_core::provider_resolution::resolve_provider_snapshot(
+            &discovery,
+            &astra_turn_core::provider_resolution::ProviderClaimTrustPolicy {
+                standard_protocols: std::collections::BTreeMap::from([(
+                    "mcp".to_string(),
+                    astra_turn_types::ProviderClaimTrust::Trusted,
+                )]),
+                ..Default::default()
+            },
+            &std::collections::BTreeMap::from([(
+                astra_turn_types::NativeToolId::new("weather").unwrap(),
+                astra_turn_types::PublicToolAlias::new("mcp__weather").unwrap(),
+            )]),
+        )
+        .unwrap();
+        let index =
+            astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
+                std::slice::from_ref(&resolved),
+            )
+            .unwrap();
+        let schemas =
+            astra_mcp::mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = server_executor_for_test_workspace(workspace.path(), "resolved-policy");
+        executor.set_request_scoped_mcp_schemas(schemas);
+        executor.set_provider_policy_index(index);
+        executor.set_agent_binding_mcp(std::sync::Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "weather",
+                &["mcp__weather"],
+            ),
+        ));
+
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("resolved provider read should validate"),
+        };
+        let permitted = pipeline.permit_execution(validated).await;
+        let continued = matches!(permitted, HeadlessPipelineStage::Continue(_));
+        drop(pipeline);
+        assert!(
+            continued,
+            "{}",
+            serde_json::to_string(&harness.tool_results).unwrap()
+        );
+        assert!(matches!(
+            executor.provider_policy_lookup("mcp__weather"),
+            crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(policy)
+                if policy.parallelizable && !policy.requires_approval()
+        ));
+    }
+
+    #[tokio::test]
     async fn unknown_tool_retries_do_not_advise_avoidance_missing_catalog_entry() {
         let mut harness = PipelineHarness::new();
         // Push 3 calls with different args so dedup doesn't block them.

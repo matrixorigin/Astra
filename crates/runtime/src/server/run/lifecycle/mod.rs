@@ -6934,6 +6934,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
+                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -8037,6 +8038,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
+                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());

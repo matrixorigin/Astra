@@ -139,11 +139,12 @@ pub fn scope_context_for_tool_request(
         ..Default::default()
     };
 
-    if tool.starts_with("mcp_") {
+    if ctx.risk_tags.contains(&RiskTag::ProviderUnknownCapability)
+        || ctx.risk_tags.contains(&RiskTag::MCPUnknownCapability)
+    {
+        // Field/reason names remain wire-compatible with the existing MCP UI,
+        // but the safety rule is provider-generic.
         ctx.mcp_unknown_capability = true;
-        if !ctx.risk_tags.contains(&RiskTag::MCPUnknownCapability) {
-            ctx.risk_tags.push(RiskTag::MCPUnknownCapability);
-        }
     }
 
     ctx
@@ -383,6 +384,38 @@ mod tests {
         assert!(!availability(&scopes, AllowScope::Project).available);
         assert!(!availability(&scopes, AllowScope::User).available);
         assert!(availability(&scopes, AllowScope::RestOfTurn).available);
+    }
+
+    #[test]
+    fn scope_uses_resolved_risk_facts_instead_of_reclassifying_provider_aliases() {
+        let args = serde_json::json!({"target": "stable"});
+        let known_effect = scope_context_for_tool_request(
+            "mcp__provider__write",
+            &args,
+            vec![RiskTag::ProviderSideEffect],
+            false,
+            false,
+        );
+        assert!(!known_effect.mcp_unknown_capability);
+        assert!(
+            !known_effect
+                .risk_tags
+                .contains(&RiskTag::MCPUnknownCapability)
+        );
+
+        for unknown_tag in [
+            RiskTag::MCPUnknownCapability,
+            RiskTag::ProviderUnknownCapability,
+        ] {
+            let unknown = scope_context_for_tool_request(
+                "mcp__provider__unknown",
+                &args,
+                vec![unknown_tag],
+                false,
+                false,
+            );
+            assert!(unknown.mcp_unknown_capability);
+        }
     }
 
     #[test]

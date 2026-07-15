@@ -46,6 +46,8 @@ fn highest_risk_color(labels: &[String]) -> Color {
         "NetworkExfiltration",
         "SqlDestructive",
         "MCPUnknownCapability",
+        "ProviderUnknownCapability",
+        "ProviderSideEffect",
         "WorkspaceUntrusted",
     ];
     let medium = ["WritesOutsidePackage", "SandboxExpansion"];
@@ -74,6 +76,8 @@ fn humanize_risk_tag(label: &str) -> &'static str {
         "GitDestructive" => "Git destructive",
         "SqlDestructive" => "SQL destructive",
         "MCPUnknownCapability" => "Unknown MCP capability",
+        "ProviderUnknownCapability" => "Unknown provider capability",
+        "ProviderSideEffect" => "Provider side effect",
         "WorkspaceUntrusted" => "Untrusted workspace",
         "SandboxExpansion" => "Sandbox expansion",
         _ => "Risk",
@@ -347,6 +351,12 @@ impl ApprovalCell {
                 "MCPUnknownCapability" => {
                     Some(astra_turn_core::permission::engine::RiskTag::MCPUnknownCapability)
                 }
+                "ProviderUnknownCapability" => {
+                    Some(astra_turn_core::permission::engine::RiskTag::ProviderUnknownCapability)
+                }
+                "ProviderSideEffect" => {
+                    Some(astra_turn_core::permission::engine::RiskTag::ProviderSideEffect)
+                }
                 "WorkspaceUntrusted" => {
                     Some(astra_turn_core::permission::engine::RiskTag::WorkspaceUntrusted)
                 }
@@ -359,10 +369,12 @@ impl ApprovalCell {
         astra_turn_core::permission::scope::ScopeAvailabilityContext {
             risk_tags: self.risk_tags_for_scope(),
             source_agent_present: self.source_agent.is_some(),
-            mcp_unknown_capability: self
-                .risk_tag_labels
-                .iter()
-                .any(|label| label == "MCPUnknownCapability"),
+            mcp_unknown_capability: self.risk_tag_labels.iter().any(|label| {
+                matches!(
+                    label.as_str(),
+                    "MCPUnknownCapability" | "ProviderUnknownCapability"
+                )
+            }),
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
@@ -864,6 +876,14 @@ mod tests {
         assert_eq!(
             highest_risk_color(&["NetworkExfiltration".into()]),
             theme.error
+        );
+        assert_eq!(
+            highest_risk_color(&["ProviderUnknownCapability".into()]),
+            theme.error
+        );
+        assert_eq!(
+            humanize_risk_tag("ProviderSideEffect"),
+            "Provider side effect"
         );
         assert_eq!(
             highest_risk_color(&["WritesOutsidePackage".into()]),

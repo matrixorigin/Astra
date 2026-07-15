@@ -126,6 +126,13 @@ enum RuntimeEnvironmentDenial {
     PolicyDenied(String),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderPolicyLookup {
+    NotProvider,
+    Resolved(astra_turn_core::provider_resolution::ResolvedInvocationPolicy),
+    MissingPolicy { public_alias: String },
+}
+
 impl RuntimeEnvironmentDenial {
     fn from_unavailable_reason(reason: astra_runtime_env::ToolUnavailableReason) -> Self {
         match reason {
@@ -302,6 +309,11 @@ pub struct RuntimeToolExecutor {
     /// activation reaches MCP tools without treating arbitrary schemas as
     /// server-owned capacity.
     request_scoped_mcp_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Exact descriptor-keyed policy index for the same request-scoped MCP
+    /// surface. Batching and permission both resolve through this session-local
+    /// index; no process-global name classification is mutated.
+    provider_policy_index:
+        Arc<std::sync::RwLock<astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
@@ -406,6 +418,7 @@ impl RuntimeToolExecutor {
             plan_resume_hint_handle: None,
             plan_authoring_active_handle: None,
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -575,6 +588,39 @@ impl RuntimeToolExecutor {
             "request_scoped_mcp_schemas",
         );
         *guard = schemas;
+    }
+
+    pub fn set_provider_policy_index(
+        &self,
+        index: astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex,
+    ) {
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.provider_policy_index, "provider_policy_index");
+        *guard = index;
+    }
+
+    pub(crate) fn provider_policy_lookup(&self, public_alias: &str) -> ProviderPolicyLookup {
+        if let Some(policy) = self
+            .provider_policy_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .resolve(public_alias)
+            .cloned()
+        {
+            return ProviderPolicyLookup::Resolved(policy);
+        }
+
+        let belongs_to_provider_surface = self
+            .request_scoped_mcp_schemas_snapshot("provider_policy_lookup")
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some(public_alias));
+        if belongs_to_provider_surface {
+            ProviderPolicyLookup::MissingPolicy {
+                public_alias: public_alias.to_string(),
+            }
+        } else {
+            ProviderPolicyLookup::NotProvider
+        }
     }
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
@@ -2587,6 +2633,57 @@ mod tests {
             Some("no_request_scoped_mcp_provider_bound")
         );
         assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn provider_policy_lookup_distinguishes_non_provider_missing_and_resolved() {
+        let (exec, _dir) = test_executor();
+        assert!(matches!(
+            exec.provider_policy_lookup("mcp__tools__query"),
+            ProviderPolicyLookup::NotProvider
+        ));
+
+        let discovery = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("provider").unwrap(),
+            astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
+            astra_turn_types::ProviderProtocolId::new("mcp").unwrap(),
+            vec![astra_turn_types::ProviderToolDeclaration {
+                native_tool_id: astra_turn_types::NativeToolId::new("query").unwrap(),
+                native_tool_name: "query".to_string(),
+                title: None,
+                description: Some("Query".to_string()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                claims: Default::default(),
+                task_support: Default::default(),
+                extension_fields: Default::default(),
+            }],
+        )
+        .unwrap();
+        let resolved = crate::server::runtime_mcp::resolve_mcp_snapshot("tools", &discovery)
+            .expect("MCP snapshot should resolve");
+        let schemas = astra_mcp::mcp_resolved_provider_snapshot_to_schemas_checked(&resolved)
+            .expect("resolved schemas should project");
+        exec.set_request_scoped_mcp_schemas(schemas);
+        assert!(matches!(
+            exec.provider_policy_lookup("mcp__tools__query"),
+            ProviderPolicyLookup::MissingPolicy { .. }
+        ));
+
+        let expected_descriptor = resolved.descriptors[0].descriptor_ref();
+        let index =
+            astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(&[
+                resolved,
+            ])
+            .unwrap();
+        exec.set_provider_policy_index(index);
+        match exec.provider_policy_lookup("mcp__tools__query") {
+            ProviderPolicyLookup::Resolved(policy) => {
+                assert_eq!(policy.descriptor, expected_descriptor);
+                assert!(policy.requires_approval());
+            }
+            other => panic!("expected resolved provider policy, got {other:?}"),
+        }
     }
 
     #[test]

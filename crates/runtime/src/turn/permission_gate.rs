@@ -10,7 +10,10 @@ use crate::orchestration::permission_sync::{
     PermissionRequest, PermissionResponse, PermissionSyncHandle, PermissionUpdate,
 };
 use astra_messaging::router::AgentMailbox;
-use astra_turn_core::permission::engine::{DecisionSource, HardDecision, evaluate_permission};
+use astra_turn_core::permission::engine::{
+    DecisionSource, HardDecision, evaluate_permission_with_provider_policy,
+};
+use astra_turn_core::provider_resolution::ResolvedInvocationPolicy;
 use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
 fn normalized_tool_args(tool_name: &str, args: Option<&str>) -> Result<serde_json::Value, String> {
@@ -64,6 +67,25 @@ pub async fn check_tool_permission(
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
+    check_tool_permission_with_provider_policy(
+        tool_name,
+        args,
+        permission_context,
+        mailbox,
+        timeout,
+        None,
+    )
+    .await
+}
+
+pub async fn check_tool_permission_with_provider_policy(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&PermissionSyncHandle>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+) -> PermissionCheckResult {
     let Some(ctx) = permission_context else {
         return PermissionCheckResult::Denied {
             reason: "no permission context configured".to_string(),
@@ -81,7 +103,12 @@ pub async fn check_tool_permission(
     };
     let prompt = {
         let ctx_guard = ctx.read().await;
-        let envelope = evaluate_permission(tool_name, &normalized_args, &ctx_guard);
+        let envelope = evaluate_permission_with_provider_policy(
+            tool_name,
+            &normalized_args,
+            &ctx_guard,
+            provider_policy,
+        );
         astra_turn_core::permission::audit::record_evaluated_envelope(
             tool_name,
             &normalized_args,
@@ -202,6 +229,27 @@ pub async fn check_tool_permission_in_plan_mode(
     timeout: Duration,
     plan_mode_active: bool,
 ) -> PermissionCheckResult {
+    check_tool_permission_in_plan_mode_with_provider_policy(
+        tool_name,
+        args,
+        permission_context,
+        mailbox,
+        timeout,
+        plan_mode_active,
+        None,
+    )
+    .await
+}
+
+pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&PermissionSyncHandle>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    plan_mode_active: bool,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+) -> PermissionCheckResult {
     let normalized_args = match normalized_tool_args(tool_name, args) {
         Ok(args) => args,
         Err(reason) => {
@@ -214,9 +262,11 @@ pub async fn check_tool_permission_in_plan_mode(
         }
     };
 
-    if plan_mode_active
-        && crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args)
-    {
+    let plan_mode_blocked = provider_policy.map_or_else(
+        || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args),
+        |policy| !policy.is_read_only(),
+    );
+    if plan_mode_active && plan_mode_blocked {
         return PermissionCheckResult::Denied {
             reason: format!(
                 "tool '{tool_name}' is blocked while plan mode is active. \
@@ -228,12 +278,13 @@ pub async fn check_tool_permission_in_plan_mode(
         };
     }
     let normalized_args_str = serde_json::to_string(&normalized_args).ok();
-    check_tool_permission(
+    check_tool_permission_with_provider_policy(
         tool_name,
         normalized_args_str.as_deref(),
         permission_context,
         mailbox,
         timeout,
+        provider_policy,
     )
     .await
 }
@@ -254,6 +305,68 @@ mod tests {
             result,
             PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
         )
+    }
+
+    fn provider_policy(effect: astra_turn_types::ResolvedToolEffect) -> ResolvedInvocationPolicy {
+        let read_only = effect == astra_turn_types::ResolvedToolEffect::ReadOnly;
+        ResolvedInvocationPolicy {
+            descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                astra_turn_types::ToolIdentity::new(
+                    astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
+                    astra_turn_types::NativeToolId::new("native").unwrap(),
+                ),
+                "version",
+            )
+            .unwrap(),
+            effect,
+            parallelizable: read_only,
+            approval: if read_only {
+                astra_turn_core::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval
+            } else {
+                astra_turn_core::provider_resolution::ProviderApprovalBaseline::RequiresApproval
+            },
+            idempotency: if read_only {
+                astra_turn_types::ResolvedToolIdempotency::PureRead
+            } else {
+                astra_turn_types::ResolvedToolIdempotency::NonIdempotent
+            },
+            semantic_cache: astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_uses_the_exact_provider_policy_instead_of_name_heuristics() {
+        let ctx = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            ..Default::default()
+        });
+        let read = provider_policy(astra_turn_types::ResolvedToolEffect::ReadOnly);
+        let unknown = provider_policy(astra_turn_types::ResolvedToolEffect::Unknown);
+
+        let allowed = check_tool_permission_in_plan_mode_with_provider_policy(
+            "provider__read",
+            Some("{}"),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true,
+            Some(&read),
+        )
+        .await;
+        assert!(is_allowed(&allowed));
+
+        let denied = check_tool_permission_in_plan_mode_with_provider_policy(
+            "provider__unknown",
+            Some("{}"),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true,
+            Some(&unknown),
+        )
+        .await;
+        assert!(matches!(denied, PermissionCheckResult::Denied { .. }));
     }
 
     #[tokio::test]

@@ -312,7 +312,10 @@ impl PendingApproval {
                 .is_some_and(|meta| !meta.is_known())
                 || self
                     .risk_tags
-                    .contains(&astra_turn_core::permission::engine::RiskTag::MCPUnknownCapability),
+                    .contains(&astra_turn_core::permission::engine::RiskTag::MCPUnknownCapability)
+                || self.risk_tags.contains(
+                    &astra_turn_core::permission::engine::RiskTag::ProviderUnknownCapability,
+                ),
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
@@ -1413,6 +1416,36 @@ mod tests {
         let view = q.focused_view().expect("pending approval");
         assert_eq!(
             view.selection_hint.as_deref(),
+            Some("Don't ask again stays session-only for this request.")
+        );
+    }
+
+    #[test]
+    fn provider_unknown_capability_keeps_always_session_only() {
+        use astra_turn_core::permission::engine::RiskTag;
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "mcp__provider__effect".into(),
+            "Run provider effect".into(),
+            None,
+            "capability metadata is unknown".into(),
+            serde_json::json!({"target": "stable"}),
+            tx,
+            ApprovalMetadata::default().with_risk_tags(vec![RiskTag::ProviderUnknownCapability]),
+        );
+
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "unknown provider capability may be remembered only in the live session"
+        );
+        assert_eq!(
+            q.focused_view().unwrap().selection_hint.as_deref(),
             Some("Don't ask again stays session-only for this request.")
         );
     }

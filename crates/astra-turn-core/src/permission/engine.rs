@@ -254,6 +254,11 @@ pub enum RiskTag {
     /// MCP server with no destructiveHint annotation; we don't
     /// know what it does.
     MCPUnknownCapability,
+    /// A dynamic provider descriptor exists, but its effect claims are
+    /// missing, contradictory, or not trusted enough to relax policy.
+    ProviderUnknownCapability,
+    /// A resolved dynamic provider descriptor is known to have side effects.
+    ProviderSideEffect,
     /// Workspace not in the trust ledger; persistent rules from
     /// `.astra/permissions.json` are downgraded to allow-only-once.
     WorkspaceUntrusted,
@@ -390,8 +395,49 @@ pub fn evaluate_permission(
     args: &Value,
     ctx: &PermissionSyncContext,
 ) -> DecisionEnvelope {
+    evaluate_permission_with_provider_policy(tool_name, args, ctx, None)
+}
+
+/// Evaluate permission using the exact provider policy that was selected for
+/// this invocation. Static tools pass `None` and retain their args-aware
+/// registry behavior; dynamic tools must pass the descriptor-keyed policy used
+/// by batching and execution.
+#[must_use]
+pub fn evaluate_permission_with_provider_policy(
+    tool_name: &str,
+    args: &Value,
+    ctx: &PermissionSyncContext,
+    provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
-    let risk_tags = risk_tags_for_request(tool_name, args);
+    let mut risk_tags = risk_tags_for_request(tool_name, args);
+    if let Some(policy) = provider_policy {
+        // The descriptor is the capability authority for dynamic tools. Drop
+        // tags inferred only from the public alias or the static-tool
+        // registry; retaining those would let names such as `mcp__*`
+        // contradict the exact descriptor used by batching and execution.
+        // Intrinsic guards (for example explicit deny rules and git safety)
+        // remain in the normal evaluation chain below.
+        risk_tags.retain(|tag| {
+            !matches!(
+                tag,
+                RiskTag::MCPUnknownCapability
+                    | RiskTag::BashExecute
+                    | RiskTag::WritesSensitiveFile
+                    | RiskTag::WritesOutsidePackage
+            )
+        });
+        let provider_tag = if policy.is_read_only() {
+            None
+        } else if policy.effect == astra_turn_types::ResolvedToolEffect::Mutating {
+            Some(RiskTag::ProviderSideEffect)
+        } else {
+            Some(RiskTag::ProviderUnknownCapability)
+        };
+        if let Some(tag) = provider_tag {
+            push_risk_tag(&mut risk_tags, tag);
+        }
+    }
     let will_save = Some(allow_rule_preview(tool_name, args));
     let rule_match_context =
         crate::permission::types::RuleMatchContext::from_tool_args(tool_name, args);
@@ -755,8 +801,20 @@ pub fn evaluate_permission(
         push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
     }
 
-    if explicit_approval_reason(tool_name, args).is_none()
-        && is_read_only_tool_with_args(tool_name, Some(args))
+    let provider_requires_approval =
+        provider_policy.is_some_and(|policy| policy.requires_approval());
+    let static_explicit_reason = if provider_policy.is_none() {
+        explicit_approval_reason(tool_name, args)
+    } else {
+        None
+    };
+    let resolved_read_only = provider_policy.map_or_else(
+        || is_read_only_tool_with_args(tool_name, Some(args)),
+        |policy| policy.is_read_only(),
+    );
+    if static_explicit_reason.is_none()
+        && !provider_requires_approval
+        && resolved_read_only
         && ctx.mode() != PermissionMode::Deny
     {
         let decision = HardDecision::Allow;
@@ -858,7 +916,11 @@ pub fn evaluate_permission(
         "no fingerprinted override",
     );
 
-    if let Some(policy_reason) = explicit_approval_reason(tool_name, args) {
+    let explicit_reason = static_explicit_reason.or_else(|| {
+        provider_requires_approval
+            .then(|| "resolved provider capability requires approval".to_string())
+    });
+    if let Some(policy_reason) = explicit_reason {
         let prompt_reason =
             primary_approval_reason(tool_name, args).unwrap_or_else(|| policy_reason.clone());
         let mode = ctx.mode();
@@ -1887,6 +1949,8 @@ mod tests {
             RiskTag::GitDestructive,
             RiskTag::SqlDestructive,
             RiskTag::MCPUnknownCapability,
+            RiskTag::ProviderUnknownCapability,
+            RiskTag::ProviderSideEffect,
             RiskTag::WorkspaceUntrusted,
             RiskTag::SandboxExpansion,
         ];
@@ -3189,6 +3253,129 @@ mod tests {
                 mode: "agent policy allowlist".to_string()
             }
         );
+    }
+
+    fn provider_policy(
+        effect: astra_turn_types::ResolvedToolEffect,
+        parallelizable: bool,
+        approval: crate::provider_resolution::ProviderApprovalBaseline,
+    ) -> crate::provider_resolution::ResolvedInvocationPolicy {
+        crate::provider_resolution::ResolvedInvocationPolicy {
+            descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                astra_turn_types::ToolIdentity::new(
+                    astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
+                    astra_turn_types::NativeToolId::new("native").unwrap(),
+                ),
+                "version",
+            )
+            .unwrap(),
+            effect,
+            parallelizable,
+            approval,
+            idempotency: if effect == astra_turn_types::ResolvedToolEffect::ReadOnly {
+                astra_turn_types::ResolvedToolIdempotency::PureRead
+            } else {
+                astra_turn_types::ResolvedToolIdempotency::NonIdempotent
+            },
+            semantic_cache: astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_read_policy_drives_the_same_permission_short_circuit_as_batching() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let policy = provider_policy(
+            astra_turn_types::ResolvedToolEffect::ReadOnly,
+            true,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        let envelope = evaluate_permission_with_provider_policy(
+            "mcp__provider__read",
+            &serde_json::json!({}),
+            &ctx,
+            Some(&policy),
+        );
+
+        assert_eq!(envelope.decision, HardDecision::Allow);
+        assert_eq!(envelope.source, DecisionSource::ReadShortCircuit);
+        assert!(
+            envelope.risk_tags.is_empty(),
+            "resolved read-only provider inherited static risk tags: {:?}",
+            envelope.risk_tags
+        );
+        assert!(policy.parallelizable);
+    }
+
+    #[test]
+    fn provider_unknown_and_mutating_policies_require_explicit_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        for (effect, expected_tag) in [
+            (
+                astra_turn_types::ResolvedToolEffect::Unknown,
+                RiskTag::ProviderUnknownCapability,
+            ),
+            (
+                astra_turn_types::ResolvedToolEffect::Mutating,
+                RiskTag::ProviderSideEffect,
+            ),
+        ] {
+            let policy = provider_policy(
+                effect,
+                false,
+                crate::provider_resolution::ProviderApprovalBaseline::RequiresApproval,
+            );
+            let envelope = evaluate_permission_with_provider_policy(
+                "mcp__provider__effect",
+                &serde_json::json!({}),
+                &ctx,
+                Some(&policy),
+            );
+
+            assert!(matches!(
+                envelope.decision,
+                HardDecision::NeedExternal { .. }
+            ));
+            assert!(matches!(
+                envelope.source,
+                DecisionSource::ExplicitApprovalGate { .. }
+            ));
+            assert!(envelope.risk_tags.contains(&expected_tag));
+            assert!(!envelope.risk_tags.contains(&RiskTag::MCPUnknownCapability));
+            assert!(!envelope.risk_tags.contains(&RiskTag::BashExecute));
+            assert!(!policy.parallelizable);
+        }
+    }
+
+    #[test]
+    fn provider_read_policy_does_not_bypass_an_explicit_deny_rule() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                deny_rules: vec![crate::permission::types::PermissionRule::tool(
+                    "mcp__provider__read",
+                )],
+                ..Default::default()
+            },
+        );
+        let policy = provider_policy(
+            astra_turn_types::ResolvedToolEffect::ReadOnly,
+            true,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        let envelope = evaluate_permission_with_provider_policy(
+            "mcp__provider__read",
+            &serde_json::json!({}),
+            &ctx,
+            Some(&policy),
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(envelope.source, DecisionSource::DenyRule { .. }));
     }
 
     // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──

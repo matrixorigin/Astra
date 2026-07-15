@@ -8274,6 +8274,11 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     let provider_snapshot = runtime_mcp::resolve_mcp_snapshot("tools", &provider_snapshot)
         .expect("test discovery snapshot should resolve");
     let provider_snapshot_hash = provider_snapshot.content_hash.clone();
+    let provider_policy_index =
+        astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
+            std::slice::from_ref(&provider_snapshot),
+        )
+        .unwrap();
     let capabilities = PreparedRuntimeCapabilities {
         mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {
             schemas: vec![json!({
@@ -8285,6 +8290,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
                 }
             })],
             provider_snapshots: vec![provider_snapshot],
+            provider_policy_index,
             control_tools: Default::default(),
             stop_after_success_tools: Default::default(),
             manager: None,
