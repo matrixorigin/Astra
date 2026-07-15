@@ -10,9 +10,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{DurableToolReference, canonical_public_arguments_hash};
+use crate::{
+    DurableToolReference, ToolInvocationResultPayload, ToolInvocationTerminalOutcome,
+    canonical_public_arguments_hash,
+};
 
 pub const SEMANTIC_READ_CACHE_CONTRACT_VERSION: &str = "semantic-read-cache-v1";
+pub const SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION: &str = "semantic-read-observation-v1";
+pub const SEMANTIC_READ_OBSERVATION_MAX_BYTES: usize = 256 * 1024;
 const MAX_FRESHNESS_COMPONENT_BYTES: usize = 4096;
 const MAX_FRESHNESS_FACTS: usize = 64;
 const MAX_POLICY_DECISION_ID_BYTES: usize = 256;
@@ -50,7 +55,7 @@ impl SemanticFreshnessFact {
         })
     }
 
-    fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
+    pub fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
         validate_content_id("subject_id", &self.subject_id)?;
         validate_content_id("revision_id", &self.revision_id)
     }
@@ -131,7 +136,7 @@ impl SemanticReadFreshnessContext {
         Ok(context)
     }
 
-    fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
+    pub fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
         if self.contract_version != SEMANTIC_READ_CACHE_CONTRACT_VERSION {
             return Err(SemanticReadCacheContractError::UnsupportedContractVersion(
                 self.contract_version.clone(),
@@ -216,7 +221,7 @@ impl SemanticReadCacheKey {
         Ok(key)
     }
 
-    fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
+    pub fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
         if self.contract_version != SEMANTIC_READ_CACHE_CONTRACT_VERSION {
             return Err(SemanticReadCacheContractError::UnsupportedContractVersion(
                 self.contract_version.clone(),
@@ -267,6 +272,95 @@ impl<'de> Deserialize<'de> for SemanticReadCacheKey {
     }
 }
 
+/// Content-addressed successful provider observation. Invocation-specific
+/// presentation and cache-hit metadata are added after lookup and therefore
+/// are not part of this reusable payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SemanticReadObservation {
+    pub contract_version: String,
+    pub key: SemanticReadCacheKey,
+    pub result: ToolInvocationResultPayload,
+    pub observation_id: String,
+}
+
+impl SemanticReadObservation {
+    pub fn from_terminal_outcome(
+        key: SemanticReadCacheKey,
+        outcome: &ToolInvocationTerminalOutcome,
+    ) -> Result<Self, SemanticReadCacheContractError> {
+        let ToolInvocationTerminalOutcome::Succeeded { result } = outcome else {
+            return Err(SemanticReadCacheContractError::NonSuccessfulObservation);
+        };
+        key.validate()?;
+        let mut observation = Self {
+            contract_version: SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION.to_string(),
+            key,
+            result: result.clone(),
+            observation_id: String::new(),
+        };
+        observation.observation_id = observation_content_id(&observation)?;
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn encoded_len(&self) -> Result<usize, SemanticReadCacheContractError> {
+        serde_json::to_vec(self)
+            .map(|encoded| encoded.len())
+            .map_err(|error| SemanticReadCacheContractError::Serialization(error.to_string()))
+    }
+
+    pub fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
+        if self.contract_version != SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION {
+            return Err(SemanticReadCacheContractError::UnsupportedContractVersion(
+                self.contract_version.clone(),
+            ));
+        }
+        self.key.validate()?;
+        validate_content_id("observation_id", &self.observation_id)?;
+        let expected = observation_content_id(self)?;
+        if self.observation_id != expected {
+            return Err(SemanticReadCacheContractError::ContentIdMismatch {
+                field: "observation_id",
+                expected,
+                actual: self.observation_id.clone(),
+            });
+        }
+        let encoded_bytes = self.encoded_len()?;
+        if encoded_bytes > SEMANTIC_READ_OBSERVATION_MAX_BYTES {
+            return Err(SemanticReadCacheContractError::ObservationTooLarge {
+                max_bytes: SEMANTIC_READ_OBSERVATION_MAX_BYTES,
+                actual_bytes: encoded_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for SemanticReadObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawObservation {
+            contract_version: String,
+            key: SemanticReadCacheKey,
+            result: ToolInvocationResultPayload,
+            observation_id: String,
+        }
+
+        let raw = RawObservation::deserialize(deserializer)?;
+        let observation = Self {
+            contract_version: raw.contract_version,
+            key: raw.key,
+            result: raw.result,
+            observation_id: raw.observation_id,
+        };
+        observation.validate().map_err(serde::de::Error::custom)?;
+        Ok(observation)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SemanticReadCacheContractError {
     #[error("semantic read-cache {field} must not be empty")]
@@ -305,6 +399,15 @@ pub enum SemanticReadCacheContractError {
     },
     #[error("semantic read-cache serialization failed: {0}")]
     Serialization(String),
+    #[error("only a typed successful pure-read outcome can become a semantic observation")]
+    NonSuccessfulObservation,
+    #[error(
+        "semantic read observation exceeds the {max_bytes} byte limit (actual {actual_bytes} bytes)"
+    )]
+    ObservationTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
 }
 
 fn validate_raw_component(
@@ -423,6 +526,23 @@ fn key_content_id(key: &SemanticReadCacheKey) -> Result<String, SemanticReadCach
     })
 }
 
+fn observation_content_id(
+    observation: &SemanticReadObservation,
+) -> Result<String, SemanticReadCacheContractError> {
+    #[derive(Serialize)]
+    struct ObservationContent<'a> {
+        contract_version: &'a str,
+        key: &'a SemanticReadCacheKey,
+        result: &'a ToolInvocationResultPayload,
+    }
+
+    content_id(&ObservationContent {
+        contract_version: &observation.contract_version,
+        key: &observation.key,
+        result: &observation.result,
+    })
+}
+
 fn content_id(value: &impl Serialize) -> Result<String, SemanticReadCacheContractError> {
     let encoded = serde_json::to_vec(value)
         .map_err(|error| SemanticReadCacheContractError::Serialization(error.to_string()))?;
@@ -442,6 +562,7 @@ mod tests {
     use super::*;
     use crate::{ProviderBindingRef, ResolvedToolDescriptorRef, ToolIdentity};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn fact(scope: SemanticFreshnessScope, subject: &str, revision: &str) -> SemanticFreshnessFact {
         SemanticFreshnessFact::new(scope, subject, revision).unwrap()
@@ -462,6 +583,31 @@ mod tests {
 
     fn decision_id(label: &str) -> String {
         tagged_content_id("test-decision", label.as_bytes())
+    }
+
+    fn cache_key() -> SemanticReadCacheKey {
+        let freshness = SemanticReadFreshnessContext::new(
+            "owner",
+            vec![fact(SemanticFreshnessScope::Resource, "resource", "rev-1")],
+        )
+        .unwrap();
+        SemanticReadCacheKey::new(
+            provider_tool("descriptor-v1"),
+            &json!({"query": "status"}),
+            &decision_id("policy"),
+            &freshness,
+        )
+        .unwrap()
+    }
+
+    fn success(output: String) -> ToolInvocationTerminalOutcome {
+        ToolInvocationTerminalOutcome::Succeeded {
+            result: ToolInvocationResultPayload {
+                output,
+                metadata: BTreeMap::from([("provider_status".to_string(), json!("fresh"))]),
+                exit_semantics: None,
+            },
+        }
     }
 
     #[test]
@@ -726,5 +872,52 @@ mod tests {
         encoded["key_id"] = Value::String(decision_id("forged"));
 
         assert!(serde_json::from_value::<SemanticReadCacheKey>(encoded).is_err());
+    }
+
+    #[test]
+    fn observation_accepts_only_typed_success_and_is_content_addressed() {
+        let key = cache_key();
+        let observation =
+            SemanticReadObservation::from_terminal_outcome(key.clone(), &success("ok".into()))
+                .unwrap();
+        assert_eq!(observation.key, key);
+        assert!(observation.encoded_len().unwrap() <= SEMANTIC_READ_OBSERVATION_MAX_BYTES);
+        let restored: SemanticReadObservation =
+            serde_json::from_value(serde_json::to_value(&observation).unwrap()).unwrap();
+        assert_eq!(restored, observation);
+
+        let failure = ToolInvocationTerminalOutcome::Failed {
+            result: ToolInvocationResultPayload {
+                output: "failed".to_string(),
+                metadata: BTreeMap::new(),
+                exit_semantics: None,
+            },
+            error_kind: Some("provider_failure".to_string()),
+            retryable: false,
+        };
+        assert!(matches!(
+            SemanticReadObservation::from_terminal_outcome(key, &failure),
+            Err(SemanticReadCacheContractError::NonSuccessfulObservation)
+        ));
+    }
+
+    #[test]
+    fn oversized_or_forged_observations_fail_loudly() {
+        assert!(matches!(
+            SemanticReadObservation::from_terminal_outcome(
+                cache_key(),
+                &success("x".repeat(SEMANTIC_READ_OBSERVATION_MAX_BYTES)),
+            ),
+            Err(SemanticReadCacheContractError::ObservationTooLarge { .. })
+        ));
+
+        let observation = SemanticReadObservation::from_terminal_outcome(
+            cache_key(),
+            &success("valid".to_string()),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_value(&observation).unwrap();
+        encoded["result"]["output"] = json!("tampered");
+        assert!(serde_json::from_value::<SemanticReadObservation>(encoded).is_err());
     }
 }

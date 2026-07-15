@@ -83,6 +83,7 @@ pub mod routing_metrics;
 pub mod runtime_scaffolding;
 pub mod safety_middleware;
 pub mod section_types;
+pub mod semantic_read_cache;
 pub mod session_latches;
 pub mod shadow_diff;
 pub mod spill_backend;
