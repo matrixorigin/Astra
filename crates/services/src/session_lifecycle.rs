@@ -252,10 +252,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM team_snapshots WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "tool_exactly_once_results",
-        sql: "DELETE FROM tool_exactly_once_results WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "tool_invocation_ledger",
         sql: "DELETE FROM tool_invocation_ledger WHERE session_id = ? AND user_id = ?",
     },

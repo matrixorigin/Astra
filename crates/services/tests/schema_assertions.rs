@@ -60,6 +60,7 @@ async fn schema_rationalization_runtime_contract() {
         "skill_marketplace_stats",
         "skill_quality_reports",
         "task_verification_results",
+        "tool_exactly_once_results",
     ] {
         assert!(
             !table_exists(&pool, &schema, removed).await,
@@ -1624,22 +1625,6 @@ async fn phase2_web_hydration_schema_contract() {
         .await,
         ["user_id", "resource_type", "resource_id", "created_at"],
         "auth audit lookups must be observable by owner/resource recency"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "tool_exactly_once_results").await,
-        ["user_id", "session_id", "dedup_key"],
-        "tool exactly-once recovery must dedupe within the owner/session boundary"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "tool_exactly_once_results",
-            "idx_tool_exactly_once_session"
-        )
-        .await
-        .is_empty(),
-        "tool_exactly_once_results must not keep a redundant session/user index; the owner-first primary key covers owner/session cleanup"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "tool_invocation_ledger").await,

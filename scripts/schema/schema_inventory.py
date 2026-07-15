@@ -371,16 +371,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::runs",
         product_owner="tool output history, previews, and artifacts",
     ),
-    "tool_exactly_once_results": TableMetadata(
-        semantic_owner="runtime::server::tool_exactly_once",
-        state_class="coordination fact",
-        primary_query="side-effect dedup lookup by user_id, session_id, dedup_key",
-        retention_policy="retain at least as long as side-effect replay is possible for the session/run",
-        rebuildability="not rebuildable safely; prevents duplicate side effects after crash or retry",
-        merge_guidance="never merge into event logs; exactly-once lookup must stay direct and small",
-        migration_owner="runtime::server::tool_exactly_once",
-        product_owner="tool side-effect safety",
-    ),
     "tool_invocation_ledger": TableMetadata(
         semantic_owner="astra_services::tool_invocation_ledger",
         state_class="durable invocation coordination fact",

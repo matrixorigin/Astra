@@ -2032,26 +2032,12 @@ pub async fn ensure_core_schema(
         .await?;
     }
 
-    query(
-        "CREATE TABLE IF NOT EXISTS tool_exactly_once_results (
-            user_id      VARCHAR(128) NOT NULL,
-            session_id   VARCHAR(128) NOT NULL,
-            dedup_key    VARCHAR(128) NOT NULL,
-            key_json     JSON NOT NULL,
-            result_json  JSON NOT NULL,
-            recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-            PRIMARY KEY (user_id, session_id, dedup_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    drop_index_if_present(
-        &pool,
-        &settings.database,
-        "tool_exactly_once_results",
-        "idx_tool_exactly_once_session",
-    )
-    .await?;
+    // Retired semantic name+arguments dedup storage. Durable delivery is owned
+    // by `tool_invocation_ledger`; keeping this table would preserve a second,
+    // contradictory authority for external side effects.
+    query("DROP TABLE IF EXISTS tool_exactly_once_results")
+        .execute(&pool)
+        .await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (

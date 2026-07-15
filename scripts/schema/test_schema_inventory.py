@@ -32,7 +32,7 @@ class SchemaInventoryTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(core_tables),
-            90,
+            89,
             "core storage DDL count changed; update the schema plan and inventory baseline",
         )
 
@@ -75,7 +75,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_history_chunks",
             "session_tool_output_batches",
             "session_tool_outputs",
-            "tool_exactly_once_results",
             "tool_invocation_ledger",
         }
         for table in first_batch:
@@ -105,10 +104,6 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn(
             "do not merge into agent_events",
             self.tables["agent_run_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "not rebuildable safely",
-            self.tables["tool_exactly_once_results"]["rebuildability"],
         )
         self.assertIn(
             "large payload",
