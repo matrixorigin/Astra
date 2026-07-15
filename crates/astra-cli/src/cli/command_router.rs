@@ -1090,7 +1090,25 @@ async fn execute_task_worker(
     }
 }
 
-async fn execute_repl_bridge_command(
+fn execute_repl_bridge_command<'a>(
+    slash_cmd: &'a str,
+    arg: &'a str,
+    profile: Option<&'a str>,
+    global_model: Option<&'a str>,
+    api: &'a astra_thin_client::ThinClient,
+    cli_context: &'a crate::cli::cli_config::cli_context::CliContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExitCode, String>> + 'a>> {
+    Box::pin(execute_repl_bridge_command_impl(
+        slash_cmd,
+        arg,
+        profile,
+        global_model,
+        api,
+        cli_context,
+    ))
+}
+
+async fn execute_repl_bridge_command_impl(
     slash_cmd: &str,
     arg: &str,
     profile: Option<&str>,
@@ -1284,17 +1302,21 @@ mod token_refresh_error_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_cli_command(
+pub(crate) fn execute_cli_command<'a>(
     command: Option<Command>,
     profile: Option<String>,
     global_model: Option<String>,
     auto_approve: bool,
     system_prompt: Option<String>,
-    api: &astra_thin_client::ThinClient,
+    api: &'a astra_thin_client::ThinClient,
     no_instructions: bool,
     max_budget: f64,
-    cli_context: &crate::cli::cli_config::cli_context::CliContext,
-) -> Result<ExitCode, String> {
+    cli_context: &'a crate::cli::cli_config::cli_context::CliContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExitCode, String>> + 'a>> {
+    // Erase the large command-dispatch future at the API boundary. Keeping this
+    // wrapper as `async fn` embeds both `Command` and the boxed implementation
+    // in every caller's state machine, which can overflow the normal Tokio test
+    // thread stack even for small branches such as `health`.
     Box::pin(execute_cli_command_impl(
         command,
         profile,
@@ -1306,7 +1328,6 @@ pub(crate) async fn execute_cli_command(
         max_budget,
         cli_context,
     ))
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]

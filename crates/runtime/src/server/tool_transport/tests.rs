@@ -954,8 +954,9 @@ fn route_boundary_preserves_skipped_terminal_status_from_tool_metadata() {
         WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
         ExecutorBinding::server_local(),
     );
+    request.tool_call_id = "call-skip".to_string();
     request.args = serde_json::json!({
-        "_tool_call_id": "call-skip",
+        "_tool_call_id": "stale-legacy-call-id",
         "_run_id": "run-1",
         "path": "README.md"
     });
@@ -990,11 +991,12 @@ fn route_boundary_preserves_skipped_terminal_status_from_tool_metadata() {
 #[test]
 fn route_boundary_events_require_call_id_without_mutating_result_metadata() {
     let service = ToolExecutionService::new_for_test();
-    let request = request(
+    let mut request = request(
         "bash",
         WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
         ExecutorBinding::server_local(),
     );
+    request.tool_call_id.clear();
     let boundary = service.route_boundary(request);
     let result = astra_tools::ToolResult::text("ok".to_string());
 

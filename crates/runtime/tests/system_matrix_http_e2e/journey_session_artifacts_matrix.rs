@@ -1558,16 +1558,30 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     ctx.pool.close().await;
 }
 
-async fn run_bridge_failure_session_artifact_latest_and_download_routes(
-    title: &str,
-    suite: &str,
-    agent_id: &str,
-    user_message: &str,
+struct BridgeFailureArtifactScenario<'a> {
+    title: &'a str,
+    suite: &'a str,
+    agent_id: &'a str,
+    user_message: &'a str,
     stream_blocks: Vec<String>,
-    expected_outcome: &str,
-    expected_code: &str,
-    partial_text: &str,
+    expected_outcome: &'a str,
+    expected_code: &'a str,
+    partial_text: &'a str,
+}
+
+async fn run_bridge_failure_session_artifact_latest_and_download_routes(
+    scenario: BridgeFailureArtifactScenario<'_>,
 ) {
+    let BridgeFailureArtifactScenario {
+        title,
+        suite,
+        agent_id,
+        user_message,
+        stream_blocks,
+        expected_outcome,
+        expected_code,
+        partial_text,
+    } = scenario;
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
@@ -2948,36 +2962,36 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
 
 pub async fn run_bridge_failed_session_artifact_latest_and_download_routes() {
     let partial_text = "half bridge answer";
-    run_bridge_failure_session_artifact_latest_and_download_routes(
-        "bridge artifact failed latest download",
-        "bridge_artifact_failed_latest_download",
-        "system-matrix-bridge-failure-artifact",
-        "trigger a bridge stream failure",
-        vec![format!(
+    run_bridge_failure_session_artifact_latest_and_download_routes(BridgeFailureArtifactScenario {
+        title: "bridge artifact failed latest download",
+        suite: "bridge_artifact_failed_latest_download",
+        agent_id: "system-matrix-bridge-failure-artifact",
+        user_message: "trigger a bridge stream failure",
+        stream_blocks: vec![format!(
             "data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"
         )],
-        "stream_incomplete",
-        "STREAM_INCOMPLETE",
+        expected_outcome: "stream_incomplete",
+        expected_code: "STREAM_INCOMPLETE",
         partial_text,
-    )
+    })
     .await;
 }
 
 pub async fn run_bridge_sse_parse_error_session_artifact_latest_and_download_routes() {
     let partial_text = "bridge parse partial";
-    run_bridge_failure_session_artifact_latest_and_download_routes(
-        "bridge artifact sse parse latest download",
-        "bridge_artifact_sse_parse_latest_download",
-        "system-matrix-bridge-parse-error-artifact",
-        "trigger a bridge parse failure after partial output",
-        vec![
+    run_bridge_failure_session_artifact_latest_and_download_routes(BridgeFailureArtifactScenario {
+        title: "bridge artifact sse parse latest download",
+        suite: "bridge_artifact_sse_parse_latest_download",
+        agent_id: "system-matrix-bridge-parse-error-artifact",
+        user_message: "trigger a bridge parse failure after partial output",
+        stream_blocks: vec![
             format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
             "data: {not-json}\n\n".to_string(),
         ],
-        "sse_parse_error",
-        "SSE_PARSE_ERROR",
+        expected_outcome: "sse_parse_error",
+        expected_code: "SSE_PARSE_ERROR",
         partial_text,
-    )
+    })
     .await;
 }
 

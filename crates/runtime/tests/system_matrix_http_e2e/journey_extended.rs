@@ -454,27 +454,27 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
         let chunk = chunk.expect("duplicate tool result sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_duplicates {
-            if let Some(payload) = maybe_tool_result_payload_from_sse(
+        if !posted_duplicates
+            && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
                 "tc-dup-tool-1",
                 &ctx.edge_agent_id,
                 "ok",
                 tool_output,
                 0,
-            ) {
-                for _ in 0..2 {
-                    let (status, body) = post_json(
-                        &ctx.app,
-                        "/tools/result",
-                        Some(b.auth_header.as_str()),
-                        payload.clone(),
-                    )
-                    .await;
-                    assert_eq!(status, StatusCode::OK, "duplicate /tools/result: {body}");
-                }
-                posted_duplicates = true;
+            )
+        {
+            for _ in 0..2 {
+                let (status, body) = post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload.clone(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "duplicate /tools/result: {body}");
             }
+            posted_duplicates = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;
@@ -627,53 +627,53 @@ pub async fn run_chat_turn_partial_batch_failure() {
         let chunk = chunk.expect("partial batch sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_first {
-            if let Some(payload) = maybe_tool_result_payload_from_sse(
+        if !posted_first
+            && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
                 "tc-partial-1",
                 &ctx.edge_agent_id,
                 "ok",
                 ok_output,
                 0,
-            ) {
-                let (status, body) = post_json(
-                    &ctx.app,
-                    "/tools/result",
-                    Some(b.auth_header.as_str()),
-                    payload,
-                )
-                .await;
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "first partial /tools/result: {body}"
-                );
-                posted_first = true;
-            }
+            )
+        {
+            let (status, body) = post_json(
+                &ctx.app,
+                "/tools/result",
+                Some(b.auth_header.as_str()),
+                payload,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "first partial /tools/result: {body}"
+            );
+            posted_first = true;
         }
-        if !posted_second {
-            if let Some(payload) = maybe_tool_result_payload_from_sse(
+        if !posted_second
+            && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
                 "tc-partial-2",
                 &ctx.edge_agent_id,
                 "error",
                 err_output,
                 0,
-            ) {
-                let (status, body) = post_json(
-                    &ctx.app,
-                    "/tools/result",
-                    Some(b.auth_header.as_str()),
-                    payload,
-                )
-                .await;
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "second partial /tools/result: {body}"
-                );
-                posted_second = true;
-            }
+            )
+        {
+            let (status, body) = post_json(
+                &ctx.app,
+                "/tools/result",
+                Some(b.auth_header.as_str()),
+                payload,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "second partial /tools/result: {body}"
+            );
+            posted_second = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;
@@ -1129,46 +1129,46 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
         let chunk = chunk.expect("waiting overlap primary sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !ran_overlap_turn {
-            if let Some(payload) = maybe_tool_result_payload_from_sse(
+        if !ran_overlap_turn
+            && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
                 "tc-overlap-wait-1",
                 &ctx.edge_agent_id,
                 "ok",
                 tool_output,
                 0,
-            ) {
-                overlap_raw = collect_turn(
-                    ctx.app.clone(),
-                    b.auth_header.clone(),
-                    json!({
-                        "agent_id": "system-matrix-overlap-agent",
-                        "session_id": ctx.session_id,
-                        "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
-                        "selected_model": seeded_selected_model(ctx),
-                        "test_llm_rounds": [{
-                            "full_text": "Waiting overlap plain turn finished."
-                        }]
-                    }),
-                    test_secret.clone(),
-                )
-                .await;
-                ran_overlap_turn = true;
+            )
+        {
+            overlap_raw = collect_turn(
+                ctx.app.clone(),
+                b.auth_header.clone(),
+                json!({
+                    "agent_id": "system-matrix-overlap-agent",
+                    "session_id": ctx.session_id,
+                    "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
+                    "selected_model": seeded_selected_model(ctx),
+                    "test_llm_rounds": [{
+                        "full_text": "Waiting overlap plain turn finished."
+                    }]
+                }),
+                test_secret.clone(),
+            )
+            .await;
+            ran_overlap_turn = true;
 
-                let (status, body) = post_json(
-                    &ctx.app,
-                    "/tools/result",
-                    Some(b.auth_header.as_str()),
-                    payload,
-                )
-                .await;
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "waiting overlap tool result: {body}"
-                );
-                posted_tool_result = true;
-            }
+            let (status, body) = post_json(
+                &ctx.app,
+                "/tools/result",
+                Some(b.auth_header.as_str()),
+                payload,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "waiting overlap tool result: {body}"
+            );
+            posted_tool_result = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;

@@ -753,20 +753,20 @@ pub async fn run_saas_edge_tool_result_success_path() {
         let chunk = chunk.expect("sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_result {
-            if let Some(payload) = maybe_tool_result_payload_from_sse(
+        if !posted_result
+            && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
                 "tc-saas-tool-ok",
                 &ctx.edge_agent_id,
                 "completed",
                 tool_output,
                 0,
-            ) {
-                let (st_tool, tool_j) =
-                    post_json(app, "/tools/result", Some(auth.as_str()), payload).await;
-                assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
-                posted_result = true;
-            }
+            )
+        {
+            let (st_tool, tool_j) =
+                post_json(app, "/tools/result", Some(auth.as_str()), payload).await;
+            assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
+            posted_result = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
             break;

@@ -136,9 +136,8 @@ use harness::require_system_e2e_env;
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
-    let mut b = harness::bootstrap().await;
-    journey_full::run_product_matrix_full_journey(&b.ctx, &mut b.auth_header, &mut b.refresh_token)
-        .await;
+    let b = harness::bootstrap().await;
+    journey_full::run_product_matrix_full_journey(&b.ctx, &b.auth_header, &b.refresh_token).await;
     b.ctx.pool.close().await;
 }
 
