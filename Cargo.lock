@@ -547,6 +547,7 @@ dependencies = [
  "astra-core",
  "astra-logging",
  "astra-runtime-env",
+ "astra-sync-protocol",
  "astra-turn-types",
  "async-trait",
  "axum",

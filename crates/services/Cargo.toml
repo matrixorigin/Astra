@@ -12,6 +12,7 @@ astra-core.workspace = true
 astra-logging.workspace = true
 astra-runtime-env.workspace = true
 astra-turn-types.workspace = true
+astra-sync-protocol.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true

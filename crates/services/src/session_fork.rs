@@ -14,8 +14,10 @@ use crate::session_journal::{
     validate_session_id,
 };
 use crate::session_workspace::{self, WorkspaceMetadata};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
+    io::Write,
     path::PathBuf,
 };
 
@@ -66,6 +68,9 @@ pub struct ForkSessionResult {
     /// Composite snapshot at the fork point — references to all state dimensions
     /// that were captured. The caller can use this to restore any subset.
     pub fork_snapshot: Option<CompositeSnapshot>,
+    /// Frozen, content-addressed state evidence at the fork cursor. Missing
+    /// dimensions are explicit gaps rather than silent partial recovery.
+    pub state_manifest: astra_sync_protocol::SessionStateManifestV1,
 }
 
 pub use astra_core::composite_snapshot::{
@@ -130,6 +135,65 @@ where
 fn is_step_checkpoint_file_name(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name.ends_with("-heavy.json") || name.ends_with("-light.json")
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn checkpoint_directory_hash(path: &std::path::Path) -> Result<Option<String>, String> {
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let entries = collect_step_checkpoint_entries(
+        std::fs::read_dir(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?
+            .map(|entry| entry.map(StepCheckpointDirEntry::from_dir_entry)),
+    )?;
+    let mut hasher = Sha256::new();
+    let mut count = 0_usize;
+    for entry in entries {
+        if !is_step_checkpoint_file_name(&entry.name) {
+            continue;
+        }
+        hasher.update(entry.name.to_string_lossy().as_bytes());
+        let bytes = std::fs::read(&entry.path)
+            .map_err(|error| format!("read checkpoint {}: {error}", entry.path.display()))?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        count += 1;
+    }
+    Ok((count > 0).then(|| format!("sha256:{:x}", hasher.finalize())))
+}
+
+fn persist_state_manifest(
+    session_id: &str,
+    manifest: &astra_sync_protocol::SessionStateManifestV1,
+) -> Result<(), String> {
+    let directory = session_workspace::workspace_dir_for(session_id);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create state manifest directory: {error}"))?;
+    let path = directory.join("state-manifest-v1.json");
+    let temporary = directory.join("state-manifest-v1.json.tmp");
+    let bytes = serde_json::to_vec(manifest)
+        .map_err(|error| format!("serialize state manifest: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("open state manifest temp file: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("write state manifest: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync state manifest: {error}"))?;
+    drop(file);
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("commit state manifest: {error}"))?;
+    std::fs::File::open(&directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync state manifest directory: {error}"))
 }
 
 /// Fork parent journal into a new session file and workspace metadata.
@@ -297,6 +361,78 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         )
     });
 
+    use astra_sync_protocol::{
+        SessionStateDimension as Dimension, SessionStateManifestEntry as Entry,
+        SessionStateManifestV1,
+    };
+    let child_journal = journal_file_path(&new_id);
+    let child_workspace = session_workspace::workspace_file_path(&new_id)
+        .map_err(|error| format!("resolve child workspace manifest: {error}"))?;
+    let checkpoint_dir = crate::local_session_artifact_store()
+        .session_dir(&new_id)?
+        .join("step_checkpoints");
+    let checkpoint_entry = match checkpoint_directory_hash(&checkpoint_dir)? {
+        Some(hash) => Entry::referenced_hash(
+            Dimension::Checkpoint,
+            checkpoint_dir.to_string_lossy(),
+            hash,
+        )?,
+        None => Entry::gap(
+            Dimension::Checkpoint,
+            "no checkpoint covers the frozen fork cursor",
+        ),
+    };
+    let memory_entry = match fork_snapshot
+        .as_ref()
+        .and_then(CompositeSnapshot::memory_snapshot)
+    {
+        Some(memory) => Entry::referenced(
+            Dimension::Memory,
+            memory
+                .path
+                .clone()
+                .unwrap_or_else(|| format!("memory://{}@{}", memory.profile, memory.epoch)),
+            &serde_json::to_vec(memory)
+                .map_err(|error| format!("serialize memory snapshot reference: {error}"))?,
+        ),
+        None => Entry::gap(
+            Dimension::Memory,
+            "no memory snapshot was frozen at the fork cursor",
+        ),
+    };
+    let state_manifest = SessionStateManifestV1::new(
+        &parent,
+        &new_id,
+        format!("turn:{forked_at_turn}"),
+        vec![
+            Entry::referenced_hash(
+                Dimension::Transcript,
+                child_journal.to_string_lossy(),
+                sha256_file(&child_journal)?,
+            )?,
+            checkpoint_entry,
+            Entry::referenced_hash(
+                Dimension::Workspace,
+                child_workspace.to_string_lossy(),
+                sha256_file(&child_workspace)?,
+            )?,
+            Entry::gap(
+                Dimension::Task,
+                "local fork has no task snapshot at the frozen cursor",
+            ),
+            Entry::gap(
+                Dimension::Artifact,
+                "artifact ownership was not frozen into this local fork",
+            ),
+            Entry::gap(
+                Dimension::Invocation,
+                "invocation ledger was not frozen into this local fork",
+            ),
+            memory_entry,
+        ],
+    )?;
+    persist_state_manifest(&new_id, &state_manifest)?;
+
     artifact_guard.commit();
     Ok(ForkSessionResult {
         new_session_id: new_id,
@@ -304,6 +440,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         forked_at_turn,
         data_branch_name,
         fork_snapshot,
+        state_manifest,
     })
 }
 
@@ -423,6 +560,23 @@ mod tests {
         };
         let result = fork_local_session(opts).expect("fork should succeed");
         assert_eq!(result.events_copied, 5, "all turn events should be copied");
+        assert_eq!(result.state_manifest.as_of_cursor, "turn:5");
+        assert!(!result.state_manifest.is_complete());
+        assert!(
+            session_workspace::workspace_dir_for(&result.new_session_id)
+                .join("state-manifest-v1.json")
+                .is_file()
+        );
+        let restored_manifest: astra_sync_protocol::SessionStateManifestV1 =
+            serde_json::from_slice(
+                &std::fs::read(
+                    session_workspace::workspace_dir_for(&result.new_session_id)
+                        .join("state-manifest-v1.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(restored_manifest, result.state_manifest);
 
         let forked_events = read_journal(&result.new_session_id).unwrap();
         let turn_events: Vec<_> = forked_events
