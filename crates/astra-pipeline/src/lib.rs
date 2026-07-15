@@ -9,7 +9,6 @@
 
 pub mod crash_recovery;
 pub mod event;
-pub mod exactly_once;
 pub mod feedback_extraction;
 pub mod feedback_store;
 pub mod output_stream;
