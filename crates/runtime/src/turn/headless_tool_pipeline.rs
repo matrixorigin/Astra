@@ -214,6 +214,7 @@ pub(crate) struct ValidatedExecution {
 pub(crate) struct PermittedExecution {
     pub execution: HeadlessResolvedExecution,
     pub idem_key: IdempotencyKey,
+    pub pre_tool_context: Option<String>,
     pub resolved_provider_policy:
         Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
     pub permission_grant:
@@ -223,6 +224,7 @@ pub(crate) struct PermittedExecution {
 pub(crate) struct ExecutedExecution {
     pub execution: HeadlessResolvedExecution,
     pub idem_key: IdempotencyKey,
+    pub pre_tool_context: Option<String>,
     pub is_err: bool,
     pub error_kind: Option<astra_core::ErrorKind>,
     pub executed_ms: u64,
@@ -572,6 +574,32 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_cached_read_file(harness: &mut PipelineHarness, path: &str, output: &str) {
+        let idem_key = read_cache_key_at_epoch(path, 0);
+        harness.idempotency_cache.record(
+            &idem_key,
+            CachedToolResult {
+                tool_name: "read_file".to_string(),
+                output: output.to_string(),
+                is_error: false,
+                cached_at: 0,
+                context_signature: idem_key.context_signature.clone(),
+            },
+        );
+    }
+
+    fn configure_server_read_file(harness: &mut PipelineHarness, call_id: &str, path: &str) {
+        harness.tool_calls = vec![json!({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": serde_json::to_string(&json!({ "path": path })).unwrap(),
+            }
+        })];
+        harness.edge_tool_round.clear();
+    }
+
     async fn short_circuit_cached_read_file(
         harness: &mut PipelineHarness,
         turn_index: usize,
@@ -579,29 +607,19 @@ mod tests {
         path: &str,
     ) {
         harness.valid_tool_names.insert("read_file".to_string());
-        harness.tool_calls.clear();
-        harness.tool_calls.push(json!({
-            "id": call_id,
-            "function": { "name": "read_file", "arguments": serde_json::to_string(&json!({ "path": path })).unwrap() }
-        }));
-        let idem_key = read_cache_key_at_epoch(path, 0);
-        harness.idempotency_cache.record(
-            &idem_key,
-            CachedToolResult {
-                tool_name: "read_file".to_string(),
-                output: format!("cached {path}"),
-                is_error: false,
-                cached_at: 0,
-                context_signature: idem_key.context_signature.clone(),
-            },
-        );
+        configure_server_read_file(harness, call_id, path);
+        seed_cached_read_file(harness, path, &format!("cached {path}"));
 
         harness.call_counts.clear();
         let mut pipeline = harness.pipeline_with_server_executor(turn_index, None);
-        match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
-            HeadlessPipelineStage::ShortCircuit => {}
-            _ => panic!("expected cached read_file to short-circuit"),
-        }
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("cached read_file must still pass validation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
     }
 
     fn begin_recorded_turn(harness: &mut PipelineHarness, tool_count: usize) {
@@ -949,6 +967,156 @@ mod tests {
         assert!(
             error.contains("no permission context configured"),
             "expected actionable missing-context denial, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_does_not_bypass_current_permission_denial() {
+        let mut harness = PipelineHarness::new();
+        harness.permission_context = None;
+        harness.valid_tool_names.insert("read_file".to_string());
+        configure_server_read_file(&mut harness, "call-read-secret", "secret.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "secret.txt",
+            "cached-secret-that-must-not-be-replayed",
+        );
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("cache presence must not bypass or replace validation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(
+            !model_visible.contains("cached-secret-that-must-not-be-replayed"),
+            "a denied invocation must not expose cached output: {model_visible}"
+        );
+        assert!(
+            harness
+                .tool_call_records
+                .last()
+                .and_then(|record| record.error.as_deref())
+                .is_some_and(|error| error.contains("no permission context configured")),
+            "the current permission denial must win over historical cache state"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_does_not_bypass_current_restriction() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.restricted_tools.insert("read_file".to_string());
+        configure_server_read_file(&mut harness, "call-read-restricted", "policy.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "policy.txt",
+            "cached-restricted-output-that-must-not-be-replayed",
+        );
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected admitted execution before restriction evaluation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(
+            !model_visible.contains("cached-restricted-output-that-must-not-be-replayed"),
+            "a restricted invocation must not expose cached output: {model_visible}"
+        );
+        assert_eq!(
+            harness
+                .tool_call_records
+                .last()
+                .map(astra_services::session_journal::ToolCallRecord::effective_disposition),
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+        assert!(model_visible.to_ascii_lowercase().contains("restricted"));
+    }
+
+    #[tokio::test]
+    async fn cached_read_does_not_bypass_current_pre_tool_hook() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision":"block","reason":"current hook denied"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        configure_server_read_file(&mut harness, "call-read-hooked", "hooked.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "hooked.txt",
+            "cached-hooked-output-that-must-not-be-replayed",
+        );
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution before hook evaluation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(
+            !model_visible.contains("cached-hooked-output-that-must-not-be-replayed"),
+            "a hook-blocked invocation must not expose cached output: {model_visible}"
+        );
+        assert!(model_visible.contains("current hook denied"));
+    }
+
+    #[tokio::test]
+    async fn cached_read_does_not_bypass_current_tool_admission() {
+        let mut harness = PipelineHarness::new();
+        configure_server_read_file(&mut harness, "call-read-hidden", "hidden.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "hidden.txt",
+            "cached-hidden-output-that-must-not-be-replayed",
+        );
+
+        let mut pipeline = harness.pipeline();
+        assert!(matches!(
+            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(
+            !model_visible.contains("cached-hidden-output-that-must-not-be-replayed"),
+            "a non-admitted invocation must not expose cached output: {model_visible}"
+        );
+        assert!(
+            harness
+                .tool_call_records
+                .last()
+                .and_then(|record| record.error.as_deref())
+                .is_some_and(|error| error == "unknown_tool: read_file"),
+            "the current admission decision must win over historical cache state"
         );
     }
 
@@ -1365,8 +1533,12 @@ mod tests {
 
         {
             let mut pipeline = harness.pipeline_with_server_executor(1, None);
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("semantic cache candidates must still pass validation"),
+            };
             assert!(matches!(
-                pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+                pipeline.permit_execution(validated).await,
                 HeadlessPipelineStage::ShortCircuit
             ));
         }
@@ -1596,6 +1768,7 @@ mod tests {
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic(tool_name, &args),
+                    pre_tool_context: None,
                     is_err,
                     error_kind: None,
                     executed_ms: 1,
@@ -1634,12 +1807,16 @@ mod tests {
 
         {
             let mut pipeline = harness.pipeline_with_server_executor(1, None);
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("semantic cache candidates must still pass validation"),
+            };
             assert!(
                 matches!(
-                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                    pipeline.permit_execution(validated).await,
                     HeadlessPipelineStage::ShortCircuit
                 ),
-                "same epoch should use the semantic cache"
+                "same epoch should reuse the semantic cache after authorization"
             );
         }
 
@@ -1659,6 +1836,7 @@ mod tests {
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
+                    pre_tool_context: None,
                     is_err: false,
                     error_kind: None,
                     executed_ms: 1,
@@ -1750,6 +1928,7 @@ mod tests {
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
+                    pre_tool_context: None,
                     is_err: false,
                     error_kind: None,
                     executed_ms: 1,
@@ -1800,7 +1979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tool_hooks_modify_cached_and_recorded_output() {
+    async fn post_tool_hooks_transform_visible_output_without_polluting_observation_cache() {
         let mut harness = PipelineHarness::new();
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
@@ -1837,7 +2016,7 @@ mod tests {
             .idempotency_cache
             .check(&idem_key)
             .expect("cache entry should be recorded");
-        assert_eq!(cached.output, "hooked result");
+        assert_eq!(cached.output, "found result");
         assert!(
             pipeline.ctx.tool_call_records[0]
                 .result_preview
@@ -1849,6 +2028,111 @@ mod tests {
                 .to_string()
                 .contains("hooked result")
         );
+    }
+
+    #[tokio::test]
+    async fn current_post_tool_hook_transforms_reused_observation() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"output":"currently transformed cached result"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        configure_server_read_file(&mut harness, "call-read-post-hook", "cached.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "cached.txt",
+            "raw-cached-observation-that-must-be-transformed",
+        );
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("cache presence must not replace validation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(model_visible.contains("currently transformed cached result"));
+        assert!(
+            !model_visible.contains("raw-cached-observation-that-must-be-transformed"),
+            "the current PostTool hook must govern reused output: {model_visible}"
+        );
+        assert_eq!(
+            harness
+                .idempotency_cache
+                .check(&read_cache_key_at_epoch("cached.txt", 0))
+                .map(|cached| cached.output.as_str()),
+            Some("raw-cached-observation-that-must-be-transformed"),
+            "per-invocation hook transforms must not mutate the observation cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_context_survives_server_execution_without_polluting_observation_cache() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command:
+                    r#"echo '{"decision":"allow_with_context","context":"current policy context"}'"#
+                        .into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        configure_server_read_file(&mut harness, "call-read-context", "context.txt");
+        seed_cached_read_file(
+            &mut harness,
+            "context.txt",
+            "stale-cache-that-context-sensitive-calls-must-not-reuse",
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("context.txt"), "fresh provider observation").unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated server read"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("context-sensitive reads must execute instead of reusing old cache"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        pipeline.record_execution(executed).await;
+        drop(pipeline);
+
+        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+        assert!(model_visible.contains("fresh provider observation"));
+        assert!(model_visible.contains("[Hook context]: current policy context"));
+        assert!(!model_visible.contains("stale-cache-that-context-sensitive-calls-must-not-reuse"));
+
+        let cached = harness
+            .idempotency_cache
+            .check(&read_cache_key_at_epoch("context.txt", 0))
+            .expect("fresh provider observation must replace the old cache entry");
+        assert!(cached.output.contains("fresh provider observation"));
+        assert!(!cached.output.contains("current policy context"));
     }
 
     #[tokio::test]
@@ -1953,6 +2237,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };
@@ -2002,6 +2287,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };
@@ -2044,6 +2330,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };
@@ -2103,6 +2390,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("read_file", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };
@@ -2150,6 +2438,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("bash", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };
@@ -2195,6 +2484,7 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
+            pre_tool_context: None,
             resolved_provider_policy: None,
             permission_grant: None,
         };

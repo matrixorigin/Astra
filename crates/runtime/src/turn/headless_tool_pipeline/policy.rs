@@ -399,186 +399,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
         let scoped_call_sig = observation_scoped_signature(&slot.name, &call_sig, workspace_epoch);
         let idem_key = policy_idempotency_key(&slot.name, &slot.args, workspace_epoch);
-        if READ_ONLY_TOOLS.contains(&slot.name.as_str())
-            && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
-        {
-            let cache_key = idem_key.cache_key();
-            let args_preview = make_args_preview(&slot.name, &slot.args);
-            let prior_cache_hits = self
-                .ctx
-                .turn_guard
-                .health
-                .cache_hits_for_signature(&scoped_call_sig);
-            if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
-                let body = format!(
-                    "⛔ Repeated cached read suppressed: this exact {} request has already \
-                     been served from cache {} time(s). Use the earlier cached result in the \
-                     conversation instead of calling again; if you need different evidence, \
-                     change the arguments.",
-                    slot.name, prior_cache_hits
-                );
-                let (tool_msg, tr) = openai_tool_roundtrip_values(&slot.id, &slot.name, &body);
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-                self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
-                    &slot.name,
-                    &slot.id,
-                    Some(&cache_key),
-                    args_preview.as_deref(),
-                );
-                self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
-                    &slot.name,
-                    Some(&slot.id),
-                    args_preview.as_deref(),
-                    REASON_REPEATED_CACHE_HIT_SUPPRESSED,
-                    true,
-                    Some(&body),
-                );
-                self.ctx
-                    .turn_guard
-                    .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
-                self.ctx
-                    .tool_call_records
-                    .push(journal_record_cross_turn_cache_hit(
-                        slot.name.clone(),
-                        body.len() as u32,
-                        args_preview,
-                        Some(&body),
-                    ));
-                return HeadlessPipelineStage::ShortCircuit;
-            }
-            if !self.ctx.quiet {
-                self.ctx.term.emit_line(
-                    HeadlessStderrStyle::Dim,
-                    headless_stderr_cache_hit_line(&slot.name),
-                );
-                emit_headless_tool_body_preview(
-                    self.ctx.term,
-                    self.ctx.quiet,
-                    &slot.name,
-                    &cached.output,
-                    false,
-                );
-            }
-            let (mut tool_msg, tr) =
-                headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &cached.output);
-            // Add round-index metadata for cache-hit result tracking.
-            if let Some(obj) = tool_msg.as_object_mut() {
-                obj.insert(
-                    "_round_index".to_string(),
-                    serde_json::Value::Number(self.ctx.llm_round.into()),
-                );
-                obj.insert(
-                    "_tool_name".to_string(),
-                    serde_json::Value::String(slot.name.clone()),
-                );
-            }
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
-                &slot.name,
-                &slot.id,
-                Some(&cache_key),
-                args_preview.as_deref(),
-            );
-            self.ctx
-                .step_recorder
-                .record_cache_hit_with_reason_and_metadata(
-                    &slot.name,
-                    Some(&slot.id),
-                    args_preview.as_deref(),
-                    cached.clone(),
-                    "cached_cross_turn",
-                );
-            self.ctx
-                .turn_guard
-                .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    slot.name.clone(),
-                    cached.output.len() as u32,
-                    args_preview,
-                    Some(&cached.output),
-                ));
-            return HeadlessPipelineStage::ShortCircuit;
-        }
-
-        if READ_ONLY_TOOLS.contains(&slot.name.as_str())
-            && let Some((prev_turn, cached_output)) =
-                self.ctx.semantic_dedup.pre_check_block_with_generation(
-                    &slot.name,
-                    &slot.args,
-                    self.ctx.turn_index,
-                    workspace_epoch,
-                )
-        {
-            let args_preview = make_args_preview(&slot.name, &slot.args);
-            let prior_cache_hits = self
-                .ctx
-                .turn_guard
-                .health
-                .cache_hits_for_signature(&scoped_call_sig);
-            let (body, reason_code) =
-                if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
-                    (
-                        format!(
-                            "⛔ Repeated cached read suppressed: this exact {} request has \
-                             already been served from cache {} time(s). Use the earlier cached \
-                             result in the conversation instead of calling again; if you need \
-                             different evidence, change the arguments.",
-                            slot.name, prior_cache_hits
-                        ),
-                        REASON_REPEATED_CACHE_HIT_SUPPRESSED,
-                    )
-                } else {
-                    (cached_output.clone(), "semantic_dedup_pre_check")
-                };
-            let (mut tool_msg, tr) =
-                headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
-            if let Some(obj) = tool_msg.as_object_mut() {
-                obj.insert(
-                    "_round_index".to_string(),
-                    serde_json::Value::Number(self.ctx.llm_round.into()),
-                );
-                obj.insert(
-                    "_tool_name".to_string(),
-                    serde_json::Value::String(slot.name.clone()),
-                );
-            }
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            trace_short_circuit_tool_skip(
-                self.ctx.step_recorder,
-                &slot.id,
-                &slot.name,
-                reason_code,
-                Some(&idem_key.cache_key()),
-                args_preview.as_deref(),
-                Some(&body),
-                true,
-            );
-            self.ctx
-                .turn_guard
-                .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    slot.name.clone(),
-                    cached_output.len() as u32,
-                    args_preview,
-                    Some(&cached_output),
-                ));
-            agent_warn!(
-                "dedup",
-                "Semantic cache hit: tool '{}' (id={}) matches turn {} via param-aware dedup",
-                slot.name,
-                slot.id,
-                prev_turn + 1,
-            );
-            return HeadlessPipelineStage::ShortCircuit;
-        }
-
         let count = {
             let count = self
                 .ctx
@@ -899,16 +719,240 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         })
     }
 
+    /// Reuse is an execution optimization, not an alternate authorization path.
+    /// Callers must run admission, runtime binding, permission, restriction, and
+    /// PreTool hook checks before reaching this method.
+    async fn try_reuse_authorized_read(
+        &mut self,
+        execution: &HeadlessResolvedExecution,
+        idem_key: &IdempotencyKey,
+    ) -> bool {
+        if !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+            return false;
+        }
+
+        let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
+        let call_sig = tool_dedup_signature(&execution.name, &execution.args);
+        let scoped_call_sig =
+            observation_scoped_signature(&execution.name, &call_sig, workspace_epoch);
+
+        if let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() {
+            let cache_key = idem_key.cache_key();
+            let args_preview = make_args_preview(&execution.name, &execution.args);
+            let prior_cache_hits = self
+                .ctx
+                .turn_guard
+                .health
+                .cache_hits_for_signature(&scoped_call_sig);
+            if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
+                let body = format!(
+                    "⛔ Repeated cached read suppressed: this exact {} request has already \
+                     been served from cache {} time(s). Use the earlier cached result in the \
+                     conversation instead of calling again; if you need different evidence, \
+                     change the arguments.",
+                    execution.name, prior_cache_hits
+                );
+                let (tool_msg, tr) =
+                    openai_tool_roundtrip_values(&execution.id, &execution.name, &body);
+                self.ctx.messages.push(tool_msg);
+                self.ctx.tool_results.push(tr);
+                self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+                    &execution.name,
+                    &execution.id,
+                    Some(&cache_key),
+                    args_preview.as_deref(),
+                );
+                self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
+                    &execution.name,
+                    Some(&execution.id),
+                    args_preview.as_deref(),
+                    REASON_REPEATED_CACHE_HIT_SUPPRESSED,
+                    true,
+                    Some(&body),
+                );
+                self.ctx
+                    .turn_guard
+                    .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                self.ctx
+                    .tool_call_records
+                    .push(journal_record_cross_turn_cache_hit(
+                        execution.name.clone(),
+                        body.len() as u32,
+                        args_preview,
+                        Some(&body),
+                    ));
+                return true;
+            }
+            if !self.ctx.tool_event_hooks.is_empty()
+                && let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                    self.ctx.tool_event_hooks,
+                    &execution.name,
+                    &execution.args,
+                    &cached.output,
+                )
+                .await
+            {
+                cached.output = modified;
+            }
+            if !self.ctx.quiet {
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_cache_hit_line(&execution.name),
+                );
+                emit_headless_tool_body_preview(
+                    self.ctx.term,
+                    self.ctx.quiet,
+                    &execution.name,
+                    &cached.output,
+                    false,
+                );
+            }
+            let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
+                &execution.id,
+                &execution.name,
+                &cached.output,
+            );
+            if let Some(obj) = tool_msg.as_object_mut() {
+                obj.insert(
+                    "_round_index".to_string(),
+                    serde_json::Value::Number(self.ctx.llm_round.into()),
+                );
+                obj.insert(
+                    "_tool_name".to_string(),
+                    serde_json::Value::String(execution.name.clone()),
+                );
+            }
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(tr);
+            self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+                &execution.name,
+                &execution.id,
+                Some(&cache_key),
+                args_preview.as_deref(),
+            );
+            self.ctx
+                .step_recorder
+                .record_cache_hit_with_reason_and_metadata(
+                    &execution.name,
+                    Some(&execution.id),
+                    args_preview.as_deref(),
+                    cached.clone(),
+                    "cached_cross_turn",
+                );
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+            self.ctx
+                .tool_call_records
+                .push(journal_record_cross_turn_cache_hit(
+                    execution.name.clone(),
+                    cached.output.len() as u32,
+                    args_preview,
+                    Some(&cached.output),
+                ));
+            return true;
+        }
+
+        if let Some((prev_turn, cached_output)) =
+            self.ctx.semantic_dedup.pre_check_block_with_generation(
+                &execution.name,
+                &execution.args,
+                self.ctx.turn_index,
+                workspace_epoch,
+            )
+        {
+            let args_preview = make_args_preview(&execution.name, &execution.args);
+            let prior_cache_hits = self
+                .ctx
+                .turn_guard
+                .health
+                .cache_hits_for_signature(&scoped_call_sig);
+            let (body, reason_code) =
+                if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
+                    (
+                        format!(
+                            "⛔ Repeated cached read suppressed: this exact {} request has \
+                         already been served from cache {} time(s). Use the earlier cached \
+                         result in the conversation instead of calling again; if you need \
+                         different evidence, change the arguments.",
+                            execution.name, prior_cache_hits
+                        ),
+                        REASON_REPEATED_CACHE_HIT_SUPPRESSED,
+                    )
+                } else {
+                    let mut output = cached_output;
+                    if !self.ctx.tool_event_hooks.is_empty()
+                        && let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                            self.ctx.tool_event_hooks,
+                            &execution.name,
+                            &execution.args,
+                            &output,
+                        )
+                        .await
+                    {
+                        output = modified;
+                    }
+                    (output, "semantic_dedup_pre_check")
+                };
+            let (mut tool_msg, tr) =
+                headless_idempotency_hit_openai_pair(&execution.id, &execution.name, &body);
+            if let Some(obj) = tool_msg.as_object_mut() {
+                obj.insert(
+                    "_round_index".to_string(),
+                    serde_json::Value::Number(self.ctx.llm_round.into()),
+                );
+                obj.insert(
+                    "_tool_name".to_string(),
+                    serde_json::Value::String(execution.name.clone()),
+                );
+            }
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(tr);
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &execution.id,
+                &execution.name,
+                reason_code,
+                Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
+                Some(&body),
+                true,
+            );
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+            self.ctx
+                .tool_call_records
+                .push(journal_record_cross_turn_cache_hit(
+                    execution.name.clone(),
+                    body.len() as u32,
+                    args_preview,
+                    Some(&body),
+                ));
+            agent_warn!(
+                "dedup",
+                "Semantic cache hit: tool '{}' (id={}) matches turn {} via param-aware dedup",
+                execution.name,
+                execution.id,
+                prev_turn + 1,
+            );
+            return true;
+        }
+
+        false
+    }
+
     pub(super) async fn permit_execution(
         &mut self,
         validated: ValidatedExecution,
     ) -> HeadlessPipelineStage<PermittedExecution> {
         let ValidatedExecution {
-            mut execution,
+            execution,
             idem_key,
         } = validated;
         let mut resolved_provider_policy = None;
         let mut permission_grant = None;
+        let mut pre_tool_context = None;
         if server_owned_edge_result_should_be_rejected(
             &execution,
             self.ctx.runtime_tool_executor.is_some(),
@@ -1132,6 +1176,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
+        let mut cache_reuse_allowed = true;
         if !self.ctx.tool_event_hooks.is_empty() {
             let decision = crate::skills::hooks::evaluate_pre_tool_hooks(
                 self.ctx.tool_event_hooks,
@@ -1170,16 +1215,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     return HeadlessPipelineStage::ShortCircuit;
                 }
                 crate::skills::hooks::PreToolDecision::AllowWithContext(ctx) => {
-                    execution.result_str =
-                        format!("{}\n\n[Hook context]: {ctx}", execution.result_str);
+                    // The hook made this invocation context-sensitive. A cache
+                    // entry produced without that context is not equivalent.
+                    cache_reuse_allowed = false;
+                    pre_tool_context = Some(ctx);
                 }
                 crate::skills::hooks::PreToolDecision::Allow => {}
             }
         }
 
+        if cache_reuse_allowed && self.try_reuse_authorized_read(&execution, &idem_key).await {
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
         HeadlessPipelineStage::Continue(PermittedExecution {
             execution,
             idem_key,
+            pre_tool_context,
             resolved_provider_policy,
             permission_grant,
         })

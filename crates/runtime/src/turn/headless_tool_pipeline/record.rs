@@ -114,10 +114,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let ExecutedExecution {
             mut execution,
             idem_key,
+            pre_tool_context,
             is_err,
             error_kind,
             executed_ms,
         } = executed;
+        let cache_observation = execution.result_str.clone();
+        if let Some(context) = pre_tool_context {
+            execution
+                .result_str
+                .push_str(&format!("\n\n[Hook context]: {context}"));
+        }
         if !self.ctx.tool_event_hooks.is_empty() && !is_err {
             if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
                 self.ctx.tool_event_hooks,
@@ -244,15 +251,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
-            // The `_if_ok` helper no-ops on `is_err`, so the outer
-            // guard is redundant — keep the READ_ONLY_TOOLS filter
-            // (tool-name scope) but hand `is_err` to the helper for
-            // the error-branch decision.
+            // Cache and compare the provider observation, not presentation
+            // transforms from the current Pre/PostTool hook set. Reuse applies
+            // the then-current hooks again after authorization.
             record_headless_cacheable_success_and_semantic_hint_if_ok(
                 &execution.name,
                 &execution.args,
                 &idem_key,
                 HeadlessCacheableRecordCtx {
+                    observation: &cache_observation,
                     result_str: &mut execution.result_str,
                     call_id: Some(&execution.id),
                     turn_index: self.ctx.turn_index,

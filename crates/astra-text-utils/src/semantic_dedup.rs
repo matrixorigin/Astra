@@ -705,10 +705,32 @@ impl SemanticDedup {
         turn_index: usize,
         context_generation: u64,
     ) {
+        let observation = result_str.clone();
+        self.append_near_duplicate_hint_for_observation_with_generation(
+            result_str,
+            &observation,
+            tool_name,
+            args,
+            turn_index,
+            context_generation,
+        );
+    }
+
+    /// Record and compare a raw observation while appending any duplicate hint
+    /// to a separately transformed, model-visible result.
+    pub fn append_near_duplicate_hint_for_observation_with_generation(
+        &mut self,
+        result_str: &mut String,
+        observation: &str,
+        tool_name: &str,
+        args: &Value,
+        turn_index: usize,
+        context_generation: u64,
+    ) {
         if let Some((prev_turn, reason)) = self.check_and_record_with_generation(
             tool_name,
             args,
-            result_str.as_str(),
+            observation,
             turn_index,
             context_generation,
         ) {
@@ -1320,6 +1342,41 @@ mod tests {
         assert!(out2.contains("DUPLICATE HINT"));
         assert!(!out2.contains("Do NOT call this tool again"));
         assert!(out2.contains("read_file"));
+    }
+
+    #[test]
+    fn raw_observation_is_recorded_separately_from_visible_transform() {
+        let mut tracker = SemanticDedup::new(0.75);
+        let args = json!({"path": "src/main.rs"});
+        let observation = "raw provider observation that is long enough for reuse";
+
+        let mut first_visible = "redacted presentation one".to_string();
+        tracker.append_near_duplicate_hint_for_observation_with_generation(
+            &mut first_visible,
+            observation,
+            "read_file",
+            &args,
+            1,
+            7,
+        );
+        assert!(!first_visible.contains("DUPLICATE HINT"));
+
+        let mut second_visible = "redacted presentation two".to_string();
+        tracker.append_near_duplicate_hint_for_observation_with_generation(
+            &mut second_visible,
+            observation,
+            "read_file",
+            &args,
+            2,
+            7,
+        );
+        assert!(second_visible.contains("DUPLICATE HINT"));
+
+        let (_, reused) = tracker
+            .pre_check_block_with_generation("read_file", &args, 3, 7)
+            .expect("raw observation should be reusable");
+        assert_eq!(reused, observation);
+        assert!(!reused.contains("redacted presentation"));
     }
 
     #[test]

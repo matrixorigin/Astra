@@ -323,6 +323,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let PermittedExecution {
             mut execution,
             idem_key,
+            pre_tool_context,
             resolved_provider_policy,
             permission_grant,
         } = permitted;
@@ -344,7 +345,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         )
         .await;
 
-        self.postprocess_execution(execution, idem_key, tool_start)
+        let mut executed = self.postprocess_execution(execution, idem_key, tool_start);
+        executed.pre_tool_context = pre_tool_context;
+        executed
     }
 
     /// Apply the canonical execution-outcome semantics after a provider has
@@ -442,6 +445,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         ExecutedExecution {
             execution,
             idem_key,
+            pre_tool_context: None,
             is_err,
             error_kind: source_error_kind,
             executed_ms,

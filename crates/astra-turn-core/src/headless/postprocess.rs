@@ -171,6 +171,9 @@ impl HeadlessStepDeadline {
 
 /// Mutable handles for [`record_headless_cacheable_success_and_semantic_hint`].
 pub struct HeadlessCacheableRecordCtx<'a> {
+    /// Raw provider observation used for cache identity and similarity.
+    pub observation: &'a str,
+    /// Per-invocation, model-visible result that may receive a duplicate hint.
     pub result_str: &'a mut String,
     pub call_id: Option<&'a str>,
     pub turn_index: usize,
@@ -205,7 +208,7 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
 ) {
     let cached_result = CachedToolResult {
         tool_name: name.to_string(),
-        output: ctx.result_str.clone(),
+        output: ctx.observation.to_string(),
         is_error: false,
         cached_at: epoch_ms(),
         context_signature: idem_key.context_signature.clone(),
@@ -219,8 +222,9 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
     }
     ctx.idempotency_cache.record(idem_key, cached_result);
     ctx.semantic_dedup
-        .append_near_duplicate_hint_if_any_with_generation(
+        .append_near_duplicate_hint_for_observation_with_generation(
             ctx.result_str,
+            ctx.observation,
             name,
             args,
             ctx.turn_index,
