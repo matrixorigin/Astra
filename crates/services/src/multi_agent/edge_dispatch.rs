@@ -537,19 +537,51 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
-        let affected = n.rows_affected() > 0;
+        let updated = n.rows_affected() > 0;
+        // A reconnect may replay a result whose first delivery committed but
+        // whose ACK was lost. Treat the exact persisted terminal body as an
+        // accepted idempotent delivery; a conflicting body remains rejected.
+        let accepted = if updated {
+            true
+        } else {
+            let row = sqlx::query(
+                "SELECT status, CAST(result_json AS CHAR) AS result_json \
+                 FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                   AND request_id = ? AND edge_agent_id = ?",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .bind(edge_agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
+            row.is_some_and(|row| {
+                matches!(
+                    (
+                        row.try_get::<String, _>("status"),
+                        row.try_get::<Option<String>, _>("result_json")
+                    ),
+                    (Ok(status), Ok(Some(body)))
+                        if status == "completed" && body == result_json
+                )
+            })
+        };
         if let Some(ref m) = self.metrics {
             m.dispatch_deliver_update_latency.record(start.elapsed());
-            if affected {
+            if updated {
                 saturating_decrement(&m.dispatch_queue_depth);
                 m.dispatch_deliver_hits_total
                     .fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if !accepted {
                 m.dispatch_deliver_misses_total
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        Ok(affected)
+        Ok(accepted)
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, reason = %reason))]
@@ -1179,6 +1211,13 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&waited)
                 .expect("waited result should be JSON"),
             serde_json::from_str::<serde_json::Value>(&result_json).expect("result should be JSON")
+        );
+        assert!(
+            pod_c
+                .deliver_result(&identity, &edge_agent_id, &result_json)
+                .await
+                .expect("exact replay after lost acknowledgement"),
+            "an exact terminal replay must be acknowledged idempotently"
         );
         assert!(
             !pod_c

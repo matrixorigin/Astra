@@ -1402,17 +1402,17 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
         "command": "pwd"
     });
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_dispatch_id(&request, "edge-dispatch-1");
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
 
     assert_eq!(plan.selected_executor_id(), Some("edge-1"));
-    assert_eq!(plan.dispatch_request_id(), "edge-dispatch-1");
+    assert_eq!(plan.dispatch_request_id(), plan.identity().storage_key());
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(310));
 
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
     assert_eq!(payload["type"], "edge_tool_request");
-    assert_eq!(payload["request_id"], "edge-dispatch-1");
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "bash");
     assert_eq!(payload["timeout_secs"], 300);
     assert_eq!(payload["args"]["command"], "pwd");
@@ -1455,17 +1455,13 @@ fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     });
     let binding = request.runtime_environment_binding(&registry);
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_binding_and_dispatch_id(
-        &request,
-        &binding,
-        "edge-dispatch-read",
-    );
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(40));
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
-    assert_eq!(payload["request_id"], "edge-dispatch-read");
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "read_file");
     assert_eq!(payload["timeout_secs"], 30);
 }
@@ -1490,11 +1486,7 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
     request.policy.max_execution_secs = Some(7.2);
     let binding = request.runtime_environment_binding(&registry);
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_binding_and_dispatch_id(
-        &request,
-        &binding,
-        "edge-dispatch-short",
-    );
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(18));
     let payload: Value =
@@ -2609,8 +2601,12 @@ async fn edge_ws_result_preserves_tool_result_fields() {
     });
 
     let message = rx.recv().await.expect("edge tool request");
-    let request_id = match message {
-        astra_server_types::EdgeServerMessage::ToolRequest { request_id, .. } => request_id,
+    let (request_id, delivery_generation) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            ..
+        } => (request_id, delivery_generation),
         other => panic!("expected tool request, got {other:?}"),
     };
     let mut fields = serde_json::Map::new();
@@ -2623,6 +2619,7 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         "user-1",
         "edge-selected",
         &request_id,
+        delivery_generation,
         astra_server_types::edge_connection_pool::EdgeToolResult {
             output: "failed".to_string(),
             is_error: true,
@@ -2788,6 +2785,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
                 tool,
                 args,
                 timeout_secs,
+                ..
             } => {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
@@ -2950,6 +2948,9 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED
     );
     assert_eq!(metadata["blocked"], true);
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert!(result.output.contains("reconcile its durable invocation"));
     assert_eq!(metadata["executor"]["status"], "degraded");
     assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
     assert_eq!(local.calls(), 0);

@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use uuid::Uuid;
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ToolExecutionRequest, ToolTransportKind,
@@ -17,10 +16,9 @@ pub(crate) enum EdgeTransportAttempt {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeBoundExecutionPlan {
-    #[allow(dead_code)]
-    user_id: String,
     selected_executor_id: Option<String>,
     dispatch_request_id: String,
+    identity: astra_turn_types::ToolInvocationIdentity,
     tool_name: String,
     args: Value,
     timeout_secs: u64,
@@ -32,46 +30,35 @@ impl EdgeBoundExecutionPlan {
     const DEFAULT_TIMEOUT_SECS: u64 = 300;
     const WAIT_GRACE_SECS: u64 = 10;
 
-    pub(crate) fn from_request_with_binding(
+    pub(crate) fn try_from_request_with_binding(
         request: &ToolExecutionRequest,
         binding: &astra_runtime_env::RunBinding,
-    ) -> Self {
-        Self::from_request_with_binding_and_dispatch_id(
-            request,
-            binding,
-            format!("xp-{}-{}", request.session_id, Uuid::new_v4().simple()),
-        )
-    }
-
-    pub(crate) fn from_request_with_binding_and_dispatch_id(
-        request: &ToolExecutionRequest,
-        binding: &astra_runtime_env::RunBinding,
-        dispatch_request_id: impl Into<String>,
-    ) -> Self {
-        let mut plan = Self::from_request_with_dispatch_id(request, dispatch_request_id);
+    ) -> Result<Self, astra_turn_types::ToolInvocationContractError> {
+        let mut plan = Self::try_from_request(request)?;
         plan.timeout_secs = timeout_secs_from_policy(binding).unwrap_or(Self::DEFAULT_TIMEOUT_SECS);
-        plan
+        Ok(plan)
     }
 
-    pub(crate) fn from_request_with_dispatch_id(
+    pub(crate) fn try_from_request(
         request: &ToolExecutionRequest,
-        dispatch_request_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            user_id: request.user_id.clone(),
+    ) -> Result<Self, astra_turn_types::ToolInvocationContractError> {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &request.user_id,
+            &request.session_id,
+            &request.run_id,
+            &request.turn_chain_id,
+            &request.tool_call_id,
+        )?;
+        Ok(Self {
             selected_executor_id: edge_executor_id(request).map(ToString::to_string),
-            dispatch_request_id: dispatch_request_id.into(),
+            dispatch_request_id: identity.storage_key(),
+            identity,
             tool_name: request.tool_name.clone(),
             args: request.args.clone(),
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn user_id(&self) -> &str {
-        &self.user_id
+        })
     }
 
     pub(crate) fn selected_executor_id(&self) -> Option<&str> {
@@ -82,6 +69,10 @@ impl EdgeBoundExecutionPlan {
         &self.dispatch_request_id
     }
 
+    pub(crate) fn identity(&self) -> &astra_turn_types::ToolInvocationIdentity {
+        &self.identity
+    }
+
     pub(crate) fn wait_timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs.saturating_add(Self::WAIT_GRACE_SECS))
     }
@@ -89,6 +80,8 @@ impl EdgeBoundExecutionPlan {
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: self.dispatch_request_id.clone(),
+            identity: self.identity.clone(),
+            delivery_generation: 1,
             tool: self.tool_name.clone(),
             args: self.args.clone(),
             timeout_secs: self.timeout_secs,

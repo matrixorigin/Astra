@@ -31,7 +31,14 @@ pub(crate) async fn execute_edge_bound(
     if matches!(request.executor.status, ExecutorStatus::Offline) {
         return edge_unavailable_result(&request, binding);
     }
-    let plan = EdgeBoundExecutionPlan::from_request_with_binding(&request, binding);
+    let plan = match EdgeBoundExecutionPlan::try_from_request_with_binding(&request, binding) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return astra_tools::ToolResult::error(format!(
+                "edge invocation identity is incomplete: {error}"
+            ));
+        }
+    };
 
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
@@ -48,6 +55,33 @@ pub(crate) async fn execute_edge_bound(
     );
 
     let mut diagnostics = Vec::new();
+    // The database-backed dispatch is the authoritative production path: it
+    // records intent before socket delivery and can accept a replayed result
+    // after either endpoint reconnects. Once it may have dispatched, never
+    // fall through to another transport and duplicate an external effect.
+    match try_edge_dispatch(
+        &request,
+        binding,
+        &plan,
+        edge_dispatch_service,
+        edge_registry_service.as_ref(),
+        tool_registry,
+        cancel_token.clone(),
+    )
+    .await
+    {
+        EdgeTransportAttempt::Delivered(result) => return result,
+        EdgeTransportAttempt::TransportDisconnected => {
+            diagnostics
+                .push("edge-dispatch: outcome may be unknown after durable dispatch".to_string());
+            return edge_transport_disconnected_result(&request, binding, diagnostics, true);
+        }
+        EdgeTransportAttempt::Unavailable => {
+            diagnostics
+                .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
+        }
+    }
+    let mut outcome_may_be_unknown = false;
     match try_edge_websocket(
         &request,
         binding,
@@ -60,33 +94,16 @@ pub(crate) async fn execute_edge_bound(
     {
         EdgeTransportAttempt::Delivered(result) => return result,
         EdgeTransportAttempt::TransportDisconnected => {
-            diagnostics.push("edge-websocket: transport disconnected or timed out".to_string());
+            diagnostics
+                .push("edge-websocket: outcome may be unknown after socket dispatch".to_string());
+            outcome_may_be_unknown = true;
         }
         EdgeTransportAttempt::Unavailable => {
             diagnostics.push("edge-websocket: no connected edge agent available".to_string());
         }
     }
-    match try_edge_dispatch(
-        &request,
-        binding,
-        &plan,
-        edge_dispatch_service,
-        edge_registry_service.as_ref(),
-        tool_registry,
-        cancel_token,
-    )
-    .await
-    {
-        EdgeTransportAttempt::Delivered(result) => return result,
-        EdgeTransportAttempt::TransportDisconnected => {
-            diagnostics.push("edge-dispatch: store/delivery channel unavailable".to_string());
-        }
-        EdgeTransportAttempt::Unavailable => {
-            diagnostics.push("edge-dispatch: no registered edge agent matches".to_string());
-        }
-    }
 
-    edge_transport_disconnected_result(&request, binding, diagnostics)
+    edge_transport_disconnected_result(&request, binding, diagnostics, outcome_may_be_unknown)
 }
 
 async fn try_edge_websocket(
@@ -262,8 +279,9 @@ async fn try_edge_websocket(
         "edge_dispatch: try_edge_websocket selected edge, sending tool request over WS"
     );
     let edge_result = pool
-        .execute_tool_with_cancel(
+        .execute_invocation_on_connection_with_cancel(
             &edge_owner_user_id,
+            plan.identity(),
             &edge.edge_agent_id,
             &request.tool_name,
             &request.args,
@@ -530,9 +548,17 @@ fn edge_unavailable_result(
     }
 }
 
-fn edge_transport_disconnected_message(request: &ToolExecutionRequest) -> String {
+fn edge_transport_disconnected_message(
+    request: &ToolExecutionRequest,
+    outcome_may_be_unknown: bool,
+) -> String {
+    let action = if outcome_may_be_unknown {
+        "The request may have reached the edge; reconcile its durable invocation before any retry."
+    } else {
+        "Reconnect the executor transport before retrying."
+    };
     format!(
-        "Error: transport '{}' disconnected or timed out while executing tool '{}' on executor '{}'. Reconnect the executor transport and retry; no alternate execution provider is available for this file environment.",
+        "Error: transport '{}' disconnected or timed out while executing tool '{}' on executor '{}'. {action} No alternate execution provider is available for this file environment.",
         serde_json::to_value(request.executor.transport)
             .ok()
             .and_then(|value| value.as_str().map(ToString::to_string))
@@ -546,6 +572,7 @@ fn edge_transport_disconnected_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     diagnostics: Vec<String>,
+    outcome_may_be_unknown: bool,
 ) -> astra_tools::ToolResult {
     let mut degraded_executor = request.executor.clone();
     degraded_executor.status = ExecutorStatus::Degraded;
@@ -554,7 +581,7 @@ fn edge_transport_disconnected_result(
     attach_runtime_error_metadata(
         &mut metadata,
         &astra_runtime_env::RuntimeError::transport_disconnected(
-            edge_transport_disconnected_message(request),
+            edge_transport_disconnected_message(request, outcome_may_be_unknown),
         ),
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     );
@@ -564,8 +591,15 @@ fn edge_transport_disconnected_result(
             Value::Array(diagnostics.into_iter().map(Value::String).collect()),
         );
     }
+    if outcome_may_be_unknown {
+        metadata.insert("side_effects_maybe".to_string(), Value::Bool(true));
+        metadata.insert(
+            "outcome_certainty".to_string(),
+            Value::String("unknown".to_string()),
+        );
+    }
     astra_tools::ToolResult {
-        output: edge_transport_disconnected_message(request),
+        output: edge_transport_disconnected_message(request, outcome_may_be_unknown),
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: None,

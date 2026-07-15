@@ -19,7 +19,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "signal", "time"] }
 tokio-util.workspace = true
 tokio-tungstenite = { workspace = true }
 rustls = { workspace = true }
@@ -28,8 +28,14 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
 fastrand = "2"
+fs2 = "0.4"
 reqwest = { workspace = true }
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools = { path = "../astra-tools" }
 astra-server-types.workspace = true
+astra-turn-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

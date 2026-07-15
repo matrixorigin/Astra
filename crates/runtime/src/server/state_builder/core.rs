@@ -342,12 +342,15 @@ mod tests {
             tokio::spawn(async move { service.execute(request, &NoopLocalTransport).await });
 
         let message = rx.recv().await.expect("edge tool request is delivered");
-        let request_id = match message {
+        let (request_id, delivery_generation) = match message {
             astra_server_types::EdgeServerMessage::ToolRequest {
-                request_id, tool, ..
+                request_id,
+                tool,
+                delivery_generation,
+                ..
             } => {
                 assert_eq!(tool, "bash");
-                request_id
+                (request_id, delivery_generation)
             }
             other => panic!("expected edge tool request, got {other:?}"),
         };
@@ -355,6 +358,7 @@ mod tests {
             "user-1",
             "edge-selected",
             &request_id,
+            delivery_generation,
             astra_server_types::edge_connection_pool::EdgeToolResult {
                 output: "ok".to_string(),
                 is_error: false,

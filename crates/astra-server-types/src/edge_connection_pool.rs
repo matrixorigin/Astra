@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
+use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, ToolInvocationIdentity};
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
 /// When exceeded, the oldest entry (by dispatch time) is evicted before inserting.
@@ -73,7 +73,13 @@ pub struct EdgeConnection {
     /// overwriting a newer connection that replaced this one in the pool.
     pub generation: u64,
     /// Pending tool call responses: request_id → oneshot sender.
-    pending_results: Arc<DashMap<String, oneshot::Sender<EdgeToolResult>>>,
+    pending_results: Arc<DashMap<String, PendingEdgeResult>>,
+}
+
+#[derive(Debug)]
+struct PendingEdgeResult {
+    delivery_generation: u64,
+    sender: oneshot::Sender<EdgeToolResult>,
 }
 
 /// Result from an edge tool execution.
@@ -113,6 +119,7 @@ pub struct EdgeConnectionPool {
     max_pending: usize,
     /// Maximum number of inflight dispatched tool requests per user.
     max_pending_per_user: usize,
+    next_delivery_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +138,7 @@ impl EdgeConnectionPool {
             next_generation: Arc::new(AtomicU64::new(1)),
             max_pending: MAX_PENDING_REQUESTS,
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
+            next_delivery_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -327,10 +335,59 @@ impl EdgeConnectionPool {
         args: &serde_json::Value,
         cancel_token: Option<&CancellationToken>,
     ) -> Option<EdgeToolResult> {
+        let invocation_id = Uuid::new_v4().to_string();
+        let identity = ToolInvocationIdentity::new(
+            user_id,
+            format!("edge-direct:{edge_agent_id}"),
+            "edge-direct",
+            "edge-direct",
+            invocation_id,
+        )
+        .expect("non-empty direct edge invocation identity");
+        self.execute_invocation_with_cancel(&identity, edge_agent_id, tool, args, cancel_token)
+            .await
+    }
+
+    /// Execute an edge tool using the caller's durable logical identity.
+    pub async fn execute_invocation_with_cancel(
+        &self,
+        identity: &ToolInvocationIdentity,
+        edge_agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
+        self.execute_invocation_on_connection_with_cancel(
+            &identity.user_id,
+            identity,
+            edge_agent_id,
+            tool,
+            args,
+            cancel_token,
+        )
+        .await
+    }
+
+    /// Execute a logical invocation through a connection owned by a distinct
+    /// authenticated principal.
+    ///
+    /// Sandbox edges may connect with a workspace-scoped service account while
+    /// the invocation identity remains owned by the end user. The connection
+    /// owner selects the socket; the durable identity remains unchanged in the
+    /// request and result protocol.
+    pub async fn execute_invocation_on_connection_with_cancel(
+        &self,
+        connection_user_id: &str,
+        identity: &ToolInvocationIdentity,
+        edge_agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
-        let key = pool_key(user_id, edge_agent_id);
+        let key = pool_key(connection_user_id, edge_agent_id);
         let (pending_results, sender) = {
             let Some(entry) = self.connections.get(&key) else {
                 tracing::warn!(
@@ -354,12 +411,24 @@ impl EdgeConnectionPool {
             (conn.pending_results.clone(), conn.sender.clone())
         };
 
-        let request_id = Uuid::new_v4().to_string();
+        let request_id = identity.storage_key();
+        let delivery_generation = self
+            .next_delivery_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let (tx, rx) = oneshot::channel();
-        pending_results.insert(request_id.clone(), tx);
+        pending_results.insert(
+            request_id.clone(),
+            PendingEdgeResult {
+                delivery_generation,
+                sender: tx,
+            },
+        );
 
         let msg = EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
+            identity: identity.clone(),
+            delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
@@ -372,7 +441,7 @@ impl EdgeConnectionPool {
             args: args.clone(),
             dispatched_at: Instant::now(),
         };
-        self.insert_pending_request(user_id, &request_id, dispatched);
+        self.insert_pending_request(&identity.user_id, &request_id, dispatched);
 
         if let Err(e) = sender.send(msg).await {
             tracing::warn!(
@@ -400,6 +469,7 @@ impl EdgeConnectionPool {
         let cancel_edge = || {
             let _ = sender.try_send(EdgeServerMessage::ToolCancel {
                 request_id: request_id.clone(),
+                delivery_generation,
             });
         };
 
@@ -478,13 +548,28 @@ impl EdgeConnectionPool {
         user_id: &str,
         edge_agent_id: &str,
         request_id: &str,
+        delivery_generation: u64,
         result: EdgeToolResult,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
         if let Some(entry) = self.connections.get(&key)
-            && let Some((_, tx)) = entry.value().pending_results.remove(request_id)
+            && let Some(pending) = entry.value().pending_results.get(request_id)
         {
-            return tx.send(result).is_ok();
+            if pending.delivery_generation != delivery_generation {
+                tracing::warn!(
+                    user_id = %user_id,
+                    edge_agent_id = %edge_agent_id,
+                    request_id = %request_id,
+                    expected_generation = pending.delivery_generation,
+                    delivery_generation,
+                    "edge tool result generation did not match pending delivery"
+                );
+                return false;
+            }
+            drop(pending);
+            if let Some((_, pending)) = entry.value().pending_results.remove(request_id) {
+                return pending.sender.send(result).is_ok();
+            }
         }
         // No pending entry: the request was already cancelled, timed out, or the
         // connection was reset. Log so operators can correlate late edge results
@@ -834,8 +919,12 @@ mod tests {
 
         // Read the tool request from the receiver
         let msg = rx.recv().await.unwrap();
-        let request_id = match msg {
-            EdgeServerMessage::ToolRequest { request_id, .. } => request_id,
+        let (request_id, delivery_generation) = match msg {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                ..
+            } => (request_id, delivery_generation),
             _ => panic!("expected ToolRequest"),
         };
 
@@ -844,6 +933,7 @@ mod tests {
             "user-1",
             "edge-a",
             &request_id,
+            delivery_generation,
             EdgeToolResult {
                 output: "file1.txt\nfile2.txt".into(),
                 is_error: false,

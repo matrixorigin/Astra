@@ -433,6 +433,8 @@ async fn edge_ws_tool_request_roundtrip() {
     let result_msg = json!({
         "type": "edge_tool_result",
         "request_id": request_id,
+        "identity": req_json["identity"].clone(),
+        "delivery_generation": req_json["delivery_generation"].clone(),
         "output": "hello\n",
         "is_error": false,
         "duration_ms": 42
@@ -454,20 +456,31 @@ async fn edge_ws_tool_request_roundtrip() {
 }
 
 #[tokio::test]
-async fn edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout() {
+async fn edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
 
-    let request_id = "dispatch-disconnect-1";
+    let invocation_id = "dispatch-disconnect-1";
+    let tool_identity = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "disconnect-session",
+        "disconnect-run",
+        "disconnect-chain",
+        invocation_id,
+    )
+    .unwrap();
+    let request_id = tool_identity.storage_key();
     let identity = EdgeDispatchIdentity::new(
         "test-user-1",
         "disconnect-session",
         "disconnect-run",
         "disconnect-chain",
-        request_id,
+        &request_id,
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
-        request_id: request_id.to_string(),
+        request_id: request_id.clone(),
+        identity: tool_identity,
+        delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
         timeout_secs: 30,
@@ -494,14 +507,91 @@ async fn edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout(
 
     drop(ws);
 
-    let failed = dispatch
-        .wait_for_status("test-user-1", request_id, "failed")
+    let row = dispatch
+        .wait_for_status("test-user-1", &request_id, "dispatched")
         .await;
-    assert_eq!(
-        failed.failure_reason.as_deref(),
-        Some("edge_ws_disconnected")
-    );
+    assert_eq!(row.status, "dispatched");
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let tool_identity = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "replay-session",
+        "replay-run",
+        "replay-chain",
+        "replay-call",
+    )
+    .unwrap();
+    let request_id = tool_identity.storage_key();
+    let dispatch_identity = EdgeDispatchIdentity::new(
+        "test-user-1",
+        "replay-session",
+        "replay-run",
+        "replay-chain",
+        &request_id,
+    );
+    let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        request_id: request_id.clone(),
+        identity: tool_identity.clone(),
+        delivery_generation: 9,
+        tool: "bash".to_string(),
+        args: json!({"command": "effect"}),
+        timeout_secs: 30,
+    };
+    dispatch
+        .insert_dispatch(
+            &dispatch_identity,
+            "edge-replay",
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut first = ws_auth(addr, "edge-replay", "replay-host").await;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(3), first.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let delivered: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+    assert_eq!(delivered["request_id"], request_id);
+    drop(first);
+
+    let second = ws_auth(addr, "edge-replay", "replay-host").await;
+    let (mut write, mut read) = second.split();
+    write
+        .send(Message::Text(
+            json!({
+                "type": "edge_tool_result",
+                "request_id": request_id,
+                "identity": tool_identity,
+                "delivery_generation": 9,
+                "output": "effect-completed",
+                "is_error": false,
+                "duration_ms": 12
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&ack.into_text().unwrap()).unwrap();
+    assert_eq!(ack["type"], "edge_tool_result_ack");
+    assert_eq!(ack["request_id"], request_id);
+    let row = dispatch
+        .wait_for_status("test-user-1", &request_id, "completed")
+        .await;
+    assert!(row.result_json.unwrap().contains("effect-completed"));
     server.abort();
 }
 
@@ -556,6 +646,8 @@ async fn edge_tool_error_result_propagated() {
     let result_msg = json!({
         "type": "edge_tool_result",
         "request_id": request_id,
+        "identity": req_json["identity"].clone(),
+        "delivery_generation": req_json["delivery_generation"].clone(),
         "output": "command not found: fail-cmd",
         "is_error": true,
         "duration_ms": 5
@@ -648,6 +740,8 @@ async fn edge_reconnect_after_disconnect() {
     let result_msg = json!({
         "type": "edge_tool_result",
         "request_id": request_id,
+        "identity": req_json["identity"].clone(),
+        "delivery_generation": req_json["delivery_generation"].clone(),
         "output": "file1.txt\nfile2.txt",
         "is_error": false
     });
@@ -733,6 +827,7 @@ async fn edge_deliver_result_for_unknown_request_returns_false() {
         "test-user-1",
         "edge-unk",
         "nonexistent-request-id",
+        1,
         EdgeToolResult {
             output: "orphaned".into(),
             is_error: false,

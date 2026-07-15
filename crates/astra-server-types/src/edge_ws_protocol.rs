@@ -25,6 +25,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub use astra_turn_types::ToolInvocationIdentity;
+
 /// Timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
@@ -55,6 +57,8 @@ pub enum EdgeClientMessage {
     #[serde(rename = "edge_tool_result")]
     ToolResult {
         request_id: String,
+        identity: ToolInvocationIdentity,
+        delivery_generation: u64,
         output: String,
         #[serde(default)]
         is_error: bool,
@@ -85,6 +89,8 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_tool_request")]
     ToolRequest {
         request_id: String,
+        identity: ToolInvocationIdentity,
+        delivery_generation: u64,
         tool: String,
         args: Value,
         /// Maximum execution time in seconds.
@@ -102,12 +108,21 @@ pub enum EdgeServerMessage {
 
     /// Cancel an in-flight tool execution request.
     ///
-    /// Sent when the caller times out, cancels via `CancellationToken`, or the
-    /// dispatch fails. The edge SHOULD abort the tool process and discard any
-    /// partial result. Failing to acknowledge is acceptable — the server has
-    /// already dropped the pending-result slot.
+    /// Sent when the caller times out or cancels via `CancellationToken`. The
+    /// generation prevents a delayed cancel from targeting a newer delivery.
     #[serde(rename = "edge_tool_cancel")]
-    ToolCancel { request_id: String },
+    ToolCancel {
+        request_id: String,
+        delivery_generation: u64,
+    },
+
+    /// The server durably accepted this exact result delivery. The edge must
+    /// retain and replay a completed result until this acknowledgement arrives.
+    #[serde(rename = "edge_tool_result_ack")]
+    ToolResultAck {
+        request_id: String,
+        delivery_generation: u64,
+    },
 }
 
 impl EdgeServerMessage {
@@ -132,6 +147,10 @@ fn default_tool_timeout_secs() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn identity() -> ToolInvocationIdentity {
+        ToolInvocationIdentity::new("user", "session", "run", "turn", "call").unwrap()
+    }
 
     #[test]
     fn edge_auth_deserializes() {
@@ -163,6 +182,8 @@ mod tests {
         let msg: EdgeClientMessage = serde_json::from_value(json!({
             "type": "edge_tool_result",
             "request_id": "req-123",
+            "identity": identity(),
+            "delivery_generation": 3,
             "output": "file contents here",
             "is_error": false,
             "duration_ms": 42
@@ -175,6 +196,7 @@ mod tests {
                 is_error,
                 duration_ms,
                 tool_result_fields,
+                ..
             } => {
                 assert_eq!(request_id, "req-123");
                 assert_eq!(output, "file contents here");
@@ -190,6 +212,8 @@ mod tests {
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-456".into(),
+            identity: identity(),
+            delivery_generation: 1,
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
             timeout_secs: 120,
@@ -248,6 +272,8 @@ mod tests {
     fn edge_client_tool_result_serializes() {
         let msg = EdgeClientMessage::ToolResult {
             request_id: "r1".into(),
+            identity: identity(),
+            delivery_generation: 1,
             output: "ok".into(),
             is_error: false,
             duration_ms: Some(42),
@@ -263,6 +289,8 @@ mod tests {
     fn edge_client_tool_result_none_duration_serializes_as_null() {
         let msg = EdgeClientMessage::ToolResult {
             request_id: "r1".into(),
+            identity: identity(),
+            delivery_generation: 1,
             output: "ok".into(),
             is_error: false,
             duration_ms: None,
@@ -288,6 +316,8 @@ mod tests {
         let msg: EdgeServerMessage = serde_json::from_value(json!({
             "type": "edge_tool_request",
             "request_id": "r1",
+            "identity": identity(),
+            "delivery_generation": 1,
             "tool": "bash",
             "args": {"command": "ls"},
             "timeout_secs": 120
@@ -305,20 +335,14 @@ mod tests {
     }
 
     #[test]
-    fn edge_server_tool_request_default_timeout() {
-        let msg: EdgeServerMessage = serde_json::from_value(json!({
+    fn edge_server_tool_request_requires_durable_identity() {
+        let result = serde_json::from_value::<EdgeServerMessage>(json!({
             "type": "edge_tool_request",
             "request_id": "r1",
             "tool": "bash",
             "args": {}
-        }))
-        .unwrap();
-        match msg {
-            EdgeServerMessage::ToolRequest { timeout_secs, .. } => {
-                assert_eq!(timeout_secs, EDGE_TOOL_TIMEOUT_SECS);
-            }
-            _ => panic!("expected ToolRequest"),
-        }
+        }));
+        assert!(result.is_err());
     }
 
     #[test]

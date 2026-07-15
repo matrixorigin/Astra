@@ -25,6 +25,7 @@ server = [
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+astra-turn-types.workspace = true
 
 astra-core = { workspace = true, optional = true }
 astra-services = { workspace = true, optional = true }
