@@ -1666,6 +1666,19 @@ async fn phase2_web_hydration_schema_contract() {
             .any(|column| column == "decision_json"),
         "prepared invocation resume requires the complete frozen decision, not only its hash"
     );
+    let invocation_columns = column_names(&pool, &schema, "tool_invocation_ledger").await;
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "dispatch_owner"),
+        "provider dispatch completion must be fenced by an explicit worker owner"
+    );
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "dispatch_lease_expires_at"),
+        "abandoned provider dispatches require a durable liveness deadline"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [

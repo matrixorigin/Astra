@@ -1819,9 +1819,10 @@ impl RuntimeToolExecutor {
                 })
                 .await
             {
-                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute(
-                    durable_decision,
-                )) => {
+                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                    decision: durable_decision,
+                    owner_id,
+                }) => {
                     let frozen = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&durable_decision) {
                         Ok(frozen) => frozen,
                         Err(error) => {
@@ -1831,7 +1832,7 @@ impl RuntimeToolExecutor {
                         }
                     };
                     frozen.apply_to_request(&mut request);
-                    Some((ledger, identity, frozen.route))
+                    Some((ledger, identity, frozen.route, owner_id))
                 }
                 Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
                     result,
@@ -1856,14 +1857,25 @@ impl RuntimeToolExecutor {
             binding_fields: route_binding_fields,
             cancel_token: self.cancel_token.clone(),
         };
+        let lease_heartbeat = durable_invocation
+            .as_ref()
+            .map(|(ledger, identity, _, owner_id)| {
+                ledger.start_lease_heartbeat(identity.clone(), owner_id.clone())
+            });
         let result = match durable_invocation.as_ref() {
-            Some((_, _, route)) => {
+            Some((_, _, route, _)) => {
                 execute_tool_route_with_events_at_route(route_context, request, *route).await
             }
             None => execute_tool_route_with_events(route_context, request).await,
         };
         match durable_invocation {
-            Some((ledger, identity, _)) => ledger.finish(&identity, result).await,
+            Some((ledger, identity, _, owner_id)) => {
+                let result = ledger.finish(&identity, &owner_id, result).await;
+                if let Some(heartbeat) = lease_heartbeat {
+                    heartbeat.stop().await;
+                }
+                result
+            }
             None => result,
         }
     }

@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
-    ToolInvocationTerminalOutcome,
+    DispatchCertainty, ToolInvocationDecision, ToolInvocationDispatchLease,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationRecord, ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use thiserror::Error;
 
@@ -42,62 +42,101 @@ impl InMemoryInvocationLedger {
             state: ToolInvocationState::Prepared,
             dispatch_certainty: DispatchCertainty::NotDispatched,
             attempt_count: 0,
+            dispatch_lease: None,
             outcome: None,
         };
         self.entries.insert(identity, entry.clone());
         Ok(ToolInvocationPrepareOutcome::Prepared(entry))
     }
 
-    /// Compare-and-set one legal state transition. Persistence adapters must
-    /// make the expected-state check and update atomic.
-    pub fn compare_and_transition(
+    /// Atomically claim the only transition that may cross the provider route
+    /// boundary. The lease owner is thereafter required for renewal and
+    /// completion.
+    pub fn claim_dispatch(
         &mut self,
         identity: &ToolInvocationIdentity,
-        expected: ToolInvocationState,
-        next: ToolInvocationState,
-        dispatch_certainty: DispatchCertainty,
+        lease: ToolInvocationDispatchLease,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
-        if matches!(
-            next,
-            ToolInvocationState::Succeeded
-                | ToolInvocationState::Failed
-                | ToolInvocationState::Rejected
-        ) {
-            return Err(InvocationLedgerError::TerminalOutcomeRequired { state: next });
-        }
         let entry = self.entries.get_mut(identity).ok_or_else(|| {
             InvocationLedgerError::MissingInvocation {
                 identity: identity.clone(),
             }
         })?;
-        if entry.state != expected {
+        if entry.state != ToolInvocationState::Prepared {
             return Err(InvocationLedgerError::StateMismatch {
                 identity: identity.clone(),
-                expected,
+                expected: ToolInvocationState::Prepared,
                 actual: entry.state,
             });
         }
-        if !expected.can_transition_to(next) {
-            return Err(InvocationLedgerError::IllegalTransition {
-                identity: identity.clone(),
-                from: expected,
-                to: next,
-            });
-        }
-        let required_certainty = next.required_dispatch_certainty();
-        if dispatch_certainty != required_certainty {
-            return Err(InvocationLedgerError::CertaintyMismatch {
-                state: next,
-                expected: required_certainty,
-                actual: dispatch_certainty,
-            });
-        }
+        entry.state = ToolInvocationState::Dispatched;
+        entry.dispatch_certainty = DispatchCertainty::Dispatched;
+        entry.attempt_count = entry.attempt_count.saturating_add(1);
+        entry.dispatch_lease = Some(lease);
+        Ok(entry.clone())
+    }
 
-        entry.state = next;
-        entry.dispatch_certainty = dispatch_certainty;
-        if expected == ToolInvocationState::Prepared && next == ToolInvocationState::Dispatched {
-            entry.attempt_count = entry.attempt_count.saturating_add(1);
+    pub fn renew_dispatch(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        lease: ToolInvocationDispatchLease,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let entry = self.dispatched_entry_for_owner(identity, &lease.owner_id)?;
+        let current = entry
+            .dispatch_lease
+            .as_ref()
+            .expect("dispatched entries must have a validated lease");
+        if lease.expires_at_epoch_ms <= current.expires_at_epoch_ms {
+            return Err(InvocationLedgerError::LeaseNotExtended {
+                identity: Box::new(identity.clone()),
+                current_expiry_epoch_ms: current.expires_at_epoch_ms,
+                proposed_expiry_epoch_ms: lease.expires_at_epoch_ms,
+            });
         }
+        entry.dispatch_lease = Some(lease);
+        Ok(entry.clone())
+    }
+
+    /// Convert an abandoned dispatch to uncertainty only after its owner lease
+    /// has expired. An active lease is returned unchanged.
+    pub fn reconcile_expired_dispatch(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        now_epoch_ms: u64,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if entry.state != ToolInvocationState::Dispatched {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity: identity.clone(),
+                expected: ToolInvocationState::Dispatched,
+                actual: entry.state,
+            });
+        }
+        let lease = entry.dispatch_lease.as_ref().ok_or_else(|| {
+            InvocationLedgerError::MissingDispatchLease {
+                identity: identity.clone(),
+            }
+        })?;
+        if !lease.is_expired_at(now_epoch_ms) {
+            return Ok(entry.clone());
+        }
+        entry.state = ToolInvocationState::OutcomeUnknown;
+        entry.dispatch_certainty = DispatchCertainty::Unknown;
+        Ok(entry.clone())
+    }
+
+    pub fn mark_outcome_unknown(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let entry = self.dispatched_entry_for_owner(identity, owner_id)?;
+        entry.state = ToolInvocationState::OutcomeUnknown;
+        entry.dispatch_certainty = DispatchCertainty::Unknown;
         Ok(entry.clone())
     }
 
@@ -105,6 +144,7 @@ impl InMemoryInvocationLedger {
         &mut self,
         identity: &ToolInvocationIdentity,
         expected: ToolInvocationState,
+        owner_id: Option<&str>,
         outcome: ToolInvocationTerminalOutcome,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
         let next = outcome.state();
@@ -119,6 +159,13 @@ impl InMemoryInvocationLedger {
                 expected,
                 actual: entry.state,
             });
+        }
+        if expected == ToolInvocationState::Dispatched {
+            let owner_id =
+                owner_id.ok_or_else(|| InvocationLedgerError::DispatchOwnerRequired {
+                    identity: identity.clone(),
+                })?;
+            ensure_owner(identity, entry, owner_id)?;
         }
         if !expected.can_transition_to(next) {
             return Err(InvocationLedgerError::IllegalTransition {
@@ -136,6 +183,45 @@ impl InMemoryInvocationLedger {
     pub fn get(&self, identity: &ToolInvocationIdentity) -> Option<&ToolInvocationRecord> {
         self.entries.get(identity)
     }
+
+    fn dispatched_entry_for_owner(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+    ) -> Result<&mut ToolInvocationRecord, InvocationLedgerError> {
+        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if entry.state != ToolInvocationState::Dispatched {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity: identity.clone(),
+                expected: ToolInvocationState::Dispatched,
+                actual: entry.state,
+            });
+        }
+        ensure_owner(identity, entry, owner_id)?;
+        Ok(entry)
+    }
+}
+
+fn ensure_owner(
+    identity: &ToolInvocationIdentity,
+    entry: &ToolInvocationRecord,
+    owner_id: &str,
+) -> Result<(), InvocationLedgerError> {
+    let lease = entry.dispatch_lease.as_ref().ok_or_else(|| {
+        InvocationLedgerError::MissingDispatchLease {
+            identity: identity.clone(),
+        }
+    })?;
+    if lease.owner_id != owner_id {
+        return Err(InvocationLedgerError::DispatchOwnerMismatch {
+            identity: identity.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -158,18 +244,22 @@ pub enum InvocationLedgerError {
         from: ToolInvocationState,
         to: ToolInvocationState,
     },
-    #[error(
-        "dispatch certainty {actual:?} is inconsistent with state {state:?}; expected {expected:?}"
-    )]
-    CertaintyMismatch {
-        state: ToolInvocationState,
-        expected: DispatchCertainty,
-        actual: DispatchCertainty,
-    },
-    #[error("terminal state {state:?} requires a typed invocation outcome")]
-    TerminalOutcomeRequired { state: ToolInvocationState },
     #[error("invocation fingerprint and durable decision disagree: {identity:?}")]
     DecisionMismatch { identity: ToolInvocationIdentity },
+    #[error("dispatched invocation is missing its owner lease: {identity:?}")]
+    MissingDispatchLease { identity: ToolInvocationIdentity },
+    #[error("dispatch owner does not own invocation: {identity:?}")]
+    DispatchOwnerMismatch { identity: ToolInvocationIdentity },
+    #[error("dispatch owner is required to complete invocation: {identity:?}")]
+    DispatchOwnerRequired { identity: ToolInvocationIdentity },
+    #[error(
+        "dispatch lease renewal must extend its deadline for {identity:?}: current {current_expiry_epoch_ms}, proposed {proposed_expiry_epoch_ms}"
+    )]
+    LeaseNotExtended {
+        identity: Box<ToolInvocationIdentity>,
+        current_expiry_epoch_ms: u64,
+        proposed_expiry_epoch_ms: u64,
+    },
 }
 
 #[cfg(test)]
@@ -209,6 +299,10 @@ mod tests {
                 exit_semantics: None,
             },
         }
+    }
+
+    fn lease(owner_id: &str, expires_at_epoch_ms: u64) -> ToolInvocationDispatchLease {
+        ToolInvocationDispatchLease::new(owner_id, expires_at_epoch_ms).unwrap()
     }
 
     #[test]
@@ -297,21 +391,15 @@ mod tests {
             .unwrap();
 
         let dispatched = ledger
-            .compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
+            .claim_dispatch(&identity, lease("worker-1", 100))
             .unwrap();
         assert_eq!(dispatched.attempt_count, 1);
+        assert_eq!(
+            dispatched.dispatch_lease.as_ref().unwrap().owner_id,
+            "worker-1"
+        );
         assert!(matches!(
-            ledger.compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            ),
+            ledger.claim_dispatch(&identity, lease("worker-2", 200)),
             Err(InvocationLedgerError::StateMismatch { .. })
         ));
     }
@@ -324,35 +412,28 @@ mod tests {
             .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
         ledger
-            .compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
-            .unwrap();
-        ledger
-            .compare_and_transition(
-                &identity,
-                ToolInvocationState::Dispatched,
-                ToolInvocationState::OutcomeUnknown,
-                DispatchCertainty::Unknown,
-            )
+            .claim_dispatch(&identity, lease("worker-1", 100))
             .unwrap();
 
+        assert_eq!(
+            ledger
+                .reconcile_expired_dispatch(&identity, 99)
+                .unwrap()
+                .state,
+            ToolInvocationState::Dispatched
+        );
+        let unknown = ledger.reconcile_expired_dispatch(&identity, 100).unwrap();
+        assert_eq!(unknown.state, ToolInvocationState::OutcomeUnknown);
+
         assert!(matches!(
-            ledger.compare_and_transition(
-                &identity,
-                ToolInvocationState::OutcomeUnknown,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            ),
-            Err(InvocationLedgerError::IllegalTransition { .. })
+            ledger.claim_dispatch(&identity, lease("worker-2", 200)),
+            Err(InvocationLedgerError::StateMismatch { .. })
         ));
         let reconciled = ledger
             .compare_and_complete(
                 &identity,
                 ToolInvocationState::OutcomeUnknown,
+                None,
                 success("deployed"),
             )
             .unwrap();
@@ -362,54 +443,59 @@ mod tests {
     }
 
     #[test]
-    fn terminal_transition_without_typed_outcome_is_rejected() {
+    fn completion_requires_the_dispatch_owner() {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
             .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
         ledger
-            .compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
+            .claim_dispatch(&identity, lease("worker-1", 100))
             .unwrap();
 
         assert!(matches!(
-            ledger.compare_and_transition(
+            ledger.compare_and_complete(
                 &identity,
                 ToolInvocationState::Dispatched,
-                ToolInvocationState::Succeeded,
-                DispatchCertainty::Dispatched,
+                Some("worker-2"),
+                success("wrong owner"),
             ),
-            Err(InvocationLedgerError::TerminalOutcomeRequired {
-                state: ToolInvocationState::Succeeded
-            })
+            Err(InvocationLedgerError::DispatchOwnerMismatch { .. })
         ));
+        let completed = ledger
+            .compare_and_complete(
+                &identity,
+                ToolInvocationState::Dispatched,
+                Some("worker-1"),
+                success("deployed"),
+            )
+            .unwrap();
+        assert_eq!(completed.state, ToolInvocationState::Succeeded);
     }
 
     #[test]
-    fn state_and_dispatch_certainty_cannot_disagree() {
+    fn only_owner_can_extend_and_renewal_must_move_deadline_forward() {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
             .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
 
+        ledger
+            .claim_dispatch(&identity, lease("worker-1", 100))
+            .unwrap();
+
         assert!(matches!(
-            ledger.compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Unknown,
-            ),
-            Err(InvocationLedgerError::CertaintyMismatch { .. })
+            ledger.renew_dispatch(&identity, lease("worker-2", 200)),
+            Err(InvocationLedgerError::DispatchOwnerMismatch { .. })
         ));
-        assert_eq!(
-            ledger.get(&identity).unwrap().state,
-            ToolInvocationState::Prepared
-        );
+        assert!(matches!(
+            ledger.renew_dispatch(&identity, lease("worker-1", 100)),
+            Err(InvocationLedgerError::LeaseNotExtended { .. })
+        ));
+        let renewed = ledger
+            .renew_dispatch(&identity, lease("worker-1", 200))
+            .unwrap();
+        assert_eq!(renewed.dispatch_lease.unwrap().expires_at_epoch_ms, 200);
     }
 }

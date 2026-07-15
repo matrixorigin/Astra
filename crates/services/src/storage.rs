@@ -2065,6 +2065,8 @@ pub async fn ensure_core_schema(
             state               VARCHAR(32) NOT NULL,
             dispatch_certainty  VARCHAR(32) NOT NULL,
             attempt_count       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            dispatch_owner      VARCHAR(64) NULL,
+            dispatch_lease_expires_at DATETIME(6) NULL,
             outcome_json        JSON NULL,
             created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -2080,6 +2082,22 @@ pub async fn ensure_core_schema(
         "tool_invocation_ledger",
         "decision_json",
         "ALTER TABLE tool_invocation_ledger ADD COLUMN decision_json JSON NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "dispatch_owner",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_owner VARCHAR(64) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "dispatch_lease_expires_at",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_lease_expires_at DATETIME(6) NULL",
     )
     .await?;
     add_column_if_missing(

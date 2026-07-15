@@ -7,19 +7,55 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astra_turn_core::invocation_ledger::{InMemoryInvocationLedger, InvocationLedgerError};
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome,
+    ToolInvocationDecision, ToolInvocationDispatchLease, ToolInvocationFingerprint,
+    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
+    ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) enum InvocationBeginDisposition {
-    Execute(ToolInvocationDecision),
+    Execute {
+        decision: ToolInvocationDecision,
+        owner_id: String,
+    },
     Return(astra_tools::ToolResult),
+}
+
+pub(crate) const DISPATCH_LEASE_DURATION: Duration = Duration::from_secs(90);
+pub(crate) const DISPATCH_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+
+pub(crate) struct DispatchLeaseHeartbeat {
+    cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DispatchLeaseHeartbeat {
+    pub(crate) async fn stop(mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!(%error, "tool invocation lease heartbeat task failed");
+            }
+        }
+    }
+}
+
+impl Drop for DispatchLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,22 +95,93 @@ impl RuntimeToolInvocationLedger {
     pub(crate) async fn dispatch(
         &self,
         identity: &ToolInvocationIdentity,
+        owner_id: &str,
     ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
         match self {
             Self::Database(ledger) => Ok(ledger
-                .compare_and_transition(
+                .claim_dispatch(
                     identity,
-                    ToolInvocationState::Prepared,
-                    ToolInvocationState::Dispatched,
-                    DispatchCertainty::Dispatched,
+                    owner_id,
+                    duration_millis(DISPATCH_LEASE_DURATION)?,
                 )
                 .await?),
-            Self::InMemory(ledger) => Ok(ledger.lock().await.compare_and_transition(
-                identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )?),
+            Self::InMemory(ledger) => {
+                let lease = lease_from_now(owner_id, DISPATCH_LEASE_DURATION)?;
+                Ok(ledger.lock().await.claim_dispatch(identity, lease)?)
+            }
+        }
+    }
+
+    pub(crate) async fn renew_dispatch(
+        &self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+    ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
+        match self {
+            Self::Database(ledger) => Ok(ledger
+                .renew_dispatch(
+                    identity,
+                    owner_id,
+                    duration_millis(DISPATCH_LEASE_DURATION)?,
+                )
+                .await?),
+            Self::InMemory(ledger) => {
+                let lease = lease_from_now(owner_id, DISPATCH_LEASE_DURATION)?;
+                Ok(ledger.lock().await.renew_dispatch(identity, lease)?)
+            }
+        }
+    }
+
+    pub(crate) async fn reconcile_expired_dispatch(
+        &self,
+        identity: &ToolInvocationIdentity,
+    ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
+        match self {
+            Self::Database(ledger) => Ok(ledger.reconcile_expired_dispatch(identity).await?),
+            Self::InMemory(ledger) => Ok(ledger
+                .lock()
+                .await
+                .reconcile_expired_dispatch(identity, now_epoch_ms()?)?),
+        }
+    }
+
+    pub(crate) fn start_lease_heartbeat(
+        &self,
+        identity: ToolInvocationIdentity,
+        owner_id: String,
+    ) -> DispatchLeaseHeartbeat {
+        let ledger = self.clone();
+        let cancel = CancellationToken::new();
+        let heartbeat_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DISPATCH_LEASE_RENEW_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` ticks immediately once; the initial claim already
+            // owns a full lease, so wait for the first renewal interval.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = ledger.renew_dispatch(&identity, &owner_id).await {
+                            tracing::warn!(
+                                user_id = %identity.user_id,
+                                session_id = %identity.session_id,
+                                run_id = %identity.run_id,
+                                turn_chain_id = %identity.turn_chain_id,
+                                invocation_id = %identity.invocation_id,
+                                dispatch_owner = %owner_id,
+                                %error,
+                                "tool invocation lease renewal failed"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        DispatchLeaseHeartbeat {
+            cancel,
+            task: Some(task),
         }
     }
 
@@ -91,15 +198,40 @@ impl RuntimeToolInvocationLedger {
     pub(crate) async fn complete(
         &self,
         identity: &ToolInvocationIdentity,
+        owner_id: &str,
         outcome: &ToolInvocationTerminalOutcome,
     ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
         match self {
             Self::Database(ledger) => Ok(ledger
-                .compare_and_complete(identity, ToolInvocationState::Dispatched, outcome)
+                .compare_and_complete(
+                    identity,
+                    ToolInvocationState::Dispatched,
+                    Some(owner_id),
+                    outcome,
+                )
                 .await?),
             Self::InMemory(ledger) => Ok(ledger.lock().await.compare_and_complete(
                 identity,
                 ToolInvocationState::Dispatched,
+                Some(owner_id),
+                outcome.clone(),
+            )?),
+        }
+    }
+
+    async fn reconcile_complete(
+        &self,
+        identity: &ToolInvocationIdentity,
+        outcome: &ToolInvocationTerminalOutcome,
+    ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
+        match self {
+            Self::Database(ledger) => Ok(ledger
+                .compare_and_complete(identity, ToolInvocationState::OutcomeUnknown, None, outcome)
+                .await?),
+            Self::InMemory(ledger) => Ok(ledger.lock().await.compare_and_complete(
+                identity,
+                ToolInvocationState::OutcomeUnknown,
+                None,
                 outcome.clone(),
             )?),
         }
@@ -108,22 +240,14 @@ impl RuntimeToolInvocationLedger {
     pub(crate) async fn mark_outcome_unknown(
         &self,
         identity: &ToolInvocationIdentity,
+        owner_id: &str,
     ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
         match self {
-            Self::Database(ledger) => Ok(ledger
-                .compare_and_transition(
-                    identity,
-                    ToolInvocationState::Dispatched,
-                    ToolInvocationState::OutcomeUnknown,
-                    DispatchCertainty::Unknown,
-                )
-                .await?),
-            Self::InMemory(ledger) => Ok(ledger.lock().await.compare_and_transition(
-                identity,
-                ToolInvocationState::Dispatched,
-                ToolInvocationState::OutcomeUnknown,
-                DispatchCertainty::Unknown,
-            )?),
+            Self::Database(ledger) => Ok(ledger.mark_outcome_unknown(identity, owner_id).await?),
+            Self::InMemory(ledger) => Ok(ledger
+                .lock()
+                .await
+                .mark_outcome_unknown(identity, owner_id)?),
         }
     }
 
@@ -145,8 +269,12 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationState::Prepared => {
                 validate_decision(&record.decision)
                     .map_err(RuntimeInvocationLedgerError::InvalidDecision)?;
-                match self.dispatch(identity).await {
-                    Ok(record) => Ok(InvocationBeginDisposition::Execute(record.decision)),
+                let owner_id = uuid::Uuid::now_v7().to_string();
+                match self.dispatch(identity, &owner_id).await {
+                    Ok(record) => Ok(InvocationBeginDisposition::Execute {
+                        decision: record.decision,
+                        owner_id,
+                    }),
                     Err(dispatch_error) => {
                         let Some(authoritative) = self.get(identity).await? else {
                             return Err(dispatch_error);
@@ -154,6 +282,14 @@ impl RuntimeToolInvocationLedger {
                         disposition_for_existing_record(authoritative)?.ok_or(dispatch_error)
                     }
                 }
+            }
+            ToolInvocationState::Dispatched => {
+                let authoritative = self.reconcile_expired_dispatch(identity).await?;
+                disposition_for_existing_record(authoritative)?.ok_or_else(|| {
+                    RuntimeInvocationLedgerError::InvalidRecord(
+                        "reconciled invocation remained prepared".to_string(),
+                    )
+                })
             }
             _ => disposition_for_existing_record(record)?.ok_or_else(|| {
                 RuntimeInvocationLedgerError::InvalidRecord(
@@ -170,10 +306,11 @@ impl RuntimeToolInvocationLedger {
     pub(crate) async fn finish(
         &self,
         identity: &ToolInvocationIdentity,
+        owner_id: &str,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
         if result_side_effects_maybe(&result) {
-            return match self.mark_outcome_unknown(identity).await {
+            return match self.mark_outcome_unknown(identity, owner_id).await {
                 Ok(_) => {
                     annotate_durable_state(&mut result, ToolInvocationState::OutcomeUnknown, false);
                     let metadata = result.metadata.get_or_insert_with(Map::new);
@@ -181,26 +318,55 @@ impl RuntimeToolInvocationLedger {
                     metadata.insert("resumable".to_string(), Value::Bool(true));
                     result
                 }
-                Err(error) => durability_error_result(
-                    identity,
-                    ToolInvocationState::Dispatched,
-                    format!("persist outcome-unknown state: {error}"),
-                ),
+                Err(error) => {
+                    if matches!(self.get(identity).await, Ok(Some(record)) if record.state == ToolInvocationState::OutcomeUnknown)
+                    {
+                        annotate_durable_state(
+                            &mut result,
+                            ToolInvocationState::OutcomeUnknown,
+                            false,
+                        );
+                        let metadata = result.metadata.get_or_insert_with(Map::new);
+                        metadata.insert("retryable".to_string(), Value::Bool(false));
+                        metadata.insert("resumable".to_string(), Value::Bool(true));
+                        result
+                    } else {
+                        durability_error_result(
+                            identity,
+                            ToolInvocationState::Dispatched,
+                            format!("persist outcome-unknown state: {error}"),
+                        )
+                    }
+                }
             };
         }
 
         let outcome = terminal_outcome_from_result(&result);
-        match self.complete(identity, &outcome).await {
+        match self.complete(identity, owner_id, &outcome).await {
             Ok(record) => project_terminal_outcome(&outcome, record.state, false),
             Err(complete_error) => {
-                if let Ok(Some(record)) = self.get(identity).await
-                    && record.state.is_terminal()
-                {
-                    return replay_terminal_record(&record).unwrap_or_else(|error| {
-                        durability_error_result(identity, record.state, error.to_string())
-                    });
+                if let Ok(Some(record)) = self.get(identity).await {
+                    if record.state == ToolInvocationState::OutcomeUnknown {
+                        return match self.reconcile_complete(identity, &outcome).await {
+                            Ok(reconciled) => {
+                                project_terminal_outcome(&outcome, reconciled.state, false)
+                            }
+                            Err(reconcile_error) => durability_error_result(
+                                identity,
+                                ToolInvocationState::OutcomeUnknown,
+                                format!(
+                                    "persist terminal outcome: {complete_error}; reconcile acknowledged outcome: {reconcile_error}"
+                                ),
+                            ),
+                        };
+                    }
+                    if record.state.is_terminal() {
+                        return replay_terminal_record(&record).unwrap_or_else(|error| {
+                            durability_error_result(identity, record.state, error.to_string())
+                        });
+                    }
                 }
-                match self.mark_outcome_unknown(identity).await {
+                match self.mark_outcome_unknown(identity, owner_id).await {
                     Ok(_) => durability_error_result(
                         identity,
                         ToolInvocationState::OutcomeUnknown,
@@ -219,13 +385,41 @@ impl RuntimeToolInvocationLedger {
     }
 }
 
+fn now_epoch_ms() -> Result<u64, RuntimeInvocationLedgerError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeInvocationLedgerError::Clock(error.to_string()))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| RuntimeInvocationLedgerError::Clock("epoch milliseconds overflow".to_string()))
+}
+
+fn duration_millis(duration: Duration) -> Result<u64, RuntimeInvocationLedgerError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        RuntimeInvocationLedgerError::Clock("dispatch lease duration overflow".to_string())
+    })
+}
+
+fn lease_from_now(
+    owner_id: &str,
+    duration: Duration,
+) -> Result<ToolInvocationDispatchLease, RuntimeInvocationLedgerError> {
+    let expires_at_epoch_ms = now_epoch_ms()?
+        .checked_add(duration_millis(duration)?)
+        .ok_or_else(|| {
+            RuntimeInvocationLedgerError::Clock("dispatch lease deadline overflow".to_string())
+        })?;
+    ToolInvocationDispatchLease::new(owner_id, expires_at_epoch_ms)
+        .map_err(|error| RuntimeInvocationLedgerError::InvalidRecord(error.to_string()))
+}
+
 fn disposition_for_existing_record(
     record: ToolInvocationRecord,
 ) -> Result<Option<InvocationBeginDisposition>, RuntimeInvocationLedgerError> {
     match record.state {
         ToolInvocationState::Prepared => Ok(None),
         ToolInvocationState::Dispatched => Ok(Some(InvocationBeginDisposition::Return(
-            pending_result(&record.identity),
+            pending_result(&record),
         ))),
         ToolInvocationState::OutcomeUnknown => Ok(Some(InvocationBeginDisposition::Return(
             outcome_unknown_result(&record.identity),
@@ -420,14 +614,22 @@ fn annotate_durable_state(
     metadata.insert("invocation_replay".to_string(), Value::Bool(replay));
 }
 
-fn pending_result(identity: &ToolInvocationIdentity) -> astra_tools::ToolResult {
-    invocation_state_result(
-        identity,
+fn pending_result(record: &ToolInvocationRecord) -> astra_tools::ToolResult {
+    let mut result = invocation_state_result(
+        &record.identity,
         ToolInvocationState::Dispatched,
         "tool_invocation_in_progress",
         false,
         "The same logical tool invocation is already dispatched; Astra will not send it again.",
-    )
+    );
+    if let Some(lease) = record.dispatch_lease.as_ref() {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        metadata.insert(
+            "dispatch_lease_expires_at_epoch_ms".to_string(),
+            Value::from(lease.expires_at_epoch_ms),
+        );
+    }
+    result
 }
 
 fn outcome_unknown_result(identity: &ToolInvocationIdentity) -> astra_tools::ToolResult {
@@ -525,6 +727,8 @@ pub(crate) enum RuntimeInvocationLedgerError {
     InvalidRecord(String),
     #[error("invalid frozen tool invocation decision: {0}")]
     InvalidDecision(String),
+    #[error("tool invocation dispatch clock error: {0}")]
+    Clock(String),
 }
 
 impl From<astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError>
@@ -583,6 +787,13 @@ mod tests {
             .await
     }
 
+    fn execute_owner(disposition: InvocationBeginDisposition) -> String {
+        match disposition {
+            InvocationBeginDisposition::Execute { owner_id, .. } => owner_id,
+            InvocationBeginDisposition::Return(_) => panic!("invocation should execute"),
+        }
+    }
+
     #[tokio::test]
     async fn logical_identity_not_semantic_arguments_controls_replay() {
         let ledger = RuntimeToolInvocationLedger::new(None);
@@ -591,12 +802,9 @@ mod tests {
         let second = identity("call-2");
         let fingerprint = fingerprint(&args);
 
-        assert!(matches!(
-            begin(&ledger, &first, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute(_)
-        ));
+        let first_owner = execute_owner(begin(&ledger, &first, &fingerprint).await.unwrap());
         let first_result = astra_tools::ToolResult::text("deployed".to_string());
-        let committed = ledger.finish(&first, first_result).await;
+        let committed = ledger.finish(&first, &first_owner, first_result).await;
         assert!(!committed.is_error);
         assert_eq!(
             committed.metadata.as_ref().unwrap()["durable_invocation_state"],
@@ -605,14 +813,14 @@ mod tests {
 
         let replay = match begin(&ledger, &first, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute(_) => panic!("terminal identity must replay"),
+            InvocationBeginDisposition::Execute { .. } => panic!("terminal identity must replay"),
         };
         assert_eq!(replay.output, "deployed");
         assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
 
         assert!(matches!(
             begin(&ledger, &second, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute(_)
+            InvocationBeginDisposition::Execute { .. }
         ));
     }
 
@@ -633,6 +841,66 @@ mod tests {
             Err(RuntimeInvocationLedgerError::InMemory(error))
                 if matches!(*error, InvocationLedgerError::IdentityConflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn active_dispatch_returns_observable_pending_without_a_second_claim() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-active");
+        let fingerprint = fingerprint(&json!({"command": "deploy"}));
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
+
+        let pending = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("a live lease must fence duplicate dispatch")
+            }
+        };
+        let metadata = pending.metadata.as_ref().unwrap();
+        assert_eq!(metadata["durable_invocation_state"], "dispatched");
+        assert_eq!(metadata["error_kind"], "tool_invocation_in_progress");
+        assert!(metadata["dispatch_lease_expires_at_epoch_ms"].is_u64());
+        let record = ledger.get(&identity).await.unwrap().unwrap();
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.dispatch_lease.unwrap().owner_id, owner);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_late_result_reconciles_an_expired_dispatch() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-late-result");
+        let fingerprint = fingerprint(&json!({"command": "deploy"}));
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
+        match &ledger {
+            RuntimeToolInvocationLedger::InMemory(inner) => {
+                let reconciled = inner
+                    .lock()
+                    .await
+                    .reconcile_expired_dispatch(&identity, u64::MAX)
+                    .unwrap();
+                assert_eq!(reconciled.state, ToolInvocationState::OutcomeUnknown);
+            }
+            RuntimeToolInvocationLedger::Database(_) => unreachable!("test ledger is in-memory"),
+        }
+
+        let completed = ledger
+            .finish(
+                &identity,
+                &owner,
+                astra_tools::ToolResult::text("deployed".to_string()),
+            )
+            .await;
+        assert!(!completed.is_error, "{completed:?}");
+        assert_eq!(
+            completed.metadata.as_ref().unwrap()["durable_invocation_state"],
+            "succeeded"
+        );
+        let replay = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => panic!("terminal result must replay"),
+        };
+        assert_eq!(replay.output, "deployed");
+        assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
     }
 
     #[tokio::test]
@@ -657,8 +925,8 @@ mod tests {
             .await
             .unwrap();
         match resumed {
-            InvocationBeginDisposition::Execute(authoritative) => {
-                assert_eq!(authoritative, original);
+            InvocationBeginDisposition::Execute { decision, .. } => {
+                assert_eq!(decision, original);
             }
             InvocationBeginDisposition::Return(_) => panic!("prepared invocation should resume"),
         }
@@ -709,17 +977,14 @@ mod tests {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-1");
         let fingerprint = fingerprint(&json!({"command": "deploy"}));
-        assert!(matches!(
-            begin(&ledger, &identity, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute(_)
-        ));
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
         let mut ambiguous = astra_tools::ToolResult::error("connection lost".to_string());
         ambiguous.metadata = Some(Map::from_iter([
             ("execution_started".to_string(), Value::Bool(true)),
             ("side_effects_maybe".to_string(), Value::Bool(true)),
         ]));
 
-        let result = ledger.finish(&identity, ambiguous).await;
+        let result = ledger.finish(&identity, &owner, ambiguous).await;
         assert_eq!(
             result.metadata.as_ref().unwrap()["durable_invocation_state"],
             "outcome_unknown"
@@ -727,7 +992,7 @@ mod tests {
         assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
         let resumed = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute(_) => {
+            InvocationBeginDisposition::Execute { .. } => {
                 panic!("uncertain invocation must not retry")
             }
         };
@@ -742,18 +1007,18 @@ mod tests {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-1");
         let fingerprint = fingerprint(&json!({"command": "test -f missing"}));
-        begin(&ledger, &identity, &fingerprint).await.unwrap();
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
         let result = astra_tools::ToolResult {
             output: "not found".to_string(),
             metadata: Some(Map::from_iter([("exit_code".to_string(), json!(1))])),
             is_error: false,
             exit_semantics: Some(ExitSemantics::DomainNegative),
         };
-        ledger.finish(&identity, result).await;
+        ledger.finish(&identity, &owner, result).await;
 
         let replay = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute(_) => panic!("terminal identity must replay"),
+            InvocationBeginDisposition::Execute { .. } => panic!("terminal identity must replay"),
         };
         assert_eq!(replay.output, "not found");
         assert_eq!(replay.exit_semantics, Some(ExitSemantics::DomainNegative));

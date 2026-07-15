@@ -10,7 +10,7 @@ use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationLedgerStoreError,
 };
 use astra_turn_types::{
-    DispatchCertainty, DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+    DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
     ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationResultPayload,
     ToolInvocationState, ToolInvocationTerminalOutcome,
 };
@@ -91,6 +91,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     let prefix = Uuid::new_v4().simple().to_string();
     let first = identity(&prefix, "call-1");
     let second = identity(&prefix, "call-2");
+    let abandoned = identity(&prefix, "call-abandoned");
     cleanup(&pool, &first).await;
     let ledger = DatabaseToolInvocationLedger::new(shared);
     let original = fingerprint("deploy");
@@ -138,19 +139,14 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         ToolInvocationPrepareOutcome::Prepared(_)
     ));
 
-    let dispatch = |ledger: DatabaseToolInvocationLedger, identity: ToolInvocationIdentity| async move {
-        ledger
-            .compare_and_transition(
-                &identity,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
-            .await
+    let dispatch = |ledger: DatabaseToolInvocationLedger,
+                    identity: ToolInvocationIdentity,
+                    owner: &'static str| async move {
+        ledger.claim_dispatch(&identity, owner, 90_000).await
     };
     let (race_a, race_b) = tokio::join!(
-        dispatch(ledger.clone(), second.clone()),
-        dispatch(ledger.clone(), second.clone())
+        dispatch(ledger.clone(), second.clone(), "worker-a"),
+        dispatch(ledger.clone(), second.clone(), "worker-b")
     );
     let race_results = [race_a, race_b];
     assert_eq!(
@@ -172,23 +168,32 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         1,
         "the losing worker must observe the authoritative dispatched state: {race_results:?}"
     );
+    let winning_owner = race_results
+        .iter()
+        .find_map(|result| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|record| record.dispatch_lease.as_ref())
+                .map(|lease| lease.owner_id.clone())
+        })
+        .expect("winning dispatch owner");
     assert!(matches!(
         ledger
-            .compare_and_transition(
+            .compare_and_complete(
                 &second,
                 ToolInvocationState::Dispatched,
-                ToolInvocationState::Failed,
-                DispatchCertainty::Dispatched,
+                Some("not-the-owner"),
+                &failure("wrong owner"),
             )
             .await,
-        Err(ToolInvocationLedgerStoreError::TerminalOutcomeRequired {
-            state: ToolInvocationState::Failed
-        })
+        Err(ToolInvocationLedgerStoreError::DispatchOwnerMismatch { .. })
     ));
     let failed = ledger
         .compare_and_complete(
             &second,
             ToolInvocationState::Dispatched,
+            Some(&winning_owner),
             &failure("provider failed"),
         )
         .await
@@ -202,25 +207,61 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
                 && record.outcome.as_ref().unwrap().result().output == "provider failed"
     ));
 
+    ledger
+        .prepare(&abandoned, &original, &decision())
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&abandoned, "worker-abandoned", 90_000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ledger.reconcile_expired_dispatch(&abandoned).await.unwrap(),
+        record if record.state == ToolInvocationState::Dispatched
+    ));
+    let wrong_owner_renewal = ledger
+        .renew_dispatch(&abandoned, "wrong-worker", 90_000)
+        .await;
+    assert!(
+        matches!(
+            wrong_owner_renewal,
+            Err(ToolInvocationLedgerStoreError::DispatchOwnerMismatch { .. })
+        ),
+        "wrong owner must not renew another worker's dispatch: {wrong_owner_renewal:?}"
+    );
+    sqlx::query(
+        "UPDATE tool_invocation_ledger
+         SET dispatch_lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND turn_chain_id = ? AND invocation_id = ?",
+    )
+    .bind(&abandoned.user_id)
+    .bind(&abandoned.session_id)
+    .bind(&abandoned.run_id)
+    .bind(&abandoned.turn_chain_id)
+    .bind(&abandoned.invocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let expired = ledger.reconcile_expired_dispatch(&abandoned).await.unwrap();
+    assert_eq!(expired.state, ToolInvocationState::OutcomeUnknown);
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&abandoned, "replacement-worker", 90_000)
+            .await,
+        Err(ToolInvocationLedgerStoreError::StateMismatch {
+            actual: ToolInvocationState::OutcomeUnknown,
+            ..
+        })
+    ));
+
     let dispatched = ledger
-        .compare_and_transition(
-            &first,
-            ToolInvocationState::Prepared,
-            ToolInvocationState::Dispatched,
-            DispatchCertainty::Dispatched,
-        )
+        .claim_dispatch(&first, "worker-first", 90_000)
         .await
         .unwrap();
     assert_eq!(dispatched.attempt_count, 1);
     assert!(matches!(
-        ledger
-            .compare_and_transition(
-                &first,
-                ToolInvocationState::Prepared,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
-            .await,
+        ledger.claim_dispatch(&first, "worker-other", 90_000).await,
         Err(ToolInvocationLedgerStoreError::StateMismatch {
             actual: ToolInvocationState::Dispatched,
             ..
@@ -228,29 +269,18 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     ));
 
     ledger
-        .compare_and_transition(
-            &first,
-            ToolInvocationState::Dispatched,
-            ToolInvocationState::OutcomeUnknown,
-            DispatchCertainty::Unknown,
-        )
+        .mark_outcome_unknown(&first, "worker-first")
         .await
         .unwrap();
     assert!(matches!(
-        ledger
-            .compare_and_transition(
-                &first,
-                ToolInvocationState::OutcomeUnknown,
-                ToolInvocationState::Dispatched,
-                DispatchCertainty::Dispatched,
-            )
-            .await,
-        Err(ToolInvocationLedgerStoreError::IllegalTransition { .. })
+        ledger.claim_dispatch(&first, "worker-other", 90_000).await,
+        Err(ToolInvocationLedgerStoreError::StateMismatch { .. })
     ));
     let reconciled = ledger
         .compare_and_complete(
             &first,
             ToolInvocationState::OutcomeUnknown,
+            None,
             &success("deployed"),
         )
         .await

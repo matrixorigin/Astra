@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::ResolvedToolDescriptorRef;
 
 pub const TOOL_INVOCATION_CONTRACT_VERSION: &str = "tool-invocation-v1";
+pub const TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES: usize = 64;
 
 const INTERNAL_TRANSPORT_ARGUMENTS: [&str; 3] = ["_run_id", "_tool_call_id", "_turn_chain_id"];
 
@@ -354,6 +355,60 @@ pub enum DispatchCertainty {
     Unknown,
 }
 
+/// Exclusive ownership proof for one route-boundary dispatch. The owner token
+/// is opaque and unguessable; the deadline is a liveness lease, not an
+/// execution timeout. A live worker renews it while the provider call runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolInvocationDispatchLease {
+    pub owner_id: String,
+    pub expires_at_epoch_ms: u64,
+}
+
+impl ToolInvocationDispatchLease {
+    pub fn new(
+        owner_id: impl Into<String>,
+        expires_at_epoch_ms: u64,
+    ) -> Result<Self, ToolInvocationContractError> {
+        let owner_id = owner_id.into();
+        if owner_id.trim().is_empty() {
+            return Err(ToolInvocationContractError::EmptyDispatchOwner);
+        }
+        if owner_id.len() > TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES {
+            return Err(ToolInvocationContractError::DispatchOwnerTooLong {
+                actual_bytes: owner_id.len(),
+                max_bytes: TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES,
+            });
+        }
+        if expires_at_epoch_ms == 0 {
+            return Err(ToolInvocationContractError::InvalidDispatchLeaseExpiry);
+        }
+        Ok(Self {
+            owner_id,
+            expires_at_epoch_ms,
+        })
+    }
+
+    pub fn is_expired_at(&self, now_epoch_ms: u64) -> bool {
+        self.expires_at_epoch_ms <= now_epoch_ms
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationDispatchLease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawLease {
+            owner_id: String,
+            expires_at_epoch_ms: u64,
+        }
+
+        let raw = RawLease::deserialize(deserializer)?;
+        Self::new(raw.owner_id, raw.expires_at_epoch_ms).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Durable, replayable result returned by one acknowledged invocation. The
 /// payload is the bounded runtime projection, not an unbounded provider body;
 /// large raw evidence belongs in an owner-scoped artifact referenced by
@@ -418,6 +473,8 @@ pub struct ToolInvocationRecord {
     pub dispatch_certainty: DispatchCertainty,
     pub attempt_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_lease: Option<ToolInvocationDispatchLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ToolInvocationTerminalOutcome>,
 }
 
@@ -437,6 +494,15 @@ impl ToolInvocationRecord {
                 expected: required_certainty,
                 actual: self.dispatch_certainty,
             });
+        }
+        match (&self.dispatch_lease, self.state) {
+            (None, ToolInvocationState::Dispatched) => {
+                return Err(ToolInvocationContractError::MissingDispatchLease);
+            }
+            (Some(_), ToolInvocationState::Prepared) => {
+                return Err(ToolInvocationContractError::UnexpectedDispatchLease);
+            }
+            _ => {}
         }
         match (&self.outcome, self.state) {
             (Some(outcome), state) if outcome.state() == state => Ok(()),
@@ -469,6 +535,8 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
             dispatch_certainty: DispatchCertainty,
             attempt_count: u32,
             #[serde(default)]
+            dispatch_lease: Option<ToolInvocationDispatchLease>,
+            #[serde(default)]
             outcome: Option<ToolInvocationTerminalOutcome>,
         }
 
@@ -480,6 +548,7 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
             state: raw.state,
             dispatch_certainty: raw.dispatch_certainty,
             attempt_count: raw.attempt_count,
+            dispatch_lease: raw.dispatch_lease,
             outcome: raw.outcome,
         };
         record.validate().map_err(serde::de::Error::custom)?;
@@ -537,6 +606,15 @@ pub enum ToolInvocationContractError {
     EmptyToolReferenceField { field: &'static str },
     #[error("tool invocation canonical arguments hash must not be empty")]
     EmptyCanonicalArgumentsHash,
+    #[error("tool invocation dispatch owner must not be empty")]
+    EmptyDispatchOwner,
+    #[error("tool invocation dispatch owner is too long: {actual_bytes} bytes exceeds {max_bytes}")]
+    DispatchOwnerTooLong {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("tool invocation dispatch lease expiry must be a positive epoch timestamp")]
+    InvalidDispatchLeaseExpiry,
     #[error("tool invocation decision snapshot must be a JSON object")]
     InvalidDecisionSnapshot,
     #[error("serialize tool invocation decision: {0}")]
@@ -567,6 +645,10 @@ pub enum ToolInvocationContractError {
         expected: DispatchCertainty,
         actual: DispatchCertainty,
     },
+    #[error("a dispatched tool invocation is missing its owner lease")]
+    MissingDispatchLease,
+    #[error("a prepared tool invocation must not already have a dispatch lease")]
+    UnexpectedDispatchLease,
 }
 
 #[cfg(test)]
@@ -710,6 +792,15 @@ mod tests {
         let missing = serde_json::from_value::<ToolInvocationRecord>(base.clone()).unwrap_err();
         assert!(missing.to_string().contains("missing"), "{missing}");
 
+        let mut dispatched_without_owner = base.clone();
+        dispatched_without_owner["state"] = json!("dispatched");
+        let missing_lease =
+            serde_json::from_value::<ToolInvocationRecord>(dispatched_without_owner).unwrap_err();
+        assert!(
+            missing_lease.to_string().contains("owner lease"),
+            "{missing_lease}"
+        );
+
         let mut mismatched = base;
         mismatched["outcome"] = json!({
             "kind": "failed",
@@ -747,6 +838,7 @@ mod tests {
             state: ToolInvocationState::Failed,
             dispatch_certainty: DispatchCertainty::Dispatched,
             attempt_count: 1,
+            dispatch_lease: None,
             outcome: Some(outcome),
         };
 
@@ -767,5 +859,19 @@ mod tests {
 
         let error = serde_json::from_value::<ToolInvocationDecision>(encoded).unwrap_err();
         assert!(error.to_string().contains("content id mismatch"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_lease_rejects_empty_owner_and_zero_deadline() {
+        for invalid in [
+            json!({"owner_id": "", "expires_at_epoch_ms": 1}),
+            json!({"owner_id": "worker-1", "expires_at_epoch_ms": 0}),
+            json!({
+                "owner_id": "x".repeat(TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES + 1),
+                "expires_at_epoch_ms": 1
+            }),
+        ] {
+            assert!(serde_json::from_value::<ToolInvocationDispatchLease>(invalid).is_err());
+        }
     }
 }

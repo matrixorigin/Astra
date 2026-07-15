@@ -5,9 +5,9 @@
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
-    ToolInvocationTerminalOutcome,
+    DispatchCertainty, ToolInvocationDecision, ToolInvocationDispatchLease,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationRecord, ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
@@ -93,69 +93,45 @@ impl DatabaseToolInvocationLedger {
         row.map(|row| decode_record(&row, identity)).transpose()
     }
 
-    /// Atomic state transition. Only one worker can claim
-    /// `Prepared -> Dispatched`; a zero-row update is decoded as missing or a
-    /// compare-and-set conflict instead of silently succeeding.
-    pub async fn compare_and_transition(
+    /// Atomically grant one worker the right to cross the provider boundary.
+    /// MatrixOne's clock owns the lease deadline, avoiding application-host
+    /// clock skew in expiry decisions.
+    pub async fn claim_dispatch(
         &self,
         identity: &ToolInvocationIdentity,
-        expected: ToolInvocationState,
-        next: ToolInvocationState,
-        dispatch_certainty: DispatchCertainty,
+        owner_id: &str,
+        lease_duration_ms: u64,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
-        if matches!(
-            next,
-            ToolInvocationState::Succeeded
-                | ToolInvocationState::Failed
-                | ToolInvocationState::Rejected
-        ) {
-            return Err(ToolInvocationLedgerStoreError::TerminalOutcomeRequired { state: next });
-        }
-        if !expected.can_transition_to(next) {
-            return Err(ToolInvocationLedgerStoreError::IllegalTransition {
-                from: expected,
-                to: next,
-            });
-        }
-        let required = next.required_dispatch_certainty();
-        if dispatch_certainty != required {
-            return Err(ToolInvocationLedgerStoreError::CertaintyMismatch {
-                state: next,
-                expected: required,
-                actual: dispatch_certainty,
-            });
-        }
-        let attempt_increment = u64::from(
-            expected == ToolInvocationState::Prepared && next == ToolInvocationState::Dispatched,
-        );
+        validate_lease_input(owner_id, lease_duration_ms)?;
+        let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut tx = self.pool.get().begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
-             SET state = ?, dispatch_certainty = ?,
-                 attempt_count = attempt_count + ?, updated_at = CURRENT_TIMESTAMP(6)
+             SET state = 'dispatched', dispatch_certainty = 'dispatched',
+                 attempt_count = attempt_count + 1, dispatch_owner = ?,
+                 dispatch_lease_expires_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
+                 updated_at = CURRENT_TIMESTAMP(6)
              WHERE user_id = ? AND session_id = ? AND run_id = ?
-               AND turn_chain_id = ? AND invocation_id = ? AND state = ?",
+               AND turn_chain_id = ? AND invocation_id = ? AND state = 'prepared'",
         )
-        .bind(state_label(next))
-        .bind(certainty_label(dispatch_certainty))
-        .bind(attempt_increment)
+        .bind(owner_id)
+        .bind(lease_duration_us)
         .bind(&identity.user_id)
         .bind(&identity.session_id)
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(&identity.invocation_id)
-        .bind(state_label(expected))
         .execute(&mut *tx)
         .await?
         .rows_affected();
 
         let record = load_record_in_tx(&mut tx, identity).await?;
         if updated != 1 {
-            rollback(tx, "compare-and-transition mismatch").await;
+            rollback(tx, "claim-dispatch mismatch").await;
             return match record {
                 Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
                     identity: identity.clone(),
-                    expected,
+                    expected: ToolInvocationState::Prepared,
                     actual: actual.state,
                 }),
                 None => Err(ToolInvocationLedgerStoreError::NotFound {
@@ -170,6 +146,118 @@ impl DatabaseToolInvocationLedger {
         Ok(record)
     }
 
+    pub async fn renew_dispatch(
+        &self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+        lease_duration_ms: u64,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        validate_lease_input(owner_id, lease_duration_ms)?;
+        let lease_duration_us = lease_duration_us(lease_duration_ms)?;
+        let mut tx = self.pool.get().begin().await?;
+        sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET dispatch_lease_expires_at =
+                     TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'dispatched' AND dispatch_owner = ?",
+        )
+        .bind(lease_duration_us)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+            ToolInvocationLedgerStoreError::NotFound {
+                identity: identity.clone(),
+            }
+        })?;
+        ensure_dispatched_owner(identity, &record, owner_id)?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Return the authoritative row after atomically converting an expired
+    /// dispatch to `OutcomeUnknown`. A live lease or concurrent completion is
+    /// returned unchanged and never overwritten.
+    pub async fn reconcile_expired_dispatch(
+        &self,
+        identity: &ToolInvocationIdentity,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        let mut tx = self.pool.get().begin().await?;
+        sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'dispatched'
+               AND dispatch_lease_expires_at <= CURRENT_TIMESTAMP(6)",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+            ToolInvocationLedgerStoreError::NotFound {
+                identity: identity.clone(),
+            }
+        })?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    pub async fn mark_outcome_unknown(
+        &self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        ToolInvocationDispatchLease::new(owner_id, 1)?;
+        let mut tx = self.pool.get().begin().await?;
+        let updated = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'dispatched' AND dispatch_owner = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let record = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+            ToolInvocationLedgerStoreError::NotFound {
+                identity: identity.clone(),
+            }
+        })?;
+        if updated != 1 {
+            rollback(tx, "mark-outcome-unknown mismatch").await;
+            ensure_dispatched_owner(identity, &record, owner_id)?;
+            return Err(ToolInvocationLedgerStoreError::StateMismatch {
+                identity: identity.clone(),
+                expected: ToolInvocationState::Dispatched,
+                actual: record.state,
+            });
+        }
+        tx.commit().await?;
+        Ok(record)
+    }
+
     /// Atomically persist an acknowledged terminal outcome with its state.
     /// A replay can observe either the pre-terminal state or the complete
     /// typed outcome, never a terminal marker without replay material.
@@ -177,6 +265,7 @@ impl DatabaseToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
         expected: ToolInvocationState,
+        owner_id: Option<&str>,
         outcome: &ToolInvocationTerminalOutcome,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         let next = outcome.state();
@@ -193,38 +282,56 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         let mut tx = self.pool.get().begin().await?;
-        let updated = sqlx::query(
+        let (owner_predicate, owner_id) = completion_owner(expected, owner_id, identity)?;
+        let query = format!(
             "UPDATE tool_invocation_ledger
              SET state = ?, dispatch_certainty = 'dispatched', outcome_json = ?,
                  updated_at = CURRENT_TIMESTAMP(6)
              WHERE user_id = ? AND session_id = ? AND run_id = ?
-               AND turn_chain_id = ? AND invocation_id = ? AND state = ?",
-        )
-        .bind(state_label(next))
-        .bind(outcome_json)
-        .bind(&identity.user_id)
-        .bind(&identity.session_id)
-        .bind(&identity.run_id)
-        .bind(&identity.turn_chain_id)
-        .bind(&identity.invocation_id)
-        .bind(state_label(expected))
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+               AND turn_chain_id = ? AND invocation_id = ? AND state = ?{owner_predicate}"
+        );
+        let mut query = sqlx::query(&query)
+            .bind(state_label(next))
+            .bind(outcome_json)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.invocation_id)
+            .bind(state_label(expected));
+        if let Some(owner_id) = owner_id {
+            query = query.bind(owner_id);
+        }
+        let updated = query.execute(&mut *tx).await?.rows_affected();
 
         let record = load_record_in_tx(&mut tx, identity).await?;
         if updated != 1 {
-            rollback(tx, "compare-and-complete mismatch").await;
-            return match record {
-                Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
+            let mismatch = match record.as_ref() {
+                Some(actual)
+                    if expected == ToolInvocationState::Dispatched
+                        && actual.state == ToolInvocationState::Dispatched
+                        && owner_id.is_some_and(|owner_id| {
+                            actual
+                                .dispatch_lease
+                                .as_ref()
+                                .is_none_or(|lease| lease.owner_id != owner_id)
+                        }) =>
+                {
+                    ToolInvocationLedgerStoreError::DispatchOwnerMismatch {
+                        identity: identity.clone(),
+                    }
+                }
+                Some(actual) => ToolInvocationLedgerStoreError::StateMismatch {
                     identity: identity.clone(),
                     expected,
                     actual: actual.state,
-                }),
-                None => Err(ToolInvocationLedgerStoreError::NotFound {
+                },
+                None => ToolInvocationLedgerStoreError::NotFound {
                     identity: identity.clone(),
-                }),
+                },
             };
+            rollback(tx, "compare-and-complete mismatch").await;
+            return Err(mismatch);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
@@ -241,7 +348,11 @@ fn select_record_query(
         "SELECT CAST(fingerprint_json AS CHAR) AS fingerprint_json,
                 CAST(decision_json AS CHAR) AS decision_json,
                 CAST(outcome_json AS CHAR) AS outcome_json,
-                state, dispatch_certainty, attempt_count
+                state, dispatch_certainty, attempt_count, dispatch_owner,
+                CAST(
+                    UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000
+                    AS UNSIGNED
+                ) AS dispatch_lease_expires_at_epoch_ms
          FROM tool_invocation_ledger
          WHERE user_id = ? AND session_id = ? AND run_id = ?
            AND turn_chain_id = ? AND invocation_id = ?",
@@ -287,6 +398,9 @@ fn decode_record(
     let state_raw: String = row.try_get("state")?;
     let certainty_raw: String = row.try_get("dispatch_certainty")?;
     let attempt_count: u64 = row.try_get("attempt_count")?;
+    let dispatch_owner: Option<String> = row.try_get("dispatch_owner")?;
+    let dispatch_lease_expires_at_epoch_ms: Option<u64> =
+        row.try_get("dispatch_lease_expires_at_epoch_ms")?;
     let outcome_json: Option<String> = row.try_get("outcome_json")?;
     let outcome = outcome_json
         .map(|value| {
@@ -305,6 +419,14 @@ fn decode_record(
     }
     let state = parse_state(&state_raw)?;
     let dispatch_certainty = parse_certainty(&certainty_raw)?;
+    let dispatch_lease = match (dispatch_owner, dispatch_lease_expires_at_epoch_ms) {
+        (Some(owner_id), Some(expires_at_epoch_ms)) => Some(ToolInvocationDispatchLease::new(
+            owner_id,
+            expires_at_epoch_ms,
+        )?),
+        (None, None) => None,
+        _ => return Err(ToolInvocationLedgerStoreError::IncompleteDispatchLease),
+    };
     let required = state.required_dispatch_certainty();
     if dispatch_certainty != required {
         return Err(ToolInvocationLedgerStoreError::CertaintyMismatch {
@@ -320,6 +442,7 @@ fn decode_record(
         state,
         dispatch_certainty,
         attempt_count: attempt_count as u32,
+        dispatch_lease,
         outcome,
     };
     record.validate()?;
@@ -330,6 +453,64 @@ async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(context, %error, "tool invocation ledger rollback failed");
     }
+}
+
+fn validate_lease_input(
+    owner_id: &str,
+    lease_duration_ms: u64,
+) -> Result<(), ToolInvocationLedgerStoreError> {
+    ToolInvocationDispatchLease::new(owner_id, 1)?;
+    if lease_duration_ms == 0 {
+        return Err(ToolInvocationLedgerStoreError::InvalidLeaseDuration);
+    }
+    Ok(())
+}
+
+fn lease_duration_us(lease_duration_ms: u64) -> Result<i64, ToolInvocationLedgerStoreError> {
+    lease_duration_ms
+        .checked_mul(1_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(ToolInvocationLedgerStoreError::LeaseDurationOverflow)
+}
+
+fn ensure_dispatched_owner(
+    identity: &ToolInvocationIdentity,
+    record: &ToolInvocationRecord,
+    owner_id: &str,
+) -> Result<(), ToolInvocationLedgerStoreError> {
+    if record.state != ToolInvocationState::Dispatched {
+        return Err(ToolInvocationLedgerStoreError::StateMismatch {
+            identity: identity.clone(),
+            expected: ToolInvocationState::Dispatched,
+            actual: record.state,
+        });
+    }
+    let lease = record
+        .dispatch_lease
+        .as_ref()
+        .ok_or(ToolInvocationLedgerStoreError::IncompleteDispatchLease)?;
+    if lease.owner_id != owner_id {
+        return Err(ToolInvocationLedgerStoreError::DispatchOwnerMismatch {
+            identity: identity.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn completion_owner<'a>(
+    expected: ToolInvocationState,
+    owner_id: Option<&'a str>,
+    identity: &ToolInvocationIdentity,
+) -> Result<(&'static str, Option<&'a str>), ToolInvocationLedgerStoreError> {
+    if expected != ToolInvocationState::Dispatched {
+        return Ok(("", None));
+    }
+    let owner_id =
+        owner_id.ok_or_else(|| ToolInvocationLedgerStoreError::DispatchOwnerRequired {
+            identity: identity.clone(),
+        })?;
+    ToolInvocationDispatchLease::new(owner_id, 1)?;
+    Ok((" AND dispatch_owner = ?", Some(owner_id)))
 }
 
 fn state_label(state: ToolInvocationState) -> &'static str {
@@ -357,14 +538,6 @@ fn parse_state(value: &str) -> Result<ToolInvocationState, ToolInvocationLedgerS
     }
 }
 
-fn certainty_label(certainty: DispatchCertainty) -> &'static str {
-    match certainty {
-        DispatchCertainty::NotDispatched => "not_dispatched",
-        DispatchCertainty::Dispatched => "dispatched",
-        DispatchCertainty::Unknown => "unknown",
-    }
-}
-
 fn parse_certainty(value: &str) -> Result<DispatchCertainty, ToolInvocationLedgerStoreError> {
     match value {
         "not_dispatched" => Ok(DispatchCertainty::NotDispatched),
@@ -373,6 +546,15 @@ fn parse_certainty(value: &str) -> Result<DispatchCertainty, ToolInvocationLedge
         other => Err(ToolInvocationLedgerStoreError::InvalidDispatchCertainty(
             other.to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+fn certainty_label(certainty: DispatchCertainty) -> &'static str {
+    match certainty {
+        DispatchCertainty::NotDispatched => "not_dispatched",
+        DispatchCertainty::Dispatched => "dispatched",
+        DispatchCertainty::Unknown => "unknown",
     }
 }
 
@@ -396,6 +578,16 @@ pub enum ToolInvocationLedgerStoreError {
     MissingAfterPrepare { identity: ToolInvocationIdentity },
     #[error("stored tool invocation is missing its frozen decision")]
     MissingDecision,
+    #[error("stored tool invocation has an incomplete dispatch lease")]
+    IncompleteDispatchLease,
+    #[error("tool invocation dispatch lease duration must be positive")]
+    InvalidLeaseDuration,
+    #[error("tool invocation dispatch lease duration exceeds database range")]
+    LeaseDurationOverflow,
+    #[error("dispatch owner does not own invocation: {identity:?}")]
+    DispatchOwnerMismatch { identity: ToolInvocationIdentity },
+    #[error("dispatch owner is required to complete invocation: {identity:?}")]
+    DispatchOwnerRequired { identity: ToolInvocationIdentity },
     #[error("tool invocation not found: {identity:?}")]
     NotFound { identity: ToolInvocationIdentity },
     #[error(
@@ -425,8 +617,6 @@ pub enum ToolInvocationLedgerStoreError {
     InvalidDispatchCertainty(String),
     #[error("invalid stored tool invocation attempt_count {0}")]
     InvalidAttemptCount(u64),
-    #[error("terminal state {state:?} requires a typed invocation outcome")]
-    TerminalOutcomeRequired { state: ToolInvocationState },
     #[error(transparent)]
     Contract(#[from] astra_turn_types::ToolInvocationContractError),
 }
