@@ -26,7 +26,7 @@ impl DatabaseSemanticReadObservationStore {
     ) -> Result<Self, SemanticReadObservationStoreError> {
         Ok(Self {
             pool,
-            limits: limits.validate()?,
+            limits: validate_database_limits(limits)?,
         })
     }
 
@@ -122,14 +122,19 @@ impl DatabaseSemanticReadObservationStore {
             }
         }
 
-        let in_flight: u64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM semantic_read_observations
+        // Normalize SQL aggregates to the signed database wire type, then
+        // cross the cache's non-negative resource domain explicitly.
+        let in_flight = nonnegative_database_integer(
+            "in_flight_fills",
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(COUNT(*) AS SIGNED) FROM semantic_read_observations
              WHERE user_id = ? AND session_id = ? AND state = 'filling'",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await?,
+        )?;
         if in_flight >= self.limits.max_in_flight_fills as u64 {
             tx.commit().await?;
             return Ok(SemanticReadCacheLookup::FillCapacityExceeded);
@@ -412,8 +417,8 @@ async fn ready_usage(
     session_id: &str,
 ) -> Result<(u64, u64), SemanticReadObservationStoreError> {
     let row = sqlx::query(
-        "SELECT COUNT(*) AS ready_entries,
-                CAST(COALESCE(SUM(observation_bytes), 0) AS UNSIGNED) AS ready_bytes
+        "SELECT CAST(COUNT(*) AS SIGNED) AS ready_entries,
+                CAST(COALESCE(SUM(observation_bytes), 0) AS SIGNED) AS ready_bytes
          FROM semantic_read_observations
          WHERE user_id = ? AND session_id = ? AND state = 'ready'",
     )
@@ -421,7 +426,10 @@ async fn ready_usage(
     .bind(session_id)
     .fetch_one(&mut **tx)
     .await?;
-    Ok((row.try_get("ready_entries")?, row.try_get("ready_bytes")?))
+    Ok((
+        nonnegative_database_integer("ready_entries", row.try_get("ready_entries")?)?,
+        nonnegative_database_integer("ready_bytes", row.try_get("ready_bytes")?)?,
+    ))
 }
 
 async fn evict_oldest_ready(
@@ -487,6 +495,22 @@ fn validate_owner(fill_owner: &str) -> Result<(), SemanticReadObservationStoreEr
     Ok(())
 }
 
+fn validate_database_limits(
+    limits: SemanticReadCacheLimits,
+) -> Result<SemanticReadCacheLimits, SemanticReadObservationStoreError> {
+    let limits = limits.validate()?;
+    for (field, value) in [
+        ("max_ready_entries", limits.max_ready_entries),
+        ("max_ready_bytes", limits.max_ready_bytes),
+        ("max_in_flight_fills", limits.max_in_flight_fills),
+    ] {
+        i64::try_from(value).map_err(|_| {
+            SemanticReadObservationStoreError::DatabaseLimitOverflow { field, value }
+        })?;
+    }
+    Ok(limits)
+}
+
 fn lease_duration_us(value: u64) -> Result<i64, SemanticReadObservationStoreError> {
     if value == 0 {
         return Err(SemanticReadObservationStoreError::InvalidFillLeaseDuration);
@@ -495,6 +519,15 @@ fn lease_duration_us(value: u64) -> Result<i64, SemanticReadObservationStoreErro
         .checked_mul(1_000)
         .and_then(|value| i64::try_from(value).ok())
         .ok_or(SemanticReadObservationStoreError::FillLeaseDurationOverflow)
+}
+
+fn nonnegative_database_integer(
+    field: &'static str,
+    value: i64,
+) -> Result<u64, SemanticReadObservationStoreError> {
+    u64::try_from(value).map_err(|_| {
+        SemanticReadObservationStoreError::InvalidNonnegativeDatabaseInteger { field, value }
+    })
 }
 
 async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
@@ -550,6 +583,10 @@ pub enum SemanticReadObservationStoreError {
     FillOwnerOrLeaseMismatch,
     #[error("semantic read observation size exceeds the database integer range")]
     ObservationSizeOverflow,
+    #[error("semantic read cache limit {field}={value} exceeds the database integer range")]
+    DatabaseLimitOverflow { field: &'static str, value: usize },
+    #[error("semantic read cache database field {field} must be non-negative, got {value}")]
+    InvalidNonnegativeDatabaseInteger { field: &'static str, value: i64 },
     #[error(
         "semantic read observation is {observation_bytes} bytes but this session permits {max_ready_bytes} ready bytes"
     )]
@@ -585,5 +622,34 @@ mod tests {
             lease_duration_us(0),
             Err(SemanticReadObservationStoreError::InvalidFillLeaseDuration)
         ));
+        assert_eq!(nonnegative_database_integer("count", 7).unwrap(), 7);
+        assert!(matches!(
+            nonnegative_database_integer("count", -1),
+            Err(
+                SemanticReadObservationStoreError::InvalidNonnegativeDatabaseInteger {
+                    field: "count",
+                    value: -1
+                }
+            )
+        ));
+        assert_eq!(
+            validate_database_limits(SemanticReadCacheLimits::default()).unwrap(),
+            SemanticReadCacheLimits::default()
+        );
+        if let Some(too_large) = usize::try_from(i64::MAX)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(1))
+        {
+            assert!(matches!(
+                validate_database_limits(SemanticReadCacheLimits {
+                    max_ready_bytes: too_large,
+                    ..SemanticReadCacheLimits::default()
+                }),
+                Err(SemanticReadObservationStoreError::DatabaseLimitOverflow {
+                    field: "max_ready_bytes",
+                    value
+                }) if value == too_large
+            ));
+        }
     }
 }

@@ -211,8 +211,8 @@ async fn durable_store_enforces_fill_fencing_bounds_isolation_and_corruption_rem
         )
         .await
         .expect("complete third and evict LRU");
-    let second_rows: u64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM semantic_read_observations
+    let second_rows: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM semantic_read_observations
          WHERE user_id = ? AND session_id = ? AND key_id = ?",
     )
     .bind(&user_id)
@@ -288,8 +288,8 @@ async fn durable_store_enforces_fill_fencing_bounds_isolation_and_corruption_rem
             .await,
         Err(SemanticReadObservationStoreError::ObservationSizeMismatchRemoved)
     ));
-    let corrupted_rows: u64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM semantic_read_observations
+    let corrupted_rows: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM semantic_read_observations
          WHERE user_id = ? AND session_id = ? AND key_id = ?",
     )
     .bind(&user_id)
