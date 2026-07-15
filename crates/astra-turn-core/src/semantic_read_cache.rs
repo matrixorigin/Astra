@@ -7,57 +7,12 @@
 use std::collections::BTreeMap;
 
 use astra_turn_types::{
-    SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadObservation,
+    SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadCacheLimits,
+    SemanticReadCacheLookup, SemanticReadObservation,
 };
 use thiserror::Error;
 
 const MAX_FILL_OWNER_BYTES: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SemanticReadCacheLimits {
-    pub max_ready_entries: usize,
-    pub max_ready_bytes: usize,
-    pub max_in_flight_fills: usize,
-}
-
-impl Default for SemanticReadCacheLimits {
-    fn default() -> Self {
-        Self {
-            max_ready_entries: 512,
-            max_ready_bytes: 32 * 1024 * 1024,
-            max_in_flight_fills: 64,
-        }
-    }
-}
-
-impl SemanticReadCacheLimits {
-    pub fn validate(self) -> Result<Self, SemanticReadObservationStoreError> {
-        if self.max_ready_entries == 0 {
-            return Err(SemanticReadObservationStoreError::InvalidLimit {
-                field: "max_ready_entries",
-            });
-        }
-        if self.max_ready_bytes == 0 {
-            return Err(SemanticReadObservationStoreError::InvalidLimit {
-                field: "max_ready_bytes",
-            });
-        }
-        if self.max_in_flight_fills == 0 {
-            return Err(SemanticReadObservationStoreError::InvalidLimit {
-                field: "max_in_flight_fills",
-            });
-        }
-        Ok(self)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticReadCacheLookup {
-    Hit(Box<SemanticReadObservation>),
-    FillClaimed,
-    FillInProgress { lease_expires_at_epoch_ms: u64 },
-    FillCapacityExceeded,
-}
 
 #[derive(Clone, Debug)]
 enum CacheEntry {
@@ -346,8 +301,6 @@ fn ensure_same_key(
 
 #[derive(Debug, Error)]
 pub enum SemanticReadObservationStoreError {
-    #[error("semantic read observation store limit '{field}' must be positive")]
-    InvalidLimit { field: &'static str },
     #[error("semantic read cache key ID resolved to different key content")]
     CacheKeyCollision,
     #[error("semantic read observation does not match its claimed cache key")]

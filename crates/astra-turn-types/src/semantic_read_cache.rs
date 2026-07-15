@@ -22,6 +22,38 @@ const MAX_FRESHNESS_COMPONENT_BYTES: usize = 4096;
 const MAX_FRESHNESS_FACTS: usize = 64;
 const MAX_POLICY_DECISION_ID_BYTES: usize = 256;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticReadCacheLimits {
+    pub max_ready_entries: usize,
+    pub max_ready_bytes: usize,
+    pub max_in_flight_fills: usize,
+}
+
+impl Default for SemanticReadCacheLimits {
+    fn default() -> Self {
+        Self {
+            max_ready_entries: 512,
+            max_ready_bytes: 32 * 1024 * 1024,
+            max_in_flight_fills: 64,
+        }
+    }
+}
+
+impl SemanticReadCacheLimits {
+    pub fn validate(self) -> Result<Self, SemanticReadCacheContractError> {
+        for (field, value) in [
+            ("max_ready_entries", self.max_ready_entries),
+            ("max_ready_bytes", self.max_ready_bytes),
+            ("max_in_flight_fills", self.max_in_flight_fills),
+        ] {
+            if value == 0 {
+                return Err(SemanticReadCacheContractError::InvalidStoreLimit { field });
+            }
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticFreshnessScope {
@@ -283,6 +315,14 @@ pub struct SemanticReadObservation {
     pub observation_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticReadCacheLookup {
+    Hit(Box<SemanticReadObservation>),
+    FillClaimed,
+    FillInProgress { lease_expires_at_epoch_ms: u64 },
+    FillCapacityExceeded,
+}
+
 impl SemanticReadObservation {
     pub fn from_terminal_outcome(
         key: SemanticReadCacheKey,
@@ -408,6 +448,8 @@ pub enum SemanticReadCacheContractError {
         max_bytes: usize,
         actual_bytes: usize,
     },
+    #[error("semantic read observation store limit '{field}' must be positive")]
+    InvalidStoreLimit { field: &'static str },
 }
 
 fn validate_raw_component(

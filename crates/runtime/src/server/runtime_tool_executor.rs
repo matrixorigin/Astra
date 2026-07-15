@@ -1931,6 +1931,7 @@ impl RuntimeToolExecutor {
                 let security_scope = serde_json::json!({
                     "contract_version": "semantic-read-security-scope-v1",
                     "user_id": request.user_id.as_str(),
+                    "session_id": request.session_id.as_str(),
                 })
                 .to_string();
                 match astra_turn_types::SemanticReadFreshnessContext::new(&security_scope, facts) {
@@ -3091,7 +3092,7 @@ mod tests {
             None,
             None,
         )
-        .with_semantic_read_freshness_source(source);
+        .with_semantic_read_freshness_source(source.clone());
         let mut other_request =
             other.tool_execution_request("public-alias", &json!({"query": "a"}));
         other_request.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
@@ -3107,6 +3108,31 @@ mod tests {
             other_context.security_scope_id
         );
         assert_ne!(first_context.context_id, other_context.context_id);
+
+        let same_user_dir = TempDir::new().unwrap();
+        let same_user_other_session = RuntimeToolExecutor::new(
+            same_user_dir.path().to_path_buf(),
+            eligible.user_id.clone(),
+            "other-session".to_string(),
+            None,
+            None,
+        )
+        .with_semantic_read_freshness_source(source);
+        let mut same_user_request =
+            same_user_other_session.tool_execution_request("public-alias", &json!({"query": "a"}));
+        same_user_request.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        same_user_other_session.attach_semantic_read_freshness(&mut same_user_request);
+        let same_user_context = match same_user_request.policy.semantic_read_freshness.unwrap() {
+            astra_turn_types::SemanticReadFreshnessResolution::Available(context) => context,
+            other => panic!("expected available freshness, got {other:?}"),
+        };
+        assert_ne!(
+            first_context.security_scope_id,
+            same_user_context.security_scope_id
+        );
+        assert_ne!(first_context.context_id, same_user_context.context_id);
     }
 
     #[test]

@@ -381,6 +381,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / tool_invocation_ledger",
         product_owner="tool invocation durability, retry, reconnect, and resume safety",
     ),
+    "semantic_read_observations": TableMetadata(
+        semantic_owner="astra_services::semantic_read_observation_store",
+        state_class="rebuildable session-scoped optimization fact",
+        primary_query="atomic lookup/fill/complete by user_id, session_id, and content-addressed semantic key",
+        retention_policy="hard bounded per session by ready entry, ready byte, and in-flight fill limits; deterministic LRU eviction; session hard delete removes all owner/session rows",
+        rebuildability="fully rebuildable by executing the authorized pure read again; errors and uncertain outcomes are never stored",
+        merge_guidance="keep separate from the invocation ledger: this reuses fresh successful observations across distinct logical invocation IDs and has independent capacity/eviction semantics",
+        migration_owner="astra_services::storage / semantic_read_observation_store",
+        product_owner="freshness-bound semantic read reuse and cache fill coordination",
+    ),
     "agent_message_queue": TableMetadata(
         semantic_owner="astra_messaging::db_transport",
         state_class="coordination queue fact",

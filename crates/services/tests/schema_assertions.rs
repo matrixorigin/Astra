@@ -1670,6 +1670,22 @@ async fn phase2_web_hydration_schema_contract() {
             .any(|column| column == "completion_source_json"),
         "non-dispatched cache completion requires durable, typed provenance"
     );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "semantic_read_observations").await,
+        ["user_id", "session_id", "key_id"],
+        "semantic observations must be owner/session scoped and content addressed"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "semantic_read_observations",
+            "idx_semantic_read_observations_session_state_access"
+        )
+        .await,
+        ["user_id", "session_id", "state", "last_accessed_at"],
+        "capacity and deterministic LRU operations require one session/state/access index"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [

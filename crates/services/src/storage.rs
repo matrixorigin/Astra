@@ -2104,6 +2104,28 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS semantic_read_observations (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            key_id              VARCHAR(71) NOT NULL,
+            key_json            JSON NOT NULL,
+            state               VARCHAR(16) NOT NULL,
+            fill_owner          VARCHAR(64) NULL,
+            fill_lease_expires_at DATETIME(6) NULL,
+            observation_json    JSON NULL,
+            observation_bytes   BIGINT UNSIGNED NULL,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            last_accessed_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, key_id),
+            INDEX idx_semantic_read_observations_session_state_access
+                (user_id, session_id, state, last_accessed_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
     query(
         "CREATE TABLE IF NOT EXISTS session_transcript_items (

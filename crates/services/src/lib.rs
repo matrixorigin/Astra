@@ -44,6 +44,7 @@ pub mod resource_governor;
 pub mod runs;
 pub mod sandbox;
 pub mod self_surface;
+pub mod semantic_read_observation_store;
 pub mod service_error;
 pub mod session_analytics;
 pub mod session_artifact_store;
