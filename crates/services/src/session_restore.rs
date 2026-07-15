@@ -1381,6 +1381,7 @@ fn composite_snapshot_index_to_remote_artifact_record(
             "snapshot_count": index.snapshots.len(),
             "latest_version": index.current_version(),
         })),
+        references: Vec::new(),
     })
 }
 

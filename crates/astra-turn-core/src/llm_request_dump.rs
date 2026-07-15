@@ -66,6 +66,7 @@ impl LlmRequestDump {
                 "provider": self.provider,
                 "error_preview": truncate_chars(&self.error, ERROR_PREVIEW_MAX_CHARS),
             })),
+            references: Vec::new(),
         }
     }
 

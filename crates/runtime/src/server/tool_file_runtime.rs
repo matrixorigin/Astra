@@ -507,6 +507,7 @@ pub(crate) fn prepare_publish_artifact_record(
             "source_path": source_path,
             "normalize_version": "artifact_file_v1",
         })),
+        references: Vec::new(),
     };
 
     Ok(PreparedPublishArtifact {
@@ -1263,6 +1264,7 @@ mod tests {
             round: None,
             content: json!({}),
             metadata: None,
+            references: Vec::new(),
         };
         let prepared = PreparedPublishArtifact {
             record,

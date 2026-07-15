@@ -2111,6 +2111,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
             round: None,
             content: json!({"preview": "capture"}),
             metadata: Some(json!({"kind": "preview"})),
+            references: Vec::new(),
         })
         .await
         .expect("S14 artifact preview seed insert must succeed");

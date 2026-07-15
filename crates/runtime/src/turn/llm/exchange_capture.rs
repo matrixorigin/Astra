@@ -170,6 +170,7 @@ pub(crate) fn build_remote_capture_record(
             "outcome": outcome,
             "trace": build_capture_trace_json(turn, round, trace),
         })),
+        references: Vec::new(),
     }
 }
 

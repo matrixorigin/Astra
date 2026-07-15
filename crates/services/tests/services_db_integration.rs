@@ -40,7 +40,8 @@ use astra_services::{
     DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
     IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService,
     MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService, ReplayService,
-    RetrievalStage, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
     SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
     SnapshotListFilter,
 };
@@ -1394,6 +1395,7 @@ async fn cleanup_restore_fixture_for_owner(
             "ctx_decision_audits",
             "ctx_snapshots",
             "agent_event_edges",
+            "session_artifact_references",
             "session_artifacts",
             "session_checkpoints",
             "agent_events",
@@ -1985,6 +1987,7 @@ async fn session_artifact_persist_uses_microsecond_created_at_for_latest_orderin
             round: Some(0),
             content: serde_json::json!({"marker": "first"}),
             metadata: None,
+            references: Vec::new(),
         })
         .await
         .expect("persist first artifact");
@@ -2000,6 +2003,7 @@ async fn session_artifact_persist_uses_microsecond_created_at_for_latest_orderin
             round: Some(0),
             content: serde_json::json!({"marker": "second"}),
             metadata: None,
+            references: Vec::new(),
         })
         .await
         .expect("persist second artifact");
@@ -2034,6 +2038,226 @@ async fn session_artifact_persist_uses_microsecond_created_at_for_latest_orderin
         latest.artifact_id, second_id,
         "latest ordering must prefer the later created_at even when its artifact_id sorts lower"
     );
+
+    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_and_durable_reference_persist_atomically() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let artifact_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'artifact-reference-atomicity', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: artifact_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "tool_result_evidence_v1".to_string(),
+            source: Some("runtime_tool_invocation".to_string()),
+            turn: Some(1),
+            round: None,
+            content: serde_json::json!({"result": "governed"}),
+            metadata: None,
+            references: vec![SessionArtifactReference {
+                kind: SessionArtifactReferenceKind::InvocationLedger,
+                reference_id: "sha256:logical-invocation".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*) FROM session_artifact_references
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+               AND reference_kind = 'invocation_ledger'
+               AND reference_id = 'sha256:logical-invocation') AS reference_count,
+            (SELECT CASE WHEN retention_until IS NOT NULL THEN 1 ELSE 0 END FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?) AS has_retention",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("reference_count").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("has_retention").unwrap(), 1);
+
+    let replayable_reference = SessionArtifactReference {
+        kind: SessionArtifactReferenceKind::Manifest,
+        reference_id: "manifest:durable-owner".to_string(),
+    };
+    sqlx::query(
+        "UPDATE session_artifacts
+         SET retention_until = TIMESTAMPADD(DAY, 365, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        store
+            .retain_json_artifact_reference(
+                &user_id,
+                &session_id,
+                &artifact_id,
+                &replayable_reference,
+            )
+            .await
+            .unwrap(),
+        "the first retain must create the durable edge"
+    );
+    assert!(
+        !store
+            .retain_json_artifact_reference(
+                &user_id,
+                &session_id,
+                &artifact_id,
+                &replayable_reference,
+            )
+            .await
+            .unwrap(),
+        "retain replay must be idempotent"
+    );
+    let retained_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifact_references
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+           AND reference_kind = 'manifest' AND reference_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .bind(&replayable_reference.reference_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_count, 1);
+    let retention_days: i64 = sqlx::query_scalar(
+        "SELECT TIMESTAMPDIFF(DAY, CURRENT_TIMESTAMP(6), retention_until)
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        retention_days >= 364,
+        "retaining an existing edge must never shorten a longer retention policy"
+    );
+
+    let foreign_release = store
+        .release_json_artifact_reference(
+            "another-user",
+            &session_id,
+            &artifact_id,
+            &replayable_reference,
+        )
+        .await;
+    assert!(matches!(
+        foreign_release,
+        Err(SessionArtifactStoreError::SessionNotOwned { .. })
+    ));
+    assert!(
+        store
+            .release_json_artifact_reference(
+                &user_id,
+                &session_id,
+                &artifact_id,
+                &replayable_reference,
+            )
+            .await
+            .unwrap(),
+        "the first release must remove the durable edge"
+    );
+    assert!(
+        !store
+            .release_json_artifact_reference(
+                &user_id,
+                &session_id,
+                &artifact_id,
+                &replayable_reference,
+            )
+            .await
+            .unwrap(),
+        "release replay must be idempotent"
+    );
+
+    sqlx::query(
+        "UPDATE session_artifacts SET status = 'expiring'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let terminal_retain = store
+        .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &replayable_reference)
+        .await;
+    assert!(matches!(
+        terminal_retain,
+        Err(SessionArtifactStoreError::ArtifactNotRetainable { .. })
+    ));
+
+    let rejected_id = Uuid::new_v4().to_string();
+    let rejected = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: rejected_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "tool_result_evidence_v1".to_string(),
+            source: None,
+            turn: None,
+            round: None,
+            content: serde_json::json!({"must": "not persist"}),
+            metadata: None,
+            references: vec![SessionArtifactReference {
+                kind: SessionArtifactReferenceKind::InvocationLedger,
+                reference_id: "x".repeat(129),
+            }],
+        })
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(SessionArtifactStoreError::InvalidReferenceId(_))
+    ));
+    let rejected_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&rejected_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected_count, 0);
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -2100,6 +2324,7 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
             round: Some(0),
             content: serde_json::json!({"owner": false, "payload": "foreign row"}),
             metadata: Some(serde_json::json!({"scope": "foreign"})),
+            references: Vec::new(),
         })
         .await
         .expect("foreign owner can persist same artifact id in its own session");
@@ -2114,6 +2339,7 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
             round: Some(0),
             content: serde_json::json!({"owner": true, "payload": "visible only to owner"}),
             metadata: Some(serde_json::json!({"scope": "owner"})),
+            references: Vec::new(),
         })
         .await
         .expect("owner can persist same artifact id without foreign collision");
@@ -2215,6 +2441,7 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
             round: Some(0),
             content: serde_json::json!({"owner": false, "payload": "must not persist"}),
             metadata: None,
+            references: Vec::new(),
         })
         .await;
     assert!(

@@ -116,7 +116,7 @@ async fn artifact_status(
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_50_gc_archives_or_extends_artifacts_with_active_references() {
+async fn l2_50_gc_extends_artifacts_with_active_references_without_fake_cold_storage() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -141,13 +141,55 @@ async fn l2_50_gc_archives_or_extends_artifacts_with_active_references() {
         .unwrap();
     let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
     assert!(outcome.scanned >= 1);
+    assert_eq!(outcome.referenced_extended, 1);
     assert_eq!(status, "active");
-    assert!(
-        cold_ref
-            .as_deref()
-            .is_some_and(|value| value.starts_with("cold_storage://")),
-        "referenced artifact should move to cold storage, got {cold_ref:?}"
+    assert_eq!(
+        cold_ref, None,
+        "no cold reference exists until bytes are moved"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("artifact-{}", Uuid::new_v4());
+    insert_artifact(
+        &pool,
+        ArtifactSeed {
+            user_id: &user_id,
+            session_id: &session_id,
+            artifact_id: &artifact_id,
+            kind: "arbitrary_provider_result",
+            policy: "default",
+            status: "active",
+            retention_days: 1,
+            manifest_refs: 0,
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO session_artifact_references
+         (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+         VALUES (?, ?, ?, 'invocation_ledger', ?, NOW(6))",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .bind(format!("invocation:{}", Uuid::new_v4()))
+    .execute(pool.get())
+    .await
+    .unwrap();
+
+    let outcome = run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
+    assert_eq!(outcome.referenced_extended, 1);
+    assert_eq!(status, "active");
+    assert_eq!(cold_ref, None);
 }
 
 #[tokio::test]
@@ -457,14 +499,12 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
         "indexed artifact/tool queries took {query_ms}ms; limit={max_query_ms}ms"
     );
 
-    run_artifact_retention_gc_once(pool.clone(), 100)
+    let retention = run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
     let (_, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    assert!(
-        cold_ref.is_some(),
-        "referenced pg_dump artifact should be preserved via cold storage"
-    );
+    assert!(retention.referenced_extended >= 1);
+    assert_eq!(cold_ref, None, "sweeper must not fabricate cold storage");
 }
 
 #[tokio::test]

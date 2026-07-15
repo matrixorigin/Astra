@@ -33,6 +33,28 @@ pub enum SessionArtifactStoreError {
     #[error("artifact_id must not be empty: {0:?}")]
     InvalidArtifactId(String),
 
+    #[error("artifact reference_id must not be empty or exceed 128 bytes: {0:?}")]
+    InvalidReferenceId(String),
+
+    #[error("duplicate artifact reference: kind={kind}, reference_id={reference_id}")]
+    DuplicateReference {
+        kind: &'static str,
+        reference_id: String,
+    },
+
+    #[error("artifact reference mutation is not supported by this store")]
+    ReferenceMutationUnsupported,
+
+    #[error("artifact {artifact_id} was not found in session {session_id} for user {user_id}")]
+    ArtifactNotFound {
+        artifact_id: String,
+        session_id: String,
+        user_id: String,
+    },
+
+    #[error("artifact {artifact_id} cannot acquire a reference while status is {status}")]
+    ArtifactNotRetainable { artifact_id: String, status: String },
+
     /// A relative path under a session directory either escaped the session
     /// root or contained an unsupported component.
     #[error("artifact relative path {reason}: {}", path.display())]
@@ -193,6 +215,37 @@ pub struct SessionArtifactJsonRecord {
     pub content: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Durable owners that keep this artifact reachable. These edges are
+    /// inserted atomically with the artifact rather than reconstructed from
+    /// artifact kinds or payload text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<SessionArtifactReference>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionArtifactReferenceKind {
+    InvocationLedger,
+    Manifest,
+    StateItem,
+    Citation,
+}
+
+impl SessionArtifactReferenceKind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::InvocationLedger => "invocation_ledger",
+            Self::Manifest => "manifest",
+            Self::StateItem => "state_item",
+            Self::Citation => "citation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionArtifactReference {
+    pub kind: SessionArtifactReferenceKind,
+    pub reference_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -257,6 +310,32 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         limit: usize,
         cursor: Option<SessionArtifactListCursor>,
     ) -> Result<SessionArtifactListPage, SessionArtifactStoreError>;
+
+    /// Adds an owner-scoped durable reachability edge. Returns `true` only
+    /// when a new edge was inserted; replaying the same retain is successful
+    /// and returns `false`.
+    async fn retain_json_artifact_reference(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _artifact_id: &str,
+        _reference: &SessionArtifactReference,
+    ) -> Result<bool, SessionArtifactStoreError> {
+        Err(SessionArtifactStoreError::ReferenceMutationUnsupported)
+    }
+
+    /// Removes an owner-scoped durable reachability edge. Returns `true` only
+    /// when an existing edge was removed; replaying a release is successful
+    /// and returns `false`.
+    async fn release_json_artifact_reference(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _artifact_id: &str,
+        _reference: &SessionArtifactReference,
+    ) -> Result<bool, SessionArtifactStoreError> {
+        Err(SessionArtifactStoreError::ReferenceMutationUnsupported)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -309,6 +388,27 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionArtifactStoreError
 
 fn validate_artifact_list_limit(limit: usize) -> usize {
     limit.clamp(1, 100)
+}
+
+fn validate_artifact_references(
+    references: &[SessionArtifactReference],
+) -> Result<(), SessionArtifactStoreError> {
+    let mut seen = std::collections::HashSet::with_capacity(references.len());
+    for reference in references {
+        let reference_id = reference.reference_id.trim();
+        if reference_id.is_empty() || reference_id.len() > 128 {
+            return Err(SessionArtifactStoreError::InvalidReferenceId(
+                reference.reference_id.clone(),
+            ));
+        }
+        if !seen.insert((reference.kind.wire_name(), reference_id)) {
+            return Err(SessionArtifactStoreError::DuplicateReference {
+                kind: reference.kind.wire_name(),
+                reference_id: reference_id.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn artifact_list_query_limit(limit: usize) -> i64 {
@@ -542,6 +642,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         if record.artifact_id.trim().is_empty() {
             record.artifact_id = Uuid::now_v7().to_string();
         }
+        validate_artifact_references(&record.references)?;
 
         let pool = self.get_pool().await?;
         self.require_owned_session(&pool, &record.user_id, &record.session_id)
@@ -551,10 +652,13 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .metadata
             .as_ref()
             .map(|metadata| metadata.to_string());
+        let retention_until = (!record.references.is_empty())
+            .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
+        let mut tx = pool.begin().await?;
         query(
             "INSERT INTO session_artifacts \
-             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
         )
         .bind(&record.artifact_id)
         .bind(&record.session_id)
@@ -571,8 +675,25 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         )?)
         .bind(&content_json)
         .bind(metadata_json)
-        .execute(&pool)
+        .bind(retention_until)
+        .execute(&mut *tx)
         .await?;
+
+        for reference in &record.references {
+            query(
+                "INSERT INTO session_artifact_references \
+                 (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id)
+            .bind(reference.kind.wire_name())
+            .bind(reference.reference_id.trim())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
 
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
@@ -590,6 +711,115 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .await?;
 
         stored_artifact_from_row(&row)
+    }
+
+    async fn retain_json_artifact_reference(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        reference: &SessionArtifactReference,
+    ) -> Result<bool, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        validate_artifact_references(std::slice::from_ref(reference))?;
+
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let mut tx = pool.begin().await?;
+        let row = query(
+            "SELECT status FROM session_artifacts \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: artifact_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+            });
+        };
+        let status = row.string_column("status")?;
+        if status != "active" {
+            return Err(SessionArtifactStoreError::ArtifactNotRetainable {
+                artifact_id: artifact_id.to_string(),
+                status,
+            });
+        }
+
+        let inserted = query(
+            "INSERT IGNORE INTO session_artifact_references \
+             (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(reference.kind.wire_name())
+        .bind(reference.reference_id.trim())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        let retention_until = (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc();
+        query(
+            "UPDATE session_artifacts SET retention_until = ? \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? \
+               AND (retention_until IS NULL OR retention_until < ?)",
+        )
+        .bind(retention_until)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(retention_until)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    async fn release_json_artifact_reference(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        reference: &SessionArtifactReference,
+    ) -> Result<bool, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        validate_artifact_references(std::slice::from_ref(reference))?;
+
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let deleted = query(
+            "DELETE FROM session_artifact_references \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? \
+               AND reference_kind = ? AND reference_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(reference.kind.wire_name())
+        .bind(reference.reference_id.trim())
+        .execute(&pool)
+        .await?
+        .rows_affected()
+            > 0;
+        Ok(deleted)
     }
 
     async fn load_json_artifact(
@@ -1018,11 +1248,40 @@ mod tests {
             round: Some(2),
             content: serde_json::json!({"request":{"messages":1},"response":{"finish_reason":"stop"}}),
             metadata: Some(serde_json::json!({"model":"gpt-5.4"})),
+            references: Vec::new(),
         };
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["artifact_kind"], "llm_capture");
         assert_eq!(value["source"], "server_loop_host");
         assert_eq!(value["metadata"]["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn artifact_reference_contract_rejects_empty_oversized_and_duplicate_owners() {
+        for reference_id in [String::new(), "x".repeat(129)] {
+            let error = validate_artifact_references(&[SessionArtifactReference {
+                kind: SessionArtifactReferenceKind::InvocationLedger,
+                reference_id,
+            }])
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                SessionArtifactStoreError::InvalidReferenceId(_)
+            ));
+        }
+
+        let reference = SessionArtifactReference {
+            kind: SessionArtifactReferenceKind::InvocationLedger,
+            reference_id: "sha256:invocation".to_string(),
+        };
+        let error = validate_artifact_references(&[reference.clone(), reference]).unwrap_err();
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::DuplicateReference {
+                kind: "invocation_ledger",
+                ..
+            }
+        ));
     }
 
     #[test]

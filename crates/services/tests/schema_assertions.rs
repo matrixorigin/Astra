@@ -2689,6 +2689,34 @@ async fn phase6_artifact_retention_preview_schema_contract() {
         ],
         "retention GC must filter by status before due-date range and select enough identity columns for scoped updates"
     );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_artifact_references").await,
+        [
+            "user_id",
+            "session_id",
+            "artifact_id",
+            "reference_kind",
+            "reference_id",
+        ],
+        "artifact reachability must be an owner-scoped durable edge"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifact_references",
+            "idx_artifact_references_owner_reference"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "reference_kind",
+            "reference_id",
+            "artifact_id",
+        ],
+        "artifact owners must resolve references without scanning payloads"
+    );
 
     let tool_outputs = column_names(&pool, &schema, "session_tool_outputs").await;
     for expected in [

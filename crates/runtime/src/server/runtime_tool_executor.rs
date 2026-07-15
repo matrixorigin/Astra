@@ -2430,6 +2430,12 @@ impl RuntimeToolExecutor {
                 "contentHash": &content_hash,
                 "encodedBytes": encoded.len(),
             })),
+            references: vec![
+                astra_services::session_artifact_store::SessionArtifactReference {
+                    kind: astra_services::session_artifact_store::SessionArtifactReferenceKind::InvocationLedger,
+                    reference_id: identity.storage_key(),
+                },
+            ],
         };
         let stored = match tokio::time::timeout(
             TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT,

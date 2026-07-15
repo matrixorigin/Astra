@@ -4439,6 +4439,54 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS session_artifact_references (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            reference_kind VARCHAR(32) NOT NULL,
+            reference_id VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_artifact_reference_kind CHECK (
+                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation')
+            ),
+            PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
+            INDEX idx_artifact_references_owner_reference
+                (user_id, session_id, reference_kind, reference_id, artifact_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_references",
+        &[
+            "user_id",
+            "session_id",
+            "artifact_id",
+            "reference_kind",
+            "reference_id",
+        ],
+        "ALTER TABLE session_artifact_references ADD PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_references",
+        "idx_artifact_references_owner_reference",
+        &[
+            "user_id",
+            "session_id",
+            "reference_kind",
+            "reference_id",
+            "artifact_id",
+        ],
+        "ALTER TABLE session_artifact_references ADD INDEX idx_artifact_references_owner_reference (user_id, session_id, reference_kind, reference_id, artifact_id)",
+    )
+    .await?;
+
     for (table, column, ddl) in [
         (
             "agent_sessions",

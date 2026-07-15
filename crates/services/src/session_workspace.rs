@@ -627,6 +627,7 @@ pub fn to_remote_artifact_record(
             "status": metadata.status,
             "git_branch": metadata.git_branch,
         })),
+        references: Vec::new(),
     })
 }
 
