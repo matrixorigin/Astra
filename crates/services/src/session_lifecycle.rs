@@ -156,6 +156,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
+        label: "tool_invocation_archive_chunks",
+        sql: "DELETE FROM tool_invocation_archive_chunks WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_artifact_references",
         sql: "DELETE FROM session_artifact_references WHERE session_id = ? AND user_id = ?",
     },

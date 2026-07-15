@@ -10,8 +10,32 @@ use astra_turn_types::{
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
     ToolInvocationState, ToolInvocationTerminalOutcome,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
+use uuid::Uuid;
+
+const TOOL_INVOCATION_ARCHIVE_VERSION: &str = "tool-invocation-run-archive-v1";
+const TOOL_INVOCATION_COMPACTION_BATCH_RECORDS: i64 = 32;
+const TOOL_INVOCATION_ARCHIVE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+const TOOL_INVOCATION_ARCHIVE_RETENTION_DAYS: i64 = 30;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocationCompactionOutcome {
+    pub archived_records: usize,
+    pub remaining_records: u64,
+    pub artifact_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolInvocationArchiveChunk {
+    version: String,
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    records: Vec<ToolInvocationRecord>,
+}
 
 #[derive(Clone)]
 pub struct DatabaseToolInvocationLedger {
@@ -44,12 +68,13 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         let mut tx = self.pool.get().begin().await?;
+        lock_executable_run(&mut tx, identity).await?;
         let inserted = sqlx::query(
             "INSERT IGNORE INTO tool_invocation_ledger (
                 user_id, session_id, run_id, turn_chain_id, invocation_id,
-                fingerprint_json, decision_json, state, dispatch_certainty, attempt_count,
+                identity_key, fingerprint_json, decision_json, state, dispatch_certainty, attempt_count,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0,
                        CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
         )
         .bind(&identity.user_id)
@@ -57,6 +82,7 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(&identity.invocation_id)
+        .bind(identity.storage_key())
         .bind(&fingerprint_json)
         .bind(&decision_json)
         .execute(&mut *tx)
@@ -91,7 +117,296 @@ impl DatabaseToolInvocationLedger {
         let row = select_record_query(identity)
             .fetch_optional(self.pool.get())
             .await?;
-        row.map(|row| decode_record(&row, identity)).transpose()
+        match row {
+            Some(row) => decode_record(&row, identity).map(Some),
+            None => self.load_archived_record(identity).await,
+        }
+    }
+
+    /// Move a bounded batch of a terminal run's invocation records from the
+    /// hot CAS table into one owner-scoped archive artifact. The artifact,
+    /// lookup range, durable reference, and hot-row deletion commit together.
+    pub async fn compact_terminal_run_batch(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<ToolInvocationCompactionOutcome, ToolInvocationLedgerStoreError> {
+        let mut tx = self.pool.get().begin().await?;
+        lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
+        let non_terminal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state IN ('prepared', 'dispatched')",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let non_terminal_count = u64::try_from(non_terminal_count).map_err(|_| {
+            ToolInvocationLedgerStoreError::InvalidCompactionCount(non_terminal_count)
+        })?;
+        if non_terminal_count > 0 {
+            return Err(ToolInvocationLedgerStoreError::RunNotQuiescent {
+                run_id: run_id.to_string(),
+                non_terminal_count,
+            });
+        }
+
+        let rows = sqlx::query(
+            "SELECT turn_chain_id, invocation_id, identity_key,
+                    CAST(fingerprint_json AS CHAR) AS fingerprint_json,
+                    CAST(decision_json AS CHAR) AS decision_json,
+                    CAST(outcome_json AS CHAR) AS outcome_json,
+                    CAST(completion_source_json AS CHAR) AS completion_source_json,
+                    state, dispatch_certainty, attempt_count, dispatch_owner,
+                    CAST(UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000 AS UNSIGNED)
+                        AS dispatch_lease_expires_at_epoch_ms
+             FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+             ORDER BY identity_key
+             LIMIT ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(TOOL_INVOCATION_COMPACTION_BATCH_RECORDS)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(ToolInvocationCompactionOutcome {
+                archived_records: 0,
+                remaining_records: 0,
+                artifact_id: None,
+            });
+        }
+
+        let mut records = Vec::with_capacity(rows.len());
+        let mut identity_keys = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let identity = ToolInvocationIdentity::new(
+                user_id,
+                session_id,
+                run_id,
+                row.try_get::<String, _>("turn_chain_id")?,
+                row.try_get::<String, _>("invocation_id")?,
+            )?;
+            let stored_identity_key: String = row.try_get("identity_key")?;
+            let expected_identity_key = identity.storage_key();
+            if stored_identity_key != expected_identity_key {
+                return Err(ToolInvocationLedgerStoreError::IdentityKeyMismatch {
+                    identity: Box::new(identity),
+                    expected: expected_identity_key,
+                    actual: stored_identity_key,
+                });
+            }
+            records.push(decode_record(row, &identity)?);
+            identity_keys.push(expected_identity_key);
+        }
+        let chunk = ToolInvocationArchiveChunk {
+            version: TOOL_INVOCATION_ARCHIVE_VERSION.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            records,
+        };
+        let content_json = serde_json::to_string(&chunk).map_err(|source| {
+            ToolInvocationLedgerStoreError::Serialization {
+                field: "archive_chunk",
+                source,
+            }
+        })?;
+        if content_json.len() > TOOL_INVOCATION_ARCHIVE_CHUNK_MAX_BYTES {
+            return Err(ToolInvocationLedgerStoreError::ArchiveChunkTooLarge {
+                actual_bytes: content_json.len(),
+                max_bytes: TOOL_INVOCATION_ARCHIVE_CHUNK_MAX_BYTES,
+            });
+        }
+        let first_identity_key = identity_keys.first().cloned().expect("non-empty archive");
+        let last_identity_key = identity_keys.last().cloned().expect("non-empty archive");
+        let artifact_id = Uuid::now_v7().to_string();
+        let content_hash = format!("sha256:{:x}", Sha256::digest(content_json.as_bytes()));
+        let retention_until = (chrono::Utc::now()
+            + chrono::Duration::days(TOOL_INVOCATION_ARCHIVE_RETENTION_DAYS))
+        .naive_utc();
+        let metadata = serde_json::json!({
+            "contractVersion": TOOL_INVOCATION_ARCHIVE_VERSION,
+            "recordCount": chunk.records.len(),
+            "encodedBytes": content_json.len(),
+            "contentHash": content_hash,
+        });
+        let chunk_index: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(chunk_index), 0) + 1
+             FROM tool_invocation_archive_chunks
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if chunk_index <= 0 {
+            return Err(ToolInvocationLedgerStoreError::InvalidCompactionCount(
+                chunk_index,
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO session_artifacts
+             (artifact_id, session_id, user_id, artifact_kind, source, content_json,
+              metadata, retention_until, created_at)
+             VALUES (?, ?, ?, 'tool_invocation_archive_v1', 'invocation_ledger_compactor',
+                     ?, ?, ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(&artifact_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(&content_json)
+        .bind(metadata.to_string())
+        .bind(retention_until)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_artifact_references
+             (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+             VALUES (?, ?, ?, 'invocation_ledger', ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(&artifact_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO tool_invocation_archive_chunks
+             (user_id, session_id, run_id, chunk_index, artifact_id,
+              first_identity_key, last_identity_key, record_count, encoded_bytes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(chunk_index)
+        .bind(&artifact_id)
+        .bind(&first_identity_key)
+        .bind(&last_identity_key)
+        .bind(chunk.records.len() as u64)
+        .bind(content_json.len() as u64)
+        .execute(&mut *tx)
+        .await?;
+        for record in &chunk.records {
+            sqlx::query(
+                "DELETE FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND turn_chain_id = ? AND invocation_id = ? AND identity_key = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .bind(&record.identity.turn_chain_id)
+            .bind(&record.identity.invocation_id)
+            .bind(record.identity.storage_key())
+            .execute(&mut *tx)
+            .await?;
+        }
+        let remaining_records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ToolInvocationCompactionOutcome {
+            archived_records: chunk.records.len(),
+            remaining_records: u64::try_from(remaining_records).map_err(|_| {
+                ToolInvocationLedgerStoreError::InvalidCompactionCount(remaining_records)
+            })?,
+            artifact_id: Some(artifact_id),
+        })
+    }
+
+    async fn load_archived_record(
+        &self,
+        identity: &ToolInvocationIdentity,
+    ) -> Result<Option<ToolInvocationRecord>, ToolInvocationLedgerStoreError> {
+        let identity_key = identity.storage_key();
+        let rows = sqlx::query(
+            "SELECT chunks.artifact_id, artifacts.status, artifacts.content_json
+             FROM tool_invocation_archive_chunks chunks
+             LEFT JOIN session_artifacts artifacts
+               ON artifacts.user_id = chunks.user_id
+              AND artifacts.session_id = chunks.session_id
+              AND artifacts.artifact_id = chunks.artifact_id
+             WHERE chunks.user_id = ? AND chunks.session_id = ? AND chunks.run_id = ?
+               AND chunks.first_identity_key <= ? AND chunks.last_identity_key >= ?
+             ORDER BY chunks.chunk_index LIMIT 2",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity_key)
+        .bind(&identity_key)
+        .fetch_all(self.pool.get())
+        .await?;
+        if rows.len() > 1 {
+            return Err(ToolInvocationLedgerStoreError::OverlappingArchiveRanges {
+                identity: identity.clone(),
+            });
+        }
+        let Some(row) = rows.first() else {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM agent_runs
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .fetch_optional(self.pool.get())
+            .await?;
+            if status
+                .as_deref()
+                .is_some_and(crate::runs::durable_run_status_is_terminal)
+            {
+                return Err(
+                    ToolInvocationLedgerStoreError::TerminalRunRecordUnavailable {
+                        identity: identity.clone(),
+                    },
+                );
+            }
+            return Ok(None);
+        };
+        let artifact_id: String = row.try_get("artifact_id")?;
+        let status: Option<String> = row.try_get("status")?;
+        let content_json: Option<String> = row.try_get("content_json")?;
+        if status.as_deref() != Some("active") || content_json.is_none() {
+            return Err(ToolInvocationLedgerStoreError::ArchiveUnavailable {
+                artifact_id,
+                status,
+            });
+        }
+        let content_json = content_json.expect("checked archive content");
+        let chunk: ToolInvocationArchiveChunk =
+            serde_json::from_str(&content_json).map_err(|source| {
+                ToolInvocationLedgerStoreError::InvalidArchive {
+                    artifact_id: artifact_id.clone(),
+                    source,
+                }
+            })?;
+        if chunk.version != TOOL_INVOCATION_ARCHIVE_VERSION
+            || chunk.user_id != identity.user_id
+            || chunk.session_id != identity.session_id
+            || chunk.run_id != identity.run_id
+        {
+            return Err(ToolInvocationLedgerStoreError::ArchiveScopeMismatch { artifact_id });
+        }
+        Ok(chunk
+            .records
+            .into_iter()
+            .find(|record| record.identity == *identity))
     }
 
     /// Atomically grant one worker the right to cross the provider boundary.
@@ -414,6 +729,84 @@ impl DatabaseToolInvocationLedger {
     }
 }
 
+/// Serialize invocation admission with terminal run transitions. The run row
+/// is the durable closure boundary: after it becomes terminal, an old or
+/// forged invocation identity can be inspected from archived evidence but can
+/// never create a fresh dispatchable ledger row.
+async fn lock_executable_run(
+    tx: &mut Transaction<'_, MySql>,
+    identity: &ToolInvocationIdentity,
+) -> Result<(), ToolInvocationLedgerStoreError> {
+    let row = sqlx::query(
+        "SELECT session_id, status FROM agent_runs
+         WHERE user_id = ? AND run_id = ? FOR UPDATE",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(ToolInvocationLedgerStoreError::RunNotFound {
+            user_id: identity.user_id.clone(),
+            run_id: identity.run_id.clone(),
+        });
+    };
+    let session_id: String = row.try_get("session_id")?;
+    if session_id != identity.session_id {
+        return Err(ToolInvocationLedgerStoreError::RunSessionMismatch {
+            run_id: identity.run_id.clone(),
+            expected_session_id: identity.session_id.clone(),
+            actual_session_id: session_id,
+        });
+    }
+    let status: String = row.try_get("status")?;
+    if status != astra_core::STATUS_RUNNING {
+        return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
+            run_id: identity.run_id.clone(),
+            status,
+        });
+    }
+    Ok(())
+}
+
+async fn lock_terminal_run(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+) -> Result<(), ToolInvocationLedgerStoreError> {
+    let row = sqlx::query(
+        "SELECT session_id, status FROM agent_runs
+         WHERE user_id = ? AND run_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(ToolInvocationLedgerStoreError::RunNotFound {
+            user_id: user_id.to_string(),
+            run_id: run_id.to_string(),
+        });
+    };
+    let actual_session_id: String = row.try_get("session_id")?;
+    if actual_session_id != session_id {
+        return Err(ToolInvocationLedgerStoreError::RunSessionMismatch {
+            run_id: run_id.to_string(),
+            expected_session_id: session_id.to_string(),
+            actual_session_id,
+        });
+    }
+    let status: String = row.try_get("status")?;
+    if !crate::runs::durable_run_status_is_terminal(&status) {
+        return Err(ToolInvocationLedgerStoreError::RunNotTerminal {
+            run_id: run_id.to_string(),
+            status,
+        });
+    }
+    Ok(())
+}
+
 fn select_record_query(
     identity: &ToolInvocationIdentity,
 ) -> sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments> {
@@ -664,6 +1057,58 @@ pub enum ToolInvocationLedgerStoreError {
     },
     #[error("tool invocation identity conflicts with its durable fingerprint: {identity:?}")]
     IdentityConflict { identity: ToolInvocationIdentity },
+    #[error("tool invocation run {run_id} was not found for user {user_id}")]
+    RunNotFound { user_id: String, run_id: String },
+    #[error(
+        "tool invocation run {run_id} belongs to session {actual_session_id}, not {expected_session_id}"
+    )]
+    RunSessionMismatch {
+        run_id: String,
+        expected_session_id: String,
+        actual_session_id: String,
+    },
+    #[error("tool invocation run {run_id} is not executable while status is {status}")]
+    RunNotExecutable { run_id: String, status: String },
+    #[error("tool invocation run {run_id} is not terminal while status is {status}")]
+    RunNotTerminal { run_id: String, status: String },
+    #[error(
+        "tool invocation run {run_id} still has {non_terminal_count} prepared or dispatched rows"
+    )]
+    RunNotQuiescent {
+        run_id: String,
+        non_terminal_count: u64,
+    },
+    #[error(
+        "tool invocation identity key mismatch for {identity:?}: expected {expected}, actual {actual}"
+    )]
+    IdentityKeyMismatch {
+        identity: Box<ToolInvocationIdentity>,
+        expected: String,
+        actual: String,
+    },
+    #[error("tool invocation archive chunk is {actual_bytes} bytes; maximum is {max_bytes}")]
+    ArchiveChunkTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("tool invocation compaction returned invalid row count {0}")]
+    InvalidCompactionCount(i64),
+    #[error("invalid tool invocation archive artifact {artifact_id}: {source}")]
+    InvalidArchive {
+        artifact_id: String,
+        source: serde_json::Error,
+    },
+    #[error("tool invocation archive artifact {artifact_id} has mismatched owner or run scope")]
+    ArchiveScopeMismatch { artifact_id: String },
+    #[error("tool invocation archive artifact {artifact_id} is unavailable with status {status:?}")]
+    ArchiveUnavailable {
+        artifact_id: String,
+        status: Option<String>,
+    },
+    #[error("overlapping tool invocation archive ranges for {identity:?}")]
+    OverlappingArchiveRanges { identity: ToolInvocationIdentity },
+    #[error("tool invocation record is no longer retained for terminal run: {identity:?}")]
+    TerminalRunRecordUnavailable { identity: ToolInvocationIdentity },
     #[error("tool invocation disappeared after prepare: {identity:?}")]
     MissingAfterPrepare { identity: ToolInvocationIdentity },
     #[error("stored tool invocation is missing its frozen decision")]

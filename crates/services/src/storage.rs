@@ -2046,6 +2046,7 @@ pub async fn ensure_core_schema(
             run_id              VARCHAR(128) NOT NULL,
             turn_chain_id       VARCHAR(128) NOT NULL,
             invocation_id       VARCHAR(128) NOT NULL,
+            identity_key        VARCHAR(71) NOT NULL,
             fingerprint_json    JSON NOT NULL,
             decision_json       JSON NOT NULL,
             state               VARCHAR(32) NOT NULL,
@@ -2058,10 +2059,73 @@ pub async fn ensure_core_schema(
             created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
-            INDEX idx_tool_invocation_updated (updated_at)
+            INDEX idx_tool_invocation_updated (updated_at),
+            INDEX idx_tool_invocation_run_compaction
+                (user_id, session_id, run_id, state, identity_key)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "identity_key",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN identity_key VARCHAR(71) NULL",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "idx_tool_invocation_run_compaction",
+        &["user_id", "session_id", "run_id", "state", "identity_key"],
+        "ALTER TABLE tool_invocation_ledger ADD INDEX idx_tool_invocation_run_compaction (user_id, session_id, run_id, state, identity_key)",
+    )
+    .await?;
+    query(
+        "CREATE TABLE IF NOT EXISTS tool_invocation_archive_chunks (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            chunk_index BIGINT UNSIGNED NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            first_identity_key VARCHAR(71) NOT NULL,
+            last_identity_key VARCHAR(71) NOT NULL,
+            record_count BIGINT UNSIGNED NOT NULL,
+            encoded_bytes BIGINT UNSIGNED NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, run_id, chunk_index),
+            UNIQUE KEY uq_tool_invocation_archive_artifact
+                (user_id, session_id, artifact_id),
+            INDEX idx_tool_invocation_archive_lookup
+                (user_id, session_id, run_id, first_identity_key, last_identity_key)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_archive_chunks",
+        &["user_id", "session_id", "run_id", "chunk_index"],
+        "ALTER TABLE tool_invocation_archive_chunks ADD PRIMARY KEY (user_id, session_id, run_id, chunk_index)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_archive_chunks",
+        "idx_tool_invocation_archive_lookup",
+        &[
+            "user_id",
+            "session_id",
+            "run_id",
+            "first_identity_key",
+            "last_identity_key",
+        ],
+        "ALTER TABLE tool_invocation_archive_chunks ADD INDEX idx_tool_invocation_archive_lookup (user_id, session_id, run_id, first_identity_key, last_identity_key)",
+    )
     .await?;
     add_column_if_missing(
         &pool,

@@ -81,6 +81,7 @@ pub(crate) mod tool_execution_service;
 pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
+pub mod tool_invocation_compactor;
 pub(crate) mod tool_invocation_decision;
 pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;

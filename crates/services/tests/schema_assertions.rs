@@ -1655,6 +1655,12 @@ async fn phase2_web_hydration_schema_contract() {
     assert!(
         invocation_columns
             .iter()
+            .any(|column| column == "identity_key"),
+        "bounded archive lookup requires a deterministic invocation identity key"
+    );
+    assert!(
+        invocation_columns
+            .iter()
             .any(|column| column == "dispatch_owner"),
         "provider dispatch completion must be fenced by an explicit worker owner"
     );
@@ -1669,6 +1675,39 @@ async fn phase2_web_hydration_schema_contract() {
             .iter()
             .any(|column| column == "completion_source_json"),
         "non-dispatched cache completion requires durable, typed provenance"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "tool_invocation_ledger",
+            "idx_tool_invocation_run_compaction"
+        )
+        .await,
+        ["user_id", "session_id", "run_id", "state", "identity_key"],
+        "terminal-run compaction must remain owner/run scoped and bounded"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "tool_invocation_archive_chunks").await,
+        ["user_id", "session_id", "run_id", "chunk_index"],
+        "invocation archive chunks must remain owner/session/run scoped"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "tool_invocation_archive_chunks",
+            "idx_tool_invocation_archive_lookup"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "run_id",
+            "first_identity_key",
+            "last_identity_key"
+        ],
+        "archived invocation replay must resolve one bounded identity-key range"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "semantic_read_observations").await,

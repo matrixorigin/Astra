@@ -370,6 +370,53 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("artifact-{}", Uuid::new_v4());
+    insert_artifact(
+        &pool,
+        ArtifactSeed {
+            user_id: &user_id,
+            session_id: &session_id,
+            artifact_id: &artifact_id,
+            kind: "raw_provider_result",
+            policy: "default",
+            status: "active",
+            retention_days: -1,
+            manifest_refs: 0,
+        },
+    )
+    .await;
+    run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT status, content_json, CAST(metadata AS CHAR) AS metadata_json
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<String, _>("status").unwrap(), "expired");
+    let content: serde_json::Value =
+        serde_json::from_str(&row.try_get::<String, _>("content_json").unwrap()).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.try_get::<String, _>("metadata_json").unwrap()).unwrap();
+    assert_eq!(
+        content,
+        json!({"expired": true, "reason": "retention_elapsed"})
+    );
+    assert_eq!(metadata, json!({"retentionExpired": true}));
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_55_presigned_download_contains_ttl_and_signature() {
     let signed = build_presigned_artifact_download(
         "/sessions/s/artifacts/a/download/presigned",

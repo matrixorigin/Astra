@@ -226,7 +226,18 @@ async fn apply_artifact_retention_policy(
                  retention_until = DATE_ADD(NOW(6), INTERVAL 365 DAY),
                  updated_at = NOW(6)
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-               AND (status <=> 'active' OR status <=> 'expiring')",
+               AND (status <=> 'active' OR status <=> 'expiring')
+               AND (
+                   referenced_by_manifest_count > 0
+                   OR referenced_by_state_items_count > 0
+                   OR referenced_by_citation_count > 0
+                   OR EXISTS (
+                       SELECT 1 FROM session_artifact_references refs
+                       WHERE refs.user_id = session_artifacts.user_id
+                         AND refs.session_id = session_artifacts.session_id
+                         AND refs.artifact_id = session_artifacts.artifact_id
+                   )
+               )",
         )
         .bind(&artifact.user_id)
         .bind(&artifact.session_id)
@@ -243,7 +254,11 @@ async fn apply_artifact_retention_policy(
 
     let expired_rows = sqlx::query(
         "UPDATE session_artifacts
-         SET status = 'expired', updated_at = NOW(6)
+         SET status = 'expired',
+             content_json = '{\"expired\":true,\"reason\":\"retention_elapsed\"}',
+             metadata = '{\"retentionExpired\":true}',
+             cold_storage_ref = NULL,
+             updated_at = NOW(6)
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
