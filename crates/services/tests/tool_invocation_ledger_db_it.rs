@@ -17,6 +17,7 @@ use astra_turn_types::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn identity(prefix: &str, invocation_id: &str) -> ToolInvocationIdentity {
@@ -232,9 +233,26 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     .await
     .unwrap();
     assert_eq!(hot_rows, 0);
-    for (identity, expected) in identities.iter().zip(expected) {
-        assert_eq!(ledger.get(identity).await.unwrap(), Some(expected));
+    for (identity, expected) in identities.iter().zip(&expected) {
+        assert_eq!(ledger.get(identity).await.unwrap().as_ref(), Some(expected));
+        assert!(matches!(
+            ledger
+                .prepare(identity, &invocation_fingerprint, &invocation_decision)
+                .await
+                .unwrap(),
+            ToolInvocationPrepareOutcome::Existing(record) if record == *expected
+        ));
     }
+    assert!(matches!(
+        ledger
+            .prepare(
+                &identities[0],
+                &fingerprint("conflicting archived invocation"),
+                &invocation_decision,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
     let replay = ledger
         .compact_terminal_run_batch(
             &identities[0].user_id,
@@ -574,6 +592,15 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         Err(ToolInvocationLedgerStoreError::Contract(_))
     ));
 
+    let prepared_before_closure = identity(&prefix, "prepared-before-run-closure");
+    assert!(matches!(
+        ledger
+            .prepare(&prepared_before_closure, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+
     sqlx::query(
         "UPDATE agent_runs SET status = 'completed'
          WHERE user_id = ? AND run_id = ?",
@@ -583,6 +610,38 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     .execute(&pool)
     .await
     .unwrap();
+    assert!(matches!(
+        ledger
+            .prepare(&cached, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Succeeded
+                && record.outcome.as_ref().unwrap().result().output == "cached observation"
+    ));
+    assert!(matches!(
+        ledger
+            .prepare(&second, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Failed
+                && record.outcome.as_ref().unwrap().result().output == "provider failed"
+    ));
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&prepared_before_closure, "worker-after-closure", 90_000)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&prepared_before_closure).await.unwrap(),
+        Some(record)
+            if record.state == ToolInvocationState::Prepared
+                && record.attempt_count == 0
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
     let after_closure = identity(&prefix, "call-after-run-closure");
     assert!(matches!(
         ledger
@@ -593,4 +652,107 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     ));
 
     cleanup(&pool, &first).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn run_closure_serializes_with_new_admission_and_dispatch_claim() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let prepare_identity = identity(&format!("{prefix}-prepare"), "concurrent-prepare");
+    cleanup(&pool, &prepare_identity).await;
+    insert_active_run(&pool, &prepare_identity).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared.clone());
+    let invocation_fingerprint = fingerprint("concurrent admission");
+    let invocation_decision = decision();
+
+    let mut closure_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&prepare_identity.user_id)
+    .bind(&prepare_identity.run_id)
+    .execute(&mut *closure_tx)
+    .await
+    .unwrap();
+    let prepare_task = {
+        let ledger = ledger.clone();
+        let identity = prepare_identity.clone();
+        let fingerprint = invocation_fingerprint.clone();
+        let decision = invocation_decision.clone();
+        tokio::spawn(async move { ledger.prepare(&identity, &fingerprint, &decision).await })
+    };
+    tokio::pin!(prepare_task);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut prepare_task)
+            .await
+            .is_err(),
+        "new identity admission must wait for the run closure transaction"
+    );
+    closure_tx.commit().await.unwrap();
+    assert!(matches!(
+        prepare_task.await.unwrap(),
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&prepare_identity).await,
+        Err(ToolInvocationLedgerStoreError::TerminalRunRecordUnavailable { .. })
+    ));
+
+    let dispatch_identity = identity(&format!("{prefix}-dispatch"), "concurrent-dispatch");
+    cleanup(&pool, &dispatch_identity).await;
+    insert_active_run(&pool, &dispatch_identity).await;
+    ledger
+        .prepare(
+            &dispatch_identity,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    let mut closure_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&dispatch_identity.user_id)
+    .bind(&dispatch_identity.run_id)
+    .execute(&mut *closure_tx)
+    .await
+    .unwrap();
+    let dispatch_task = {
+        let ledger = ledger.clone();
+        let identity = dispatch_identity.clone();
+        tokio::spawn(async move {
+            ledger
+                .claim_dispatch(&identity, "concurrent-worker", 90_000)
+                .await
+        })
+    };
+    tokio::pin!(dispatch_task);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut dispatch_task)
+            .await
+            .is_err(),
+        "dispatch claim must wait for the run closure transaction"
+    );
+    closure_tx.commit().await.unwrap();
+    assert!(matches!(
+        dispatch_task.await.unwrap(),
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&dispatch_identity).await.unwrap(),
+        Some(record)
+            if record.state == ToolInvocationState::Prepared
+                && record.attempt_count == 0
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
+
+    cleanup(&pool, &prepare_identity).await;
+    cleanup(&pool, &dispatch_identity).await;
 }

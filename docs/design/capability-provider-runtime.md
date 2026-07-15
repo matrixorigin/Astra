@@ -412,8 +412,15 @@ The ledger records:
 Execution rules:
 
 - persist `Prepared` before dispatch;
+- resolve an existing invocation identity from hot or retained archive
+  evidence independently of current run executability, so terminal outcomes
+  remain deterministically replayable after closure and resume;
+- serialize creation of a new identity with the run closure boundary;
 - use a compare-and-set transition so concurrent workers cannot dispatch one
   invocation twice;
+- revalidate run executability under the same durable closure lock and
+  transaction as `Prepared -> Dispatched`; prior admission is not authority to
+  cross the provider boundary after the run closes;
 - persist the terminal typed result before exposing durable success;
 - retry idempotent work only when the downstream contract makes it safe;
 - never retry a non-idempotent call after ambiguous dispatch;

@@ -47,8 +47,12 @@ impl DatabaseToolInvocationLedger {
         Self { pool }
     }
 
-    /// Insert `Prepared` idempotently and return the authoritative row. An
-    /// existing identity with a different fingerprint is a hard conflict.
+    /// Return an existing identity or insert `Prepared` idempotently.
+    ///
+    /// Replay is independent of run admission: a terminal run may still own
+    /// an authoritative hot or archived result. Only creation of a new
+    /// identity is serialized with the run closure boundary. An existing
+    /// identity with a different fingerprint is always a hard conflict.
     pub async fn prepare(
         &self,
         identity: &ToolInvocationIdentity,
@@ -68,7 +72,41 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         let mut tx = self.pool.get().begin().await?;
-        lock_executable_run(&mut tx, identity).await?;
+        if let Some(record) = load_record_in_tx(&mut tx, identity).await? {
+            if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                rollback(tx, "prepare identity conflict").await;
+                return Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                    identity: identity.clone(),
+                });
+            }
+            tx.commit().await?;
+            return Ok(ToolInvocationPrepareOutcome::Existing(record));
+        }
+        if let Err(error) = lock_executable_run(&mut tx, identity).await {
+            rollback(tx, "prepare run admission denied").await;
+            if matches!(
+                &error,
+                ToolInvocationLedgerStoreError::RunNotExecutable { .. }
+            ) {
+                return match self.load_archived_record(identity).await {
+                    Ok(Some(record)) => {
+                        if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                            Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                                identity: identity.clone(),
+                            })
+                        } else {
+                            Ok(ToolInvocationPrepareOutcome::Existing(record))
+                        }
+                    }
+                    Ok(None)
+                    | Err(ToolInvocationLedgerStoreError::TerminalRunRecordUnavailable {
+                        ..
+                    }) => Err(error),
+                    Err(archive_error) => Err(archive_error),
+                };
+            }
+            return Err(error);
+        }
         let inserted = sqlx::query(
             "INSERT IGNORE INTO tool_invocation_ledger (
                 user_id, session_id, run_id, turn_chain_id, invocation_id,
@@ -410,8 +448,10 @@ impl DatabaseToolInvocationLedger {
     }
 
     /// Atomically grant one worker the right to cross the provider boundary.
-    /// MatrixOne's clock owns the lease deadline, avoiding application-host
-    /// clock skew in expiry decisions.
+    /// The run closure row is locked and revalidated in the same transaction
+    /// as `Prepared -> Dispatched`; a prepared identity is not authority to
+    /// start new work after its run closes. MatrixOne's clock owns the lease
+    /// deadline, avoiding application-host clock skew in expiry decisions.
     pub async fn claim_dispatch(
         &self,
         identity: &ToolInvocationIdentity,
@@ -421,6 +461,7 @@ impl DatabaseToolInvocationLedger {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut tx = self.pool.get().begin().await?;
+        lock_executable_run(&mut tx, identity).await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'dispatched', dispatch_certainty = 'dispatched',
@@ -729,10 +770,10 @@ impl DatabaseToolInvocationLedger {
     }
 }
 
-/// Serialize invocation admission with terminal run transitions. The run row
-/// is the durable closure boundary: after it becomes terminal, an old or
-/// forged invocation identity can be inspected from archived evidence but can
-/// never create a fresh dispatchable ledger row.
+/// Serialize new invocation admission and dispatch with terminal run
+/// transitions. The run row is the durable closure boundary: existing
+/// identities remain readable before this guard, but after the run becomes
+/// terminal no identity can create or cross a fresh provider boundary.
 async fn lock_executable_run(
     tx: &mut Transaction<'_, MySql>,
     identity: &ToolInvocationIdentity,
