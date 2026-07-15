@@ -5657,7 +5657,6 @@ async fn apply_restored_session(
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
         }
-        state.runtime_idempotency_cache = Some(step_restored.idempotency_cache);
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if has_cloud_heavy_fallback {
         apply_restored_cloud_heavy_state(state, &restored);
@@ -6767,23 +6766,6 @@ mod resume_tests {
             }))
         );
         assert_eq!(state.runtime_consecutive_context_window_errors, 2);
-        assert!(
-            state.runtime_idempotency_cache.is_some(),
-            "step restore should carry a replay guard cache into the next turn"
-        );
-        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-            "read_file",
-            &serde_json::json!({"path": "src/lib.rs"}),
-        );
-        assert_eq!(
-            state
-                .runtime_idempotency_cache
-                .as_ref()
-                .and_then(|cache| cache.check(&idem_key))
-                .expect("restored replay guard cache should include completed tool")
-                .output,
-            "cached src/lib.rs"
-        );
     }
 
     #[serial_test::serial]

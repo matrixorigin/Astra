@@ -129,8 +129,10 @@ pub struct TurnGuard {
     /// Drift observation count (persists across turns, fed from StallTrackingState).
     /// When >= 3, TurnGuard raises advisory evidence strength.
     pub drift_nudge_count: usize,
-    /// Monotonic session-local epoch for observations whose result depends on
-    /// workspace state. Successful workspace mutations advance the epoch.
+    /// Monotonic turn/process-incarnation-local epoch for observations whose
+    /// result depends on workspace state. Successful workspace mutations
+    /// advance the epoch. This is an in-memory invalidation token, not durable
+    /// workspace identity and never sufficient evidence for recovery reuse.
     workspace_epoch: u64,
     /// Validation command attempts observed in the current workspace epoch,
     /// keyed by a normalized validation prefix.
@@ -225,7 +227,7 @@ impl TurnGuard {
         self.drift_nudge_count = count;
     }
 
-    /// Current workspace observation epoch.
+    /// Current turn-local workspace observation epoch.
     #[must_use]
     pub fn workspace_epoch(&self) -> u64 {
         self.workspace_epoch

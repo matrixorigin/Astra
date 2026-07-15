@@ -44,7 +44,7 @@ use crate::step_protocol::{
 // ---------------------------------------------------------------------------
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
-use crate::step_restore::RestoredSession;
+use crate::step_restore::{CacheRestoreReport, RestoredSession};
 
 /// Recover a crashed session using the full state machine.
 ///
@@ -162,17 +162,20 @@ fn build_restored_from_scan(
     scan: &JournalScanResult,
     heavy: &HeavyCheckpoint,
 ) -> Result<RestoredSession, RecoveryError> {
-    use crate::step_protocol::InMemoryIdempotencyCache;
+    use crate::step_protocol::persisted_cache_key_is_context_bound;
     use std::collections::HashMap;
 
-    let mut cache = InMemoryIdempotencyCache::new();
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
+    let mut cache_restore_report = CacheRestoreReport::default();
 
     // Extract completed tool results from events
     for tool_call in &scan.tool_calls_found {
         if let Some(ref cached) = tool_call.cached_result {
             if let Some(cache_key) = tool_call.idempotency_key.as_deref() {
-                cache.record_cache_key(cache_key, cached.clone());
+                cache_restore_report.rejected_unverified_entries += 1;
+                if persisted_cache_key_is_context_bound(cache_key) {
+                    cache_restore_report.rejected_context_bound_entries += 1;
+                }
             }
 
             completed_results
@@ -182,13 +185,20 @@ fn build_restored_from_scan(
         }
     }
 
+    if cache_restore_report.rejected_unverified_entries > 0 {
+        tracing::warn!(
+            rejected_unverified_entries = cache_restore_report.rejected_unverified_entries,
+            rejected_context_bound_entries = cache_restore_report.rejected_context_bound_entries,
+            "crash recovery retained completed results for audit but rejected them as executable replay authority"
+        );
+    }
+
     Ok(RestoredSession {
         messages: heavy.messages.clone(),
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
-        idempotency_cache: cache,
         resume_turn: extract_turn_from_step_id(&heavy.light.step_id),
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -197,6 +207,7 @@ fn build_restored_from_scan(
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state.clone(),
         pipeline_state: heavy.pipeline_state.clone(),
+        cache_restore_report,
     })
 }
 
@@ -1086,7 +1097,7 @@ impl Default for CrashRecoveryManager {
 mod tests {
     use super::*;
     use crate::step_protocol::{
-        ExecutionCursor, IdempotencyKey, StepCheckpoint, StepEvent, StepEventType,
+        ContextSignature, ExecutionCursor, IdempotencyKey, StepCheckpoint, StepEvent, StepEventType,
     };
 
     // -- Helper: build a minimal valid checkpoint --
@@ -1395,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn build_restored_from_scan_restores_cache_under_persisted_key() {
+    fn build_restored_from_scan_rejects_semantic_key_as_replay_authority() {
         let args = serde_json::json!({"path": "src/lib.rs"});
         let key = IdempotencyKey::semantic("read_file", &args);
         let cached_result = CachedToolResult {
@@ -1422,15 +1433,58 @@ mod tests {
         let heavy = make_test_heavy_checkpoint();
 
         let restored = build_restored_from_scan(&scan, &heavy).unwrap();
-        let restored_cached = restored
-            .idempotency_cache
-            .check(&key)
-            .expect("restored cache must use the persisted idempotency cache key");
-
-        assert_eq!(restored_cached.output, "module contents");
+        assert_eq!(restored.cache_restore_report.rejected_unverified_entries, 1);
+        assert_eq!(
+            restored.cache_restore_report.rejected_context_bound_entries,
+            0
+        );
         assert_eq!(
             restored.completed_tool_results.get("read_file"),
             Some(&vec!["module contents".to_string()])
+        );
+    }
+
+    #[test]
+    fn crash_restore_does_not_promote_context_bound_history_into_current_cache() {
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args).with_context(ContextSignature {
+            workspace_version: Some("workspace_epoch:0".to_string()),
+            memory_snapshot_id: None,
+        });
+        let scan = JournalScanResult {
+            last_checkpoint: make_test_checkpoint(),
+            checkpoint_turn: 3,
+            events_after: Vec::new(),
+            tool_calls_found: vec![ToolCallRecord {
+                step_id: "step-1".to_string(),
+                tool_name: "read_file".to_string(),
+                tool_index: 0,
+                idempotency_key: Some(key.cache_key()),
+                status: ToolCallStatus::Completed,
+                cached_result: Some(CachedToolResult {
+                    tool_name: "read_file".to_string(),
+                    output: "content before mutation".to_string(),
+                    is_error: false,
+                    cached_at: 1000,
+                    context_signature: Some(ContextSignature {
+                        workspace_version: Some("workspace_epoch:0".to_string()),
+                        memory_snapshot_id: None,
+                    }),
+                }),
+            }],
+            gap_detected: None,
+        };
+
+        let restored = build_restored_from_scan(&scan, &make_test_heavy_checkpoint()).unwrap();
+        assert_eq!(restored.cache_restore_report.rejected_unverified_entries, 1);
+        assert_eq!(
+            restored.cache_restore_report.rejected_context_bound_entries,
+            1
+        );
+        assert_eq!(
+            restored.completed_tool_results.get("read_file"),
+            Some(&vec!["content before mutation".to_string()]),
+            "audit output must survive even when the reusable observation does not"
         );
     }
 

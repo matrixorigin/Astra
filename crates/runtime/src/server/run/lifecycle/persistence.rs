@@ -845,11 +845,25 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     current_date: &str,
     loop_state: &mut AgenticLoopState,
 ) {
+    if restored.cache_restore_report.rejected_unverified_entries > 0 {
+        tracing::warn!(
+            target: "astra_runtime::recovery",
+            rejected_unverified_entries = restored.cache_restore_report.rejected_unverified_entries,
+            rejected_context_bound_entries = restored
+                .cache_restore_report
+                .rejected_context_bound_entries,
+            "restored tool results remain audit-only; invocation identity or current freshness is required before reuse"
+        );
+    }
     loop_state.restricted_tools.extend(restored.blocked_tools);
     if !restored.recent_tools.is_empty() {
         loop_state.recent_tools = restored.recent_tools;
     }
-    loop_state.idempotency_cache = restored.idempotency_cache;
+    // Never carry event-derived semantic observations across a process
+    // recovery boundary. The local cache and TurnGuard workspace epoch share
+    // one agent-turn scope; durable replay is owned by the invocation ledger
+    // instead.
+    loop_state.idempotency_cache = Default::default();
     loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =

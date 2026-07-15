@@ -344,7 +344,6 @@ pub(crate) struct SessionState {
     /// Consecutive context-window failures restored from the latest heavy checkpoint.
     pub runtime_consecutive_context_window_errors: u32,
     /// Tool replay guard rebuilt from step events on resume.
-    pub runtime_idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -651,7 +650,6 @@ impl Default for SessionState {
             runtime_pipeline_state: None,
             runtime_compaction_state: None,
             runtime_consecutive_context_window_errors: 0,
-            runtime_idempotency_cache: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
@@ -758,7 +756,6 @@ impl SessionState {
         self.runtime_pipeline_state = None;
         self.runtime_compaction_state = None;
         self.runtime_consecutive_context_window_errors = 0;
-        self.runtime_idempotency_cache = None;
     }
 
     /// Set the current session id and keep the Tier 1 task manager in sync
@@ -1051,21 +1048,6 @@ mod default_tests {
 
     #[test]
     fn clear_session_id_clears_resume_recovery_fields() {
-        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-            "read_file",
-            &serde_json::json!({"path": "src/lib.rs"}),
-        );
-        idempotency_cache.record(
-            &idem_key,
-            astra_pipeline::step_protocol::CachedToolResult {
-                tool_name: "read_file".into(),
-                output: "old session contents".into(),
-                is_error: false,
-                cached_at: 1,
-                context_signature: None,
-            },
-        );
         let mut state = SessionState {
             session_id: Some("sess-1".into()),
             resume_guidance: Some("resume".into()),
@@ -1075,7 +1057,6 @@ mod default_tests {
             runtime_pipeline_state: Some(serde_json::json!({"old_session": true})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 3})),
             runtime_consecutive_context_window_errors: 2,
-            runtime_idempotency_cache: Some(idempotency_cache),
             ..Default::default()
         };
 
@@ -1089,7 +1070,6 @@ mod default_tests {
         assert!(state.runtime_pipeline_state.is_none());
         assert!(state.runtime_compaction_state.is_none());
         assert_eq!(state.runtime_consecutive_context_window_errors, 0);
-        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]

@@ -323,26 +323,10 @@ mod tests {
 
     #[test]
     fn report_turn_failure_preserves_runtime_recovery_state_without_partial_checkpoint() {
-        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-            "read_file",
-            &serde_json::json!({"path": "src/lib.rs"}),
-        );
-        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-        idempotency_cache.record(
-            &idem_key,
-            astra_pipeline::step_protocol::CachedToolResult {
-                tool_name: "read_file".into(),
-                output: "cached contents".into(),
-                is_error: false,
-                cached_at: 1,
-                context_signature: None,
-            },
-        );
         let mut state = SessionState {
             runtime_pipeline_state: Some(serde_json::json!({"previous": true})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 2})),
             runtime_consecutive_context_window_errors: 2,
-            runtime_idempotency_cache: Some(idempotency_cache),
             ..Default::default()
         };
         let failure = crate::TurnFailure {
@@ -372,15 +356,6 @@ mod tests {
             Some(serde_json::json!({"attempt_count": 2}))
         );
         assert_eq!(state.runtime_consecutive_context_window_errors, 2);
-        assert_eq!(
-            state
-                .runtime_idempotency_cache
-                .as_ref()
-                .and_then(|cache| cache.check(&idem_key))
-                .expect("restored cache should survive no-checkpoint failure")
-                .output,
-            "cached contents"
-        );
     }
 
     #[test]

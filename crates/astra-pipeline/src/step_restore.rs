@@ -4,7 +4,7 @@
 //!
 //! 1. Load latest heavy checkpoint → full conversation state
 //! 2. Replay events from JSONL → extract completed tool results
-//! 3. Warm idempotency cache → skip already-done tools on resume
+//! 3. Recover completed-tool audit history without granting replay authority
 //! 4. Validate protocol version → reject incompatible checkpoints
 //!
 //! # Usage
@@ -14,7 +14,7 @@
 //! if let Some(state) = restored {
 //!     // Resume from checkpoint
 //!     let messages = state.messages;
-//!     let cache = state.idempotency_cache;
+//!     let completed_results = state.completed_tool_results;
 //!     // ... continue execution
 //! }
 //! ```
@@ -23,9 +23,33 @@ use std::collections::HashMap;
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
-    CachedToolResult, HeavyCheckpoint, InMemoryIdempotencyCache, PROTOCOL_VERSION, SlotState,
-    StepEvent, StepEventType, VersionPolicy, check_protocol_version_with_policy,
+    HeavyCheckpoint, PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, VersionPolicy,
+    check_protocol_version_with_policy, persisted_cache_key_is_context_bound,
 };
+
+pub const CACHE_RESTORE_REPORT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRestoreReport {
+    pub contract_version: u32,
+    /// Completed-event rows deliberately kept out of the live execution
+    /// cache because they carry neither durable logical invocation identity
+    /// nor a verified current context snapshot.
+    pub rejected_unverified_entries: usize,
+    /// Diagnostic subset of `rejected_unverified_entries` that explicitly
+    /// carried a context/freshness suffix.
+    pub rejected_context_bound_entries: usize,
+}
+
+impl Default for CacheRestoreReport {
+    fn default() -> Self {
+        Self {
+            contract_version: CACHE_RESTORE_REPORT_VERSION,
+            rejected_unverified_entries: 0,
+            rejected_context_bound_entries: 0,
+        }
+    }
+}
 
 /// Restored session state — everything needed to resume execution.
 #[derive(Debug)]
@@ -40,8 +64,6 @@ pub struct RestoredSession {
     pub blocked_tools: Vec<String>,
     /// Recently used tools (for selection context)
     pub recent_tools: Vec<String>,
-    /// Pre-warmed idempotency cache (skip already-done tools)
-    pub idempotency_cache: InMemoryIdempotencyCache,
     /// Turn number to resume from
     pub resume_turn: u32,
     /// Protocol version of the checkpoint
@@ -61,6 +83,9 @@ pub struct RestoredSession {
     pub compaction_state: Option<serde_json::Value>,
     /// Serialized context pipeline state for warm-start on resume.
     pub pipeline_state: Option<serde_json::Value>,
+    /// Explicit account of completed-event rows rejected as execution cache
+    /// authority during recovery.
+    pub cache_restore_report: CacheRestoreReport,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestoreError {
@@ -122,7 +147,7 @@ pub fn restore_session_with_policy(
     // Step 2: Validate protocol version
     validate_checkpoint_version(&heavy, policy)?;
 
-    // Step 3: Extract resume turn and warm cache
+    // Step 3: Extract resume turn and completed-tool audit history.
     build_restored_session(user_id, session_id, heavy)
 }
 
@@ -133,7 +158,8 @@ fn build_restored_session(
     heavy: HeavyCheckpoint,
 ) -> Result<Option<RestoredSession>, RestoreError> {
     let resume_turn = extract_resume_turn(&heavy);
-    let (cache, completed_results) = warm_cache_from_events(user_id, session_id);
+    let (completed_results, cache_restore_report) =
+        recover_completed_tool_audit_from_events(user_id, session_id);
 
     Ok(Some(RestoredSession {
         messages: heavy.messages,
@@ -141,7 +167,6 @@ fn build_restored_session(
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
-        idempotency_cache: cache,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -150,6 +175,7 @@ fn build_restored_session(
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
         pipeline_state: heavy.pipeline_state,
+        cache_restore_report,
     }))
 }
 
@@ -188,17 +214,21 @@ fn extract_resume_turn(heavy: &HeavyCheckpoint) -> u32 {
         .unwrap_or(0)
 }
 
-/// Stream step events from JSONL to warm the idempotency cache.
+/// Stream completed tool events from JSONL for recovery audit state.
 ///
-/// Extracts completed tool results and pre-populates the cache so that
-/// on resume, already-executed tools are skipped (especially important
-/// for non-idempotent tools like bash).
-pub fn warm_cache_from_events(
+/// Event payloads historically carried a name/arguments-derived cache-key
+/// string. That is neither logical invocation identity nor proof that the
+/// current workspace still matches the observation context. Promoting it into
+/// a live execution cache can collapse distinct intent or serve stale reads.
+/// Completed results remain available for audit and recovery classification;
+/// executable replay authority comes from the invocation ledger/checkpoint
+/// state machine instead.
+pub fn recover_completed_tool_audit_from_events(
     user_id: &str,
     session_id: &str,
-) -> (InMemoryIdempotencyCache, HashMap<String, Vec<String>>) {
-    let mut cache = InMemoryIdempotencyCache::new();
+) -> (HashMap<String, Vec<String>>, CacheRestoreReport) {
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
+    let mut cache_restore_report = CacheRestoreReport::default();
 
     let result = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
         if let StepEventType::ToolCallCompleted = &event.event_type {
@@ -223,16 +253,10 @@ pub fn warm_cache_from_events(
                 .unwrap_or_default();
 
             if !tool_name.is_empty() && !cache_key.is_empty() && !is_error {
-                cache.record_cache_key(
-                    cache_key,
-                    CachedToolResult {
-                        tool_name: tool_name.to_string(),
-                        output: output.to_string(),
-                        is_error,
-                        cached_at: event.created_at,
-                        context_signature: None,
-                    },
-                );
+                cache_restore_report.rejected_unverified_entries += 1;
+                if persisted_cache_key_is_context_bound(cache_key) {
+                    cache_restore_report.rejected_context_bound_entries += 1;
+                }
             }
 
             if !tool_name.is_empty() {
@@ -249,11 +273,20 @@ pub fn warm_cache_from_events(
             user_id,
             session_id,
             error = %error,
-            "failed to stream step events while warming idempotency cache"
+            "failed to stream completed tool events during recovery"
+        );
+    }
+    if cache_restore_report.rejected_unverified_entries > 0 {
+        tracing::warn!(
+            user_id,
+            session_id,
+            rejected_unverified_entries = cache_restore_report.rejected_unverified_entries,
+            rejected_context_bound_entries = cache_restore_report.rejected_context_bound_entries,
+            "completed tool-event results were retained for audit but rejected as executable replay authority"
         );
     }
 
-    (cache, completed_results)
+    (completed_results, cache_restore_report)
 }
 
 /// Determine which execution slots are already complete and can be skipped.
@@ -273,19 +306,18 @@ pub fn completed_slots(heavy: &HeavyCheckpoint) -> Vec<usize> {
 
 /// Build a summary of what was recovered (for logging/explain mode).
 pub fn restore_summary(restored: &RestoredSession) -> String {
-    let cache_entries = restored.idempotency_cache.len();
     let tool_count: usize = restored
         .completed_tool_results
         .values()
         .map(|v| v.len())
         .sum();
     let mut s = format!(
-        "Restored session: turn={}, messages={}, cache={} entries, \
-         completed_tools={}, blocked={}, budget_tokens={}, budget_rounds={}",
+        "Restored session: turn={}, messages={}, completed_tools={}, \
+         unverified_cache_entries_rejected={}, blocked={}, budget_tokens={}, budget_rounds={}",
         restored.resume_turn,
         restored.messages.len(),
-        cache_entries,
         tool_count,
+        restored.cache_restore_report.rejected_unverified_entries,
         restored.blocked_tools.len(),
         restored.budget_remaining_tokens,
         restored.budget_remaining_rounds,
@@ -512,7 +544,6 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
-            idempotency_cache: InMemoryIdempotencyCache::new(),
             resume_turn: 3,
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),
@@ -521,6 +552,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
+            cache_restore_report: CacheRestoreReport::default(),
         };
 
         let summary = restore_summary(&restored);
@@ -533,15 +565,15 @@ mod tests {
     // ── Event-based cache warming ──
 
     #[test]
-    fn warm_cache_from_empty_events() {
-        // Non-existent session → empty cache
-        let (cache, results) = warm_cache_from_events(TEST_USER_ID, "nonexistent-session-xyz");
-        assert!(cache.is_empty());
+    fn completed_tool_audit_from_empty_events_is_empty() {
+        let (results, report) =
+            recover_completed_tool_audit_from_events(TEST_USER_ID, "nonexistent-session-xyz");
         assert!(results.is_empty());
+        assert_eq!(report, CacheRestoreReport::default());
     }
 
     #[test]
-    fn warm_cache_from_events_uses_persisted_cache_key() {
+    fn restore_rejects_unscoped_semantic_result_as_replay_authority() {
         let session_id = format!("warm-cache-key-{}-{}", std::process::id(), epoch_ms());
         let args = serde_json::json!({"path": "src/lib.rs"});
         let key = IdempotencyKey::semantic("read_file", &args);
@@ -563,14 +595,57 @@ mod tests {
         });
         drop(store);
 
-        let (cache, results) = warm_cache_from_events(TEST_USER_ID, &session_id);
-        let cached = cache
-            .check(&key)
-            .expect("warm cache must restore the exact persisted idempotency key");
-        assert_eq!(cached.output, "module contents");
+        let (results, report) = recover_completed_tool_audit_from_events(TEST_USER_ID, &session_id);
         assert_eq!(
             results.get("read_file").cloned().unwrap_or_default(),
             vec!["module contents".to_string()]
+        );
+        assert_eq!(report.rejected_unverified_entries, 1);
+        assert_eq!(report.rejected_context_bound_entries, 0);
+
+        let _ = std::fs::remove_dir_all(
+            crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)
+                .expect("valid session id for test cleanup"),
+        );
+    }
+
+    #[test]
+    fn restore_rejects_context_bound_observation_without_current_freshness_proof() {
+        let session_id = format!("warm-cache-context-{}-{}", std::process::id(), epoch_ms());
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args).with_context(
+            crate::step_protocol::ContextSignature {
+                workspace_version: Some("workspace_epoch:0".to_string()),
+                memory_snapshot_id: None,
+            },
+        );
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
+        store
+            .append(StepEvent {
+                event_id: "completed-stale-read".to_string(),
+                canonical_event_id: None,
+                step_id: "step-1".to_string(),
+                event_type: StepEventType::ToolCallCompleted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({
+                    "tool_name": "read_file",
+                    "idempotency_key": key.cache_key(),
+                    "output": "content before workspace mutation",
+                    "is_error": false,
+                })),
+                created_at: 1000,
+            })
+            .unwrap();
+        drop(store);
+
+        let (results, report) = recover_completed_tool_audit_from_events(TEST_USER_ID, &session_id);
+        assert_eq!(report.rejected_unverified_entries, 1);
+        assert_eq!(report.rejected_context_bound_entries, 1);
+        assert_eq!(
+            results.get("read_file"),
+            Some(&vec!["content before workspace mutation".to_string()]),
+            "audit history remains available even though the optimization entry is rejected"
         );
 
         let _ = std::fs::remove_dir_all(

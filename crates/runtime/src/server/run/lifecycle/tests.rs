@@ -589,7 +589,7 @@ async fn csl_persist_after_restore_keeps_current_user_message() {
 }
 
 #[test]
-fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_state() {
+fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtime_state() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -601,28 +601,12 @@ fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_stat
         None,
         None,
     );
-    let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-        "read_file",
-        &json!({"path": "src/lib.rs"}),
-    );
-    let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-    idempotency_cache.record(
-        &idem_key,
-        astra_pipeline::step_protocol::CachedToolResult {
-            tool_name: "read_file".into(),
-            output: "cached contents".into(),
-            is_error: false,
-            cached_at: 123,
-            context_signature: None,
-        },
-    );
     let restored = astra_pipeline::step_restore::RestoredSession {
         messages: Vec::new(),
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
-        idempotency_cache,
         resume_turn: 0,
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         completed_tool_results: HashMap::new(),
@@ -637,17 +621,21 @@ fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_stat
             "consecutive_futile_attempts": 1,
         })),
         pipeline_state: None,
+        cache_restore_report: astra_pipeline::step_restore::CacheRestoreReport {
+            rejected_unverified_entries: 1,
+            rejected_context_bound_entries: 1,
+            ..Default::default()
+        },
     };
 
     restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
 
     assert!(state.restricted_tools.contains("flaky_tool"));
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
-    let cached = state
-        .idempotency_cache
-        .check(&idem_key)
-        .expect("idempotency cache should be restored");
-    assert_eq!(cached.output, "cached contents");
+    assert!(
+        state.idempotency_cache.is_empty(),
+        "event-derived semantic observations must not cross the recovery boundary"
+    );
     assert_eq!(state.consecutive_context_window_errors, 5);
     assert_eq!(state.compaction_effectiveness.attempt_count, 6);
     assert_eq!(

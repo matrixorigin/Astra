@@ -162,7 +162,9 @@ fn build_turn_stream_params<'a>(
         pipeline_state: state.runtime_pipeline_state.clone(),
         compaction_state: state.runtime_compaction_state.clone(),
         consecutive_context_window_errors: state.runtime_consecutive_context_window_errors,
-        idempotency_cache: state.runtime_idempotency_cache.clone(),
+        // Headless read observations share a lifecycle with the turn-local
+        // workspace epoch. They must not be imported from session state.
+        idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: prepared.append_system_prompt.clone(),
         session_memory_extractor: state.session_memory_extractor.clone(),
@@ -326,21 +328,6 @@ mod tests {
 
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
-        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-            "read_file",
-            &serde_json::json!({"path": "src/lib.rs"}),
-        );
-        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-        idempotency_cache.record(
-            &idem_key,
-            astra_pipeline::step_protocol::CachedToolResult {
-                tool_name: "read_file".into(),
-                output: "cached contents".into(),
-                is_error: false,
-                cached_at: 1,
-                context_signature: None,
-            },
-        );
         let mut state = SessionState {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             current_plan_subtask_id: Some("subtask-1".into()),
@@ -354,7 +341,6 @@ mod tests {
                 "consecutive_futile_attempts": 1,
             })),
             runtime_consecutive_context_window_errors: 2,
-            runtime_idempotency_cache: Some(idempotency_cache),
             ..SessionState::default()
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -409,16 +395,9 @@ mod tests {
             }))
         );
         assert_eq!(params.consecutive_context_window_errors, 2);
-        let restored_cache = params
-            .idempotency_cache
-            .as_ref()
-            .expect("idempotency cache");
-        assert_eq!(
-            restored_cache
-                .check(&idem_key)
-                .expect("restored cached tool")
-                .output,
-            "cached contents"
+        assert!(
+            params.idempotency_cache.is_none(),
+            "turn-local observation cache must start cold"
         );
         assert!(params.cancel_token.is_some());
         assert!(params.incremental_state.is_some());

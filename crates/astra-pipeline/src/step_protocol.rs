@@ -1251,6 +1251,13 @@ impl IdempotencyKey {
     }
 }
 
+/// Context-bound observation keys are safe only while the caller can prove
+/// that the current context snapshot is identical. A process restart does not
+/// provide that proof by itself, even when the serialized key is intact.
+pub fn persisted_cache_key_is_context_bound(cache_key: &str) -> bool {
+    cache_key.contains(":freshness=")
+}
+
 /// Cached tool result (for crash recovery).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedToolResult {
