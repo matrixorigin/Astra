@@ -65,6 +65,7 @@ pub use runtime_scaffolding::{
 pub use semantic_read_cache::{
     SEMANTIC_READ_CACHE_CONTRACT_VERSION, SemanticFreshnessFact, SemanticFreshnessScope,
     SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadFreshnessContext,
+    SemanticReadFreshnessResolution, SemanticReadFreshnessUnavailableReason,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

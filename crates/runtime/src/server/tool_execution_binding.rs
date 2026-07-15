@@ -214,7 +214,7 @@ pub struct ToolPolicySnapshot {
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]
-    pub semantic_read_freshness: Option<astra_turn_types::SemanticReadFreshnessContext>,
+    pub semantic_read_freshness: Option<astra_turn_types::SemanticReadFreshnessResolution>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -691,18 +691,20 @@ mod tests {
             &json!({"query": "status"}),
         );
         request.policy.semantic_read_freshness = Some(
-            astra_turn_types::SemanticReadFreshnessContext::new(
-                "tenant:user-1",
-                vec![
-                    astra_turn_types::SemanticFreshnessFact::new(
-                        astra_turn_types::SemanticFreshnessScope::Provider,
-                        "provider-1",
-                        "revision-7",
-                    )
-                    .unwrap(),
-                ],
-            )
-            .unwrap(),
+            astra_turn_types::SemanticReadFreshnessResolution::Available(
+                astra_turn_types::SemanticReadFreshnessContext::new(
+                    "tenant:user-1",
+                    vec![
+                        astra_turn_types::SemanticFreshnessFact::new(
+                            astra_turn_types::SemanticFreshnessScope::Provider,
+                            "provider-1",
+                            "revision-7",
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
         );
 
         let encoded = serde_json::to_value(&request).unwrap();

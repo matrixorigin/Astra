@@ -89,6 +89,23 @@ pub struct SemanticReadFreshnessContext {
     pub context_id: String,
 }
 
+/// Runtime evidence state presented to the frozen invocation decision. Cache
+/// availability is an optimization: an unavailable source never fabricates a
+/// context and never blocks the underlying tool call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticReadFreshnessUnavailableReason {
+    SourceNotConfigured,
+    RevisionUnavailable,
+    SourceFailed,
+    InvalidEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticReadFreshnessResolution {
+    Available(SemanticReadFreshnessContext),
+    Unavailable(SemanticReadFreshnessUnavailableReason),
+}
+
 impl SemanticReadFreshnessContext {
     pub fn new(
         security_scope: &str,

@@ -7,7 +7,8 @@
 use astra_turn_types::{
     DurableToolReference, ResolvedSemanticCacheBaseline, ResolvedToolEffect,
     ResolvedToolIdempotency, SemanticReadCacheContractError, SemanticReadCacheKey,
-    SemanticReadFreshnessContext, ToolInvocationContractError, ToolInvocationDecision,
+    SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
+    SemanticReadFreshnessUnavailableReason, ToolInvocationContractError, ToolInvocationDecision,
     ToolInvocationFingerprint,
 };
 use serde::{Deserialize, Serialize};
@@ -101,7 +102,11 @@ pub(crate) enum InvocationSemanticReadCacheDecision {
 pub(crate) enum SemanticReadCacheBypassReason {
     NoProviderPolicy,
     PolicyDisabled,
-    FreshnessUnavailable,
+    FreshnessResolutionMissing,
+    SourceNotConfigured,
+    RevisionUnavailable,
+    SourceFailed,
+    InvalidEvidence,
 }
 
 impl InvocationSemanticReadCacheDecision {
@@ -114,8 +119,20 @@ impl InvocationSemanticReadCacheDecision {
                 reason: SemanticReadCacheBypassReason::PolicyDisabled,
             } => "disabled_by_policy",
             Self::Disabled {
-                reason: SemanticReadCacheBypassReason::FreshnessUnavailable,
-            } => "bypassed_freshness_unavailable",
+                reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
+            } => "bypassed_freshness_resolution_missing",
+            Self::Disabled {
+                reason: SemanticReadCacheBypassReason::SourceNotConfigured,
+            } => "bypassed_freshness_source_not_configured",
+            Self::Disabled {
+                reason: SemanticReadCacheBypassReason::RevisionUnavailable,
+            } => "bypassed_revision_unavailable",
+            Self::Disabled {
+                reason: SemanticReadCacheBypassReason::SourceFailed,
+            } => "bypassed_freshness_source_failed",
+            Self::Disabled {
+                reason: SemanticReadCacheBypassReason::InvalidEvidence,
+            } => "bypassed_invalid_freshness_evidence",
             Self::FreshnessBound { .. } => "eligible_freshness_bound",
         }
     }
@@ -333,16 +350,16 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.admission_snapshot = Some(self.admission.clone());
         request.policy.semantic_read_freshness = match &self.semantic_cache {
             InvocationSemanticReadCacheDecision::Disabled { .. } => None,
-            InvocationSemanticReadCacheDecision::FreshnessBound { freshness } => {
-                Some(freshness.clone())
-            }
+            InvocationSemanticReadCacheDecision::FreshnessBound { freshness } => Some(
+                SemanticReadFreshnessResolution::Available(freshness.clone()),
+            ),
         };
     }
 }
 
 fn resolve_semantic_read_cache_decision(
     provider_policy: Option<&astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
-    freshness: Option<&SemanticReadFreshnessContext>,
+    freshness: Option<&SemanticReadFreshnessResolution>,
 ) -> Result<InvocationSemanticReadCacheDecision, ToolInvocationDecisionError> {
     let Some(policy) = provider_policy else {
         if freshness.is_some() {
@@ -369,13 +386,39 @@ fn resolve_semantic_read_cache_decision(
                 return Err(ToolInvocationDecisionError::InvalidSemanticReadCachePolicy);
             }
             Ok(match freshness {
-                Some(freshness) => InvocationSemanticReadCacheDecision::FreshnessBound {
-                    freshness: freshness.clone(),
-                },
+                Some(SemanticReadFreshnessResolution::Available(freshness)) => {
+                    InvocationSemanticReadCacheDecision::FreshnessBound {
+                        freshness: freshness.clone(),
+                    }
+                }
+                Some(SemanticReadFreshnessResolution::Unavailable(reason)) => {
+                    InvocationSemanticReadCacheDecision::Disabled {
+                        reason: unavailable_reason(*reason),
+                    }
+                }
                 None => InvocationSemanticReadCacheDecision::Disabled {
-                    reason: SemanticReadCacheBypassReason::FreshnessUnavailable,
+                    reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
                 },
             })
+        }
+    }
+}
+
+fn unavailable_reason(
+    reason: SemanticReadFreshnessUnavailableReason,
+) -> SemanticReadCacheBypassReason {
+    match reason {
+        SemanticReadFreshnessUnavailableReason::SourceNotConfigured => {
+            SemanticReadCacheBypassReason::SourceNotConfigured
+        }
+        SemanticReadFreshnessUnavailableReason::RevisionUnavailable => {
+            SemanticReadCacheBypassReason::RevisionUnavailable
+        }
+        SemanticReadFreshnessUnavailableReason::SourceFailed => {
+            SemanticReadCacheBypassReason::SourceFailed
+        }
+        SemanticReadFreshnessUnavailableReason::InvalidEvidence => {
+            SemanticReadCacheBypassReason::InvalidEvidence
         }
     }
 }
@@ -489,7 +532,8 @@ mod tests {
             ResolvedToolIdempotency::PureRead,
             semantic_cache,
         ));
-        request.policy.semantic_read_freshness = freshness;
+        request.policy.semantic_read_freshness =
+            freshness.map(SemanticReadFreshnessResolution::Available);
         request
     }
 
@@ -588,7 +632,7 @@ mod tests {
         assert_eq!(
             decision.semantic_cache,
             InvocationSemanticReadCacheDecision::Disabled {
-                reason: SemanticReadCacheBypassReason::FreshnessUnavailable,
+                reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
             }
         );
         assert!(
@@ -596,6 +640,28 @@ mod tests {
                 .semantic_read_cache_key(&request.args)
                 .unwrap()
                 .is_none()
+        );
+
+        let mut failed = request;
+        failed.policy.semantic_read_freshness = Some(SemanticReadFreshnessResolution::Unavailable(
+            SemanticReadFreshnessUnavailableReason::SourceFailed,
+        ));
+        let failed_decision = ToolInvocationDecisionSnapshot::resolve(
+            &failed,
+            ToolExecutionRouteKind::RequestScopedMcp,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(
+            failed_decision.semantic_cache,
+            InvocationSemanticReadCacheDecision::Disabled {
+                reason: SemanticReadCacheBypassReason::SourceFailed,
+            }
+        );
+        assert_eq!(
+            ToolInvocationDecisionSnapshot::from_durable(&failed_decision.durable().unwrap())
+                .unwrap(),
+            failed_decision
         );
     }
 
@@ -632,7 +698,9 @@ mod tests {
         restored.apply_to_request(&mut current);
         assert_eq!(
             current.policy.semantic_read_freshness,
-            Some(original_freshness)
+            Some(SemanticReadFreshnessResolution::Available(
+                original_freshness
+            ))
         );
         assert_eq!(restored, decision);
     }
@@ -641,7 +709,9 @@ mod tests {
     fn stale_or_ineligible_freshness_inputs_fail_closed() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let mut built_in = request();
-        built_in.policy.semantic_read_freshness = Some(freshness("rev-1"));
+        built_in.policy.semantic_read_freshness = Some(SemanticReadFreshnessResolution::Available(
+            freshness("rev-1"),
+        ));
         assert!(matches!(
             ToolInvocationDecisionSnapshot::resolve(
                 &built_in,

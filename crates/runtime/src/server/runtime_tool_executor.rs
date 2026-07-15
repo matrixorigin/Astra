@@ -44,6 +44,9 @@ use astra_turn_types::{ProviderCallOutcome, ProviderCallPayload};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
+use crate::server::semantic_read_freshness::{
+    ProviderSemanticFreshnessSource, resolve_provider_semantic_freshness,
+};
 use crate::server::server_bash_execution::execute_server_bash;
 use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
 use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
@@ -316,6 +319,10 @@ pub struct RuntimeToolExecutor {
     /// index; no process-global name classification is mutated.
     provider_policy_index:
         Arc<std::sync::RwLock<astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex>>,
+    /// Optional provider-neutral snapshot source for revision evidence. The
+    /// source cannot authorize reuse; it only supplies facts for an already
+    /// trusted freshness-bound provider policy.
+    semantic_read_freshness_source: Option<Arc<dyn ProviderSemanticFreshnessSource>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
@@ -421,6 +428,7 @@ impl RuntimeToolExecutor {
             plan_authoring_active_handle: None,
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
+            semantic_read_freshness_source: None,
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -462,6 +470,14 @@ impl RuntimeToolExecutor {
         service: Arc<dyn astra_services::ReflectService>,
     ) -> Self {
         self.reflect_service = service;
+        self
+    }
+
+    pub fn with_semantic_read_freshness_source(
+        mut self,
+        source: Arc<dyn ProviderSemanticFreshnessSource>,
+    ) -> Self {
+        self.semantic_read_freshness_source = Some(source);
         self
     }
 
@@ -1729,6 +1745,7 @@ impl RuntimeToolExecutor {
                 .await,
         );
         let durable_invocation = if request.policy.permission_grant.is_some() {
+            self.attach_semantic_read_freshness(&mut request);
             let route = self.tool_execution_service.routing_decision(&request);
             let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
                 &request,
@@ -1894,6 +1911,75 @@ impl RuntimeToolExecutor {
             }
             None => result,
         }
+    }
+
+    fn attach_semantic_read_freshness(&self, request: &mut ToolExecutionRequest) {
+        let Some(policy) = request.policy.resolved_provider_policy.as_ref() else {
+            return;
+        };
+        if policy.semantic_cache != astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound
+        {
+            return;
+        }
+
+        let resolution = match resolve_provider_semantic_freshness(
+            self.semantic_read_freshness_source.as_deref(),
+            &policy.descriptor,
+            &request.args,
+        ) {
+            Ok(facts) => {
+                let security_scope = serde_json::json!({
+                    "contract_version": "semantic-read-security-scope-v1",
+                    "user_id": request.user_id.as_str(),
+                })
+                .to_string();
+                match astra_turn_types::SemanticReadFreshnessContext::new(&security_scope, facts) {
+                    Ok(context) => {
+                        astra_turn_types::SemanticReadFreshnessResolution::Available(context)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            %error,
+                            "provider semantic freshness evidence was invalid; executing uncached"
+                        );
+                        astra_turn_types::SemanticReadFreshnessResolution::Unavailable(
+                            astra_turn_types::SemanticReadFreshnessUnavailableReason::InvalidEvidence,
+                        )
+                    }
+                }
+            }
+            Err(reason) => {
+                match reason {
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceFailed => {
+                        tracing::warn!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            "provider semantic freshness source failed; executing uncached"
+                        );
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceNotConfigured
+                    | astra_turn_types::SemanticReadFreshnessUnavailableReason::RevisionUnavailable => {
+                        tracing::debug!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            ?reason,
+                            "provider semantic freshness unavailable; executing uncached"
+                        );
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::InvalidEvidence => {
+                        tracing::warn!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            "provider semantic freshness evidence was invalid; executing uncached"
+                        );
+                    }
+                }
+                astra_turn_types::SemanticReadFreshnessResolution::Unavailable(reason)
+            }
+        };
+        request.policy.semantic_read_freshness = Some(resolution);
     }
 
     /// Execute a tool locally on the server (no edge routing).
@@ -2375,6 +2461,7 @@ fn tool_result_from_provider_payload(
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
@@ -2403,6 +2490,29 @@ mod tests {
     }
 
     struct ReadyReflectService;
+
+    struct StaticSemanticFreshnessSource {
+        calls: AtomicUsize,
+        response: Result<
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence,
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError,
+        >,
+    }
+
+    impl crate::server::semantic_read_freshness::ProviderSemanticFreshnessSource
+        for StaticSemanticFreshnessSource
+    {
+        fn resolve(
+            &self,
+            _request: crate::server::semantic_read_freshness::ProviderSemanticFreshnessRequest<'_>,
+        ) -> Result<
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence,
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.response.clone()
+        }
+    }
 
     #[async_trait]
     impl astra_services::ReflectService for ReadyReflectService {
@@ -2913,6 +3023,131 @@ mod tests {
             }
             other => panic!("expected resolved provider policy, got {other:?}"),
         }
+    }
+
+    fn semantic_read_provider_policy(
+        cache: astra_turn_types::ResolvedSemanticCacheBaseline,
+    ) -> astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+        astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+            descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                astra_turn_types::ToolIdentity::new(
+                    astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
+                    astra_turn_types::NativeToolId::new("native-read").unwrap(),
+                ),
+                "descriptor-v1",
+            )
+            .unwrap(),
+            effect: astra_turn_types::ResolvedToolEffect::ReadOnly,
+            parallelizable: true,
+            approval:
+                astra_turn_core::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+            idempotency: astra_turn_types::ResolvedToolIdempotency::PureRead,
+            semantic_cache: cache,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn semantic_freshness_source_is_policy_gated_and_astra_security_scoped() {
+        let source = Arc::new(StaticSemanticFreshnessSource {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Current {
+                    facts: vec![astra_turn_types::SemanticFreshnessFact::new(
+                        astra_turn_types::SemanticFreshnessScope::Resource,
+                        "resource-a",
+                        "rev-1",
+                    )
+                    .unwrap()],
+                },
+            ),
+        });
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_semantic_read_freshness_source(source.clone());
+        let mut eligible = exec.tool_execution_request("public-alias", &json!({"query": "a"}));
+        eligible.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        exec.attach_semantic_read_freshness(&mut eligible);
+        let first_context = match eligible.policy.semantic_read_freshness.unwrap() {
+            astra_turn_types::SemanticReadFreshnessResolution::Available(context) => context,
+            other => panic!("expected available freshness, got {other:?}"),
+        };
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+
+        let mut ineligible = exec.tool_execution_request("public-alias", &json!({"query": "a"}));
+        ineligible.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+        ));
+        exec.attach_semantic_read_freshness(&mut ineligible);
+        assert!(ineligible.policy.semantic_read_freshness.is_none());
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+
+        let other_dir = TempDir::new().unwrap();
+        let other = RuntimeToolExecutor::new(
+            other_dir.path().to_path_buf(),
+            "other-user".to_string(),
+            "other-session".to_string(),
+            None,
+            None,
+        )
+        .with_semantic_read_freshness_source(source);
+        let mut other_request =
+            other.tool_execution_request("public-alias", &json!({"query": "a"}));
+        other_request.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        other.attach_semantic_read_freshness(&mut other_request);
+        let other_context = match other_request.policy.semantic_read_freshness.unwrap() {
+            astra_turn_types::SemanticReadFreshnessResolution::Available(context) => context,
+            other => panic!("expected available freshness, got {other:?}"),
+        };
+        assert_ne!(
+            first_context.security_scope_id,
+            other_context.security_scope_id
+        );
+        assert_ne!(first_context.context_id, other_context.context_id);
+    }
+
+    #[test]
+    fn missing_or_invalid_freshness_evidence_becomes_explicit_uncached_state() {
+        let (exec, _dir) = test_executor();
+        let mut missing = exec.tool_execution_request("public-alias", &Value::Null);
+        missing.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        exec.attach_semantic_read_freshness(&mut missing);
+        assert_eq!(
+            missing.policy.semantic_read_freshness,
+            Some(
+                astra_turn_types::SemanticReadFreshnessResolution::Unavailable(
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceNotConfigured,
+                )
+            )
+        );
+
+        let invalid_source = Arc::new(StaticSemanticFreshnessSource {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Current {
+                    facts: Vec::new(),
+                },
+            ),
+        });
+        let exec = exec.with_semantic_read_freshness_source(invalid_source);
+        let mut invalid = exec.tool_execution_request("public-alias", &Value::Null);
+        invalid.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        exec.attach_semantic_read_freshness(&mut invalid);
+        assert_eq!(
+            invalid.policy.semantic_read_freshness,
+            Some(
+                astra_turn_types::SemanticReadFreshnessResolution::Unavailable(
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::InvalidEvidence,
+                )
+            )
+        );
     }
 
     #[test]
