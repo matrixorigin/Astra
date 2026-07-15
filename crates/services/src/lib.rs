@@ -67,6 +67,7 @@ pub mod sync_engine;
 pub mod sync_outbox;
 pub mod task_orchestrator;
 pub mod team_persistence;
+pub mod tool_invocation_ledger;
 pub mod triggers;
 pub mod turn_intent_judge;
 pub mod verification;

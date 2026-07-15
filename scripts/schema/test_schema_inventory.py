@@ -32,7 +32,7 @@ class SchemaInventoryTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(core_tables),
-            89,
+            90,
             "core storage DDL count changed; update the schema plan and inventory baseline",
         )
 
@@ -76,6 +76,7 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_tool_output_batches",
             "session_tool_outputs",
             "tool_exactly_once_results",
+            "tool_invocation_ledger",
         }
         for table in first_batch:
             with self.subTest(table=table):

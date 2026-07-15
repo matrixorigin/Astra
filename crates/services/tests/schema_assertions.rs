@@ -1641,6 +1641,17 @@ async fn phase2_web_hydration_schema_contract() {
         .is_empty(),
         "tool_exactly_once_results must not keep a redundant session/user index; the owner-first primary key covers owner/session cleanup"
     );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "tool_invocation_ledger").await,
+        [
+            "user_id",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
+            "invocation_id"
+        ],
+        "tool invocation durability must use the complete owner/run/turn/invocation identity"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [

@@ -2053,6 +2053,26 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            run_id              VARCHAR(128) NOT NULL,
+            turn_chain_id       VARCHAR(128) NOT NULL,
+            invocation_id       VARCHAR(128) NOT NULL,
+            fingerprint_json    JSON NOT NULL,
+            state               VARCHAR(32) NOT NULL,
+            dispatch_certainty  VARCHAR(32) NOT NULL,
+            attempt_count       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
+            INDEX idx_tool_invocation_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
     query(
         "CREATE TABLE IF NOT EXISTS session_transcript_items (

@@ -381,6 +381,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="runtime::server::tool_exactly_once",
         product_owner="tool side-effect safety",
     ),
+    "tool_invocation_ledger": TableMetadata(
+        semantic_owner="astra_services::tool_invocation_ledger",
+        state_class="durable invocation coordination fact",
+        primary_query="atomic invocation prepare and state transition by full owner/session/run/turn/invocation identity",
+        retention_policy="retain for the complete replay and reconciliation lifetime of the owning session/run; session hard delete removes owner/session rows",
+        rebuildability="not rebuildable safely after dispatch; it is the authority preventing duplicate delivery and preserving outcome uncertainty",
+        merge_guidance="keep separate from semantic result caches and event logs; invocation CAS and reconciliation have different identity and lifecycle contracts",
+        migration_owner="astra_services::storage / tool_invocation_ledger",
+        product_owner="tool invocation durability, retry, reconnect, and resume safety",
+    ),
     "agent_message_queue": TableMetadata(
         semantic_owner="astra_messaging::db_transport",
         state_class="coordination queue fact",

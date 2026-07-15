@@ -255,6 +255,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         label: "tool_exactly_once_results",
         sql: "DELETE FROM tool_exactly_once_results WHERE session_id = ? AND user_id = ?",
     },
+    SessionDeleteStatement {
+        label: "tool_invocation_ledger",
+        sql: "DELETE FROM tool_invocation_ledger WHERE session_id = ? AND user_id = ?",
+    },
 ];
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
