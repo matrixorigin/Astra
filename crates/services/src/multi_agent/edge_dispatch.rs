@@ -97,6 +97,14 @@ impl EdgeDispatchIdentity {
     }
 }
 
+fn terminal_result_replay_matches(persisted: &str, replayed: &str) -> Result<bool, String> {
+    let persisted = serde_json::from_str::<serde_json::Value>(persisted)
+        .map_err(|error| format!("persisted terminal result is invalid JSON: {error}"))?;
+    let replayed = serde_json::from_str::<serde_json::Value>(replayed)
+        .map_err(|error| format!("replayed terminal result is invalid JSON: {error}"))?;
+    Ok(persisted == replayed)
+}
+
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(context, %error, "edge_dispatch rollback failed");
@@ -539,8 +547,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
         let updated = n.rows_affected() > 0;
         // A reconnect may replay a result whose first delivery committed but
-        // whose ACK was lost. Treat the exact persisted terminal body as an
-        // accepted idempotent delivery; a conflicting body remains rejected.
+        // whose ACK was lost. MatrixOne's JSON column may normalize object key
+        // order and whitespace, so compare JSON values rather than storage
+        // serialization. A semantically conflicting body remains rejected.
         let accepted = if updated {
             true
         } else {
@@ -559,16 +568,28 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("edge_dispatch verify replayed result: {e}"))?;
-            row.is_some_and(|row| {
-                matches!(
-                    (
-                        row.try_get::<String, _>("status"),
-                        row.try_get::<Option<String>, _>("result_json")
-                    ),
-                    (Ok(status), Ok(Some(body)))
-                        if status == "completed" && body == result_json
-                )
-            })
+            match row {
+                None => false,
+                Some(row) => {
+                    let status = row.try_get::<String, _>("status").map_err(|error| {
+                        format!("edge_dispatch replay status decode failed: {error}")
+                    })?;
+                    if status != "completed" {
+                        false
+                    } else {
+                        let body = row
+                            .try_get::<Option<String>, _>("result_json")
+                            .map_err(|error| {
+                                format!("edge_dispatch replay result_json decode failed: {error}")
+                            })?
+                            .ok_or_else(|| {
+                                "edge_dispatch completed replay row is missing result_json"
+                                    .to_string()
+                            })?;
+                        terminal_result_replay_matches(&body, result_json)?
+                    }
+                }
+            }
         };
         if let Some(ref m) = self.metrics {
             m.dispatch_deliver_update_latency.record(start.elapsed());
@@ -1044,6 +1065,33 @@ mod tests {
         let result = decode_terminal_result_json(&FakeEdgeDispatchRow::complete()).unwrap();
 
         assert_eq!(result, r#"{"status":"completed"}"#);
+    }
+
+    #[test]
+    fn terminal_result_replay_compares_json_semantics_not_database_formatting() {
+        let persisted =
+            r#"{"duration_ms": 12, "output": "ok", "request_id": "r1", "status": "completed"}"#;
+        let reordered_replay =
+            r#"{"request_id":"r1","status":"completed","output":"ok","duration_ms":12}"#;
+
+        assert!(terminal_result_replay_matches(persisted, reordered_replay).unwrap());
+        assert!(
+            !terminal_result_replay_matches(
+                persisted,
+                r#"{"request_id":"r1","status":"completed","output":"changed","duration_ms":12}"#
+            )
+            .unwrap()
+        );
+        assert!(
+            terminal_result_replay_matches(persisted, "not-json")
+                .unwrap_err()
+                .contains("replayed terminal result is invalid JSON")
+        );
+        assert!(
+            terminal_result_replay_matches("not-json", reordered_replay)
+                .unwrap_err()
+                .contains("persisted terminal result is invalid JSON")
+        );
     }
 
     #[test]
