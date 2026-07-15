@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn validate_version_compatible_accepts_same_major() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        // Same major (1xxx), different minor
+        // Same major (2xxx), different minor
         heavy.light.protocol_version = PROTOCOL_VERSION + 1;
         let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
         assert!(result.is_ok());
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn validate_version_compatible_rejects_different_major() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        heavy.light.protocol_version = 2000; // major 2, current is major 1
+        heavy.light.protocol_version = 1000; // major 1, current is major 2
         let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
         assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
     }

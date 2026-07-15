@@ -1,4 +1,4 @@
-//! Step Protocol v1: Slot-based execution, tiered checkpoints, DB-first events.
+//! Step Protocol v2: Slot-based execution, tiered checkpoints, DB-first events.
 //!
 //! # Architecture: 3 Concerns, 3 Types
 //!
@@ -42,7 +42,7 @@ use astra_text_utils::str_preview::prefix_chars;
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
 /// Version encoding: major * 1000 + minor. E.g., 1000 = v1.0, 1001 = v1.1, 2000 = v2.0.
-pub const PROTOCOL_VERSION_MAJOR: u32 = 1;
+pub const PROTOCOL_VERSION_MAJOR: u32 = 2;
 pub const PROTOCOL_VERSION_MINOR: u32 = 0;
 pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSION_MINOR;
 
@@ -1240,14 +1240,7 @@ impl IdempotencyKey {
             format!("{}:{}:{}", self.step_id, self.tool_index, self.content_hash)
         };
         if let Some(ctx) = &self.context_signature {
-            let mut parts = base;
-            if let Some(ws) = &ctx.workspace_version {
-                parts.push_str(&format!(":ws={}", prefix_chars(ws, 8)));
-            }
-            if let Some(ms) = &ctx.memory_snapshot_id {
-                parts.push_str(&format!(":ms={}", prefix_chars(ms, 8)));
-            }
-            parts
+            format!("{base}:freshness={}", context_signature_hash(ctx))
         } else {
             base
         }
@@ -1512,9 +1505,17 @@ fn compute_content_hash(tool_name: &str, args: &serde_json::Value) -> String {
     // (BTreeMap internally), so identical args → identical hash.
     let canonical = canonical_json(args);
     hasher.update(canonical.as_bytes());
-    let hash = hasher.finalize();
-    let hex = format!("{:x}", hash);
-    prefix_chars(&hex, 16)
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn context_signature_hash(context: &ContextSignature) -> String {
+    use sha2::{Digest, Sha256};
+    let value = serde_json::to_value(context)
+        .expect("semantic cache freshness context must serialize to JSON");
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_json(&value).as_bytes())
+    )
 }
 
 /// Produce canonical JSON with sorted keys (recursively).
@@ -1603,13 +1604,13 @@ mod tests {
                 "compatible rejects zero",
             ),
             (
-                2000,
+                1000,
                 VersionPolicy::Compatible,
                 false,
                 "compatible rejects diff major",
             ),
             (
-                1050,
+                2050,
                 VersionPolicy::Compatible,
                 true,
                 "compatible accepts same major",
@@ -2005,7 +2006,7 @@ mod tests {
         // Same content hash, different cache keys
         assert_eq!(key_no_ctx.content_hash, key_with_ctx.content_hash);
         assert_ne!(key_no_ctx.cache_key(), key_with_ctx.cache_key());
-        assert!(key_with_ctx.cache_key().contains(":ws=abc12345"));
+        assert!(key_with_ctx.cache_key().contains(":freshness=sha256:"));
     }
 
     #[test]
@@ -2015,7 +2016,22 @@ mod tests {
             workspace_version: None,
             memory_snapshot_id: Some("snap-20250101".into()),
         });
-        assert!(key.cache_key().contains(":ms=snap-202"));
+        assert!(key.cache_key().contains(":freshness=sha256:"));
+    }
+
+    #[test]
+    fn freshness_context_does_not_alias_on_shared_human_prefixes() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        let first = IdempotencyKey::semantic("read_file", &args).with_context(ContextSignature {
+            workspace_version: Some("workspace_epoch:10000000-a".into()),
+            memory_snapshot_id: None,
+        });
+        let second = IdempotencyKey::semantic("read_file", &args).with_context(ContextSignature {
+            workspace_version: Some("workspace_epoch:10000000-b".into()),
+            memory_snapshot_id: None,
+        });
+
+        assert_ne!(first.cache_key(), second.cache_key());
     }
 
     #[test]
@@ -3037,8 +3053,8 @@ mod tests {
 
     #[test]
     fn version_scheme_major_minor_encoding() {
-        assert_eq!(PROTOCOL_VERSION, 1000);
-        assert_eq!(PROTOCOL_VERSION_MAJOR, 1);
+        assert_eq!(PROTOCOL_VERSION, 2000);
+        assert_eq!(PROTOCOL_VERSION_MAJOR, 2);
         assert_eq!(PROTOCOL_VERSION_MINOR, 0);
         assert_eq!(PROTOCOL_VERSION / 1000, PROTOCOL_VERSION_MAJOR);
         assert_eq!(PROTOCOL_VERSION % 1000, PROTOCOL_VERSION_MINOR);
