@@ -502,6 +502,7 @@ async fn persist_context_manifest_for_llm_call(
     let context_window_tokens = context_window_tokens_for_context_manifest(state);
     let projection = crate::turn::llm::context::build_context_manifest_projection(
         crate::turn::llm::context::ContextManifestProjectionInput {
+            owner_id: user_id,
             session_id,
             run_id,
             turn_index,
