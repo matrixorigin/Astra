@@ -3,7 +3,10 @@ use astra_core::{
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
     error_response_coded,
 };
-use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+use astra_turn_types::{
+    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
+    ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
+};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -2760,6 +2763,12 @@ pub enum DatabaseRunStateStoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid durable tool output: output_id={output_id}, source={source}")]
+    InvalidToolOutput {
+        output_id: String,
+        #[source]
+        source: ToolInvocationContractError,
+    },
 }
 
 type DbStoreResult<T> = Result<T, DatabaseRunStateStoreError>;
@@ -2769,7 +2778,7 @@ pub struct ToolOutputBatchItem {
     pub output_id: String,
     pub tool_call_id: Option<String>,
     pub tool_name: String,
-    pub output_json: serde_json::Value,
+    pub result: ToolInvocationResultPayload,
 }
 
 /// MatrixOne durable run store.
@@ -3189,18 +3198,7 @@ impl DatabaseRunStateStore {
         user_id: &str,
         items: &[ToolOutputBatchItem],
     ) -> DbStoreResult<()> {
-        let payloads = items
-            .iter()
-            .map(|item| {
-                serde_json::to_string(&item.output_json).map_err(|source| {
-                    DatabaseRunStateStoreError::Json {
-                        operation: "serialize_tool_output",
-                        entity: item.output_id.clone(),
-                        source,
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let payloads = serialize_tool_output_payloads(items)?;
         let payload_bytes = payloads.iter().map(String::len).sum::<usize>();
         if items.len() > MAX_TOOL_OUTPUT_BATCH_ROWS || payload_bytes > MAX_TOOL_OUTPUT_BATCH_BYTES {
             return Err(DatabaseRunStateStoreError::ToolOutputBatchTooLarge {
@@ -3822,6 +3820,25 @@ impl DatabaseRunStateStore {
 
         Ok(())
     }
+}
+
+fn serialize_tool_output_payloads(items: &[ToolOutputBatchItem]) -> DbStoreResult<Vec<String>> {
+    items
+        .iter()
+        .map(|item| {
+            item.result.validate().map_err(|source| {
+                DatabaseRunStateStoreError::InvalidToolOutput {
+                    output_id: item.output_id.clone(),
+                    source,
+                }
+            })?;
+            serde_json::to_string(&item.result).map_err(|source| DatabaseRunStateStoreError::Json {
+                operation: "serialize_tool_output",
+                entity: item.output_id.clone(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
@@ -6151,10 +6168,9 @@ fn build_tool_output_preview_row(
     contract: &ToolPreviewContract,
 ) -> ToolOutputPreviewRow {
     let content_hash = format!("sha256:{}", sha256_hex(payload.as_bytes()));
-    let preview_source = tool_output_preview_source(&item.output_json, payload);
+    let preview_source = tool_output_preview_source(&item.result, payload);
     let preview_text = truncate_utf8_bytes(preview_source.as_ref(), contract.max_preview_bytes);
-    let explicit_artifact_ref = extract_optional_string(&item.output_json, "artifact_ref")
-        .or_else(|| extract_optional_string(&item.output_json, "artifact_uri"));
+    let explicit_artifact_ref = tool_result_artifact_ref(&item.result);
     let large_payload_ref = (payload.len() > contract.max_preview_bytes).then(|| {
         format!(
             "tool_output://{session_id}/{}@{}",
@@ -6176,38 +6192,51 @@ fn build_tool_output_preview_row(
         artifact_ref: explicit_artifact_ref.or(large_payload_ref),
         content_hash,
         normalize_version: contract.normalize_version.clone(),
-        parent_output_id: extract_optional_string(&item.output_json, "parent_output_id"),
+        parent_output_id: item
+            .result
+            .metadata
+            .get("parent_output_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
     }
 }
 
 fn tool_output_preview_source<'a>(
-    output_json: &'a serde_json::Value,
+    result: &'a ToolInvocationResultPayload,
     payload: &'a str,
 ) -> Cow<'a, str> {
-    for key in [
-        "result", "output", "content", "text", "message", "error", "stderr", "stdout",
-    ] {
-        if let Some(text) = extract_preview_string_field(output_json, key) {
-            return text;
-        }
+    let output = result.output.trim();
+    if !output.is_empty() {
+        return Cow::Borrowed(output);
     }
     Cow::Borrowed(payload)
 }
 
-fn extract_preview_string_field<'a>(
-    output_json: &'a serde_json::Value,
-    key: &str,
-) -> Option<Cow<'a, str>> {
-    let value = output_json.get(key)?;
-    match value {
-        serde_json::Value::String(text) => {
-            let text = text.trim();
-            (!text.is_empty()).then_some(Cow::Borrowed(text))
-        }
-        serde_json::Value::Number(number) => Some(Cow::Owned(number.to_string())),
-        serde_json::Value::Bool(value) => Some(Cow::Owned(value.to_string())),
-        _ => None,
-    }
+fn tool_result_artifact_ref(result: &ToolInvocationResultPayload) -> Option<String> {
+    result
+        .metadata
+        .get(TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
+        .and_then(|reference| {
+            reference
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| extract_optional_string(reference, "artifactUri"))
+                .or_else(|| extract_optional_string(reference, "artifactId"))
+        })
+        .or_else(|| {
+            result
+                .metadata
+                .get("artifact_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            result
+                .metadata
+                .get("artifact_uri")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
@@ -7952,12 +7981,48 @@ mod tests {
     }
 
     fn preview_item(tool_name: &str, output_json: serde_json::Value) -> ToolOutputBatchItem {
+        let mut object = output_json.as_object().cloned().unwrap_or_default();
+        let output = [
+            "result", "output", "content", "text", "message", "error", "stderr", "stdout",
+        ]
+        .into_iter()
+        .find_map(|key| object.remove(key))
+        .map(|value| match value {
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
         ToolOutputBatchItem {
             output_id: "output-1".to_string(),
             tool_call_id: Some("call-1".to_string()),
             tool_name: tool_name.to_string(),
-            output_json,
+            result: ToolInvocationResultPayload::bounded_projection(
+                output,
+                object.into_iter().collect(),
+                None,
+            ),
         }
+    }
+
+    #[test]
+    fn tool_output_serialization_rejects_forged_unbounded_payload_before_database_work() {
+        let item = ToolOutputBatchItem {
+            output_id: "forged-output".to_string(),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: "provider_read".to_string(),
+            result: ToolInvocationResultPayload {
+                output: "🦀".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES),
+                metadata: Default::default(),
+                exit_semantics: None,
+            },
+        };
+
+        let error = serialize_tool_output_payloads(&[item]).unwrap_err();
+        assert!(matches!(
+            error,
+            DatabaseRunStateStoreError::InvalidToolOutput { ref output_id, .. }
+                if output_id == "forged-output"
+        ));
     }
 
     #[test]
@@ -7984,7 +8049,7 @@ mod tests {
             "result": ".agent/\n.github/\nrust/\nweb/\n",
         });
         let item = preview_item("list_dir", output_json);
-        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+        let payload = serde_json::to_string(&item.result).expect("payload serializes");
 
         let row = build_tool_output_preview_row(
             "session-1",
@@ -8016,9 +8081,9 @@ mod tests {
                 "result": large_result,
             }),
         );
-        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+        let payload = serde_json::to_string(&item.result).expect("payload serializes");
 
-        let source = tool_output_preview_source(&item.output_json, &payload);
+        let source = tool_output_preview_source(&item.result, &payload);
         assert!(
             matches!(source, Cow::Borrowed(_)),
             "large string result must be borrowed before the bounded preview allocation"
@@ -8034,12 +8099,13 @@ mod tests {
         assert_eq!(row.preview_text.len(), 128);
         assert!(row.preview_text.chars().all(|ch| ch == 'x'));
         assert_eq!(row.preview_status, "truncated");
-        assert_eq!(row.payload.len(), payload.len());
+        assert!(row.payload.len() <= astra_turn_types::TOOL_INVOCATION_RESULT_MAX_BYTES);
+        assert!(row.payload.contains("astraResultProjection"));
         assert!(row.payload.contains("capacity_provider_coverage"));
     }
 
     #[test]
-    fn tool_output_preview_falls_back_to_payload_without_scalar_result() {
+    fn tool_output_preview_uses_canonical_json_text_for_structured_result() {
         let item = preview_item(
             "custom_tool",
             json!({
@@ -8047,7 +8113,7 @@ mod tests {
                 "data": ["also", "not", "scalar"],
             }),
         );
-        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+        let payload = serde_json::to_string(&item.result).expect("payload serializes");
 
         let row = build_tool_output_preview_row(
             "session-1",
@@ -8056,7 +8122,10 @@ mod tests {
             &preview_contract(64, false),
         );
 
-        assert_eq!(row.preview_text, truncate_utf8_bytes(&payload, 64));
+        assert_eq!(
+            row.preview_text,
+            truncate_utf8_bytes(&item.result.output, 64)
+        );
         assert_eq!(row.preview_status, "fallback");
     }
 

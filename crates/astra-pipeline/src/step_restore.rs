@@ -27,7 +27,7 @@ use crate::step_protocol::{
     check_protocol_version_with_policy, persisted_cache_key_is_context_bound,
 };
 
-pub const CACHE_RESTORE_REPORT_VERSION: u32 = 1;
+pub const CACHE_RESTORE_REPORT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheRestoreReport {
@@ -39,6 +39,15 @@ pub struct CacheRestoreReport {
     /// Diagnostic subset of `rejected_unverified_entries` that explicitly
     /// carried a context/freshness suffix.
     pub rejected_context_bound_entries: usize,
+    /// Whether this bounded audit projection covers the complete journal.
+    /// Audit completeness is separate from executable replay authority.
+    pub journal_complete: bool,
+    pub journal_bytes_read: usize,
+    pub events_examined: usize,
+    pub prefix_truncated: bool,
+    pub events_dropped: usize,
+    pub trailing_torn_line: bool,
+    pub degraded_reason: Option<String>,
 }
 
 impl Default for CacheRestoreReport {
@@ -47,6 +56,13 @@ impl Default for CacheRestoreReport {
             contract_version: CACHE_RESTORE_REPORT_VERSION,
             rejected_unverified_entries: 0,
             rejected_context_bound_entries: 0,
+            journal_complete: true,
+            journal_bytes_read: 0,
+            events_examined: 0,
+            prefix_truncated: false,
+            events_dropped: 0,
+            trailing_torn_line: false,
+            degraded_reason: None,
         }
     }
 }
@@ -227,13 +243,57 @@ pub fn recover_completed_tool_audit_from_events(
     user_id: &str,
     session_id: &str,
 ) -> (HashMap<String, Vec<String>>, CacheRestoreReport) {
+    recover_completed_tool_audit_from_events_with_bounds(
+        user_id,
+        session_id,
+        crate::step_checkpoint::STEP_EVENT_RECOVERY_MAX_BYTES,
+        crate::step_checkpoint::STEP_EVENT_RECOVERY_MAX_EVENTS,
+    )
+}
+
+fn recover_completed_tool_audit_from_events_with_bounds(
+    user_id: &str,
+    session_id: &str,
+    max_bytes: usize,
+    max_events: usize,
+) -> (HashMap<String, Vec<String>>, CacheRestoreReport) {
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
     let mut cache_restore_report = CacheRestoreReport::default();
 
-    let result = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
+    let window = match FileBackedEventStore::load_recent_events_bounded(
+        user_id, session_id, max_bytes, max_events,
+    ) {
+        Ok(window) => window,
+        Err(error) => {
+            cache_restore_report.journal_complete = false;
+            cache_restore_report.degraded_reason = Some(error.to_string());
+            tracing::warn!(
+                user_id,
+                session_id,
+                error = %error,
+                "completed-tool audit recovery failed without returning a partial projection"
+            );
+            return (completed_results, cache_restore_report);
+        }
+    };
+    cache_restore_report.journal_bytes_read = window.bytes_read;
+    cache_restore_report.events_examined = window.events.len();
+    cache_restore_report.prefix_truncated = window.prefix_truncated;
+    cache_restore_report.events_dropped = window.events_dropped;
+    cache_restore_report.trailing_torn_line = window.trailing_torn_line;
+    cache_restore_report.journal_complete =
+        !window.prefix_truncated && window.events_dropped == 0 && !window.trailing_torn_line;
+    if !cache_restore_report.journal_complete {
+        cache_restore_report.degraded_reason = Some(format!(
+            "bounded event audit window: prefix_truncated={}, events_dropped={}, trailing_torn_line={}",
+            window.prefix_truncated, window.events_dropped, window.trailing_torn_line
+        ));
+    }
+
+    for event in &window.events {
         if let StepEventType::ToolCallCompleted = &event.event_type {
             let Some(payload) = &event.payload else {
-                return;
+                continue;
             };
             let tool_name = payload
                 .get("tool_name")
@@ -266,15 +326,6 @@ pub fn recover_completed_tool_audit_from_events(
                     .push(output.to_string());
             }
         }
-    });
-
-    if let Err(error) = result {
-        tracing::warn!(
-            user_id,
-            session_id,
-            error = %error,
-            "failed to stream completed tool events during recovery"
-        );
     }
     if cache_restore_report.rejected_unverified_entries > 0 {
         tracing::warn!(
@@ -313,11 +364,12 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
         .sum();
     let mut s = format!(
         "Restored session: turn={}, messages={}, completed_tools={}, \
-         unverified_cache_entries_rejected={}, blocked={}, budget_tokens={}, budget_rounds={}",
+         unverified_cache_entries_rejected={}, audit_complete={}, blocked={}, budget_tokens={}, budget_rounds={}",
         restored.resume_turn,
         restored.messages.len(),
         tool_count,
         restored.cache_restore_report.rejected_unverified_entries,
+        restored.cache_restore_report.journal_complete,
         restored.blocked_tools.len(),
         restored.budget_remaining_tokens,
         restored.budget_remaining_rounds,
@@ -647,6 +699,52 @@ mod tests {
             Some(&vec!["content before workspace mutation".to_string()]),
             "audit history remains available even though the optimization entry is rejected"
         );
+
+        let _ = std::fs::remove_dir_all(
+            crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)
+                .expect("valid session id for test cleanup"),
+        );
+    }
+
+    #[test]
+    fn bounded_completed_tool_audit_reports_degraded_tail_instead_of_full_history() {
+        let session_id = format!("bounded-audit-{}-{}", std::process::id(), epoch_ms());
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
+        for idx in 0..4 {
+            store
+                .append(StepEvent {
+                    event_id: format!("completed-{idx}"),
+                    canonical_event_id: None,
+                    step_id: "step-1".to_string(),
+                    event_type: StepEventType::ToolCallCompleted,
+                    agent_id: None,
+                    caused_by: vec![],
+                    payload: Some(serde_json::json!({
+                        "tool_name": "read_file",
+                        "output": format!("content-{idx}"),
+                        "is_error": false,
+                    })),
+                    created_at: 1_000 + idx,
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let (results, report) = recover_completed_tool_audit_from_events_with_bounds(
+            TEST_USER_ID,
+            &session_id,
+            crate::step_checkpoint::STEP_EVENT_RECOVERY_MAX_BYTES,
+            2,
+        );
+        assert_eq!(
+            results.get("read_file"),
+            Some(&vec!["content-2".to_string(), "content-3".to_string()])
+        );
+        assert!(!report.journal_complete);
+        assert!(report.prefix_truncated);
+        assert_eq!(report.events_dropped, 2);
+        assert_eq!(report.events_examined, 2);
+        assert!(report.degraded_reason.is_some());
 
         let _ = std::fs::remove_dir_all(
             crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)

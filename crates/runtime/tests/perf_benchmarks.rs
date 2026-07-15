@@ -251,7 +251,12 @@ async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
                 output_id: id("out"),
                 tool_call_id: Some(format!("call-{idx}")),
                 tool_name: "slow_query_analyzer".to_string(),
-                output_json: json!({"idx": idx, "line": "slow query", "duration_ms": 123}),
+                result: astra_turn_types::ToolInvocationResultPayload::new(
+                    format!(r#"{{"idx":{idx},"line":"slow query","duration_ms":123}}"#),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
             });
         }
         store

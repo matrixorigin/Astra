@@ -168,7 +168,12 @@ async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
                 output_id: format!("out-{}", Uuid::new_v4()),
                 tool_call_id: Some("call-1".to_string()),
                 tool_name: tool_name.clone(),
-                output_json: json!({"text": "x".repeat(1_200)}),
+                result: astra_turn_types::ToolInvocationResultPayload::new(
+                    "x".repeat(1_200),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
             }],
         )
         .await
@@ -260,7 +265,14 @@ async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
                 output_id: output_id.clone(),
                 tool_call_id: Some("call-pg".to_string()),
                 tool_name: "pg_dump".to_string(),
-                output_json: json!({"declared_size_bytes": 3_221_225_472_u64, "raw": raw}),
+                result: astra_turn_types::ToolInvocationResultPayload::bounded_projection(
+                    raw,
+                    std::collections::BTreeMap::from([(
+                        "declared_size_bytes".to_string(),
+                        json!(3_221_225_472_u64),
+                    )]),
+                    None,
+                ),
             }],
         )
         .await
@@ -393,7 +405,15 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
             output_id: format!("out-{i}-{}", Uuid::new_v4()),
             tool_call_id: Some(format!("call-{i}")),
             tool_name: "slow_query_analyzer".to_string(),
-            output_json: json!({"idx": i, "declared_size_bytes": 838_860_800_u64, "line": "slow query"}),
+            result: astra_turn_types::ToolInvocationResultPayload::new(
+                format!("slow query {i}"),
+                std::collections::BTreeMap::from([(
+                    "declared_size_bytes".to_string(),
+                    json!(838_860_800_u64),
+                )]),
+                None,
+            )
+            .unwrap(),
         });
         if items.len() == 500 {
             store

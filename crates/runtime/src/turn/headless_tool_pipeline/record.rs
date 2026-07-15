@@ -177,8 +177,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution.result_str = finalized.output;
         execution.tool_result_fields = finalized.metadata;
 
+        let journal_result_source =
+            tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
+        let journal_result_inline =
+            truncate_tool_result_for_model(&execution.name, &journal_result_source);
+        let journal_result = maybe_persist_model_tool_result(
+            self.ctx.current_session_id,
+            &execution.id,
+            &execution.name,
+            &journal_result_source,
+            journal_result_inline,
+        );
+
         let args_json = serde_json::to_string(&execution.args).ok();
-        let args_size = args_json.as_ref().map(|s| s.len() as u32).unwrap_or(0);
+        let args_size = args_json
+            .as_ref()
+            .map(|value| u32::try_from(value.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
         let args_preview = make_args_preview(&execution.name, &execution.args);
         let args_full = args_json;
         let file_path = execution
@@ -193,7 +208,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 is_err,
                 executed_ms,
                 args_size,
-                execution.result_str.as_str(),
+                journal_result.as_str(),
                 args_preview.clone(),
                 file_path,
                 args_full,

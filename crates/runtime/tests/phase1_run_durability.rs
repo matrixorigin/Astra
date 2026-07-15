@@ -730,7 +730,12 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
             output_id: format!("out-{idx}-{}", Uuid::new_v4()),
             tool_call_id: Some(format!("call-{idx}")),
             tool_name: "bash".to_string(),
-            output_json: json!({"idx": idx, "stdout": "ok"}),
+            result: astra_turn_types::ToolInvocationResultPayload::new(
+                format!(r#"{{"idx":{idx},"stdout":"ok"}}"#),
+                Default::default(),
+                None,
+            )
+            .unwrap(),
         })
         .collect::<Vec<_>>();
     store
@@ -743,7 +748,12 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
             output_id: format!("oversized-{idx}-{}", Uuid::new_v4()),
             tool_call_id: None,
             tool_name: "bash".to_string(),
-            output_json: json!({"idx": idx}),
+            result: astra_turn_types::ToolInvocationResultPayload::new(
+                idx.to_string(),
+                Default::default(),
+                None,
+            )
+            .unwrap(),
         })
         .collect::<Vec<_>>();
     assert!(
@@ -777,7 +787,12 @@ async fn l2_one_thousand_tool_outputs_insert_under_1000ms() {
                 output_id: format!("l2-out-{chunk}-{idx}-{}", Uuid::new_v4()),
                 tool_call_id: Some(format!("call-{chunk}-{idx}")),
                 tool_name: "bash".to_string(),
-                output_json: json!({"chunk": chunk, "idx": idx, "stdout": "ok"}),
+                result: astra_turn_types::ToolInvocationResultPayload::new(
+                    format!(r#"{{"chunk":{chunk},"idx":{idx},"stdout":"ok"}}"#),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
             })
             .collect::<Vec<_>>();
         store
@@ -1064,7 +1079,12 @@ async fn l3_s08_one_thousand_tool_outputs_split_under_two_seconds() {
                 output_id: format!("out-{chunk}-{idx}-{}", Uuid::new_v4()),
                 tool_call_id: Some(format!("call-{chunk}-{idx}")),
                 tool_name: "bash".to_string(),
-                output_json: json!({"chunk": chunk, "idx": idx, "stdout": "ok"}),
+                result: astra_turn_types::ToolInvocationResultPayload::new(
+                    format!(r#"{{"chunk":{chunk},"idx":{idx},"stdout":"ok"}}"#),
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
             })
             .collect::<Vec<_>>();
         store

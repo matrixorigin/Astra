@@ -28,6 +28,11 @@ const STEP_EVENT_ARTIFACT_KIND: &str = "step_event";
 const STEP_BREAKPOINT_INDEX_ARTIFACT_KIND: &str = "step_breakpoint_index";
 const STEP_COMPOSITE_INDEX_ARTIFACT_KIND: &str = "step_composite_snapshot_index";
 
+/// Recovery reads a recent tail rather than allowing one long-lived session
+/// to force an unbounded journal scan during resume.
+pub const STEP_EVENT_RECOVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const STEP_EVENT_RECOVERY_MAX_EVENTS: usize = 4_096;
+
 /// Maximum number of light checkpoints to retain (older ones pruned).
 const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
@@ -651,6 +656,30 @@ pub struct FileBackedEventStore {
     events: Vec<StepEvent>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BoundedStepEventWindow {
+    pub events: Vec<StepEvent>,
+    pub bytes_read: usize,
+    pub prefix_truncated: bool,
+    pub events_dropped: usize,
+    pub trailing_torn_line: bool,
+}
+
+impl BoundedStepEventWindow {
+    #[must_use]
+    pub fn is_complete_since(&self, created_at: u64) -> bool {
+        if self.trailing_torn_line {
+            return false;
+        }
+        if !self.prefix_truncated && self.events_dropped == 0 {
+            return true;
+        }
+        self.events
+            .first()
+            .is_some_and(|event| event.created_at <= created_at)
+    }
+}
+
 impl FileBackedEventStore {
     /// Create a new store for a session, loading existing events from disk.
     pub fn new(user_id: &str, session_id: &str) -> Self {
@@ -761,20 +790,6 @@ impl FileBackedEventStore {
         events
     }
 
-    fn load_events_matching(
-        user_id: &str,
-        session_id: &str,
-        mut keep: impl FnMut(&StepEvent) -> bool,
-    ) -> std::io::Result<Vec<StepEvent>> {
-        let mut events = Vec::new();
-        Self::for_each_event(user_id, session_id, |event| {
-            if keep(event) {
-                events.push(event.clone());
-            }
-        })?;
-        Ok(events)
-    }
-
     /// Stream persisted events without materializing the whole journal.
     pub fn for_each_event(
         user_id: &str,
@@ -804,8 +819,122 @@ impl FileBackedEventStore {
         session_id: &str,
         checkpoint_created_at: u64,
     ) -> std::io::Result<Vec<StepEvent>> {
-        Self::load_events_matching(user_id, session_id, |event| {
-            event.created_at >= checkpoint_created_at
+        let window = Self::load_recent_events_bounded(
+            user_id,
+            session_id,
+            STEP_EVENT_RECOVERY_MAX_BYTES,
+            STEP_EVENT_RECOVERY_MAX_EVENTS,
+        )?;
+        if !window.is_complete_since(checkpoint_created_at) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "step event recovery window is incomplete: bytes_read={}, prefix_truncated={}, events_dropped={}, checkpoint_created_at={checkpoint_created_at}",
+                    window.bytes_read, window.prefix_truncated, window.events_dropped
+                ),
+            ));
+        }
+        Ok(window
+            .events
+            .into_iter()
+            .filter(|event| event.created_at >= checkpoint_created_at)
+            .collect())
+    }
+
+    /// Read a byte- and event-bounded tail of the owner-scoped JSONL journal.
+    /// A torn final append is reported explicitly; corruption in any complete
+    /// line fails rather than yielding a silently partial recovery view.
+    pub fn load_recent_events_bounded(
+        user_id: &str,
+        session_id: &str,
+        max_bytes: usize,
+        max_events: usize,
+    ) -> std::io::Result<BoundedStepEventWindow> {
+        if max_bytes == 0 || max_events == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "step event recovery bounds must be positive",
+            ));
+        }
+        let path = events_path_for(user_id, session_id)?;
+        if !path.exists() {
+            return Ok(BoundedStepEventWindow::default());
+        }
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let file_bytes = file.metadata()?.len();
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let start = file_bytes.saturating_sub(max_bytes_u64);
+        let starts_at_line_boundary = if start == 0 {
+            true
+        } else {
+            file.seek(SeekFrom::Start(start - 1))?;
+            let mut previous = [0_u8; 1];
+            file.read_exact(&mut previous)?;
+            previous[0] == b'\n'
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(file_bytes.saturating_sub(start)).unwrap_or(max_bytes),
+        );
+        file.read_to_end(&mut bytes)?;
+        let bytes_read = bytes.len();
+        let mut prefix_truncated = start > 0;
+        if prefix_truncated && !starts_at_line_boundary {
+            match bytes.iter().position(|byte| *byte == b'\n') {
+                Some(end) => {
+                    bytes.drain(..=end);
+                }
+                None => {
+                    bytes.clear();
+                }
+            }
+        }
+        let text = String::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("step event journal is not UTF-8: {error}"),
+            )
+        })?;
+        let ends_with_newline = text.ends_with('\n');
+        let mut events = Vec::new();
+        let mut trailing_torn_line = false;
+        let line_count = text.split('\n').count();
+        for (index, line) in text.split('\n').enumerate() {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<VersionedStepArtifact<StepEvent>>(line) {
+                Ok(envelope) => events.push(validate_versioned_step_artifact(
+                    STEP_EVENT_ARTIFACT_KIND,
+                    user_id,
+                    session_id,
+                    envelope,
+                )?),
+                Err(_) if index + 1 == line_count && !ends_with_newline => {
+                    trailing_torn_line = true;
+                }
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid complete step event JSONL line: {error}"),
+                    ));
+                }
+            }
+        }
+        let events_dropped = events.len().saturating_sub(max_events);
+        if events_dropped > 0 {
+            events.drain(..events_dropped);
+            prefix_truncated = true;
+        }
+        Ok(BoundedStepEventWindow {
+            events,
+            bytes_read,
+            prefix_truncated,
+            events_dropped,
+            trailing_torn_line,
         })
     }
 
@@ -1264,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn file_event_store_recovers_valid_events_after_torn_jsonl_tail() {
+    fn lenient_event_view_keeps_valid_prefix_but_recovery_rejects_torn_tail() {
         let session_id = unique_session_id("test-torn-jsonl-tail");
         let path = events_path_for(TEST_USER_ID, &session_id).unwrap();
         let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
@@ -1296,14 +1425,10 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e1", "e2"]);
 
-        let recovered =
+        let error =
             FileBackedEventStore::load_events_created_at_or_after(TEST_USER_ID, &session_id, 0)
-                .expect("torn JSONL tail must not fail recovery");
-        let ids: Vec<_> = recovered
-            .iter()
-            .map(|event| event.event_id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["e1", "e2"]);
+                .expect_err("crash recovery must not hide a torn terminal event");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
     }
@@ -1372,6 +1497,75 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(session_dir_for(TEST_USER_ID, &session_id).unwrap());
+    }
+
+    #[test]
+    fn bounded_event_tail_reports_omitted_history_and_proves_only_covered_checkpoints() {
+        let session_id = unique_session_id("test-bounded-event-tail");
+        let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
+        {
+            let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
+            for idx in 0..10 {
+                let mut event =
+                    make_event(&format!("e{idx}"), "s1", StepEventType::ToolCallCompleted);
+                event.created_at = idx * 100;
+                store.append(event).unwrap();
+            }
+        }
+
+        let window = FileBackedEventStore::load_recent_events_bounded(
+            TEST_USER_ID,
+            &session_id,
+            STEP_EVENT_RECOVERY_MAX_BYTES,
+            3,
+        )
+        .unwrap();
+        let ids = window
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["e7", "e8", "e9"]);
+        assert!(window.prefix_truncated);
+        assert_eq!(window.events_dropped, 7);
+        assert!(window.is_complete_since(700));
+        assert!(!window.is_complete_since(699));
+
+        let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
+    }
+
+    #[test]
+    fn bounded_event_tail_surfaces_torn_tail_without_accepting_midstream_corruption() {
+        let session_id = unique_session_id("test-bounded-event-corruption");
+        let path = events_path_for(TEST_USER_ID, &session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
+        std::fs::create_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap()).unwrap();
+        let event = event_json_for_test(
+            &session_id,
+            &make_event("e1", "s1", StepEventType::ToolCallCompleted),
+        );
+        std::fs::write(&path, format!("{event}\n{{\"torn\":")).unwrap();
+        let window = FileBackedEventStore::load_recent_events_bounded(
+            TEST_USER_ID,
+            &session_id,
+            STEP_EVENT_RECOVERY_MAX_BYTES,
+            STEP_EVENT_RECOVERY_MAX_EVENTS,
+        )
+        .unwrap();
+        assert_eq!(window.events.len(), 1);
+        assert!(window.trailing_torn_line);
+
+        std::fs::write(&path, format!("{event}\n{{not-json}}\n{event}\n")).unwrap();
+        let error = FileBackedEventStore::load_recent_events_bounded(
+            TEST_USER_ID,
+            &session_id,
+            STEP_EVENT_RECOVERY_MAX_BYTES,
+            STEP_EVENT_RECOVERY_MAX_EVENTS,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap());
     }
 
     #[test]

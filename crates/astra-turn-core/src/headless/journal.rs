@@ -248,13 +248,14 @@ pub fn journal_record_executed_tool_call(
         })
     };
 
-    // Store full result up to 50 KB. Larger outputs (bash, read_file) are
-    // already persisted to tool-results/<call_id>.txt by tool_result_storage.
-    const MAX_RESULT_FULL_BYTES: usize = 50_000;
-    let result_full = if result_str.is_empty() || result_str.len() > MAX_RESULT_FULL_BYTES {
+    // The caller supplies the final model-visible value, which is either an
+    // inline governed result or an owner-scoped artifact reference. Enforce
+    // the shared durable boundary again here so alternate callers cannot put
+    // an unbounded body into the journal.
+    let result_full = if result_str.is_empty() {
         None
     } else {
-        Some(result_str.to_string())
+        Some(bounded_journal_result(result_str))
     };
 
     ToolCallRecord {
@@ -268,7 +269,7 @@ pub fn journal_record_executed_tool_call(
             None
         },
         input_bytes: Some(args_size),
-        output_bytes: Some(result_str.len() as u32),
+        output_bytes: Some(u32::try_from(result_str.len()).unwrap_or(u32::MAX)),
         args_preview,
         result_preview,
         file_path,
@@ -279,6 +280,23 @@ pub fn journal_record_executed_tool_call(
         disposition: Some(ToolCallDisposition::Executed),
         ..Default::default()
     }
+}
+
+fn bounded_journal_result(result: &str) -> String {
+    let projection = astra_turn_types::ToolInvocationResultPayload::bounded_projection(
+        result.to_string(),
+        Default::default(),
+        None,
+    );
+    let Some(evidence) = projection.metadata.get("astraResultProjection") else {
+        return projection.output;
+    };
+    let evidence = serde_json::to_string(evidence)
+        .expect("bounded result projection evidence must serialize to JSON");
+    format!(
+        "{}\n<astra-result-projection>{evidence}</astra-result-projection>",
+        projection.output
+    )
 }
 
 #[cfg(test)]
@@ -649,8 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn executed_record_result_full_capped_at_50kb() {
-        let large = "x".repeat(51_000);
+    fn executed_record_result_full_uses_explicit_durable_projection() {
+        let large = "🦀".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES);
         let r = journal_record_executed_tool_call(
             "bash".into(),
             false,
@@ -661,10 +679,13 @@ mod tests {
             None,
             None,
         );
-        assert!(
-            r.result_full.is_none(),
-            "result_full must be None for outputs > 50KB"
-        );
+        let result = r
+            .result_full
+            .expect("oversized output has a bounded projection");
+        assert!(result.len() <= astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES);
+        assert!(result.contains("durable result projection omitted bytes"));
+        assert!(result.contains("<astra-result-projection>"));
+        assert!(result.contains("contentHash"));
         assert!(r.result_preview.is_some(), "result_preview still populated");
     }
 }

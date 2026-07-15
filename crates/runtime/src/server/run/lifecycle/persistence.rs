@@ -845,6 +845,18 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     current_date: &str,
     loop_state: &mut AgenticLoopState,
 ) {
+    if !restored.cache_restore_report.journal_complete {
+        tracing::warn!(
+            target: "astra_runtime::recovery",
+            journal_bytes_read = restored.cache_restore_report.journal_bytes_read,
+            events_examined = restored.cache_restore_report.events_examined,
+            prefix_truncated = restored.cache_restore_report.prefix_truncated,
+            events_dropped = restored.cache_restore_report.events_dropped,
+            trailing_torn_line = restored.cache_restore_report.trailing_torn_line,
+            degraded_reason = ?restored.cache_restore_report.degraded_reason,
+            "restored session has an explicitly degraded completed-tool audit projection"
+        );
+    }
     if restored.cache_restore_report.rejected_unverified_entries > 0 {
         tracing::warn!(
             target: "astra_runtime::recovery",

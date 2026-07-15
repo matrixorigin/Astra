@@ -649,7 +649,12 @@ async fn tool_output_batches_isolate_identity_by_owner_session() {
                 output_id: output_id.clone(),
                 tool_call_id: Some("owner-call".into()),
                 tool_name: missing_tool_name.clone(),
-                output_json: json!({"source": "owner_row"}),
+                result: astra_turn_types::ToolInvocationResultPayload::new(
+                    "owner_row",
+                    Default::default(),
+                    None,
+                )
+                .unwrap(),
             }],
         )
         .await
