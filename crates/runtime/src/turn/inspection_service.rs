@@ -402,6 +402,12 @@ pub fn local_reflect_from_snapshot(
             if let Some(ref cb) = snapshot.circuit_breaker {
                 lines.push(format!("circuit_breaker: {}", cb.state));
             }
+            for decision in &snapshot.semantic_cache_decisions {
+                lines.push(format!(
+                    "semantic_read_cache: {}={}",
+                    decision.tool_name, decision.state
+                ));
+            }
         }
 
         ObservationFacet::Errors => {

@@ -76,8 +76,30 @@ impl Drop for SemanticReadFillHeartbeat {
 }
 
 pub(crate) enum SemanticReadBeforeDispatch {
-    Proceed(Option<Box<SemanticReadFillClaim>>),
+    Proceed {
+        fill: Option<Box<SemanticReadFillClaim>>,
+        evidence: Option<SemanticReadDecisionEvidence>,
+    },
     Return(astra_tools::ToolResult),
+}
+
+pub(crate) struct SemanticReadDecisionEvidence {
+    pub(crate) state: &'static str,
+    pub(crate) key_id: Option<String>,
+}
+
+fn proceed(
+    fill: Option<Box<SemanticReadFillClaim>>,
+    state: &'static str,
+    key: &SemanticReadCacheKey,
+) -> SemanticReadBeforeDispatch {
+    SemanticReadBeforeDispatch::Proceed {
+        fill,
+        evidence: Some(SemanticReadDecisionEvidence {
+            state,
+            key_id: Some(key.key_id.clone()),
+        }),
+    }
 }
 
 impl RuntimeSemanticReadObservationStore {
@@ -301,7 +323,10 @@ pub(crate) async fn before_dispatch(
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> SemanticReadBeforeDispatch {
     let Some(key) = key else {
-        return SemanticReadBeforeDispatch::Proceed(None);
+        return SemanticReadBeforeDispatch::Proceed {
+            fill: None,
+            evidence: None,
+        };
     };
     let Some(store) = store else {
         tracing::debug!(
@@ -314,7 +339,7 @@ pub(crate) async fn before_dispatch(
             semantic_read_cache_key_id = %key.key_id,
             "semantic read observation cache is not enabled for this runtime"
         );
-        return SemanticReadBeforeDispatch::Proceed(None);
+        return proceed(None, "rollout_disabled", key);
     };
     let fill_owner = uuid::Uuid::now_v7().to_string();
     match lookup_or_wait_for_fill(store, identity, key, &fill_owner, cancel_token).await {
@@ -348,7 +373,7 @@ pub(crate) async fn before_dispatch(
                         semantic_read_cache_key_id = %key.key_id,
                         "cache completion failed but the ledger authoritatively remained prepared; dispatching normally"
                     );
-                    SemanticReadBeforeDispatch::Proceed(None)
+                    proceed(None, "completion_degraded", key)
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -362,7 +387,7 @@ pub(crate) async fn before_dispatch(
                         %error,
                         "semantic cache completion failed; the authoritative dispatch CAS will decide whether execution is still needed"
                     );
-                    SemanticReadBeforeDispatch::Proceed(None)
+                    proceed(None, "completion_failed", key)
                 }
             }
         }
@@ -384,12 +409,16 @@ pub(crate) async fn before_dispatch(
                 key.clone(),
                 fill_owner.clone(),
             );
-            SemanticReadBeforeDispatch::Proceed(Some(Box::new(SemanticReadFillClaim {
-                store: store.clone(),
-                key: key.clone(),
-                owner_id: fill_owner,
-                heartbeat,
-            })))
+            proceed(
+                Some(Box::new(SemanticReadFillClaim {
+                    store: store.clone(),
+                    key: key.clone(),
+                    owner_id: fill_owner,
+                    heartbeat,
+                })),
+                "fill_claimed",
+                key,
+            )
         }
         Ok(SemanticReadCacheLookup::FillInProgress {
             lease_expires_at_epoch_ms,
@@ -406,7 +435,7 @@ pub(crate) async fn before_dispatch(
                 semantic_read_fill_wait_deadline_ms = SEMANTIC_READ_FILL_WAIT_DEADLINE.as_millis(),
                 "semantic read fill did not settle within the bounded wait; executing this pure read uncached"
             );
-            SemanticReadBeforeDispatch::Proceed(None)
+            proceed(None, "fill_in_progress", key)
         }
         Ok(SemanticReadCacheLookup::FillCapacityExceeded) => {
             tracing::warn!(
@@ -419,7 +448,7 @@ pub(crate) async fn before_dispatch(
                 semantic_read_cache_key_id = %key.key_id,
                 "semantic read fill capacity is saturated; executing this pure read uncached"
             );
-            SemanticReadBeforeDispatch::Proceed(None)
+            proceed(None, "fill_capacity_exceeded", key)
         }
         Err(RuntimeSemanticReadObservationStoreError::WaitCancelled) => {
             tracing::debug!(
@@ -432,7 +461,7 @@ pub(crate) async fn before_dispatch(
                 semantic_read_cache_key_id = %key.key_id,
                 "semantic read wait was cancelled; authoritative route cancellation remains in control"
             );
-            SemanticReadBeforeDispatch::Proceed(None)
+            proceed(None, "wait_cancelled", key)
         }
         Err(error) => {
             tracing::warn!(
@@ -446,7 +475,7 @@ pub(crate) async fn before_dispatch(
                 %error,
                 "semantic read observation lookup failed; executing normally"
             );
-            SemanticReadBeforeDispatch::Proceed(None)
+            proceed(None, "lookup_degraded", key)
         }
     }
 }
@@ -800,5 +829,22 @@ mod tests {
                 .unwrap(),
             SemanticReadCacheLookup::FillInProgress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn disabled_store_returns_bounded_explainable_bypass_evidence() {
+        let key = key();
+        let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
+        let decision =
+            before_dispatch(None, &ledger, &identity("call-disabled"), Some(&key), None).await;
+        let SemanticReadBeforeDispatch::Proceed {
+            fill: None,
+            evidence: Some(evidence),
+        } = decision
+        else {
+            panic!("disabled cache must execute authoritatively with evidence");
+        };
+        assert_eq!(evidence.state, "rollout_disabled");
+        assert_eq!(evidence.key_id, Some(key.key_id));
     }
 }

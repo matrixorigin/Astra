@@ -578,6 +578,14 @@ fn build_introspect_snapshot_with_tool_admission(
         .as_ref()
         .map(|s| s.working_memory().render_prompt_section())
         .unwrap_or_default();
+    let mut semantic_cache_decisions = state
+        .tool_results
+        .iter()
+        .rev()
+        .filter_map(semantic_cache_decision_from_tool_result)
+        .take(16)
+        .collect::<Vec<_>>();
+    semantic_cache_decisions.reverse();
 
     let recent_rounds = state
         .recent_rounds
@@ -722,6 +730,7 @@ fn build_introspect_snapshot_with_tool_admission(
         working_memory_summary: working_mem,
         lifecycle_summary,
         tool_admission,
+        semantic_cache_decisions,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()
@@ -750,6 +759,75 @@ fn build_introspect_snapshot_with_tool_admission(
     }
 
     snapshot
+}
+
+fn semantic_cache_decision_from_tool_result(
+    tool_result: &Value,
+) -> Option<astra_turn_core::introspect::SemanticCacheDecisionSnapshotEntry> {
+    let tool_name = tool_result.get("name")?.as_str()?;
+    let state = tool_result.get("semantic_read_cache_state")?.as_str()?;
+    if tool_name.is_empty()
+        || tool_name.len() > 128
+        || state.is_empty()
+        || state.len() > 64
+        || !state
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return None;
+    }
+    let key_id = tool_result
+        .get("semantic_read_cache_key_id")
+        .and_then(Value::as_str)
+        .filter(|key_id| {
+            key_id.len() == 71
+                && key_id.starts_with("sha256:")
+                && key_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_string);
+    Some(
+        astra_turn_core::introspect::SemanticCacheDecisionSnapshotEntry {
+            tool_name: tool_name.to_string(),
+            state: state.to_string(),
+            key_id,
+        },
+    )
+}
+
+#[cfg(test)]
+mod semantic_cache_introspection_tests {
+    use super::*;
+
+    #[test]
+    fn governed_cache_decision_projection_is_bounded_and_rejects_forged_fields() {
+        let valid = semantic_cache_decision_from_tool_result(&serde_json::json!({
+            "name": "mcp__catalog__read",
+            "semantic_read_cache_state": "freshness_unavailable",
+            "semantic_read_cache_key_id": format!("sha256:{:064x}", 7),
+        }))
+        .expect("valid governed decision");
+        assert_eq!(valid.tool_name, "mcp__catalog__read");
+        assert_eq!(valid.state, "freshness_unavailable");
+        assert!(valid.key_id.unwrap().starts_with("sha256:"));
+
+        assert!(
+            semantic_cache_decision_from_tool_result(&serde_json::json!({
+                "name": "read",
+                "semantic_read_cache_state": "forged state with spaces",
+            }))
+            .is_none()
+        );
+        assert!(
+            semantic_cache_decision_from_tool_result(&serde_json::json!({
+                "name": "read",
+                "semantic_read_cache_state": "hit",
+                "semantic_read_cache_key_id": "not-a-content-id",
+            }))
+            .expect("the decision remains useful without an invalid optional key")
+            .key_id
+            .is_none()
+        );
+    }
 }
 
 fn step_latency_snapshot_entries(

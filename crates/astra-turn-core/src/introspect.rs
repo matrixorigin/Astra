@@ -70,6 +70,11 @@ pub struct IntrospectSnapshot {
     /// schemas remain canonical and do not include provider placement.
     #[serde(default)]
     pub tool_admission: Vec<ToolAdmissionSnapshotEntry>,
+    /// Recent governed semantic-read decisions projected from authoritative
+    /// tool-result evidence. This is bounded runtime evidence, not a second
+    /// cache state store.
+    #[serde(default)]
+    pub semantic_cache_decisions: Vec<SemanticCacheDecisionSnapshotEntry>,
     /// Provider-reported input token total for this snapshot. This includes
     /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
     pub total_input_tokens: u64,
@@ -263,6 +268,14 @@ pub struct ToolAdmissionSnapshotEntry {
     pub candidates: Vec<ToolAdmissionCandidateSnapshotEntry>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticCacheDecisionSnapshotEntry {
+    pub tool_name: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolAdmissionCandidateSnapshotEntry {
     pub offer_id: String,
@@ -384,6 +397,12 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
         out.push_str(" tool_admission=");
         out.push_str(&tool_admission_inline_summary(s));
     }
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str(&format!(
+            " semantic_cache_decisions={}",
+            s.semantic_cache_decisions.len()
+        ));
+    }
     out
 }
 
@@ -462,6 +481,17 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
             "Tool admission: {}\n",
             tool_admission_inline_summary(s)
         ));
+    }
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str("Semantic read cache decisions: ");
+        out.push_str(
+            &s.semantic_cache_decisions
+                .iter()
+                .map(|entry| format!("{}={}", entry.tool_name, entry.state))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push('\n');
     }
     out.trim_end().to_string()
 }
@@ -561,6 +591,21 @@ fn render_full(s: &IntrospectSnapshot) -> String {
     if !s.step_latency.is_empty() {
         out.push('\n');
         out.push_str(&render_step_latency(s));
+    }
+
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str("\n## Semantic Read Cache Decisions\n");
+        for decision in &s.semantic_cache_decisions {
+            out.push_str("- ");
+            out.push_str(&decision.tool_name);
+            out.push_str(": ");
+            out.push_str(&decision.state);
+            if let Some(key_id) = decision.key_id.as_deref() {
+                out.push_str(" key=");
+                out.push_str(key_id);
+            }
+            out.push('\n');
+        }
     }
 
     if s.alerts.len() > 3 {
@@ -987,6 +1032,7 @@ mod tests {
                     .into(),
             capacity_provider_coverage: Vec::new(),
             tool_admission: Vec::new(),
+            semantic_cache_decisions: Vec::new(),
             total_input_tokens: 145_000,
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
@@ -1022,6 +1068,24 @@ mod tests {
         assert!(output.contains("turns=8/20"));
         assert!(output.contains("alerts=2"));
         assert!(output.contains("model=deepseek-v4-pro-official(thinking:high)"));
+    }
+
+    #[test]
+    fn semantic_cache_decisions_are_visible_without_breaking_hint_geometry() {
+        let mut snapshot = sample_snapshot();
+        snapshot.semantic_cache_decisions = vec![SemanticCacheDecisionSnapshotEntry {
+            tool_name: "catalog_read".to_string(),
+            state: "freshness_unavailable".to_string(),
+            key_id: None,
+        }];
+
+        let hint = render_introspect(&snapshot, IntrospectTextDepth::Hint);
+        assert!(!hint.contains('\n'));
+        assert!(hint.contains("semantic_cache_decisions=1"));
+        let summary = render_introspect(&snapshot, IntrospectTextDepth::Summary);
+        assert!(summary.contains("catalog_read=freshness_unavailable"));
+        let full = render_introspect(&snapshot, IntrospectTextDepth::Full);
+        assert!(full.contains("## Semantic Read Cache Decisions"));
     }
 
     #[test]

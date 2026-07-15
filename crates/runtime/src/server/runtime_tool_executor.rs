@@ -47,10 +47,16 @@ use async_trait::async_trait;
 const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticReadCacheActivation {
+    DisabledNoCapabilities,
+    Enabled { binding_count: usize },
+}
+
 use crate::orchestration::AgentToolContext;
 use crate::server::semantic_read_freshness::{
-    ProviderSemanticFreshnessEvidence, ProviderSemanticFreshnessSource,
-    prepare_provider_semantic_freshness,
+    ProviderSemanticFreshnessEvidence, ProviderSemanticFreshnessRegistry,
+    ProviderSemanticFreshnessSource, prepare_provider_semantic_freshness,
 };
 use crate::server::server_bash_execution::execute_server_bash;
 use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
@@ -133,6 +139,27 @@ struct PreparedSemanticRead {
     condition: astra_turn_types::SemanticReadCondition,
 }
 
+struct SemanticReadPreparation {
+    prepared: Option<PreparedSemanticRead>,
+    bypass_state: Option<&'static str>,
+}
+
+impl SemanticReadPreparation {
+    fn ready(prepared: PreparedSemanticRead) -> Self {
+        Self {
+            prepared: Some(prepared),
+            bypass_state: None,
+        }
+    }
+
+    fn bypass(state: &'static str) -> Self {
+        Self {
+            prepared: None,
+            bypass_state: Some(state),
+        }
+    }
+}
+
 fn consume_semantic_read_condition_ack(
     result: &mut astra_tools::ToolResult,
     condition: &astra_turn_types::SemanticReadCondition,
@@ -144,6 +171,23 @@ fn consume_semantic_read_condition_ack(
     };
     serde_json::from_value::<astra_turn_types::SemanticReadConditionAck>(encoded)
         .is_ok_and(|acknowledgement| acknowledgement.confirms(condition))
+}
+
+fn attach_semantic_read_decision_evidence(
+    result: &mut astra_tools::ToolResult,
+    evidence: crate::server::semantic_read_observation_runtime::SemanticReadDecisionEvidence,
+) {
+    let metadata = result.metadata.get_or_insert_with(Default::default);
+    metadata.insert(
+        "semantic_read_cache_state".to_string(),
+        Value::String(evidence.state.to_string()),
+    );
+    if let Some(key_id) = evidence.key_id {
+        metadata.insert(
+            "semantic_read_cache_key_id".to_string(),
+            Value::String(key_id),
+        );
+    }
 }
 
 struct PendingDurableToolCompletion {
@@ -581,14 +625,20 @@ impl RuntimeToolExecutor {
         self
     }
 
-    /// Enable semantic read reuse with one concrete provider capability.
-    /// Store and conditional-read source are installed atomically so a
-    /// runtime can never publish observations from an unconditioned route.
-    pub fn enable_semantic_read_cache(
+    /// Configure semantic read reuse from exact provider capabilities.
+    /// An empty registry keeps the optimization explicitly disabled. Store
+    /// and conditional-read routing are installed atomically so a runtime can
+    /// never publish observations from an unconditioned route.
+    pub fn configure_semantic_read_cache(
         &mut self,
-        source: Arc<dyn ProviderSemanticFreshnessSource>,
+        registry: ProviderSemanticFreshnessRegistry,
         limits: astra_turn_types::SemanticReadCacheLimits,
-    ) -> Result<(), String> {
+    ) -> Result<SemanticReadCacheActivation, String> {
+        if registry.is_empty() {
+            self.semantic_read_freshness_source = None;
+            self.semantic_read_observation_store = None;
+            return Ok(SemanticReadCacheActivation::DisabledNoCapabilities);
+        }
         if self.invocation_ledger.is_none() {
             return Err(
                 "durable invocation ledger must be enabled before semantic read cache".to_string(),
@@ -599,9 +649,28 @@ impl RuntimeToolExecutor {
             limits,
         )
         .map_err(|error| error.to_string())?;
-        self.semantic_read_freshness_source = Some(source);
+        let binding_count = registry.len();
+        self.semantic_read_freshness_source = Some(Arc::new(registry));
         self.semantic_read_observation_store = Some(store);
-        Ok(())
+        Ok(SemanticReadCacheActivation::Enabled { binding_count })
+    }
+
+    #[cfg(test)]
+    fn enable_semantic_read_cache(
+        &mut self,
+        source: Arc<dyn ProviderSemanticFreshnessSource>,
+        limits: astra_turn_types::SemanticReadCacheLimits,
+    ) -> Result<(), String> {
+        let mut registry = ProviderSemanticFreshnessRegistry::default();
+        registry
+            .register(
+                astra_turn_types::ProviderBindingRef::new("binding-a")
+                    .map_err(|error| error.to_string())?,
+                source,
+            )
+            .map_err(|error| error.to_string())?;
+        self.configure_semantic_read_cache(registry, limits)
+            .map(|_| ())
     }
 
     /// Bind logical invocation delivery to the durable database ledger.
@@ -2114,10 +2183,11 @@ impl RuntimeToolExecutor {
                 }
             };
             frozen.apply_to_request(&mut request);
-            let prepared_semantic_read = self
-                .prepare_semantic_read_condition(&frozen, &identity, &request.args)
+            let semantic_read_preparation = self
+                .prepare_semantic_read(&frozen, &identity, &request.args)
                 .await;
-            let semantic_cache_key = match prepared_semantic_read.as_ref() {
+            let mut semantic_bypass_state = semantic_read_preparation.bypass_state;
+            let semantic_cache_key = match semantic_read_preparation.prepared.as_ref() {
                 Some(prepared) => {
                     frozen.semantic_read_cache_key(&request.args, &prepared.freshness)
                 }
@@ -2136,6 +2206,7 @@ impl RuntimeToolExecutor {
                         %error,
                         "semantic read cache key construction failed; executing uncached"
                     );
+                    semantic_bypass_state = Some("key_construction_failed");
                     None
                 }
             };
@@ -2150,7 +2221,7 @@ impl RuntimeToolExecutor {
                 semantic_read_cache_key_id = semantic_cache_key.as_ref().map(|key| key.key_id.as_str()),
                 "resolved frozen tool invocation decision"
             );
-            let cache_fill = match crate::server::semantic_read_observation_runtime::before_dispatch(
+            let (cache_fill, mut cache_evidence) = match crate::server::semantic_read_observation_runtime::before_dispatch(
                 self.semantic_read_observation_store.as_ref(),
                 ledger,
                 &identity,
@@ -2159,13 +2230,21 @@ impl RuntimeToolExecutor {
             )
             .await
             {
-                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(fill) => fill,
+                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed { fill, evidence } => (fill, evidence),
                 crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => {
                     return GovernableRuntimeToolResult::completed(result);
                 }
             };
+            if cache_evidence.is_none() {
+                cache_evidence = semantic_bypass_state.map(|state| {
+                    crate::server::semantic_read_observation_runtime::SemanticReadDecisionEvidence {
+                        state,
+                        key_id: semantic_cache_key.as_ref().map(|key| key.key_id.clone()),
+                    }
+                });
+            }
             let cache_fill = cache_fill.and_then(|claim| {
-                prepared_semantic_read.map(|prepared| {
+                semantic_read_preparation.prepared.map(|prepared| {
                     request.policy.semantic_read_condition = Some(prepared.condition.clone());
                     PendingSemanticReadFill {
                         claim,
@@ -2197,7 +2276,14 @@ impl RuntimeToolExecutor {
                             ),
                         );
                     }
-                    Some((ledger.clone(), identity, frozen.route, owner_id, cache_fill))
+                    Some((
+                        ledger.clone(),
+                        identity,
+                        frozen.route,
+                        owner_id,
+                        cache_fill,
+                        cache_evidence,
+                    ))
                 }
                 Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
                     result,
@@ -2243,30 +2329,35 @@ impl RuntimeToolExecutor {
         };
         let route = durable_invocation
             .as_ref()
-            .map(|(_, _, route, _, _)| *route)
+            .map(|(_, _, route, _, _, _)| *route)
             .unwrap_or_else(|| self.tool_execution_service.routing_decision(&request));
         let lease_heartbeat =
             durable_invocation
                 .as_ref()
-                .map(|(ledger, identity, _, owner_id, _)| {
+                .map(|(ledger, identity, _, owner_id, _, _)| {
                     ledger.start_lease_heartbeat(identity.clone(), owner_id.clone())
                 });
         let mut executed =
             execute_tool_route_before_completion_events(&route_context, request, route).await;
-        let durable = durable_invocation.map(|(ledger, identity, _, owner_id, mut cache_fill)| {
-            if let Some(fill) = cache_fill.as_mut() {
-                fill.provider_confirmed =
-                    consume_semantic_read_condition_ack(&mut executed.result, &fill.condition);
-            }
-            PendingDurableToolCompletion {
-                ledger,
-                identity,
-                owner_id,
-                cache_fill,
-                lease_heartbeat: lease_heartbeat
-                    .expect("durable invocation must start a lease heartbeat"),
-            }
-        });
+        let durable = durable_invocation.map(
+            |(ledger, identity, _, owner_id, mut cache_fill, cache_evidence)| {
+                if let Some(evidence) = cache_evidence {
+                    attach_semantic_read_decision_evidence(&mut executed.result, evidence);
+                }
+                if let Some(fill) = cache_fill.as_mut() {
+                    fill.provider_confirmed =
+                        consume_semantic_read_condition_ack(&mut executed.result, &fill.condition);
+                }
+                PendingDurableToolCompletion {
+                    ledger,
+                    identity,
+                    owner_id,
+                    cache_fill,
+                    lease_heartbeat: lease_heartbeat
+                        .expect("durable invocation must start a lease heartbeat"),
+                }
+            },
+        );
         GovernableRuntimeToolResult {
             result: executed.result,
             pending: Some(PendingRuntimeToolCompletion {
@@ -2499,15 +2590,17 @@ impl RuntimeToolExecutor {
         result
     }
 
-    async fn prepare_semantic_read_condition(
+    async fn prepare_semantic_read(
         &self,
         decision: &crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
         identity: &astra_turn_types::ToolInvocationIdentity,
         arguments: &Value,
-    ) -> Option<PreparedSemanticRead> {
-        self.semantic_read_observation_store.as_ref()?;
+    ) -> SemanticReadPreparation {
+        if self.semantic_read_observation_store.is_none() {
+            return SemanticReadPreparation::bypass("rollout_disabled");
+        }
         if !decision.requires_semantic_read_freshness() {
-            return None;
+            return SemanticReadPreparation::bypass("policy_disabled");
         }
         let Some(policy) = decision.provider_policy.as_ref() else {
             tracing::warn!(
@@ -2519,7 +2612,7 @@ impl RuntimeToolExecutor {
                 semantic_read_cache_state = "invalid_frozen_policy",
                 "freshness-required decision has no exact provider descriptor; executing uncached"
             );
-            return None;
+            return SemanticReadPreparation::bypass("invalid_frozen_policy");
         };
 
         let evidence = match prepare_provider_semantic_freshness(
@@ -2559,7 +2652,19 @@ impl RuntimeToolExecutor {
                         );
                     }
                 }
-                return None;
+                let state = match reason {
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceFailed => {
+                        "freshness_source_failed"
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceNotConfigured
+                    | astra_turn_types::SemanticReadFreshnessUnavailableReason::RevisionUnavailable => {
+                        "freshness_unavailable"
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::InvalidEvidence => {
+                        "freshness_invalid"
+                    }
+                };
+                return SemanticReadPreparation::bypass(state);
             }
         };
         let ProviderSemanticFreshnessEvidence::Conditional {
@@ -2579,7 +2684,7 @@ impl RuntimeToolExecutor {
         match astra_turn_types::SemanticReadFreshnessContext::new(&security_scope, facts) {
             Ok(freshness) => {
                 match astra_turn_types::SemanticReadCondition::new(&protocol, &token, &freshness) {
-                    Ok(condition) => Some(PreparedSemanticRead {
+                    Ok(condition) => SemanticReadPreparation::ready(PreparedSemanticRead {
                         freshness,
                         condition,
                     }),
@@ -2591,7 +2696,7 @@ impl RuntimeToolExecutor {
                             %error,
                             "provider semantic read condition was invalid; executing uncached"
                         );
-                        None
+                        SemanticReadPreparation::bypass("condition_invalid")
                     }
                 }
             }
@@ -2603,9 +2708,21 @@ impl RuntimeToolExecutor {
                     %error,
                     "provider semantic freshness evidence was invalid; executing uncached"
                 );
-                None
+                SemanticReadPreparation::bypass("freshness_invalid")
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn prepare_semantic_read_condition(
+        &self,
+        decision: &crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        arguments: &Value,
+    ) -> Option<PreparedSemanticRead> {
+        self.prepare_semantic_read(decision, identity, arguments)
+            .await
+            .prepared
     }
     async fn execute_local_with_metadata(
         &self,
@@ -3303,6 +3420,39 @@ mod tests {
             &mut malformed,
             &expected
         ));
+    }
+
+    #[test]
+    fn semantic_read_decision_evidence_is_bounded_result_metadata() {
+        let mut result = astra_tools::ToolResult::text("authoritative".to_string());
+        attach_semantic_read_decision_evidence(
+            &mut result,
+            crate::server::semantic_read_observation_runtime::SemanticReadDecisionEvidence {
+                state: "lookup_degraded",
+                key_id: Some(format!("sha256:{:064x}", 7)),
+            },
+        );
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["semantic_read_cache_state"], "lookup_degraded");
+        assert_eq!(
+            metadata["semantic_read_cache_key_id"],
+            format!("sha256:{:064x}", 7)
+        );
+
+        let mut bypass = astra_tools::ToolResult::text("authoritative".to_string());
+        attach_semantic_read_decision_evidence(
+            &mut bypass,
+            crate::server::semantic_read_observation_runtime::SemanticReadDecisionEvidence {
+                state: "freshness_unavailable",
+                key_id: None,
+            },
+        );
+        let bypass_metadata = bypass.metadata.unwrap();
+        assert_eq!(
+            bypass_metadata["semantic_read_cache_state"],
+            "freshness_unavailable"
+        );
+        assert!(!bypass_metadata.contains_key("semantic_read_cache_key_id"));
     }
 
     struct ReadyReflectService;
@@ -4149,6 +4299,61 @@ mod tests {
             first_context.freshness.context_id,
             same_user_context.freshness.context_id
         );
+    }
+
+    #[test]
+    fn production_semantic_cache_wiring_requires_capability_and_durable_ledger() {
+        let (mut exec, _dir) = test_executor();
+        assert_eq!(
+            exec.configure_semantic_read_cache(
+                ProviderSemanticFreshnessRegistry::default(),
+                astra_turn_types::SemanticReadCacheLimits::default(),
+            )
+            .unwrap(),
+            SemanticReadCacheActivation::DisabledNoCapabilities
+        );
+        assert!(exec.semantic_read_observation_store.is_none());
+        assert!(exec.semantic_read_freshness_source.is_none());
+
+        let source = Arc::new(StaticSemanticFreshnessSource {
+            calls: AtomicUsize::new(0),
+            response: Ok(ProviderSemanticFreshnessEvidence::Unavailable),
+        });
+        let mut missing_ledger_registry = ProviderSemanticFreshnessRegistry::default();
+        missing_ledger_registry
+            .register(
+                astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
+                source.clone(),
+            )
+            .unwrap();
+        assert!(
+            exec.configure_semantic_read_cache(
+                missing_ledger_registry,
+                astra_turn_types::SemanticReadCacheLimits::default(),
+            )
+            .unwrap_err()
+            .contains("durable invocation ledger")
+        );
+        assert!(exec.semantic_read_observation_store.is_none());
+
+        exec.enable_durable_invocations();
+        let mut registry = ProviderSemanticFreshnessRegistry::default();
+        registry
+            .register(
+                astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
+                source,
+            )
+            .unwrap();
+        assert_eq!(
+            exec.configure_semantic_read_cache(
+                registry,
+                astra_turn_types::SemanticReadCacheLimits::default(),
+            )
+            .unwrap(),
+            SemanticReadCacheActivation::Enabled { binding_count: 1 }
+        );
+        assert!(exec.semantic_read_observation_store.is_some());
+        assert!(exec.semantic_read_freshness_source.is_some());
     }
 
     #[tokio::test]
@@ -5578,7 +5783,7 @@ esac
         )
         .await
         {
-            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(Some(fill)) => fill,
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed { fill: Some(fill), .. } => fill,
             _ => panic!("first read should claim a fill"),
         };
         let dispatch_owner = match ledger.dispatch_prepared(&first_identity).await.unwrap() {
@@ -5618,7 +5823,7 @@ esac
         .await
         {
             crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => result,
-            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(_) => {
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed { .. } => {
                 panic!("durably published observation should be reused")
             }
         };
@@ -5659,9 +5864,9 @@ esac
         )
         .await
         {
-            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
-                Some(fill),
-            ) => fill,
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed {
+                fill: Some(fill), ..
+            } => fill,
             _ => panic!("first read should claim a fill"),
         };
         let dispatch_owner = match ledger.dispatch_prepared(&identity).await.unwrap() {
@@ -5695,9 +5900,10 @@ esac
             None,
         )
         .await;
-        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
-            Some(next_fill),
-        ) = next
+        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed {
+            fill: Some(next_fill),
+            ..
+        } = next
         else {
             panic!("changed freshness must leave no reusable observation");
         };
@@ -5733,7 +5939,7 @@ esac
         )
         .await
         {
-            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(Some(fill)) => fill,
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed { fill: Some(fill), .. } => fill,
             _ => panic!("first read should claim a fill"),
         };
         let dispatch_owner = match ledger.dispatch_prepared(&first_identity).await.unwrap() {
@@ -5781,9 +5987,10 @@ esac
             None,
         )
         .await;
-        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
-            Some(fill),
-        ) = next
+        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed {
+            fill: Some(fill),
+            ..
+        } = next
         else {
             panic!("uncertain provider outcome must leave no reusable observation");
         };

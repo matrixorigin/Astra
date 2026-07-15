@@ -232,7 +232,8 @@ fn runtime_event_count(snapshot: &IntrospectSnapshot) -> i64 {
         .len()
         .saturating_add(snapshot.tool_errors.len())
         .saturating_add(snapshot.stall_state.events.len())
-        .saturating_add(snapshot.alerts.len()) as i64
+        .saturating_add(snapshot.alerts.len())
+        .saturating_add(snapshot.semantic_cache_decisions.len()) as i64
 }
 
 fn introspect_data_coverage(
@@ -290,7 +291,7 @@ fn introspect_data_coverage(
         },
         source,
         events,
-        decisions: 0,
+        decisions: snapshot.semantic_cache_decisions.len() as i64,
         providers,
         warnings,
     }
@@ -586,6 +587,37 @@ fn build_introspect_observations(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
     ) {
+        for (index, decision) in snapshot.semantic_cache_decisions.iter().enumerate() {
+            observations.push(ObservationRecord {
+                ref_id: Urn::new("observation", "local", "introspect")
+                    .seg("semantic_cache")
+                    .idx(index)
+                    .build(),
+                topic: "execution".to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "semantic_read_cache_decision".to_string(),
+                severity: if matches!(
+                    decision.state.as_str(),
+                    "hit"
+                        | "filled"
+                        | "fill_claimed"
+                        | "policy_disabled"
+                        | "rollout_disabled"
+                        | "freshness_unavailable"
+                ) {
+                    "info"
+                } else {
+                    "warning"
+                }
+                .to_string(),
+                summary: format!(
+                    "{} semantic_read_cache={}",
+                    decision.tool_name, decision.state
+                ),
+                confidence: ObservationConfidence::evidence(0.95),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+            });
+        }
         for admission in &snapshot.tool_admission {
             observations.push(ObservationRecord {
                 ref_id: Urn::new("observation", "local", "introspect")
