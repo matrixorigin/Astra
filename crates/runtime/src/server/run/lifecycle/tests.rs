@@ -8271,6 +8271,8 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
         }],
     )
     .unwrap();
+    let provider_snapshot = runtime_mcp::resolve_mcp_snapshot("tools", &provider_snapshot)
+        .expect("test discovery snapshot should resolve");
     let provider_snapshot_hash = provider_snapshot.content_hash.clone();
     let capabilities = PreparedRuntimeCapabilities {
         mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {

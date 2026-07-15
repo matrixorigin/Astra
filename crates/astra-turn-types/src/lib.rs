@@ -45,9 +45,14 @@ pub use memory_structure::{
 pub use memory_writability::{is_transient_runtime_status_text, should_store_in_memory};
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
-    ProviderClaim, ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot,
-    ProviderIdentity, ProviderProtocolId, ProviderRejection, ProviderRejectionCode,
-    ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration, ResolvedToolDescriptorRef,
+    ProviderClaim, ProviderClaimSource, ProviderClaimTrust, ProviderContractError,
+    ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderRejection,
+    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticDiagnostic,
+    ProviderSemanticDiagnosticCode, ProviderTaskSupport, ProviderToolClaims,
+    ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline, ResolvedProviderClaim,
+    ResolvedProviderSnapshot, ResolvedProviderSnapshotRef, ResolvedProviderToolClaims,
+    ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
+    ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
     ToolIdentity,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};

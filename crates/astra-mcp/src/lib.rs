@@ -20,8 +20,9 @@ pub use rmcp::model::Tool as McpTool;
 pub use tools::{
     MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, McpToolCallResult, extract_result_text,
     extract_result_text_with_limit, is_dangerous_env_var, mcp_provider_snapshot_to_schemas_checked,
-    mcp_tool_schema_from_parts, mcp_tool_to_provider_declaration, mcp_tool_to_schema,
-    mcp_tools_to_provider_snapshot, sanitize_tool_name, tools_to_schemas_checked,
+    mcp_resolved_provider_snapshot_to_schemas_checked, mcp_tool_schema_from_parts,
+    mcp_tool_to_provider_declaration, mcp_tool_to_schema, mcp_tools_to_provider_snapshot,
+    sanitize_tool_name, tools_to_schemas_checked,
 };
 pub use types::{ConnectionState, McpServerConfig, RetryConfig, Transport};
 

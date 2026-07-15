@@ -4,7 +4,7 @@
 //! facts. They intentionally do not decide permission, retry, caching, prompt
 //! placement, or result projection policy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,8 @@ non_empty_id!(ProviderProtocolId, "provider_protocol_id");
 non_empty_id!(NativeToolId, "native_tool_id");
 non_empty_id!(DescriptorVersion, "descriptor_version");
 non_empty_id!(ProviderRejectionCode, "provider_rejection_code");
+non_empty_id!(PublicToolAlias, "public_tool_alias");
+non_empty_id!(ProviderResolverVersion, "provider_resolver_version");
 
 /// Stable internal tool identity. Model-visible aliases are deliberately not
 /// part of this key.
@@ -101,6 +103,222 @@ impl ResolvedToolDescriptorRef {
             descriptor_version: DescriptorVersion::new(descriptor_version)?,
         })
     }
+}
+
+/// Resolver-assigned confidence in one provider claim. Only `Trusted` claims
+/// may relax Astra's conservative execution baseline. Advisory and untrusted
+/// claims remain observable evidence, but never silently become policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderClaimTrust {
+    Trusted,
+    Advisory,
+    #[default]
+    Untrusted,
+}
+
+/// A provider claim after Astra has assigned trust from host-owned authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProviderClaim<T> {
+    pub value: T,
+    pub source: ProviderClaimSource,
+    pub trust: ProviderClaimTrust,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProviderToolClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<ResolvedProviderClaim<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<ResolvedProviderClaim<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent: Option<ResolvedProviderClaim<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world: Option<ResolvedProviderClaim<bool>>,
+}
+
+/// Side-effect baseline resolved from trusted declaration facts. `Unknown` is
+/// deliberately not represented as `Mutating`: policy may treat both
+/// conservatively while diagnostics and future reconciliation retain truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedToolEffect {
+    ReadOnly,
+    Mutating,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedConcurrencyBaseline {
+    ParallelReadOnly,
+    #[default]
+    Serial,
+}
+
+/// Semantic result reuse is independent from effect and retry safety. A pure
+/// read can return changing data, so discovery hints alone never enable it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedSemanticCacheBaseline {
+    #[default]
+    Disabled,
+    FreshnessBound,
+}
+
+/// Provider-neutral idempotency semantics. This intentionally does not reuse
+/// the legacy built-in `IdempotentWrite` label: a remote idempotent effect is
+/// not necessarily an overwrite, and retry still depends on dispatch certainty
+/// and provider idempotency-key support.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedToolIdempotency {
+    PureRead,
+    IdempotentEffect,
+    #[default]
+    NonIdempotent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSemanticDiagnosticCode {
+    MissingEffectClaim,
+    InsufficientEffectTrust,
+    ContradictoryEffectClaims,
+    InsufficientIdempotencyTrust,
+    IdempotencyWithoutKnownEffect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSemanticDiagnostic {
+    pub code: ProviderSemanticDiagnosticCode,
+    pub message: String,
+}
+
+/// Primitive semantic baseline shared by permission, batching, retry and
+/// cache policy. Per-invocation arguments and authority can only refine this
+/// object; downstream consumers must not reinterpret raw provider hints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedToolSemantics {
+    pub effect: ResolvedToolEffect,
+    pub idempotency: ResolvedToolIdempotency,
+    pub concurrency: ResolvedConcurrencyBaseline,
+    pub semantic_cache: ResolvedSemanticCacheBaseline,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ProviderSemanticDiagnostic>,
+}
+
+/// Content-addressed parent snapshot reference embedded in every descriptor.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ResolvedProviderSnapshotRef {
+    pub provider_binding: ProviderBindingRef,
+    pub content_hash: String,
+}
+
+/// Resolver output before the parent snapshot reference is known. The public
+/// constructor for `ResolvedProviderSnapshot` consumes drafts atomically so a
+/// descriptor cannot be attached to a different snapshot accidentally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedToolDescriptorDraft {
+    pub identity: ToolIdentity,
+    pub native_tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    pub schema_hash: String,
+    pub claims: ResolvedProviderToolClaims,
+    pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extension_fields: Map<String, Value>,
+    pub semantic_baseline: ResolvedToolSemantics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedToolDescriptor {
+    pub identity: ToolIdentity,
+    pub native_tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    pub schema_hash: String,
+    pub claims: ResolvedProviderToolClaims,
+    pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extension_fields: Map<String, Value>,
+    pub semantic_baseline: ResolvedToolSemantics,
+    pub provider_snapshot: ResolvedProviderSnapshotRef,
+    pub descriptor_version: DescriptorVersion,
+}
+
+impl ResolvedToolDescriptor {
+    pub fn descriptor_ref(&self) -> ResolvedToolDescriptorRef {
+        ResolvedToolDescriptorRef {
+            identity: self.identity.clone(),
+            descriptor_version: self.descriptor_version.clone(),
+        }
+    }
+
+    fn from_draft(
+        draft: ResolvedToolDescriptorDraft,
+        provider_snapshot: ResolvedProviderSnapshotRef,
+        descriptor_version: DescriptorVersion,
+    ) -> Self {
+        Self {
+            identity: draft.identity,
+            native_tool_name: draft.native_tool_name,
+            title: draft.title,
+            description: draft.description,
+            input_schema: draft.input_schema,
+            output_schema: draft.output_schema,
+            schema_hash: draft.schema_hash,
+            claims: draft.claims,
+            task_support: draft.task_support,
+            extension_fields: draft.extension_fields,
+            semantic_baseline: draft.semantic_baseline,
+            provider_snapshot,
+            descriptor_version,
+        }
+    }
+
+    fn to_draft(&self) -> ResolvedToolDescriptorDraft {
+        ResolvedToolDescriptorDraft {
+            identity: self.identity.clone(),
+            native_tool_name: self.native_tool_name.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+            output_schema: self.output_schema.clone(),
+            schema_hash: self.schema_hash.clone(),
+            claims: self.claims.clone(),
+            task_support: self.task_support,
+            extension_fields: self.extension_fields.clone(),
+            semantic_baseline: self.semantic_baseline.clone(),
+        }
+    }
+}
+
+/// Immutable semantic snapshot. Aliases are a projection index into exact
+/// descriptor references; they never redefine internal tool identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolvedProviderSnapshot {
+    pub provider_identity: ProviderIdentity,
+    pub binding_ref: ProviderBindingRef,
+    pub protocol: ProviderProtocolId,
+    pub discovery_snapshot_hash: String,
+    pub resolver_version: ProviderResolverVersion,
+    pub resolution_policy_hash: String,
+    pub descriptors: Vec<ResolvedToolDescriptor>,
+    pub alias_index: BTreeMap<PublicToolAlias, ResolvedToolDescriptorRef>,
+    pub content_hash: String,
 }
 
 /// Provenance for one provider declaration claim.
@@ -294,6 +512,21 @@ impl ProviderDiscoverySnapshot {
     ) -> Result<Self, ProviderContractError> {
         for declaration in &mut tool_declarations {
             declaration.validate()?;
+            for source in provider_claim_sources(&declaration.claims) {
+                if let ProviderClaimSource::StandardProtocol {
+                    protocol: claim_protocol,
+                    field,
+                } = source
+                    && claim_protocol != &protocol
+                {
+                    return Err(ProviderContractError::ClaimProtocolMismatch {
+                        native_tool_id: declaration.native_tool_id.to_string(),
+                        field: field.clone(),
+                        snapshot_protocol: protocol.to_string(),
+                        claim_protocol: claim_protocol.to_string(),
+                    });
+                }
+            }
             declaration.canonicalize_json();
         }
         tool_declarations.sort_by(|left, right| {
@@ -332,6 +565,208 @@ impl ProviderDiscoverySnapshot {
 
     pub fn tool_identity(&self, declaration: &ProviderToolDeclaration) -> ToolIdentity {
         ToolIdentity::new(self.binding_ref.clone(), declaration.native_tool_id.clone())
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolvedProviderSnapshotWire {
+    provider_identity: ProviderIdentity,
+    binding_ref: ProviderBindingRef,
+    protocol: ProviderProtocolId,
+    discovery_snapshot_hash: String,
+    resolver_version: ProviderResolverVersion,
+    resolution_policy_hash: String,
+    descriptors: Vec<ResolvedToolDescriptor>,
+    alias_index: BTreeMap<PublicToolAlias, ResolvedToolDescriptorRef>,
+    content_hash: String,
+}
+
+impl<'de> Deserialize<'de> for ResolvedProviderSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ResolvedProviderSnapshotWire::deserialize(deserializer)?;
+        let supplied_descriptors = wire.descriptors.clone();
+        let supplied_alias_index = wire.alias_index.clone();
+        let aliases = wire
+            .alias_index
+            .iter()
+            .map(|(alias, descriptor)| (alias.clone(), descriptor.identity.clone()))
+            .collect();
+        let drafts = wire
+            .descriptors
+            .iter()
+            .map(ResolvedToolDescriptor::to_draft)
+            .collect();
+        let rebuilt = Self::new(
+            wire.provider_identity,
+            wire.binding_ref,
+            wire.protocol,
+            wire.discovery_snapshot_hash,
+            wire.resolver_version,
+            wire.resolution_policy_hash,
+            drafts,
+            aliases,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if wire.content_hash != rebuilt.content_hash {
+            return Err(serde::de::Error::custom(
+                ProviderContractError::ResolvedContentHashMismatch {
+                    supplied: wire.content_hash,
+                    computed: rebuilt.content_hash,
+                },
+            ));
+        }
+        if supplied_descriptors != rebuilt.descriptors
+            || supplied_alias_index != rebuilt.alias_index
+        {
+            return Err(serde::de::Error::custom(
+                ProviderContractError::ResolvedSnapshotInvariantMismatch,
+            ));
+        }
+        Ok(rebuilt)
+    }
+}
+
+impl ResolvedProviderSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider_identity: ProviderIdentity,
+        binding_ref: ProviderBindingRef,
+        protocol: ProviderProtocolId,
+        discovery_snapshot_hash: String,
+        resolver_version: ProviderResolverVersion,
+        resolution_policy_hash: String,
+        mut drafts: Vec<ResolvedToolDescriptorDraft>,
+        aliases: Vec<(PublicToolAlias, ToolIdentity)>,
+    ) -> Result<Self, ProviderContractError> {
+        if discovery_snapshot_hash.trim().is_empty() {
+            return Err(ProviderContractError::EmptyIdentifier {
+                kind: "discovery_snapshot_hash",
+            });
+        }
+        if resolution_policy_hash.trim().is_empty() {
+            return Err(ProviderContractError::EmptyIdentifier {
+                kind: "resolution_policy_hash",
+            });
+        }
+
+        drafts.sort_by(|left, right| left.identity.cmp(&right.identity));
+        let mut identities = BTreeSet::new();
+        for draft in &drafts {
+            if draft.identity.provider_binding != binding_ref {
+                return Err(ProviderContractError::DescriptorBindingMismatch {
+                    native_tool_id: draft.identity.native_tool_id.to_string(),
+                    expected: binding_ref.to_string(),
+                    actual: draft.identity.provider_binding.to_string(),
+                });
+            }
+            if !identities.insert(draft.identity.clone()) {
+                return Err(ProviderContractError::DuplicateResolvedToolIdentity {
+                    native_tool_id: draft.identity.native_tool_id.to_string(),
+                });
+            }
+        }
+
+        let mut versioned_drafts = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let encoded = serde_json::to_vec(&draft)
+                .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+            let descriptor_version =
+                DescriptorVersion::new(format!("sha256:{:x}", Sha256::digest(encoded)))?;
+            versioned_drafts.push((draft, descriptor_version));
+        }
+
+        let descriptor_refs = versioned_drafts
+            .iter()
+            .map(|(draft, version)| {
+                (
+                    draft.identity.clone(),
+                    ResolvedToolDescriptorRef {
+                        identity: draft.identity.clone(),
+                        descriptor_version: version.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let descriptor_ref_list = descriptor_refs.values().cloned().collect::<Vec<_>>();
+
+        let mut alias_index = BTreeMap::new();
+        let mut projected_identities = BTreeSet::new();
+        for (alias, identity) in aliases {
+            let Some(descriptor_ref) = descriptor_refs.get(&identity) else {
+                return Err(ProviderContractError::AliasTargetsUnknownTool {
+                    alias: alias.to_string(),
+                    native_tool_id: identity.native_tool_id.to_string(),
+                });
+            };
+            if alias_index
+                .insert(alias.clone(), descriptor_ref.clone())
+                .is_some()
+            {
+                return Err(ProviderContractError::DuplicatePublicAlias {
+                    alias: alias.to_string(),
+                });
+            }
+            if !projected_identities.insert(identity.clone()) {
+                return Err(ProviderContractError::DuplicateToolProjection {
+                    native_tool_id: identity.native_tool_id.to_string(),
+                });
+            }
+        }
+        if projected_identities != identities {
+            let missing = identities
+                .difference(&projected_identities)
+                .next()
+                .expect("different identity sets must have a missing descriptor");
+            return Err(ProviderContractError::MissingToolProjection {
+                native_tool_id: missing.native_tool_id.to_string(),
+            });
+        }
+
+        // Descriptors cannot contain their own parent content hash while that
+        // hash is being derived. Hash their independent versions plus all
+        // resolver/projection inputs, then attach the resulting parent ref.
+        let snapshot_hash_input = (
+            &provider_identity,
+            &binding_ref,
+            &protocol,
+            &discovery_snapshot_hash,
+            &resolver_version,
+            &resolution_policy_hash,
+            &descriptor_ref_list,
+            &alias_index,
+        );
+        let encoded = serde_json::to_vec(&snapshot_hash_input)
+            .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+        let content_hash = format!("sha256:{:x}", Sha256::digest(encoded));
+        let provider_snapshot = ResolvedProviderSnapshotRef {
+            provider_binding: binding_ref.clone(),
+            content_hash: content_hash.clone(),
+        };
+        let descriptors = versioned_drafts
+            .into_iter()
+            .map(|(draft, descriptor_version)| {
+                ResolvedToolDescriptor::from_draft(
+                    draft,
+                    provider_snapshot.clone(),
+                    descriptor_version,
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            provider_identity,
+            binding_ref,
+            protocol,
+            discovery_snapshot_hash,
+            resolver_version,
+            resolution_policy_hash,
+            descriptors,
+            alias_index,
+            content_hash,
+        })
     }
 }
 
@@ -412,6 +847,42 @@ pub enum ProviderContractError {
         "provider snapshot content hash mismatch: supplied '{supplied}', computed '{computed}'"
     )]
     ContentHashMismatch { supplied: String, computed: String },
+    #[error(
+        "resolved provider snapshot content hash mismatch: supplied '{supplied}', computed '{computed}'"
+    )]
+    ResolvedContentHashMismatch { supplied: String, computed: String },
+    #[error("resolved provider snapshot contains fields inconsistent with its canonical content")]
+    ResolvedSnapshotInvariantMismatch,
+    #[error(
+        "resolved tool '{native_tool_id}' belongs to binding '{actual}', expected '{expected}'"
+    )]
+    DescriptorBindingMismatch {
+        native_tool_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("duplicate resolved native tool identity '{native_tool_id}'")]
+    DuplicateResolvedToolIdentity { native_tool_id: String },
+    #[error("public alias '{alias}' targets unknown tool '{native_tool_id}'")]
+    AliasTargetsUnknownTool {
+        alias: String,
+        native_tool_id: String,
+    },
+    #[error("duplicate public tool alias '{alias}'")]
+    DuplicatePublicAlias { alias: String },
+    #[error("tool '{native_tool_id}' has more than one public alias")]
+    DuplicateToolProjection { native_tool_id: String },
+    #[error("tool '{native_tool_id}' is missing a public alias projection")]
+    MissingToolProjection { native_tool_id: String },
+    #[error(
+        "tool '{native_tool_id}' claim '{field}' names protocol '{claim_protocol}', but its snapshot protocol is '{snapshot_protocol}'"
+    )]
+    ClaimProtocolMismatch {
+        native_tool_id: String,
+        field: String,
+        snapshot_protocol: String,
+        claim_protocol: String,
+    },
     #[error("failed to serialize provider snapshot: {0}")]
     Serialization(String),
 }
@@ -432,6 +903,19 @@ fn validate_claim_source(source: &ProviderClaimSource) -> Result<(), ProviderCon
         return Err(ProviderContractError::EmptyIdentifier { kind });
     }
     Ok(())
+}
+
+fn provider_claim_sources(
+    claims: &ProviderToolClaims,
+) -> impl Iterator<Item = &ProviderClaimSource> {
+    [
+        claims.read_only.as_ref().map(|claim| &claim.source),
+        claims.destructive.as_ref().map(|claim| &claim.source),
+        claims.idempotent.as_ref().map(|claim| &claim.source),
+        claims.open_world.as_ref().map(|claim| &claim.source),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 fn canonical_json(value: &Value) -> Value {
@@ -546,6 +1030,31 @@ mod tests {
         assert!(matches!(
             error,
             ProviderContractError::UnqualifiedExtensionField { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_a_claim_borrowing_another_protocols_authority() {
+        let mut tool = declaration("read", json!({"type": "object"}));
+        tool.claims.read_only = Some(ProviderClaim::new(
+            true,
+            ProviderClaimSource::StandardProtocol {
+                protocol: ProviderProtocolId::new("trusted-other-protocol").unwrap(),
+                field: "readOnlyHint".to_string(),
+            },
+        ));
+
+        let error = ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("provider-a").unwrap(),
+            ProviderBindingRef::new("binding-a").unwrap(),
+            ProviderProtocolId::new("mcp").unwrap(),
+            vec![tool],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderContractError::ClaimProtocolMismatch { .. }
         ));
     }
 

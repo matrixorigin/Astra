@@ -4,6 +4,7 @@ use astra_turn_types::{
     NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload, ProviderClaim,
     ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
     ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
+    ResolvedProviderSnapshot,
 };
 use rmcp::model::{CallToolResult, TaskSupport, Tool};
 use serde_json::{Map, Value};
@@ -238,6 +239,57 @@ pub fn mcp_provider_snapshot_to_schemas_checked(
         ));
     }
     provider_declarations_to_schemas_checked(server_name, &snapshot.tool_declarations)
+}
+
+/// Project the exact aliases and descriptors from Astra's resolved snapshot.
+/// This is the runtime path: model schemas can no longer be generated from a
+/// parallel declaration/name map that permission or execution cannot identify.
+pub fn mcp_resolved_provider_snapshot_to_schemas_checked(
+    snapshot: &ResolvedProviderSnapshot,
+) -> Result<Vec<Value>, String> {
+    if snapshot.protocol.as_str() != "mcp" {
+        return Err(format!(
+            "cannot apply MCP schema projection to '{}' resolved provider snapshot",
+            snapshot.protocol
+        ));
+    }
+
+    let descriptors = snapshot
+        .descriptors
+        .iter()
+        .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    snapshot
+        .alias_index
+        .iter()
+        .map(|(alias, descriptor_ref)| {
+            let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+                format!(
+                    "resolved MCP alias '{}' references missing descriptor '{}@{}'",
+                    alias,
+                    descriptor_ref.identity.native_tool_id,
+                    descriptor_ref.descriptor_version
+                )
+            })?;
+            let public_name = alias.as_str();
+            if sanitize_tool_name(public_name) != public_name {
+                return Err(format!(
+                    "resolved MCP public alias '{public_name}' is not model-safe"
+                ));
+            }
+            Ok(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "description": truncate_with_marker(
+                        descriptor.description.as_deref().unwrap_or_default(),
+                        MAX_DESCRIPTION_LENGTH,
+                    ),
+                    "parameters": &descriptor.input_schema,
+                }
+            }))
+        })
+        .collect()
 }
 
 fn provider_declarations_to_schemas_checked(

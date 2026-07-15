@@ -70,6 +70,7 @@ pub mod pipeline;
 pub mod plan_mode_policy;
 pub mod prepare_turn_explain_text;
 pub mod prompt_facing;
+pub mod provider_resolution;
 pub mod reasoning_capabilities;
 pub mod recent_arg_hints;
 pub mod recovery_state;

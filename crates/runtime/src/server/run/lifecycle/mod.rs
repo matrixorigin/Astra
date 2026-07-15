@@ -4267,7 +4267,9 @@ impl AgenticRunLifecycleService {
                             "binding_ref": snapshot.binding_ref.as_str(),
                             "protocol": snapshot.protocol.as_str(),
                             "content_hash": &snapshot.content_hash,
-                            "tool_count": snapshot.tool_declarations.len(),
+                            "discovery_content_hash": &snapshot.discovery_snapshot_hash,
+                            "resolver_version": snapshot.resolver_version.as_str(),
+                            "tool_count": snapshot.descriptors.len(),
                         })
                     })
                     .collect(),

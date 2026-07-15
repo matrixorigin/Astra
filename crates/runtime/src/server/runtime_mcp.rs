@@ -4,14 +4,14 @@
 //! the current turn. The runtime discovers tools for that request and keeps the
 //! resulting schemas and connections in memory only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use astra_core::{ErrorResponse, error_response_coded};
 use astra_mcp::{
     MAX_RESULT_CONTENT_LENGTH, McpClientManager, McpServerConfig, McpTool, McpToolCallResult,
-    Transport, mcp_provider_snapshot_to_schemas_checked, mcp_tool_to_provider_declaration,
+    Transport, mcp_resolved_provider_snapshot_to_schemas_checked, mcp_tool_to_provider_declaration,
     mcp_tool_to_schema, mcp_tools_to_provider_snapshot, sanitize_tool_name,
 };
 use astra_services::{
@@ -19,7 +19,8 @@ use astra_services::{
     runs::RuntimeMcpBindingRequest,
 };
 use astra_turn_types::{
-    ProviderBindingRef, ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId,
+    NativeToolId, ProviderBindingRef, ProviderClaimTrust, ProviderDiscoverySnapshot,
+    ProviderIdentity, ProviderProtocolId, PublicToolAlias, ResolvedProviderSnapshot,
 };
 use axum::{Json, http::StatusCode};
 use regex::Regex;
@@ -34,11 +35,44 @@ static AGENT_BINDING_MCP_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new(
 #[derive(Clone)]
 pub(crate) struct RuntimeMcpBundle {
     pub schemas: Vec<Value>,
-    pub provider_snapshots: Vec<ProviderDiscoverySnapshot>,
+    pub provider_snapshots: Vec<ResolvedProviderSnapshot>,
     pub control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
     pub stop_after_success_tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     pub manager: Option<Arc<RwLock<McpClientManager>>>,
     pub agent_binding_mcp: Option<Arc<AgentBindingMcpRuntime>>,
+}
+
+pub(crate) fn resolve_mcp_snapshot(
+    tool_namespace: &str,
+    discovery: &ProviderDiscoverySnapshot,
+) -> Result<ResolvedProviderSnapshot, String> {
+    let aliases = discovery
+        .tool_declarations
+        .iter()
+        .map(|declaration| {
+            let alias = sanitize_tool_name(&format!(
+                "mcp__{}__{}",
+                tool_namespace, declaration.native_tool_name
+            ));
+            Ok((
+                declaration.native_tool_id.clone(),
+                PublicToolAlias::new(alias).map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect::<Result<BTreeMap<NativeToolId, PublicToolAlias>, String>>()?;
+    // MCP annotations are protocol-defined hints, not authorization. Keep
+    // them visible as advisory evidence until binding/deployment policy grants
+    // stronger authority explicitly.
+    let trust_policy = astra_turn_core::provider_resolution::ProviderClaimTrustPolicy {
+        standard_protocols: BTreeMap::from([("mcp".to_string(), ProviderClaimTrust::Advisory)]),
+        ..Default::default()
+    };
+    astra_turn_core::provider_resolution::resolve_provider_snapshot(
+        discovery,
+        &trust_policy,
+        &aliases,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone)]
@@ -413,25 +447,58 @@ pub(crate) async fn discover_binding_tools(
             "mcp_discovery_invalid",
         )
     })?;
-    let schemas = mcp_provider_snapshot_to_schemas_checked(&tool_namespace, &provider_snapshot)
+    let resolved_snapshot =
+        resolve_mcp_snapshot(&tool_namespace, &provider_snapshot).map_err(|error| {
+            mcp_error(
+                StatusCode::CONFLICT,
+                error,
+                "mcp_provider_resolution_failed",
+            )
+        })?;
+    let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved_snapshot)
         .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
 
-    let mut discovered = Vec::with_capacity(provider_snapshot.tool_declarations.len());
-    for (declaration, schema) in provider_snapshot.tool_declarations.into_iter().zip(schemas) {
+    let mut discovered = Vec::with_capacity(resolved_snapshot.descriptors.len());
+    for schema in schemas {
         let public_name = schema["function"]["name"]
             .as_str()
             .unwrap_or_default()
             .to_string();
+        let alias = PublicToolAlias::new(public_name.clone()).map_err(|error| {
+            mcp_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+                "mcp_provider_projection_invalid",
+            )
+        })?;
+        let descriptor_ref = resolved_snapshot.alias_index.get(&alias).ok_or_else(|| {
+            mcp_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MCP schema alias '{public_name}' has no resolved descriptor"),
+                "mcp_provider_projection_invalid",
+            )
+        })?;
+        let descriptor = resolved_snapshot
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.descriptor_ref() == *descriptor_ref)
+            .ok_or_else(|| {
+                mcp_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("MCP schema alias '{public_name}' references a missing descriptor"),
+                    "mcp_provider_projection_invalid",
+                )
+            })?;
         let hash_parts = json!({
-            "provider_declaration": &declaration,
+            "descriptor_version": descriptor.descriptor_version.as_str(),
             "public_name": public_name,
         });
         discovered.push(McpDiscoveredToolData {
-            tool_name: declaration.native_tool_name,
+            tool_name: descriptor.native_tool_name.clone(),
             public_name,
-            description: declaration.description,
-            input_schema_json: Some(declaration.input_schema),
-            output_schema_json: declaration.output_schema,
+            description: descriptor.description.clone(),
+            input_schema_json: Some(descriptor.input_schema.clone()),
+            output_schema_json: descriptor.output_schema.clone(),
             schema_hash: mcp_schema_hash(&hash_parts),
         });
     }
@@ -530,10 +597,16 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
                 "mcp_runtime_discovery_invalid",
             )
         })?;
-        let binding_schemas =
-            mcp_provider_snapshot_to_schemas_checked(&tool_namespace, &provider_snapshot).map_err(
-                |error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"),
-            )?;
+        let resolved_snapshot =
+            resolve_mcp_snapshot(&tool_namespace, &provider_snapshot).map_err(|error| {
+                mcp_error(
+                    StatusCode::CONFLICT,
+                    error,
+                    "mcp_provider_resolution_failed",
+                )
+            })?;
+        let binding_schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved_snapshot)
+            .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
         for schema in binding_schemas {
             let public_name = schema["function"]["name"]
                 .as_str()
@@ -548,7 +621,7 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
             }
             schemas.push(schema);
         }
-        provider_snapshots.push(provider_snapshot);
+        provider_snapshots.push(resolved_snapshot);
     }
 
     Ok(Some(RuntimeMcpBundle {
@@ -937,7 +1010,7 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
             "agent_binding_discovery_failed",
         )
     })?;
-    let (schemas, control_tools, stop_after_success_tools) =
+    let (_adapter_schemas, control_tools, stop_after_success_tools) =
         agent_binding_tools_to_schemas_checked(&tool_namespace, &tools)
             .map_err(|(error, code)| mcp_error(StatusCode::BAD_GATEWAY, error, code))?;
     let declarations = tools
@@ -990,6 +1063,22 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
             "agent_binding_discovery_invalid",
         )
     })?;
+    let resolved_snapshot =
+        resolve_mcp_snapshot(&tool_namespace, &provider_snapshot).map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                format!("invalid Agent Binding MCP provider resolution: {error}"),
+                "agent_binding_provider_resolution_failed",
+            )
+        })?;
+    let schemas =
+        mcp_resolved_provider_snapshot_to_schemas_checked(&resolved_snapshot).map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                error,
+                "agent_binding_public_name_conflict",
+            )
+        })?;
     let tool_names_by_public_name = tool_names_by_public_name(&schemas, &tools);
     let agent_binding_mcp = AgentBindingMcpRuntime {
         server_name: tool_namespace,
@@ -999,7 +1088,7 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
     };
     Ok(RuntimeMcpBundle {
         schemas,
-        provider_snapshots: vec![provider_snapshot],
+        provider_snapshots: vec![resolved_snapshot],
         control_tools,
         stop_after_success_tools,
         manager: None,
@@ -1340,11 +1429,20 @@ mod tests {
         assert!(bundle.agent_binding_mcp.is_some());
         assert_eq!(bundle.schemas[0]["function"]["name"], "mcp__tools__query");
         assert_eq!(bundle.provider_snapshots.len(), 1);
+        let snapshot = &bundle.provider_snapshots[0];
+        let descriptor = &snapshot.descriptors[0];
+        assert_eq!(descriptor.identity.native_tool_id.as_str(), "query");
         assert_eq!(
-            bundle.provider_snapshots[0].tool_declarations[0]
-                .native_tool_id
-                .as_str(),
-            "query"
+            descriptor.semantic_baseline.effect,
+            astra_turn_types::ResolvedToolEffect::Unknown,
+            "standard MCP hints are advisory and missing hints must remain conservative"
+        );
+        assert_eq!(
+            snapshot
+                .alias_index
+                .get(&astra_turn_types::PublicToolAlias::new("mcp__tools__query").unwrap()),
+            Some(&descriptor.descriptor_ref()),
+            "the model-visible schema alias must resolve to the exact carried descriptor"
         );
 
         let output = bundle
@@ -1407,7 +1505,7 @@ mod tests {
 
         assert!(bundle.schemas.is_empty());
         assert_eq!(bundle.provider_snapshots.len(), 1);
-        assert!(bundle.provider_snapshots[0].tool_declarations.is_empty());
+        assert!(bundle.provider_snapshots[0].descriptors.is_empty());
         assert!(bundle.control_tools.is_empty());
         assert!(bundle.manager.is_none());
         assert!(bundle.agent_binding_mcp.is_some());
