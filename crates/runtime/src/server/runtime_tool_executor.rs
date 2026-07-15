@@ -1501,6 +1501,22 @@ impl RuntimeToolExecutor {
         request
     }
 
+    fn tool_execution_request_for_invocation(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        name: &str,
+        args: &Value,
+    ) -> ToolExecutionRequest {
+        let mut request = self
+            .execution_binding
+            .tool_execution_request_for_invocation(identity, name, args);
+        if let Some(offer) = self.selected_offer_for_request(&request) {
+            request = Self::request_with_selected_offer_route(request, offer.route);
+            request = request.with_selected_offer(offer);
+        }
+        request
+    }
+
     fn selected_offer_for_request(
         &self,
         request: &ToolExecutionRequest,
@@ -1642,6 +1658,47 @@ impl RuntimeToolExecutor {
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         let request = self.tool_execution_request(name, args);
 
+        self.execute_request_with_metadata(request).await
+    }
+
+    /// Execute one validated logical invocation without projecting durable
+    /// identity into provider-authored arguments.
+    pub async fn execute_invocation_with_metadata(
+        &self,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
+        name: &str,
+        args: &Value,
+    ) -> astra_tools::ToolResult {
+        let identity = match astra_turn_types::ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return astra_tools::ToolResult::error(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": error.to_string(),
+                        "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                        "retryable": false,
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        let request = self.tool_execution_request_for_invocation(&identity, name, args);
+        self.execute_request_with_metadata(request).await
+    }
+
+    async fn execute_request_with_metadata(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> astra_tools::ToolResult {
         // Early cancel check before route-boundary event emission.
         if let Some(token) = self.cancel_token.as_ref() {
             if token.is_cancelled() {

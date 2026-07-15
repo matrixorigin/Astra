@@ -234,6 +234,8 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub token: &'a str,
     pub current_user_id: Option<&'a str>,
     pub current_session_id: Option<&'a String>,
+    pub current_run_id: Option<&'a str>,
+    pub current_turn_chain_id: Option<&'a str>,
     pub tool_calls: &'a [Value],
     pub edge_tool_round: &'a [E],
     pub by_sig: &'a HashMap<String, String>,
@@ -481,6 +483,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let api = self.ctx.api;
         let token = self.ctx.token;
         let session_id = self.ctx.current_session_id;
+        let run_id = self.ctx.current_run_id;
+        let turn_chain_id = self.ctx.current_turn_chain_id;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
 
@@ -501,6 +505,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     api,
                     token,
                     session_id,
+                    run_id,
+                    turn_chain_id,
                     session_turn,
                     edge_round_present,
                 )
@@ -739,6 +745,8 @@ mod tests {
                     token: "",
                     current_user_id: None,
                     current_session_id: None,
+                    current_run_id: None,
+                    current_turn_chain_id: None,
                     tool_calls: &self.tool_calls,
                     edge_tool_round: &self.edge_tool_round,
                     by_sig: &self.by_sig,

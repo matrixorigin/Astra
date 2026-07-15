@@ -1334,6 +1334,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             token: &state.api_token,
             current_user_id: state.context_manifest_user_id.as_deref(),
             current_session_id: state.current_session_id.as_ref(),
+            current_run_id: state.current_run_id.as_deref(),
+            current_turn_chain_id: state
+                .bridge_turn_chain_id
+                .as_deref()
+                .or(state.current_run_id.as_deref()),
             tool_calls: all_tool_calls,
             edge_tool_round: edge_round_for_headless,
             reasoning_content: turn_result.accum.reasoning_content.as_str(),

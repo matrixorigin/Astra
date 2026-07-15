@@ -19,6 +19,34 @@ use astra_turn_core::tool_result_semantics::{
 /// when no edge agent matched the tool call.
 const EDGE_PROTOCOL_ERROR_PREFIX: &str = super::HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX;
 
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessInvocationScope<'a> {
+    Durable {
+        run_id: &'a str,
+        turn_chain_id: &'a str,
+    },
+    LegacyUnscoped,
+    Incomplete,
+}
+
+fn resolve_invocation_scope<'a>(
+    run_id: Option<&'a str>,
+    turn_chain_id: Option<&'a str>,
+) -> HeadlessInvocationScope<'a> {
+    match (run_id, turn_chain_id) {
+        (Some(run_id), Some(turn_chain_id))
+            if !run_id.trim().is_empty() && !turn_chain_id.trim().is_empty() =>
+        {
+            HeadlessInvocationScope::Durable {
+                run_id,
+                turn_chain_id,
+            }
+        }
+        (None, None) => HeadlessInvocationScope::LegacyUnscoped,
+        _ => HeadlessInvocationScope::Incomplete,
+    }
+}
+
 /// Pure execution: server-side tool execution + hydration.
 /// No &mut pipeline needed — only shared refs.
 pub(crate) async fn execute_tool_pure(
@@ -27,6 +55,8 @@ pub(crate) async fn execute_tool_pure(
     api: &ThinClient,
     token: &str,
     current_session_id: Option<&String>,
+    current_run_id: Option<&str>,
+    current_turn_chain_id: Option<&str>,
     session_turn: u32,
     edge_round_present: bool,
 ) {
@@ -35,16 +65,36 @@ pub(crate) async fn execute_tool_pure(
             && !selected_runtime_provider_tool_missing_edge_result(execution, edge_round_present)
         {
             executor.set_turn_index(session_turn.max(1));
-            let mut server_args = execution.args.clone();
-            if let Some(obj) = server_args.as_object_mut() {
-                obj.insert(
-                    "_tool_call_id".to_string(),
-                    serde_json::Value::String(execution.id.clone()),
-                );
-            }
-            let result = executor
-                .execute_with_metadata(&execution.name, &server_args)
-                .await;
+            let result = match resolve_invocation_scope(current_run_id, current_turn_chain_id) {
+                HeadlessInvocationScope::Durable {
+                    run_id,
+                    turn_chain_id,
+                } => {
+                    executor
+                        .execute_invocation_with_metadata(
+                            run_id,
+                            turn_chain_id,
+                            &execution.id,
+                            &execution.name,
+                            &execution.args,
+                        )
+                        .await
+                }
+                HeadlessInvocationScope::LegacyUnscoped => {
+                    executor
+                        .execute_with_metadata(&execution.name, &execution.args)
+                        .await
+                }
+                HeadlessInvocationScope::Incomplete => astra_tools::ToolResult::error(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": "incomplete runtime tool invocation identity",
+                        "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                        "retryable": false,
+                    })
+                    .to_string(),
+                ),
+            };
             execution.tool_result_fields = result.metadata;
             execution.result_str = result.output;
         }
@@ -170,7 +220,31 @@ fn structured_output_error_kind(result_str: &str) -> Option<astra_core::ErrorKin
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::{Map, Value};
+
+    #[test]
+    fn invocation_scope_rejects_partial_or_blank_identity() {
+        assert_eq!(
+            resolve_invocation_scope(Some("run-1"), Some("turn-1")),
+            HeadlessInvocationScope::Durable {
+                run_id: "run-1",
+                turn_chain_id: "turn-1",
+            }
+        );
+        assert_eq!(
+            resolve_invocation_scope(None, None),
+            HeadlessInvocationScope::LegacyUnscoped
+        );
+        assert_eq!(
+            resolve_invocation_scope(Some("run-1"), None),
+            HeadlessInvocationScope::Incomplete
+        );
+        assert_eq!(
+            resolve_invocation_scope(Some("  "), Some("turn-1")),
+            HeadlessInvocationScope::Incomplete
+        );
+    }
 
     #[test]
     fn transport_failure_metadata_marks_read_only_tool_as_error() {
@@ -253,6 +327,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.api,
             self.ctx.token,
             self.ctx.current_session_id,
+            self.ctx.current_run_id,
+            self.ctx.current_turn_chain_id,
             self.ctx.session_turn,
             !self.ctx.edge_tool_round.is_empty(),
         )

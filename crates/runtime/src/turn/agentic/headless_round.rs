@@ -41,6 +41,10 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub token: &'a str,
     pub current_user_id: Option<&'a str>,
     pub current_session_id: Option<&'a String>,
+    /// Durable run identity for server-side tool invocations.
+    pub current_run_id: Option<&'a str>,
+    /// Durable causal turn identity. This may span retries/resume of one visible turn.
+    pub current_turn_chain_id: Option<&'a str>,
     pub tool_calls: &'a [Value],
     pub edge_tool_round: &'a [E],
     pub reasoning_content: &'a str,
@@ -210,6 +214,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         token,
         current_user_id,
         current_session_id,
+        current_run_id,
+        current_turn_chain_id,
         tool_calls,
         edge_tool_round,
         reasoning_content,
@@ -271,6 +277,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             token,
             current_user_id,
             current_session_id,
+            current_run_id,
+            current_turn_chain_id,
             tool_calls,
             edge_tool_round,
             by_sig: edge_callback_outputs,

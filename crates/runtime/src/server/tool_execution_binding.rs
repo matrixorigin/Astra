@@ -220,6 +220,14 @@ pub struct ToolExecutionRequest {
     pub policy: ToolPolicySnapshot,
 }
 
+struct ToolExecutionIdentityParts<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
+    run_id: &'a str,
+    turn_chain_id: &'a str,
+    invocation_id: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelectedToolOfferSnapshot {
     pub offer_id: String,
@@ -375,12 +383,52 @@ impl ExecutionBindingState {
         let turn_chain_id = string_arg(args, "_turn_chain_id")
             .map(str::to_string)
             .unwrap_or_else(|| run_id.clone());
+        self.build_tool_execution_request(
+            ToolExecutionIdentityParts {
+                user_id,
+                session_id,
+                run_id: &run_id,
+                turn_chain_id: &turn_chain_id,
+                invocation_id: tool_call_id(args).unwrap_or_default(),
+            },
+            name,
+            args,
+        )
+    }
+
+    /// Build a route request from a validated durable identity. Invocation
+    /// identity stays out of provider-authored arguments.
+    pub(crate) fn tool_execution_request_for_invocation(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        name: &str,
+        args: &Value,
+    ) -> ToolExecutionRequest {
+        self.build_tool_execution_request(
+            ToolExecutionIdentityParts {
+                user_id: &identity.user_id,
+                session_id: &identity.session_id,
+                run_id: &identity.run_id,
+                turn_chain_id: &identity.turn_chain_id,
+                invocation_id: &identity.invocation_id,
+            },
+            name,
+            args,
+        )
+    }
+
+    fn build_tool_execution_request(
+        &self,
+        identity: ToolExecutionIdentityParts<'_>,
+        name: &str,
+        args: &Value,
+    ) -> ToolExecutionRequest {
         ToolExecutionRequest {
-            user_id: user_id.to_string(),
-            run_id,
-            turn_chain_id,
-            session_id: session_id.to_string(),
-            tool_call_id: tool_call_id(args).unwrap_or_default().to_string(),
+            user_id: identity.user_id.to_string(),
+            run_id: identity.run_id.to_string(),
+            turn_chain_id: identity.turn_chain_id.to_string(),
+            session_id: identity.session_id.to_string(),
+            tool_call_id: identity.invocation_id.to_string(),
             tool_name: name.to_string(),
             args: args.clone(),
             workspace: self.workspace.clone(),
@@ -458,6 +506,7 @@ mod tests {
             "bash",
             &json!({
                 "_run_id": " run-1 ",
+                "_turn_chain_id": " turn-7 ",
                 "_tool_call_id": "call-1",
                 "command": "pwd",
             }),
@@ -466,7 +515,7 @@ mod tests {
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.run_id, "run-1");
-        assert_eq!(request.turn_chain_id, "run-1");
+        assert_eq!(request.turn_chain_id, "turn-7");
         assert_eq!(request.tool_call_id, "call-1");
         assert_eq!(request.tool_name, "bash");
         assert_eq!(request.args["command"], "pwd");
@@ -477,6 +526,51 @@ mod tests {
                 .workspace_id,
             "workspace-1"
         );
+    }
+
+    #[test]
+    fn execution_binding_state_uses_run_as_explicit_legacy_turn_fallback() {
+        let state = ExecutionBindingState::server_sandbox("/tmp/astra-workspace");
+
+        let request = state.tool_execution_request(
+            "user-1",
+            "session-1",
+            "bash",
+            &json!({
+                "_run_id": "run-1",
+                "_tool_call_id": "call-1",
+                "command": "pwd",
+            }),
+        );
+
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.turn_chain_id, "run-1");
+    }
+
+    #[test]
+    fn typed_invocation_request_keeps_identity_out_of_provider_arguments() {
+        let state = ExecutionBindingState::server_sandbox("/tmp/astra-workspace");
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user-1",
+            "session-1",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let args = json!({"_provider_cursor": "cursor-7", "query": "select 1"});
+
+        let request = state.tool_execution_request_for_invocation(&identity, "query", &args);
+
+        assert_eq!(request.user_id, "user-1");
+        assert_eq!(request.session_id, "session-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.turn_chain_id, "turn-1");
+        assert_eq!(request.tool_call_id, "call-1");
+        assert_eq!(request.args, args);
+        assert!(request.args.get("_run_id").is_none());
+        assert!(request.args.get("_turn_chain_id").is_none());
+        assert!(request.args.get("_tool_call_id").is_none());
     }
 
     #[test]
@@ -530,6 +624,7 @@ mod tests {
             "query": "select 1",
             "_tool_call_id": "call-1",
             "_run_id": "run-1",
+            "_turn_chain_id": "turn-1",
             "_domain_parameter": "must remain"
         });
 
@@ -539,6 +634,7 @@ mod tests {
         assert_eq!(projected["_domain_parameter"], "must remain");
         assert!(projected.get("_tool_call_id").is_none(), "{projected:?}");
         assert!(projected.get("_run_id").is_none(), "{projected:?}");
+        assert!(projected.get("_turn_chain_id").is_none(), "{projected:?}");
     }
 
     #[test]
