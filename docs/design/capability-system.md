@@ -7,6 +7,10 @@ The capability system owns tools, skills, MCP, provider decisions, tool schema p
 
 This is the target contract for implementation. It is not a snapshot of the current tool code.
 
+The protocol-independent provider snapshot, internal tool identity, invocation,
+and typed outcome sub-contract is defined in
+[capability-provider-runtime.md](capability-provider-runtime.md).
+
 ## Principle
 
 ```text
