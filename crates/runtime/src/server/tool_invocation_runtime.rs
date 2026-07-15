@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use astra_turn_core::invocation_ledger::{InMemoryInvocationLedger, InvocationLedgerError};
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationFingerprint, ToolInvocationIdentity,
+    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
     ToolInvocationState, ToolInvocationTerminalOutcome,
 };
@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 pub(crate) enum InvocationBeginDisposition {
-    Execute,
+    Execute(ToolInvocationDecision),
     Return(astra_tools::ToolResult),
 }
 
@@ -44,13 +44,15 @@ impl RuntimeToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
         fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
     ) -> Result<ToolInvocationPrepareOutcome, RuntimeInvocationLedgerError> {
         match self {
-            Self::Database(ledger) => Ok(ledger.prepare(identity, fingerprint).await?),
-            Self::InMemory(ledger) => Ok(ledger
-                .lock()
-                .await
-                .prepare(identity.clone(), fingerprint.clone())?),
+            Self::Database(ledger) => Ok(ledger.prepare(identity, fingerprint, decision).await?),
+            Self::InMemory(ledger) => Ok(ledger.lock().await.prepare(
+                identity.clone(),
+                fingerprint.clone(),
+                decision.clone(),
+            )?),
         }
     }
 
@@ -132,21 +134,27 @@ impl RuntimeToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
         fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
     ) -> Result<InvocationBeginDisposition, RuntimeInvocationLedgerError> {
-        let record = match self.prepare(identity, fingerprint).await? {
+        let record = match self.prepare(identity, fingerprint, decision).await? {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
         };
         match record.state {
-            ToolInvocationState::Prepared => match self.dispatch(identity).await {
-                Ok(_) => Ok(InvocationBeginDisposition::Execute),
-                Err(dispatch_error) => {
-                    let Some(authoritative) = self.get(identity).await? else {
-                        return Err(dispatch_error);
-                    };
-                    disposition_for_existing_record(authoritative)?.ok_or(dispatch_error)
+            ToolInvocationState::Prepared => {
+                validate_decision(&record.decision)
+                    .map_err(RuntimeInvocationLedgerError::InvalidDecision)?;
+                match self.dispatch(identity).await {
+                    Ok(record) => Ok(InvocationBeginDisposition::Execute(record.decision)),
+                    Err(dispatch_error) => {
+                        let Some(authoritative) = self.get(identity).await? else {
+                            return Err(dispatch_error);
+                        };
+                        disposition_for_existing_record(authoritative)?.ok_or(dispatch_error)
+                    }
                 }
-            },
+            }
             _ => disposition_for_existing_record(record)?.ok_or_else(|| {
                 RuntimeInvocationLedgerError::InvalidRecord(
                     "existing prepared invocation was not dispatchable".to_string(),
@@ -515,6 +523,8 @@ pub(crate) enum RuntimeInvocationLedgerError {
     InMemory(Box<InvocationLedgerError>),
     #[error("invalid durable invocation record: {0}")]
     InvalidRecord(String),
+    #[error("invalid frozen tool invocation decision: {0}")]
+    InvalidDecision(String),
 }
 
 impl From<astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError>
@@ -543,12 +553,34 @@ mod tests {
     }
 
     fn fingerprint(arguments: &Value) -> ToolInvocationFingerprint {
+        let decision = decision("decision-v1");
+        fingerprint_for(arguments, &decision)
+    }
+
+    fn fingerprint_for(
+        arguments: &Value,
+        decision: &ToolInvocationDecision,
+    ) -> ToolInvocationFingerprint {
         ToolInvocationFingerprint::new(
             DurableToolReference::built_in("bash", "contract-v1").unwrap(),
             arguments,
-            "decision-v1",
+            &decision.decision_id,
         )
         .unwrap()
+    }
+
+    fn decision(label: &str) -> ToolInvocationDecision {
+        ToolInvocationDecision::new(&json!({"decision": label})).unwrap()
+    }
+
+    async fn begin(
+        ledger: &RuntimeToolInvocationLedger,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> Result<InvocationBeginDisposition, RuntimeInvocationLedgerError> {
+        ledger
+            .begin(identity, fingerprint, &decision("decision-v1"), |_| Ok(()))
+            .await
     }
 
     #[tokio::test]
@@ -560,8 +592,8 @@ mod tests {
         let fingerprint = fingerprint(&args);
 
         assert!(matches!(
-            ledger.begin(&first, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute
+            begin(&ledger, &first, &fingerprint).await.unwrap(),
+            InvocationBeginDisposition::Execute(_)
         ));
         let first_result = astra_tools::ToolResult::text("deployed".to_string());
         let committed = ledger.finish(&first, first_result).await;
@@ -571,35 +603,65 @@ mod tests {
             "succeeded"
         );
 
-        let replay = match ledger.begin(&first, &fingerprint).await.unwrap() {
+        let replay = match begin(&ledger, &first, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute => panic!("terminal identity must replay"),
+            InvocationBeginDisposition::Execute(_) => panic!("terminal identity must replay"),
         };
         assert_eq!(replay.output, "deployed");
         assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
 
         assert!(matches!(
-            ledger.begin(&second, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute
+            begin(&ledger, &second, &fingerprint).await.unwrap(),
+            InvocationBeginDisposition::Execute(_)
         ));
     }
 
     #[tokio::test]
-    async fn same_identity_with_changed_decision_fails_instead_of_replaying() {
+    async fn same_identity_with_changed_arguments_fails_instead_of_replaying() {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-1");
-        ledger
-            .begin(&identity, &fingerprint(&json!({"command": "deploy"})))
-            .await
-            .unwrap();
+        begin(
+            &ledger,
+            &identity,
+            &fingerprint(&json!({"command": "deploy"})),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
-            ledger
-                .begin(&identity, &fingerprint(&json!({"command": "destroy"})))
-                .await,
+            begin(&ledger, &identity, &fingerprint(&json!({"command": "destroy"}))).await,
             Err(RuntimeInvocationLedgerError::InMemory(error))
                 if matches!(*error, InvocationLedgerError::IdentityConflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_resume_uses_original_decision_when_live_policy_changed() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-1");
+        let args = json!({"command": "deploy"});
+        let original = decision("original-policy");
+        ledger
+            .prepare(&identity, &fingerprint_for(&args, &original), &original)
+            .await
+            .unwrap();
+        let changed = decision("changed-live-policy");
+
+        let resumed = ledger
+            .begin(
+                &identity,
+                &fingerprint_for(&args, &changed),
+                &changed,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        match resumed {
+            InvocationBeginDisposition::Execute(authoritative) => {
+                assert_eq!(authoritative, original);
+            }
+            InvocationBeginDisposition::Return(_) => panic!("prepared invocation should resume"),
+        }
     }
 
     #[test]
@@ -648,8 +710,8 @@ mod tests {
         let identity = identity("call-1");
         let fingerprint = fingerprint(&json!({"command": "deploy"}));
         assert!(matches!(
-            ledger.begin(&identity, &fingerprint).await.unwrap(),
-            InvocationBeginDisposition::Execute
+            begin(&ledger, &identity, &fingerprint).await.unwrap(),
+            InvocationBeginDisposition::Execute(_)
         ));
         let mut ambiguous = astra_tools::ToolResult::error("connection lost".to_string());
         ambiguous.metadata = Some(Map::from_iter([
@@ -663,9 +725,11 @@ mod tests {
             "outcome_unknown"
         );
         assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
-        let resumed = match ledger.begin(&identity, &fingerprint).await.unwrap() {
+        let resumed = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute => panic!("uncertain invocation must not retry"),
+            InvocationBeginDisposition::Execute(_) => {
+                panic!("uncertain invocation must not retry")
+            }
         };
         let metadata = resumed.metadata.unwrap();
         assert_eq!(metadata["error_kind"], "tool_invocation_outcome_unknown");
@@ -678,7 +742,7 @@ mod tests {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-1");
         let fingerprint = fingerprint(&json!({"command": "test -f missing"}));
-        ledger.begin(&identity, &fingerprint).await.unwrap();
+        begin(&ledger, &identity, &fingerprint).await.unwrap();
         let result = astra_tools::ToolResult {
             output: "not found".to_string(),
             metadata: Some(Map::from_iter([("exit_code".to_string(), json!(1))])),
@@ -687,9 +751,9 @@ mod tests {
         };
         ledger.finish(&identity, result).await;
 
-        let replay = match ledger.begin(&identity, &fingerprint).await.unwrap() {
+        let replay = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result,
-            InvocationBeginDisposition::Execute => panic!("terminal identity must replay"),
+            InvocationBeginDisposition::Execute(_) => panic!("terminal identity must replay"),
         };
         assert_eq!(replay.output, "not found");
         assert_eq!(replay.exit_semantics, Some(ExitSemantics::DomainNegative));

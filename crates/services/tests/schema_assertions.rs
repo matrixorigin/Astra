@@ -1659,6 +1659,13 @@ async fn phase2_web_hydration_schema_contract() {
             .any(|column| column == "outcome_json"),
         "tool invocation terminal state and replay outcome must share one durable row"
     );
+    assert!(
+        column_names(&pool, &schema, "tool_invocation_ledger")
+            .await
+            .iter()
+            .any(|column| column == "decision_json"),
+        "prepared invocation resume requires the complete frozen decision, not only its hash"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [

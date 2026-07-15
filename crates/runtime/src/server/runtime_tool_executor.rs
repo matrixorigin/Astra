@@ -57,7 +57,10 @@ use crate::server::tool_local_execution::{
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
-use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
+use crate::server::tool_route_runtime::{
+    ToolRouteRuntimeContext, execute_tool_route_with_events,
+    execute_tool_route_with_events_at_route,
+};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -1410,10 +1413,18 @@ impl RuntimeToolExecutor {
     }
 
     pub(super) fn binding_event_fields(&self) -> Map<String, Value> {
-        let mut fields = binding_event_fields(
+        self.binding_event_fields_for(
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
-        );
+        )
+    }
+
+    fn binding_event_fields_for(
+        &self,
+        workspace: &WorkspaceBinding,
+        executor: &ExecutorBinding,
+    ) -> Map<String, Value> {
+        let mut fields = binding_event_fields(workspace, executor);
         fields.insert(
             "capacity_provider_coverage".to_string(),
             serde_json::to_value(self.capacity_provider_coverage()).unwrap_or(Value::Null),
@@ -1751,6 +1762,20 @@ impl RuntimeToolExecutor {
                     );
                 }
             };
+            let durable_decision = match decision.durable() {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
             tracing::debug!(
                     user_id = %request.user_id,
                     session_id = %request.session_id,
@@ -1786,9 +1811,27 @@ impl RuntimeToolExecutor {
                     "runtime ledger is not configured",
                 );
             };
-            match ledger.begin(&identity, &fingerprint).await {
-                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute) => {
-                    Some((ledger, identity))
+            match ledger
+                .begin(&identity, &fingerprint, &durable_decision, |decision| {
+                    crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+                .await
+            {
+                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute(
+                    durable_decision,
+                )) => {
+                    let frozen = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&durable_decision) {
+                        Ok(frozen) => frozen,
+                        Err(error) => {
+                            return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                                &identity, error,
+                            );
+                        }
+                    };
+                    frozen.apply_to_request(&mut request);
+                    Some((ledger, identity, frozen.route))
                 }
                 Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
                     result,
@@ -1803,20 +1846,24 @@ impl RuntimeToolExecutor {
             None
         };
 
-        let result = execute_tool_route_with_events(
-            ToolRouteRuntimeContext {
-                execution_service: &self.tool_execution_service,
-                local_transport: self,
-                work_surface_events: &self.work_surface_events,
-                session_id: &self.session_id,
-                binding_fields: self.binding_event_fields(),
-                cancel_token: self.cancel_token.clone(),
-            },
-            request,
-        )
-        .await;
+        let route_binding_fields =
+            self.binding_event_fields_for(&request.workspace, &request.executor);
+        let route_context = ToolRouteRuntimeContext {
+            execution_service: &self.tool_execution_service,
+            local_transport: self,
+            work_surface_events: &self.work_surface_events,
+            session_id: &self.session_id,
+            binding_fields: route_binding_fields,
+            cancel_token: self.cancel_token.clone(),
+        };
+        let result = match durable_invocation.as_ref() {
+            Some((_, _, route)) => {
+                execute_tool_route_with_events_at_route(route_context, request, *route).await
+            }
+            None => execute_tool_route_with_events(route_context, request).await,
+        };
         match durable_invocation {
-            Some((ledger, identity)) => ledger.finish(&identity, result).await,
+            Some((ledger, identity, _)) => ledger.finish(&identity, result).await,
             None => result,
         }
     }

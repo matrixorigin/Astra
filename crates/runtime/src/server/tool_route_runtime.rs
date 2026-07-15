@@ -7,6 +7,8 @@ use crate::server::tool_execution_binding::ToolExecutionRequest;
 use crate::server::tool_execution_result::annotate_default_executor_cancel_if_needed;
 use crate::server::tool_execution_service::ToolExecutionService;
 use crate::server::tool_local_transport::ServerLocalToolTransport;
+use crate::server::tool_route_boundary::ToolRouteBoundary;
+use crate::server::tool_route_selection::ToolExecutionRouteKind;
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, agent_waiting_event, executor_blocked_events,
 };
@@ -30,7 +32,19 @@ pub(crate) async fn execute_tool_route_with_events<L>(
 where
     L: ServerLocalToolTransport + ?Sized,
 {
-    let boundary = context.execution_service.route_boundary(request);
+    let route = context.execution_service.routing_decision(&request);
+    execute_tool_route_with_events_at_route(context, request, route).await
+}
+
+pub(crate) async fn execute_tool_route_with_events_at_route<L>(
+    context: ToolRouteRuntimeContext<'_, L>,
+    request: ToolExecutionRequest,
+    route: ToolExecutionRouteKind,
+) -> astra_tools::ToolResult
+where
+    L: ServerLocalToolTransport + ?Sized,
+{
+    let boundary = ToolRouteBoundary::new(request, route);
     emit_optional_work_surface_event(
         context.work_surface_events,
         &context.binding_fields,

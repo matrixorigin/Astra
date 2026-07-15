@@ -273,6 +273,7 @@ impl ToolExecutionService {
         &self.tool_registry
     }
 
+    #[cfg(test)]
     pub(crate) fn route_boundary(&self, request: ToolExecutionRequest) -> ToolRouteBoundary {
         let route = self.routing_decision(&request);
         ToolRouteBoundary::new(request, route)

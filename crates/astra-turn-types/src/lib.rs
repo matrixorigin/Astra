@@ -64,9 +64,9 @@ pub use runtime_scaffolding::{
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CONTRACT_VERSION,
-    ToolInvocationContractError, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
-    canonical_public_tool_arguments,
+    ToolInvocationContractError, ToolInvocationDecision, ToolInvocationFingerprint,
+    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
+    ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
+    canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
 pub use user_intent::{UserIntentDelivery, UserIntentStatus};

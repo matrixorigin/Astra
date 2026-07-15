@@ -5,10 +5,10 @@
 //! admission snapshot, preventing decision-hash/dispatch TOCTOU.
 
 use astra_turn_types::{
-    DurableToolReference, ToolInvocationContractError, ToolInvocationFingerprint,
+    DurableToolReference, ToolInvocationContractError, ToolInvocationDecision,
+    ToolInvocationFingerprint,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::tool_execution_binding::{
@@ -20,9 +20,9 @@ use super::tool_route_selection::ToolExecutionRouteKind;
 
 const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v1";
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
-    contract_version: &'static str,
+    contract_version: String,
     pub tool: DurableToolReference,
     pub route: ToolExecutionRouteKind,
     pub workspace: InvocationWorkspaceSnapshot,
@@ -35,7 +35,7 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub admission: ToolExecutionAdmissionSnapshot,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvocationWorkspaceSnapshot {
     kind: WorkspaceBindingKind,
     cwd: Option<String>,
@@ -43,7 +43,7 @@ pub(crate) struct InvocationWorkspaceSnapshot {
     record: Option<InvocationWorkspaceRecordSnapshot>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct InvocationWorkspaceRecordSnapshot {
     workspace_id: String,
     owner_scope: astra_runtime_env::WorkspaceOwnerScope,
@@ -55,7 +55,7 @@ struct InvocationWorkspaceRecordSnapshot {
     revision: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvocationExecutorSnapshot {
     kind: ExecutorBindingKind,
     executor_id: String,
@@ -63,7 +63,7 @@ pub(crate) struct InvocationExecutorSnapshot {
     status: astra_runtime_env::ExecutorStatus,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvocationRuntimeSnapshot {
     session_manager: astra_runtime_env::RuntimeSessionManager,
     isolation_backend: astra_runtime_env::RuntimeIsolationBackend,
@@ -76,7 +76,7 @@ pub(crate) struct InvocationRuntimeSnapshot {
     interaction_channels: Vec<astra_runtime_env::RuntimeInteractionChannel>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvocationPermissionGrantSnapshot {
     source: ToolPermissionGrantSource,
     updates_hash: Option<String>,
@@ -114,7 +114,7 @@ impl ToolInvocationDecisionSnapshot {
         transport_policy.admission_snapshot = None;
 
         Ok(Self {
-            contract_version: DECISION_CONTRACT_VERSION,
+            contract_version: DECISION_CONTRACT_VERSION.to_string(),
             tool,
             route,
             workspace: InvocationWorkspaceSnapshot {
@@ -168,9 +168,27 @@ impl ToolInvocationDecisionSnapshot {
     }
 
     pub(crate) fn decision_id(&self) -> Result<String, ToolInvocationDecisionError> {
-        let encoded = serde_json::to_vec(self)
+        Ok(self.durable()?.decision_id)
+    }
+
+    pub(crate) fn durable(&self) -> Result<ToolInvocationDecision, ToolInvocationDecisionError> {
+        Ok(ToolInvocationDecision::new(self)?)
+    }
+
+    pub(crate) fn from_durable(
+        decision: &ToolInvocationDecision,
+    ) -> Result<Self, ToolInvocationDecisionError> {
+        let snapshot: Self = serde_json::from_value(decision.snapshot.clone())
             .map_err(|error| ToolInvocationDecisionError::Serialization(error.to_string()))?;
-        Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+        if snapshot.contract_version != DECISION_CONTRACT_VERSION {
+            return Err(ToolInvocationDecisionError::UnsupportedContractVersion(
+                snapshot.contract_version,
+            ));
+        }
+        if snapshot.decision_id()? != decision.decision_id {
+            return Err(ToolInvocationDecisionError::DecisionEnvelopeMismatch);
+        }
+        Ok(snapshot)
     }
 
     pub(crate) fn fingerprint(
@@ -183,6 +201,66 @@ impl ToolInvocationDecisionSnapshot {
             self.decision_id()?,
         )?)
     }
+
+    /// Restore the operational request fields that were frozen before the
+    /// original prepare. Display labels remain current because they are not
+    /// execution authority; every route/policy/identity-bearing field comes
+    /// from the durable decision.
+    pub(crate) fn apply_to_request(&self, request: &mut ToolExecutionRequest) {
+        request.workspace.kind = self.workspace.kind;
+        request.workspace.cwd = self.workspace.cwd.clone();
+        request.workspace.authority = self.workspace.authority;
+        request.workspace_record =
+            self.workspace
+                .record
+                .as_ref()
+                .map(|record| astra_runtime_env::WorkspaceRecord {
+                    workspace_id: record.workspace_id.clone(),
+                    owner_scope: record.owner_scope,
+                    kind: record.kind,
+                    authority: record.authority,
+                    root_or_volume_ref: record.root_or_volume_ref.clone(),
+                    source: record.source.clone(),
+                    persistence: record.persistence,
+                    revision: record.revision.clone(),
+                    display_name: request.workspace.display_name.clone(),
+                });
+        request.executor.kind = self.executor.kind;
+        request.executor.executor_id = self.executor.executor_id.clone();
+        request.executor.transport = self.executor.transport;
+        request.executor.status = self.executor.status;
+        request.runtime = self.runtime.as_ref().map(|runtime| {
+            let display_name = request
+                .runtime
+                .as_ref()
+                .filter(|current| current.runtime_id == runtime.runtime_id)
+                .map(|current| current.display_name.clone())
+                .unwrap_or_else(|| runtime.runtime_id.clone());
+            astra_runtime_env::RuntimeBinding {
+                session_manager: runtime.session_manager,
+                isolation_backend: runtime.isolation_backend,
+                launch_driver: runtime.launch_driver,
+                runtime_id: runtime.runtime_id.clone(),
+                display_name,
+                status: runtime.status,
+                ephemeral: runtime.ephemeral,
+                supports_long_sessions: runtime.supports_long_sessions,
+                platform: runtime.platform,
+                interaction_channels: runtime.interaction_channels.clone(),
+            }
+        });
+        request.selected_offer = self.selected_offer.clone();
+        request.policy = self.transport_policy.clone();
+        request.policy.resolved_provider_policy = self.provider_policy.clone();
+        request.policy.permission_grant = self.permission_grant.as_ref().map(|grant| {
+            super::tool_execution_binding::ToolPermissionGrantSnapshot {
+                source: grant.source.clone(),
+                reason: None,
+                updates_hash: grant.updates_hash.clone(),
+            }
+        });
+        request.policy.admission_snapshot = Some(self.admission.clone());
+    }
 }
 
 #[derive(Debug, Error)]
@@ -193,6 +271,10 @@ pub(crate) enum ToolInvocationDecisionError {
     MissingAdmissionSnapshot,
     #[error("serialize tool invocation decision: {0}")]
     Serialization(String),
+    #[error("unsupported tool invocation decision contract version '{0}'")]
+    UnsupportedContractVersion(String),
+    #[error("tool invocation decision envelope does not match its decoded snapshot")]
+    DecisionEnvelopeMismatch,
     #[error(transparent)]
     Contract(#[from] ToolInvocationContractError),
 }
@@ -332,5 +414,38 @@ mod tests {
             ),
             Err(ToolInvocationDecisionError::MissingToolContract { .. })
         ));
+    }
+
+    #[test]
+    fn durable_round_trip_restores_frozen_operational_fields() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut request = request();
+        request.workspace.cwd = Some("/original".to_string());
+        request.policy.max_output_bytes = Some(4096);
+        let original = ToolInvocationDecisionSnapshot::resolve(
+            &request,
+            ToolExecutionRouteKind::ServerLocal,
+            &registry,
+        )
+        .unwrap();
+        let durable = original.durable().unwrap();
+
+        request.workspace.cwd = Some("/changed".to_string());
+        request.workspace.authority = WorkspaceAuthority::None;
+        request.executor.status = astra_runtime_env::ExecutorStatus::Offline;
+        request.policy.max_output_bytes = Some(1);
+        request.policy.admission_snapshot = Some(Default::default());
+        let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
+        restored.apply_to_request(&mut request);
+
+        assert_eq!(request.workspace.cwd.as_deref(), Some("/original"));
+        assert_eq!(request.workspace.authority, WorkspaceAuthority::ReadWrite);
+        assert_eq!(
+            request.executor.status,
+            astra_runtime_env::ExecutorStatus::Online
+        );
+        assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert_eq!(restored.route, ToolExecutionRouteKind::ServerLocal);
+        assert_eq!(restored, original);
     }
 }

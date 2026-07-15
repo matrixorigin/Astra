@@ -5,7 +5,7 @@
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationFingerprint, ToolInvocationIdentity,
+    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
     ToolInvocationTerminalOutcome,
 };
@@ -28,6 +28,7 @@ impl DatabaseToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
         fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
     ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
         let fingerprint_json = serde_json::to_string(fingerprint).map_err(|source| {
             ToolInvocationLedgerStoreError::Serialization {
@@ -35,13 +36,19 @@ impl DatabaseToolInvocationLedger {
                 source,
             }
         })?;
+        let decision_json = serde_json::to_string(decision).map_err(|source| {
+            ToolInvocationLedgerStoreError::Serialization {
+                field: "decision_json",
+                source,
+            }
+        })?;
         let mut tx = self.pool.get().begin().await?;
         let inserted = sqlx::query(
             "INSERT IGNORE INTO tool_invocation_ledger (
                 user_id, session_id, run_id, turn_chain_id, invocation_id,
-                fingerprint_json, state, dispatch_certainty, attempt_count,
+                fingerprint_json, decision_json, state, dispatch_certainty, attempt_count,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0,
                        CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
         )
         .bind(&identity.user_id)
@@ -50,6 +57,7 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity.turn_chain_id)
         .bind(&identity.invocation_id)
         .bind(&fingerprint_json)
+        .bind(&decision_json)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -60,7 +68,7 @@ impl DatabaseToolInvocationLedger {
                 identity: identity.clone(),
             }
         })?;
-        if record.fingerprint != *fingerprint {
+        if !record.fingerprint.same_tool_and_arguments(fingerprint) {
             rollback(tx, "prepare identity conflict").await;
             return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                 identity: identity.clone(),
@@ -231,6 +239,7 @@ fn select_record_query(
 ) -> sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments> {
     sqlx::query(
         "SELECT CAST(fingerprint_json AS CHAR) AS fingerprint_json,
+                CAST(decision_json AS CHAR) AS decision_json,
                 CAST(outcome_json AS CHAR) AS outcome_json,
                 state, dispatch_certainty, attempt_count
          FROM tool_invocation_ledger
@@ -265,6 +274,16 @@ fn decode_record(
             source,
         }
     })?;
+    let decision_json: Option<String> = row.try_get("decision_json")?;
+    let decision = serde_json::from_str(
+        decision_json
+            .as_deref()
+            .ok_or(ToolInvocationLedgerStoreError::MissingDecision)?,
+    )
+    .map_err(|source| ToolInvocationLedgerStoreError::InvalidStoredJson {
+        field: "decision_json",
+        source,
+    })?;
     let state_raw: String = row.try_get("state")?;
     let certainty_raw: String = row.try_get("dispatch_certainty")?;
     let attempt_count: u64 = row.try_get("attempt_count")?;
@@ -297,6 +316,7 @@ fn decode_record(
     let record = ToolInvocationRecord {
         identity: identity.clone(),
         fingerprint,
+        decision,
         state,
         dispatch_certainty,
         attempt_count: attempt_count as u32,
@@ -374,6 +394,8 @@ pub enum ToolInvocationLedgerStoreError {
     IdentityConflict { identity: ToolInvocationIdentity },
     #[error("tool invocation disappeared after prepare: {identity:?}")]
     MissingAfterPrepare { identity: ToolInvocationIdentity },
+    #[error("stored tool invocation is missing its frozen decision")]
+    MissingDecision,
     #[error("tool invocation not found: {identity:?}")]
     NotFound { identity: ToolInvocationIdentity },
     #[error(

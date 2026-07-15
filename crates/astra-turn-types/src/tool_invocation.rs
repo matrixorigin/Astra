@@ -220,6 +220,83 @@ impl ToolInvocationFingerprint {
             policy_decision_id,
         })
     }
+
+    /// Facts that identify the caller's immutable tool input. A mutable
+    /// policy environment may differ on resume; the durable decision stored
+    /// with the original invocation remains authoritative in that case.
+    pub fn same_tool_and_arguments(&self, other: &Self) -> bool {
+        self.tool == other.tool && self.canonical_arguments_hash == other.canonical_arguments_hash
+    }
+}
+
+/// Protocol-independent durable envelope for the complete frozen dispatch
+/// decision. Runtime-specific fields remain opaque to storage adapters, while
+/// the content ID is validated at every deserialize boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolInvocationDecision {
+    pub decision_id: String,
+    pub snapshot: Value,
+}
+
+impl ToolInvocationDecision {
+    pub fn new<T: Serialize>(snapshot: &T) -> Result<Self, ToolInvocationContractError> {
+        let snapshot = serde_json::to_value(snapshot).map_err(|error| {
+            ToolInvocationContractError::DecisionSerialization(error.to_string())
+        })?;
+        Self::from_snapshot(snapshot)
+    }
+
+    pub fn from_snapshot(snapshot: Value) -> Result<Self, ToolInvocationContractError> {
+        if !snapshot.is_object() {
+            return Err(ToolInvocationContractError::InvalidDecisionSnapshot);
+        }
+        let snapshot = canonical_json(&snapshot);
+        let decision_id = decision_content_id(&snapshot);
+        Ok(Self {
+            decision_id,
+            snapshot,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        if !self.snapshot.is_object() {
+            return Err(ToolInvocationContractError::InvalidDecisionSnapshot);
+        }
+        let expected = decision_content_id(&canonical_json(&self.snapshot));
+        if self.decision_id != expected {
+            return Err(ToolInvocationContractError::DecisionContentIdMismatch {
+                expected,
+                actual: self.decision_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDecision {
+            decision_id: String,
+            snapshot: Value,
+        }
+        let raw = RawDecision::deserialize(deserializer)?;
+        let decision = Self {
+            decision_id: raw.decision_id,
+            snapshot: raw.snapshot,
+        };
+        decision.validate().map_err(serde::de::Error::custom)?;
+        Ok(decision)
+    }
+}
+
+fn decision_content_id(snapshot: &Value) -> String {
+    let encoded = serde_json::to_vec(snapshot)
+        .expect("canonical tool invocation decision must serialize to JSON");
+    format!("sha256:{:x}", Sha256::digest(encoded))
 }
 
 /// Durable invocation state. `OutcomeUnknown` can only be resolved by
@@ -336,6 +413,7 @@ impl ToolInvocationTerminalOutcome {
 pub struct ToolInvocationRecord {
     pub identity: ToolInvocationIdentity,
     pub fingerprint: ToolInvocationFingerprint,
+    pub decision: ToolInvocationDecision,
     pub state: ToolInvocationState,
     pub dispatch_certainty: DispatchCertainty,
     pub attempt_count: u32,
@@ -345,6 +423,13 @@ pub struct ToolInvocationRecord {
 
 impl ToolInvocationRecord {
     pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        self.decision.validate()?;
+        if self.fingerprint.policy_decision_id != self.decision.decision_id {
+            return Err(ToolInvocationContractError::RecordDecisionMismatch {
+                fingerprint_decision_id: self.fingerprint.policy_decision_id.clone(),
+                durable_decision_id: self.decision.decision_id.clone(),
+            });
+        }
         let required_certainty = self.state.required_dispatch_certainty();
         if self.dispatch_certainty != required_certainty {
             return Err(ToolInvocationContractError::RecordCertaintyMismatch {
@@ -379,6 +464,7 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
         struct RawRecord {
             identity: ToolInvocationIdentity,
             fingerprint: ToolInvocationFingerprint,
+            decision: ToolInvocationDecision,
             state: ToolInvocationState,
             dispatch_certainty: DispatchCertainty,
             attempt_count: u32,
@@ -390,6 +476,7 @@ impl<'de> Deserialize<'de> for ToolInvocationRecord {
         let record = Self {
             identity: raw.identity,
             fingerprint: raw.fingerprint,
+            decision: raw.decision,
             state: raw.state,
             dispatch_certainty: raw.dispatch_certainty,
             attempt_count: raw.attempt_count,
@@ -450,6 +537,19 @@ pub enum ToolInvocationContractError {
     EmptyToolReferenceField { field: &'static str },
     #[error("tool invocation canonical arguments hash must not be empty")]
     EmptyCanonicalArgumentsHash,
+    #[error("tool invocation decision snapshot must be a JSON object")]
+    InvalidDecisionSnapshot,
+    #[error("serialize tool invocation decision: {0}")]
+    DecisionSerialization(String),
+    #[error("tool invocation decision content id mismatch: expected {expected}, found {actual}")]
+    DecisionContentIdMismatch { expected: String, actual: String },
+    #[error(
+        "tool invocation fingerprint decision {fingerprint_decision_id} does not match durable decision {durable_decision_id}"
+    )]
+    RecordDecisionMismatch {
+        fingerprint_decision_id: String,
+        durable_decision_id: String,
+    },
     #[error("tool invocation terminal state {state:?} is missing its typed outcome")]
     MissingTerminalOutcome { state: ToolInvocationState },
     #[error(
@@ -480,6 +580,14 @@ mod tests {
 
     fn tool_ref() -> DurableToolReference {
         DurableToolReference::built_in("bash", "registry-v1").unwrap()
+    }
+
+    fn decision() -> ToolInvocationDecision {
+        ToolInvocationDecision::new(&json!({
+            "contract_version": "test-v1",
+            "route": "server_local"
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -586,13 +694,15 @@ mod tests {
 
     #[test]
     fn durable_record_rejects_terminal_state_without_matching_outcome() {
+        let decision = decision();
         let base = json!({
             "identity": identity("call-1"),
             "fingerprint": ToolInvocationFingerprint::new(
                 tool_ref(),
                 &json!({"command": "deploy"}),
-                "policy-v1"
+                &decision.decision_id
             ).unwrap(),
+            "decision": decision,
             "state": "succeeded",
             "dispatch_certainty": "dispatched",
             "attempt_count": 1
@@ -624,14 +734,16 @@ mod tests {
             error_kind: Some("permission_denied".to_string()),
             retryable: false,
         };
+        let decision = decision();
         let record = ToolInvocationRecord {
             identity: identity("call-1"),
             fingerprint: ToolInvocationFingerprint::new(
                 tool_ref(),
                 &json!({"command": "deploy"}),
-                "policy-v1",
+                &decision.decision_id,
             )
             .unwrap(),
+            decision,
             state: ToolInvocationState::Failed,
             dispatch_certainty: DispatchCertainty::Dispatched,
             attempt_count: 1,
@@ -645,5 +757,15 @@ mod tests {
             restored.outcome.unwrap().result().output,
             "permission denied"
         );
+    }
+
+    #[test]
+    fn durable_decision_rejects_forged_content_id() {
+        let decision = decision();
+        let mut encoded = serde_json::to_value(decision).unwrap();
+        encoded["snapshot"]["route"] = json!("edge_bound");
+
+        let error = serde_json::from_value::<ToolInvocationDecision>(encoded).unwrap_err();
+        assert!(error.to_string().contains("content id mismatch"), "{error}");
     }
 }

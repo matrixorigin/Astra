@@ -10,9 +10,9 @@ use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationLedgerStoreError,
 };
 use astra_turn_types::{
-    DispatchCertainty, DurableToolReference, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationResultPayload, ToolInvocationState,
-    ToolInvocationTerminalOutcome,
+    DispatchCertainty, DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationResultPayload,
+    ToolInvocationState, ToolInvocationTerminalOutcome,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -30,12 +30,27 @@ fn identity(prefix: &str, invocation_id: &str) -> ToolInvocationIdentity {
 }
 
 fn fingerprint(command: &str) -> ToolInvocationFingerprint {
+    fingerprint_with_decision(command, &decision())
+}
+
+fn fingerprint_with_decision(
+    command: &str,
+    decision: &ToolInvocationDecision,
+) -> ToolInvocationFingerprint {
     ToolInvocationFingerprint::new(
         DurableToolReference::built_in("bash", "registry-v1").unwrap(),
         &json!({"command": command}),
-        "policy-v1",
+        &decision.decision_id,
     )
     .unwrap()
+}
+
+fn decision() -> ToolInvocationDecision {
+    ToolInvocationDecision::new(&json!({"route": "server_local"})).unwrap()
+}
+
+fn named_decision(policy: &str) -> ToolInvocationDecision {
+    ToolInvocationDecision::new(&json!({"route": "server_local", "policy": policy})).unwrap()
 }
 
 fn success(output: &str) -> ToolInvocationTerminalOutcome {
@@ -79,25 +94,47 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     cleanup(&pool, &first).await;
     let ledger = DatabaseToolInvocationLedger::new(shared);
     let original = fingerprint("deploy");
+    let original_decision = decision();
 
     assert!(matches!(
-        ledger.prepare(&first, &original).await.unwrap(),
+        ledger
+            .prepare(&first, &original, &original_decision)
+            .await
+            .unwrap(),
         ToolInvocationPrepareOutcome::Prepared(record)
-            if record.state == ToolInvocationState::Prepared && record.attempt_count == 0
+            if record.state == ToolInvocationState::Prepared
+                && record.attempt_count == 0
+                && record.decision == original_decision
+    ));
+    let changed_decision = named_decision("changed-after-prepare");
+    let changed_fingerprint = fingerprint_with_decision("deploy", &changed_decision);
+    assert!(matches!(
+        ledger
+            .prepare(&first, &changed_fingerprint, &changed_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.decision == original_decision
+                && record.fingerprint == original
     ));
     assert!(matches!(
-        ledger.prepare(&first, &original).await.unwrap(),
+        ledger.prepare(&first, &original, &decision()).await.unwrap(),
         ToolInvocationPrepareOutcome::Existing(record)
             if record.state == ToolInvocationState::Prepared
     ));
     assert!(matches!(
-        ledger.prepare(&first, &fingerprint("destroy")).await,
+        ledger
+            .prepare(&first, &fingerprint("destroy"), &decision())
+            .await,
         Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
     ));
 
     // Equal arguments under a different invocation ID remain distinct intent.
     assert!(matches!(
-        ledger.prepare(&second, &original).await.unwrap(),
+        ledger
+            .prepare(&second, &original, &decision())
+            .await
+            .unwrap(),
         ToolInvocationPrepareOutcome::Prepared(_)
     ));
 
@@ -159,7 +196,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     assert_eq!(failed.state, ToolInvocationState::Failed);
     assert_eq!(failed.outcome.unwrap().result().output, "provider failed");
     assert!(matches!(
-        ledger.prepare(&second, &original).await.unwrap(),
+        ledger.prepare(&second, &original, &decision()).await.unwrap(),
         ToolInvocationPrepareOutcome::Existing(record)
             if record.state == ToolInvocationState::Failed
                 && record.outcome.as_ref().unwrap().result().output == "provider failed"

@@ -6900,11 +6900,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable durable logical-invocation delivery.
-            // Bind logical invocation identity to the durable ledger so
-            // resume/reconnect cannot semantically collapse distinct calls.
-            executor.enable_durable_invocations();
-
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
@@ -6948,6 +6943,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
             }
+            // Select the database ledger only after composition has attached
+            // its shared pool; offline composition selects the in-memory
+            // adapter explicitly.
+            executor.enable_durable_invocations();
             // Share the host's plan-resume hint slot so tool-triggered
             // plan-mode changes refresh the system prompt mid-run.
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
@@ -8003,11 +8002,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable durable logical-invocation delivery.
-            // Bind logical invocation identity to the durable ledger so
-            // resume/reconnect cannot semantically collapse distinct calls.
-            executor.enable_durable_invocations();
-
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
@@ -8050,6 +8044,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
             }
+            executor.enable_durable_invocations();
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
                 executor.set_observability_session(observability_session);
             }
@@ -10759,9 +10754,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ));
             }
 
-            // Enable durable logical-invocation delivery.
-            // Bind logical invocation identity to the durable ledger so
-            // resume/reconnect cannot semantically collapse distinct calls.
+            if let Some(pool) = self.shared_pool.as_ref() {
+                executor.set_context_manifest_pool(pool.clone());
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(pool.clone()),
+                );
+            }
             executor.enable_durable_invocations();
 
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
@@ -10773,13 +10772,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     ToolExecutionService::builder(),
                     &load_deployment_tool_policy(),
                 );
-                if let Some(pool) = self.shared_pool.as_ref() {
-                    executor.set_context_manifest_pool(pool.clone());
-                    executor = executor.with_workspace_artifact_store(
-                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
-                            .with_pool(pool.clone()),
-                    );
-                }
                 if let Some(pool) = &self.edge_connection_pool {
                     builder = builder.edge_connection_pool(pool.clone());
                 }

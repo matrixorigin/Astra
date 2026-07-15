@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationFingerprint, ToolInvocationIdentity,
+    DispatchCertainty, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
     ToolInvocationTerminalOutcome,
 };
@@ -23,9 +23,13 @@ impl InMemoryInvocationLedger {
         &mut self,
         identity: ToolInvocationIdentity,
         fingerprint: ToolInvocationFingerprint,
+        decision: ToolInvocationDecision,
     ) -> Result<ToolInvocationPrepareOutcome, InvocationLedgerError> {
+        if fingerprint.policy_decision_id != decision.decision_id {
+            return Err(InvocationLedgerError::DecisionMismatch { identity });
+        }
         if let Some(existing) = self.entries.get(&identity) {
-            if existing.fingerprint != fingerprint {
+            if !existing.fingerprint.same_tool_and_arguments(&fingerprint) {
                 return Err(InvocationLedgerError::IdentityConflict { identity });
             }
             return Ok(ToolInvocationPrepareOutcome::Existing(existing.clone()));
@@ -34,6 +38,7 @@ impl InMemoryInvocationLedger {
         let entry = ToolInvocationRecord {
             identity: identity.clone(),
             fingerprint,
+            decision,
             state: ToolInvocationState::Prepared,
             dispatch_certainty: DispatchCertainty::NotDispatched,
             attempt_count: 0,
@@ -163,6 +168,8 @@ pub enum InvocationLedgerError {
     },
     #[error("terminal state {state:?} requires a typed invocation outcome")]
     TerminalOutcomeRequired { state: ToolInvocationState },
+    #[error("invocation fingerprint and durable decision disagree: {identity:?}")]
+    DecisionMismatch { identity: ToolInvocationIdentity },
 }
 
 #[cfg(test)]
@@ -177,11 +184,19 @@ mod tests {
         ToolInvocationIdentity::new("user", "session", "run", "turn", invocation_id).unwrap()
     }
 
+    fn decision() -> ToolInvocationDecision {
+        ToolInvocationDecision::new(&json!({"route": "test"})).unwrap()
+    }
+
+    fn named_decision(name: &str) -> ToolInvocationDecision {
+        ToolInvocationDecision::new(&json!({"route": "test", "policy": name})).unwrap()
+    }
+
     fn fingerprint(command: &str) -> ToolInvocationFingerprint {
         ToolInvocationFingerprint::new(
             DurableToolReference::built_in("bash", "registry-v1").unwrap(),
             &json!({"command": command}),
-            "policy-v1",
+            decision().decision_id,
         )
         .unwrap()
     }
@@ -202,11 +217,15 @@ mod tests {
         let shared = fingerprint("deploy");
 
         assert!(matches!(
-            ledger.prepare(identity("call-1"), shared.clone()).unwrap(),
+            ledger
+                .prepare(identity("call-1"), shared.clone(), decision())
+                .unwrap(),
             ToolInvocationPrepareOutcome::Prepared(_)
         ));
         assert!(matches!(
-            ledger.prepare(identity("call-2"), shared).unwrap(),
+            ledger
+                .prepare(identity("call-2"), shared, decision())
+                .unwrap(),
             ToolInvocationPrepareOutcome::Prepared(_)
         ));
     }
@@ -216,15 +235,56 @@ mod tests {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         let original = fingerprint("deploy");
-        ledger.prepare(identity.clone(), original.clone()).unwrap();
+        ledger
+            .prepare(identity.clone(), original.clone(), decision())
+            .unwrap();
 
         assert!(matches!(
-            ledger.prepare(identity.clone(), original).unwrap(),
+            ledger
+                .prepare(identity.clone(), original, decision())
+                .unwrap(),
             ToolInvocationPrepareOutcome::Existing(_)
         ));
         assert!(matches!(
-            ledger.prepare(identity, fingerprint("destroy")),
+            ledger.prepare(identity, fingerprint("destroy"), decision()),
             Err(InvocationLedgerError::IdentityConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn prepared_resume_keeps_original_decision_when_live_policy_changes() {
+        let mut ledger = InMemoryInvocationLedger::default();
+        let identity = identity("call-1");
+        let args = json!({"command": "deploy"});
+        let original_decision = named_decision("original");
+        let original_fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "registry-v1").unwrap(),
+            &args,
+            &original_decision.decision_id,
+        )
+        .unwrap();
+        ledger
+            .prepare(
+                identity.clone(),
+                original_fingerprint,
+                original_decision.clone(),
+            )
+            .unwrap();
+        let changed_decision = named_decision("changed");
+        let changed_fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "registry-v1").unwrap(),
+            &args,
+            &changed_decision.decision_id,
+        )
+        .unwrap();
+
+        let resumed = ledger
+            .prepare(identity, changed_fingerprint, changed_decision)
+            .unwrap();
+        assert!(matches!(
+            resumed,
+            ToolInvocationPrepareOutcome::Existing(record)
+                if record.decision == original_decision
         ));
     }
 
@@ -233,7 +293,7 @@ mod tests {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
-            .prepare(identity.clone(), fingerprint("deploy"))
+            .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
 
         let dispatched = ledger
@@ -261,7 +321,7 @@ mod tests {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
-            .prepare(identity.clone(), fingerprint("deploy"))
+            .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
         ledger
             .compare_and_transition(
@@ -306,7 +366,7 @@ mod tests {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
-            .prepare(identity.clone(), fingerprint("deploy"))
+            .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
         ledger
             .compare_and_transition(
@@ -335,7 +395,7 @@ mod tests {
         let mut ledger = InMemoryInvocationLedger::default();
         let identity = identity("call-1");
         ledger
-            .prepare(identity.clone(), fingerprint("deploy"))
+            .prepare(identity.clone(), fingerprint("deploy"), decision())
             .unwrap();
 
         assert!(matches!(
