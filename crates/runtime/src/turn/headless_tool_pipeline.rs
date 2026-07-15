@@ -516,7 +516,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let futs: Vec<_> = executions
             .iter_mut()
-            .map(|(exec, _, provider_policy, permission_grant)| {
+            .map(|(exec, _, provider_policy, permission_grant)| async move {
+                let Ok(_permit) =
+                    astra_turn_core::parallel_tool_exec::acquire_shared_tool_permit().await
+                else {
+                    exec.result_str = serde_json::json!({
+                        "status": "failed",
+                        "error": "global tool execution admission is closed",
+                        "error_kind": astra_core::ErrorKind::ResourceLimit.as_str(),
+                        "retryable": true,
+                    })
+                    .to_string();
+                    exec.tool_result_fields = Some(Map::from_iter([
+                        ("status".to_string(), Value::String("failed".to_string())),
+                        (
+                            "error_kind".to_string(),
+                            Value::String(
+                                astra_core::ErrorKind::ResourceLimit.as_str().to_string(),
+                            ),
+                        ),
+                        ("retryable".to_string(), Value::Bool(true)),
+                    ]));
+                    return;
+                };
                 execute_tool_pure(
                     exec,
                     server_executor,
@@ -530,6 +552,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     session_turn,
                     edge_round_present,
                 )
+                .await;
             })
             .collect();
         futures_util::future::join_all(futs).await;

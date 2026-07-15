@@ -7,8 +7,7 @@
 use astra_turn_types::{
     DurableToolReference, ResolvedSemanticCacheBaseline, ResolvedToolEffect,
     ResolvedToolIdempotency, SemanticReadCacheContractError, SemanticReadCacheKey,
-    SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
-    SemanticReadFreshnessUnavailableReason, ToolInvocationContractError, ToolInvocationDecision,
+    SemanticReadFreshnessContext, ToolInvocationContractError, ToolInvocationDecision,
     ToolInvocationFingerprint,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,7 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v2";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v3";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
@@ -92,9 +91,10 @@ pub(crate) enum InvocationSemanticReadCacheDecision {
     Disabled {
         reason: SemanticReadCacheBypassReason,
     },
-    FreshnessBound {
-        freshness: SemanticReadFreshnessContext,
-    },
+    /// The frozen policy permits semantic read reuse, but current freshness
+    /// evidence is deliberately resolved per delivery attempt. Transient
+    /// resource revisions are not durable execution authority.
+    FreshnessRequired,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,11 +102,6 @@ pub(crate) enum InvocationSemanticReadCacheDecision {
 pub(crate) enum SemanticReadCacheBypassReason {
     NoProviderPolicy,
     PolicyDisabled,
-    FreshnessResolutionMissing,
-    SourceNotConfigured,
-    RevisionUnavailable,
-    SourceFailed,
-    InvalidEvidence,
 }
 
 impl InvocationSemanticReadCacheDecision {
@@ -118,22 +113,7 @@ impl InvocationSemanticReadCacheDecision {
             Self::Disabled {
                 reason: SemanticReadCacheBypassReason::PolicyDisabled,
             } => "disabled_by_policy",
-            Self::Disabled {
-                reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
-            } => "bypassed_freshness_resolution_missing",
-            Self::Disabled {
-                reason: SemanticReadCacheBypassReason::SourceNotConfigured,
-            } => "bypassed_freshness_source_not_configured",
-            Self::Disabled {
-                reason: SemanticReadCacheBypassReason::RevisionUnavailable,
-            } => "bypassed_revision_unavailable",
-            Self::Disabled {
-                reason: SemanticReadCacheBypassReason::SourceFailed,
-            } => "bypassed_freshness_source_failed",
-            Self::Disabled {
-                reason: SemanticReadCacheBypassReason::InvalidEvidence,
-            } => "bypassed_invalid_freshness_evidence",
-            Self::FreshnessBound { .. } => "eligible_freshness_bound",
+            Self::FreshnessRequired => "eligible_freshness_required",
         }
     }
 }
@@ -162,10 +142,10 @@ impl ToolInvocationDecisionSnapshot {
             .admission_snapshot
             .clone()
             .ok_or(ToolInvocationDecisionError::MissingAdmissionSnapshot)?;
-        let semantic_cache = resolve_semantic_read_cache_decision(
-            provider_policy.as_ref(),
-            request.policy.semantic_read_freshness.as_ref(),
-        )?;
+        if request.policy.semantic_read_freshness.is_some() {
+            return Err(ToolInvocationDecisionError::UnexpectedSemanticReadFreshness);
+        }
+        let semantic_cache = resolve_semantic_read_cache_decision(provider_policy.as_ref())?;
         let mut transport_policy = request.policy.clone();
         transport_policy.allowed_tools.sort();
         transport_policy.allowed_tools.dedup();
@@ -276,10 +256,11 @@ impl ToolInvocationDecisionSnapshot {
     pub(crate) fn semantic_read_cache_key(
         &self,
         arguments: &serde_json::Value,
+        freshness: &SemanticReadFreshnessContext,
     ) -> Result<Option<SemanticReadCacheKey>, ToolInvocationDecisionError> {
         match &self.semantic_cache {
             InvocationSemanticReadCacheDecision::Disabled { .. } => Ok(None),
-            InvocationSemanticReadCacheDecision::FreshnessBound { freshness } => {
+            InvocationSemanticReadCacheDecision::FreshnessRequired => {
                 Ok(Some(SemanticReadCacheKey::new(
                     self.tool.clone(),
                     arguments,
@@ -288,6 +269,13 @@ impl ToolInvocationDecisionSnapshot {
                 )?))
             }
         }
+    }
+
+    pub(crate) fn requires_semantic_read_freshness(&self) -> bool {
+        matches!(
+            self.semantic_cache,
+            InvocationSemanticReadCacheDecision::FreshnessRequired
+        )
     }
 
     /// Restore the operational request fields that were frozen before the
@@ -348,23 +336,14 @@ impl ToolInvocationDecisionSnapshot {
             }
         });
         request.policy.admission_snapshot = Some(self.admission.clone());
-        request.policy.semantic_read_freshness = match &self.semantic_cache {
-            InvocationSemanticReadCacheDecision::Disabled { .. } => None,
-            InvocationSemanticReadCacheDecision::FreshnessBound { freshness } => Some(
-                SemanticReadFreshnessResolution::Available(freshness.clone()),
-            ),
-        };
+        request.policy.semantic_read_freshness = None;
     }
 }
 
 fn resolve_semantic_read_cache_decision(
     provider_policy: Option<&astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
-    freshness: Option<&SemanticReadFreshnessResolution>,
 ) -> Result<InvocationSemanticReadCacheDecision, ToolInvocationDecisionError> {
     let Some(policy) = provider_policy else {
-        if freshness.is_some() {
-            return Err(ToolInvocationDecisionError::UnexpectedSemanticReadFreshness);
-        }
         return Ok(InvocationSemanticReadCacheDecision::Disabled {
             reason: SemanticReadCacheBypassReason::NoProviderPolicy,
         });
@@ -372,9 +351,6 @@ fn resolve_semantic_read_cache_decision(
 
     match policy.semantic_cache {
         ResolvedSemanticCacheBaseline::Disabled => {
-            if freshness.is_some() {
-                return Err(ToolInvocationDecisionError::UnexpectedSemanticReadFreshness);
-            }
             Ok(InvocationSemanticReadCacheDecision::Disabled {
                 reason: SemanticReadCacheBypassReason::PolicyDisabled,
             })
@@ -385,44 +361,10 @@ fn resolve_semantic_read_cache_decision(
             {
                 return Err(ToolInvocationDecisionError::InvalidSemanticReadCachePolicy);
             }
-            Ok(match freshness {
-                Some(SemanticReadFreshnessResolution::Available(freshness)) => {
-                    InvocationSemanticReadCacheDecision::FreshnessBound {
-                        freshness: freshness.clone(),
-                    }
-                }
-                Some(SemanticReadFreshnessResolution::Unavailable(reason)) => {
-                    InvocationSemanticReadCacheDecision::Disabled {
-                        reason: unavailable_reason(*reason),
-                    }
-                }
-                None => InvocationSemanticReadCacheDecision::Disabled {
-                    reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
-                },
-            })
+            Ok(InvocationSemanticReadCacheDecision::FreshnessRequired)
         }
     }
 }
-
-fn unavailable_reason(
-    reason: SemanticReadFreshnessUnavailableReason,
-) -> SemanticReadCacheBypassReason {
-    match reason {
-        SemanticReadFreshnessUnavailableReason::SourceNotConfigured => {
-            SemanticReadCacheBypassReason::SourceNotConfigured
-        }
-        SemanticReadFreshnessUnavailableReason::RevisionUnavailable => {
-            SemanticReadCacheBypassReason::RevisionUnavailable
-        }
-        SemanticReadFreshnessUnavailableReason::SourceFailed => {
-            SemanticReadCacheBypassReason::SourceFailed
-        }
-        SemanticReadFreshnessUnavailableReason::InvalidEvidence => {
-            SemanticReadCacheBypassReason::InvalidEvidence
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum ToolInvocationDecisionError {
     #[error("tool '{tool_name}' has no exact provider descriptor or built-in registry contract")]
@@ -435,7 +377,9 @@ pub(crate) enum ToolInvocationDecisionError {
     UnsupportedContractVersion(String),
     #[error("tool invocation decision envelope does not match its decoded snapshot")]
     DecisionEnvelopeMismatch,
-    #[error("semantic read freshness was supplied without an eligible provider cache policy")]
+    #[error(
+        "transient semantic read freshness must be resolved after the durable decision is restored"
+    )]
     UnexpectedSemanticReadFreshness,
     #[error("freshness-bound semantic cache policy is not a pure read")]
     InvalidSemanticReadCachePolicy,
@@ -522,7 +466,6 @@ mod tests {
     fn provider_request(
         descriptor_version: &str,
         semantic_cache: ResolvedSemanticCacheBaseline,
-        freshness: Option<SemanticReadFreshnessContext>,
     ) -> ToolExecutionRequest {
         let mut request = request();
         request.tool_name = "projected_read_alias".to_string();
@@ -532,8 +475,6 @@ mod tests {
             ResolvedToolIdempotency::PureRead,
             semantic_cache,
         ));
-        request.policy.semantic_read_freshness =
-            freshness.map(SemanticReadFreshnessResolution::Available);
         request
     }
 
@@ -569,7 +510,6 @@ mod tests {
         let mut request = provider_request(
             "descriptor-v1",
             ResolvedSemanticCacheBaseline::FreshnessBound,
-            Some(freshness("rev-1")),
         );
         let original = ToolInvocationDecisionSnapshot::resolve(
             &request,
@@ -615,12 +555,11 @@ mod tests {
     }
 
     #[test]
-    fn freshness_bound_policy_bypasses_loudly_without_concrete_fact() {
+    fn durable_decision_freezes_eligibility_but_not_transient_freshness() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let request = provider_request(
             "descriptor-v1",
             ResolvedSemanticCacheBaseline::FreshnessBound,
-            None,
         );
         let decision = ToolInvocationDecisionSnapshot::resolve(
             &request,
@@ -631,48 +570,21 @@ mod tests {
 
         assert_eq!(
             decision.semantic_cache,
-            InvocationSemanticReadCacheDecision::Disabled {
-                reason: SemanticReadCacheBypassReason::FreshnessResolutionMissing,
-            }
+            InvocationSemanticReadCacheDecision::FreshnessRequired
         );
-        assert!(
+        assert!(decision.requires_semantic_read_freshness());
+        assert_eq!(
+            ToolInvocationDecisionSnapshot::from_durable(&decision.durable().unwrap()).unwrap(),
             decision
-                .semantic_read_cache_key(&request.args)
-                .unwrap()
-                .is_none()
-        );
-
-        let mut failed = request;
-        failed.policy.semantic_read_freshness = Some(SemanticReadFreshnessResolution::Unavailable(
-            SemanticReadFreshnessUnavailableReason::SourceFailed,
-        ));
-        let failed_decision = ToolInvocationDecisionSnapshot::resolve(
-            &failed,
-            ToolExecutionRouteKind::RequestScopedMcp,
-            &registry,
-        )
-        .unwrap();
-        assert_eq!(
-            failed_decision.semantic_cache,
-            InvocationSemanticReadCacheDecision::Disabled {
-                reason: SemanticReadCacheBypassReason::SourceFailed,
-            }
-        );
-        assert_eq!(
-            ToolInvocationDecisionSnapshot::from_durable(&failed_decision.durable().unwrap())
-                .unwrap(),
-            failed_decision
         );
     }
 
     #[test]
-    fn frozen_freshness_round_trips_and_builds_content_addressed_key() {
+    fn current_freshness_builds_key_without_changing_durable_decision_identity() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        let original_freshness = freshness("rev-1");
         let request = provider_request(
             "descriptor-v1",
             ResolvedSemanticCacheBaseline::FreshnessBound,
-            Some(original_freshness.clone()),
         );
         let decision = ToolInvocationDecisionSnapshot::resolve(
             &request,
@@ -680,38 +592,45 @@ mod tests {
             &registry,
         )
         .unwrap();
-        let key = decision
-            .semantic_read_cache_key(&request.args)
+        let original_decision_id = decision.decision_id().unwrap();
+        let first_freshness = freshness("rev-1");
+        let second_freshness = freshness("rev-2");
+        let first = decision
+            .semantic_read_cache_key(&request.args, &first_freshness)
+            .unwrap()
+            .expect("eligible read cache key");
+        let second = decision
+            .semantic_read_cache_key(&request.args, &second_freshness)
             .unwrap()
             .expect("eligible read cache key");
 
-        assert_eq!(key.freshness_context_id, original_freshness.context_id);
-        assert_eq!(key.policy_decision_id, decision.decision_id().unwrap());
+        assert_eq!(first.policy_decision_id, original_decision_id);
+        assert_eq!(second.policy_decision_id, original_decision_id);
+        assert_ne!(first.freshness_context_id, second.freshness_context_id);
+        assert_ne!(first.key_id, second.key_id);
 
-        let durable = decision.durable().unwrap();
-        let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
+        let restored =
+            ToolInvocationDecisionSnapshot::from_durable(&decision.durable().unwrap()).unwrap();
         let mut current = provider_request(
             "descriptor-v1",
             ResolvedSemanticCacheBaseline::FreshnessBound,
-            Some(freshness("rev-new-current-state")),
         );
+        current.policy.semantic_read_freshness =
+            Some(astra_turn_types::SemanticReadFreshnessResolution::Available(second_freshness));
         restored.apply_to_request(&mut current);
-        assert_eq!(
-            current.policy.semantic_read_freshness,
-            Some(SemanticReadFreshnessResolution::Available(
-                original_freshness
-            ))
+        assert!(
+            current.policy.semantic_read_freshness.is_none(),
+            "restoring execution authority must not restore stale freshness evidence"
         );
-        assert_eq!(restored, decision);
+        assert_eq!(restored.decision_id().unwrap(), original_decision_id);
     }
 
     #[test]
     fn stale_or_ineligible_freshness_inputs_fail_closed() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let mut built_in = request();
-        built_in.policy.semantic_read_freshness = Some(SemanticReadFreshnessResolution::Available(
-            freshness("rev-1"),
-        ));
+        built_in.policy.semantic_read_freshness =
+            Some(astra_turn_types::SemanticReadFreshnessResolution::Available(freshness("rev-1")));
         assert!(matches!(
             ToolInvocationDecisionSnapshot::resolve(
                 &built_in,
@@ -721,11 +640,10 @@ mod tests {
             Err(ToolInvocationDecisionError::UnexpectedSemanticReadFreshness)
         ));
 
-        let request = provider_request(
-            "descriptor-v1",
-            ResolvedSemanticCacheBaseline::Disabled,
-            Some(freshness("rev-1")),
-        );
+        let mut request =
+            provider_request("descriptor-v1", ResolvedSemanticCacheBaseline::Disabled);
+        request.policy.semantic_read_freshness =
+            Some(astra_turn_types::SemanticReadFreshnessResolution::Available(freshness("rev-1")));
         assert!(matches!(
             ToolInvocationDecisionSnapshot::resolve(
                 &request,
@@ -738,7 +656,6 @@ mod tests {
         let mut invalid = provider_request(
             "descriptor-v1",
             ResolvedSemanticCacheBaseline::FreshnessBound,
-            None,
         );
         invalid.policy.resolved_provider_policy = Some(provider_policy(
             "descriptor-v1",
@@ -757,9 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn pre_freshness_decision_contract_is_rejected_as_an_explicit_upgrade_boundary() {
+    fn pre_current_freshness_decision_contract_is_rejected_as_an_explicit_upgrade_boundary() {
         let legacy = ToolInvocationDecision::from_snapshot(json!({
-            "contract_version": "tool-dispatch-decision-v1",
+            "contract_version": "tool-dispatch-decision-v2",
             "legacy": true,
         }))
         .unwrap();
@@ -767,7 +684,7 @@ mod tests {
         assert!(matches!(
             ToolInvocationDecisionSnapshot::from_durable(&legacy),
             Err(ToolInvocationDecisionError::UnsupportedContractVersion(version))
-                if version == "tool-dispatch-decision-v1"
+                if version == "tool-dispatch-decision-v2"
         ));
     }
 

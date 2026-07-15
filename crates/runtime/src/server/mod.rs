@@ -55,6 +55,7 @@ pub mod run;
 pub(crate) mod runtime_mcp;
 pub mod runtime_tool_executor;
 pub mod semantic_read_freshness;
+pub(crate) mod semantic_read_observation_runtime;
 pub(crate) mod server_bash_execution;
 pub mod server_loop_host;
 pub mod server_skill_subrun;

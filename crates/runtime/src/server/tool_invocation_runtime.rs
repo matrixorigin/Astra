@@ -11,9 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astra_turn_core::invocation_ledger::{InMemoryInvocationLedger, InvocationLedgerError};
 use astra_turn_types::{
-    ToolInvocationDecision, ToolInvocationDispatchLease, ToolInvocationFingerprint,
-    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
-    ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
+    DispatchCertainty, SemanticReadCacheKey, SemanticReadObservation,
+    ToolInvocationCompletionSource, ToolInvocationDecision, ToolInvocationDispatchLease,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationRecord, ToolInvocationResultPayload, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -24,6 +26,11 @@ pub(crate) enum InvocationBeginDisposition {
         decision: ToolInvocationDecision,
         owner_id: String,
     },
+    Return(astra_tools::ToolResult),
+}
+
+pub(crate) enum InvocationPrepareDisposition {
+    Prepared { decision: ToolInvocationDecision },
     Return(astra_tools::ToolResult),
 }
 
@@ -251,16 +258,16 @@ impl RuntimeToolInvocationLedger {
         }
     }
 
-    /// Prepare and atomically claim the route boundary. A terminal row is
-    /// replayed; an acknowledged or uncertain in-flight row is never sent a
-    /// second time.
-    pub(crate) async fn begin(
+    /// Establish the authoritative logical invocation and freeze its original
+    /// decision without crossing a provider route boundary. This is the only
+    /// state in which semantic observation reuse may compete with dispatch.
+    pub(crate) async fn prepare_for_execution(
         &self,
         identity: &ToolInvocationIdentity,
         fingerprint: &ToolInvocationFingerprint,
         decision: &ToolInvocationDecision,
         validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
-    ) -> Result<InvocationBeginDisposition, RuntimeInvocationLedgerError> {
+    ) -> Result<InvocationPrepareDisposition, RuntimeInvocationLedgerError> {
         let record = match self.prepare(identity, fingerprint, decision).await? {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
@@ -269,33 +276,187 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationState::Prepared => {
                 validate_decision(&record.decision)
                     .map_err(RuntimeInvocationLedgerError::InvalidDecision)?;
-                let owner_id = uuid::Uuid::now_v7().to_string();
-                match self.dispatch(identity, &owner_id).await {
-                    Ok(record) => Ok(InvocationBeginDisposition::Execute {
-                        decision: record.decision,
-                        owner_id,
-                    }),
-                    Err(dispatch_error) => {
-                        let Some(authoritative) = self.get(identity).await? else {
-                            return Err(dispatch_error);
-                        };
-                        disposition_for_existing_record(authoritative)?.ok_or(dispatch_error)
-                    }
-                }
+                Ok(InvocationPrepareDisposition::Prepared {
+                    decision: record.decision,
+                })
             }
             ToolInvocationState::Dispatched => {
                 let authoritative = self.reconcile_expired_dispatch(identity).await?;
-                disposition_for_existing_record(authoritative)?.ok_or_else(|| {
-                    RuntimeInvocationLedgerError::InvalidRecord(
-                        "reconciled invocation remained prepared".to_string(),
-                    )
+                let disposition =
+                    disposition_for_existing_record(authoritative)?.ok_or_else(|| {
+                        RuntimeInvocationLedgerError::InvalidRecord(
+                            "reconciled invocation remained prepared".to_string(),
+                        )
+                    })?;
+                Ok(match disposition {
+                    InvocationBeginDisposition::Return(result) => {
+                        InvocationPrepareDisposition::Return(result)
+                    }
+                    InvocationBeginDisposition::Execute { .. } => {
+                        return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                            "existing dispatched invocation became executable without prepare"
+                                .to_string(),
+                        ));
+                    }
                 })
             }
-            _ => disposition_for_existing_record(record)?.ok_or_else(|| {
-                RuntimeInvocationLedgerError::InvalidRecord(
-                    "existing prepared invocation was not dispatchable".to_string(),
-                )
+            _ => {
+                let disposition = disposition_for_existing_record(record)?.ok_or_else(|| {
+                    RuntimeInvocationLedgerError::InvalidRecord(
+                        "existing prepared invocation was not dispatchable".to_string(),
+                    )
+                })?;
+                Ok(match disposition {
+                    InvocationBeginDisposition::Return(result) => {
+                        InvocationPrepareDisposition::Return(result)
+                    }
+                    InvocationBeginDisposition::Execute { .. } => {
+                        return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                            "terminal invocation became executable".to_string(),
+                        ));
+                    }
+                })
+            }
+        }
+    }
+
+    /// Atomically claim a previously prepared invocation for provider
+    /// dispatch. A concurrent cache completion or dispatch is projected from
+    /// the authoritative row instead of being sent again.
+    pub(crate) async fn dispatch_prepared(
+        &self,
+        identity: &ToolInvocationIdentity,
+    ) -> Result<InvocationBeginDisposition, RuntimeInvocationLedgerError> {
+        let owner_id = uuid::Uuid::now_v7().to_string();
+        match self.dispatch(identity, &owner_id).await {
+            Ok(record) => Ok(InvocationBeginDisposition::Execute {
+                decision: record.decision,
+                owner_id,
             }),
+            Err(dispatch_error) => {
+                let Some(authoritative) = self.get(identity).await? else {
+                    return Err(dispatch_error);
+                };
+                disposition_for_existing_record(authoritative)?.ok_or(dispatch_error)
+            }
+        }
+    }
+
+    /// Atomically complete a still-prepared logical invocation from a trusted
+    /// successful observation. `Ok(None)` means a failed CAS was proven to
+    /// have left the invocation prepared, so normal dispatch remains safe.
+    pub(crate) async fn complete_from_semantic_read_cache(
+        &self,
+        identity: &ToolInvocationIdentity,
+        expected_key: &SemanticReadCacheKey,
+        observation: &SemanticReadObservation,
+    ) -> Result<Option<astra_tools::ToolResult>, RuntimeInvocationLedgerError> {
+        expected_key
+            .validate()
+            .map_err(|error| RuntimeInvocationLedgerError::InvalidRecord(error.to_string()))?;
+        observation
+            .validate()
+            .map_err(|error| RuntimeInvocationLedgerError::InvalidRecord(error.to_string()))?;
+        if observation.key != *expected_key {
+            return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                "semantic observation key does not match the currently resolved freshness key"
+                    .to_string(),
+            ));
+        }
+        let prepared = self.get(identity).await?.ok_or_else(|| {
+            RuntimeInvocationLedgerError::InvalidRecord(
+                "semantic cache completion has no prepared invocation".to_string(),
+            )
+        })?;
+        if observation.key.tool != prepared.fingerprint.tool
+            || observation.key.canonical_arguments_hash
+                != prepared.fingerprint.canonical_arguments_hash
+            || observation.key.policy_decision_id != prepared.decision.decision_id
+        {
+            return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                "semantic observation identity does not match the prepared tool, arguments, and frozen decision"
+                    .to_string(),
+            ));
+        }
+        let completion_source = ToolInvocationCompletionSource::semantic_read_cache(
+            observation.key.key_id.clone(),
+            observation.observation_id.clone(),
+        )
+        .map_err(|error| RuntimeInvocationLedgerError::InvalidRecord(error.to_string()))?;
+        let completed = match self {
+            Self::Database(ledger) => ledger
+                .complete_from_semantic_read_cache(
+                    identity,
+                    &observation.result,
+                    &completion_source,
+                )
+                .await
+                .map_err(RuntimeInvocationLedgerError::from),
+            Self::InMemory(ledger) => ledger
+                .lock()
+                .await
+                .complete_from_semantic_read_cache(
+                    identity,
+                    observation.result.clone(),
+                    completion_source,
+                )
+                .map_err(RuntimeInvocationLedgerError::from),
+        };
+        match completed {
+            Ok(record) => Ok(Some(project_terminal_record(&record, false)?)),
+            Err(completion_error) => {
+                let Some(authoritative) = self.get(identity).await? else {
+                    return Err(completion_error);
+                };
+                if authoritative.state == ToolInvocationState::Prepared {
+                    return Ok(None);
+                }
+                disposition_for_existing_record(authoritative)?.map_or_else(
+                    || Err(completion_error),
+                    |disposition| match disposition {
+                        InvocationBeginDisposition::Return(result) => Ok(Some(result)),
+                        InvocationBeginDisposition::Execute { .. } => {
+                            Err(RuntimeInvocationLedgerError::InvalidRecord(
+                                "cache completion race returned an executable disposition"
+                                    .to_string(),
+                            ))
+                        }
+                    },
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn confirms_dispatched_outcome(
+        &self,
+        identity: &ToolInvocationIdentity,
+        expected: &ToolInvocationTerminalOutcome,
+    ) -> Result<bool, RuntimeInvocationLedgerError> {
+        Ok(self.get(identity).await?.is_some_and(|record| {
+            record.dispatch_certainty == DispatchCertainty::Dispatched
+                && record.outcome.as_ref() == Some(expected)
+        }))
+    }
+
+    /// Prepare and atomically claim the route boundary. A terminal row is
+    /// replayed; an acknowledged or uncertain in-flight row is never sent a
+    /// second time.
+    #[cfg(test)]
+    pub(crate) async fn begin(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
+    ) -> Result<InvocationBeginDisposition, RuntimeInvocationLedgerError> {
+        match self
+            .prepare_for_execution(identity, fingerprint, decision, validate_decision)
+            .await?
+        {
+            InvocationPrepareDisposition::Prepared { .. } => self.dispatch_prepared(identity).await,
+            InvocationPrepareDisposition::Return(result) => {
+                Ok(InvocationBeginDisposition::Return(result))
+            }
         }
     }
 
@@ -432,7 +593,9 @@ fn disposition_for_existing_record(
     }
 }
 
-fn terminal_outcome_from_result(result: &astra_tools::ToolResult) -> ToolInvocationTerminalOutcome {
+pub(crate) fn terminal_outcome_from_result(
+    result: &astra_tools::ToolResult,
+) -> ToolInvocationTerminalOutcome {
     let payload = ToolInvocationResultPayload {
         output: result.output.clone(),
         metadata: result
@@ -535,13 +698,41 @@ fn result_side_effects_maybe(result: &astra_tools::ToolResult) -> bool {
 fn replay_terminal_record(
     record: &ToolInvocationRecord,
 ) -> Result<astra_tools::ToolResult, RuntimeInvocationLedgerError> {
+    project_terminal_record(record, true)
+}
+
+fn project_terminal_record(
+    record: &ToolInvocationRecord,
+    replay: bool,
+) -> Result<astra_tools::ToolResult, RuntimeInvocationLedgerError> {
     let outcome = record.outcome.as_ref().ok_or_else(|| {
         RuntimeInvocationLedgerError::InvalidRecord(format!(
             "terminal invocation {:?} has no typed outcome",
             record.identity
         ))
     })?;
-    Ok(project_terminal_outcome(outcome, record.state, true))
+    let mut result = project_terminal_outcome(outcome, record.state, replay);
+    if let Some(ToolInvocationCompletionSource::SemanticReadCache {
+        cache_key_id,
+        observation_id,
+        ..
+    }) = record.completion_source.as_ref()
+    {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        metadata.insert(
+            "semantic_read_cache_state".to_string(),
+            Value::String("hit".to_string()),
+        );
+        metadata.insert(
+            "semantic_read_cache_key_id".to_string(),
+            Value::String(cache_key_id.clone()),
+        );
+        metadata.insert(
+            "semantic_read_observation_id".to_string(),
+            Value::String(observation_id.clone()),
+        );
+    }
+    Ok(result)
 }
 
 fn project_terminal_outcome(
@@ -749,7 +940,10 @@ impl From<InvocationLedgerError> for RuntimeInvocationLedgerError {
 mod tests {
     use super::*;
     use astra_tools::exit_semantics::ExitSemantics;
-    use astra_turn_types::DurableToolReference;
+    use astra_turn_types::{
+        DurableToolReference, SemanticFreshnessFact, SemanticFreshnessScope, SemanticReadCacheKey,
+        SemanticReadFreshnessContext, SemanticReadObservation,
+    };
     use serde_json::json;
 
     fn identity(invocation_id: &str) -> ToolInvocationIdentity {
@@ -775,6 +969,52 @@ mod tests {
 
     fn decision(label: &str) -> ToolInvocationDecision {
         ToolInvocationDecision::new(&json!({"decision": label})).unwrap()
+    }
+
+    fn semantic_observation(
+        arguments: &Value,
+        decision: &ToolInvocationDecision,
+        output: &str,
+    ) -> SemanticReadObservation {
+        semantic_observation_at_revision(arguments, decision, output, "revision-1")
+    }
+
+    fn semantic_observation_at_revision(
+        arguments: &Value,
+        decision: &ToolInvocationDecision,
+        output: &str,
+        revision: &str,
+    ) -> SemanticReadObservation {
+        let freshness = SemanticReadFreshnessContext::new(
+            "user:session",
+            vec![
+                SemanticFreshnessFact::new(
+                    SemanticFreshnessScope::Resource,
+                    "resource-a",
+                    revision,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let key = SemanticReadCacheKey::new(
+            DurableToolReference::built_in("bash", "contract-v1").unwrap(),
+            arguments,
+            &decision.decision_id,
+            &freshness,
+        )
+        .unwrap();
+        SemanticReadObservation::from_terminal_outcome(
+            key,
+            &ToolInvocationTerminalOutcome::Succeeded {
+                result: ToolInvocationResultPayload {
+                    output: output.to_string(),
+                    metadata: BTreeMap::new(),
+                    exit_semantics: None,
+                },
+            },
+        )
+        .unwrap()
     }
 
     async fn begin(
@@ -930,6 +1170,171 @@ mod tests {
             }
             InvocationBeginDisposition::Return(_) => panic!("prepared invocation should resume"),
         }
+    }
+
+    #[tokio::test]
+    async fn cache_hit_completes_prepared_without_dispatch_and_replays_provenance() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-cache");
+        let arguments = json!({"command": "read"});
+        let decision = decision("decision-v1");
+        let fingerprint = fingerprint_for(&arguments, &decision);
+        assert!(matches!(
+            ledger
+                .prepare_for_execution(&identity, &fingerprint, &decision, |_| Ok(()))
+                .await
+                .unwrap(),
+            InvocationPrepareDisposition::Prepared { .. }
+        ));
+        let observation = semantic_observation(&arguments, &decision, "cached result");
+
+        let completed = ledger
+            .complete_from_semantic_read_cache(&identity, &observation.key, &observation)
+            .await
+            .unwrap()
+            .expect("cache completion should return the terminal result");
+        assert_eq!(completed.output, "cached result");
+        let metadata = completed.metadata.as_ref().unwrap();
+        assert_eq!(metadata["durable_invocation_state"], "succeeded");
+        assert_eq!(metadata["invocation_replay"], false);
+        assert_eq!(metadata["semantic_read_cache_state"], "hit");
+        assert_eq!(
+            metadata["semantic_read_observation_id"],
+            observation.observation_id
+        );
+        let record = ledger.get(&identity).await.unwrap().unwrap();
+        assert_eq!(record.dispatch_certainty, DispatchCertainty::NotDispatched);
+        assert_eq!(record.attempt_count, 0);
+        assert!(record.dispatch_lease.is_none());
+
+        let replay = match ledger.dispatch_prepared(&identity).await.unwrap() {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("cache-completed invocation must not dispatch")
+            }
+        };
+        assert_eq!(replay.output, "cached result");
+        assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
+        assert_eq!(
+            replay.metadata.as_ref().unwrap()["semantic_read_cache_state"],
+            "hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_completion_rejects_observation_for_different_arguments() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-cache-mismatch");
+        let arguments = json!({"command": "read-a"});
+        let decision = decision("decision-v1");
+        ledger
+            .prepare_for_execution(
+                &identity,
+                &fingerprint_for(&arguments, &decision),
+                &decision,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let wrong = semantic_observation(&json!({"command": "read-b"}), &decision, "wrong");
+        let expected_key = semantic_observation(&arguments, &decision, "expected").key;
+
+        assert!(matches!(
+            ledger
+                .complete_from_semantic_read_cache(&identity, &expected_key, &wrong)
+                .await,
+            Err(RuntimeInvocationLedgerError::InvalidRecord(message))
+                if message.contains("does not match")
+        ));
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            ToolInvocationState::Prepared
+        );
+        assert!(matches!(
+            ledger.dispatch_prepared(&identity).await.unwrap(),
+            InvocationBeginDisposition::Execute { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cache_completion_rejects_observation_for_previous_freshness_revision() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-cache-stale-revision");
+        let arguments = json!({"command": "read"});
+        let decision = decision("decision-v1");
+        ledger
+            .prepare_for_execution(
+                &identity,
+                &fingerprint_for(&arguments, &decision),
+                &decision,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let stale = semantic_observation_at_revision(
+            &arguments,
+            &decision,
+            "stale",
+            "revision-before-resume",
+        );
+        let current = semantic_observation_at_revision(
+            &arguments,
+            &decision,
+            "current",
+            "revision-after-resume",
+        );
+
+        assert!(matches!(
+            ledger
+                .complete_from_semantic_read_cache(&identity, &current.key, &stale)
+                .await,
+            Err(RuntimeInvocationLedgerError::InvalidRecord(message))
+                if message.contains("currently resolved freshness key")
+        ));
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            ToolInvocationState::Prepared
+        );
+        assert!(matches!(
+            ledger.dispatch_prepared(&identity).await.unwrap(),
+            InvocationBeginDisposition::Execute { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_claim_wins_cache_completion_race_without_overwriting_provider_state() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-cache-race");
+        let arguments = json!({"command": "read"});
+        let decision = decision("decision-v1");
+        ledger
+            .prepare_for_execution(
+                &identity,
+                &fingerprint_for(&arguments, &decision),
+                &decision,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ledger.dispatch_prepared(&identity).await.unwrap(),
+            InvocationBeginDisposition::Execute { .. }
+        ));
+        let observation = semantic_observation(&arguments, &decision, "cached result");
+
+        let pending = ledger
+            .complete_from_semantic_read_cache(&identity, &observation.key, &observation)
+            .await
+            .unwrap()
+            .expect("dispatch winner should project its authoritative state");
+        assert_eq!(
+            pending.metadata.as_ref().unwrap()["error_kind"],
+            "tool_invocation_in_progress"
+        );
+        let record = ledger.get(&identity).await.unwrap().unwrap();
+        assert_eq!(record.state, ToolInvocationState::Dispatched);
+        assert_eq!(record.attempt_count, 1);
+        assert!(record.completion_source.is_none());
     }
 
     #[test]

@@ -23,18 +23,42 @@ pub enum ToolEngineRegistrationError {
     DuplicatePrefix { prefix: String },
 }
 
+/// Trusted invocation identity carried beside model/provider-authored tool
+/// arguments.
+///
+/// Tool handlers that need correlation metadata can opt into
+/// [`ToolHandler::execute_invocation`]. Keeping this envelope separate from
+/// `args` prevents internal runtime identity from violating strict provider
+/// schemas or changing the semantic identity of a tool call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolInvocationMetadata<'a> {
+    pub run_id: Option<&'a str>,
+    pub turn_chain_id: Option<&'a str>,
+    pub tool_call_id: Option<&'a str>,
+}
+
 #[async_trait]
-pub trait ToolHandler<C>: Send + Sync {
+pub trait ToolHandler<C: Sync>: Send + Sync {
     async fn execute(
         &self,
         context: &C,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> ToolResult;
+
+    async fn execute_invocation(
+        &self,
+        context: &C,
+        args: &Value,
+        _invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        self.execute(context, args, cancel_token).await
+    }
 }
 
 #[async_trait]
-pub trait DynamicToolHandler<C>: Send + Sync {
+pub trait DynamicToolHandler<C: Sync>: Send + Sync {
     async fn execute(
         &self,
         name: &str,
@@ -42,16 +66,27 @@ pub trait DynamicToolHandler<C>: Send + Sync {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> ToolResult;
+
+    async fn execute_invocation(
+        &self,
+        name: &str,
+        context: &C,
+        args: &Value,
+        _invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        self.execute(name, context, args, cancel_token).await
+    }
 }
 
 #[derive(Clone)]
-struct PrefixHandler<C> {
+struct PrefixHandler<C: Sync> {
     prefix: String,
     name_validator: Option<fn(&str) -> bool>,
     handler: Arc<dyn DynamicToolHandler<C>>,
 }
 
-impl<C> PrefixHandler<C> {
+impl<C: Sync> PrefixHandler<C> {
     fn matches(&self, name: &str) -> bool {
         name.starts_with(&self.prefix)
             && self.name_validator.is_none_or(|validator| validator(name))
@@ -59,18 +94,18 @@ impl<C> PrefixHandler<C> {
 }
 
 #[derive(Clone)]
-pub struct ToolEngine<C> {
+pub struct ToolEngine<C: Sync> {
     handlers: HashMap<String, Arc<dyn ToolHandler<C>>>,
     prefix_handlers: Vec<PrefixHandler<C>>,
 }
 
-impl<C> Default for ToolEngine<C> {
+impl<C: Sync> Default for ToolEngine<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<C> ToolEngine<C> {
+impl<C: Sync> ToolEngine<C> {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
@@ -186,18 +221,41 @@ impl<C> ToolEngine<C> {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> Option<ToolResult> {
+        self.execute_invocation(
+            name,
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    pub async fn execute_invocation(
+        &self,
+        name: &str,
+        context: &C,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<ToolResult> {
         if let Some(handler) = self.handlers.get(name) {
             return Some(
-                AssertUnwindSafe(handler.execute(context, args, cancel_token))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::error!(
-                            tool_name = %name,
-                            "tool handler panicked; returning error to caller"
-                        );
-                        ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-                    }),
+                AssertUnwindSafe(handler.execute_invocation(
+                    context,
+                    args,
+                    invocation,
+                    cancel_token,
+                ))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        tool_name = %name,
+                        "tool handler panicked; returning error to caller"
+                    );
+                    ToolResult::error(format!("Internal error: tool '{name}' panicked"))
+                }),
             );
         }
         let handler = self
@@ -205,16 +263,22 @@ impl<C> ToolEngine<C> {
             .iter()
             .find(|entry| entry.matches(name))?;
         Some(
-            AssertUnwindSafe(handler.handler.execute(name, context, args, cancel_token))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::error!(
-                        tool_name = %name,
-                        "prefix handler panicked; returning error to caller"
-                    );
-                    ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-                }),
+            AssertUnwindSafe(handler.handler.execute_invocation(
+                name,
+                context,
+                args,
+                invocation,
+                cancel_token,
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                tracing::error!(
+                    tool_name = %name,
+                    "prefix handler panicked; returning error to caller"
+                );
+                ToolResult::error(format!("Internal error: tool '{name}' panicked"))
+            }),
         )
     }
 }
@@ -314,6 +378,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct InvocationAwareHandler;
+
+    #[async_trait]
+    impl ToolHandler<TestContext> for InvocationAwareHandler {
+        async fn execute(
+            &self,
+            _context: &TestContext,
+            _args: &Value,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> ToolResult {
+            ToolResult::error("invocation envelope missing".to_string())
+        }
+
+        async fn execute_invocation(
+            &self,
+            _context: &TestContext,
+            args: &Value,
+            invocation: ToolInvocationMetadata<'_>,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> ToolResult {
+            ToolResult::text(
+                json!({
+                    "arguments": args,
+                    "run_id": invocation.run_id,
+                    "turn_chain_id": invocation.turn_chain_id,
+                    "tool_call_id": invocation.tool_call_id,
+                })
+                .to_string(),
+            )
+        }
+    }
+
     #[tokio::test]
     async fn registered_handler_executes_with_context() {
         let mut engine = ToolEngine::new();
@@ -331,6 +428,39 @@ mod tests {
 
         assert_eq!(result.output, "ctx:ok");
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn invocation_metadata_reaches_handler_without_mutating_arguments() {
+        let mut engine = ToolEngine::new();
+        engine
+            .register_handler("invocation_aware", InvocationAwareHandler)
+            .unwrap();
+        let args = json!({"query": "status", "_provider_cursor": "cursor-7"});
+
+        let result = engine
+            .execute_invocation(
+                "invocation_aware",
+                &TestContext { prefix: "ctx" },
+                &args,
+                ToolInvocationMetadata {
+                    run_id: Some("run-1"),
+                    turn_chain_id: Some("turn-1"),
+                    tool_call_id: Some("call-1"),
+                },
+                None,
+            )
+            .await
+            .expect("registered handler should execute");
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert_eq!(output["arguments"], args);
+        assert_eq!(output["run_id"], "run-1");
+        assert_eq!(output["turn_chain_id"], "turn-1");
+        assert_eq!(output["tool_call_id"], "call-1");
+        assert!(output["arguments"].get("_run_id").is_none());
+        assert!(output["arguments"].get("_turn_chain_id").is_none());
+        assert!(output["arguments"].get("_tool_call_id").is_none());
     }
 
     #[tokio::test]

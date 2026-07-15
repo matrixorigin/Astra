@@ -13,10 +13,12 @@ pub(crate) async fn execute_agent_tool(
     default_executor: &DefaultToolExecutor,
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
+    tool_call_id: Option<&str>,
 ) -> astra_tools::ToolResult {
+    let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
-            crate::orchestration::handle_agent_tool(args, agent_tool_context).await,
+            crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
         );
     }
     let action = match agent_action_from_args(args) {
@@ -37,7 +39,7 @@ pub(crate) async fn execute_agent_tool(
         AgentAction::RunChain => default_executor.execute("run_chain", args).await,
         AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage => {
             agent_tool_result_from_output(
-                crate::orchestration::handle_agent_tool(args, agent_tool_context).await,
+                crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
             )
         }
     }
@@ -46,10 +48,13 @@ pub(crate) async fn execute_agent_tool(
 pub(crate) async fn execute_agent_fanout_tool(
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
+    tool_call_id: Option<&str>,
 ) -> astra_tools::ToolResult {
+    let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
-            crate::orchestration::handle_agent_fanout_tool(args, agent_tool_context).await,
+            crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context)
+                .await,
         );
     }
     let action = match agent_fanout_action_from_args(args) {
@@ -65,8 +70,22 @@ pub(crate) async fn execute_agent_fanout_tool(
         );
     }
     agent_tool_result_from_output(
-        crate::orchestration::handle_agent_fanout_tool(args, agent_tool_context).await,
+        crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context).await,
     )
+}
+
+fn correlated_agent_arguments(args: &Value, tool_call_id: Option<&str>) -> Value {
+    let Some(tool_call_id) = tool_call_id.filter(|value| !value.is_empty()) else {
+        return args.clone();
+    };
+    let Some(mut object) = args.as_object().cloned() else {
+        return args.clone();
+    };
+    object.insert(
+        "_tool_call_id".to_string(),
+        Value::String(tool_call_id.to_string()),
+    );
+    Value::Object(object)
 }
 
 fn render_agent_error(error: String) -> String {

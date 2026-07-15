@@ -83,8 +83,7 @@ where
         context.work_surface_events,
         &context.binding_fields,
         context.session_id,
-        &boundary.request().tool_name,
-        &boundary.request().args,
+        boundary.request(),
         &result,
     )
     .await;
@@ -103,11 +102,10 @@ pub(crate) async fn emit_tool_result_status_events(
     work_surface_events: &WorkSurfaceEventEmitter,
     binding_fields: &Map<String, Value>,
     session_id: &str,
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     result: &astra_tools::ToolResult,
 ) {
-    if let Some(events) = executor_blocked_events(session_id, tool_name, args, result) {
+    if let Some(events) = executor_blocked_events(session_id, request, result) {
         work_surface_events
             .emit(
                 events.executor_status_changed,
@@ -123,7 +121,7 @@ pub(crate) async fn emit_tool_result_status_events(
             )
             .await;
     }
-    if let Some(event) = agent_waiting_event(tool_name, args, result) {
+    if let Some(event) = agent_waiting_event(request, result) {
         work_surface_events
             .emit(
                 event,
@@ -150,6 +148,7 @@ async fn emit_optional_work_surface_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tool_execution_binding::ExecutionBindingState;
     use serde_json::json;
 
     #[tokio::test]
@@ -172,15 +171,15 @@ mod tests {
             .to_string(),
         );
 
-        emit_tool_result_status_events(
-            &emitter,
-            &binding_fields,
+        let request = ExecutionBindingState::server_sandbox(".").tool_execution_request(
+            "user-1",
             "session-1",
             "agent",
             &json!({"_tool_call_id": "call-agent"}),
-            &result,
-        )
-        .await;
+        );
+
+        emit_tool_result_status_events(&emitter, &binding_fields, "session-1", &request, &result)
+            .await;
 
         let event = rx.try_recv().expect("agent waiting event should emit");
         assert_eq!(event["type"], "agent_waiting");

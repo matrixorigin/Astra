@@ -1,4 +1,6 @@
 use serde_json::{Map, Value};
+
+use super::tool_execution_binding::ToolExecutionRequest;
 use tokio::sync::mpsc::Sender;
 
 use super::tool_execution_result::result_metadata_str;
@@ -93,6 +95,7 @@ pub(crate) fn binding_snapshot_events(session_id: &str) -> [Map<String, Value>; 
 pub(crate) fn task_board_snapshot_event(
     session_id: &str,
     reason: &str,
+    trusted_run_id: Option<&str>,
     args: &Value,
     tasks: impl serde::Serialize,
 ) -> Map<String, Value> {
@@ -105,7 +108,7 @@ pub(crate) fn task_board_snapshot_event(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
-    if let Some(run_id) = run_id(args) {
+    if let Some(run_id) = trusted_run_id.or_else(|| run_id(args)) {
         event.insert("run_id".to_string(), Value::String(run_id.to_string()));
     }
     event.insert("reason".to_string(), Value::String(reason.to_string()));
@@ -132,11 +135,10 @@ fn run_id(args: &Value) -> Option<&str> {
 }
 
 pub(crate) fn agent_waiting_event(
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     result: &astra_tools::ToolResult,
 ) -> Option<Map<String, Value>> {
-    if tool_name != "agent" {
+    if request.tool_name != "agent" {
         return None;
     }
     let parsed = serde_json::from_str::<Value>(&result.output).ok();
@@ -171,7 +173,7 @@ pub(crate) fn agent_waiting_event(
     event.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     event.insert("status".to_string(), Value::String("waiting".to_string()));
     event.insert("reason".to_string(), Value::String(reason.to_string()));
-    if let Some(call_id) = tool_call_id(args) {
+    if let Some(call_id) = request_tool_call_id(request) {
         event.insert("call_id".to_string(), Value::String(call_id.to_string()));
     }
     copy_result_routing_metadata(&mut event, result);
@@ -180,8 +182,7 @@ pub(crate) fn agent_waiting_event(
 
 pub(crate) fn executor_blocked_events(
     session_id: &str,
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     result: &astra_tools::ToolResult,
 ) -> Option<ExecutorBlockedEvents> {
     let error_kind = result_metadata_str(result, "error_kind")?;
@@ -194,8 +195,8 @@ pub(crate) fn executor_blocked_events(
         TOOL_ERROR_KIND_CAPABILITY_DENIED => ("online", TOOL_ERROR_KIND_CAPABILITY_DENIED),
         _ => return None,
     };
-    let call_id = tool_call_id(args)?;
-    let run_id = run_id(args);
+    let call_id = request_tool_call_id(request)?;
+    let run_id = request_run_id(request);
     let reason = result_metadata_str(result, "reason").unwrap_or(error_kind);
 
     let mut executor_event = Map::new();
@@ -216,7 +217,7 @@ pub(crate) fn executor_blocked_events(
     if let Some(run_id) = run_id {
         executor_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
     }
-    executor_event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    executor_event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
     executor_event.insert("message".to_string(), Value::String(result.output.clone()));
     copy_result_routing_metadata(&mut executor_event, result);
 
@@ -234,7 +235,7 @@ pub(crate) fn executor_blocked_events(
     if let Some(run_id) = run_id {
         blocked_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
     }
-    blocked_event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    blocked_event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
     blocked_event.insert("message".to_string(), Value::String(result.output.clone()));
     copy_result_routing_metadata(&mut blocked_event, result);
 
@@ -242,6 +243,18 @@ pub(crate) fn executor_blocked_events(
         executor_status_changed: executor_event,
         run_blocked: blocked_event,
     })
+}
+
+fn request_tool_call_id(request: &ToolExecutionRequest) -> Option<&str> {
+    (!request.tool_call_id.is_empty())
+        .then_some(request.tool_call_id.as_str())
+        .or_else(|| tool_call_id(&request.args))
+}
+
+fn request_run_id(request: &ToolExecutionRequest) -> Option<&str> {
+    (!request.run_id.is_empty())
+        .then_some(request.run_id.as_str())
+        .or_else(|| run_id(&request.args))
 }
 
 #[cfg(test)]
@@ -283,6 +296,7 @@ mod tests {
         let event = task_board_snapshot_event(
             "session-1",
             "task-create",
+            None,
             &json!({"_run_id": "run-1", "_tool_call_id": "call-1"}),
             json!([{"id": "todo-1", "title": "Implement"}]),
         );

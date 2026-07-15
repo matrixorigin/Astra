@@ -90,9 +90,27 @@ struct AgentBindingMcpTool {
     metadata: Option<Value>,
 }
 
-#[derive(Debug)]
-struct AgentBindingMcpRpcError {
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub(crate) struct AgentBindingMcpRpcError {
     detail: String,
+    outcome_unknown: bool,
+    timed_out: bool,
+}
+
+impl AgentBindingMcpRpcError {
+    pub(crate) fn side_effects_maybe(&self) -> bool {
+        self.outcome_unknown
+    }
+
+    pub(crate) fn is_timeout(&self) -> bool {
+        self.timed_out
+    }
+
+    fn redacted(mut self, secrets: &Value) -> Self {
+        self.detail = redact_known_secrets(&self.detail, secrets);
+        self
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,6 +141,16 @@ fn agent_binding_mcp_http_client() -> &'static reqwest::Client {
 fn agent_binding_mcp_rpc_error(detail: impl Into<String>) -> AgentBindingMcpRpcError {
     AgentBindingMcpRpcError {
         detail: detail.into(),
+        outcome_unknown: false,
+        timed_out: false,
+    }
+}
+
+fn agent_binding_mcp_timeout_error(detail: impl Into<String>) -> AgentBindingMcpRpcError {
+    AgentBindingMcpRpcError {
+        detail: detail.into(),
+        outcome_unknown: true,
+        timed_out: true,
     }
 }
 
@@ -670,7 +698,7 @@ async fn post_agent_binding_mcp_rpc(
     )
     .await
     .map_err(|_| {
-        agent_binding_mcp_rpc_error(format!(
+        agent_binding_mcp_timeout_error(format!(
             "Agent Binding MCP RPC to '{endpoint_url}' timed out after {AGENT_BINDING_MCP_RPC_TIMEOUT_SECS}s"
         ))
     })?
@@ -836,16 +864,34 @@ fn agent_binding_tools_to_schemas_checked(
 }
 
 fn tool_names_by_public_name(
-    schemas: &[Value],
-    tools: &[AgentBindingMcpTool],
-) -> HashMap<String, String> {
-    schemas
+    snapshot: &ResolvedProviderSnapshot,
+) -> Result<HashMap<String, String>, String> {
+    let descriptors = snapshot
+        .descriptors
         .iter()
-        .zip(tools)
-        .filter_map(|(schema, tool)| {
-            schema["function"]["name"]
-                .as_str()
-                .map(|public_name| (public_name.to_string(), tool.tool.name.to_string()))
+        .map(|descriptor| {
+            (
+                descriptor.descriptor_ref(),
+                descriptor.native_tool_name.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    snapshot
+        .alias_index
+        .iter()
+        .map(|(public_alias, descriptor_ref)| {
+            let native_name = descriptors.get(descriptor_ref).ok_or_else(|| {
+                format!(
+                    "Agent Binding alias '{}' references missing descriptor '{}@{}'",
+                    public_alias,
+                    descriptor_ref.identity.native_tool_id,
+                    descriptor_ref.descriptor_version,
+                )
+            })?;
+            Ok((
+                public_alias.as_str().to_string(),
+                (*native_name).to_string(),
+            ))
         })
         .collect()
 }
@@ -927,11 +973,11 @@ impl AgentBindingMcpRuntime {
         &self,
         public_name: &str,
         args: &Value,
-    ) -> Result<McpToolCallResult, String> {
+    ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
         let tool_name = self
             .tool_names_by_public_name
             .get(public_name)
-            .ok_or_else(|| format!("Tool not found: {public_name}"))?;
+            .ok_or_else(|| agent_binding_mcp_rpc_error(format!("Tool not found: {public_name}")))?;
         let payload = json!({
             "jsonrpc": "2.0",
             "id": "astra-agent-binding-tools-call",
@@ -944,22 +990,16 @@ impl AgentBindingMcpRuntime {
         let result = post_agent_binding_mcp_rpc(&self.endpoint_url, &self.authorization, payload)
             .await
             .map_err(|error| {
-                redact_known_secrets(
-                    &error.detail,
-                    &json!({
-                        "authorization": &self.authorization,
-                        "url": &self.endpoint_url,
-                    }),
-                )
-            })?;
-        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
-            redact_known_secrets(
-                &error.detail,
-                &json!({
+                error.redacted(&json!({
                     "authorization": &self.authorization,
                     "url": &self.endpoint_url,
-                }),
-            )
+                }))
+            })?;
+        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
+            error.redacted(&json!({
+                "authorization": &self.authorization,
+                "url": &self.endpoint_url,
+            }))
         })
     }
 
@@ -1092,7 +1132,14 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
                 "agent_binding_public_name_conflict",
             )
         })?;
-    let tool_names_by_public_name = tool_names_by_public_name(&schemas, &tools);
+    let tool_names_by_public_name =
+        tool_names_by_public_name(&resolved_snapshot).map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                error,
+                "agent_binding_provider_resolution_failed",
+            )
+        })?;
     let agent_binding_mcp = AgentBindingMcpRuntime {
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
@@ -1125,6 +1172,51 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_binding_timeout_preserves_unknown_outcome_evidence() {
+        let error = agent_binding_mcp_timeout_error("timed out");
+
+        assert!(error.side_effects_maybe());
+        assert!(error.is_timeout());
+    }
+
+    #[test]
+    fn agent_binding_routes_sorted_aliases_by_descriptor_identity() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [
+                {
+                    "name": "zebra",
+                    "description": "Z tool",
+                    "inputSchema": {"type": "object"}
+                },
+                {
+                    "name": "alpha",
+                    "description": "A tool",
+                    "inputSchema": {"type": "object"}
+                }
+            ]
+        }))
+        .expect("valid discovery response");
+        let native_tools = tools
+            .iter()
+            .map(|tool| tool.tool.clone())
+            .collect::<Vec<_>>();
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("provider-1").unwrap(),
+            ProviderBindingRef::new("binding-1").unwrap(),
+            &native_tools,
+        )
+        .unwrap();
+        let resolved = resolve_mcp_snapshot("tools", &discovery).unwrap();
+        let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+        let routes = tool_names_by_public_name(&resolved).unwrap();
+
+        assert_eq!(schemas[0]["function"]["name"], "mcp__tools__alpha");
+        assert_eq!(schemas[1]["function"]["name"], "mcp__tools__zebra");
+        assert_eq!(routes["mcp__tools__alpha"], "alpha");
+        assert_eq!(routes["mcp__tools__zebra"], "zebra");
+    }
 
     #[test]
     fn agent_binding_discovery_preserves_terminal_control_metadata_by_public_name() {

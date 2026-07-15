@@ -45,20 +45,11 @@ impl ToolRouteBoundary {
     }
 
     pub(crate) fn routing_decision_event(&self) -> Option<Map<String, Value>> {
-        tool_routing_decision_event(
-            &self.request.tool_name,
-            &self.request.args,
-            self.route,
-            self.route_fields(),
-        )
+        tool_routing_decision_event(&self.request, self.route, self.route_fields())
     }
 
     pub(crate) fn transport_started_event(&self) -> Option<Map<String, Value>> {
-        tool_transport_started_event(
-            &self.request.tool_name,
-            &self.request.args,
-            self.route_fields(),
-        )
+        tool_transport_started_event(&self.request, self.route_fields())
     }
 
     pub(crate) fn transport_finished_event(
@@ -66,12 +57,7 @@ impl ToolRouteBoundary {
         result: &astra_tools::ToolResult,
         duration_ms: u64,
     ) -> Option<Map<String, Value>> {
-        tool_transport_finished_event(
-            &self.request.tool_name,
-            &self.request.args,
-            result,
-            duration_ms,
-        )
+        tool_transport_finished_event(&self.request, result, duration_ms)
     }
 
     pub(crate) fn tool_call_end_event(
@@ -79,12 +65,7 @@ impl ToolRouteBoundary {
         result: &astra_tools::ToolResult,
         duration_ms: u64,
     ) -> Option<Map<String, Value>> {
-        tool_call_end_event(
-            &self.request.tool_name,
-            &self.request.args,
-            result,
-            duration_ms,
-        )
+        tool_call_end_event(&self.request, result, duration_ms)
     }
 
     pub(crate) fn attach_binding_metadata(
@@ -112,30 +93,26 @@ pub(crate) fn route_binding_event_fields(
     }
 }
 
-fn tool_call_id(args: &Value) -> Option<&str> {
-    args.get("_tool_call_id").and_then(Value::as_str)
+fn request_tool_call_id(request: &ToolExecutionRequest) -> Option<&str> {
+    (!request.tool_call_id.is_empty())
+        .then_some(request.tool_call_id.as_str())
+        .or_else(|| request.args.get("_tool_call_id").and_then(Value::as_str))
 }
 
-fn run_id(args: &Value) -> Option<&str> {
-    args.get("_run_id").and_then(Value::as_str)
+fn request_run_id(request: &ToolExecutionRequest) -> Option<&str> {
+    (!request.run_id.is_empty())
+        .then_some(request.run_id.as_str())
+        .or_else(|| request.args.get("_run_id").and_then(Value::as_str))
 }
 
-fn insert_run_id(event: &mut Map<String, Value>, args: &Value) {
-    if let Some(run_id) = run_id(args) {
+fn insert_run_id(event: &mut Map<String, Value>, request: &ToolExecutionRequest) {
+    if let Some(run_id) = request_run_id(request) {
         event.insert("run_id".to_string(), Value::String(run_id.to_string()));
     }
 }
 
 pub(crate) fn public_tool_arguments(args: &Value) -> Value {
-    let Some(map) = args.as_object() else {
-        return args.clone();
-    };
-    Value::Object(
-        map.iter()
-            .filter(|(key, _)| !key.starts_with('_'))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    )
+    astra_turn_types::canonical_public_tool_arguments(args)
 }
 
 fn insert_event_binding_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
@@ -145,20 +122,19 @@ fn insert_event_binding_fields(event: &mut Map<String, Value>, fields: &Map<Stri
 }
 
 pub(crate) fn tool_routing_decision_event(
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     route: ToolExecutionRouteKind,
     route_fields: Option<&Map<String, Value>>,
 ) -> Option<Map<String, Value>> {
-    let call_id = tool_call_id(args)?;
+    let call_id = request_tool_call_id(request)?;
     let mut event = Map::new();
     event.insert(
         "type".to_string(),
         Value::String("tool_routing_decision".to_string()),
     );
     event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-    insert_run_id(&mut event, args);
-    event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    insert_run_id(&mut event, request);
+    event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
     event.insert(
         "route".to_string(),
         Value::String(route.as_str().to_string()),
@@ -170,20 +146,22 @@ pub(crate) fn tool_routing_decision_event(
 }
 
 pub(crate) fn tool_transport_started_event(
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     route_fields: Option<&Map<String, Value>>,
 ) -> Option<Map<String, Value>> {
-    let call_id = tool_call_id(args)?;
+    let call_id = request_tool_call_id(request)?;
     let mut event = Map::new();
     event.insert(
         "type".to_string(),
         Value::String("tool_transport_started".to_string()),
     );
     event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-    insert_run_id(&mut event, args);
-    event.insert("tool".to_string(), Value::String(tool_name.to_string()));
-    event.insert("arguments".to_string(), public_tool_arguments(args));
+    insert_run_id(&mut event, request);
+    event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
+    event.insert(
+        "arguments".to_string(),
+        public_tool_arguments(&request.args),
+    );
     if let Some(route_fields) = route_fields {
         insert_event_binding_fields(&mut event, route_fields);
     }
@@ -191,12 +169,11 @@ pub(crate) fn tool_transport_started_event(
 }
 
 pub(crate) fn tool_transport_finished_event(
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     result: &astra_tools::ToolResult,
     duration_ms: u64,
 ) -> Option<Map<String, Value>> {
-    let call_id = tool_call_id(args)?;
+    let call_id = request_tool_call_id(request)?;
     let mut event = Map::new();
     event.insert(
         "type".to_string(),
@@ -210,8 +187,8 @@ pub(crate) fn tool_transport_finished_event(
         ),
     );
     event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-    insert_run_id(&mut event, args);
-    event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    insert_run_id(&mut event, request);
+    event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
     event.insert("success".to_string(), Value::Bool(!result.is_error));
     event.insert(
         "duration_ms".to_string(),
@@ -225,20 +202,19 @@ pub(crate) fn tool_transport_finished_event(
 }
 
 pub(crate) fn tool_call_end_event(
-    tool_name: &str,
-    args: &Value,
+    request: &ToolExecutionRequest,
     result: &astra_tools::ToolResult,
     duration_ms: u64,
 ) -> Option<Map<String, Value>> {
-    let call_id = tool_call_id(args)?;
+    let call_id = request_tool_call_id(request)?;
     let mut event = Map::new();
     event.insert(
         "type".to_string(),
         Value::String("tool_call_end".to_string()),
     );
     event.insert("call_id".to_string(), Value::String(call_id.to_string()));
-    insert_run_id(&mut event, args);
-    event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    insert_run_id(&mut event, request);
+    event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
     event.insert("result".to_string(), Value::String(result.output.clone()));
     event.insert("success".to_string(), Value::Bool(!result.is_error));
     event.insert(
@@ -277,6 +253,45 @@ pub(crate) fn attach_binding_metadata(
     metadata
         .entry("runtime_environment".to_string())
         .or_insert_with(|| serde_json::to_value(&binding).unwrap_or(Value::Null));
+}
+
+#[cfg(test)]
+mod invocation_identity_tests {
+    use super::*;
+    use crate::server::tool_execution_binding::ExecutionBindingState;
+    use serde_json::json;
+
+    #[test]
+    fn typed_invocation_events_use_request_identity_and_keep_arguments_public() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user-1",
+            "session-1",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let args = json!({"query": "status", "_provider_cursor": "cursor-7"});
+        let request = ExecutionBindingState::server_sandbox(".")
+            .tool_execution_request_for_invocation(&identity, "reflect", &args);
+        let boundary = ToolRouteBoundary::new(request, ToolExecutionRouteKind::ServerRuntime);
+        let result = astra_tools::ToolResult::text("ok".to_string());
+
+        let routing = boundary.routing_decision_event().unwrap();
+        let started = boundary.transport_started_event().unwrap();
+        let finished = boundary.transport_finished_event(&result, 7).unwrap();
+        let ended = boundary.tool_call_end_event(&result, 7).unwrap();
+
+        for event in [&routing, &started, &finished, &ended] {
+            assert_eq!(event["call_id"], "call-1");
+            assert_eq!(event["run_id"], "run-1");
+            assert_eq!(event["tool"], "reflect");
+        }
+        assert_eq!(started["arguments"], args);
+        assert!(started["arguments"].get("_run_id").is_none());
+        assert!(started["arguments"].get("_turn_chain_id").is_none());
+        assert!(started["arguments"].get("_tool_call_id").is_none());
+    }
 }
 
 const RESULT_ROUTING_METADATA_FIELDS: &[&str] = &[

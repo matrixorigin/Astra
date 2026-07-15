@@ -311,6 +311,7 @@ fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> T
 pub(super) async fn execute_with_executor(
     executor: &RuntimeToolExecutor,
     args: &Value,
+    run_id: Option<&str>,
 ) -> astra_tools::ToolResult {
     let outcome = execute_task_tool(&executor.task_manager(), args).await;
     if let Some(rollback) = outcome.rollback {
@@ -323,7 +324,7 @@ pub(super) async fn execute_with_executor(
             },
         );
         executor
-            .emit_task_board_snapshot(rollback.event_reason, args)
+            .emit_task_board_snapshot(rollback.event_reason, run_id, args)
             .await;
     }
     outcome.result

@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::tool::args::shape::{canonicalize_tool_call_name_in_place, tool_call_name};
 
@@ -71,6 +71,22 @@ pub fn shared_tool_semaphore() -> Arc<Semaphore> {
     static CELL: OnceLock<Arc<Semaphore>> = OnceLock::new();
     CELL.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_tool_executions())))
         .clone()
+}
+
+/// Acquire one slot from the process-wide tool execution budget while
+/// preserving the same wait/closed metrics across all runtime frontends.
+pub async fn acquire_shared_tool_permit() -> Result<OwnedSemaphorePermit, ()> {
+    let start = Instant::now();
+    match shared_tool_semaphore().acquire_owned().await {
+        Ok(permit) => {
+            record_tool_admission("acquired", start.elapsed());
+            Ok(permit)
+        }
+        Err(_closed) => {
+            record_tool_admission("closed", start.elapsed());
+            Err(())
+        }
+    }
 }
 
 pub fn set_tool_execution_metrics_registry(

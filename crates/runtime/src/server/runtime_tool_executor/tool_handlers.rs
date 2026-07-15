@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 use astra_tools::ToolExecutor;
 use astra_tools::executor::SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES;
 use astra_tools::tool_engine::{
-    DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, WebSearchToolHandler,
+    DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, ToolInvocationMetadata,
+    WebSearchToolHandler,
 };
 
 use super::RuntimeToolExecutor;
@@ -253,13 +254,30 @@ impl ToolHandler<RuntimeToolExecutor> for TaskBoardToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::ToolResult::error(
                 "Task tool not executed: run was cancelled".to_string(),
             );
         }
-        crate::server::tool_task_runtime::execute_with_executor(context, args).await
+        crate::server::tool_task_runtime::execute_with_executor(context, args, invocation.run_id)
+            .await
     }
 }
 
@@ -274,6 +292,22 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::ToolResult::error(
@@ -284,6 +318,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
             &context.default_executor,
             context.agent_tool_context.as_ref(),
             args,
+            invocation.tool_call_id,
         )
         .await
     }
@@ -300,13 +335,34 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::ToolResult::error(
                 "Agent fanout not executed: run was cancelled".to_string(),
             );
         }
-        execute_agent_fanout_tool(context.agent_tool_context.as_ref(), args).await
+        execute_agent_fanout_tool(
+            context.agent_tool_context.as_ref(),
+            args,
+            invocation.tool_call_id,
+        )
+        .await
     }
 }
 
