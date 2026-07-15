@@ -199,6 +199,12 @@ pub struct ToolPolicySnapshot {
     pub max_execution_secs: Option<f64>,
     pub max_output_bytes: Option<usize>,
     pub max_background_session_secs: Option<f64>,
+    /// Opaque conditional-read instruction for the exact native provider
+    /// request. Unlike admission-only fields below, this is intentionally
+    /// serialized across transport boundaries. Transports that do not
+    /// understand the declared protocol must not fabricate an acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_read_condition: Option<astra_turn_types::SemanticReadCondition>,
     /// Exact provider policy already used by the permission gate. This is
     /// internal durable-decision input and is never forwarded to providers.
     #[serde(skip)]
@@ -713,6 +719,42 @@ mod tests {
             "internal cache authority must not be sent to providers: {encoded}"
         );
         assert!(!encoded.to_string().contains("revision-7"));
+    }
+
+    #[test]
+    fn conditional_read_instruction_crosses_the_transport_boundary_unchanged() {
+        let state = ExecutionBindingState::server_sandbox("/tmp/astra-workspace");
+        let mut request = state.tool_execution_request(
+            "user-1",
+            "session-1",
+            "provider_read",
+            &json!({"query": "status", "_run_id": "run-secret"}),
+        );
+        let freshness = astra_turn_types::SemanticReadFreshnessContext::new(
+            "tenant:user-1",
+            vec![
+                astra_turn_types::SemanticFreshnessFact::new(
+                    astra_turn_types::SemanticFreshnessScope::Provider,
+                    "provider-1",
+                    "revision-7",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let condition =
+            astra_turn_types::SemanticReadCondition::new("if-match", "etag-7", &freshness).unwrap();
+        request.policy.semantic_read_condition = Some(condition.clone());
+
+        let transport_request = request.with_transport_arguments();
+        assert_eq!(
+            transport_request.policy.semantic_read_condition,
+            Some(condition.clone())
+        );
+        assert!(transport_request.args.get("_run_id").is_none());
+        let restored: ToolExecutionRequest =
+            serde_json::from_value(serde_json::to_value(transport_request).unwrap()).unwrap();
+        assert_eq!(restored.policy.semantic_read_condition, Some(condition));
     }
 
     #[test]

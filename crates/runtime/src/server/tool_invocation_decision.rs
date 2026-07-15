@@ -142,7 +142,9 @@ impl ToolInvocationDecisionSnapshot {
             .admission_snapshot
             .clone()
             .ok_or(ToolInvocationDecisionError::MissingAdmissionSnapshot)?;
-        if request.policy.semantic_read_freshness.is_some() {
+        if request.policy.semantic_read_freshness.is_some()
+            || request.policy.semantic_read_condition.is_some()
+        {
             return Err(ToolInvocationDecisionError::UnexpectedSemanticReadFreshness);
         }
         let semantic_cache = resolve_semantic_read_cache_decision(provider_policy.as_ref())?;
@@ -153,6 +155,7 @@ impl ToolInvocationDecisionSnapshot {
         transport_policy.permission_grant = None;
         transport_policy.admission_snapshot = None;
         transport_policy.semantic_read_freshness = None;
+        transport_policy.semantic_read_condition = None;
 
         Ok(Self {
             contract_version: DECISION_CONTRACT_VERSION.to_string(),
@@ -337,6 +340,7 @@ impl ToolInvocationDecisionSnapshot {
         });
         request.policy.admission_snapshot = Some(self.admission.clone());
         request.policy.semantic_read_freshness = None;
+        request.policy.semantic_read_condition = None;
     }
 }
 

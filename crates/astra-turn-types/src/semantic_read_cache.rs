@@ -17,6 +17,8 @@ use crate::{
 
 pub const SEMANTIC_READ_CACHE_CONTRACT_VERSION: &str = "semantic-read-cache-v1";
 pub const SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION: &str = "semantic-read-observation-v1";
+pub const SEMANTIC_READ_CONDITION_CONTRACT_VERSION: &str = "semantic-read-condition-v1";
+pub const SEMANTIC_READ_CONDITION_ACK_METADATA_KEY: &str = "astra.semantic_read_condition_ack";
 pub const SEMANTIC_READ_OBSERVATION_MAX_BYTES: usize = 256 * 1024;
 const MAX_FRESHNESS_COMPONENT_BYTES: usize = 4096;
 const MAX_FRESHNESS_FACTS: usize = 64;
@@ -141,6 +143,145 @@ pub enum SemanticReadFreshnessUnavailableReason {
 pub enum SemanticReadFreshnessResolution {
     Available(SemanticReadFreshnessContext),
     Unavailable(SemanticReadFreshnessUnavailableReason),
+}
+
+/// Transport-owned conditional-read input for one exact provider dispatch.
+///
+/// `token` is deliberately opaque to Astra. It is never used as cache
+/// identity or emitted through observability; only the content-addressed
+/// `condition_id` and the already-redacted freshness context cross those
+/// boundaries. Native transports must translate the protocol/token pair into
+/// their provider's conditional request mechanism.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticReadCondition {
+    contract_version: String,
+    protocol: String,
+    token: String,
+    freshness_context_id: String,
+    condition_id: String,
+}
+
+impl std::fmt::Debug for SemanticReadCondition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticReadCondition")
+            .field("contract_version", &self.contract_version)
+            .field("protocol", &self.protocol)
+            .field("token", &"[REDACTED]")
+            .field("freshness_context_id", &self.freshness_context_id)
+            .field("condition_id", &self.condition_id)
+            .finish()
+    }
+}
+
+impl SemanticReadCondition {
+    pub fn new(
+        protocol: &str,
+        token: &str,
+        freshness: &SemanticReadFreshnessContext,
+    ) -> Result<Self, SemanticReadCacheContractError> {
+        validate_raw_component("condition_protocol", protocol)?;
+        validate_raw_component("condition_token", token)?;
+        freshness.validate()?;
+        let mut condition = Self {
+            contract_version: SEMANTIC_READ_CONDITION_CONTRACT_VERSION.to_string(),
+            protocol: protocol.to_string(),
+            token: token.to_string(),
+            freshness_context_id: freshness.context_id.clone(),
+            condition_id: String::new(),
+        };
+        condition.condition_id = condition_content_id(&condition)?;
+        Ok(condition)
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    pub fn freshness_context_id(&self) -> &str {
+        &self.freshness_context_id
+    }
+
+    pub fn condition_id(&self) -> &str {
+        &self.condition_id
+    }
+
+    pub fn validate(&self) -> Result<(), SemanticReadCacheContractError> {
+        if self.contract_version != SEMANTIC_READ_CONDITION_CONTRACT_VERSION {
+            return Err(SemanticReadCacheContractError::UnsupportedContractVersion(
+                self.contract_version.clone(),
+            ));
+        }
+        validate_raw_component("condition_protocol", &self.protocol)?;
+        validate_raw_component("condition_token", &self.token)?;
+        validate_content_id("freshness_context_id", &self.freshness_context_id)?;
+        validate_content_id("condition_id", &self.condition_id)?;
+        let expected = condition_content_id(self)?;
+        if expected != self.condition_id {
+            return Err(SemanticReadCacheContractError::ContentIdMismatch {
+                field: "condition_id",
+                expected,
+                actual: self.condition_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for SemanticReadCondition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawCondition {
+            contract_version: String,
+            protocol: String,
+            token: String,
+            freshness_context_id: String,
+            condition_id: String,
+        }
+
+        let raw = RawCondition::deserialize(deserializer)?;
+        let condition = Self {
+            contract_version: raw.contract_version,
+            protocol: raw.protocol,
+            token: raw.token,
+            freshness_context_id: raw.freshness_context_id,
+            condition_id: raw.condition_id,
+        };
+        condition.validate().map_err(serde::de::Error::custom)?;
+        Ok(condition)
+    }
+}
+
+/// Provider acknowledgement that the returned observation was evaluated
+/// under the exact conditional request attached to the dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticReadConditionAck {
+    contract_version: String,
+    condition_id: String,
+    freshness_context_id: String,
+}
+
+impl SemanticReadConditionAck {
+    pub fn for_condition(condition: &SemanticReadCondition) -> Self {
+        Self {
+            contract_version: SEMANTIC_READ_CONDITION_CONTRACT_VERSION.to_string(),
+            condition_id: condition.condition_id.clone(),
+            freshness_context_id: condition.freshness_context_id.clone(),
+        }
+    }
+
+    pub fn confirms(&self, condition: &SemanticReadCondition) -> bool {
+        self.contract_version == SEMANTIC_READ_CONDITION_CONTRACT_VERSION
+            && self.condition_id == condition.condition_id
+            && self.freshness_context_id == condition.freshness_context_id
+    }
 }
 
 impl SemanticReadFreshnessContext {
@@ -549,6 +690,25 @@ fn context_content_id(
         contract_version: &context.contract_version,
         security_scope_id: &context.security_scope_id,
         facts: &context.facts,
+    })
+}
+
+fn condition_content_id(
+    condition: &SemanticReadCondition,
+) -> Result<String, SemanticReadCacheContractError> {
+    #[derive(Serialize)]
+    struct ConditionContent<'a> {
+        contract_version: &'a str,
+        protocol: &'a str,
+        token: &'a str,
+        freshness_context_id: &'a str,
+    }
+
+    content_id(&ConditionContent {
+        contract_version: &condition.contract_version,
+        protocol: &condition.protocol,
+        token: &condition.token,
+        freshness_context_id: &condition.freshness_context_id,
     })
 }
 
@@ -969,5 +1129,58 @@ mod tests {
         let mut encoded = serde_json::to_value(&observation).unwrap();
         encoded["result"]["output"] = json!("tampered");
         assert!(serde_json::from_value::<SemanticReadObservation>(encoded).is_err());
+    }
+
+    #[test]
+    fn conditional_read_token_is_transportable_but_redacted_from_debug() {
+        let freshness = SemanticReadFreshnessContext::new(
+            "owner",
+            vec![fact(SemanticFreshnessScope::Resource, "resource", "rev-7")],
+        )
+        .unwrap();
+        let condition =
+            SemanticReadCondition::new("if-match", "sensitive-etag", &freshness).unwrap();
+
+        let debug = format!("{condition:?}");
+        assert!(!debug.contains("sensitive-etag"));
+        assert!(debug.contains("[REDACTED]"));
+        let restored: SemanticReadCondition =
+            serde_json::from_value(serde_json::to_value(&condition).unwrap()).unwrap();
+        assert_eq!(restored, condition);
+        assert_eq!(restored.token(), "sensitive-etag");
+    }
+
+    #[test]
+    fn conditional_read_identity_rejects_tampering() {
+        let freshness = SemanticReadFreshnessContext::new(
+            "owner",
+            vec![fact(SemanticFreshnessScope::Resource, "resource", "rev-7")],
+        )
+        .unwrap();
+        let condition = SemanticReadCondition::new("if-match", "etag-7", &freshness).unwrap();
+        let mut encoded = serde_json::to_value(condition).unwrap();
+        encoded["token"] = json!("etag-8");
+
+        assert!(serde_json::from_value::<SemanticReadCondition>(encoded).is_err());
+    }
+
+    #[test]
+    fn acknowledgement_confirms_only_the_exact_condition_and_context() {
+        let first_freshness = SemanticReadFreshnessContext::new(
+            "owner",
+            vec![fact(SemanticFreshnessScope::Resource, "resource", "rev-7")],
+        )
+        .unwrap();
+        let second_freshness = SemanticReadFreshnessContext::new(
+            "owner",
+            vec![fact(SemanticFreshnessScope::Resource, "resource", "rev-8")],
+        )
+        .unwrap();
+        let first = SemanticReadCondition::new("if-match", "etag-7", &first_freshness).unwrap();
+        let second = SemanticReadCondition::new("if-match", "etag-8", &second_freshness).unwrap();
+        let acknowledgement = SemanticReadConditionAck::for_condition(&first);
+
+        assert!(acknowledgement.confirms(&first));
+        assert!(!acknowledgement.confirms(&second));
     }
 }

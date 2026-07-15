@@ -63,10 +63,12 @@ pub use runtime_scaffolding::{
     scaffolding_body_prefixes_for_filtering,
 };
 pub use semantic_read_cache::{
-    SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION,
+    SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,
+    SEMANTIC_READ_CONDITION_CONTRACT_VERSION, SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION,
     SEMANTIC_READ_OBSERVATION_MAX_BYTES, SemanticFreshnessFact, SemanticFreshnessScope,
     SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadCacheLimits,
-    SemanticReadCacheLookup, SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
+    SemanticReadCacheLookup, SemanticReadCondition, SemanticReadConditionAck,
+    SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
     SemanticReadFreshnessUnavailableReason, SemanticReadObservation,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};

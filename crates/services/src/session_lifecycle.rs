@@ -267,6 +267,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         label: "semantic_read_observations",
         sql: "DELETE FROM semantic_read_observations WHERE session_id = ? AND user_id = ?",
     },
+    SessionDeleteStatement {
+        label: "semantic_read_observation_budgets",
+        sql: "DELETE FROM semantic_read_observation_budgets WHERE session_id = ? AND user_id = ?",
+    },
 ];
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[

@@ -48,7 +48,7 @@ impl DatabaseSemanticReadObservationStore {
             }
         })?;
         let mut tx = self.pool.get().begin().await?;
-        lock_session(&mut tx, user_id, session_id).await?;
+        lock_cache_budget(&mut tx, user_id, session_id).await?;
         sqlx::query(
             "DELETE FROM semantic_read_observations
              WHERE user_id = ? AND session_id = ? AND state = 'filling'
@@ -185,7 +185,7 @@ impl DatabaseSemanticReadObservationStore {
             }
         })?;
         let mut tx = self.pool.get().begin().await?;
-        lock_session(&mut tx, user_id, session_id).await?;
+        lock_cache_budget(&mut tx, user_id, session_id).await?;
         let row = load_entry_in_tx(&mut tx, user_id, session_id, &key.key_id)
             .await?
             .ok_or(SemanticReadObservationStoreError::MissingFill)?;
@@ -256,6 +256,44 @@ impl DatabaseSemanticReadObservationStore {
         Ok(())
     }
 
+    /// Renew one exact fill lease without taking the session-wide accounting
+    /// lock. The owner/key CAS is sufficient because renewal cannot change
+    /// entry counts or bytes.
+    pub async fn renew_fill(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        key: &SemanticReadCacheKey,
+        fill_owner: &str,
+        fill_lease_duration_ms: u64,
+    ) -> Result<(), SemanticReadObservationStoreError> {
+        validate_owner(fill_owner)?;
+        key.validate()?;
+        let lease_duration_us = lease_duration_us(fill_lease_duration_ms)?;
+        let renewed = sqlx::query(
+            "UPDATE semantic_read_observations
+             SET fill_lease_expires_at = TIMESTAMPADD(
+                     MICROSECOND, ?, CURRENT_TIMESTAMP(6)
+                 ),
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND key_id = ?
+               AND state = 'filling' AND fill_owner = ?
+               AND fill_lease_expires_at > CURRENT_TIMESTAMP(6)",
+        )
+        .bind(lease_duration_us)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(&key.key_id)
+        .bind(fill_owner)
+        .execute(self.pool.get())
+        .await?
+        .rows_affected();
+        if renewed != 1 {
+            return Err(SemanticReadObservationStoreError::FillOwnerOrLeaseMismatch);
+        }
+        Ok(())
+    }
+
     pub async fn abandon_fill(
         &self,
         user_id: &str,
@@ -266,7 +304,7 @@ impl DatabaseSemanticReadObservationStore {
         validate_owner(fill_owner)?;
         key.validate()?;
         let mut tx = self.pool.get().begin().await?;
-        lock_session(&mut tx, user_id, session_id).await?;
+        lock_cache_budget(&mut tx, user_id, session_id).await?;
         let deleted = sqlx::query(
             "DELETE FROM semantic_read_observations
              WHERE user_id = ? AND session_id = ? AND key_id = ?
@@ -297,20 +335,59 @@ struct StoredEntry {
     observation_bytes: Option<u64>,
 }
 
-async fn lock_session(
+async fn lock_cache_budget(
     tx: &mut Transaction<'_, MySql>,
     user_id: &str,
     session_id: &str,
 ) -> Result<(), SemanticReadObservationStoreError> {
     let exists: Option<String> = sqlx::query_scalar(
         "SELECT session_id FROM agent_sessions
-         WHERE session_id = ? AND user_id = ? FOR UPDATE",
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(session_id)
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?;
     if exists.is_none() {
+        return Err(SemanticReadObservationStoreError::SessionNotFound);
+    }
+    sqlx::query(
+        "INSERT IGNORE INTO semantic_read_observation_budgets (
+             user_id, session_id, created_at, updated_at
+         ) VALUES (?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
+    let locked: Option<String> = sqlx::query_scalar(
+        "SELECT session_id FROM semantic_read_observation_budgets
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if locked.is_none() {
+        return Err(SemanticReadObservationStoreError::BudgetLockMissing);
+    }
+    let session_still_exists: Option<String> = sqlx::query_scalar(
+        "SELECT session_id FROM agent_sessions
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if session_still_exists.is_none() {
+        sqlx::query(
+            "DELETE FROM semantic_read_observation_budgets
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await?;
         return Err(SemanticReadObservationStoreError::SessionNotFound);
     }
     Ok(())
@@ -542,6 +619,8 @@ pub enum SemanticReadObservationStoreError {
     Database(#[from] sqlx::Error),
     #[error("semantic read observation session does not exist or is not owned by the caller")]
     SessionNotFound,
+    #[error("semantic read observation budget lock disappeared during acquisition")]
+    BudgetLockMissing,
     #[error("semantic read cache fill owner must not be empty")]
     EmptyFillOwner,
     #[error(

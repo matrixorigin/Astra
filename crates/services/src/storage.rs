@@ -2169,6 +2169,18 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS semantic_read_observation_budgets (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS semantic_read_observations (
             user_id             VARCHAR(128) NOT NULL,
             session_id          VARCHAR(128) NOT NULL,

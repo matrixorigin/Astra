@@ -86,6 +86,13 @@ async fn cleanup_session(pool: &sqlx::MySqlPool, user_id: &str, session_id: &str
             .bind(session_id)
             .execute(pool)
             .await;
+    let _ = sqlx::query(
+        "DELETE FROM semantic_read_observation_budgets WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
         .bind(user_id)
         .bind(session_id)
@@ -125,6 +132,44 @@ async fn durable_store_enforces_fill_fencing_bounds_isolation_and_corruption_rem
             .await
             .expect("claim first"),
         SemanticReadCacheLookup::FillClaimed
+    );
+    assert!(matches!(
+        store
+            .renew_fill(&user_id, &session_id, &first, "wrong-owner", 30_000)
+            .await,
+        Err(SemanticReadObservationStoreError::FillOwnerOrLeaseMismatch)
+    ));
+    sqlx::query(
+        "UPDATE semantic_read_observations
+         SET fill_lease_expires_at = TIMESTAMPADD(SECOND, 1, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND key_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&first.key_id)
+    .execute(&pool)
+    .await
+    .expect("shorten fill lease before renewal");
+    store
+        .renew_fill(&user_id, &session_id, &first, "owner-a", 30_000)
+        .await
+        .expect("renew exact live owner lease");
+    let renewed_seconds: i64 = sqlx::query_scalar(
+        "SELECT CAST(TIMESTAMPDIFF(
+             SECOND, CURRENT_TIMESTAMP(6), fill_lease_expires_at
+         ) AS SIGNED)
+         FROM semantic_read_observations
+         WHERE user_id = ? AND session_id = ? AND key_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&first.key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read renewed fill lease");
+    assert!(
+        renewed_seconds >= 20,
+        "renewal must materially extend the lease"
     );
     assert!(matches!(
         store

@@ -1715,6 +1715,11 @@ async fn phase2_web_hydration_schema_contract() {
         "semantic observations must be owner/session scoped and content addressed"
     );
     assert_eq!(
+        primary_key_columns(&pool, &schema, "semantic_read_observation_budgets").await,
+        ["user_id", "session_id"],
+        "semantic cache aggregate accounting must use its own owner/session lock instead of the session authority row"
+    );
+    assert_eq!(
         index_columns(
             &pool,
             &schema,
