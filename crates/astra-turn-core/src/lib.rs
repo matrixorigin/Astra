@@ -59,6 +59,7 @@ pub mod input_classifier;
 pub mod interaction_types;
 pub mod interruption;
 pub mod introspect;
+pub mod invocation_ledger;
 pub mod lru_map;
 pub mod microcompact;
 pub mod observer;

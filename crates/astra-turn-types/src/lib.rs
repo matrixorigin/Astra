@@ -17,6 +17,7 @@ mod result_quality;
 mod runtime_scaffolding;
 pub mod session_facts;
 mod tool_idempotency;
+mod tool_invocation;
 mod user_intent;
 
 pub use agent_communication::{
@@ -61,4 +62,10 @@ pub use runtime_scaffolding::{
     scaffolding_body_prefixes_for_filtering,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
+pub use tool_invocation::{
+    DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CONTRACT_VERSION,
+    ToolInvocationContractError, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
+    canonical_public_arguments_hash, canonical_public_tool_arguments,
+};
 pub use user_intent::{UserIntentDelivery, UserIntentStatus};
