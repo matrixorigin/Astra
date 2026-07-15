@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use astra_turn_types::{
     DispatchCertainty, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use thiserror::Error;
 
@@ -36,6 +37,7 @@ impl InMemoryInvocationLedger {
             state: ToolInvocationState::Prepared,
             dispatch_certainty: DispatchCertainty::NotDispatched,
             attempt_count: 0,
+            outcome: None,
         };
         self.entries.insert(identity, entry.clone());
         Ok(ToolInvocationPrepareOutcome::Prepared(entry))
@@ -50,6 +52,14 @@ impl InMemoryInvocationLedger {
         next: ToolInvocationState,
         dispatch_certainty: DispatchCertainty,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        if matches!(
+            next,
+            ToolInvocationState::Succeeded
+                | ToolInvocationState::Failed
+                | ToolInvocationState::Rejected
+        ) {
+            return Err(InvocationLedgerError::TerminalOutcomeRequired { state: next });
+        }
         let entry = self.entries.get_mut(identity).ok_or_else(|| {
             InvocationLedgerError::MissingInvocation {
                 identity: identity.clone(),
@@ -86,6 +96,38 @@ impl InMemoryInvocationLedger {
         Ok(entry.clone())
     }
 
+    pub fn compare_and_complete(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        expected: ToolInvocationState,
+        outcome: ToolInvocationTerminalOutcome,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let next = outcome.state();
+        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if entry.state != expected {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity: identity.clone(),
+                expected,
+                actual: entry.state,
+            });
+        }
+        if !expected.can_transition_to(next) {
+            return Err(InvocationLedgerError::IllegalTransition {
+                identity: identity.clone(),
+                from: expected,
+                to: next,
+            });
+        }
+        entry.state = next;
+        entry.dispatch_certainty = DispatchCertainty::Dispatched;
+        entry.outcome = Some(outcome);
+        Ok(entry.clone())
+    }
+
     pub fn get(&self, identity: &ToolInvocationIdentity) -> Option<&ToolInvocationRecord> {
         self.entries.get(identity)
     }
@@ -119,13 +161,17 @@ pub enum InvocationLedgerError {
         expected: DispatchCertainty,
         actual: DispatchCertainty,
     },
+    #[error("terminal state {state:?} requires a typed invocation outcome")]
+    TerminalOutcomeRequired { state: ToolInvocationState },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_turn_types::DurableToolReference;
+    use astra_turn_types::ToolInvocationResultPayload;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn identity(invocation_id: &str) -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user", "session", "run", "turn", invocation_id).unwrap()
@@ -138,6 +184,16 @@ mod tests {
             "policy-v1",
         )
         .unwrap()
+    }
+
+    fn success(output: &str) -> ToolInvocationTerminalOutcome {
+        ToolInvocationTerminalOutcome::Succeeded {
+            result: ToolInvocationResultPayload {
+                output: output.to_string(),
+                metadata: BTreeMap::new(),
+                exit_semantics: None,
+            },
+        }
     }
 
     #[test]
@@ -234,15 +290,44 @@ mod tests {
             Err(InvocationLedgerError::IllegalTransition { .. })
         ));
         let reconciled = ledger
-            .compare_and_transition(
+            .compare_and_complete(
                 &identity,
                 ToolInvocationState::OutcomeUnknown,
-                ToolInvocationState::Succeeded,
-                DispatchCertainty::Dispatched,
+                success("deployed"),
             )
             .unwrap();
         assert_eq!(reconciled.state, ToolInvocationState::Succeeded);
         assert_eq!(reconciled.attempt_count, 1);
+        assert_eq!(reconciled.outcome.unwrap().result().output, "deployed");
+    }
+
+    #[test]
+    fn terminal_transition_without_typed_outcome_is_rejected() {
+        let mut ledger = InMemoryInvocationLedger::default();
+        let identity = identity("call-1");
+        ledger
+            .prepare(identity.clone(), fingerprint("deploy"))
+            .unwrap();
+        ledger
+            .compare_and_transition(
+                &identity,
+                ToolInvocationState::Prepared,
+                ToolInvocationState::Dispatched,
+                DispatchCertainty::Dispatched,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ledger.compare_and_transition(
+                &identity,
+                ToolInvocationState::Dispatched,
+                ToolInvocationState::Succeeded,
+                DispatchCertainty::Dispatched,
+            ),
+            Err(InvocationLedgerError::TerminalOutcomeRequired {
+                state: ToolInvocationState::Succeeded
+            })
+        ));
     }
 
     #[test]

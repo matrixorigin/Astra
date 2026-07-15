@@ -11,9 +11,11 @@ use astra_services::tool_invocation_ledger::{
 };
 use astra_turn_types::{
     DispatchCertainty, DurableToolReference, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationState,
+    ToolInvocationPrepareOutcome, ToolInvocationResultPayload, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 fn identity(prefix: &str, invocation_id: &str) -> ToolInvocationIdentity {
@@ -34,6 +36,28 @@ fn fingerprint(command: &str) -> ToolInvocationFingerprint {
         "policy-v1",
     )
     .unwrap()
+}
+
+fn success(output: &str) -> ToolInvocationTerminalOutcome {
+    ToolInvocationTerminalOutcome::Succeeded {
+        result: ToolInvocationResultPayload {
+            output: output.to_string(),
+            metadata: BTreeMap::new(),
+            exit_semantics: None,
+        },
+    }
+}
+
+fn failure(output: &str) -> ToolInvocationTerminalOutcome {
+    ToolInvocationTerminalOutcome::Failed {
+        result: ToolInvocationResultPayload {
+            output: output.to_string(),
+            metadata: BTreeMap::from([("provider_request_id".to_string(), json!("req-9"))]),
+            exit_semantics: Some("execution_error".to_string()),
+        },
+        error_kind: Some("provider_failure".to_string()),
+        retryable: false,
+    }
 }
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdentity) {
@@ -111,6 +135,35 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         1,
         "the losing worker must observe the authoritative dispatched state: {race_results:?}"
     );
+    assert!(matches!(
+        ledger
+            .compare_and_transition(
+                &second,
+                ToolInvocationState::Dispatched,
+                ToolInvocationState::Failed,
+                DispatchCertainty::Dispatched,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::TerminalOutcomeRequired {
+            state: ToolInvocationState::Failed
+        })
+    ));
+    let failed = ledger
+        .compare_and_complete(
+            &second,
+            ToolInvocationState::Dispatched,
+            &failure("provider failed"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.state, ToolInvocationState::Failed);
+    assert_eq!(failed.outcome.unwrap().result().output, "provider failed");
+    assert!(matches!(
+        ledger.prepare(&second, &original).await.unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Failed
+                && record.outcome.as_ref().unwrap().result().output == "provider failed"
+    ));
 
     let dispatched = ledger
         .compare_and_transition(
@@ -158,16 +211,34 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         Err(ToolInvocationLedgerStoreError::IllegalTransition { .. })
     ));
     let reconciled = ledger
-        .compare_and_transition(
+        .compare_and_complete(
             &first,
             ToolInvocationState::OutcomeUnknown,
-            ToolInvocationState::Succeeded,
-            DispatchCertainty::Dispatched,
+            &success("deployed"),
         )
         .await
         .unwrap();
     assert_eq!(reconciled.state, ToolInvocationState::Succeeded);
     assert_eq!(reconciled.attempt_count, 1);
+    assert_eq!(reconciled.outcome.unwrap().result().output, "deployed");
+
+    sqlx::query(
+        "UPDATE tool_invocation_ledger SET outcome_json = NULL
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND turn_chain_id = ? AND invocation_id = ?",
+    )
+    .bind(&first.user_id)
+    .bind(&first.session_id)
+    .bind(&first.run_id)
+    .bind(&first.turn_chain_id)
+    .bind(&first.invocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        ledger.get(&first).await,
+        Err(ToolInvocationLedgerStoreError::Contract(_))
+    ));
 
     cleanup(&pool, &first).await;
 }

@@ -7,6 +7,7 @@ use astra_core::SharedPool;
 use astra_turn_types::{
     DispatchCertainty, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
@@ -94,6 +95,14 @@ impl DatabaseToolInvocationLedger {
         next: ToolInvocationState,
         dispatch_certainty: DispatchCertainty,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        if matches!(
+            next,
+            ToolInvocationState::Succeeded
+                | ToolInvocationState::Failed
+                | ToolInvocationState::Rejected
+        ) {
+            return Err(ToolInvocationLedgerStoreError::TerminalOutcomeRequired { state: next });
+        }
         if !expected.can_transition_to(next) {
             return Err(ToolInvocationLedgerStoreError::IllegalTransition {
                 from: expected,
@@ -152,6 +161,69 @@ impl DatabaseToolInvocationLedger {
         tx.commit().await?;
         Ok(record)
     }
+
+    /// Atomically persist an acknowledged terminal outcome with its state.
+    /// A replay can observe either the pre-terminal state or the complete
+    /// typed outcome, never a terminal marker without replay material.
+    pub async fn compare_and_complete(
+        &self,
+        identity: &ToolInvocationIdentity,
+        expected: ToolInvocationState,
+        outcome: &ToolInvocationTerminalOutcome,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        let next = outcome.state();
+        if !expected.can_transition_to(next) {
+            return Err(ToolInvocationLedgerStoreError::IllegalTransition {
+                from: expected,
+                to: next,
+            });
+        }
+        let outcome_json = serde_json::to_string(outcome).map_err(|source| {
+            ToolInvocationLedgerStoreError::Serialization {
+                field: "outcome_json",
+                source,
+            }
+        })?;
+        let mut tx = self.pool.get().begin().await?;
+        let updated = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = ?, dispatch_certainty = 'dispatched', outcome_json = ?,
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ? AND state = ?",
+        )
+        .bind(state_label(next))
+        .bind(outcome_json)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .bind(state_label(expected))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let record = load_record_in_tx(&mut tx, identity).await?;
+        if updated != 1 {
+            rollback(tx, "compare-and-complete mismatch").await;
+            return match record {
+                Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
+                    identity: identity.clone(),
+                    expected,
+                    actual: actual.state,
+                }),
+                None => Err(ToolInvocationLedgerStoreError::NotFound {
+                    identity: identity.clone(),
+                }),
+            };
+        }
+        let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
+            identity: identity.clone(),
+        })?;
+        tx.commit().await?;
+        Ok(record)
+    }
 }
 
 fn select_record_query(
@@ -159,6 +231,7 @@ fn select_record_query(
 ) -> sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments> {
     sqlx::query(
         "SELECT CAST(fingerprint_json AS CHAR) AS fingerprint_json,
+                CAST(outcome_json AS CHAR) AS outcome_json,
                 state, dispatch_certainty, attempt_count
          FROM tool_invocation_ledger
          WHERE user_id = ? AND session_id = ? AND run_id = ?
@@ -195,6 +268,17 @@ fn decode_record(
     let state_raw: String = row.try_get("state")?;
     let certainty_raw: String = row.try_get("dispatch_certainty")?;
     let attempt_count: u64 = row.try_get("attempt_count")?;
+    let outcome_json: Option<String> = row.try_get("outcome_json")?;
+    let outcome = outcome_json
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|source| {
+                ToolInvocationLedgerStoreError::InvalidStoredJson {
+                    field: "outcome_json",
+                    source,
+                }
+            })
+        })
+        .transpose()?;
     if attempt_count > u64::from(u32::MAX) {
         return Err(ToolInvocationLedgerStoreError::InvalidAttemptCount(
             attempt_count,
@@ -210,13 +294,16 @@ fn decode_record(
             actual: dispatch_certainty,
         });
     }
-    Ok(ToolInvocationRecord {
+    let record = ToolInvocationRecord {
         identity: identity.clone(),
         fingerprint,
         state,
         dispatch_certainty,
         attempt_count: attempt_count as u32,
-    })
+        outcome,
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
@@ -316,6 +403,10 @@ pub enum ToolInvocationLedgerStoreError {
     InvalidDispatchCertainty(String),
     #[error("invalid stored tool invocation attempt_count {0}")]
     InvalidAttemptCount(u64),
+    #[error("terminal state {state:?} requires a typed invocation outcome")]
+    TerminalOutcomeRequired { state: ToolInvocationState },
+    #[error(transparent)]
+    Contract(#[from] astra_turn_types::ToolInvocationContractError),
 }
 
 #[cfg(test)]

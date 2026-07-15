@@ -1652,6 +1652,13 @@ async fn phase2_web_hydration_schema_contract() {
         ],
         "tool invocation durability must use the complete owner/run/turn/invocation identity"
     );
+    assert!(
+        column_names(&pool, &schema, "tool_invocation_ledger")
+            .await
+            .iter()
+            .any(|column| column == "outcome_json"),
+        "tool invocation terminal state and replay outcome must share one durable row"
+    );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
     for expected in [

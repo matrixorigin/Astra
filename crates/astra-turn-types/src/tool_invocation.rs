@@ -277,15 +277,127 @@ pub enum DispatchCertainty {
     Unknown,
 }
 
+/// Durable, replayable result returned by one acknowledged invocation. The
+/// payload is the bounded runtime projection, not an unbounded provider body;
+/// large raw evidence belongs in an owner-scoped artifact referenced by
+/// metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationResultPayload {
+    pub output: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_semantics: Option<String>,
+}
+
+/// Typed acknowledged outcome. Transport ambiguity is represented by the
+/// ledger's `OutcomeUnknown` state and therefore has no fabricated payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolInvocationTerminalOutcome {
+    Succeeded {
+        result: ToolInvocationResultPayload,
+    },
+    Failed {
+        result: ToolInvocationResultPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        retryable: bool,
+    },
+    Rejected {
+        result: ToolInvocationResultPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rejection_code: Option<String>,
+        retryable: bool,
+    },
+}
+
+impl ToolInvocationTerminalOutcome {
+    pub fn state(&self) -> ToolInvocationState {
+        match self {
+            Self::Succeeded { .. } => ToolInvocationState::Succeeded,
+            Self::Failed { .. } => ToolInvocationState::Failed,
+            Self::Rejected { .. } => ToolInvocationState::Rejected,
+        }
+    }
+
+    pub fn result(&self) -> &ToolInvocationResultPayload {
+        match self {
+            Self::Succeeded { result }
+            | Self::Failed { result, .. }
+            | Self::Rejected { result, .. } => result,
+        }
+    }
+}
+
 /// Portable durable ledger row. Storage adapters may add database timestamps,
 /// but identity, fingerprint, state, certainty, and attempts are shared facts.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ToolInvocationRecord {
     pub identity: ToolInvocationIdentity,
     pub fingerprint: ToolInvocationFingerprint,
     pub state: ToolInvocationState,
     pub dispatch_certainty: DispatchCertainty,
     pub attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ToolInvocationTerminalOutcome>,
+}
+
+impl ToolInvocationRecord {
+    pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
+        let required_certainty = self.state.required_dispatch_certainty();
+        if self.dispatch_certainty != required_certainty {
+            return Err(ToolInvocationContractError::RecordCertaintyMismatch {
+                state: self.state,
+                expected: required_certainty,
+                actual: self.dispatch_certainty,
+            });
+        }
+        match (&self.outcome, self.state) {
+            (Some(outcome), state) if outcome.state() == state => Ok(()),
+            (
+                None,
+                ToolInvocationState::Succeeded
+                | ToolInvocationState::Failed
+                | ToolInvocationState::Rejected,
+            ) => Err(ToolInvocationContractError::MissingTerminalOutcome { state: self.state }),
+            (None, _) => Ok(()),
+            (Some(outcome), _) => Err(ToolInvocationContractError::OutcomeStateMismatch {
+                state: self.state,
+                outcome_state: outcome.state(),
+            }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInvocationRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawRecord {
+            identity: ToolInvocationIdentity,
+            fingerprint: ToolInvocationFingerprint,
+            state: ToolInvocationState,
+            dispatch_certainty: DispatchCertainty,
+            attempt_count: u32,
+            #[serde(default)]
+            outcome: Option<ToolInvocationTerminalOutcome>,
+        }
+
+        let raw = RawRecord::deserialize(deserializer)?;
+        let record = Self {
+            identity: raw.identity,
+            fingerprint: raw.fingerprint,
+            state: raw.state,
+            dispatch_certainty: raw.dispatch_certainty,
+            attempt_count: raw.attempt_count,
+            outcome: raw.outcome,
+        };
+        record.validate().map_err(serde::de::Error::custom)?;
+        Ok(record)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +450,23 @@ pub enum ToolInvocationContractError {
     EmptyToolReferenceField { field: &'static str },
     #[error("tool invocation canonical arguments hash must not be empty")]
     EmptyCanonicalArgumentsHash,
+    #[error("tool invocation terminal state {state:?} is missing its typed outcome")]
+    MissingTerminalOutcome { state: ToolInvocationState },
+    #[error(
+        "tool invocation outcome state {outcome_state:?} is inconsistent with ledger state {state:?}"
+    )]
+    OutcomeStateMismatch {
+        state: ToolInvocationState,
+        outcome_state: ToolInvocationState,
+    },
+    #[error(
+        "tool invocation dispatch certainty {actual:?} is inconsistent with state {state:?}; expected {expected:?}"
+    )]
+    RecordCertaintyMismatch {
+        state: ToolInvocationState,
+        expected: DispatchCertainty,
+        actual: DispatchCertainty,
+    },
 }
 
 #[cfg(test)]
@@ -452,6 +581,69 @@ mod tests {
         assert!(
             empty_policy.to_string().contains("policy decision"),
             "{empty_policy}"
+        );
+    }
+
+    #[test]
+    fn durable_record_rejects_terminal_state_without_matching_outcome() {
+        let base = json!({
+            "identity": identity("call-1"),
+            "fingerprint": ToolInvocationFingerprint::new(
+                tool_ref(),
+                &json!({"command": "deploy"}),
+                "policy-v1"
+            ).unwrap(),
+            "state": "succeeded",
+            "dispatch_certainty": "dispatched",
+            "attempt_count": 1
+        });
+        let missing = serde_json::from_value::<ToolInvocationRecord>(base.clone()).unwrap_err();
+        assert!(missing.to_string().contains("missing"), "{missing}");
+
+        let mut mismatched = base;
+        mismatched["outcome"] = json!({
+            "kind": "failed",
+            "result": {"output": "failed"},
+            "retryable": false
+        });
+        let mismatch = serde_json::from_value::<ToolInvocationRecord>(mismatched).unwrap_err();
+        assert!(mismatch.to_string().contains("inconsistent"), "{mismatch}");
+    }
+
+    #[test]
+    fn typed_terminal_outcome_round_trips_replay_payload() {
+        let outcome = ToolInvocationTerminalOutcome::Failed {
+            result: ToolInvocationResultPayload {
+                output: "permission denied".to_string(),
+                metadata: BTreeMap::from([(
+                    "provider_trace".to_string(),
+                    json!({"request": "req-7"}),
+                )]),
+                exit_semantics: Some("execution_error".to_string()),
+            },
+            error_kind: Some("permission_denied".to_string()),
+            retryable: false,
+        };
+        let record = ToolInvocationRecord {
+            identity: identity("call-1"),
+            fingerprint: ToolInvocationFingerprint::new(
+                tool_ref(),
+                &json!({"command": "deploy"}),
+                "policy-v1",
+            )
+            .unwrap(),
+            state: ToolInvocationState::Failed,
+            dispatch_certainty: DispatchCertainty::Dispatched,
+            attempt_count: 1,
+            outcome: Some(outcome),
+        };
+
+        let restored: ToolInvocationRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(restored, record);
+        assert_eq!(
+            restored.outcome.unwrap().result().output,
+            "permission denied"
         );
     }
 }
