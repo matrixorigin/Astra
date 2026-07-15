@@ -73,13 +73,14 @@ pub(crate) mod tool_binding_projection;
 pub(crate) mod tool_database_snapshots;
 pub(crate) mod tool_edge_selection;
 pub(crate) mod tool_edge_transport;
-pub(crate) mod tool_exactly_once;
 pub(crate) mod tool_execution_binding;
 pub(crate) mod tool_execution_result;
 pub(crate) mod tool_execution_service;
 pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
+pub(crate) mod tool_invocation_decision;
+pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;
 pub(crate) mod tool_local_transport;
 

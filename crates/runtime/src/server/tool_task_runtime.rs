@@ -115,7 +115,7 @@ pub(crate) struct TaskToolOutcome {
 }
 
 pub(crate) fn public_task_arguments(args: &Value) -> Value {
-    crate::server::tool_exactly_once::public_tool_arguments(args)
+    astra_turn_types::canonical_public_tool_arguments(args)
 }
 
 pub(crate) async fn task_list(task_manager: &TaskManager, args: &Value) -> String {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -198,6 +199,45 @@ pub struct ToolPolicySnapshot {
     pub max_execution_secs: Option<f64>,
     pub max_output_bytes: Option<usize>,
     pub max_background_session_secs: Option<f64>,
+    /// Exact provider policy already used by the permission gate. This is
+    /// internal durable-decision input and is never forwarded to providers.
+    #[serde(skip)]
+    pub resolved_provider_policy:
+        Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
+    /// Acknowledged grant that allowed this invocation to reach dispatch.
+    #[serde(skip)]
+    pub permission_grant: Option<ToolPermissionGrantSnapshot>,
+    /// Frozen administrator admission facts used by both decision hashing and
+    /// route execution, preventing policy TOCTOU within one invocation.
+    #[serde(skip)]
+    pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionAdmissionSnapshot {
+    /// Whether the exact selected offer was disabled at decision time.
+    pub selected_offer_disabled: bool,
+    /// Exact allowlist for the selected provider. `None` means that provider
+    /// had no configured allowlist; unrelated providers are intentionally not
+    /// part of this invocation's decision identity.
+    pub selected_provider_allowed_tools: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionGrantSource {
+    Policy,
+    ImplicitPolicy,
+    ParentApproval,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissionGrantSnapshot {
+    pub source: ToolPermissionGrantSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

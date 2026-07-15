@@ -32,7 +32,7 @@ use super::tool_transport_metadata::{
 ///
 /// Eliminates semi-constructed state by requiring all dependencies to be
 /// set before building the final service.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ToolExecutionServiceBuilder {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
@@ -42,6 +42,21 @@ pub struct ToolExecutionServiceBuilder {
     tool_registry: astra_runtime_env::ToolRegistry,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
     provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+}
+
+impl Default for ToolExecutionServiceBuilder {
+    fn default() -> Self {
+        Self {
+            edge_connection_pool: None,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
+            gateway_relay_transport: None,
+            sandbox_resident_agent_transport: None,
+            tool_registry: astra_runtime_env::ToolRegistry::builtins(),
+            disabled_tool_offers: Arc::new(RwLock::new(HashSet::new())),
+            provider_allowed_tools: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 impl ToolExecutionServiceBuilder {
@@ -203,6 +218,33 @@ impl ToolExecutionService {
 
     pub fn provider_allowed_tools_handle(&self) -> Arc<RwLock<HashMap<String, HashSet<String>>>> {
         Arc::clone(&self.provider_allowed_tools)
+    }
+
+    pub(crate) async fn invocation_admission_snapshot(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> super::tool_execution_binding::ToolExecutionAdmissionSnapshot {
+        let selected_offer_disabled = if let Some(offer) = request.selected_offer.as_ref() {
+            self.disabled_tool_offers
+                .read()
+                .await
+                .contains(&offer.offer_id)
+        } else {
+            false
+        };
+        let selected_provider_allowed_tools = if let Some(offer) = request.selected_offer.as_ref() {
+            self.provider_allowed_tools
+                .read()
+                .await
+                .get(&offer.provider_id)
+                .map(|tools| tools.iter().cloned().collect())
+        } else {
+            None
+        };
+        super::tool_execution_binding::ToolExecutionAdmissionSnapshot {
+            selected_offer_disabled,
+            selected_provider_allowed_tools,
+        }
     }
 
     pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
@@ -380,8 +422,30 @@ impl ToolExecutionService {
         }
 
         // ── Runtime offer policy check (admin API / config) ──
-        let disabled_offer_ids = self.disabled_tool_offers.read().await.clone();
-        let provider_allowed_tools = self.provider_allowed_tools.read().await.clone();
+        let (disabled_offer_ids, provider_allowed_tools) = if let Some(snapshot) =
+            transport_request.policy.admission_snapshot.as_ref()
+        {
+            let disabled_offer_ids = transport_request
+                .selected_offer
+                .as_ref()
+                .filter(|_| snapshot.selected_offer_disabled)
+                .map(|offer| HashSet::from([offer.offer_id.clone()]))
+                .unwrap_or_default();
+            let provider_allowed_tools = transport_request
+                .selected_offer
+                .as_ref()
+                .zip(snapshot.selected_provider_allowed_tools.as_ref())
+                .map(|(offer, tools)| {
+                    HashMap::from([(offer.provider_id.clone(), tools.iter().cloned().collect())])
+                })
+                .unwrap_or_default();
+            (disabled_offer_ids, provider_allowed_tools)
+        } else {
+            (
+                self.disabled_tool_offers.read().await.clone(),
+                self.provider_allowed_tools.read().await.clone(),
+            )
+        };
         let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
             &[],
@@ -407,6 +471,24 @@ impl ToolExecutionService {
             meta.insert(
                 "tool_offer_id".to_string(),
                 serde_json::Value::String(offer_id.clone()),
+            );
+            meta.insert(
+                "error_kind".to_string(),
+                serde_json::Value::String("policy_denied".to_string()),
+            );
+            meta.insert(
+                "rejection_code".to_string(),
+                serde_json::Value::String("tool_offer_disabled".to_string()),
+            );
+            meta.insert("blocked".to_string(), serde_json::Value::Bool(true));
+            meta.insert("retryable".to_string(), serde_json::Value::Bool(false));
+            meta.insert(
+                "execution_started".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            meta.insert(
+                "side_effects_maybe".to_string(),
+                serde_json::Value::Bool(false),
             );
             return astra_tools::ToolResult {
                 output: format!(
@@ -437,6 +519,24 @@ impl ToolExecutionService {
             meta.insert(
                 "provider_id".to_string(),
                 serde_json::Value::String(provider_id.clone()),
+            );
+            meta.insert(
+                "error_kind".to_string(),
+                serde_json::Value::String("policy_denied".to_string()),
+            );
+            meta.insert(
+                "rejection_code".to_string(),
+                serde_json::Value::String("provider_tool_disallowed".to_string()),
+            );
+            meta.insert("blocked".to_string(), serde_json::Value::Bool(true));
+            meta.insert("retryable".to_string(), serde_json::Value::Bool(false));
+            meta.insert(
+                "execution_started".to_string(),
+                serde_json::Value::Bool(false),
+            );
+            meta.insert(
+                "side_effects_maybe".to_string(),
+                serde_json::Value::Bool(false),
             );
             return astra_tools::ToolResult {
                 output: format!(
@@ -814,6 +914,77 @@ mod tests {
         let _ = ToolExecutionService::builder()
             .initial_disabled_tool_offers(&["web_fetch".to_string()])
             .build();
+    }
+
+    #[test]
+    fn default_service_uses_the_canonical_builtin_registry() {
+        let service = ToolExecutionService::new_for_test();
+
+        assert!(service.tool_registry().get("task_board").is_some());
+        assert!(service.tool_registry().get("read_file").is_some());
+    }
+
+    #[tokio::test]
+    async fn invocation_admission_snapshot_excludes_unrelated_provider_policy() {
+        let service = ToolExecutionService::builder()
+            .initial_disabled_tool_offers(&[
+                "read_file@provider-a".to_string(),
+                "write_file@provider-b".to_string(),
+            ])
+            .initial_provider_allowed_tools(HashMap::from([
+                (
+                    "provider-a".to_string(),
+                    HashSet::from(["read_file".to_string()]),
+                ),
+                (
+                    "provider-b".to_string(),
+                    HashSet::from(["write_file".to_string()]),
+                ),
+            ]))
+            .build();
+        let request = ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn_chain_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            args: serde_json::json!({"path": "/workspace/file.txt"}),
+            workspace: WorkspaceBinding::server_sandbox("/workspace"),
+            workspace_record: None,
+            executor: ExecutorBinding::server_local(),
+            runtime: None,
+            selected_offer: Some(
+                super::super::tool_execution_binding::SelectedToolOfferSnapshot {
+                    offer_id: "read_file@provider-a".to_string(),
+                    provider_id: "provider-a".to_string(),
+                    route: ToolExecutionRouteKind::ServerLocal,
+                },
+            ),
+            policy: Default::default(),
+        };
+
+        let snapshot = service.invocation_admission_snapshot(&request).await;
+        assert!(snapshot.selected_offer_disabled);
+        assert_eq!(
+            snapshot.selected_provider_allowed_tools,
+            Some(std::collections::BTreeSet::from(["read_file".to_string()]))
+        );
+
+        service
+            .enable_tool_offer("write_file@provider-b")
+            .await
+            .unwrap();
+        service
+            .provider_allowed_tools_handle()
+            .write()
+            .await
+            .insert("provider-b".to_string(), HashSet::new());
+        assert_eq!(
+            service.invocation_admission_snapshot(&request).await,
+            snapshot,
+            "unrelated provider changes must not invalidate this invocation"
+        );
     }
 
     #[test]

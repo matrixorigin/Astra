@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::server::tool_exactly_once;
 use crate::server::tool_execution_binding::WorkspaceBinding;
 use crate::server::tool_execution_result::workspace_path_mismatch_tool_result;
 use crate::server::tool_plan_gate::{is_plan_mode_blocked_tool, plan_mode_blocked_tool_result};
@@ -26,7 +25,6 @@ pub(crate) struct LocalToolPreflightContext<'a> {
     pub(crate) workspace_root: &'a Path,
     pub(crate) workspace_binding: &'a WorkspaceBinding,
     pub(crate) approval_gate: Option<&'a dyn astra_tools::ToolApprovalGate>,
-    pub(crate) exactly_once_executor: Option<&'a tool_exactly_once::ExactlyOnceState>,
     pub(crate) plan_mode_authoring_active: bool,
 }
 
@@ -57,11 +55,6 @@ pub(crate) async fn run_local_tool_preflight(
     .await
     {
         return LocalToolPreflight::ShortCircuit(result);
-    }
-
-    if let Some(cached) = tool_exactly_once::check_cache(context.exactly_once_executor, name, args)
-    {
-        return LocalToolPreflight::ShortCircuit(cached);
     }
 
     LocalToolPreflight::Continue
@@ -218,7 +211,6 @@ pub(crate) struct LocalToolExecutionLifecycle<'a> {
     pub(crate) aggregate_output_bytes: &'a AtomicUsize,
     pub(crate) memoria_client: &'a astra_tools::memoria::MemoriaToolGateway,
     pub(crate) progress_callback: Option<&'a dyn astra_tools::ToolProgressCallback>,
-    pub(crate) exactly_once_executor: Option<&'a tool_exactly_once::ExactlyOnceState>,
 }
 
 impl<'a> LocalToolExecutionLifecycle<'a> {
@@ -233,7 +225,6 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
     pub(crate) async fn finish(
         &self,
         name: &str,
-        args: &Value,
         call_id: &str,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
@@ -250,8 +241,6 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
                 .tool_completed(call_id, &result.output, !result.is_error)
                 .await;
         }
-        tool_exactly_once::record_result(self.exactly_once_executor, name, args, &result).await;
-
         result
     }
 }

@@ -49,6 +49,13 @@ impl ResolvedInvocationPolicy {
     pub fn is_read_only(&self) -> bool {
         self.effect == ResolvedToolEffect::ReadOnly
     }
+
+    /// Content-addressed descriptor semantic baseline. Runtime admission,
+    /// authority, route, approval outcome and argument refinements must be
+    /// combined with this ID to form the final per-invocation decision.
+    pub fn baseline_content_id(&self) -> Result<String, ProviderResolutionError> {
+        hash_serializable(self)
+    }
 }
 
 /// Request/session-scoped alias index. It is deliberately not process-global:
@@ -610,6 +617,16 @@ mod tests {
         assert_eq!(
             unknown.semantic_cache,
             ResolvedSemanticCacheBaseline::Disabled
+        );
+        assert_eq!(
+            read.baseline_content_id().unwrap(),
+            read.clone().baseline_content_id().unwrap()
+        );
+        let mut changed = read.clone();
+        changed.approval = ProviderApprovalBaseline::RequiresApproval;
+        assert_ne!(
+            read.baseline_content_id().unwrap(),
+            changed.baseline_content_id().unwrap()
         );
     }
 

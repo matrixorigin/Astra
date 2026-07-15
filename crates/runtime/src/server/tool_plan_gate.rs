@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
 /// injector. Populated on first access per plan-mode state change; cleared
@@ -28,12 +28,25 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
 }
 
 pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(format!(
+    let mut result = astra_tools::ToolResult::error(format!(
         "Tool '{tool}' is blocked while plan mode is active. \
          Use read-only tools to finish the plan, then call \
          `exit_plan_mode(plan='...')` to submit it for trusted user \
          approval before write tools can run."
-    ))
+    ));
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String("policy_denied".to_string()),
+        ),
+        (
+            "rejection_code".to_string(),
+            Value::String("plan_mode_active".to_string()),
+        ),
+        ("blocked".to_string(), Value::Bool(true)),
+        ("retryable".to_string(), Value::Bool(false)),
+    ]));
+    result
 }
 
 pub(crate) async fn plan_mode_authoring_active(

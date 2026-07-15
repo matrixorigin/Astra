@@ -6900,10 +6900,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
+            // Enable durable logical-invocation delivery.
+            // Bind logical invocation identity to the durable ledger so
+            // resume/reconnect cannot semantically collapse distinct calls.
+            executor.enable_durable_invocations();
 
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
@@ -8003,10 +8003,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
+            // Enable durable logical-invocation delivery.
+            // Bind logical invocation identity to the durable ledger so
+            // resume/reconnect cannot semantically collapse distinct calls.
+            executor.enable_durable_invocations();
 
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
@@ -10759,10 +10759,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
+            // Enable durable logical-invocation delivery.
+            // Bind logical invocation identity to the durable ledger so
+            // resume/reconnect cannot semantically collapse distinct calls.
+            executor.enable_durable_invocations();
 
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.

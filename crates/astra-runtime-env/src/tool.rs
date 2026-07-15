@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -244,6 +245,15 @@ impl ToolRegistry {
 
     pub fn iter(&self) -> impl Iterator<Item = &ToolSpec> {
         self.tools.values()
+    }
+
+    /// Content-addressed contract of one built-in tool. Unrelated registry
+    /// additions do not invalidate durable invocations of this tool.
+    pub fn tool_contract_version(&self, name: &str) -> Option<String> {
+        let spec = self.get(name)?;
+        let encoded = serde_json::to_vec(spec)
+            .expect("validated built-in tool specifications must serialize");
+        Some(format!("sha256:{:x}", Sha256::digest(encoded)))
     }
 }
 
@@ -1349,6 +1359,34 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn tool_contract_versions_are_content_addressed_per_tool() {
+        let registry = ToolRegistry::new(vec![
+            project_read("read_file", ToolLoadPolicy::AlwaysLoad),
+            project_write("write_file", ToolLoadPolicy::AlwaysLoad),
+        ]);
+        let read_version = registry.tool_contract_version("read_file").unwrap();
+
+        let with_unrelated_tool = ToolRegistry::new(vec![
+            project_read("read_file", ToolLoadPolicy::AlwaysLoad),
+            project_write("write_file", ToolLoadPolicy::Deferred),
+        ]);
+        assert_eq!(
+            with_unrelated_tool
+                .tool_contract_version("read_file")
+                .unwrap(),
+            read_version
+        );
+
+        let changed_read =
+            ToolRegistry::new(vec![project_read("read_file", ToolLoadPolicy::Deferred)]);
+        assert_ne!(
+            changed_read.tool_contract_version("read_file").unwrap(),
+            read_version
+        );
+        assert!(registry.tool_contract_version("missing").is_none());
     }
 
     #[test]

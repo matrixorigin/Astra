@@ -1,5 +1,6 @@
 use astra_core::agent_warn;
 use astra_pipeline::step_protocol::ContextSignature;
+use sha2::{Digest, Sha256};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::permission_gate::{PermissionCheckResult, permission_denied_error_result};
@@ -906,6 +907,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
+        let mut resolved_provider_policy = None;
+        let mut permission_grant = None;
         if server_owned_edge_result_should_be_rejected(
             &execution,
             self.ctx.runtime_tool_executor.is_some(),
@@ -1022,6 +1025,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 _ => None,
             };
+            resolved_provider_policy = provider_policy.cloned();
             let permission_result = match &provider_lookup {
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
                     public_alias,
@@ -1052,8 +1056,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
             };
             match permission_result {
-                PermissionCheckResult::Allowed => {}
+                PermissionCheckResult::Allowed => {
+                    permission_grant = Some(
+                        crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                            reason: None,
+                            updates_hash: None,
+                        },
+                    );
+                }
                 PermissionCheckResult::AllowedImplicit { reason } => {
+                    permission_grant = Some(
+                        crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::ImplicitPolicy,
+                            reason: Some(reason.clone()),
+                            updates_hash: None,
+                        },
+                    );
                     if !self.ctx.quiet {
                         self.ctx.term.emit_line(
                             HeadlessStderrStyle::Yellow,
@@ -1064,7 +1083,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         );
                     }
                 }
-                PermissionCheckResult::AllowedViaRequest { .. } => {
+                PermissionCheckResult::AllowedViaRequest { new_rules } => {
+                    let encoded = serde_json::to_vec(&new_rules)
+                        .expect("validated permission updates must serialize");
+                    permission_grant = Some(
+                        crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+                            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::ParentApproval,
+                            reason: None,
+                            updates_hash: Some(format!(
+                                "sha256:{:x}",
+                                Sha256::digest(encoded)
+                            )),
+                        },
+                    );
                     if !self.ctx.quiet {
                         self.ctx.term.emit_line(
                             HeadlessStderrStyle::Yellow,
@@ -1149,6 +1180,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         HeadlessPipelineStage::Continue(PermittedExecution {
             execution,
             idem_key,
+            resolved_provider_policy,
+            permission_grant,
         })
     }
 }

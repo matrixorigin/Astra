@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use super::tool_execution_result::approval_timeout_tool_result;
@@ -19,9 +19,21 @@ pub(crate) async fn approval_preflight_result(
         astra_tools::ApprovalDecision::Approved => None,
         astra_tools::ApprovalDecision::Denied { reason } => {
             let msg = reason.unwrap_or_else(|| "User denied execution".into());
-            Some(astra_tools::ToolResult::error(format!(
-                "Tool execution denied: {msg}"
-            )))
+            let mut result =
+                astra_tools::ToolResult::error(format!("Tool execution denied: {msg}"));
+            result.metadata = Some(Map::from_iter([
+                (
+                    "error_kind".to_string(),
+                    Value::String("approval_denied".to_string()),
+                ),
+                (
+                    "rejection_code".to_string(),
+                    Value::String("approval_denied".to_string()),
+                ),
+                ("blocked".to_string(), Value::Bool(true)),
+                ("retryable".to_string(), Value::Bool(false)),
+            ]));
+            Some(result)
         }
         astra_tools::ApprovalDecision::Timeout => Some(approval_timeout_tool_result()),
     }
@@ -65,6 +77,10 @@ mod tests {
         let result = result.expect("mutating git action must require approval");
         assert!(result.is_error);
         assert!(result.output.contains("blocked by test"));
+        let metadata = result.metadata.expect("denial must be machine-readable");
+        assert_eq!(metadata["error_kind"], "approval_denied");
+        assert_eq!(metadata["rejection_code"], "approval_denied");
+        assert_eq!(metadata["retryable"], false);
     }
 
     #[tokio::test]

@@ -57,6 +57,10 @@ pub(crate) async fn execute_tool_pure(
     current_session_id: Option<&String>,
     current_run_id: Option<&str>,
     current_turn_chain_id: Option<&str>,
+    resolved_provider_policy: Option<
+        &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+    >,
+    permission_grant: Option<&crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
     session_turn: u32,
     edge_round_present: bool,
 ) {
@@ -77,6 +81,8 @@ pub(crate) async fn execute_tool_pure(
                             &execution.id,
                             &execution.name,
                             &execution.args,
+                            resolved_provider_policy,
+                            permission_grant,
                         )
                         .await
                 }
@@ -317,6 +323,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let PermittedExecution {
             mut execution,
             idem_key,
+            resolved_provider_policy,
+            permission_grant,
         } = permitted;
 
         self.begin_execution_trace(&execution, &idem_key);
@@ -329,6 +337,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.current_session_id,
             self.ctx.current_run_id,
             self.ctx.current_turn_chain_id,
+            resolved_provider_policy.as_ref(),
+            permission_grant.as_ref(),
             self.ctx.session_turn,
             !self.ctx.edge_tool_round.is_empty(),
         )

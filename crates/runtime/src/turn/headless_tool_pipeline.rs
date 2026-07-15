@@ -214,6 +214,10 @@ pub(crate) struct ValidatedExecution {
 pub(crate) struct PermittedExecution {
     pub execution: HeadlessResolvedExecution,
     pub idem_key: IdempotencyKey,
+    pub resolved_provider_policy:
+        Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
+    pub permission_grant:
+        Option<crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
 }
 
 pub(crate) struct ExecutedExecution {
@@ -474,9 +478,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         // Phase 2: execute all concurrently (no &mut self needed).
-        let mut executions: Vec<(HeadlessResolvedExecution, IdempotencyKey)> = permitted_batch
+        let mut executions: Vec<(
+            HeadlessResolvedExecution,
+            IdempotencyKey,
+            Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
+            Option<crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
+        )> = permitted_batch
             .into_iter()
-            .map(|p| (p.execution, p.idem_key))
+            .map(|p| {
+                (
+                    p.execution,
+                    p.idem_key,
+                    p.resolved_provider_policy,
+                    p.permission_grant,
+                )
+            })
             .collect();
 
         let server_executor = self.ctx.runtime_tool_executor;
@@ -490,7 +506,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let started_at: Vec<Instant> = executions
             .iter()
-            .map(|(execution, idem_key)| {
+            .map(|(execution, idem_key, _, _)| {
                 self.begin_execution_trace(execution, idem_key);
                 Instant::now()
             })
@@ -498,7 +514,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let futs: Vec<_> = executions
             .iter_mut()
-            .map(|(exec, _)| {
+            .map(|(exec, _, provider_policy, permission_grant)| {
                 execute_tool_pure(
                     exec,
                     server_executor,
@@ -507,6 +523,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     session_id,
                     run_id,
                     turn_chain_id,
+                    provider_policy.as_ref(),
+                    permission_grant.as_ref(),
                     session_turn,
                     edge_round_present,
                 )
@@ -515,7 +533,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         futures_util::future::join_all(futs).await;
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
-        for ((execution, idem_key), started) in executions.into_iter().zip(started_at) {
+        for ((execution, idem_key, _, _), started) in executions.into_iter().zip(started_at) {
             let executed = self.postprocess_execution(execution, idem_key, started);
             self.record_execution(executed).await;
         }
@@ -1935,6 +1953,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -1982,6 +2002,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -2022,6 +2044,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -2079,6 +2103,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("read_file", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -2124,6 +2150,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("bash", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -2167,6 +2195,8 @@ mod tests {
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
+            resolved_provider_policy: None,
+            permission_grant: None,
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -2625,13 +2655,28 @@ mod tests {
             _ => panic!("resolved provider read should validate"),
         };
         let permitted = pipeline.permit_execution(validated).await;
-        let continued = matches!(permitted, HeadlessPipelineStage::Continue(_));
+        let (carried_descriptor, carried_grant) = match permitted {
+            HeadlessPipelineStage::Continue(permitted) => (
+                permitted
+                    .resolved_provider_policy
+                    .expect("permission must carry the exact provider policy")
+                    .descriptor,
+                permitted
+                    .permission_grant
+                    .expect("permission must carry its grant provenance"),
+            ),
+            _ => panic!(
+                "resolved provider read should be permitted: {}",
+                serde_json::to_string(&harness.tool_results).unwrap()
+            ),
+        };
         drop(pipeline);
-        assert!(
-            continued,
-            "{}",
-            serde_json::to_string(&harness.tool_results).unwrap()
-        );
+        assert_eq!(carried_descriptor, resolved.descriptors[0].descriptor_ref());
+        assert!(matches!(
+            carried_grant.source,
+            crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy
+                | crate::server::tool_execution_binding::ToolPermissionGrantSource::ImplicitPolicy
+        ));
         assert!(matches!(
             executor.provider_policy_lookup("mcp__weather"),
             crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(policy)

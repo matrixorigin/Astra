@@ -129,7 +129,12 @@ pub(crate) fn approval_timeout_tool_result() -> astra_tools::ToolResult {
             "reason".to_string(),
             Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
         ),
+        (
+            "rejection_code".to_string(),
+            Value::String(TOOL_ERROR_KIND_APPROVAL_TIMEOUT.to_string()),
+        ),
         ("blocked".to_string(), Value::Bool(true)),
+        ("retryable".to_string(), Value::Bool(true)),
     ]));
     result
 }

@@ -48,7 +48,6 @@ use crate::server::server_bash_execution::execute_server_bash;
 use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
 use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
 use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
-use crate::server::tool_exactly_once;
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
@@ -247,9 +246,9 @@ pub struct RuntimeToolExecutor {
     pub(crate) database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
     /// Session-state rollback journal for bounded self-mod and task undo.
     pub(crate) session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
-    /// Exactly-once executor for crash recovery deduplication.
-    /// When active (Some), checks idempotency cache before executing tools.
-    exactly_once_executor: Option<tool_exactly_once::ExactlyOnceState>,
+    /// Logical-invocation delivery ledger. Unlike the legacy semantic cache,
+    /// this is keyed by owner/run/turn/invocation identity.
+    invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
 
     // ── Governor ────────────────────────────────────────────────��─────────────
     /// Sandbox policy for tool execution.
@@ -432,7 +431,7 @@ impl RuntimeToolExecutor {
             enforce_server_tool_capabilities: false,
             server_service_tools_enabled: true,
             control_plane_tools_enabled: true,
-            exactly_once_executor: None,
+            invocation_ledger: None,
         }
     }
 
@@ -463,18 +462,14 @@ impl RuntimeToolExecutor {
         self
     }
 
-    /// Enable exactly-once execution for crash recovery deduplication.
-    /// When enabled, tools are checked against an idempotency cache before execution.
-    /// The cache is warmed from the event store and (when available) the DB on creation
-    /// to survive restarts.
-    pub async fn enable_exactly_once(&mut self) {
-        self.exactly_once_executor = Some(
-            tool_exactly_once::enable_exactly_once(
-                &self.user_id,
-                &self.session_id,
+    /// Bind logical invocation delivery to the durable database ledger.
+    /// Local/test executors use the same state machine through an in-memory
+    /// adapter until a shared pool is attached.
+    pub fn enable_durable_invocations(&mut self) {
+        self.invocation_ledger = Some(
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(
                 self.context_manifest_pool.clone(),
-            )
-            .await,
+            ),
         );
     }
 
@@ -1670,6 +1665,12 @@ impl RuntimeToolExecutor {
         invocation_id: &str,
         name: &str,
         args: &Value,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
+        permission_grant: Option<
+            &crate::server::tool_execution_binding::ToolPermissionGrantSnapshot,
+        >,
     ) -> astra_tools::ToolResult {
         let identity = match astra_turn_types::ToolInvocationIdentity::new(
             &self.user_id,
@@ -1691,24 +1692,118 @@ impl RuntimeToolExecutor {
                 );
             }
         };
-        let request = self.tool_execution_request_for_invocation(&identity, name, args);
+        let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
+        request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
+        request.policy.permission_grant = permission_grant.cloned();
         self.execute_request_with_metadata(request).await
     }
 
     async fn execute_request_with_metadata(
         &self,
-        request: ToolExecutionRequest,
+        mut request: ToolExecutionRequest,
     ) -> astra_tools::ToolResult {
-        // Early cancel check before route-boundary event emission.
-        if let Some(token) = self.cancel_token.as_ref() {
-            if token.is_cancelled() {
-                return self
-                    .tool_execution_service
-                    .cancelled_before_route_result(&request);
-            }
+        // Cancellation before the durable prepare boundary is known not to
+        // have dispatched and must not leave a stranded ledger row.
+        if let Some(token) = self.cancel_token.as_ref()
+            && token.is_cancelled()
+        {
+            return self
+                .tool_execution_service
+                .cancelled_before_route_result(&request);
         }
 
-        execute_tool_route_with_events(
+        request.policy.admission_snapshot = Some(
+            self.tool_execution_service
+                .invocation_admission_snapshot(&request)
+                .await,
+        );
+        let durable_invocation = if request.policy.permission_grant.is_some() {
+            let route = self.tool_execution_service.routing_decision(&request);
+            let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                route,
+                self.tool_execution_service.tool_registry(),
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let fingerprint = match decision.fingerprint(&request.args) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            tracing::debug!(
+                    user_id = %request.user_id,
+                    session_id = %request.session_id,
+                    run_id = %request.run_id,
+                    turn_chain_id = %request.turn_chain_id,
+                    invocation_id = %request.tool_call_id,
+                    policy_decision_id = %fingerprint.policy_decision_id,
+                    "resolved exact tool invocation decision"
+            );
+            let identity = match astra_turn_types::ToolInvocationIdentity::new(
+                &request.user_id,
+                &request.session_id,
+                &request.run_id,
+                &request.turn_chain_id,
+                &request.tool_call_id,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let Some(ledger) = self.invocation_ledger.as_ref() else {
+                return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                    &identity,
+                    "runtime ledger is not configured",
+                );
+            };
+            match ledger.begin(&identity, &fingerprint).await {
+                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute) => {
+                    Some((ledger, identity))
+                }
+                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
+                    result,
+                )) => return result,
+                Err(error) => {
+                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                        &identity, error,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let result = execute_tool_route_with_events(
             ToolRouteRuntimeContext {
                 execution_service: &self.tool_execution_service,
                 local_transport: self,
@@ -1719,7 +1814,11 @@ impl RuntimeToolExecutor {
             },
             request,
         )
-        .await
+        .await;
+        match durable_invocation {
+            Some((ledger, identity)) => ledger.finish(&identity, result).await,
+            None => result,
+        }
     }
 
     /// Execute a tool locally on the server (no edge routing).
@@ -1740,7 +1839,6 @@ impl RuntimeToolExecutor {
             aggregate_output_bytes: &self.aggregate_output_bytes,
             memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),
-            exactly_once_executor: self.exactly_once_executor.as_ref(),
         };
         let call_id = lifecycle.start(name, args).await;
 
@@ -1771,7 +1869,7 @@ impl RuntimeToolExecutor {
             }
         };
 
-        let result = lifecycle.finish(name, args, &call_id, result).await;
+        let result = lifecycle.finish(name, &call_id, result).await;
         if name == "tool_search" && !result.is_error {
             self.record_tool_search_activation_output(&result.output);
         }
@@ -1800,7 +1898,6 @@ impl RuntimeToolExecutor {
                 workspace_root: &self.workspace_root,
                 workspace_binding: self.execution_binding.workspace(),
                 approval_gate: self.approval_gate.as_deref(),
-                exactly_once_executor: self.exactly_once_executor.as_ref(),
                 plan_mode_authoring_active,
             },
             name,
@@ -4045,121 +4142,93 @@ esac
     }
 
     #[tokio::test]
-    async fn exactly_once_cache_ignores_internal_tool_metadata() {
-        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+    async fn route_boundary_replays_only_the_same_logical_invocation() {
+        use crate::server::tool_execution_binding::{
+            ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+        };
 
         let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once().await;
-
-        let public_first_args = json!({"action": "create", "title": "cached first"});
-        let replay_first_args = json!({
-            "action": "create",
-            "title": "cached first",
-            "_tool_call_id": "call-replayed",
-            "_run_id": "run-replayed"
-        });
-        let second_args = json!({
-            "action": "create",
-            "title": "live second",
-            "_tool_call_id": "call-live"
-        });
-        let first_key = IdempotencyKey::semantic("task_board", &public_first_args);
-        {
-            let executor = exec
-                .exactly_once_executor
-                .as_ref()
-                .expect("exactly-once executor")
-                .in_memory
-                .lock()
-                .expect("exactly-once lock");
-            assert!(
-                executor.cache().check(&first_key).is_none(),
-                "precondition: first key should start empty"
-            );
-        }
-        {
-            let mut executor = exec
-                .exactly_once_executor
-                .as_ref()
-                .expect("exactly-once executor")
-                .in_memory
-                .lock()
-                .expect("exactly-once lock");
-            executor.cache_mut().record(
-                &first_key,
-                CachedToolResult {
-                    tool_name: "task_board".to_string(),
-                    output: "cached-first".to_string(),
-                    is_error: false,
-                    cached_at: 1,
-                    context_signature: None,
-                },
-            );
-        }
+        exec.enable_durable_invocations();
+        let grant = ToolPermissionGrantSnapshot {
+            source: ToolPermissionGrantSource::ImplicitPolicy,
+            reason: None,
+            updates_hash: None,
+        };
+        let args = json!({"action": "create", "title": "intentional duplicate"});
 
         let first = exec
-            .execute_local_with_metadata("task_board", &replay_first_args, None)
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
             .await;
-        assert_eq!(first.output, "cached-first");
+        assert!(
+            !first.is_error,
+            "first invocation should execute: {first:?}"
+        );
+        assert_eq!(
+            first.metadata.as_ref().unwrap()["durable_invocation_state"],
+            "succeeded"
+        );
+
+        let replay = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert_eq!(replay.output, first.output);
+        assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
 
         let second = exec
-            .execute_local_with_metadata("task_board", &second_args, None)
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-2",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
             .await;
         assert!(
-            second.output.contains("\"success\":true"),
-            "second tool should execute normally: {second:?}"
+            !second.is_error,
+            "distinct invocation should execute: {second:?}"
+        );
+        assert_ne!(
+            second.output, first.output,
+            "equal arguments with distinct invocation IDs are distinct intent"
         );
 
-        let second_key = IdempotencyKey::semantic(
-            "task_board",
-            &json!({"action": "create", "title": "live second"}),
+        let conflict = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &json!({"action": "create", "title": "different intent"}),
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(conflict.is_error);
+        assert_eq!(
+            conflict.metadata.as_ref().unwrap()["error_kind"],
+            "tool_invocation_ledger"
         );
-        let executor = exec
-            .exactly_once_executor
-            .as_ref()
-            .expect("exactly-once executor")
-            .in_memory
-            .lock()
-            .expect("exactly-once lock");
-        assert!(
-            executor.cache().check(&second_key).is_some(),
-            "live tool should be recorded under sanitized semantic args"
-        );
-    }
-
-    #[tokio::test]
-    async fn exactly_once_record_skips_failed_tool_results() {
-        use astra_pipeline::step_protocol::IdempotencyKey;
-
-        let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once().await;
-
-        let args = json!({"command": "curl https://example.invalid"});
-        let result = astra_tools::ToolResult {
-            output: "network timeout".to_string(),
-            is_error: true,
-            metadata: None,
-            exit_semantics: None,
-        };
-        tool_exactly_once::record_result(
-            exec.exactly_once_executor.as_ref(),
-            "bash",
-            &args,
-            &result,
-        )
-        .await;
-
-        let key = IdempotencyKey::semantic("bash", &args);
-        let executor = exec
-            .exactly_once_executor
-            .as_ref()
-            .expect("exactly-once executor")
-            .in_memory
-            .lock()
-            .expect("exactly-once lock");
-        assert!(
-            executor.cache().check(&key).is_none(),
-            "server executor must not cache failed exactly-once results"
+        assert_eq!(
+            conflict.metadata.as_ref().unwrap()["side_effects_maybe"],
+            false
         );
     }
 
