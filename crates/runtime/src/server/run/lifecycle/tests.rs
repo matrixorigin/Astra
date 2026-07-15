@@ -8254,6 +8254,24 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     request.attachments = vec![json!({"id": "att-1", "kind": "file"})];
     request.edge_executor_id = Some("edge-1".to_string());
     request.capabilities = vec!["bash".to_string(), "fs".to_string()];
+    let provider_snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+        astra_turn_types::ProviderIdentity::new("capability-server-tools").unwrap(),
+        astra_turn_types::ProviderBindingRef::new("tools").unwrap(),
+        astra_turn_types::ProviderProtocolId::new("mcp").unwrap(),
+        vec![astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("query").unwrap(),
+            native_tool_name: "query".to_string(),
+            title: Some("Query".to_string()),
+            description: Some("Query data".to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: Default::default(),
+            extension_fields: Default::default(),
+        }],
+    )
+    .unwrap();
+    let provider_snapshot_hash = provider_snapshot.content_hash.clone();
     let capabilities = PreparedRuntimeCapabilities {
         mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {
             schemas: vec![json!({
@@ -8264,7 +8282,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
                     "parameters": {"type": "object"}
                 }
             })],
-            provider_snapshots: Vec::new(),
+            provider_snapshots: vec![provider_snapshot],
             control_tools: Default::default(),
             stop_after_success_tools: Default::default(),
             manager: None,
@@ -8300,6 +8318,26 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     assert_eq!(
         manifest["agent_binding"]["discovered_skills"][0]["name"],
         "binding-only"
+    );
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["provider_identity"],
+        "capability-server-tools"
+    );
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["binding_ref"],
+        "tools"
+    );
+    assert_eq!(manifest["provider_snapshot_refs"][0]["protocol"], "mcp");
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["content_hash"],
+        provider_snapshot_hash
+    );
+    assert_eq!(manifest["provider_snapshot_refs"][0]["tool_count"], 1);
+    assert!(
+        manifest["provider_snapshot_refs"][0]
+            .get("tool_declarations")
+            .is_none(),
+        "runtime manifest must project a bounded reference, not the declaration graph"
     );
     let serialized = serde_json::to_string(&manifest).expect("runtime manifest should serialize");
     assert!(!serialized.contains("secret-runtime-token"));
