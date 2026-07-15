@@ -12,6 +12,7 @@ mod implicit_feedback;
 mod memory_ranking;
 mod memory_structure;
 mod memory_writability;
+mod provider_contract;
 mod result_quality;
 mod runtime_scaffolding;
 pub mod session_facts;
@@ -42,6 +43,13 @@ pub use memory_structure::{
     should_store_persistent_memory, validate_persistent_memory_content,
 };
 pub use memory_writability::{is_transient_runtime_status_text, should_store_in_memory};
+pub use provider_contract::{
+    DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
+    ProviderClaim, ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot,
+    ProviderIdentity, ProviderProtocolId, ProviderRejection, ProviderRejectionCode,
+    ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration, ResolvedToolDescriptorRef,
+    ToolIdentity,
+};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use runtime_scaffolding::{
     SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message,

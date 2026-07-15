@@ -8264,6 +8264,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
                     "parameters": {"type": "object"}
                 }
             })],
+            provider_snapshots: Vec::new(),
             control_tools: Default::default(),
             stop_after_success_tools: Default::default(),
             manager: None,

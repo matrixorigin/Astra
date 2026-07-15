@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +40,7 @@ use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_res
 use astra_turn_core::tool::schema::{
     prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
 };
+use astra_turn_types::{ProviderCallOutcome, ProviderCallPayload};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
@@ -2042,18 +2044,54 @@ impl ToolExecutor for RuntimeToolExecutor {
 }
 
 fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_tools::ToolResult {
-    let mut tool_result = astra_tools::ToolResult::text(result.output);
-    let Some(structured_content) = result.structured_content else {
-        return tool_result;
+    let (payload, is_error) = match result.into_provider_outcome() {
+        ProviderCallOutcome::Success(payload) => (payload, false),
+        ProviderCallOutcome::ToolFailure(payload) => (payload, true),
+        ProviderCallOutcome::Rejected(rejection) => {
+            let mut result = astra_tools::ToolResult::error(rejection.message);
+            result.metadata = Some(Map::from_iter([(
+                "providerRejection".to_string(),
+                json!({
+                    "code": rejection.code,
+                    "retryable": rejection.retryable,
+                }),
+            )]));
+            return result;
+        }
     };
-    let metadata = tool_result.metadata.get_or_insert_with(Map::new);
-    if let Some(artifacts) = structured_content.get("artifacts") {
-        metadata.insert("artifacts".to_string(), artifacts.clone());
+    tool_result_from_provider_payload(payload, is_error)
+}
+
+fn tool_result_from_provider_payload(
+    payload: ProviderCallPayload,
+    is_error: bool,
+) -> astra_tools::ToolResult {
+    let mut tool_result = if is_error {
+        astra_tools::ToolResult::error(payload.text)
+    } else {
+        astra_tools::ToolResult::text(payload.text)
+    };
+    if let Some(structured_content) = payload.structured_content {
+        let metadata = tool_result.metadata.get_or_insert_with(Map::new);
+        if let Some(artifacts) = structured_content.get("artifacts") {
+            metadata.insert("artifacts".to_string(), artifacts.clone());
+        }
+        if let Some(artifact) = structured_content.get("artifact") {
+            metadata.insert("artifact".to_string(), artifact.clone());
+        }
+        metadata.insert("structuredContent".to_string(), structured_content);
     }
-    if let Some(artifact) = structured_content.get("artifact") {
-        metadata.insert("artifact".to_string(), artifact.clone());
+    if let Some(protocol_metadata) = payload.protocol_metadata {
+        let encoded = protocol_metadata.to_string().into_bytes();
+        tool_result.metadata.get_or_insert_with(Map::new).insert(
+            "providerProtocolMetadataSummary".to_string(),
+            json!({
+                "contentHash": format!("{:x}", Sha256::digest(&encoded)),
+                "originalBytes": encoded.len(),
+                "rawProjected": false,
+            }),
+        );
     }
-    metadata.insert("structuredContent".to_string(), structured_content);
     tool_result
 }
 
@@ -2153,6 +2191,8 @@ mod tests {
         let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
             output: "created file".to_string(),
             structured_content: Some(structured_content.clone()),
+            protocol_metadata: None,
+            is_error: false,
         });
 
         assert_eq!(result.output, "created file");
@@ -2163,6 +2203,34 @@ mod tests {
             metadata.get("artifacts"),
             structured_content.get("artifacts")
         );
+    }
+
+    #[test]
+    fn mcp_tool_call_result_conversion_preserves_typed_error_even_when_output_says_ok() {
+        let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
+            output: "ok".to_string(),
+            structured_content: Some(json!({"errorCode": "WRITE_REJECTED"})),
+            protocol_metadata: Some(json!({"requestId": "request-1"})),
+            is_error: true,
+        });
+
+        assert!(result.is_error);
+        assert_eq!(result.output, "ok");
+        let metadata = result.metadata.expect("preserved provider result metadata");
+        assert_eq!(
+            metadata.get("structuredContent"),
+            Some(&json!({"errorCode": "WRITE_REJECTED"}))
+        );
+        let protocol_summary = metadata
+            .get("providerProtocolMetadataSummary")
+            .expect("bounded protocol metadata summary");
+        assert_eq!(protocol_summary["rawProjected"], false);
+        assert_eq!(protocol_summary["originalBytes"], 25);
+        assert_eq!(
+            protocol_summary["contentHash"].as_str().map(str::len),
+            Some(64)
+        );
+        assert!(!Value::Object(metadata).to_string().contains("request-1"));
     }
 
     #[test]

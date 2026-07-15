@@ -4256,6 +4256,24 @@ impl AgenticRunLifecycleService {
             }
         });
 
+        if let Some(bundle) = runtime_capabilities.mcp_bundle.as_ref() {
+            manifest["provider_snapshot_refs"] = Value::Array(
+                bundle
+                    .provider_snapshots
+                    .iter()
+                    .map(|snapshot| {
+                        json!({
+                            "provider_identity": snapshot.provider_identity.as_str(),
+                            "binding_ref": snapshot.binding_ref.as_str(),
+                            "protocol": snapshot.protocol.as_str(),
+                            "content_hash": &snapshot.content_hash,
+                            "tool_count": snapshot.tool_declarations.len(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
         if let (Some(binding_request), Some(binding_context)) = (
             request.agent_binding.as_ref(),
             runtime_capabilities.agent_binding.as_ref(),

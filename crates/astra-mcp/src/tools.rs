@@ -1,7 +1,12 @@
 use std::collections::HashSet;
 
-use rmcp::model::{CallToolResult, Tool};
-use serde_json::Value;
+use astra_turn_types::{
+    NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload, ProviderClaim,
+    ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
+    ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
+};
+use rmcp::model::{CallToolResult, TaskSupport, Tool};
+use serde_json::{Map, Value};
 
 /// Maximum length for tool descriptions sent to the model.
 pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
@@ -16,6 +21,25 @@ const TRUNCATION_MARKER: &str = "… [truncated]";
 pub struct McpToolCallResult {
     pub output: String,
     pub structured_content: Option<Value>,
+    pub protocol_metadata: Option<Value>,
+    pub is_error: bool,
+}
+
+impl McpToolCallResult {
+    /// Convert the wire-specific MCP result into the provider-neutral outcome.
+    /// The typed MCP flag is authoritative; result prose is never classified.
+    pub fn into_provider_outcome(self) -> ProviderCallOutcome {
+        let payload = ProviderCallPayload {
+            text: self.output,
+            structured_content: self.structured_content,
+            protocol_metadata: self.protocol_metadata,
+        };
+        if self.is_error {
+            ProviderCallOutcome::ToolFailure(payload)
+        } else {
+            ProviderCallOutcome::Success(payload)
+        }
+    }
 }
 
 fn truncate_with_marker(s: &str, max_len: usize) -> String {
@@ -55,6 +79,122 @@ pub fn mcp_tool_to_schema(server_name: &str, tool: &Tool) -> Value {
     mcp_tool_schema_from_parts(server_name, tool.name.as_ref(), raw_desc, params)
 }
 
+/// Decode an MCP declaration into Astra's provider-neutral discovery contract.
+/// Optional hints retain both their absence and their MCP field provenance.
+pub fn mcp_tool_to_provider_declaration(
+    tool: &Tool,
+) -> Result<ProviderToolDeclaration, ProviderContractError> {
+    let protocol = ProviderProtocolId::new("mcp")?;
+    let claim = |value: Option<bool>, field: &str| {
+        value.map(|value| {
+            ProviderClaim::new(
+                value,
+                ProviderClaimSource::StandardProtocol {
+                    protocol: protocol.clone(),
+                    field: field.to_string(),
+                },
+            )
+        })
+    };
+    let annotations = tool.annotations.as_ref();
+    let claims = ProviderToolClaims {
+        read_only: claim(
+            annotations.and_then(|value| value.read_only_hint),
+            "annotations.readOnlyHint",
+        ),
+        destructive: claim(
+            annotations.and_then(|value| value.destructive_hint),
+            "annotations.destructiveHint",
+        ),
+        idempotent: claim(
+            annotations.and_then(|value| value.idempotent_hint),
+            "annotations.idempotentHint",
+        ),
+        open_world: claim(
+            annotations.and_then(|value| value.open_world_hint),
+            "annotations.openWorldHint",
+        ),
+    };
+    let task_support = match tool
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.task_support)
+    {
+        None => ProviderTaskSupport::Unspecified,
+        Some(TaskSupport::Forbidden) => ProviderTaskSupport::Forbidden,
+        Some(TaskSupport::Optional) => ProviderTaskSupport::Optional,
+        Some(TaskSupport::Required) => ProviderTaskSupport::Required,
+    };
+
+    // Keep protocol fields even when Astra has not assigned portable semantics
+    // to them yet. The namespace prevents accidental interpretation by another
+    // adapter and makes future resolution changes invalidate the snapshot hash.
+    let mut extension_fields = Map::new();
+    insert_serialized_extension(
+        &mut extension_fields,
+        "mcp.annotations",
+        tool.annotations.as_ref(),
+    )?;
+    insert_serialized_extension(
+        &mut extension_fields,
+        "mcp.execution",
+        tool.execution.as_ref(),
+    )?;
+    insert_serialized_extension(&mut extension_fields, "mcp.icons", tool.icons.as_ref())?;
+    if let Some(meta) = &tool.meta {
+        extension_fields.insert("mcp._meta".to_string(), Value::Object(meta.0.clone()));
+    }
+
+    let declaration = ProviderToolDeclaration {
+        native_tool_id: NativeToolId::new(tool.name.to_string())?,
+        native_tool_name: tool.name.to_string(),
+        title: tool.title.clone(),
+        description: tool.description.as_deref().map(str::to_string),
+        input_schema: Value::Object(tool.input_schema.as_ref().clone()),
+        output_schema: tool
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object(schema.as_ref().clone())),
+        claims,
+        task_support,
+        extension_fields,
+    };
+    declaration.validate()?;
+    Ok(declaration)
+}
+
+/// Build the immutable discovery snapshot for one MCP binding.
+pub fn mcp_tools_to_provider_snapshot(
+    provider_identity: ProviderIdentity,
+    binding_ref: ProviderBindingRef,
+    tools: &[Tool],
+) -> Result<ProviderDiscoverySnapshot, ProviderContractError> {
+    let declarations = tools
+        .iter()
+        .map(mcp_tool_to_provider_declaration)
+        .collect::<Result<Vec<_>, _>>()?;
+    ProviderDiscoverySnapshot::new(
+        provider_identity,
+        binding_ref,
+        ProviderProtocolId::new("mcp")?,
+        declarations,
+    )
+}
+
+fn insert_serialized_extension<T: serde::Serialize>(
+    extensions: &mut Map<String, Value>,
+    key: &str,
+    value: Option<&T>,
+) -> Result<(), ProviderContractError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = serde_json::to_value(value)
+        .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+    extensions.insert(key.to_string(), value);
+    Ok(())
+}
+
 /// Convert cached MCP tool metadata to Astra tool schema.
 pub fn mcp_tool_schema_from_parts(
     server_name: &str,
@@ -77,10 +217,42 @@ pub fn mcp_tool_schema_from_parts(
 
 /// Convert MCP tools to schemas and fail if sanitized public names collide.
 pub fn tools_to_schemas_checked(server_name: &str, tools: &[Tool]) -> Result<Vec<Value>, String> {
+    let declarations = tools
+        .iter()
+        .map(mcp_tool_to_provider_declaration)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid MCP tool declaration: {error}"))?;
+    provider_declarations_to_schemas_checked(server_name, &declarations)
+}
+
+/// Project a validated MCP provider snapshot into model-facing function
+/// schemas. The public alias is snapshot-scoped and never becomes identity.
+pub fn mcp_provider_snapshot_to_schemas_checked(
+    server_name: &str,
+    snapshot: &ProviderDiscoverySnapshot,
+) -> Result<Vec<Value>, String> {
+    if snapshot.protocol.as_str() != "mcp" {
+        return Err(format!(
+            "cannot apply MCP schema projection to '{}' provider snapshot",
+            snapshot.protocol
+        ));
+    }
+    provider_declarations_to_schemas_checked(server_name, &snapshot.tool_declarations)
+}
+
+fn provider_declarations_to_schemas_checked(
+    server_name: &str,
+    declarations: &[ProviderToolDeclaration],
+) -> Result<Vec<Value>, String> {
     let mut seen = HashSet::new();
-    let mut schemas = Vec::with_capacity(tools.len());
-    for tool in tools {
-        let schema = mcp_tool_to_schema(server_name, tool);
+    let mut schemas = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let schema = mcp_tool_schema_from_parts(
+            server_name,
+            &declaration.native_tool_name,
+            declaration.description.as_deref().unwrap_or_default(),
+            declaration.input_schema.clone(),
+        );
         let name = schema["function"]["name"].as_str().unwrap_or_default();
         if !seen.insert(name.to_string()) {
             return Err(format!(
@@ -151,6 +323,11 @@ pub fn extract_tool_call_result_with_limit(
     McpToolCallResult {
         output,
         structured_content: result.structured_content.clone(),
+        protocol_metadata: result
+            .meta
+            .as_ref()
+            .map(|metadata| Value::Object(metadata.0.clone())),
+        is_error: result.is_error.unwrap_or(false),
     }
 }
 
@@ -262,7 +439,7 @@ mod tests {
 
     #[test]
     fn extract_tool_call_result_preserves_structured_content() {
-        use rmcp::model::{Content, RawContent};
+        use rmcp::model::{Content, Meta, RawContent};
 
         let structured = serde_json::json!({
             "artifacts": [{
@@ -274,10 +451,160 @@ mod tests {
         let mut result =
             CallToolResult::success(vec![Content::new(RawContent::text("created file"), None)]);
         result.structured_content = Some(structured.clone());
+        result.meta = Some(Meta(Map::from_iter([(
+            "requestId".to_string(),
+            Value::String("request-1".to_string()),
+        )])));
 
         let extracted = extract_tool_call_result(&result);
         assert_eq!(extracted.output, "created file");
         assert_eq!(extracted.structured_content, Some(structured));
+        assert_eq!(
+            extracted.protocol_metadata,
+            Some(serde_json::json!({"requestId": "request-1"}))
+        );
+        assert!(!extracted.is_error);
+    }
+
+    #[test]
+    fn extract_tool_call_result_preserves_typed_failure_without_reading_prose() {
+        use rmcp::model::{Content, RawContent};
+
+        let failure = CallToolResult::error(vec![Content::new(RawContent::text("ok"), None)]);
+        let success = CallToolResult::success(vec![Content::new(
+            RawContent::text("error: quoted documentation"),
+            None,
+        )]);
+
+        let failure = extract_tool_call_result(&failure);
+        let success = extract_tool_call_result(&success);
+        assert!(failure.is_error);
+        assert!(matches!(
+            failure.into_provider_outcome(),
+            ProviderCallOutcome::ToolFailure(_)
+        ));
+        assert!(!success.is_error);
+        assert!(matches!(
+            success.into_provider_outcome(),
+            ProviderCallOutcome::Success(_)
+        ));
+    }
+
+    #[test]
+    fn provider_declaration_preserves_mcp_claims_schemas_and_task_support() {
+        use rmcp::model::{ToolAnnotations, ToolExecution};
+
+        let input = Map::from_iter([("type".to_string(), Value::String("object".to_string()))]);
+        let output = Map::from_iter([("type".to_string(), Value::String("object".to_string()))]);
+        let mut tool = Tool::new("write", "Write data", Arc::new(input));
+        tool.title = Some("Writer".to_string());
+        tool.output_schema = Some(Arc::new(output));
+        tool.annotations = Some(ToolAnnotations::from_raw(
+            Some("Annotated writer".to_string()),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+        ));
+        tool.execution = Some(ToolExecution::from_raw(Some(TaskSupport::Optional)));
+
+        let declaration = mcp_tool_to_provider_declaration(&tool).unwrap();
+        assert_eq!(declaration.native_tool_id.as_str(), "write");
+        assert_eq!(declaration.title.as_deref(), Some("Writer"));
+        assert!(declaration.output_schema.is_some());
+        assert_eq!(
+            declaration
+                .claims
+                .read_only
+                .as_ref()
+                .map(|claim| claim.value),
+            Some(false)
+        );
+        assert_eq!(
+            declaration
+                .claims
+                .destructive
+                .as_ref()
+                .map(|claim| claim.value),
+            Some(true)
+        );
+        assert_eq!(
+            declaration
+                .claims
+                .idempotent
+                .as_ref()
+                .map(|claim| claim.value),
+            Some(true)
+        );
+        assert_eq!(
+            declaration
+                .claims
+                .open_world
+                .as_ref()
+                .map(|claim| claim.value),
+            Some(false)
+        );
+        assert_eq!(declaration.task_support, ProviderTaskSupport::Optional);
+        assert!(declaration.extension_fields.contains_key("mcp.annotations"));
+        assert!(declaration.extension_fields.contains_key("mcp.execution"));
+    }
+
+    #[test]
+    fn absent_mcp_hints_remain_unknown_in_provider_declaration() {
+        let tool = Tool::new("read", "Read data", Arc::new(Map::new()));
+        let declaration = mcp_tool_to_provider_declaration(&tool).unwrap();
+
+        assert_eq!(declaration.claims, ProviderToolClaims::default());
+        assert_eq!(declaration.task_support, ProviderTaskSupport::Unspecified);
+        assert!(declaration.extension_fields.is_empty());
+    }
+
+    #[test]
+    fn mcp_snapshot_is_stable_when_server_discovery_order_changes() {
+        let tools = vec![
+            Tool::new("z", "Z", Arc::new(Map::new())),
+            Tool::new("a", "A", Arc::new(Map::new())),
+        ];
+        let snapshot = |tools: &[Tool]| {
+            mcp_tools_to_provider_snapshot(
+                ProviderIdentity::new("server-1").unwrap(),
+                ProviderBindingRef::new("binding-1").unwrap(),
+                tools,
+            )
+            .unwrap()
+        };
+
+        let first = snapshot(&tools);
+        let second = snapshot(&tools.into_iter().rev().collect::<Vec<_>>());
+        assert_eq!(first.content_hash, second.content_hash);
+        assert_eq!(
+            first
+                .tool_declarations
+                .iter()
+                .map(|tool| tool.native_tool_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+        let projected = mcp_provider_snapshot_to_schemas_checked("server", &first).unwrap();
+        assert_eq!(projected[0]["function"]["name"], "mcp__server__a");
+        assert_eq!(projected[1]["function"]["name"], "mcp__server__z");
+    }
+
+    #[test]
+    fn mcp_projection_rejects_a_non_mcp_snapshot() {
+        let snapshot = ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("server-1").unwrap(),
+            ProviderBindingRef::new("binding-1").unwrap(),
+            ProviderProtocolId::new("custom").unwrap(),
+            vec![
+                mcp_tool_to_provider_declaration(&Tool::new("read", "Read", Arc::new(Map::new())))
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let error = mcp_provider_snapshot_to_schemas_checked("server", &snapshot).unwrap_err();
+        assert!(error.contains("custom"));
     }
 
     #[test]

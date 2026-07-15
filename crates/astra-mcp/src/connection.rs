@@ -279,6 +279,18 @@ impl McpConnection {
         let mut success = true;
         let mut error_msg = None;
         match &result {
+            Ok(call_result) if is_acknowledged_tool_failure(call_result) => {
+                const MESSAGE: &str = "MCP tool returned an acknowledged error result";
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+                *self.last_error.write().await = Some(MESSAGE.to_string());
+                success = false;
+                error_msg = Some(MESSAGE.to_string());
+                tracing::warn!(
+                    server = %self.name,
+                    tool = name,
+                    "MCP tool call returned isError=true"
+                );
+            }
             Ok(_) => {
                 *self.last_error.write().await = None;
                 tracing::debug!(
@@ -421,6 +433,10 @@ impl McpConnection {
         }
         skills
     }
+}
+
+fn is_acknowledged_tool_failure(result: &CallToolResult) -> bool {
+    result.is_error.unwrap_or(false)
 }
 
 // ── Public connection API ──────────────────────────────────────────────
@@ -869,4 +885,23 @@ async fn fetch_tools_with_timeout(
         ))
     })?
     .map_err(McpError::Service)
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::{CallToolResult, Content};
+
+    use super::is_acknowledged_tool_failure;
+
+    #[test]
+    fn call_observation_uses_the_typed_mcp_error_flag_only() {
+        let failure = CallToolResult::error(vec![Content::text("ok")]);
+        let success = CallToolResult::success(vec![Content::text("error: quoted text")]);
+        let mut unspecified = CallToolResult::success(Vec::new());
+        unspecified.is_error = None;
+
+        assert!(is_acknowledged_tool_failure(&failure));
+        assert!(!is_acknowledged_tool_failure(&success));
+        assert!(!is_acknowledged_tool_failure(&unspecified));
+    }
 }
