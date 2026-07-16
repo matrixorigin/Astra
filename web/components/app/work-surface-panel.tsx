@@ -43,6 +43,7 @@ type WorkSurfacePanelProps = {
   activeRun?: { runId: string; status: string; waitingFor?: string | null };
   tab: WorkSurfaceTab;
   onTabChange: (tab: WorkSurfaceTab) => void;
+  defaultCollapsed?: boolean;
   openSignal?: number;
   onRefresh: () => void;
   onLoadAgentRun: (runId: string) => Promise<WorkSurfaceRunResponse>;
@@ -63,6 +64,7 @@ export function WorkSurfacePanel({
   activeRun,
   tab,
   onTabChange,
+  defaultCollapsed = false,
   openSignal,
   onRefresh,
   onLoadAgentRun,
@@ -70,7 +72,7 @@ export function WorkSurfacePanel({
     throw new Error("Session insights are not available on this surface.");
   },
 }: WorkSurfacePanelProps) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [transcriptAgentId, setTranscriptAgentId] = useState<string | null>(
@@ -144,6 +146,7 @@ export function WorkSurfacePanel({
   );
   const agentActivityCount = state.agents.length;
   const toolActivityCount = state.tools.length;
+  const insightCount = insightRecommendationCount(insightsState.payload);
   const visibleRunStatus = activeRun?.status ?? state.runStatus;
   const selectedAgent = selectedAgentId
     ? visibleAgents.find((agent) => agent.agentId === selectedAgentId)
@@ -159,6 +162,18 @@ export function WorkSurfacePanel({
     }
     setCollapsed((value) => !value);
   }, []);
+
+  const openWorkSurfaceTab = useCallback(
+    (nextTab: WorkSurfaceTab) => {
+      onTabChange(nextTab);
+      if (window.innerWidth < 1024) {
+        setMobileOpen(true);
+        return;
+      }
+      setCollapsed(false);
+    },
+    [onTabChange],
+  );
 
   useKeyboardShortcut(
     useCallback(
@@ -299,8 +314,11 @@ export function WorkSurfacePanel({
       return;
     }
     openSignalRef.current = openSignal;
-    setCollapsed(false);
-    setMobileOpen(true);
+    if (window.innerWidth < 1024) {
+      setMobileOpen(true);
+    } else {
+      setCollapsed(false);
+    }
     setViewModes((current) => ({
       ...current,
       [tab]: attentionCounts[tab] > 0 ? "attention" : "all",
@@ -395,7 +413,7 @@ export function WorkSurfacePanel({
           active={tab === "insights"}
           icon={Sparkles}
           label="Insights"
-          count={insightsState.payload?.reflection?.recommendations.length ?? 0}
+          count={insightCount}
           onClick={() => onTabChange("insights")}
         />
       </div>
@@ -474,18 +492,45 @@ export function WorkSurfacePanel({
         )}
       >
         {collapsed ? (
-          <button
-            type="button"
-            className="flex h-full w-full flex-col items-center gap-3 py-4 text-text-muted transition hover:bg-surface-muted/60 hover:text-text"
-            onClick={toggleWorkSurface}
-            aria-label="Expand activity panel (Ctrl+T)"
-          >
-            <ClipboardList className="size-5" />
-            <span className="[writing-mode:vertical-rl] text-xs font-medium">
-              Activity
-            </span>
-            <span className="text-[11px] text-text-muted">Ctrl+T</span>
-          </button>
+          <div className="flex h-full w-full flex-col items-center gap-1 py-3">
+            <button
+              type="button"
+              className="mb-2 inline-flex size-9 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text"
+              onClick={toggleWorkSurface}
+              aria-label="Expand run workspace (Ctrl+T)"
+              title="Run workspace · Ctrl+T"
+            >
+              <Activity className="size-4" />
+            </button>
+            <CollapsedTabButton
+              active={tab === "tasks"}
+              icon={ClipboardList}
+              label="Tasks"
+              count={counts.open}
+              onClick={() => openWorkSurfaceTab("tasks")}
+            />
+            <CollapsedTabButton
+              active={tab === "agents"}
+              icon={Bot}
+              label="Agents"
+              count={agentActivityCount}
+              onClick={() => openWorkSurfaceTab("agents")}
+            />
+            <CollapsedTabButton
+              active={tab === "tools"}
+              icon={Terminal}
+              label="Tools"
+              count={toolActivityCount}
+              onClick={() => openWorkSurfaceTab("tools")}
+            />
+            <CollapsedTabButton
+              active={tab === "insights"}
+              icon={Sparkles}
+              label="Insights"
+              count={insightCount}
+              onClick={() => openWorkSurfaceTab("insights")}
+            />
+          </div>
         ) : (
           body
         )}
@@ -547,6 +592,42 @@ function TabButton({
       {count ? (
         <span className="rounded-full bg-accent/10 px-1.5 text-[11px] text-accent">
           {count}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+function CollapsedTabButton({
+  active,
+  icon: Icon,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  icon: LucideIcon;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Open ${label.toLowerCase()} workspace`}
+      title={label}
+      className={cn(
+        "relative inline-flex size-10 items-center justify-center rounded-control transition",
+        active
+          ? "bg-accent/10 text-accent"
+          : "text-text-muted hover:bg-surface-muted hover:text-text",
+      )}
+    >
+      <Icon className="size-4" />
+      {count > 0 ? (
+        <span className="absolute right-0.5 top-0.5 min-w-3.5 rounded-full bg-text px-1 text-center text-[9px] font-semibold leading-3.5 text-white">
+          {count > 9 ? "9+" : count}
         </span>
       ) : null}
     </button>
@@ -645,7 +726,9 @@ function InsightsBoard({
   }
 
   const audit = payload.audit;
-  const recommendations = payload.reflection?.recommendations ?? [];
+  const recommendations = Array.isArray(payload.reflection?.recommendations)
+    ? payload.reflection.recommendations
+    : [];
   const reflectionFacts = insightOverviewRows(payload.reflection?.overview);
   const decisionFacts = insightOverviewRows(payload.decisionTrace?.overview);
 
@@ -2581,6 +2664,11 @@ function taskUpdatedAtMs(task: SessionTask) {
 
 function isDone(status: string) {
   return status === "completed" || status === "done" || status === "archived";
+}
+
+function insightRecommendationCount(payload: ChatInsightsResponse | null) {
+  const recommendations = payload?.reflection?.recommendations;
+  return Array.isArray(recommendations) ? recommendations.length : 0;
 }
 
 function isAgentActive(status: string) {

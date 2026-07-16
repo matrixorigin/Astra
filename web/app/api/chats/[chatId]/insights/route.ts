@@ -3,6 +3,7 @@ import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
 import type { ChatInsightsResponse } from "@/lib/api/types";
 import { requireRuntimeClient, runtimeErrorDetail } from "@/lib/runtime-client";
+import type { ReflectReport } from "@astra/sdk";
 
 type EvidenceKey = "audit" | "reflection" | "decision trace";
 
@@ -16,6 +17,35 @@ function settledValue<T>(
   }
   warnings.push(`${key}: ${runtimeErrorDetail(result.reason)}`);
   return null;
+}
+
+function normalizeReflectReport(report: ReflectReport | null): ReflectReport | null {
+  if (!report) {
+    return null;
+  }
+  const untrusted = report as ReflectReport & {
+    overview?: unknown;
+    diagnoses?: unknown;
+    insights?: unknown;
+    recommendations?: unknown;
+  };
+  return {
+    ...report,
+    overview:
+      untrusted.overview &&
+      typeof untrusted.overview === "object" &&
+      !Array.isArray(untrusted.overview)
+        ? (untrusted.overview as Record<string, unknown>)
+        : {},
+    diagnoses: Array.isArray(untrusted.diagnoses) ? untrusted.diagnoses : [],
+    insights: Array.isArray(untrusted.insights) ? untrusted.insights : [],
+    recommendations: Array.isArray(untrusted.recommendations)
+      ? untrusted.recommendations.filter(
+          (recommendation): recommendation is string =>
+            typeof recommendation === "string" && recommendation.trim().length > 0,
+        )
+      : [],
+  };
 }
 
 export async function GET(
@@ -64,15 +94,17 @@ export async function GET(
         }),
       ]);
     const warnings: string[] = [];
+    const reflection = normalizeReflectReport(
+      settledValue("reflection", reflectionResult, warnings),
+    );
+    const decisionTrace = normalizeReflectReport(
+      settledValue("decision trace", decisionTraceResult, warnings),
+    );
     const payload: ChatInsightsResponse = {
       sessionId,
       audit: settledValue("audit", auditResult, warnings),
-      reflection: settledValue("reflection", reflectionResult, warnings),
-      decisionTrace: settledValue(
-        "decision trace",
-        decisionTraceResult,
-        warnings,
-      ),
+      reflection,
+      decisionTrace,
       warnings,
       generatedAt: new Date().toISOString(),
     };

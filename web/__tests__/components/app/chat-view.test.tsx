@@ -1192,7 +1192,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
     });
-    expect(screen.getAllByText("Thinking").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Working").length).toBeGreaterThan(0);
     expect(screen.getByText("working...")).toBeInTheDocument();
     expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
@@ -1242,7 +1242,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       });
       expect(mockGetChat).toHaveBeenCalledWith("chat-123");
       expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
-      expect(screen.getAllByText("Thinking").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Working").length).toBeGreaterThan(0);
       expect(screen.getByText("working...")).toBeInTheDocument();
       expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();

@@ -773,6 +773,24 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     expect(url).toContain("last_n=5");
   });
 
+  test("getSessionReflect normalizes omitted collection fields", async () => {
+    globalThis.fetch = mockFetch(200, {
+      session_id: "sx",
+      focus: "auto",
+      overview: null,
+      recommendations: [null, "", "Continue with verification."],
+    });
+    const report = await createClient().getSessionReflect("sx");
+    expect(report).toMatchObject({
+      session_id: "sx",
+      focus: "auto",
+      overview: {},
+      diagnoses: [],
+      insights: [],
+      recommendations: ["Continue with verification."],
+    });
+  });
+
   test("getSessionDecisionTrace", async () => {
     globalThis.fetch = mockFetch(200, {
       session_id: "sx",

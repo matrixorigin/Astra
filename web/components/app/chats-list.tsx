@@ -1,6 +1,6 @@
 'use client';
 
-import { Download, FolderInput, MessageSquare, Trash2 } from 'lucide-react';
+import { MessageSquare } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
@@ -20,8 +20,6 @@ export function ChatsList({ projectId = null }: { projectId?: string | null }) {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selectMode, setSelectMode] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const reload = useCallback(() => {
     let cancelled = false;
@@ -52,7 +50,6 @@ export function ChatsList({ projectId = null }: { projectId?: string | null }) {
   useEffect(() => reload(), [reload]);
 
   useEffect(() => subscribeChatLifecycleChange(() => {
-    setSelected(new Set());
     void reload();
   }), [reload]);
 
@@ -70,11 +67,12 @@ export function ChatsList({ projectId = null }: { projectId?: string | null }) {
       <div className="mx-auto w-full max-w-5xl">
         <PageHeader
           title={projectId ? 'Project chats' : 'Chats'}
-          action={
-            <Button variant={selectMode ? 'secondary' : 'ghost'} onClick={() => setSelectMode((value) => !value)}>
-              Select
-            </Button>
+          description={
+            projectId
+              ? 'Conversations grounded in this project workspace.'
+              : 'Continue durable sessions or start a new line of work.'
           }
+          action={<Button href="/">New chat</Button>}
         />
         <SearchField
           value={query}
@@ -103,19 +101,6 @@ export function ChatsList({ projectId = null }: { projectId?: string | null }) {
                 href={chat.projectId ? `/projects/${chat.projectId}/chats/${chat.id}` : `/chats/${chat.id}`}
                 archived={Boolean(chat.archivedAt)}
                 afterMutationHref={chat.projectId ? `/projects/${chat.projectId}` : '/chats'}
-                selectable={selectMode}
-                selected={selected.has(chat.id)}
-                onSelectChange={(checked) => {
-                  setSelected((current) => {
-                    const next = new Set(current);
-                    if (checked) {
-                      next.add(chat.id);
-                    } else {
-                      next.delete(chat.id);
-                    }
-                    return next;
-                  });
-                }}
               />
             ))}
       </div>
@@ -136,15 +121,6 @@ export function ChatsList({ projectId = null }: { projectId?: string | null }) {
           <Button variant="ghost" onClick={loadMore}>
             Load more
           </Button>
-        </div>
-      ) : null}
-
-      {selectMode && selected.size > 0 ? (
-        <div className="fixed bottom-6 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border border-border bg-surface px-4 py-2 shadow-lg">
-          <span className="px-2 text-sm text-text-secondary">{selected.size} selected</span>
-          <Button size="sm" variant="ghost" leadingIcon={Trash2}>Delete</Button>
-          <Button size="sm" variant="ghost" leadingIcon={FolderInput}>Move</Button>
-          <Button size="sm" variant="ghost" leadingIcon={Download}>Export</Button>
         </div>
       ) : null}
       </div>

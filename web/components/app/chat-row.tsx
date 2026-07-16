@@ -56,7 +56,7 @@ export function ChatRow({
   }
 
   return (
-    <div className="group flex items-start gap-2 rounded-control border border-transparent pr-1 text-text-secondary hover:border-border hover:bg-surface-muted hover:text-text">
+    <div className="group flex items-start gap-2 rounded-card border border-border/75 bg-surface pr-1 text-text-secondary shadow-[0_1px_2px_rgba(15,23,42,0.02)] transition hover:border-border-strong hover:text-text hover:shadow-[0_6px_18px_rgba(15,23,42,0.05)]">
       <Link href={href} className="flex min-w-0 flex-1 items-start gap-3 px-3 py-3">
         {content}
       </Link>

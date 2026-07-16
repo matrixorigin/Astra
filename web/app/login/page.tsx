@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useActionState, useEffect } from "react";
+import { AuthShell } from "@/components/auth/auth-shell";
 import { loginAction } from "@/lib/auth/actions";
 
 function LoginForm() {
@@ -21,17 +22,22 @@ function LoginForm() {
 
   if (state.ok) {
     return (
-      <p className="text-center text-sm text-slate-400" role="status">
-        Signed in. Redirecting…
-      </p>
+      <div
+        className="rounded-card border border-success/20 bg-success/5 px-4 py-3 text-sm text-success"
+        role="status"
+      >
+        Signed in. Opening your workspace…
+      </div>
     );
   }
 
   return (
-    <>
-      <form action={formAction} className="space-y-4">
+    <form action={formAction} className="space-y-5">
         {state.error ? (
-          <div className="rounded-xl border border-red-800/50 bg-red-950/30 px-4 py-3 text-sm text-red-300">
+          <div
+            role="alert"
+            className="rounded-card border border-danger/20 bg-danger/5 px-4 py-3 text-sm leading-5 text-danger"
+          >
             {state.error}
           </div>
         ) : null}
@@ -39,7 +45,7 @@ function LoginForm() {
         <div>
           <label
             htmlFor="username"
-            className="block text-sm font-medium text-slate-300"
+            className="block text-sm font-medium text-text"
           >
             Username
           </label>
@@ -49,15 +55,16 @@ function LoginForm() {
             type="text"
             required
             autoComplete="username"
-            className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-900/50 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-sky-500/50"
-            placeholder="your-username"
+            autoFocus
+            className="mt-2 h-11 w-full rounded-control border border-border bg-surface px-3.5 text-sm text-text outline-none transition placeholder:text-text-muted focus:border-accent focus:ring-4 focus:ring-accent/10"
+            placeholder="Your username"
           />
         </div>
 
         <div>
           <label
             htmlFor="password"
-            className="block text-sm font-medium text-slate-300"
+            className="block text-sm font-medium text-text"
           >
             Password
           </label>
@@ -67,7 +74,7 @@ function LoginForm() {
             type="password"
             required
             autoComplete="current-password"
-            className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-900/50 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-sky-500/50"
+            className="mt-2 h-11 w-full rounded-control border border-border bg-surface px-3.5 text-sm text-text outline-none transition placeholder:text-text-muted focus:border-accent focus:ring-4 focus:ring-accent/10"
             placeholder="••••••••"
           />
         </div>
@@ -75,44 +82,36 @@ function LoginForm() {
         <button
           type="submit"
           disabled={isPending}
-          className="w-full rounded-xl bg-sky-600 py-3 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+          className="inline-flex h-11 w-full items-center justify-center rounded-control bg-text px-4 text-sm font-semibold text-white transition hover:bg-text/90 disabled:cursor-wait disabled:opacity-60"
         >
           {isPending ? "Signing in…" : "Sign in"}
         </button>
       </form>
-
-      <p className="mt-6 text-center text-sm text-slate-400">
-        Don&apos;t have an account?{" "}
-        <Link href="/register" className="text-sky-400 hover:text-sky-300">
-          Register
-        </Link>
-      </p>
-
-      <p className="mt-2 text-center text-sm text-slate-500">
-        <Link href="/settings" className="hover:text-slate-300">
-          Configure API URL →
-        </Link>
-      </p>
-    </>
   );
 }
 
 export default function LoginPage() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4">
-      <div className="w-full max-w-sm">
-        <div className="mb-8 text-center">
-          <h1 className="text-2xl font-bold text-white">mo-dev-agent</h1>
-          <p className="mt-2 text-sm text-slate-400">Sign in to your account</p>
-        </div>
-        <Suspense
-          fallback={
-            <div className="h-64 animate-pulse rounded-xl bg-slate-800/50" />
-          }
-        >
-          <LoginForm />
-        </Suspense>
-      </div>
-    </div>
+    <AuthShell
+      eyebrow="Welcome back"
+      title="Continue your agent workspace."
+      description="Return to durable sessions, active tasks, delegated runs, and the evidence behind each decision."
+      footer={
+        <>
+          New to Astra?{" "}
+          <Link href="/register" className="font-medium text-text hover:text-accent">
+            Create an account
+          </Link>
+        </>
+      }
+    >
+      <Suspense
+        fallback={
+          <div className="h-64 animate-pulse rounded-card bg-surface-muted" />
+        }
+      >
+        <LoginForm />
+      </Suspense>
+    </AuthShell>
   );
 }

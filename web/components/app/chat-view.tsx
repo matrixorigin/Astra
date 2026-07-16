@@ -192,7 +192,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         toolAttentionCount,
       ].join(":")
     : "";
-  const headerRunState = chatHeaderRunState(activeRunStatus);
+  const headerRunState = chatHeaderRunState(
+    stoppingRun ? "cancelling" : activeRunStatus,
+  );
 
   // ── effects ────────────────────────────────────────────────────────────────
 
@@ -629,6 +631,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         activeRun={workSurfaceActiveRun}
         tab={workSurfaceTab}
         onTabChange={setWorkSurfaceTab}
+        defaultCollapsed
         onRefresh={() => {
           void stream.hydrateWorkSurfaceForChat();
         }}
@@ -647,7 +650,14 @@ function chatHeaderRunState(status: string | null) {
     ["running", "starting", "input-queued", "cancelling"].includes(normalized)
   ) {
     return {
-      label: normalized === "input-queued" ? "Input queued" : "Working",
+      label:
+        normalized === "input-queued"
+          ? "Message queued"
+          : normalized === "cancelling"
+            ? "Stopping"
+            : normalized === "starting"
+              ? "Starting"
+              : "Working",
       dotClass: "bg-accent",
       pulse: true,
     };
@@ -661,9 +671,20 @@ function chatHeaderRunState(status: string | null) {
   }
   if (normalized === "blocked" || normalized === "failed") {
     return {
-      label: normalized === "blocked" ? "Needs action" : "Run failed",
+      label: normalized === "blocked" ? "Needs attention" : "Run failed",
       dotClass: "bg-danger",
       pulse: false,
+    };
+  }
+  if (normalized && isTerminalChatRunStatus(normalized)) {
+    return { label: "Ready", dotClass: "bg-success", pulse: false };
+  }
+  if (normalized) {
+    const label = statusLabel(normalized);
+    return {
+      label: label.charAt(0).toUpperCase() + label.slice(1),
+      dotClass: "bg-accent",
+      pulse: true,
     };
   }
   return { label: "Ready", dotClass: "bg-success", pulse: false };

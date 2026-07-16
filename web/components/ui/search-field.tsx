@@ -11,7 +11,7 @@ export function SearchField({ className, containerClassName, ...props }: SearchF
   return (
     <label
       className={cn(
-        'flex h-11 items-center gap-3 rounded-control border border-border bg-surface px-3 focus-within:border-accent',
+        'flex h-10 items-center gap-3 rounded-control border border-border bg-surface px-3 shadow-sm transition focus-within:border-accent focus-within:ring-4 focus-within:ring-accent/10',
         containerClassName,
       )}
     >

@@ -8,10 +8,10 @@ type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 type ButtonSize = 'sm' | 'md';
 
 const variantClass: Record<ButtonVariant, string> = {
-  primary: 'bg-accent text-white hover:bg-accent/90 disabled:bg-accent/40',
-  secondary: 'border border-border bg-surface text-text hover:bg-surface-muted',
+  primary: 'bg-text text-white shadow-sm hover:-translate-y-px hover:bg-text/90 disabled:bg-text/40',
+  secondary: 'border border-border bg-surface text-text shadow-sm hover:border-border-strong hover:bg-surface-muted',
   ghost: 'text-text-secondary hover:bg-surface-muted hover:text-text',
-  danger: 'bg-danger text-white hover:bg-danger/90',
+  danger: 'bg-danger text-white shadow-sm hover:bg-danger/90',
 };
 
 const sizeClass: Record<ButtonSize, string> = {
@@ -45,7 +45,7 @@ export function Button({
   ...props
 }: ButtonProps) {
   const classes = cn(
-    'inline-flex shrink-0 items-center justify-center gap-2 rounded-control font-medium outline-none disabled:pointer-events-none disabled:opacity-60',
+    'inline-flex shrink-0 items-center justify-center gap-2 rounded-control font-medium outline-none transition focus-visible:ring-4 focus-visible:ring-accent/15 disabled:pointer-events-none disabled:translate-y-0 disabled:opacity-60',
     variantClass[variant],
     sizeClass[size],
     className,

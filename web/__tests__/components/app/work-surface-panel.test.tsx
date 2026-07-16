@@ -82,6 +82,49 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getByText("Partial evidence")).toBeInTheDocument();
   });
 
+  it("renders incomplete insight evidence without crashing", async () => {
+    const user = userEvent.setup();
+    const onLoadInsights = vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      audit: null,
+      reflection: {
+        session_id: "session-1",
+        focus: "auto",
+        overview: {},
+      },
+      decisionTrace: null,
+      warnings: [],
+      generatedAt: "2026-07-16T10:00:00.000Z",
+    });
+
+    function Surface() {
+      const [tab, setTab] = useState<"tasks" | "agents" | "tools" | "insights">(
+        "tasks",
+      );
+      return (
+        <WorkSurfacePanel
+          state={{
+            ...createEmptyWorkSurface("session-1", "run-1"),
+            hydrated: true,
+          }}
+          tab={tab}
+          onTabChange={setTab}
+          onRefresh={vi.fn()}
+          onLoadAgentRun={vi.fn()}
+          onLoadInsights={onLoadInsights}
+        />
+      );
+    }
+
+    render(<Surface />);
+    await user.click(screen.getByRole("button", { name: /Insights/i }));
+
+    expect(await screen.findByText("Reflect")).toBeInTheDocument();
+    expect(
+      screen.getByText("No recommendations were produced for the current evidence."),
+    ).toBeInTheDocument();
+  });
+
   it("opens a child run as a canonical transcript workspace", async () => {
     const user = userEvent.setup();
     const onLoadAgentRun = vi.fn().mockResolvedValue({

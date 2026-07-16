@@ -59,7 +59,11 @@ export function ProjectsList() {
   return (
     <div className="h-full overflow-y-auto overscroll-contain px-8 py-8">
       <div className="mx-auto w-full max-w-[1200px]">
-        <PageHeader title="Projects" action={<Button href="/projects/new" variant="primary" leadingIcon={Plus}>New project</Button>} />
+        <PageHeader
+          title="Projects"
+          description="Group conversations, files, instructions, and durable context around an outcome."
+          action={<Button href="/projects/new" variant="primary" leadingIcon={Plus}>New project</Button>}
+        />
 
         <SearchField
           value={query}
