@@ -2176,7 +2176,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    const REAL_TURN_TEST_TIMEOUT: Duration = Duration::from_secs(25);
+    const REAL_TURN_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn service_error(message: impl Into<String>) -> astra_services::ServiceError {
         astra_services::ServiceError::internal(message)
@@ -2201,8 +2201,9 @@ mod tests {
         }
     }
 
-    fn test_background_plan_context() -> BackgroundPlanContext {
-        BackgroundPlanContext {
+    fn test_background_plan_context() -> (BackgroundPlanContext, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().expect("isolated plan executor workspace");
+        let context = BackgroundPlanContext {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: String::new(),
             profile: None,
@@ -2223,7 +2224,7 @@ mod tests {
             root_mailbox: None,
             root_agent_id: "plan-test".into(),
             durable_task_state: None,
-            workspace_root: std::env::temp_dir(),
+            workspace_root: workspace.path().to_path_buf(),
             observability_hub: None,
             observability_session: None,
             file_journal: Arc::new(std::sync::Mutex::new(
@@ -2258,7 +2259,8 @@ mod tests {
             turn: 0,
             turn_retry_counts: std::collections::HashMap::new(),
             current_subtask_strategy_hint: None,
-        }
+        };
+        (context, workspace)
     }
 
     #[test]
@@ -3016,7 +3018,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3185,7 +3187,7 @@ All acceptance checks pass:
             }
         }
 
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
                 id: "s1".into(),
@@ -3361,7 +3363,7 @@ All acceptance checks pass:
             }
         }
 
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
                 id: "s1".into(),
@@ -3425,7 +3427,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3465,7 +3467,7 @@ All acceptance checks pass:
             crate::cli::mock_llm::MockLlmServer::start(crate::cli::mock_llm::MockScenario::Fail)
                 .await
                 .expect("mock llm server");
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3506,7 +3508,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context();
+        let (mut ctx, _workspace) = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![
@@ -3568,7 +3570,7 @@ All acceptance checks pass:
 
     #[test]
     fn turn_retry_counts_in_context_starts_empty() {
-        let ctx = test_background_plan_context();
+        let (ctx, _workspace) = test_background_plan_context();
         assert!(
             ctx.turn_retry_counts.is_empty(),
             "fresh context should have no retry counts"
