@@ -10444,27 +10444,27 @@ mod tests {
         assert!(web_fetch.visible);
         assert_eq!(
             web_fetch.selected_offer_id.as_deref(),
-            Some("web_fetch@server-builtin")
+            Some("web_fetch@edge-1")
         );
-        assert_eq!(web_fetch.selected_route, "ServerRuntime");
+        assert_eq!(web_fetch.selected_route, "EdgeBound");
         assert!(
             web_fetch
                 .candidates
                 .iter()
-                .any(|candidate| candidate.offer_id == "web_fetch@server-builtin"
+                .any(|candidate| candidate.offer_id == "web_fetch@edge-1"
                     && candidate.selected
-                    && candidate.executor_id == "server-service"
-                    && candidate.placement == "server"
-                    && candidate.scope == "session"
-                    && candidate.authority == "none")
+                    && candidate.executor_id == "edge-1"
+                    && candidate.placement == "edge:edge-1"
+                    && candidate.scope == "workspace"
+                    && candidate.authority == "read_write")
         );
         assert!(web_fetch.candidates.iter().any(|candidate| {
-            candidate.offer_id == "web_fetch@edge-1"
-                && candidate.reason == "RouteMismatch"
-                && candidate.executor_id == "edge-1"
-                && candidate.placement == "edge:edge-1"
-                && candidate.scope == "workspace"
-                && candidate.authority == "read_write"
+            candidate.offer_id == "web_fetch@server-builtin"
+                && candidate.reason == "CurrentProviderPreferred"
+                && candidate.executor_id == "server-service"
+                && candidate.placement == "server"
+                && candidate.scope == "session"
+                && candidate.authority == "none"
         }));
     }
 
@@ -10496,7 +10496,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_admission_snapshot_keeps_server_offer_when_edge_is_unavailable() {
+    fn tool_admission_snapshot_reports_unavailable_selected_edge_offer() {
         let offline_edge_snapshot = ExecutionBindingSnapshot::new(
             WorkspaceBinding::edge_workspace(
                 "MacBook Pro",
@@ -10527,17 +10527,24 @@ mod tests {
             .find(|entry| entry.tool_name == "web_fetch")
             .expect("web_fetch admission entry");
 
-        assert!(web_fetch.visible);
+        assert!(!web_fetch.visible);
         assert_eq!(
             web_fetch.selected_offer_id.as_deref(),
-            Some("web_fetch@server-builtin")
+            Some("web_fetch@edge-1")
         );
-        assert_eq!(web_fetch.selected_route, "ServerRuntime");
-        assert!(web_fetch.hidden_reason.is_none());
+        assert_eq!(web_fetch.selected_route, "EdgeBound");
+        assert_eq!(
+            web_fetch.hidden_reason.as_deref(),
+            Some("ProviderUnavailable")
+        );
         assert!(web_fetch.candidates.iter().any(|candidate| {
-            candidate.offer_id == "web_fetch@server-builtin"
+            candidate.offer_id == "web_fetch@edge-1"
                 && candidate.selected
-                && candidate.reason == "Selected"
+                && candidate.readiness == "offline"
+                && candidate.executor_id == "edge-1"
+                && candidate.placement == "edge:edge-1"
+                && candidate.scope == "workspace"
+                && candidate.reason == "ProviderUnavailable"
         }));
     }
 

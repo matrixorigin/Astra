@@ -7379,7 +7379,7 @@ esac
     }
 
     #[tokio::test]
-    async fn shared_network_web_search_does_not_inherit_edge_file_route() {
+    async fn shared_network_web_search_prefers_bound_edge_provider() {
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
@@ -7394,6 +7394,7 @@ esac
             .execute_with_metadata(
                 "web_search",
                 &json!({
+                    "query": "astra runtime",
                     "_tool_call_id": "call-web-search",
                     "_run_id": "run-web-search",
                 }),
@@ -7401,18 +7402,13 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(
-            result.output.contains("query"),
-            "server web-search validation should run instead of edge transport: {result:?}"
-        );
-        assert!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("error_kind"))
-                .is_none_or(|kind| kind != "transport_unavailable"),
-            "workspace-independent web search must not fail with the edge file route"
-        );
+        let metadata = result.metadata.as_ref().expect("edge runtime metadata");
+        assert_eq!(metadata["error_kind"], "transport_unavailable");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["failure_scope"], "executor_transport");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -7423,11 +7419,11 @@ esac
             .iter()
             .find(|event| event["type"] == "tool_routing_decision")
             .expect("tool_routing_decision");
-        assert_eq!(routing["route"], "server_runtime");
+        assert_eq!(routing["route"], "edge_bound");
         assert_eq!(routing["run_id"], "run-web-search");
-        assert_eq!(routing["workspace"]["kind"], "none");
-        assert_eq!(routing["executor"]["display_name"], "Server runtime");
-        assert_eq!(routing["transport"], "server_local");
+        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(routing["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(routing["transport"], "edge_ws");
 
         let started = events
             .iter()
@@ -7435,12 +7431,12 @@ esac
             .expect("tool_transport_started");
         assert_eq!(started["call_id"], "call-web-search");
         assert_eq!(started["run_id"], "run-web-search");
-        assert_eq!(started["workspace"]["kind"], "none");
-        assert_eq!(started["executor"]["display_name"], "Server runtime");
-        assert_eq!(started["transport"], "server_local");
+        assert_eq!(started["workspace"]["kind"], "edge_workspace");
+        assert_eq!(started["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(started["transport"], "edge_ws");
         assert!(
-            events.iter().all(|event| event["type"] != "run_blocked"),
-            "server-side argument validation must not report an edge route block: {events:?}"
+            events.iter().any(|event| event["type"] == "run_blocked"),
+            "unavailable selected edge route must be observable: {events:?}"
         );
     }
 

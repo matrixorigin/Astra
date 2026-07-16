@@ -3562,7 +3562,7 @@ async fn server_runtime_tools_bypass_edge_transport() {
 }
 
 #[tokio::test]
-async fn shared_network_tools_use_server_unless_an_edge_offer_is_explicitly_selected() {
+async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_binding() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
@@ -3603,19 +3603,10 @@ async fn shared_network_tools_use_server_unless_an_edge_offer_is_explicitly_sele
         );
         assert_eq!(
             service.routing_decision(&edge_request),
-            ToolExecutionRouteKind::ServerRuntime,
-            "{tool} must not inherit the file workspace route"
+            ToolExecutionRouteKind::EdgeBound,
+            "{tool} must prefer the selected edge executor"
         );
-        let edge_result = service
-            .execute(
-                edge_request.with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
-                    tool,
-                    "edge-selected",
-                    ToolExecutionRouteKind::EdgeBound,
-                )),
-                &local,
-            )
-            .await;
+        let edge_result = service.execute(edge_request, &local).await;
         assert!(!edge_result.is_error, "{tool}: {edge_result:?}");
         assert_eq!(edge_result.output, "ledger-result");
     }

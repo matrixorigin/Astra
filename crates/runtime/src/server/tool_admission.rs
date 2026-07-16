@@ -11,8 +11,7 @@ use super::tool_execution_binding::{
     runtime_execution_provider_id_for_executor,
 };
 use super::tool_route_selection::{
-    ToolExecutionClass, ToolExecutionRouteKind, routing_decision_for_binding,
-    runtime_executor_route_for_binding, tool_execution_class,
+    ToolExecutionClass, ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_class,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,39 +329,9 @@ fn shared_service_or_runtime_route_for_providers(
 ) -> ToolExecutionRouteKind {
     let binding_route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
-    let runtime_route =
-        runtime_executor_route_for_binding(tool_name, workspace.kind, executor.transport);
-    let binding_provider_type = provider_type_for_route(runtime_route, workspace.kind);
+    let binding_provider_type = provider_type_for_route(binding_route, workspace.kind);
     let binding_selects_runtime_provider =
         binding_provider_type.is_some_and(CapacityProviderType::is_runtime_executor);
-
-    if matches!(workspace.kind, WorkspaceBindingKind::LocalFilesystem) {
-        return binding_route;
-    }
-
-    // Shared services are independent of the bound file workspace. Prefer an
-    // enabled server offer so an offline edge file executor does not remove
-    // network capability from child agents. Offer-scoped policy must not hide
-    // a distinct runtime offer, so a disabled/disallowed server offer falls
-    // through to the explicitly bound runtime provider when one is ready.
-    if let Some(server_provider) = providers.iter().find(|provider| {
-        provider.provider_type == CapacityProviderType::ServerService
-            && provider.declares_tool(tool_name)
-    }) {
-        let server_offer = offer_for_provider(
-            tool_name,
-            server_provider,
-            ToolExecutionRouteKind::ServerRuntime,
-            CapacityProviderStatus::Ready,
-            workspace,
-            executor,
-        );
-        if !offer_disabled(context, &server_offer)
-            && provider_allows_tool(context, &server_offer.provider_id, tool_name)
-        {
-            return ToolExecutionRouteKind::ServerRuntime;
-        }
-    }
 
     if binding_selects_runtime_provider {
         let runtime_provider_declares_tool = if let Some(runtime_declared_tool_names) =
@@ -373,8 +342,42 @@ fn shared_service_or_runtime_route_for_providers(
             true
         };
         if runtime_provider_declares_tool {
-            return runtime_route;
+            if let Some(runtime_provider) =
+                provider_for_route(tool_name, workspace, binding_route, providers)
+            {
+                let runtime_offer = offer_for_provider(
+                    tool_name,
+                    runtime_provider,
+                    binding_route,
+                    CapacityProviderStatus::Ready,
+                    workspace,
+                    executor,
+                );
+                if !offer_disabled(context, &runtime_offer)
+                    && provider_allows_tool(context, &runtime_offer.provider_id, tool_name)
+                {
+                    return binding_route;
+                }
+                // A policy-disabled runtime offer may use a distinct enabled
+                // server offer below. Policy stays offer-scoped.
+            } else {
+                // The selected runtime owns this capability but is currently
+                // unavailable. Do not silently move network execution to a
+                // server whose egress/readiness was not selected by the user.
+                return binding_route;
+            }
         }
+    }
+
+    if matches!(workspace.kind, WorkspaceBindingKind::LocalFilesystem) {
+        return binding_route;
+    }
+
+    if providers.iter().any(|provider| {
+        provider.provider_type == CapacityProviderType::ServerService
+            && provider.declares_tool(tool_name)
+    }) {
+        return ToolExecutionRouteKind::ServerRuntime;
     }
 
     binding_route
@@ -859,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_network_tool_keeps_server_offer_for_edge_workspace_binding() {
+    fn shared_network_tool_selects_edge_offer_for_edge_binding() {
         let decision = resolve_tool_admission_for_binding(
             "web_fetch",
             &[],
@@ -879,36 +882,33 @@ mod tests {
         );
 
         assert!(decision.visible);
-        assert_eq!(decision.route, ToolExecutionRouteKind::ServerRuntime);
+        assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
         let offer = decision.selected_offer.as_ref().expect("selected offer");
-        assert_eq!(offer.provider_type, CapacityProviderType::ServerService);
-        assert_eq!(offer.provider_id, "server-builtin");
-        assert_eq!(
-            decision.selected_offer_id(),
-            Some("web_fetch@server-builtin")
-        );
+        assert_eq!(offer.provider_type, CapacityProviderType::EdgeCapacity);
+        assert_eq!(offer.provider_id, "edge-macpro");
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
         assert_eq!(decision.candidates.len(), 2);
         let edge_candidate = decision
             .candidates
             .iter()
             .find(|candidate| candidate.offer.provider_type == CapacityProviderType::EdgeCapacity)
             .expect("edge candidate");
-        assert!(!edge_candidate.selected);
-        assert_eq!(
-            edge_candidate.reason,
-            ToolOfferCandidateReason::RouteMismatch
-        );
+        assert!(edge_candidate.selected);
+        assert_eq!(edge_candidate.reason, ToolOfferCandidateReason::Selected);
         let server_candidate = decision
             .candidates
             .iter()
             .find(|candidate| candidate.offer.provider_type == CapacityProviderType::ServerService)
             .expect("server candidate");
-        assert!(server_candidate.selected);
-        assert_eq!(server_candidate.reason, ToolOfferCandidateReason::Selected);
+        assert!(!server_candidate.selected);
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::CurrentProviderPreferred
+        );
     }
 
     #[test]
-    fn shared_network_tool_falls_back_to_edge_only_when_server_service_is_unavailable() {
+    fn shared_network_tool_keeps_ready_edge_when_server_service_is_unavailable() {
         let decision = resolve_tool_admission_for_binding_with_context(
             "web_fetch",
             &[],
@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_network_tool_remains_server_backed_when_file_executor_is_offline() {
+    fn shared_network_tool_does_not_implicitly_fallback_when_selected_executor_offline() {
         let decision = resolve_tool_admission_for_binding(
             "web_fetch",
             &[],
@@ -1204,26 +1204,38 @@ mod tests {
             &registry(),
         );
 
-        assert!(decision.visible);
-        assert_eq!(decision.route, ToolExecutionRouteKind::ServerRuntime);
-        assert!(decision.hidden_reason.is_none());
+        assert!(!decision.visible);
+        assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
         assert_eq!(
-            decision.selected_offer_id(),
-            Some("web_fetch@server-builtin")
+            decision.hidden_reason,
+            Some(ToolHiddenReason::ProviderUnavailable)
         );
-        assert_eq!(decision.candidates.len(), 1);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        assert_eq!(decision.candidates.len(), 2);
+        let edge_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@edge-macpro")
+            .expect("offline selected edge candidate");
+        assert!(edge_candidate.selected);
         assert_eq!(
-            decision.candidates[0].offer.offer_id,
-            "web_fetch@server-builtin"
+            edge_candidate.reason,
+            ToolOfferCandidateReason::ProviderUnavailable
         );
-        assert!(decision.candidates[0].selected);
+        assert_eq!(
+            edge_candidate.offer.readiness,
+            CapacityProviderStatus::Offline
+        );
         let server_candidate = decision
             .candidates
             .iter()
             .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
             .expect("server candidate");
-        assert!(server_candidate.selected);
-        assert_eq!(server_candidate.reason, ToolOfferCandidateReason::Selected);
+        assert!(!server_candidate.selected);
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::CurrentProviderPreferred
+        );
     }
 
     #[test]
