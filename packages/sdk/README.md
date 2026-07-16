@@ -151,10 +151,23 @@ const client = new AstraClient({
 });
 
 function Chat() {
-  const { messages, sendMessage, isStreaming, plan, usage } = useAstraChat({
+  const {
+    messages,
+    sendMessage,
+    isStreaming,
+    plan,
+    tasks,
+    agents,
+    toolCalls,
+    usage,
+  } = useAstraChat({
     client,
     agentId: 'optional-agent',
     model: 'optional-model',
+    executionBudget: { initialTurns: 4, hardTurnLimit: 24 },
+    capabilities: ['multi_agent', 'reflect'],
+    allowTools: ['github'],
+    explain: true,
   });
 
   return (
@@ -162,6 +175,17 @@ function Chat() {
       {messages.map((m) => (
         <div key={m.id}>{m.content}</div>
       ))}
+      <aside>
+        {tasks.map((task) => (
+          <div key={task.id}>{task.title}: {task.status}</div>
+        ))}
+        {agents.map((agent) => (
+          <div key={agent.agentId}>{agent.description}: {agent.status}</div>
+        ))}
+        {toolCalls.map((tool) => (
+          <div key={tool.callId}>{tool.tool}: {tool.status}</div>
+        ))}
+      </aside>
       <button type="button" onClick={() => sendMessage('Hello!')}>
         Send
       </button>
@@ -169,6 +193,14 @@ function Chat() {
   );
 }
 ```
+
+`useAstraChat` projects task-board snapshots and agent lifecycle events into
+stable `tasks` and `agents` arrays while retaining raw `agentEvents` for custom
+audit or visualization needs. Integration boundaries such as
+`agentBinding`, `runtimeProfile`, `executionBudget`, `capabilities`, `explain`,
+`context`, `allowSkills`, `allowTools`, `workspaceBinding`, and
+`executorBinding` are passed through the same typed chat request rather than
+being flattened into prompt text.
 
 ## §5.5 Edge protocol (from TypeScript)
 

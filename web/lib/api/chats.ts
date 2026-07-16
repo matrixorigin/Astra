@@ -19,6 +19,7 @@ import type {
   ActiveRunMutationResponse,
   WorkSurfaceResponse,
   WorkSurfaceRunResponse,
+  ChatInsightsResponse,
   EdgeStatusResponse,
   WorkspaceSelection,
 } from "@/lib/api/types";
@@ -55,6 +56,12 @@ export function getChatWorkSurfaceRun(chatId: string, runId: string) {
     `/api/chats/${encodeURIComponent(
       chatId,
     )}/work-surface/runs/${encodeURIComponent(runId)}`,
+  );
+}
+
+export function getChatInsights(chatId: string) {
+  return requestJson<ChatInsightsResponse>(
+    `/api/chats/${encodeURIComponent(chatId)}/insights`,
   );
 }
 

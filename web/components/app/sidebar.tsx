@@ -87,7 +87,7 @@ export function Sidebar({ onSearch }: { onSearch: () => void }) {
           {collapsed ? null : (
             <span className="min-w-0">
               <span className="block truncate">Astra</span>
-              <span className="astra-sidebar-brand-subtitle block truncate">agent shell</span>
+              <span className="astra-sidebar-brand-subtitle block truncate">agent workspace</span>
             </span>
           )}
         </Link>

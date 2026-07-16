@@ -11,6 +11,7 @@ import {
   Loader2,
   Pause,
   RotateCw,
+  Sparkles,
   Terminal,
   Wrench,
   X,
@@ -26,12 +27,15 @@ import type {
   WorkspaceBinding,
   WorkSurfaceState,
 } from "@/lib/work-surface";
-import type { WorkSurfaceRunResponse } from "@/lib/api/types";
+import type {
+  ChatInsightsResponse,
+  WorkSurfaceRunResponse,
+} from "@/lib/api/types";
 import { useKeyboardShortcut } from "@/hooks/use-keyboard-shortcut";
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { cn } from "@/lib/utils/cn";
 
-export type WorkSurfaceTab = "tasks" | "agents" | "tools";
+export type WorkSurfaceTab = "tasks" | "agents" | "tools" | "insights";
 type WorkSurfaceViewMode = "all" | "attention";
 
 type WorkSurfacePanelProps = {
@@ -42,6 +46,7 @@ type WorkSurfacePanelProps = {
   openSignal?: number;
   onRefresh: () => void;
   onLoadAgentRun: (runId: string) => Promise<WorkSurfaceRunResponse>;
+  onLoadInsights?: () => Promise<ChatInsightsResponse>;
 };
 
 type AgentRunProjectionState = {
@@ -61,20 +66,32 @@ export function WorkSurfacePanel({
   openSignal,
   onRefresh,
   onLoadAgentRun,
+  onLoadInsights = async () => {
+    throw new Error("Session insights are not available on this surface.");
+  },
 }: WorkSurfacePanelProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [transcriptAgentId, setTranscriptAgentId] = useState<string | null>(
+    null,
+  );
   const [viewModes, setViewModes] = useState<
     Record<WorkSurfaceTab, WorkSurfaceViewMode>
   >({
     tasks: "all",
     agents: "all",
     tools: "all",
+    insights: "all",
   });
   const [agentRunDetails, setAgentRunDetails] = useState<
     Record<string, AgentRunProjectionState>
   >({});
+  const [insightsState, setInsightsState] = useState<{
+    loading: boolean;
+    error: string | null;
+    payload: ChatInsightsResponse | null;
+  }>({ loading: false, error: null, payload: null });
   const openSignalRef = useRef(openSignal);
   const counts = useMemo(() => taskCounts(state.tasks), [state.tasks]);
   const attentionCounts = useMemo(
@@ -82,6 +99,7 @@ export function WorkSurfacePanel({
       tasks: state.tasks.filter(taskNeedsAttention).length,
       agents: state.agents.filter(agentNeedsAttention).length,
       tools: state.tools.filter(toolNeedsAttention).length,
+      insights: 0,
     }),
     [state.agents, state.tasks, state.tools],
   );
@@ -96,7 +114,9 @@ export function WorkSurfacePanel({
       ? taskViewMode
       : tab === "agents"
         ? agentViewMode
-        : toolViewMode;
+        : tab === "tools"
+          ? toolViewMode
+          : "all";
   const visibleTasks = useMemo(
     () =>
       taskViewMode === "attention"
@@ -127,6 +147,9 @@ export function WorkSurfacePanel({
   const visibleRunStatus = activeRun?.status ?? state.runStatus;
   const selectedAgent = selectedAgentId
     ? visibleAgents.find((agent) => agent.agentId === selectedAgentId)
+    : undefined;
+  const transcriptAgent = transcriptAgentId
+    ? state.agents.find((agent) => agent.agentId === transcriptAgentId)
     : undefined;
 
   const toggleWorkSurface = useCallback(() => {
@@ -245,6 +268,32 @@ export function WorkSurfacePanel({
     };
   }, [onLoadAgentRun, selectedAgent?.runId, selectedAgent?.status]);
 
+  const loadInsights = useCallback(async () => {
+    setInsightsState((current) => ({
+      ...current,
+      loading: true,
+      error: null,
+    }));
+    try {
+      const payload = await onLoadInsights();
+      setInsightsState({ loading: false, error: null, payload });
+    } catch (error) {
+      setInsightsState((current) => ({
+        ...current,
+        loading: false,
+        error:
+          error instanceof Error ? error.message : "Failed to load insights.",
+      }));
+    }
+  }, [onLoadInsights]);
+
+  useEffect(() => {
+    if (tab !== "insights" || insightsState.loading || insightsState.payload) {
+      return;
+    }
+    void loadInsights();
+  }, [insightsState.loading, insightsState.payload, loadInsights, tab]);
+
   useEffect(() => {
     if (openSignal === undefined || openSignalRef.current === openSignal) {
       return;
@@ -286,7 +335,7 @@ export function WorkSurfacePanel({
           <div className="flex items-center gap-2">
             <ClipboardList className="size-4 text-accent" />
             <h2 className="truncate text-sm font-semibold text-text">
-              Activity
+              Run workspace
             </h2>
             <span className="ml-auto hidden rounded-control border border-border/40 px-2 py-0.5 text-[11px] text-text-muted lg:inline-flex">
               Ctrl+T
@@ -342,6 +391,13 @@ export function WorkSurfacePanel({
           count={toolActivityCount}
           onClick={() => onTabChange("tools")}
         />
+        <TabButton
+          active={tab === "insights"}
+          icon={Sparkles}
+          label="Insights"
+          count={insightsState.payload?.reflection?.recommendations.length ?? 0}
+          onClick={() => onTabChange("insights")}
+        />
       </div>
 
       {state.error ? (
@@ -383,10 +439,19 @@ export function WorkSurfacePanel({
                 current === agentId ? null : agentId,
               )
             }
+            onOpenTranscript={setTranscriptAgentId}
           />
         ) : null}
         {tab === "tools" ? (
           <ToolTimeline tools={visibleTools} loading={state.loading} />
+        ) : null}
+        {tab === "insights" ? (
+          <InsightsBoard
+            state={insightsState}
+            onRefresh={() => {
+              void loadInsights();
+            }}
+          />
         ) : null}
       </div>
     </>
@@ -437,6 +502,17 @@ export function WorkSurfacePanel({
             {body}
           </aside>
         </div>
+      ) : null}
+      {transcriptAgent ? (
+        <AgentTranscriptWorkspace
+          agent={transcriptAgent}
+          details={
+            transcriptAgent.runId
+              ? agentRunDetails[transcriptAgent.runId]
+              : undefined
+          }
+          onClose={() => setTranscriptAgentId(null)}
+        />
       ) : null}
     </>
   );
@@ -529,6 +605,224 @@ function AttentionViewToggle({
       </div>
     </div>
   );
+}
+
+function InsightsBoard({
+  state,
+  onRefresh,
+}: {
+  state: {
+    loading: boolean;
+    error: string | null;
+    payload: ChatInsightsResponse | null;
+  };
+  onRefresh: () => void;
+}) {
+  const payload = state.payload;
+  if (state.loading && !payload) {
+    return <EmptySurface loading label="Reflecting on durable evidence" />;
+  }
+  if (state.error && !payload) {
+    return (
+      <div className="rounded-card border border-danger/20 bg-danger/5 p-4">
+        <p className="text-sm font-medium text-danger">
+          Insights are unavailable
+        </p>
+        <p className="mt-1 text-xs leading-5 text-text-muted">{state.error}</p>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="mt-3 inline-flex items-center gap-1.5 rounded-control border border-border bg-surface px-3 py-1.5 text-xs font-medium text-text hover:bg-surface-muted"
+        >
+          <RotateCw className="size-3.5" />
+          Retry
+        </button>
+      </div>
+    );
+  }
+  if (!payload) {
+    return <EmptySurface loading={false} label="No durable evidence yet" />;
+  }
+
+  const audit = payload.audit;
+  const recommendations = payload.reflection?.recommendations ?? [];
+  const reflectionFacts = insightOverviewRows(payload.reflection?.overview);
+  const decisionFacts = insightOverviewRows(payload.decisionTrace?.overview);
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-card border border-border/70 bg-bg p-3 shadow-sm">
+        <div className="flex items-start gap-3">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-full border border-accent/20 bg-accent/10 text-accent">
+            <Sparkles className="size-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-semibold text-text">
+              Evidence-backed session view
+            </h3>
+            <p className="mt-1 text-xs leading-5 text-text-muted">
+              Durable audit, reflection, and routing evidence. Refreshing this
+              view does not alter the run.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={state.loading}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-control text-text-muted hover:bg-surface-muted hover:text-text disabled:opacity-50"
+            aria-label="Refresh session insights"
+          >
+            <RotateCw
+              className={cn("size-4", state.loading && "animate-spin")}
+            />
+          </button>
+        </div>
+      </section>
+
+      {audit ? (
+        <section>
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-text-muted">
+              Audit
+            </h3>
+            <span className="text-[11px] text-text-muted">
+              {audit.status}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Metric label="Turns" value={audit.turn_count} />
+            <Metric label="Tool calls" value={audit.tool_calls_total} />
+            <Metric
+              label="Tool failures"
+              value={audit.tool_calls_failed}
+            />
+            <Metric label="Compactions" value={audit.compact_count} />
+          </div>
+        </section>
+      ) : null}
+
+      <InsightSection
+        title="Reflect"
+        emptyLabel="No recommendations were produced for the current evidence."
+        rows={
+          recommendations.length
+            ? recommendations.map((recommendation, index) => ({
+                key: `recommendation-${index}`,
+                label: recommendation,
+              }))
+            : reflectionFacts
+        }
+      />
+
+      <InsightSection
+        title="Decision trace"
+        emptyLabel="No material routing decisions were reported."
+        rows={decisionFacts}
+      />
+
+      {payload.warnings.length ? (
+        <section className="rounded-card border border-warning/20 bg-warning/5 p-3">
+          <h3 className="text-xs font-semibold text-warning">
+            Partial evidence
+          </h3>
+          <ul className="mt-2 space-y-1 text-xs leading-5 text-text-muted">
+            {payload.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      <p className="text-center text-[11px] text-text-muted">
+        Refreshed {formatInsightTime(payload.generatedAt)}
+      </p>
+    </div>
+  );
+}
+
+type InsightRow = { key: string; label: string; value?: string };
+
+function InsightSection({
+  title,
+  rows,
+  emptyLabel,
+}: {
+  title: string;
+  rows: InsightRow[];
+  emptyLabel: string;
+}) {
+  return (
+    <section className="rounded-card border border-border/70 bg-bg p-3 shadow-sm">
+      <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-text-muted">
+        {title}
+      </h3>
+      {rows.length ? (
+        <div className="mt-2 divide-y divide-border/60">
+          {rows.slice(0, 8).map((row) => (
+            <div key={row.key} className="py-2 first:pt-1 last:pb-1">
+              <p className="text-xs leading-5 text-text-secondary">
+                {row.label}
+              </p>
+              {row.value ? (
+                <p className="mt-0.5 break-words font-mono text-[11px] leading-4 text-text-muted">
+                  {row.value}
+                </p>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 text-xs leading-5 text-text-muted">{emptyLabel}</p>
+      )}
+    </section>
+  );
+}
+
+function insightOverviewRows(
+  overview: Record<string, unknown> | null | undefined,
+): InsightRow[] {
+  if (!overview) {
+    return [];
+  }
+  return Object.entries(overview)
+    .map(([key, value]) => ({
+      key,
+      label: statusLabel(key),
+      value: compactInsightValue(value),
+    }))
+    .filter((row) => Boolean(row.value));
+}
+
+function compactInsightValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value.trim() || undefined;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const values = value
+      .map((item) => compactInsightValue(item))
+      .filter((item): item is string => Boolean(item));
+    return values.length ? values.slice(0, 6).join(" · ") : undefined;
+  }
+  if (isPlainRecord(value)) {
+    const entries = Object.entries(value)
+      .map(([key, item]) => {
+        const formatted = compactInsightValue(item);
+        return formatted ? `${statusLabel(key)}: ${formatted}` : null;
+      })
+      .filter((item): item is string => Boolean(item));
+    return entries.length ? entries.slice(0, 6).join(" · ") : undefined;
+  }
+  return undefined;
+}
+
+function formatInsightTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "just now"
+    : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function TaskBoard({
@@ -655,12 +949,14 @@ function AgentBoard({
   selectedAgentId,
   agentRunDetails,
   onSelectAgent,
+  onOpenTranscript,
 }: {
   agents: AgentSurfaceItem[];
   loading: boolean;
   selectedAgentId: string | null;
   agentRunDetails: Record<string, AgentRunProjectionState>;
   onSelectAgent: (agentId: string) => void;
+  onOpenTranscript: (agentId: string) => void;
 }) {
   if (!agents.length) {
     return <EmptySurface loading={loading} label="No subagent activity yet" />;
@@ -677,6 +973,7 @@ function AgentBoard({
           selected={selectedAgentId === agent.agentId}
           runDetails={agent.runId ? agentRunDetails[agent.runId] : undefined}
           onSelect={() => onSelectAgent(agent.agentId)}
+          onOpenTranscript={() => onOpenTranscript(agent.agentId)}
         />
       ))}
     </div>
@@ -688,11 +985,13 @@ function AgentCard({
   selected,
   runDetails,
   onSelect,
+  onOpenTranscript,
 }: {
   agent: AgentSurfaceItem;
   selected: boolean;
   runDetails?: AgentRunProjectionState;
   onSelect: () => void;
+  onOpenTranscript: () => void;
 }) {
   const active = isAgentActive(agent.status);
   const display = agentDisplayState(agent);
@@ -848,6 +1147,7 @@ function AgentCard({
           failed={failed}
           runDetails={runDetails}
           display={display}
+          onOpenTranscript={onOpenTranscript}
         />
       ) : null}
     </section>
@@ -927,11 +1227,13 @@ function AgentDetails({
   failed,
   runDetails,
   display,
+  onOpenTranscript,
 }: {
   agent: AgentSurfaceItem;
   failed: boolean;
   runDetails?: AgentRunProjectionState;
   display: ReturnType<typeof agentDisplayState>;
+  onOpenTranscript: () => void;
 }) {
   const updated = new Date(agent.updatedAt);
   const active = isAgentActive(agent.status);
@@ -971,6 +1273,16 @@ function AgentDetails({
         </span>
         {agent.reason ? <span>{agentReasonText(agent, display)}</span> : null}
         {agent.toolName ? <span>Tool {agent.toolName}</span> : null}
+        {agent.runId ? (
+          <button
+            type="button"
+            onClick={onOpenTranscript}
+            className="ml-auto inline-flex items-center gap-1 rounded-control border border-border bg-surface px-2 py-1 font-medium text-text-secondary hover:bg-surface-muted hover:text-text"
+          >
+            Open transcript
+            <ChevronRight className="size-3" />
+          </button>
+        ) : null}
       </div>
       {agent.resultSummary || agent.error ? (
         <div
@@ -1209,6 +1521,289 @@ function AgentRunProjection({
       )}
     </div>
   );
+}
+
+function AgentTranscriptWorkspace({
+  agent,
+  details,
+  onClose,
+}: {
+  agent: AgentSurfaceItem;
+  details?: AgentRunProjectionState;
+  onClose: () => void;
+}) {
+  const projection = details?.projection;
+  const transcript = projection?.transcript ?? [];
+  const events = projection?.events ?? [];
+  const display = agentDisplayState(agent);
+  const title = agent.description || agent.agentType || "Subagent";
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
+      <button
+        type="button"
+        aria-label="Close agent transcript"
+        onClick={onClose}
+        className="absolute inset-0 bg-slate-950/35 backdrop-blur-[2px]"
+      />
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${title} transcript`}
+        className="relative flex h-[min(92vh,920px)] w-full max-w-[1180px] flex-col overflow-hidden rounded-[14px] border border-border bg-bg shadow-[0_30px_90px_rgba(15,23,42,0.28)]"
+      >
+        <header className="flex min-h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-5">
+          <span
+            className={cn(
+              "flex size-9 shrink-0 items-center justify-center rounded-control border",
+              isAgentActive(agent.status)
+                ? "border-accent/25 bg-accent/10 text-accent"
+                : display.tone === "danger"
+                  ? "border-danger/20 bg-danger/10 text-danger"
+                  : "border-border bg-surface-muted text-text-secondary",
+            )}
+          >
+            <Bot className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <h2 className="truncate text-sm font-semibold text-text">
+                {title}
+              </h2>
+              <StatusPill
+                status={agent.status}
+                active={isAgentActive(agent.status)}
+                label={display.label}
+                tone={display.tone}
+              />
+            </div>
+            <p className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
+              {agent.runId ?? agent.agentId}
+            </p>
+          </div>
+          <div className="hidden items-center gap-2 text-xs text-text-muted md:flex">
+            <span>Agent transcript</span>
+            <span>·</span>
+            <span>{transcript.length} messages</span>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex size-9 items-center justify-center rounded-control text-text-muted hover:bg-surface-muted hover:text-text"
+            aria-label="Close transcript"
+          >
+            <X className="size-4" />
+          </button>
+        </header>
+
+        <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1fr)_300px]">
+          <main className="min-h-0 overflow-y-auto px-5 py-6 sm:px-8">
+            {details?.loading && !projection ? (
+              <div className="flex h-full min-h-56 items-center justify-center gap-2 text-sm text-text-muted">
+                <Loader2 className="size-4 animate-spin" />
+                Loading canonical run view
+              </div>
+            ) : details?.error && !projection ? (
+              <div className="rounded-card border border-danger/20 bg-danger/5 p-4 text-sm text-danger">
+                {details.error}
+              </div>
+            ) : transcript.length ? (
+              <div className="mx-auto max-w-3xl space-y-5">
+                {transcript.map((item) => (
+                  <TranscriptMessage
+                    key={`${item.item_seq}:${item.role}`}
+                    item={item}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="mx-auto max-w-3xl">
+                <div className="rounded-card border border-warning/20 bg-warning/5 p-4">
+                  <p className="text-sm font-medium text-text">
+                    Canonical conversation is not available yet
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-text-muted">
+                    Live run evidence is shown below. Activity events are not
+                    presented as a substitute for missing conversation history.
+                  </p>
+                </div>
+                <div className="mt-5 space-y-2">
+                  {events.length ? (
+                    events.map((event, index) => (
+                      <RunProjectionEventRow
+                        key={`${eventType(event)}:${index}`}
+                        event={event}
+                      />
+                    ))
+                  ) : (
+                    <p className="text-sm text-text-muted">
+                      No run evidence has arrived.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </main>
+
+          <aside className="min-h-0 overflow-y-auto border-t border-border bg-surface/70 p-4 lg:border-l lg:border-t-0">
+            <AgentTranscriptSummary
+              agent={agent}
+              projection={projection}
+              transcriptCount={transcript.length}
+            />
+          </aside>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TranscriptMessage({
+  item,
+}: {
+  item: NonNullable<WorkSurfaceRunResponse["transcript"]>[number];
+}) {
+  const role = item.role.toLowerCase();
+  const isAssistant = role === "assistant";
+  const isTool = role === "tool";
+  return (
+    <article
+      className={cn(
+        "rounded-card border p-4",
+        isAssistant
+          ? "border-border bg-surface"
+          : isTool
+            ? "border-border bg-slate-950 text-slate-100"
+            : "border-blue-200/60 bg-blue-50/55",
+      )}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <span
+          className={cn(
+            "text-[11px] font-semibold uppercase tracking-[0.1em]",
+            isTool
+              ? "text-slate-400"
+              : isAssistant
+                ? "text-accent"
+                : "text-blue-700",
+          )}
+        >
+          {statusLabel(item.role)}
+        </span>
+        {item.created_at ? (
+          <span
+            className={cn(
+              "text-[11px]",
+              isTool ? "text-slate-500" : "text-text-muted",
+            )}
+          >
+            {formatTranscriptTime(item.created_at)}
+          </span>
+        ) : null}
+      </div>
+      {item.reasoning?.trim() ? (
+        <details className="mt-3 rounded-control border border-border/60 bg-bg/60 px-3 py-2 text-xs">
+          <summary className="cursor-pointer font-medium text-text-muted">
+            Reasoning
+          </summary>
+          <p className="mt-2 whitespace-pre-wrap leading-5 text-text-secondary">
+            {item.reasoning}
+          </p>
+        </details>
+      ) : null}
+      <p
+        className={cn(
+          "mt-3 whitespace-pre-wrap break-words text-sm leading-6",
+          isTool ? "font-mono text-[13px] text-slate-200" : "text-text",
+        )}
+      >
+        {item.content || "(empty message)"}
+      </p>
+    </article>
+  );
+}
+
+function AgentTranscriptSummary({
+  agent,
+  projection,
+  transcriptCount,
+}: {
+  agent: AgentSurfaceItem;
+  projection: WorkSurfaceRunResponse | null | undefined;
+  transcriptCount: number;
+}) {
+  const facts = [
+    ["Messages", String(transcriptCount)],
+    ["Tools", String(agent.totalToolCalls ?? 0)],
+    [
+      "Tokens",
+      String(
+        (agent.totalPromptTokens ?? 0) + (agent.totalCompletionTokens ?? 0),
+      ),
+    ],
+    ["Duration", agent.durationMs ? formatDuration(agent.durationMs) : "Live"],
+  ];
+  return (
+    <div className="space-y-5">
+      <section>
+        <h3 className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
+          Run summary
+        </h3>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {facts.map(([label, value]) => (
+            <div
+              key={label}
+              className="rounded-control border border-border bg-bg p-2.5"
+            >
+              <p className="text-[10px] uppercase tracking-[0.08em] text-text-muted">
+                {label}
+              </p>
+              <p className="mt-1 truncate text-sm font-semibold text-text">
+                {value}
+              </p>
+            </div>
+          ))}
+        </div>
+      </section>
+      {projection ? <AgentRunBindingSummary projection={projection} /> : null}
+      {projection?.transcriptWarning ? (
+        <section className="rounded-control border border-warning/20 bg-warning/5 p-3 text-xs leading-5 text-text-muted">
+          {projection.transcriptWarning}
+        </section>
+      ) : null}
+      {agent.resultSummary || agent.error ? (
+        <section>
+          <h3 className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
+            Result
+          </h3>
+          <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-text-secondary">
+            {agent.error ?? agent.resultSummary}
+          </p>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function formatTranscriptTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
 }
 
 function AgentRunBindingSummary({
@@ -1919,7 +2514,8 @@ function taskCounts(tasks: SessionTask[]) {
 function tabItemCount(tab: WorkSurfaceTab, state: WorkSurfaceState) {
   if (tab === "tasks") return state.tasks.length;
   if (tab === "agents") return state.agents.length;
-  return state.tools.length;
+  if (tab === "tools") return state.tools.length;
+  return 0;
 }
 
 function taskNeedsAttention(task: SessionTask) {

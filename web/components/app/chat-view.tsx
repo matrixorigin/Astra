@@ -28,7 +28,7 @@ import {
 } from "@/hooks/use-stream-lifecycle";
 import { useWorkspaceSelection } from "@/hooks/use-workspace-selection";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
-import { getChat } from "@/lib/api/chats";
+import { getChat, getChatInsights } from "@/lib/api/chats";
 import type { ChatDetail } from "@/lib/api/types";
 import {
   deriveChatRunUiState,
@@ -45,6 +45,7 @@ import {
   type SessionTask,
   type ToolSurfaceItem,
 } from "@/lib/work-surface";
+import { cn } from "@/lib/utils/cn";
 import { useToast } from "@/components/ui/toast";
 
 // ── ChatView ─────────────────────────────────────────────────────────────────
@@ -191,6 +192,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         toolAttentionCount,
       ].join(":")
     : "";
+  const headerRunState = chatHeaderRunState(activeRunStatus);
 
   // ── effects ────────────────────────────────────────────────────────────────
 
@@ -360,8 +362,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               {detail.chat.title ?? "Untitled"}
             </h1>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
-              <span className="size-1.5 rounded-full bg-success" />
-              <span>{detail.chat.model ?? "Default model"}</span>
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  headerRunState.dotClass,
+                  headerRunState.pulse && "animate-pulse",
+                )}
+              />
+              <span>{headerRunState.label}</span>
+              <span aria-hidden="true">·</span>
+              <span className="truncate">
+                {detail.chat.model ?? "Default model"}
+              </span>
             </div>
           </div>
           <div className="min-w-0 flex-1" />
@@ -621,10 +633,40 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           void stream.hydrateWorkSurfaceForChat();
         }}
         onLoadAgentRun={stream.loadAgentRunProjection}
+        onLoadInsights={() => getChatInsights(detail.chat.id)}
         openSignal={workSurfaceOpenSignal}
       />
     </div>
   );
+}
+
+function chatHeaderRunState(status: string | null) {
+  const normalized = status?.trim().toLowerCase();
+  if (
+    normalized &&
+    ["running", "starting", "input-queued", "cancelling"].includes(normalized)
+  ) {
+    return {
+      label: normalized === "input-queued" ? "Input queued" : "Working",
+      dotClass: "bg-accent",
+      pulse: true,
+    };
+  }
+  if (normalized === "waiting" || normalized === "paused") {
+    return {
+      label: normalized === "paused" ? "Paused" : "Waiting",
+      dotClass: "bg-warning",
+      pulse: false,
+    };
+  }
+  if (normalized === "blocked" || normalized === "failed") {
+    return {
+      label: normalized === "blocked" ? "Needs action" : "Run failed",
+      dotClass: "bg-danger",
+      pulse: false,
+    };
+  }
+  return { label: "Ready", dotClass: "bg-success", pulse: false };
 }
 
 function ConversationWorkCard({

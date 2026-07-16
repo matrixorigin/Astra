@@ -411,6 +411,27 @@ export type SessionTask = {
   archived_at?: string | null;
 };
 
+export type AgentActivity = {
+  agentId: string;
+  runId?: string;
+  parentRunId?: string;
+  agentType?: string;
+  description?: string;
+  task?: string;
+  status: string;
+  reason?: string;
+  error?: string;
+  resultSummary?: string;
+  toolName?: string;
+  turn?: number;
+  maxTurns?: number;
+  totalPromptTokens?: number;
+  totalCompletionTokens?: number;
+  totalToolCalls?: number;
+  durationMs?: number;
+  updatedAt: number;
+};
+
 export type TaskBoardSnapshotEvent = {
   type: "task_board_snapshot";
   session_id: string;
@@ -689,18 +710,51 @@ export type SkillSearchSettings = {
   surfaceCap: number;
 };
 
+export type AgentBindingSelection = {
+  id: string;
+  capabilityServerRefs: {
+    mcp: string;
+    skills: string;
+  };
+};
+
+export type RuntimeProfile =
+  | "agent_binding_registry"
+  | "request_scoped_runtime_mcp";
+
+export type ExecutionBudget = {
+  initialTurns?: number;
+  hardTurnLimit?: number;
+};
+
 export type ChatConfig = {
   /** Optional runtime URL used by tests and direct clients; the Web UI proxies requests. */
   apiUrl?: string;
   sessionId?: string;
   agentId?: string;
   model?: string;
+  /** Durable binding for external MCP and skill capability servers. */
+  agentBinding?: AgentBindingSelection;
+  /** Runtime capability resolution mode used for this chat surface. */
+  runtimeProfile?: RuntimeProfile;
+  /** Explicit bounded execution budget for autonomous work. */
+  executionBudget?: ExecutionBudget;
+  /** Runtime capabilities requested by the embedding application. */
+  capabilities?: string[];
+  /** Include structured decision evidence in supported runtime paths. */
+  explain?: boolean;
+  /** Application-owned structured context; never flatten this into user text. */
+  context?: Record<string, unknown>;
   /** When set and non-empty, sent as `allow_skills` on chat requests. */
   allowSkills?: string[];
   /** When set and non-empty, sent as `allow_tools` on chat requests. */
   allowTools?: string[];
   /** Catalog surfacing — sent as `skill_search` (snake_case fields on the wire). */
   skillSearch?: SkillSearchSettings;
+  /** Optional explicit workspace boundary for direct SDK integrations. */
+  workspaceBinding?: WorkspaceBinding;
+  /** Optional explicit executor boundary for direct SDK integrations. */
+  executorBinding?: ExecutorBinding;
 };
 
 // ─── Client Configuration ──────────────────────────────────────────
@@ -753,21 +807,12 @@ export type ChatRequest = {
     model: string;
     gateway?: string;
   };
-  agentBinding?: {
-    id: string;
-    capabilityServerRefs: {
-      mcp: string;
-      skills: string;
-    };
-  };
+  agentBinding?: AgentBindingSelection;
   runtimeAuth?: {
     authorization: string;
   };
-  runtimeProfile?: "agent_binding_registry" | "request_scoped_runtime_mcp";
-  executionBudget?: {
-    initialTurns?: number;
-    hardTurnLimit?: number;
-  };
+  runtimeProfile?: RuntimeProfile;
+  executionBudget?: ExecutionBudget;
   context?: Record<string, unknown>;
   explain?: boolean;
   planSubtaskId?: string;

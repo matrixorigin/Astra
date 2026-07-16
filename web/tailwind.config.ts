@@ -40,6 +40,7 @@ const config: Config = {
       fontFamily: {
         sans: ['var(--font-sans)'],
         serif: ['var(--font-serif)'],
+        ui: ['var(--font-ui)'],
         mono: ['var(--font-mono)'],
       },
     },

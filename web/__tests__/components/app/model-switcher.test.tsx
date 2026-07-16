@@ -50,7 +50,7 @@ describe("ModelSwitcher", () => {
       expect(onModelAvailabilityChange).toHaveBeenCalledWith(false),
     );
     const trigger = screen.getByRole("button", { name: /unavailable model/i });
-    expect(trigger).toHaveAttribute("aria-invalid", "true");
+    expect(trigger).toBeEnabled();
     expect(trigger).toHaveAttribute("title", "deepseek-v4-pro");
   });
 

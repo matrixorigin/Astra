@@ -17,7 +17,12 @@ export type {
   ExecutorBinding,
   PlanState,
   TokenUsage,
+  SessionTask,
+  AgentActivity,
   ChatConfig,
+  AgentBindingSelection,
+  RuntimeProfile,
+  ExecutionBudget,
   AstraClientConfig,
 } from './types';
 

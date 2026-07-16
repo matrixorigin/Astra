@@ -232,6 +232,7 @@ export function Composer({
   const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
   const [modelAvailable, setModelAvailable] = useState(false);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
+  const [activeTools, setActiveTools] = useState<string[]>([]);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
   const {
@@ -469,13 +470,25 @@ export function Composer({
       activeSkills,
     };
     const submittedSkills = [...activeSkills];
+    const submittedTools = [
+      ...new Set([
+        ...activeTools,
+        ...(webSearch ? ['web_search', 'web_fetch'] : []),
+      ]),
+    ];
     setSubmitting(true);
     clearEditor();
     try {
       await onSubmit({
         text: trimmed,
         attachments: [],
-        options: { webSearch, thinking, model, activeSkills: submittedSkills },
+        options: {
+          webSearch,
+          thinking,
+          model,
+          activeSkills: submittedSkills,
+          activeTools: submittedTools,
+        },
       });
     } catch (error) {
       restoreEditor(snapshot);
@@ -579,6 +592,8 @@ export function Composer({
           onWebSearchChange={setWebSearch}
           activeSkills={activeSkills}
           onActiveSkillsChange={handleActiveSkillsChange}
+          activeTools={activeTools}
+          onActiveToolsChange={setActiveTools}
           workspaceSelection={workspaceSelection}
           edgeWorkspaces={edgeWorkspaces}
           edgeWorkspacesLoading={edgeWorkspacesLoading}

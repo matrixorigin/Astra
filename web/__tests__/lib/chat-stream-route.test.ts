@@ -878,7 +878,7 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
-  it("forwards selected edge workspace bindings after returning local SSE", async () => {
+  it("forwards workspace bindings and selected connectors after returning local SSE", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
@@ -897,9 +897,10 @@ describe("chat stream route proxy cancellation", () => {
           },
           options: {
             model: "sonnet-4.6-adaptive",
-            webSearch: false,
+            webSearch: true,
             thinking: true,
             activeSkills: ["rust"],
+            activeTools: ["github"],
           },
         }),
       }) as never,
@@ -921,6 +922,7 @@ describe("chat stream route proxy cancellation", () => {
         parts: [],
         attachments: [],
         selected_model: { id: "model-backend", model: "backend-model" },
+        allow_tools: ["github", "web_fetch", "web_search"],
         workspace_binding: {
           kind: "edge_workspace",
           display_name: "MacBook Pro",
@@ -940,6 +942,7 @@ describe("chat stream route proxy cancellation", () => {
             cwd: "/Users/test/astra",
             edge_agent_id: "edge-1",
             active_skills: ["rust"],
+            active_tools: ["github", "web_fetch", "web_search"],
           },
         }),
       }),

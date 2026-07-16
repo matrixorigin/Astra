@@ -1,4 +1,9 @@
-import type { RuntimeSkillListCursor } from '@astra/sdk';
+import type {
+  ReflectReport,
+  RuntimeSkillListCursor,
+  RuntimeTranscriptItemResponse,
+  SessionAuditSummary,
+} from '@astra/sdk';
 
 export type PlanTier = 'free' | 'pro' | 'team';
 export type Visibility = 'private' | 'team' | 'public';
@@ -68,6 +73,8 @@ export type ComposerOptions = {
   thinking: boolean;
   model: string;
   activeSkills?: string[];
+  /** Explicit runtime tools selected through product capability surfaces. */
+  activeTools?: string[];
   style?: string;
 };
 
@@ -110,6 +117,7 @@ export type ChatMessage = {
   role: MessageRole;
   content: string;
   activeSkills?: string[];
+  activeTools?: string[];
   reasoning?: string;
   reasoningStatus?: 'streaming' | 'complete';
   attachments?: AttachmentRef[];
@@ -176,6 +184,18 @@ export type WorkSurfaceRunResponse = {
   transport?: string | null;
   fallbackPolicy?: string | null;
   events: Array<Record<string, unknown>>;
+  transcript?: RuntimeTranscriptItemResponse[];
+  transcriptComplete?: boolean;
+  transcriptWarning?: string | null;
+  generatedAt: string;
+};
+
+export type ChatInsightsResponse = {
+  sessionId: string;
+  audit: SessionAuditSummary | null;
+  reflection: ReflectReport | null;
+  decisionTrace: ReflectReport | null;
+  warnings: string[];
   generatedAt: string;
 };
 

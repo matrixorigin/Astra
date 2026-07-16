@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { WorkSurfacePanel } from "@/components/app/work-surface-panel";
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { createEmptyWorkSurface } from "@/lib/work-surface";
@@ -18,6 +19,7 @@ vi.mock("lucide-react", () => {
     Loader2: Icon,
     Pause: Icon,
     RotateCw: Icon,
+    Sparkles: Icon,
     Terminal: Icon,
     Wrench: Icon,
     X: Icon,
@@ -25,6 +27,131 @@ vi.mock("lucide-react", () => {
 });
 
 describe("WorkSurfacePanel", () => {
+  it("loads durable reflection and decision evidence on demand", async () => {
+    const user = userEvent.setup();
+    const onLoadInsights = vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      audit: null,
+      reflection: {
+        session_id: "session-1",
+        focus: "auto",
+        overview: {},
+        diagnoses: [],
+        insights: [],
+        recommendations: ["Verify the failing integration path next."],
+      },
+      decisionTrace: {
+        session_id: "session-1",
+        focus: "tool_surface",
+        overview: { selected_route: "edge workspace" },
+        diagnoses: [],
+        insights: [],
+        recommendations: [],
+      },
+      warnings: ["audit: temporarily unavailable"],
+      generatedAt: "2026-07-16T10:00:00.000Z",
+    });
+
+    function Surface() {
+      const [tab, setTab] = useState<"tasks" | "agents" | "tools" | "insights">(
+        "tasks",
+      );
+      return (
+        <WorkSurfacePanel
+          state={{
+            ...createEmptyWorkSurface("session-1", "run-1"),
+            hydrated: true,
+          }}
+          tab={tab}
+          onTabChange={setTab}
+          onRefresh={vi.fn()}
+          onLoadAgentRun={vi.fn()}
+          onLoadInsights={onLoadInsights}
+        />
+      );
+    }
+
+    render(<Surface />);
+    await user.click(screen.getByRole("button", { name: /Insights/i }));
+
+    expect(onLoadInsights).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByText("Verify the failing integration path next."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("edge workspace")).toBeInTheDocument();
+    expect(screen.getByText("Partial evidence")).toBeInTheDocument();
+  });
+
+  it("opens a child run as a canonical transcript workspace", async () => {
+    const user = userEvent.setup();
+    const onLoadAgentRun = vi.fn().mockResolvedValue({
+      runId: "child-run-1",
+      sessionId: "session-1",
+      status: "completed",
+      events: [],
+      transcript: [
+        {
+          session_id: "session-1",
+          item_seq: 1,
+          run_id: "child-run-1",
+          role: "user",
+          content: "Review the concurrency boundary.",
+          created_at: "2026-07-16T10:00:00.000Z",
+        },
+        {
+          session_id: "session-1",
+          item_seq: 2,
+          run_id: "child-run-1",
+          role: "assistant",
+          content: "The boundary is race-safe.",
+          reasoning: "Checked the durable CAS path.",
+          created_at: "2026-07-16T10:00:02.000Z",
+        },
+      ],
+      transcriptComplete: true,
+      transcriptWarning: null,
+      generatedAt: "2026-07-16T10:00:03.000Z",
+    });
+
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "root-run"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-1",
+              runId: "child-run-1",
+              parentRunId: "root-run",
+              agentType: "code-review",
+              description: "Concurrency review",
+              status: "completed",
+              updatedAt: Date.parse("2026-07-16T10:00:03.000Z"),
+            },
+          ],
+        }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={onLoadAgentRun}
+      />,
+    );
+
+    await waitFor(() => expect(onLoadAgentRun).toHaveBeenCalledWith("child-run-1"));
+    await user.click(
+      await screen.findByRole("button", { name: /Open transcript/i }),
+    );
+
+    expect(
+      screen.getByRole("dialog", { name: "Concurrency review transcript" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Review the concurrency boundary."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("The boundary is race-safe.")).toBeInTheDocument();
+    expect(screen.getByText("Checked the durable CAS path.")).toBeInTheDocument();
+  });
+
   it("renders concise run status text in the panel header", () => {
     render(
       <WorkSurfacePanel

@@ -73,6 +73,18 @@ function normalizedActiveSkills(skills?: string[]) {
   );
 }
 
+function normalizedActiveTools(tools?: string[], webSearch = false) {
+  const normalized = Array.isArray(tools)
+    ? tools.map((tool) => tool.trim()).filter(Boolean)
+    : [];
+  if (webSearch) {
+    normalized.push("web_search", "web_fetch");
+  }
+  return [...new Set(normalized)].sort((left, right) =>
+    left.localeCompare(right),
+  );
+}
+
 async function readSendMessageRequest(
   request: NextRequest,
   chat: ReturnType<typeof getChat>,
@@ -504,6 +516,10 @@ export async function POST(
   }
 
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
+  const activeTools = normalizedActiveTools(
+    body.options?.activeTools,
+    body.options?.webSearch,
+  );
   let runtimePromise: Promise<WebRuntimeClient> | undefined;
   const getStreamRuntime = () => {
     runtimePromise ??= requireRuntimeClient({
@@ -623,17 +639,23 @@ export async function POST(
           session_id: runtimeSessionId,
           selected_model: selectedModel,
           allow_skills: activeSkills.length ? activeSkills : undefined,
+          allow_tools: activeTools.length ? activeTools : undefined,
           workspace_binding: workspaceBindings.workspaceBinding,
           executor_binding: workspaceBindings.executorBinding,
           context: {
             source: "web_v1",
             transport: "next_sse_proxy",
             edge_profile:
-              activeSkills.length || workspaceBindings.edgeProfile
+              activeSkills.length ||
+              activeTools.length ||
+              workspaceBindings.edgeProfile
                 ? {
                     ...workspaceBindings.edgeProfile,
                     ...(activeSkills.length
                       ? { active_skills: activeSkills }
+                      : {}),
+                    ...(activeTools.length
+                      ? { active_tools: activeTools }
                       : {}),
                   }
                 : undefined,

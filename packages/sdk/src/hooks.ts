@@ -9,6 +9,8 @@ import type {
   ConnectionState,
   WorkspaceBinding,
   ExecutorBinding,
+  SessionTask,
+  AgentActivity,
 } from "./types";
 import { AstraClient } from "./client";
 import {
@@ -34,6 +36,8 @@ export type UseAstraChatReturn = {
   plan: PlanState | null;
   usage: TokenUsage;
   agentEvents: StreamEvent[];
+  tasks: SessionTask[];
+  agents: AgentActivity[];
   runStatus: string | null;
   waitingFor: string | null;
   workspace?: WorkspaceBinding;
@@ -124,6 +128,68 @@ function compactToolCall(call: ToolCall): ToolCall {
   ) as ToolCall;
 }
 
+function agentActivityFromEvent(event: StreamEvent): AgentActivity {
+  const source = event as StreamEvent & {
+    agent_id: string;
+    run_id?: string;
+    parent_run_id?: string;
+    agent_type?: string;
+    description?: string;
+    task?: string;
+    status?: string;
+    reason?: string;
+    error?: string;
+    result_summary?: string;
+    tool_name?: string;
+    turn?: number;
+    max_turns?: number;
+    total_prompt_tokens?: number;
+    total_completion_tokens?: number;
+    total_tool_calls?: number;
+    total_tokens?: { prompt?: number; completion?: number };
+    duration_ms?: number;
+    timestamp?: number;
+  };
+  const status =
+    source.status ??
+    (event.type === "agent_spawned"
+      ? "running"
+      : event.type === "agent_delegated"
+        ? "delegated"
+        : event.type.replace(/^agent_/, ""));
+  const activity: AgentActivity = {
+    agentId: source.agent_id,
+    status,
+    updatedAt: source.timestamp ?? Date.now(),
+  };
+  if (source.run_id) activity.runId = source.run_id;
+  if (source.parent_run_id) activity.parentRunId = source.parent_run_id;
+  if (source.agent_type) activity.agentType = source.agent_type;
+  if (source.description) activity.description = source.description;
+  if (source.task) activity.task = source.task;
+  if (source.reason) activity.reason = source.reason;
+  if (source.error) activity.error = source.error;
+  if (source.result_summary) activity.resultSummary = source.result_summary;
+  if (source.tool_name) activity.toolName = source.tool_name;
+  if (source.turn !== undefined) activity.turn = source.turn;
+  if (source.max_turns !== undefined) activity.maxTurns = source.max_turns;
+  if (source.total_prompt_tokens !== undefined) {
+    activity.totalPromptTokens = source.total_prompt_tokens;
+  } else if (source.total_tokens?.prompt !== undefined) {
+    activity.totalPromptTokens = source.total_tokens.prompt;
+  }
+  if (source.total_completion_tokens !== undefined) {
+    activity.totalCompletionTokens = source.total_completion_tokens;
+  } else if (source.total_tokens?.completion !== undefined) {
+    activity.totalCompletionTokens = source.total_tokens.completion;
+  }
+  if (source.total_tool_calls !== undefined) {
+    activity.totalToolCalls = source.total_tool_calls;
+  }
+  if (source.duration_ms !== undefined) activity.durationMs = source.duration_ms;
+  return activity;
+}
+
 /**
  * React hook for streaming Astra chat interactions.
  *
@@ -140,6 +206,8 @@ type ChatState = {
   plan: PlanState | null;
   usage: TokenUsage;
   agentEvents: StreamEvent[];
+  tasks: SessionTask[];
+  agents: AgentActivity[];
   runStatus: string | null;
   waitingFor: string | null;
   workspace: WorkspaceBinding | undefined;
@@ -174,6 +242,8 @@ type ChatAction =
       usage: TokenUsage | ((prev: TokenUsage) => TokenUsage);
     }
   | { type: "ADD_AGENT_EVENT"; event: StreamEvent }
+  | { type: "SET_TASKS"; tasks: SessionTask[] }
+  | { type: "UPSERT_AGENT"; agent: AgentActivity }
   | {
       type: "SET_WORKSPACE_BINDING";
       workspace?: WorkspaceBinding;
@@ -193,6 +263,8 @@ const initialChatState: ChatState = {
   plan: null,
   usage: emptyUsage,
   agentEvents: [],
+  tasks: [],
+  agents: [],
   runStatus: null,
   waitingFor: null,
   workspace: undefined,
@@ -248,6 +320,19 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
     case "ADD_AGENT_EVENT":
       return { ...state, agentEvents: [...state.agentEvents, action.event] };
+    case "SET_TASKS":
+      return { ...state, tasks: action.tasks };
+    case "UPSERT_AGENT": {
+      const index = state.agents.findIndex(
+        (agent) => agent.agentId === action.agent.agentId,
+      );
+      if (index < 0) {
+        return { ...state, agents: [...state.agents, action.agent] };
+      }
+      const agents = [...state.agents];
+      agents[index] = { ...agents[index], ...action.agent };
+      return { ...state, agents };
+    }
     case "SET_WORKSPACE_BINDING":
       return {
         ...state,
@@ -279,6 +364,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     plan,
     usage,
     agentEvents,
+    tasks,
+    agents,
     runStatus,
     waitingFor,
     workspace,
@@ -723,6 +810,14 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       case "agent_cancelled":
       case "agent_interrupted":
         dispatch({ type: "ADD_AGENT_EVENT", event });
+        dispatch({
+          type: "UPSERT_AGENT",
+          agent: agentActivityFromEvent(event),
+        });
+        break;
+
+      case "task_board_snapshot":
+        dispatch({ type: "SET_TASKS", tasks: event.tasks });
         break;
     }
   }, []);
@@ -777,9 +872,17 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           sessionId: sessionId ?? undefined,
           agentId: config.agentId,
           selectedModel: { model: config.model },
+          agentBinding: config.agentBinding,
+          runtimeProfile: config.runtimeProfile,
+          executionBudget: config.executionBudget,
+          capabilities: config.capabilities,
+          explain: config.explain,
+          context: config.context,
           allowSkills: config.allowSkills,
           allowTools: config.allowTools,
           skillSearch: config.skillSearch,
+          workspaceBinding: config.workspaceBinding,
+          executorBinding: config.executorBinding,
         },
         {
           onEvent: (event) => processEvent(event, generation),
@@ -799,9 +902,17 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       config.client,
       config.agentId,
       config.model,
+      config.agentBinding,
+      config.runtimeProfile,
+      config.executionBudget,
+      config.capabilities,
+      config.explain,
+      config.context,
       config.allowSkills,
       config.allowTools,
       config.skillSearch,
+      config.workspaceBinding,
+      config.executorBinding,
       sessionId,
       processEvent,
     ],
@@ -866,6 +977,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     plan,
     usage,
     agentEvents,
+    tasks,
+    agents,
     runStatus,
     waitingFor,
     workspace,

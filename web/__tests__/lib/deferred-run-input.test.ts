@@ -82,6 +82,7 @@ describe('queueDeferredRunInput', () => {
       input: {
         content: 'clear previous skill constraints',
         active_skills: [],
+        active_tools: [],
       },
     });
     expect(result?.userMessage.id).toBe('user-input-1');
@@ -387,6 +388,7 @@ describe('queueDeferredRunInput', () => {
       input: {
         content: 'recover before queueing',
         active_skills: [],
+        active_tools: [],
       },
     });
     expect(result?.activeRun).toEqual({

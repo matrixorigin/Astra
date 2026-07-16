@@ -76,6 +76,8 @@ describe("useAstraChat", () => {
     expect(result.current.fallbackPolicy).toBeNull();
     expect(result.current.connectionState).toBe("idle");
     expect(result.current.agentEvents).toEqual([]);
+    expect(result.current.tasks).toEqual([]);
+    expect(result.current.agents).toEqual([]);
   });
 
   test("sendMessage adds user + assistant placeholder", () => {
@@ -96,7 +98,7 @@ describe("useAstraChat", () => {
     expect(result.current.messages[1].streaming).toBe(true);
   });
 
-  test("sendMessage passes allowSkills, allowTools, and skillSearch to streamChat", () => {
+  test("sendMessage passes the complete integration boundary to streamChat", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, []);
 
@@ -112,6 +114,23 @@ describe("useAstraChat", () => {
         allowSkills: ["s1"],
         allowTools: ["bash"],
         skillSearch,
+        agentBinding: {
+          id: "binding-1",
+          capabilityServerRefs: { mcp: "tools", skills: "skills" },
+        },
+        runtimeProfile: "agent_binding_registry",
+        executionBudget: { initialTurns: 3, hardTurnLimit: 12 },
+        capabilities: ["multi_agent", "reflect"],
+        explain: true,
+        context: { source: "embedded-web-agent" },
+        workspaceBinding: {
+          kind: "server_sandbox",
+          authority: "read_write",
+        },
+        executorBinding: {
+          kind: "server_local",
+          status: "online",
+        },
       }),
     );
 
@@ -125,11 +144,36 @@ describe("useAstraChat", () => {
       allowTools?: string[];
       skillSearch?: typeof skillSearch;
       selectedModel?: { model: string };
+      agentBinding?: {
+        id: string;
+        capabilityServerRefs: { mcp: string; skills: string };
+      };
+      runtimeProfile?: string;
+      executionBudget?: { initialTurns?: number; hardTurnLimit?: number };
+      capabilities?: string[];
+      explain?: boolean;
+      context?: Record<string, unknown>;
+      workspaceBinding?: { kind: string };
+      executorBinding?: { kind: string };
     };
     expect(req.selectedModel).toEqual({ model: "test-model" });
     expect(req.allowSkills).toEqual(["s1"]);
     expect(req.allowTools).toEqual(["bash"]);
     expect(req.skillSearch).toEqual(skillSearch);
+    expect(req.agentBinding).toEqual({
+      id: "binding-1",
+      capabilityServerRefs: { mcp: "tools", skills: "skills" },
+    });
+    expect(req.runtimeProfile).toBe("agent_binding_registry");
+    expect(req.executionBudget).toEqual({
+      initialTurns: 3,
+      hardTurnLimit: 12,
+    });
+    expect(req.capabilities).toEqual(["multi_agent", "reflect"]);
+    expect(req.explain).toBe(true);
+    expect(req.context).toEqual({ source: "embedded-web-agent" });
+    expect(req.workspaceBinding).toMatchObject({ kind: "server_sandbox" });
+    expect(req.executorBinding).toMatchObject({ kind: "server_local" });
   });
 
   test("processes session_info event", () => {
@@ -150,6 +194,68 @@ describe("useAstraChat", () => {
 
     expect(result.current.sessionId).toBe("sess-1");
     expect(result.current.runId).toBe("run-1");
+  });
+
+  test("projects task board and agent lifecycle for embedded workspaces", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "task_board_snapshot",
+        session_id: "s1",
+        tasks: [
+          {
+            id: "task-1",
+            title: "Review implementation",
+            status: "in_progress",
+            created_at: "2026-07-16T00:00:00.000Z",
+            updated_at: "2026-07-16T00:00:00.000Z",
+          },
+        ],
+      } as StreamEvent,
+      {
+        type: "agent_spawned",
+        agent_id: "agent-1",
+        run_id: "run-child",
+        parent_run_id: "run-parent",
+        agent_type: "code-review",
+        description: "Review correctness",
+        timestamp: 100,
+      } as StreamEvent,
+      {
+        type: "agent_completed",
+        agent_id: "agent-1",
+        status: "completed",
+        result_summary: "No critical findings",
+        total_tool_calls: 4,
+        timestamp: 200,
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() =>
+      useAstraChat({ client, model: "test-model" }),
+    );
+    act(() => {
+      result.current.sendMessage("Review");
+    });
+
+    expect(result.current.tasks).toEqual([
+      expect.objectContaining({
+        id: "task-1",
+        status: "in_progress",
+      }),
+    ]);
+    expect(result.current.agents).toEqual([
+      expect.objectContaining({
+        agentId: "agent-1",
+        runId: "run-child",
+        parentRunId: "run-parent",
+        status: "completed",
+        resultSummary: "No critical findings",
+        totalToolCalls: 4,
+        updatedAt: 200,
+      }),
+    ]);
+    expect(result.current.agentEvents).toHaveLength(2);
   });
 
   test("processes text_delta events to build assistant content", () => {

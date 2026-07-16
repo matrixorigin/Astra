@@ -83,7 +83,7 @@ describe("Composer model selection", () => {
     await waitFor(() =>
       expect(
         screen.getByRole("button", { name: /unavailable model/i }),
-      ).toHaveAttribute("aria-invalid", "true"),
+      ).toHaveAttribute("title", "deepseek-v4-pro"),
     );
     expect(send).toBeDisabled();
 
@@ -110,6 +110,7 @@ describe("Composer model selection", () => {
         thinking: true,
         model: "deepseek-v4-pro-official",
         activeSkills: [],
+        activeTools: [],
       },
     });
   });

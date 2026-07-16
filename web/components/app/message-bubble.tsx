@@ -229,6 +229,18 @@ export const MessageBubble = memo(function MessageBubble({
             skills={message.activeSkills}
             className="text-[15px] leading-[1.55]"
           />
+          {message.activeTools?.length ? (
+            <div className="mt-2 flex flex-wrap justify-end gap-1.5 border-t border-border/60 pt-2 font-ui text-[11px] text-text-muted">
+              {message.activeTools.map((tool) => (
+                <span
+                  key={tool}
+                  className="rounded-full border border-border/70 bg-surface px-2 py-0.5"
+                >
+                  {toolLabel(tool)}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </article>
     );
@@ -274,6 +286,18 @@ export const MessageBubble = memo(function MessageBubble({
     </article>
   );
 });
+
+function toolLabel(tool: string) {
+  switch (tool) {
+    case "github":
+      return "GitHub";
+    case "web_search":
+    case "web_fetch":
+      return "Web research";
+    default:
+      return tool.replace(/[_-]+/g, " ");
+  }
+}
 
 function AssistantTypingIndicator() {
   return (

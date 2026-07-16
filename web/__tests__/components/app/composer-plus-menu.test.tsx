@@ -18,6 +18,7 @@ vi.mock("lucide-react", () => {
     Check: Icon,
     FilePlus2: Icon,
     Globe: Icon,
+    GitPullRequest: Icon,
     HardDrive: Icon,
     Image: Icon,
     Monitor: Icon,
@@ -153,6 +154,23 @@ describe("ComposerPlusMenu environment selection", () => {
 
     expect(screen.queryByText("Bound edge is offline")).not.toBeInTheDocument();
     expect(screen.getByText("MacBook Pro")).toBeInTheDocument();
+  });
+});
+
+describe("ComposerPlusMenu connectors", () => {
+  it("lets the user attach the GitHub connector for the next turn", async () => {
+    const user = userEvent.setup();
+    const onActiveToolsChange = vi.fn();
+    renderMenu({ activeTools: [], onActiveToolsChange });
+
+    await user.click(screen.getByRole("button", { name: "Open add menu" }));
+    await user.click(screen.getByRole("button", { name: /Connectors/i }));
+    await user.click(screen.getByRole("button", { name: /GitHub/i }));
+
+    expect(onActiveToolsChange).toHaveBeenCalledWith(["github"]);
+    expect(
+      screen.getByText(/credentials configured on the selected server or edge/i),
+    ).toBeInTheDocument();
   });
 });
 

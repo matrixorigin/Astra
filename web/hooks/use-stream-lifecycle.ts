@@ -613,6 +613,7 @@ export function useStreamLifecycle(
         role: "user",
         content: text,
         activeSkills: options.activeSkills,
+        activeTools: options.activeTools,
         createdAt: timestamp,
         status: "complete",
       };
@@ -1580,6 +1581,7 @@ export function useStreamLifecycle(
 
   // -- Cleanup on unmount --
   useEffect(() => {
+    const stopReconcile = stopReconcileRef.current;
     return () => {
       streamAbortRef.current?.abort();
       if (autoAttachRetryTimerRef.current) {
@@ -1591,7 +1593,7 @@ export function useStreamLifecycle(
       if (reconcileIntervalRef.current) {
         window.clearInterval(reconcileIntervalRef.current);
       }
-      stopReconcileRef.current();
+      stopReconcile();
     };
   }, [
     streamAbortRef,

@@ -6,7 +6,7 @@
     "dev": "../scripts/dev/run-web-dev.sh",
     "build": "next build",
     "start": "../scripts/dev/run-web-start.sh",
-    "lint": "ESLINT_USE_FLAT_CONFIG=false eslint . --ext .js,.jsx,.ts,.tsx",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit --pretty false",
     "test": "vitest run",
     "test:e2e": "playwright test",

@@ -24,11 +24,15 @@ vi.mock("lucide-react", () => {
   );
   return {
     __esModule: true,
-    BookOpen: Icon,
-    Code2: Icon,
-    Coffee: Icon,
-    Lightbulb: Icon,
-    PenLine: Icon,
+    ArrowRight: Icon,
+    Bot: Icon,
+    GitBranch: Icon,
+    ListTodo: Icon,
+    Network: Icon,
+    RefreshCw: Icon,
+    ScanSearch: Icon,
+    Sparkles: Icon,
+    Workflow: Icon,
   };
 });
 

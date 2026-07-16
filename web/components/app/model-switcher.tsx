@@ -67,7 +67,7 @@ export function ModelSwitcher({
       trigger={
         <button
           type="button"
-          aria-invalid={modelUnavailable || undefined}
+          data-invalid={modelUnavailable || undefined}
           title={modelUnavailable ? value : undefined}
           className="flex max-w-56 items-center gap-2 rounded-control px-2 py-1 text-sm text-text-secondary hover:bg-surface-muted hover:text-text"
         >

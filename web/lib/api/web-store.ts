@@ -116,7 +116,6 @@ export function selectedWebModel(model?: string | null): string {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __astraWebStores: Record<string, Store> | undefined;
 }
 
@@ -238,6 +237,18 @@ function normalizedActiveSkills(skills?: string[]) {
   }
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
+  );
+}
+
+function normalizedActiveTools(tools?: string[], webSearch = false) {
+  const normalized = Array.isArray(tools)
+    ? tools.map((tool) => tool.trim()).filter(Boolean)
+    : [];
+  if (webSearch) {
+    normalized.push("web_search", "web_fetch");
+  }
+  return [...new Set(normalized)].sort((left, right) =>
+    left.localeCompare(right),
   );
 }
 
@@ -838,6 +849,10 @@ export async function createChatWithMessage(
     role: "user",
     content: payload.message,
     activeSkills: payload.options.activeSkills,
+    activeTools: normalizedActiveTools(
+      payload.options.activeTools,
+      payload.options.webSearch,
+    ),
     createdAt: timestamp,
     status: "complete",
   };
@@ -892,6 +907,10 @@ export async function sendMessage(
     role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
+    activeTools: normalizedActiveTools(
+      payload.options?.activeTools,
+      payload.options?.webSearch,
+    ),
     createdAt: timestamp,
     status: "complete",
   };
@@ -911,6 +930,8 @@ export async function sendMessage(
     text: payload.content,
     model: selectedWebModel(payload.options?.model ?? chat.model),
     activeSkills: payload.options?.activeSkills,
+    activeTools: payload.options?.activeTools,
+    webSearch: payload.options?.webSearch,
   });
   assertBackendSessionMatchesChat(backendSessionId, agentResult.sessionId);
   const assistantMessage = appendAssistantMessage(
@@ -1210,6 +1231,10 @@ export async function queueDeferredRunInput(
   );
 
   const activeSkills = normalizedActiveSkills(payload.options?.activeSkills);
+  const activeTools = normalizedActiveTools(
+    payload.options?.activeTools,
+    payload.options?.webSearch,
+  );
   try {
     await client.sdk.submitRunInput(activeRunId, {
       idempotencyKey: deferredRunInputIdempotencyKey(
@@ -1219,6 +1244,7 @@ export async function queueDeferredRunInput(
       input: {
         content: payload.content,
         active_skills: activeSkills,
+        active_tools: activeTools,
       },
     });
   } catch (error) {
@@ -1245,6 +1271,7 @@ export async function queueDeferredRunInput(
     role: "user",
     content: payload.content,
     activeSkills: activeSkills.length ? activeSkills : undefined,
+    activeTools: activeTools.length ? activeTools : undefined,
     createdAt: timestamp,
     status: "complete",
   };
@@ -2346,6 +2373,8 @@ async function callBackendAgent(params: {
   text: string;
   model: string;
   activeSkills?: string[];
+  activeTools?: string[];
+  webSearch?: boolean;
 }): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(
@@ -2360,6 +2389,10 @@ async function callBackendAgent(params: {
     });
     const selectedModel = await resolveBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
+    const activeTools = normalizedActiveTools(
+      params.activeTools,
+      params.webSearch,
+    );
 
     const run = await client.sdk.createRun(
       {
@@ -2367,10 +2400,16 @@ async function callBackendAgent(params: {
         sessionId: params.sessionId,
         selectedModel,
         allowSkills: activeSkills.length ? activeSkills : undefined,
+        allowTools: activeTools.length ? activeTools : undefined,
         context: {
           source: "web_v1",
-          edge_profile: activeSkills.length
-            ? { active_skills: activeSkills }
+          edge_profile: activeSkills.length || activeTools.length
+            ? {
+                ...(activeSkills.length
+                  ? { active_skills: activeSkills }
+                  : {}),
+                ...(activeTools.length ? { active_tools: activeTools } : {}),
+              }
             : undefined,
         },
       },

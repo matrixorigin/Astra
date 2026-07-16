@@ -15,6 +15,7 @@ import type { ChatDetail, ComposerOptions } from "@/lib/api/types";
 import {
   getEdgeStatus,
   getChat,
+  getChatInsights,
   getChatWorkSurface,
   getChatWorkSurfaceRun,
   queueChatRunInput,
@@ -77,6 +78,7 @@ vi.mock("lucide-react", () => {
     Pause: Icon,
     RefreshCw: Icon,
     RotateCw: Icon,
+    Sparkles: Icon,
     Terminal: Icon,
     Wrench: Icon,
     X: Icon,
@@ -160,6 +162,7 @@ vi.mock("@/components/app/composer", () => ({
 vi.mock("@/lib/api/chats", () => ({
   getEdgeStatus: vi.fn(),
   getChat: vi.fn(),
+  getChatInsights: vi.fn(),
   getChatWorkSurface: vi.fn(),
   getChatWorkSurfaceRun: vi.fn(),
   queueChatRunInput: vi.fn(),
@@ -173,6 +176,7 @@ vi.mock("@/lib/api/chats", () => ({
 
 const mockGetEdgeStatus = vi.mocked(getEdgeStatus);
 const mockGetChat = vi.mocked(getChat);
+const mockGetChatInsights = vi.mocked(getChatInsights);
 const mockGetChatWorkSurface = vi.mocked(getChatWorkSurface);
 const mockGetChatWorkSurfaceRun = vi.mocked(getChatWorkSurfaceRun);
 const mockQueueChatRunInput = vi.mocked(queueChatRunInput);

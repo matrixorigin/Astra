@@ -16,19 +16,15 @@ function emit(record: LogRecord): void {
   const line = JSON.stringify(record);
   switch (record.level) {
     case 'debug':
-      // eslint-disable-next-line no-console -- intentional structured logging
       console.debug(line);
       break;
     case 'info':
-      // eslint-disable-next-line no-console -- intentional structured logging
       console.info(line);
       break;
     case 'warn':
-      // eslint-disable-next-line no-console -- intentional structured logging
       console.warn(line);
       break;
     case 'error':
-      // eslint-disable-next-line no-console -- intentional structured logging
       console.error(line);
       break;
     default: {

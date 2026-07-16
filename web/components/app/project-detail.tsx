@@ -107,6 +107,7 @@ export function ProjectDetail({ initial }: { initial: ProjectDetailType }) {
                   webSearch: options.webSearch,
                   thinking: options.thinking,
                   activeSkills: options.activeSkills,
+                  activeTools: options.activeTools,
                 },
                 projectId: detail.project.id,
                 workspaceSelection,

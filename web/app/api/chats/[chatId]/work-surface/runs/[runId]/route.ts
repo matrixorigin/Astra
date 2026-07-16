@@ -68,8 +68,32 @@ export async function GET(
         operation: "load agent run projection",
       },
     );
+    let transcript: Awaited<
+      ReturnType<typeof runtime.sdk.getSessionTranscript>
+    > | null = null;
+    let transcriptWarning: string | null = null;
+    if (projection.session_id) {
+      try {
+        transcript = await runtime.sdk.getSessionTranscript(
+          projection.session_id,
+          { limit: 500 },
+        );
+      } catch (error) {
+        transcriptWarning = `Canonical transcript unavailable: ${runtimeErrorDetail(error)}`;
+      }
+    } else {
+      transcriptWarning =
+        "Canonical transcript unavailable because the child run did not report a session identity.";
+    }
 
     const bindingSeed = projectionBindingSeedEvent(projection);
+    const runTranscript =
+      transcript?.items.filter((item) => item.run_id === (projection.run_id ?? runId)) ??
+      [];
+    if (!transcriptWarning && transcript?.has_more) {
+      transcriptWarning =
+        "Showing the latest transcript window; older session items were not loaded.";
+    }
     return NextResponse.json({
       runId: projection.run_id ?? runId,
       sessionId: projection.session_id ?? null,
@@ -82,6 +106,9 @@ export async function GET(
         ...(bindingSeed ? [bindingSeed] : []),
         ...(projection.recent_events ?? []),
       ],
+      transcript: runTranscript,
+      transcriptComplete: Boolean(transcript && !transcript.has_more),
+      transcriptWarning,
       generatedAt: new Date().toISOString(),
     });
   } catch (error) {
