@@ -6668,6 +6668,7 @@ esac
         async fn fail_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             Err("MCP tools must not fail edge dispatch results".to_string())
@@ -6772,6 +6773,7 @@ esac
         async fn fail_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             Ok(true)
@@ -6826,6 +6828,7 @@ esac
         async fn fail_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             reason: &str,
         ) -> Result<bool, String> {
             self.failed_reasons

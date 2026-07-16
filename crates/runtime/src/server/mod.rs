@@ -602,6 +602,7 @@ mod tests {
         async fn fail_dispatch(
             &self,
             _identity: &EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             unreachable!("fail_dispatch is not used in cleanup tests")

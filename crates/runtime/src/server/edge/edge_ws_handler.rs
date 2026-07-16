@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
+const EDGE_REGISTRY_UNREGISTER_ATTEMPTS: usize = 3;
 
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -679,27 +680,22 @@ async fn handle_edge_connection(
 
     // The DB registry has the same generation fence. A stale connection may
     // finish cleanup after a replacement has already updated the registry.
-    // Always attempt it even if the in-process pool entry was replaced: the
-    // edge_id predicate protects the replacement and cleans up cross-pod rows.
-    match state
-        .execution
-        .edge_registry_service
-        .unregister_generation(
-            &user_id_cleanup,
-            &edge_agent_id_cleanup,
-            &edge_id_for_registry_cleanup,
-        )
-        .await
+    match unregister_durable_edge_generation(
+        state.execution.edge_registry_service.as_ref(),
+        &user_id_cleanup,
+        &edge_agent_id_cleanup,
+        &edge_id_for_registry_cleanup,
+    )
+    .await
     {
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
+            tracing::error!(
                 user_id = %user_id_cleanup,
                 edge_agent_id = %edge_agent_id_cleanup,
                 edge_id = %edge_id_for_registry_cleanup,
                 %error,
-                "edge WebSocket cleanup: DB unregister failed; sweeper will expire the record"
+                "failed to unregister disconnected edge generation from durable registry"
             );
         }
     }
@@ -711,6 +707,39 @@ async fn handle_edge_connection(
         removed_current_generation,
         "Edge agent disconnected"
     );
+}
+
+async fn unregister_durable_edge_generation(
+    registry: &dyn astra_services::multi_agent::EdgeRegistryService,
+    user_id: &str,
+    edge_agent_id: &str,
+    edge_id: &str,
+) -> Result<bool, String> {
+    let mut last_error = None;
+    for attempt in 1..=EDGE_REGISTRY_UNREGISTER_ATTEMPTS {
+        match registry
+            .unregister_generation(user_id, edge_agent_id, edge_id)
+            .await
+        {
+            Ok(removed) => return Ok(removed),
+            Err(error) => {
+                if attempt < EDGE_REGISTRY_UNREGISTER_ATTEMPTS {
+                    tracing::warn!(
+                        user_id,
+                        edge_agent_id,
+                        edge_id,
+                        attempt,
+                        max_attempts = EDGE_REGISTRY_UNREGISTER_ATTEMPTS,
+                        %error,
+                        "durable edge unregister failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "durable edge unregister failed".to_string()))
 }
 
 #[derive(Debug)]
@@ -790,7 +819,10 @@ async fn fail_inflight_edge_dispatches(
 ) -> usize {
     let mut failed = 0;
     for row in rows {
-        match dispatch.fail_dispatch(&row.identity, reason).await {
+        match dispatch
+            .fail_dispatch(&row.identity, &row.edge_agent_id, reason)
+            .await
+        {
             Ok(true) => failed += 1,
             Ok(false) => {
                 tracing::debug!(
@@ -875,7 +907,10 @@ async fn fail_claimed_edge_dispatch(
     row: &astra_services::multi_agent::EdgeDispatchRow,
     reason: &'static str,
 ) -> bool {
-    match dispatch.fail_dispatch(&row.identity(), reason).await {
+    match dispatch
+        .fail_dispatch(&row.identity(), &row.edge_agent_id, reason)
+        .await
+    {
         Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
@@ -1025,6 +1060,56 @@ mod tests {
     use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
     use std::sync::Mutex;
 
+    struct FlakyEdgeRegistry {
+        failures_before_success: usize,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_services::multi_agent::EdgeRegistryService for FlakyEdgeRegistry {
+        async fn register_or_update(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+            _hostname: Option<&str>,
+            _worktree_path: Option<&str>,
+            _capabilities: Option<serde_json::Value>,
+        ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+            unreachable!("register is not used by unregister retry tests")
+        }
+
+        async fn heartbeat(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<(), String> {
+            unreachable!("heartbeat is not used by unregister retry tests")
+        }
+
+        async fn list_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            unreachable!("list is not used by unregister retry tests")
+        }
+
+        async fn unregister_generation(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<bool, String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.failures_before_success {
+                Err(format!("transient unregister failure {attempt}"))
+            } else {
+                Ok(true)
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingEdgeDispatch {
         failed: Mutex<Vec<(String, String, String)>>,
@@ -1061,6 +1146,7 @@ mod tests {
         async fn fail_dispatch(
             &self,
             identity: &EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             reason: &str,
         ) -> Result<bool, String> {
             self.failed.lock().unwrap().push((
@@ -1097,6 +1183,35 @@ mod tests {
             status: "dispatched".to_string(),
             pending_wait_us: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn durable_unregister_retries_transient_failures_with_a_hard_bound() {
+        let transient = FlakyEdgeRegistry {
+            failures_before_success: 2,
+            attempts: AtomicUsize::new(0),
+        };
+        assert!(
+            unregister_durable_edge_generation(&transient, "user-1", "edge-1", "generation-1")
+                .await
+                .expect("third unregister attempt succeeds")
+        );
+        assert_eq!(transient.attempts.load(Ordering::SeqCst), 3);
+
+        let persistent = FlakyEdgeRegistry {
+            failures_before_success: usize::MAX,
+            attempts: AtomicUsize::new(0),
+        };
+        let error =
+            unregister_durable_edge_generation(&persistent, "user-1", "edge-1", "generation-1")
+                .await
+                .expect_err("persistent registry failure must remain visible");
+        assert!(error.contains("transient unregister failure 3"), "{error}");
+        assert_eq!(
+            persistent.attempts.load(Ordering::SeqCst),
+            EDGE_REGISTRY_UNREGISTER_ATTEMPTS,
+            "cleanup retries must be bounded so a broken registry cannot stall socket teardown"
+        );
     }
 
     fn edge_advertisement_with_tools(tool_names: &[&str]) -> serde_json::Value {

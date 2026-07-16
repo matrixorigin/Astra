@@ -299,6 +299,7 @@ mod tests {
         async fn fail_dispatch(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             Ok(true)

@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::super::tool_transport_metadata::TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE;
+use super::super::tool_transport_metadata::{
+    TOOL_ERROR_KIND_ROUTE_MISMATCH, TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE,
+};
 use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
@@ -349,6 +351,7 @@ struct StaticEdgeDispatch {
     return_result: bool,
     result_status: &'static str,
     terminal_admission_result: Option<String>,
+    admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -359,6 +362,7 @@ impl Default for StaticEdgeDispatch {
             return_result: true,
             result_status: "completed",
             terminal_admission_result: None,
+            admission_error: None,
         }
     }
 }
@@ -371,6 +375,7 @@ impl StaticEdgeDispatch {
             return_result: false,
             result_status: "completed",
             terminal_admission_result: None,
+            admission_error: None,
         }
     }
 
@@ -381,6 +386,7 @@ impl StaticEdgeDispatch {
             return_result: true,
             result_status: "failed",
             terminal_admission_result: None,
+            admission_error: None,
         }
     }
 
@@ -393,6 +399,29 @@ impl StaticEdgeDispatch {
             terminal_admission_result: Some(
                 serde_json::json!({"status":"completed","output":output}).to_string(),
             ),
+            admission_error: None,
+        }
+    }
+
+    fn admission_rejected(message: &str) -> Self {
+        Self {
+            admission_error: Some(
+                astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(
+                    message.to_string(),
+                ),
+            ),
+            ..Self::default()
+        }
+    }
+
+    fn admission_outcome_unknown(message: &str) -> Self {
+        Self {
+            admission_error: Some(
+                astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
+                    message.to_string(),
+                ),
+            ),
+            ..Self::default()
         }
     }
 }
@@ -417,9 +446,21 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         payload_json: &str,
-    ) -> Result<astra_services::multi_agent::EdgeDispatchAdmission, String> {
+    ) -> Result<
+        astra_services::multi_agent::EdgeDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
+        if let Some(error @ astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_)) =
+            &self.admission_error
+        {
+            return Err(error.clone());
+        }
         self.insert_dispatch(identity, edge_agent_id, payload_json)
-            .await?;
+            .await
+            .map_err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown)?;
+        if let Some(error) = &self.admission_error {
+            return Err(error.clone());
+        }
         Ok(match &self.terminal_admission_result {
             Some(result) => {
                 astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result.clone())
@@ -448,6 +489,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
@@ -543,6 +585,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
@@ -683,13 +726,16 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
         let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
-        if !matches!(row.status.as_str(), "pending" | "dispatched") {
+        if row.edge_agent_id != edge_agent_id
+            || !matches!(row.status.as_str(), "pending" | "dispatched")
+        {
             return Ok(false);
         }
         row.status = "failed".to_string();
@@ -3056,6 +3102,128 @@ async fn edge_bound_offline_or_unknown_status_blocks_without_dispatch() {
             "explicit {status:?} executor status must block before edge ledger dispatch"
         );
     }
+}
+
+#[tokio::test]
+async fn edge_admission_rejection_is_reported_as_certain_and_is_not_retried() {
+    let dispatch = Arc::new(StaticEdgeDispatch::admission_rejected(
+        "durable identity conflicts with its owner",
+    ));
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("admission rejection metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert!(
+        metadata.get("outcome_certainty").is_none(),
+        "a proven admission rejection must not claim the tool may have executed"
+    );
+    assert!(
+        result.output.contains("The tool was not dispatched"),
+        "{}",
+        result.output
+    );
+    assert_eq!(
+        local.calls(),
+        0,
+        "an edge-bound tool must never fall back locally"
+    );
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "the rejected admission fixture proves no durable dispatch was created"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
+    let dispatch = Arc::new(StaticEdgeDispatch::admission_outcome_unknown(
+        "database response was lost after insert",
+    ));
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("ambiguous admission metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+    );
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert!(result.output.contains("reconcile its durable invocation"));
+    assert_eq!(
+        metadata["diagnostics"][0],
+        "edge-dispatch: admission outcome is unknown: database response was lost after insert"
+    );
+    assert_eq!(
+        local.calls(),
+        0,
+        "unknown outcome must never be retried locally"
+    );
+    assert_eq!(
+        *dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock"),
+        vec!["edge-selected".to_string()],
+        "the fixture models an insert that may have committed before the response was lost"
+    );
 }
 
 #[tokio::test]

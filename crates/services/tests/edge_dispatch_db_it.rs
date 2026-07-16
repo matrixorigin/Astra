@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchAdmission,
-    EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistryService,
+    EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -117,18 +117,16 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
             .expect("first admission"),
         EdgeDispatchAdmission::Pending
     );
-    assert!(
+    assert!(matches!(
         svc.admit_dispatch(&identity, "different-agent", payload)
-            .await
-            .expect_err("identity cannot move to another edge")
-            .contains("conflicts")
-    );
-    assert!(
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
+    ));
+    assert!(matches!(
         svc.admit_dispatch(&identity, &agent_id, r#"{"tool":"different"}"#)
-            .await
-            .expect_err("identity cannot change its payload")
-            .contains("conflicts")
-    );
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
+    ));
     assert!(
         svc.claim_direct_dispatch(&identity, &agent_id)
             .await
@@ -283,6 +281,53 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
     assert!(
         ok,
         "correct agent_id should succeed after wrong agent rejection"
+    );
+}
+
+/// fail_dispatch must enforce the same durable owner boundary as result delivery.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user_id = format!("ed-fail-owner-usr-{}", unique_suffix());
+    let agent_id = format!("ed-fail-owner-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user_id, &Uuid::new_v4().to_string());
+
+    svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        .await
+        .expect("insert dispatch");
+
+    assert!(
+        !svc.fail_dispatch(&identity, "wrong-agent-id", "forged cancellation")
+            .await
+            .expect("wrong-owner failure attempt"),
+        "a different edge owner must not terminate the dispatch"
+    );
+    assert_eq!(
+        svc.admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+            .await
+            .expect("dispatch remains replayable"),
+        EdgeDispatchAdmission::Pending,
+        "the forged failure must leave the durable dispatch executable"
+    );
+    assert!(
+        svc.fail_dispatch(&identity, &agent_id, "cancelled")
+            .await
+            .expect("owner failure"),
+        "the owning edge may terminate its own dispatch"
+    );
+    let EdgeDispatchAdmission::Terminal(result_json) = svc
+        .admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        .await
+        .expect("failed dispatch replay")
+    else {
+        panic!("owner failure must create terminal durable evidence");
+    };
+    assert!(
+        result_json.contains("cancelled"),
+        "terminal replay must preserve the failure reason"
     );
 }
 

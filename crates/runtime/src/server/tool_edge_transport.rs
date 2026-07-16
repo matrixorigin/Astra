@@ -9,8 +9,8 @@ use super::tool_transport_errors::{capability_denied_result, edge_unavailable_me
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_CANCELLED,
-    attach_runtime_error_metadata, attach_runtime_policy_metadata, binding_event_fields,
-    cancelled_runtime_tool_result,
+    TOOL_ERROR_KIND_ROUTE_MISMATCH, attach_runtime_error_metadata, attach_runtime_policy_metadata,
+    binding_event_fields, cancelled_runtime_tool_result,
 };
 use super::tool_transport_plan::{EdgeBoundExecutionPlan, EdgeTransportAttempt};
 
@@ -72,6 +72,15 @@ pub(crate) async fn execute_edge_bound(
     .await
     {
         EdgeTransportAttempt::Delivered(result) => return result,
+        EdgeTransportAttempt::AdmissionRejected(error) => {
+            return edge_admission_rejected_result(&request, binding, "edge-dispatch", &error);
+        }
+        EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
+            diagnostics.push(format!(
+                "edge-dispatch: admission outcome is unknown: {error}"
+            ));
+            return edge_transport_failure_result(&request, binding, diagnostics, true);
+        }
         EdgeTransportAttempt::TransportDisconnected => {
             diagnostics
                 .push("edge-dispatch: outcome may be unknown after durable dispatch".to_string());
@@ -95,6 +104,15 @@ pub(crate) async fn execute_edge_bound(
     .await
     {
         EdgeTransportAttempt::Delivered(result) => return result,
+        EdgeTransportAttempt::AdmissionRejected(error) => {
+            return edge_admission_rejected_result(&request, binding, "edge-websocket", &error);
+        }
+        EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
+            diagnostics.push(format!(
+                "edge-websocket: admission outcome is unknown: {error}"
+            ));
+            return edge_transport_failure_result(&request, binding, diagnostics, true);
+        }
         EdgeTransportAttempt::TransportDisconnected => {
             diagnostics
                 .push("edge-websocket: outcome may be unknown after socket dispatch".to_string());
@@ -303,7 +321,12 @@ async fn try_edge_websocket(
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
             return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
         }
-        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
+            return EdgeTransportAttempt::AdmissionRejected(error);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+        }
     }
     match dispatch
         .claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id)
@@ -516,7 +539,12 @@ async fn try_edge_dispatch(
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
             return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
         }
-        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
+            return EdgeTransportAttempt::AdmissionRejected(error);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+        }
     }
     let wait_dispatch = dispatch.clone();
     let wait_identity = identity.clone();
@@ -529,7 +557,11 @@ async fn try_edge_dispatch(
         tokio::select! {
             _ = token.cancelled() => {
                 if let Err(e) = dispatch
-                    .fail_dispatch(&identity, TOOL_ERROR_KIND_CANCELLED)
+                    .fail_dispatch(
+                        &identity,
+                        &agent.edge_agent_id,
+                        TOOL_ERROR_KIND_CANCELLED,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -551,7 +583,10 @@ async fn try_edge_dispatch(
         wait_result.await.ok().flatten()
     };
     let Some(result_json) = result_json else {
-        if let Err(e) = dispatch.fail_dispatch(&identity, "expired").await {
+        if let Err(e) = dispatch
+            .fail_dispatch(&identity, &agent.edge_agent_id, "expired")
+            .await
+        {
             tracing::warn!(
                 error = %e,
                 request_id = %request_id,
@@ -636,6 +671,39 @@ fn edge_transport_failure_message(
             request.tool_name,
             request.executor.display_name
         )
+    }
+}
+
+fn edge_admission_rejected_result(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
+    transport: &str,
+    reason: &str,
+) -> astra_tools::ToolResult {
+    let message = format!(
+        "Error: durable edge admission rejected tool '{}' for executor '{}': {reason}. The tool was not dispatched; correct the invocation identity, edge owner, or payload before retrying.",
+        request.tool_name, request.executor.display_name
+    );
+    let mut degraded_executor = request.executor.clone();
+    degraded_executor.status = ExecutorStatus::Degraded;
+    let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
+    attach_runtime_policy_metadata(&mut metadata, binding);
+    attach_runtime_error_metadata(
+        &mut metadata,
+        &astra_runtime_env::RuntimeError::route_mismatch(&message),
+        TOOL_ERROR_KIND_ROUTE_MISMATCH,
+    );
+    metadata.insert(
+        "diagnostics".to_string(),
+        Value::Array(vec![Value::String(format!(
+            "{transport}: admission rejected: {reason}"
+        ))]),
+    );
+    astra_tools::ToolResult {
+        output: message,
+        metadata: Some(metadata),
+        is_error: true,
+        exit_semantics: None,
     }
 }
 

@@ -222,12 +222,16 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("test edge dispatch rows");
         let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
+        if row.edge_agent_id != edge_agent_id {
+            return Ok(false);
+        }
         row.status = "failed".to_string();
         row.failure_reason = Some(reason.to_string());
         let output = format!("edge dispatch {reason}");

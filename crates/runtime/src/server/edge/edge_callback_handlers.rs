@@ -1371,6 +1371,7 @@ mod edge_callback_insert_tests {
         async fn fail_dispatch(
             &self,
             _identity: &EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             Ok(false)

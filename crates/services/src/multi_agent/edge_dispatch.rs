@@ -127,14 +127,18 @@ pub trait EdgeDispatchService: Send + Sync {
     /// Admit a durable dispatch and report whether the exact identity already
     /// has terminal evidence. Implementations with a durable store must also
     /// reject an existing identity bound to different payload or edge owner.
+    /// The default is only suitable when `insert_dispatch` errors prove that
+    /// no durable write occurred; stores with ambiguous commit responses must
+    /// override this method and return `OutcomeUnknown`.
     async fn admit_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         payload_json: &str,
-    ) -> Result<EdgeDispatchAdmission, String> {
+    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
         self.insert_dispatch(identity, edge_agent_id, payload_json)
-            .await?;
+            .await
+            .map_err(EdgeDispatchAdmissionError::Rejected)?;
         Ok(EdgeDispatchAdmission::Pending)
     }
 
@@ -171,6 +175,7 @@ pub trait EdgeDispatchService: Send + Sync {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String>;
 
@@ -190,6 +195,29 @@ pub enum EdgeDispatchAdmission {
     Pending,
     Terminal(String),
 }
+
+/// Certainty at the durable admission boundary matters independently from
+/// whether the transport operation itself returned an error.
+///
+/// `Rejected` proves that this requested dispatch was not admitted. In
+/// contrast, `OutcomeUnknown` means the durable insert or its verification may
+/// have committed before the caller lost the response, so retrying through a
+/// different transport could duplicate an external side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeDispatchAdmissionError {
+    Rejected(String),
+    OutcomeUnknown(String),
+}
+
+impl std::fmt::Display for EdgeDispatchAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::OutcomeUnknown(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EdgeDispatchAdmissionError {}
 
 pub struct DatabaseEdgeDispatchService {
     pool: sqlx::Pool<sqlx::MySql>,
@@ -610,9 +638,25 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         payload_json: &str,
-    ) -> Result<EdgeDispatchAdmission, String> {
+    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
+        if !identity.is_complete() {
+            return Err(EdgeDispatchAdmissionError::Rejected(
+                "edge_dispatch admit: incomplete dispatch identity".to_string(),
+            ));
+        }
+        if edge_agent_id.trim().is_empty() {
+            return Err(EdgeDispatchAdmissionError::Rejected(
+                "edge_dispatch admit: edge_agent_id is required".to_string(),
+            ));
+        }
+        serde_json::from_str::<serde_json::Value>(payload_json).map_err(|error| {
+            EdgeDispatchAdmissionError::Rejected(format!(
+                "edge_dispatch admit: payload is invalid JSON: {error}"
+            ))
+        })?;
         self.insert_dispatch(identity, edge_agent_id, payload_json)
-            .await?;
+            .await
+            .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?;
         let row = sqlx::query(
             "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
                     status, CAST(result_json AS CHAR) AS result_json \
@@ -627,41 +671,60 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .bind(&identity.request_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|error| format!("edge_dispatch admit SELECT: {error}"))?
-        .ok_or_else(|| "edge_dispatch admitted row disappeared before verification".to_string())?;
-        let persisted_edge: String = row
-            .try_get("edge_agent_id")
-            .map_err(|error| format!("edge_dispatch admit edge_agent_id decode: {error}"))?;
-        let persisted_payload: String = row
-            .try_get("payload_json")
-            .map_err(|error| format!("edge_dispatch admit payload_json decode: {error}"))?;
+        .map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch admit SELECT: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(
+                "edge_dispatch admitted row disappeared before verification".to_string(),
+            )
+        })?;
+        let persisted_edge: String = row.try_get("edge_agent_id").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch admit edge_agent_id decode: {error}"
+            ))
+        })?;
+        let persisted_payload: String = row.try_get("payload_json").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch admit payload_json decode: {error}"
+            ))
+        })?;
         if persisted_edge != edge_agent_id
-            || !json_payloads_match(&persisted_payload, payload_json)?
+            || !json_payloads_match(&persisted_payload, payload_json)
+                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
         {
-            return Err(format!(
+            return Err(EdgeDispatchAdmissionError::Rejected(format!(
                 "edge_dispatch identity {} conflicts with its durable edge owner or payload",
                 identity.request_id
-            ));
+            )));
         }
-        let status: String = row
-            .try_get("status")
-            .map_err(|error| format!("edge_dispatch admit status decode: {error}"))?;
+        let status: String = row.try_get("status").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch admit status decode: {error}"
+            ))
+        })?;
         match status.as_str() {
             "pending" | "dispatched" => Ok(EdgeDispatchAdmission::Pending),
             "completed" | "failed" => row
                 .try_get::<Option<String>, _>("result_json")
-                .map_err(|error| format!("edge_dispatch admit result_json decode: {error}"))?
+                .map_err(|error| {
+                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                        "edge_dispatch admit result_json decode: {error}"
+                    ))
+                })?
                 .map(EdgeDispatchAdmission::Terminal)
                 .ok_or_else(|| {
-                    format!(
+                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
                         "edge_dispatch terminal identity {} has no result evidence",
                         identity.request_id
-                    )
+                    ))
                 }),
-            other => Err(format!(
+            other => Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
                 "edge_dispatch identity {} has unsupported status {other}",
                 identity.request_id
-            )),
+            ))),
         }
     }
 
@@ -936,10 +999,11 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(accepted)
     }
 
-    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, reason = %reason))]
+    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id, reason = %reason))]
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         let output = format!("edge dispatch {reason}");
@@ -949,7 +1013,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
-               AND request_id = ? AND status IN ('pending', 'dispatched')",
+               AND request_id = ? AND edge_agent_id = ? \
+               AND status IN ('pending', 'dispatched')",
         )
         .bind(&result_json)
         .bind(&identity.user_id)
@@ -957,6 +1022,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(&identity.request_id)
+        .bind(edge_agent_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?;
@@ -1078,6 +1144,7 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     async fn fail_dispatch(
         &self,
         _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
         _reason: &str,
     ) -> Result<bool, String> {
         Err("edge dispatch service not configured".to_string())

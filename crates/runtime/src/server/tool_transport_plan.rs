@@ -10,6 +10,8 @@ use super::tool_transport_metadata::delivered_binding_event_fields;
 
 pub(crate) enum EdgeTransportAttempt {
     Delivered(astra_tools::ToolResult),
+    AdmissionRejected(String),
+    AdmissionOutcomeUnknown(String),
     TransportDisconnected,
     Unavailable,
 }

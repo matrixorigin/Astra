@@ -151,8 +151,8 @@ const EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL: &str =
 struct CoreSchemaDatabaseLease {
     pool: sqlx::Pool<MySql>,
     holder_id: String,
-    stop_heartbeat: tokio::sync::oneshot::Sender<()>,
-    heartbeat: tokio::task::JoinHandle<()>,
+    stop_heartbeat: Option<tokio::sync::oneshot::Sender<()>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CoreSchemaDatabaseLease {
@@ -251,8 +251,8 @@ impl CoreSchemaDatabaseLease {
         Ok(Self {
             pool: pool.clone(),
             holder_id,
-            stop_heartbeat,
-            heartbeat,
+            stop_heartbeat: Some(stop_heartbeat),
+            heartbeat: Some(heartbeat),
         })
     }
 
@@ -260,19 +260,34 @@ impl CoreSchemaDatabaseLease {
         &self.holder_id
     }
 
-    async fn release(self) -> Result<(), sqlx::Error> {
-        let _ = self.stop_heartbeat.send(());
-        self.heartbeat.await.map_err(|error| {
-            sqlx::Error::Protocol(format!(
-                "core schema bootstrap lease heartbeat task failed: {error}"
-            ))
-        })?;
+    async fn release(mut self) -> Result<(), sqlx::Error> {
+        if let Some(stop_heartbeat) = self.stop_heartbeat.take() {
+            let _ = stop_heartbeat.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.await.map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "core schema bootstrap lease heartbeat task failed: {error}"
+                ))
+            })?;
+        }
         query("DELETE FROM astra_schema_bootstrap_leases WHERE component = ? AND holder_id = ?")
             .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
             .bind(&self.holder_id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+impl Drop for CoreSchemaDatabaseLease {
+    fn drop(&mut self) {
+        if let Some(stop_heartbeat) = self.stop_heartbeat.take() {
+            let _ = stop_heartbeat.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
     }
 }
 
@@ -6108,6 +6123,51 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_schema_lease_cancels_heartbeat_task() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/nonexistent")
+            .expect("lazy test pool");
+        let (stop_heartbeat, stop_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = stop_rx.await;
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("heartbeat task started");
+        let abort_handle = heartbeat.abort_handle();
+        let lease = CoreSchemaDatabaseLease {
+            pool,
+            holder_id: "test-holder".to_string(),
+            stop_heartbeat: Some(stop_heartbeat),
+            heartbeat: Some(heartbeat),
+        };
+
+        drop(lease);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("heartbeat future must be dropped promptly")
+            .expect("heartbeat drop notification");
+        assert!(
+            abort_handle.is_finished(),
+            "dropping the lease must not leave its heartbeat task detached"
+        );
+    }
 
     #[test]
     fn identity_column_widening_preserves_nullability() {
