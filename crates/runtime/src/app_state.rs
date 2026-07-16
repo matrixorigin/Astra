@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_tool_execution_service_shares_app_edge_connection_pool() {
+    async fn default_tool_execution_service_does_not_bypass_durable_dispatch() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
         state.edge_connection_pool.register_with_capabilities(
@@ -1234,38 +1234,19 @@ mod tests {
             selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         };
-        let handle =
-            tokio::spawn(async move { service.execute(request, &NoopLocalTransport).await });
-
-        let message = rx.recv().await.expect("edge tool request is delivered");
-        let (request_id, delivery_generation) = match message {
-            astra_server_types::EdgeServerMessage::ToolRequest {
-                request_id,
-                tool,
-                delivery_generation,
-                ..
-            } => {
-                assert_eq!(tool, "bash");
-                (request_id, delivery_generation)
-            }
-            other => panic!("expected edge tool request, got {other:?}"),
-        };
-        assert!(state.edge_connection_pool.deliver_tool_result(
-            "user-1",
-            "edge-selected",
-            &request_id,
-            delivery_generation,
-            astra_server_types::edge_connection_pool::EdgeToolResult {
-                output: "ok".to_string(),
-                is_error: false,
-                duration_ms: Some(1),
-                tool_result_fields: None,
-            },
-        ));
-
-        let result = handle.await.expect("edge execution task joins");
-        assert!(!result.is_error, "{result:?}");
-        assert_eq!(result.output, "ok");
+        let result = service.execute(request, &NoopLocalTransport).await;
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("transport metadata");
+        assert_eq!(metadata["error_kind"], "transport_unavailable");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["side_effects_maybe"], false);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a connected socket must not bypass durable dispatch admission"
+        );
     }
 
     #[test]

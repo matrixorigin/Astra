@@ -8,8 +8,9 @@ use super::tool_execution_binding::{ExecutorStatus, ToolExecutionRequest, ToolTr
 use super::tool_transport_errors::{capability_denied_result, edge_unavailable_message};
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_CANCELLED, attach_runtime_error_metadata, attach_runtime_policy_metadata,
-    binding_event_fields, cancelled_runtime_tool_result,
+    RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_CANCELLED,
+    attach_runtime_error_metadata, attach_runtime_policy_metadata, binding_event_fields,
+    cancelled_runtime_tool_result,
 };
 use super::tool_transport_plan::{EdgeBoundExecutionPlan, EdgeTransportAttempt};
 
@@ -74,7 +75,7 @@ pub(crate) async fn execute_edge_bound(
         EdgeTransportAttempt::TransportDisconnected => {
             diagnostics
                 .push("edge-dispatch: outcome may be unknown after durable dispatch".to_string());
-            return edge_transport_disconnected_result(&request, binding, diagnostics, true);
+            return edge_transport_failure_result(&request, binding, diagnostics, true);
         }
         EdgeTransportAttempt::Unavailable => {
             diagnostics
@@ -104,7 +105,7 @@ pub(crate) async fn execute_edge_bound(
         }
     }
 
-    edge_transport_disconnected_result(&request, binding, diagnostics, outcome_may_be_unknown)
+    edge_transport_failure_result(&request, binding, diagnostics, outcome_may_be_unknown)
 }
 
 async fn try_edge_websocket(
@@ -611,27 +612,34 @@ fn edge_unavailable_result(
     }
 }
 
-fn edge_transport_disconnected_message(
+fn edge_transport_failure_message(
     request: &ToolExecutionRequest,
     outcome_may_be_unknown: bool,
 ) -> String {
-    let action = if outcome_may_be_unknown {
-        "The request may have reached the edge; reconcile its durable invocation before any retry."
+    if outcome_may_be_unknown {
+        format!(
+            "Error: transport '{}' disconnected or timed out after dispatching tool '{}' to executor '{}'. The request may have reached the edge; reconcile its durable invocation before any retry. No alternate execution provider is available for this file environment.",
+            serde_json::to_value(request.executor.transport)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "edge transport".to_string()),
+            request.tool_name,
+            request.executor.display_name
+        )
     } else {
-        "Reconnect the executor transport before retrying."
-    };
-    format!(
-        "Error: transport '{}' disconnected or timed out while executing tool '{}' on executor '{}'. {action} No alternate execution provider is available for this file environment.",
-        serde_json::to_value(request.executor.transport)
-            .ok()
-            .and_then(|value| value.as_str().map(ToString::to_string))
-            .unwrap_or_else(|| "edge transport".to_string()),
-        request.tool_name,
-        request.executor.display_name
-    )
+        format!(
+            "Error: transport '{}' is unavailable before tool '{}' was dispatched to executor '{}'. Configure durable dispatch and reconnect the executor before retrying. No alternate execution provider is available for this file environment.",
+            serde_json::to_value(request.executor.transport)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "edge transport".to_string()),
+            request.tool_name,
+            request.executor.display_name
+        )
+    }
 }
 
-fn edge_transport_disconnected_result(
+fn edge_transport_failure_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     diagnostics: Vec<String>,
@@ -641,16 +649,20 @@ fn edge_transport_disconnected_result(
     degraded_executor.status = ExecutorStatus::Degraded;
     let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
-    let message = edge_transport_disconnected_message(request, outcome_may_be_unknown);
+    let message = edge_transport_failure_message(request, outcome_may_be_unknown);
     let error = if outcome_may_be_unknown {
-        astra_runtime_env::RuntimeError::transport_disconnected(message)
+        astra_runtime_env::RuntimeError::transport_disconnected(&message)
     } else {
-        astra_runtime_env::RuntimeError::transport_unavailable(message)
+        astra_runtime_env::RuntimeError::transport_unavailable(&message)
     };
     attach_runtime_error_metadata(
         &mut metadata,
         &error,
-        RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
+        if outcome_may_be_unknown {
+            RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED
+        } else {
+            RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE
+        },
     );
     if !diagnostics.is_empty() {
         metadata.insert(
@@ -666,7 +678,7 @@ fn edge_transport_disconnected_result(
         );
     }
     astra_tools::ToolResult {
-        output: edge_transport_disconnected_message(request, outcome_may_be_unknown),
+        output: message,
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: None,

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use super::super::tool_transport_metadata::TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE;
 use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
@@ -2558,8 +2559,10 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
         Some("/Users/test/other".to_string()),
         tx,
     );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
         .build();
     let local = CountingLocalTransport::new();
 
@@ -2585,10 +2588,25 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("transport 'edge_ws' disconnected")
-            || result.output.contains("transport disconnected"),
+        result
+            .output
+            .contains("unavailable before tool 'bash' was dispatched"),
         "{}",
         result.output
+    );
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE
+    );
+    assert_eq!(metadata["execution_started"], false);
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "missing selected executor must not admit a dispatch for another connected edge"
     );
     assert_eq!(local.calls(), 0);
     assert!(
@@ -3946,7 +3964,7 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
 // ── Both transports unavailable with Online executor ──────────────────
 
 #[tokio::test]
-async fn online_executor_with_no_transports_reports_disconnected_with_diagnostics() {
+async fn online_executor_without_durable_authority_is_unavailable_before_dispatch() {
     let dispatch = Arc::new(StaticEdgeDispatch::no_result());
     let _local = CountingLocalTransport::new();
 
@@ -3980,18 +3998,20 @@ async fn online_executor_with_no_transports_reports_disconnected_with_diagnostic
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("transport 'edge_ws' disconnected")
-            || result.output.contains("transport disconnected"),
-        "{}",
-        result.output
+        result
+            .output
+            .contains("unavailable before tool 'bash' was dispatched")
     );
     let metadata = result.metadata.expect("diagnostics metadata");
     assert_eq!(
         metadata["error_kind"],
-        TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+        TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE
     );
+    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE);
     assert_eq!(metadata["executor"]["status"], "degraded");
     assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["side_effects_maybe"], false);
     assert_eq!(local.calls(), 0);
 }
 

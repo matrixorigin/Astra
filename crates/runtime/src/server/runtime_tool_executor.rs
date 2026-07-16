@@ -7400,7 +7400,10 @@ esac
 
         assert!(result.is_error, "{result:?}");
         let metadata = result.metadata.as_ref().expect("edge runtime metadata");
-        assert_eq!(metadata["error_kind"], "transport_disconnected");
+        assert_eq!(metadata["error_kind"], "transport_unavailable");
+        assert_eq!(metadata["reason"], "transport_unavailable");
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["side_effects_maybe"], false);
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "edge_agent");
         assert_eq!(metadata["executor"]["display_name"], "MacBook Pro");
@@ -7437,6 +7440,11 @@ esac
                 .any(|event| event["type"] == "tool_transport_completed"),
             "transport-disconnected edge route must not be reported as completed: {events:?}"
         );
+        let blocked = events
+            .iter()
+            .find(|event| event["type"] == "run_blocked")
+            .expect("run_blocked");
+        assert_eq!(blocked["reason"], "transport_unavailable");
     }
 
     #[tokio::test]
