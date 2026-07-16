@@ -770,6 +770,14 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_hb, StatusCode::OK, "edge heartbeat: {hb}");
+    assert_eq!(
+        hb["replay_policy"], "durable_result_reconciliation_required",
+        "heartbeat must never grant automatic pending-tool replay authority"
+    );
+    assert!(
+        hb.get("pending_requests").is_none(),
+        "heartbeat must not return executable pending tool payloads"
+    );
 
     let (st_tool, tool_j) = post_json(
         app,

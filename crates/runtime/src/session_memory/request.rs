@@ -28,9 +28,10 @@ pub enum SpawnDecision {
     /// a worker. The service retained the latest request and the current
     /// worker will process it before releasing the session slot.
     Queued,
-    /// Gate rejected the attempt (no session id, below init gate,
-    /// debounced, or an extraction is already in flight). The
-    /// corresponding `SessionMemoryExtraction{outcome="skipped"}` event
-    /// has already been emitted synchronously.
+    /// Gate rejected the attempt (no owner/session id, below init gate,
+    /// debounced, or an extraction is already in flight). Owner-bound gate
+    /// rejections emit a synchronous `SessionMemoryExtraction` skipped event;
+    /// an unbound process template has no legal owner for durable emission and
+    /// instead fails loudly in the runtime log.
     Skipped,
 }

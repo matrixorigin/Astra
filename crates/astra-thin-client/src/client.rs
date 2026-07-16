@@ -19,10 +19,10 @@ use crate::edge::ASTRA_EDGE_ID_HEADER;
 use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
-    ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeRegisterRequest,
-    RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage,
-    SessionTranscriptReadScope, SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest,
-    ToolResultRequest, UserPromptRespondRequest,
+    ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
+    EdgeRegisterRequest, RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest,
+    SessionTranscriptPage, SessionTranscriptReadScope, SessionUpdateRequest, StreamEvent,
+    TaskLeaseMutationRequest, ToolResultRequest, UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
 
@@ -1677,7 +1677,7 @@ impl ThinClient {
         bearer_override: Option<&str>,
         edge_transport_id: Option<&str>,
         body: &EdgeHeartbeatRequest,
-    ) -> Result<Value, ThinClientError> {
+    ) -> Result<EdgeHeartbeatResponse, ThinClientError> {
         let url = self.url(paths::AGENTS_EDGE_HEARTBEAT)?;
         let mut req = self
             .http
@@ -1690,7 +1690,7 @@ impl ThinClient {
             req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
-        Self::json_or_error(resp).await
+        Self::typed_json_or_error(resp).await
     }
     /// `POST /agent-jobs/{task_id}/lease/claim`
     pub async fn post_agent_job_lease_claim(
@@ -2735,6 +2735,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn wiremock_agents_edge_heartbeat_round_trips_typed_reconciliation_contract() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge/heartbeat"))
+            .and(header("authorization", "Bearer t"))
+            .and(header("x-astra-edge-id", "transport-1"))
+            .and(body_json(serde_json::json!({
+                "edge_agent_id": "edge-1",
+                "pending_request_count": 2,
+                "last_seen_request_ids": ["invocation-2"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "user_id": "user-1",
+                "edge_id": "transport-1",
+                "edge_agent_id": "edge-1",
+                "unresolved_request_ids": ["invocation-1"],
+                "replay_policy": "durable_result_reconciliation_required",
+                "ack_request_ids": ["invocation-2"]
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .post_agents_edge_heartbeat(
+                Some("t"),
+                Some("transport-1"),
+                &EdgeHeartbeatRequest {
+                    edge_agent_id: "edge-1".to_string(),
+                    pending_request_count: 2,
+                    last_seen_request_ids: vec!["invocation-2".to_string()],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.replay_policy,
+            crate::protocol::EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired
+        );
+        assert_eq!(
+            response.unresolved_request_ids,
+            vec!["invocation-1".to_string()]
+        );
+        assert_eq!(response.ack_request_ids, vec!["invocation-2".to_string()]);
     }
 
     #[tokio::test]

@@ -4,25 +4,18 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
-use crate::cli::session::session_runtime::{
-    attempt_token_refresh, current_access_token, fresh_access_token,
-};
+use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::edge::edge_runtime_environment_capabilities;
-use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError};
-use tokio_util::sync::CancellationToken;
+use astra_thin_client::{
+    EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest, ThinClient, ThinClientError,
+};
 
 /// Maximum number of completed request IDs to track for deduplication.
 const MAX_COMPLETED_REQUEST_IDS: usize = 256;
-const REPLAY_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
-#[derive(Default)]
-struct ReplayExecutorRegistration {
-    executor: Option<std::sync::Weak<crate::edge_tools::ToolExecutor>>,
-    cancel_token: Option<CancellationToken>,
-}
 
 /// Process-scoped edge lifecycle state shared by the heartbeat loop and all
 /// edge-side SSE hosts within this CLI process.
@@ -30,9 +23,15 @@ struct ReplayExecutorRegistration {
 struct EdgeLifecycleContext {
     completed_request_ids: Mutex<VecDeque<String>>,
     pending_tool_requests: AtomicU32,
-    replay_in_flight: AtomicBool,
     registered_worktree_path: Mutex<Option<PathBuf>>,
-    replay_registration: Mutex<ReplayExecutorRegistration>,
+    last_reconciliation_signature: Mutex<Option<HeartbeatReconciliationSignature>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeartbeatReconciliationSignature {
+    replay_policy: astra_thin_client::EdgeHeartbeatReplayPolicy,
+    unresolved_request_ids: Vec<String>,
+    legacy_pending_request_ids: Vec<String>,
 }
 
 impl EdgeLifecycleContext {
@@ -74,6 +73,7 @@ impl EdgeLifecycleContext {
         }
     }
 
+    #[cfg(test)]
     fn registered_worktree_path(&self) -> Option<PathBuf> {
         self.registered_worktree_path
             .lock()
@@ -81,31 +81,34 @@ impl EdgeLifecycleContext {
             .and_then(|guard| guard.clone())
     }
 
-    fn register_replay_executor(
-        &self,
-        executor: &std::sync::Arc<crate::edge_tools::ToolExecutor>,
-        cancel_token: Option<&CancellationToken>,
-    ) {
-        if let Ok(mut guard) = self.replay_registration.lock() {
-            guard.executor = Some(std::sync::Arc::downgrade(executor));
-            guard.cancel_token = cancel_token.cloned();
+    fn reconciliation_changed(&self, response: &EdgeHeartbeatResponse) -> bool {
+        let mut unresolved_request_ids = response.unresolved_request_ids.clone();
+        unresolved_request_ids.sort();
+        unresolved_request_ids.dedup();
+        let mut legacy_pending_request_ids: Vec<String> = response
+            .legacy_pending_requests
+            .iter()
+            .map(|request| request.request_id.clone())
+            .collect();
+        legacy_pending_request_ids.sort();
+        legacy_pending_request_ids.dedup();
+
+        let next = response
+            .requires_reconciliation()
+            .then_some(HeartbeatReconciliationSignature {
+                replay_policy: response.replay_policy,
+                unresolved_request_ids,
+                legacy_pending_request_ids,
+            });
+        let Ok(mut previous) = self.last_reconciliation_signature.lock() else {
+            // A poisoned diagnostics lock must not hide a correctness warning.
+            return next.is_some();
+        };
+        if *previous == next {
+            return false;
         }
-    }
-
-    fn registered_replay_executor(
-        &self,
-    ) -> Option<std::sync::Arc<crate::edge_tools::ToolExecutor>> {
-        self.replay_registration
-            .lock()
-            .ok()
-            .and_then(|guard| guard.executor.as_ref().and_then(std::sync::Weak::upgrade))
-    }
-
-    fn registered_replay_cancel_token(&self) -> Option<CancellationToken> {
-        self.replay_registration
-            .lock()
-            .ok()
-            .and_then(|guard| guard.cancel_token.clone())
+        *previous = next;
+        previous.is_some()
     }
 
     fn jitter(&self, delay: Duration) -> Duration {
@@ -135,25 +138,17 @@ impl EdgeLifecycleContext {
         delay + Duration::from_millis(jitter_ms)
     }
 
-    fn try_acquire_replay_guard(&self) -> Option<ReplayInFlightGuard<'_>> {
-        self.replay_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| ReplayInFlightGuard { ctx: self })
-    }
-
     #[cfg(test)]
     fn reset_for_test(&self) {
         if let Ok(mut ids) = self.completed_request_ids.lock() {
             ids.clear();
         }
         self.pending_tool_requests.store(0, Ordering::Relaxed);
-        self.replay_in_flight.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = self.registered_worktree_path.lock() {
             *guard = None;
         }
-        if let Ok(mut guard) = self.replay_registration.lock() {
-            *guard = ReplayExecutorRegistration::default();
+        if let Ok(mut signature) = self.last_reconciliation_signature.lock() {
+            *signature = None;
         }
     }
 }
@@ -189,29 +184,6 @@ impl PendingToolRequestGuard<'static> {
 impl Drop for PendingToolRequestGuard<'_> {
     fn drop(&mut self) {
         self.ctx.dec_pending_tool_requests();
-    }
-}
-
-pub(crate) fn register_replay_executor(
-    executor: &std::sync::Arc<crate::edge_tools::ToolExecutor>,
-    cancel_token: Option<&CancellationToken>,
-) {
-    edge_lifecycle().register_replay_executor(executor, cancel_token);
-}
-
-struct ReplayInFlightGuard<'a> {
-    ctx: &'a EdgeLifecycleContext,
-}
-
-impl ReplayInFlightGuard<'static> {
-    fn try_acquire() -> Option<Self> {
-        edge_lifecycle().try_acquire_replay_guard()
-    }
-}
-
-impl Drop for ReplayInFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.ctx.replay_in_flight.store(false, Ordering::Release);
     }
 }
 
@@ -307,7 +279,7 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
 async fn send_heartbeat(
     api: &ThinClient,
     token: &str,
-) -> Result<Option<Vec<serde_json::Value>>, ThinClientError> {
+) -> Result<Option<EdgeHeartbeatResponse>, ThinClientError> {
     if !edge_cloud_registry_enabled() {
         return Ok(None);
     }
@@ -317,16 +289,11 @@ async fn send_heartbeat(
         pending_request_count: edge_lifecycle().pending_tool_request_count(),
         last_seen_request_ids: completed_request_ids_snapshot(),
     };
-    let resp = api
+    let response = api
         .post_agents_edge_heartbeat(Some(token), Some(id), &hb)
         .await?;
 
-    // Parse pending_requests from heartbeat response (reconnection dedup)
-    let pending = resp
-        .get("pending_requests")
-        .and_then(|v| v.as_array())
-        .cloned();
-    Ok(pending)
+    Ok(Some(response))
 }
 
 pub fn spawn_edge_heartbeat(
@@ -343,27 +310,32 @@ pub fn spawn_edge_heartbeat(
         loop {
             interval.tick().await;
             match send_heartbeat(&api, &token).await {
-                Ok(Some(pending_requests)) => {
+                Ok(Some(reconciliation)) => {
                     failures = 0;
-                    // ── Reconnection dedup: re-execute pending tools ──
-                    if !pending_requests.is_empty()
-                        && let Some(replay_guard) = ReplayInFlightGuard::try_acquire()
-                    {
-                        let client = api.clone();
-                        let t = token.clone();
-                        let replay_profile = profile.clone();
-                        let id = edge_executor_instance_id().to_string();
-                        tokio::spawn(async move {
-                            let _replay_guard = replay_guard;
-                            reexecute_pending_requests(
-                                &client,
-                                &t,
-                                replay_profile.as_deref(),
-                                &id,
-                                &pending_requests,
-                            )
-                            .await;
-                        });
+                    if reconciliation.requires_reconciliation() {
+                        let legacy_pending_request_ids: Vec<&str> = reconciliation
+                            .legacy_pending_requests
+                            .iter()
+                            .map(|request| request.request_id.as_str())
+                            .collect();
+                        if edge_lifecycle().reconciliation_changed(&reconciliation) {
+                            tracing::error!(
+                                target: "astra.edge.reconnect",
+                                unresolved_request_ids = ?reconciliation.unresolved_request_ids,
+                                legacy_pending_request_ids = ?legacy_pending_request_ids,
+                                replay_policy = ?reconciliation.replay_policy,
+                                "edge heartbeat reported unresolved invocations; automatic tool re-execution is forbidden without durable result evidence"
+                            );
+                        } else {
+                            tracing::trace!(
+                                target: "astra.edge.reconnect",
+                                unresolved_count = reconciliation.unresolved_request_ids.len(),
+                                legacy_pending_count = legacy_pending_request_ids.len(),
+                                "edge heartbeat reconciliation state is unchanged"
+                            );
+                        }
+                    } else {
+                        edge_lifecycle().reconciliation_changed(&reconciliation);
                     }
                 }
                 Ok(None) => {
@@ -393,198 +365,6 @@ pub fn spawn_edge_heartbeat(
             }
         }
     }))
-}
-
-/// Re-execute pending tool requests that the cloud returned after reconnection.
-///
-/// This is the dedup mechanism: when an edge reconnects, the cloud heartbeat
-/// response includes any `pending_requests` that were dispatched while the
-/// edge was disconnected. The edge re-executes them and posts results back.
-///
-/// Reuses the active SSE executor when available so replay inherits the live
-/// sandbox state, approval expansions, and cancellation token.
-async fn reexecute_pending_requests(
-    api: &ThinClient,
-    _token: &str,
-    profile: Option<&str>,
-    executor_id: &str,
-    pending: &[serde_json::Value],
-) {
-    let executor = if let Some(executor) = edge_lifecycle().registered_replay_executor() {
-        executor
-    } else {
-        let project_root = edge_lifecycle()
-            .registered_worktree_path()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project_root))
-    };
-    let cancel_token = edge_lifecycle().registered_replay_cancel_token();
-    let Some(mut replay_token) = fresh_access_token(api, profile).await else {
-        tracing::warn!(
-            target: "astra.edge.reconnect",
-            "reconnection: skipped pending tool replay because no fresh access token is available"
-        );
-        return;
-    };
-
-    for req in pending {
-        let session_id = match req.get("session_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.trim().is_empty() => id.to_string(),
-            _ => {
-                tracing::error!(
-                    target: "astra.edge.reconnect",
-                    "reconnection: skipped pending tool replay without session_id"
-                );
-                continue;
-            }
-        };
-        let run_id = match req.get("run_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.trim().is_empty() => id.to_string(),
-            _ => {
-                tracing::error!(
-                    target: "astra.edge.reconnect",
-                    "reconnection: skipped pending tool replay without run_id"
-                );
-                continue;
-            }
-        };
-        let turn_chain_id = match req.get("turn_chain_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.trim().is_empty() => id.to_string(),
-            _ => {
-                tracing::error!(
-                    target: "astra.edge.reconnect",
-                    "reconnection: skipped pending tool replay without turn_chain_id"
-                );
-                continue;
-            }
-        };
-        let request_id = match req.get("request_id").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        let tool_name = match req.get("tool_name").and_then(|v| v.as_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
-
-        tracing::info!(
-            target: "astra.edge.reconnect",
-            request_id = %request_id,
-            tool = tool_name,
-            "reconnection: re-executing pending tool"
-        );
-
-        // Execute the tool locally and post the result back to cloud.
-        let replay_cancel = cancel_token.clone().unwrap_or_default();
-        let execution_cancel = replay_cancel.child_token();
-        let timeout_cancel = execution_cancel.clone();
-        let outcome = match tokio::time::timeout(
-            REPLAY_TOOL_TIMEOUT,
-            crate::cli::stream::stream_render::execute_with_metadata_responsive(
-                std::sync::Arc::clone(&executor),
-                tool_name.to_string(),
-                args,
-                Some(execution_cancel),
-            ),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                timeout_cancel.cancel();
-                crate::edge_tools::ToolExecutionOutcome {
-                    output: format!(
-                        "Error: replayed tool execution timed out after {} seconds",
-                        REPLAY_TOOL_TIMEOUT.as_secs()
-                    ),
-                    tool_result_fields: None,
-                    is_error: true,
-                }
-            }
-        };
-
-        let tool_result_fields = outcome.tool_result_fields;
-        let output = outcome.output;
-        let status = if outcome.is_error {
-            "error"
-        } else {
-            "completed"
-        };
-
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            astra_thin_client::ToolResultRequestParts {
-                session_id,
-                run_id,
-                turn_chain_id,
-                request_id: request_id.clone(),
-                edge_agent_id: executor_id.to_string(),
-                status: status.to_string(),
-                output,
-                duration_ms: 0, // reconnection re-execution doesn't track timing
-                tool_result_fields,
-            },
-        );
-
-        match post_replayed_tool_result(api, profile, &mut replay_token, executor_id, &body).await {
-            Ok(_) => {
-                tracing::info!(
-                    target: "astra.edge.reconnect",
-                    request_id = %request_id,
-                    "reconnection: pending tool result posted successfully"
-                );
-                record_completed_request(request_id);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "astra.edge.reconnect",
-                    request_id = %request_id,
-                    error = %e,
-                    "reconnection: failed to post pending tool result"
-                );
-            }
-        }
-    }
-
-    async fn post_replayed_tool_result(
-        api: &ThinClient,
-        profile: Option<&str>,
-        replay_token: &mut String,
-        executor_id: &str,
-        body: &astra_thin_client::ToolResultRequest,
-    ) -> Result<(), ThinClientError> {
-        let Some(fresh) = fresh_access_token(api, profile).await else {
-            return Err(ThinClientError::InvalidInput(format!(
-                "refusing to post replayed tool result '{}' without a fresh access token",
-                body.request_id
-            )));
-        };
-        *replay_token = fresh;
-
-        match api
-            .post_tool_result(Some(replay_token.as_str()), Some(executor_id), body)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) if is_unauthorized(&err) => {
-                if !attempt_token_refresh(api, profile).await {
-                    return Err(err);
-                }
-                let Some(fresh) = fresh_access_token(api, profile).await else {
-                    return Err(ThinClientError::InvalidInput(format!(
-                        "token refresh completed but no fresh access token is available for replayed tool result '{}'",
-                        body.request_id
-                    )));
-                };
-                *replay_token = fresh;
-                api.post_tool_result(Some(replay_token.as_str()), Some(executor_id), body)
-                    .await
-                    .map(|_| ())
-            }
-            Err(err) => Err(err),
-        }
-    }
 }
 
 /// Register with the cloud (best-effort) and start a background heartbeat task.
@@ -650,12 +430,15 @@ fn print_skip_notice(_e: &ThinClientError) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingToolRequestGuard, ReplayInFlightGuard, attach_runtime_environment_capabilities,
+        EdgeLifecycleContext, PendingToolRequestGuard, attach_runtime_environment_capabilities,
         backoff_delay, completed_request_ids_snapshot, edge_cloud_registry_enabled, edge_lifecycle,
         enrich_register_body, heartbeat_period, jitter, record_completed_request,
-        reexecute_pending_requests, register_edge_once, send_heartbeat,
+        register_edge_once, send_heartbeat,
     };
-    use astra_thin_client::{ASTRA_EDGE_ID_HEADER, EdgeRegisterRequest, ThinClient};
+    use astra_thin_client::{
+        ASTRA_EDGE_ID_HEADER, EdgeHeartbeatReplayPolicy, EdgeHeartbeatResponse,
+        EdgeRegisterRequest, LegacyEdgePendingRequest, ThinClient,
+    };
     use serial_test::serial;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -856,7 +639,15 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/agents/edge/heartbeat"))
             .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "user_id": "user-1",
+                "edge_id": "transport-1",
+                "edge_agent_id": "edge-1",
+                "unresolved_request_ids": [],
+                "replay_policy": "durable_result_reconciliation_required",
+                "ack_request_ids": []
+            })))
             .mount(&server)
             .await;
 
@@ -881,38 +672,73 @@ mod tests {
         ctx.pending_tool_requests.store(0, Ordering::Relaxed);
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn replay_skips_pending_tools_when_no_fresh_token_is_available() {
-        let prev_token = std::env::var("ASTRA_ACCESS_TOKEN").ok();
-        env_remove("ASTRA_ACCESS_TOKEN");
+    #[test]
+    fn heartbeat_reconciliation_never_treats_pending_payloads_as_replay_authority() {
+        let reconciliation = EdgeHeartbeatResponse {
+            ok: true,
+            user_id: "user-1".to_string(),
+            edge_id: "transport-1".to_string(),
+            edge_agent_id: "edge-1".to_string(),
+            unresolved_request_ids: vec!["invocation-new".to_string()],
+            replay_policy:
+                EdgeHeartbeatReplayPolicy::LegacyPendingPayloadRequiresManualReconciliation,
+            ack_request_ids: Vec::new(),
+            legacy_pending_requests: vec![LegacyEdgePendingRequest {
+                request_id: "legacy-request".to_string(),
+            }],
+        };
 
-        let server = MockServer::start().await;
-        let api = ThinClient::new(&server.uri(), None).expect("url");
-        let pending = vec![serde_json::json!({
-            "request_id": "req-stale-replay",
-            "tool_name": "bash",
-            "args": {"cmd": "echo should-not-run"}
-        })];
+        assert_eq!(
+            reconciliation.unresolved_request_ids,
+            vec!["invocation-new"]
+        );
+        assert_eq!(
+            reconciliation.legacy_pending_requests,
+            vec![LegacyEdgePendingRequest {
+                request_id: "legacy-request".to_string(),
+            }]
+        );
+        assert!(reconciliation.requires_reconciliation());
+    }
 
-        reexecute_pending_requests(
-            &api,
-            "stale-token-from-old-sse-loop",
-            Some("__missing_edge_replay_profile__"),
-            "edge-test",
-            &pending,
-        )
-        .await;
+    #[test]
+    fn reconciliation_errors_only_when_the_unresolved_state_changes() {
+        let ctx = EdgeLifecycleContext::default();
+        let unresolved = EdgeHeartbeatResponse {
+            ok: true,
+            user_id: "user-1".to_string(),
+            edge_id: "transport-1".to_string(),
+            edge_agent_id: "edge-1".to_string(),
+            unresolved_request_ids: vec!["invocation-2".to_string(), "invocation-1".to_string()],
+            replay_policy: EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired,
+            ack_request_ids: Vec::new(),
+            legacy_pending_requests: Vec::new(),
+        };
 
+        assert!(ctx.reconciliation_changed(&unresolved));
         assert!(
-            server.received_requests().await.unwrap().is_empty(),
-            "edge replay must not reuse the old SSE token argument as a posting credential"
+            !ctx.reconciliation_changed(&EdgeHeartbeatResponse {
+                unresolved_request_ids: vec![
+                    "invocation-1".to_string(),
+                    "invocation-2".to_string()
+                ],
+                ..unresolved.clone()
+            }),
+            "ordering-only differences must not amplify the same error"
         );
 
-        match prev_token {
-            Some(value) => env_set("ASTRA_ACCESS_TOKEN", &value),
-            None => env_remove("ASTRA_ACCESS_TOKEN"),
-        }
+        let resolved = EdgeHeartbeatResponse {
+            unresolved_request_ids: Vec::new(),
+            ..unresolved.clone()
+        };
+        assert!(
+            !ctx.reconciliation_changed(&resolved),
+            "recovery clears diagnostics state without emitting an error"
+        );
+        assert!(
+            ctx.reconciliation_changed(&unresolved),
+            "a recurrence after recovery must be visible"
+        );
     }
 
     #[test]
@@ -943,18 +769,6 @@ mod tests {
             assert_eq!(ctx.pending_tool_requests.load(Ordering::Acquire), 1);
         }
         assert_eq!(ctx.pending_tool_requests.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[serial]
-    fn replay_guard_is_single_flight() {
-        let ctx = edge_lifecycle();
-        ctx.replay_in_flight.store(false, Ordering::Relaxed);
-        let guard = ReplayInFlightGuard::try_acquire().expect("first acquisition");
-        assert!(ReplayInFlightGuard::try_acquire().is_none());
-        drop(guard);
-        assert!(ReplayInFlightGuard::try_acquire().is_some());
-        ctx.replay_in_flight.store(false, Ordering::Relaxed);
     }
 
     #[test]

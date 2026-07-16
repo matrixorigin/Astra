@@ -375,11 +375,11 @@ async fn scenario_full_team_lifecycle() {
         assert!(!body["team_id"].as_str().unwrap().is_empty());
     }
 
-    // ── List: should see all 4 ──
+    // ── List: owner-scoped builtins plus all 4 custom teams ──
     let (status, body) = get(app.clone(), "/teams", user).await;
     assert_eq!(status, StatusCode::OK);
     let team_list = body["teams"].as_array().unwrap();
-    assert_eq!(team_list.len(), 4);
+    assert_eq!(team_list.len(), 7);
     let names: Vec<&str> = team_list
         .iter()
         .map(|t| t["name"].as_str().unwrap())
@@ -388,6 +388,9 @@ async fn scenario_full_team_lifecycle() {
     assert!(names.contains(&"adversarial-review"));
     assert!(names.contains(&"parallel-research"));
     assert!(names.contains(&"db-migration"));
+    assert!(names.contains(&"review"));
+    assert!(names.contains(&"research"));
+    assert!(names.contains(&"dev"));
 
     // Verify budget/max_parallel visible in list summary
     let dev_summary = team_list.iter().find(|t| t["name"] == "dev-cycle").unwrap();
@@ -450,10 +453,10 @@ async fn scenario_full_team_lifecycle() {
     let (status, _) = get(app.clone(), "/teams/db-migration", user).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // List should now have 3
+    // List should now have 3 custom teams plus the 3 owner-scoped builtins.
     let (status, body) = get(app.clone(), "/teams", user).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["teams"].as_array().unwrap().len(), 3);
+    assert_eq!(body["teams"].as_array().unwrap().len(), 6);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -475,17 +478,55 @@ async fn scenario_multi_user_isolation() {
     // Each user sees only their own
     let (_, body_a) = get(app.clone(), "/teams", "alice").await;
     let (_, body_b) = get(app.clone(), "/teams", "bob").await;
-    assert_eq!(body_a["teams"].as_array().unwrap().len(), 1);
-    assert_eq!(body_b["teams"].as_array().unwrap().len(), 1);
+    assert_eq!(body_a["teams"].as_array().unwrap().len(), 4);
+    assert_eq!(body_b["teams"].as_array().unwrap().len(), 4);
 
     // Different team_ids
-    let id_a = body_a["teams"][0]["team_id"].as_str().unwrap();
-    let id_b = body_b["teams"][0]["team_id"].as_str().unwrap();
+    let id_a = body_a["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["name"] == "dev-cycle")
+        .and_then(|team| team["team_id"].as_str())
+        .unwrap();
+    let id_b = body_b["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["name"] == "dev-cycle")
+        .and_then(|team| team["team_id"].as_str())
+        .unwrap();
     assert_ne!(id_a, id_b);
 
     // User A cannot see user B's team by name (scoped)
     let (s, _) = get(app.clone(), "/teams/dev-cycle", "charlie").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn scenario_fresh_owner_lazily_receives_isolated_builtin_teams() {
+    let app = build_test_app();
+
+    let (status, alice) = get(app.clone(), "/teams", "alice-new").await;
+    assert_eq!(status, StatusCode::OK);
+    let alice_teams = alice["teams"].as_array().unwrap();
+    assert_eq!(alice_teams.len(), 3);
+    assert_eq!(
+        alice_teams
+            .iter()
+            .map(|team| team["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["dev", "research", "review"])
+    );
+
+    let (status, review) = get(app.clone(), "/teams/review", "alice-new").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(review["user_id"], "alice-new");
+
+    let (status, bob_review) = get(app, "/teams/review", "bob-new").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bob_review["user_id"], "bob-new");
+    assert_ne!(review["team_id"], bob_review["team_id"]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

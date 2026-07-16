@@ -271,6 +271,13 @@ impl HttpTeamStore {
 
 #[async_trait]
 impl TeamPersistenceService for HttpTeamStore {
+    async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
+        // The authenticated server endpoint owns idempotent materialization.
+        // Reading the collection exercises that owner-scoped boundary without
+        // duplicating builtin definitions in the CLI.
+        self.list_teams(user_id).await.map(|_| ())
+    }
+
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
         let body = UpsertTeamRequest {
             name: &team.name,

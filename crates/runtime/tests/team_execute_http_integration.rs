@@ -657,11 +657,19 @@ async fn http_execute_invalid_json_or_missing_task() {
 #[tokio::test]
 async fn http_execute_team_for_different_user_returns_404() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+    let mut owner_private_team = store
+        .load_team("test-user", "research")
+        .await
+        .unwrap()
+        .expect("seeded research team");
+    owner_private_team.team_id = "test-user-private-research".to_string();
+    owner_private_team.name = "private-research".to_string();
+    store.save_team(&owner_private_team).await.unwrap();
     let app = build_app_with_delegation(store, Arc::new(StubSubRunExecutor)).await;
 
     let (status, body) = post_json(
         app,
-        "/teams/research/execute",
+        "/teams/private-research/execute",
         "other-user",
         json!({ "task": "t" }),
     )

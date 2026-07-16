@@ -29,8 +29,9 @@ pub use edge::{
 pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
-    EdgeHeartbeatRequest, EdgeRegisterRequest, RunUserIntentRequest, RunUserIntentResponse,
-    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
+    EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
+    LegacyEdgePendingRequest, RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest,
+    SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
     SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
     SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
     ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,

@@ -303,15 +303,11 @@ impl FeedbackSignalStore {
         let mut hints = Vec::new();
         let total = signals.len() as f64;
 
-        // Count by signal type
-        let mut type_counts: std::collections::HashMap<&str, u32> =
-            std::collections::HashMap::new();
-        for s in &signals {
-            *type_counts.entry(s.signal_type.type_name()).or_default() += 1;
-        }
-
         // Repeated retries suggest the current approach is failing
-        let retry_count = type_counts.get("Retry").copied().unwrap_or(0);
+        let retry_count = signals
+            .iter()
+            .filter(|signal| matches!(signal.signal_type, SignalType::Retry { .. }))
+            .count();
         if retry_count as f64 / total > 0.3 {
             hints.push(AdaptationHint {
                 kind: "high_retry_rate".to_string(),
@@ -330,7 +326,10 @@ impl FeedbackSignalStore {
         }
 
         // High error rate signals
-        let error_count = type_counts.get("TaskFailure").copied().unwrap_or(0);
+        let error_count = signals
+            .iter()
+            .filter(|signal| matches!(signal.signal_type, SignalType::TaskFailure { .. }))
+            .count();
         if error_count > 0 && error_count as f64 / total > 0.2 {
             hints.push(AdaptationHint {
                 kind: "elevated_failure_rate".to_string(),
@@ -406,6 +405,55 @@ mod tests {
         assert_eq!(signals[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(signals[1].turn_id.as_deref(), Some("t2"));
         assert_eq!(signals[1].signal_type.type_name(), "correction");
+    }
+
+    #[test]
+    fn adaptation_hints_are_derived_from_typed_signals() {
+        let store = FeedbackSignalStore::new();
+        for _ in 0..4 {
+            store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
+        }
+        for _ in 0..2 {
+            store.record(FeedbackSignal::new(SignalType::TaskFailure {
+                reason: "provider failed".to_string(),
+            }));
+        }
+
+        let hints = store.adaptation_hints();
+        assert!(
+            hints.iter().any(|hint| hint.kind == "high_retry_rate"),
+            "{hints:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.kind == "elevated_failure_rate"),
+            "{hints:?}"
+        );
+    }
+
+    #[test]
+    fn adaptation_hints_do_not_trigger_at_exclusive_thresholds() {
+        let store = FeedbackSignalStore::new();
+        store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
+        store.record(FeedbackSignal::new(SignalType::TaskFailure {
+            reason: "provider failed".to_string(),
+        }));
+        for _ in 0..3 {
+            store.record(FeedbackSignal::new(SignalType::Acceptance));
+        }
+
+        let hints = store.adaptation_hints();
+        assert!(
+            !hints.iter().any(|hint| hint.kind == "high_retry_rate"),
+            "20% retry rate must stay below the exclusive 30% threshold: {hints:?}"
+        );
+        assert!(
+            !hints
+                .iter()
+                .any(|hint| hint.kind == "elevated_failure_rate"),
+            "20% failure rate is the exclusive threshold and must not trigger: {hints:?}"
+        );
     }
 
     #[test]

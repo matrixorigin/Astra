@@ -1,18 +1,17 @@
-//! Matrix-backed cloud plumbing in one place: [`SharedPool`], journal ingestion, and
-//! [`SyncOrchestrator`] (learning, events, templates, preferences). Used by `astra-server`
-//! [`AppState`] and by the CLI [`ReplState`] as a single `Arc` attachment.
+//! Matrix-backed cloud plumbing in one place: [`SharedPool`], journal ingestion,
+//! sync persistence, and shutdown tracking. Used by `astra-server` [`AppState`]
+//! and by the CLI [`ReplState`] as a single `Arc` attachment.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
-    CloudTransport, SyncOrchestrator, TaskLeaseHoldCache, TaskRecord,
+    TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
     state_sync::MatrixOneSyncService,
@@ -106,7 +105,6 @@ pub struct MatrixCloudRuntime {
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     /// Normalized ingestion config used by this runtime instance.
     ingestion_config: astra_services::event_ingestion::IngestionConfig,
-    sync_orchestrator: TokioMutex<SyncOrchestrator>,
     /// Phase 3: shared with HTTP lease handlers (process-local export filter).
     pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
     /// Phase 3: local task mirror.
@@ -125,20 +123,15 @@ pub struct MatrixCloudRuntime {
     /// available, and exposed via
     /// [`Self::clone_memory_extraction_service`].
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
-    /// User ID this runtime was attached for — needed when constructing
-    /// the memory extraction service inside [`Self::with_encryptor`].
-    user_id: Arc<str>,
 }
 
 impl MatrixCloudRuntime {
-    /// Wire ingestion worker to an existing [`SharedPool`]. The
-    /// [`SyncOrchestrator`] is constructed bare (no adapters) since the
-    /// per-domain sync adapters (learning, events, templates, preferences,
-    /// tasks) were removed along with the self-evolution subsystem.
+    /// Wire owner-neutral ingestion and sync infrastructure to an existing
+    /// [`SharedPool`]. Request-owned services are bound later from authenticated
+    /// run context; the process root never invents a user principal.
     pub fn attach(
         shared_pool: SharedPool,
         _profile: &str,
-        user_id: &str,
         lease_hold_cache: Arc<TaskLeaseHoldCache>,
     ) -> Self {
         let edge_agent_id: Arc<str> = std::env::var("ASTRA_EDGE_AGENT_ID")
@@ -156,9 +149,6 @@ impl MatrixCloudRuntime {
             pool,
             audit_flusher.writer.clone(),
         ));
-        let transport: Arc<dyn CloudTransport> = Arc::new(astra_services::NoopTransport);
-        let orch = SyncOrchestrator::new(transport, user_id.to_string());
-
         Self {
             shared_pool,
             ingestion: Mutex::new(Some(sender)),
@@ -167,7 +157,6 @@ impl MatrixCloudRuntime {
             session_sync_tasks: Mutex::new(JoinSet::new()),
             ingestion_stats,
             ingestion_config,
-            sync_orchestrator: TokioMutex::new(orch),
             lease_hold_cache,
             task_mirror,
             task_dirty,
@@ -177,7 +166,6 @@ impl MatrixCloudRuntime {
             audit_flusher_handle: Mutex::new(Some(audit_flusher.join_handle)),
             encryptor: None,
             memory_extraction_service: None,
-            user_id: Arc::from(user_id),
         }
     }
 
@@ -194,8 +182,7 @@ impl MatrixCloudRuntime {
     pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
         self.encryptor = Some(Arc::clone(&enc));
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
-        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
-            .map(|client| client.with_owner_user_id(self.user_id.to_string()));
+        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env();
         if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
             let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
                 Arc::new(PoolSelectorResolver {
@@ -205,13 +192,14 @@ impl MatrixCloudRuntime {
             let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
             let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort> =
                 Arc::new(memoria);
-            let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
-                resolver,
-                memoria_client,
-                ingestion,
-                Arc::clone(&self.user_id),
-                broker,
-            ));
+            let svc = Arc::new(
+                crate::session_memory::MemoryExtractionService::new_owner_scoped_template(
+                    resolver,
+                    memoria_client,
+                    ingestion,
+                    broker,
+                ),
+            );
             self.memory_extraction_service = Some(svc);
         }
         self
@@ -484,10 +472,6 @@ impl MatrixCloudRuntime {
                 }
             }
         }
-    }
-
-    pub async fn sync_orchestrator_lock(&self) -> tokio::sync::MutexGuard<'_, SyncOrchestrator> {
-        self.sync_orchestrator.lock().await
     }
 }
 

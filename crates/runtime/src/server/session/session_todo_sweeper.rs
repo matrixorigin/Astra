@@ -175,6 +175,7 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
         "SELECT user_id, session_id, todo_id, metadata FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
+         ORDER BY updated_at ASC, user_id ASC, session_id ASC, todo_id ASC \
          LIMIT ? \
          FOR UPDATE",
     )
@@ -300,12 +301,18 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             .await
             .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
 
+        // The process-level sweeper lease is the ordinary single-owner path,
+        // but candidate claiming must still be correct if a lease handoff,
+        // operator-triggered pass, or test overlaps another worker. Lock the
+        // deterministic oldest-first batch inside the mutation transaction so
+        // two workers cannot both select a row and then report false progress.
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status IN ('completed', 'failed', 'cancelled') \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-             ORDER BY updated_at ASC \
-             LIMIT ?",
+             ORDER BY updated_at ASC, user_id ASC, session_id ASC, todo_id ASC \
+             LIMIT ? \
+             FOR UPDATE",
         )
         .bind(days)
         .bind(batch_size)
@@ -482,13 +489,17 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
             .await
             .map_err(|e| format!("archive-gc tx begin: {e}"))?;
 
+        // GC uses the same transaction-local claim boundary as auto-archive.
+        // Stable tie-breakers prevent an equal-timestamp backlog from
+        // repeatedly favoring an arbitrary subset.
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status = 'archived' \
                AND archived_at IS NOT NULL \
                AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-             ORDER BY archived_at ASC \
-             LIMIT ?",
+             ORDER BY archived_at ASC, user_id ASC, session_id ASC, todo_id ASC \
+             LIMIT ? \
+             FOR UPDATE",
         )
         .bind(days)
         .bind(batch_size)
@@ -1153,7 +1164,7 @@ mod tests {
             "INSERT INTO session_todos (\
                  session_id, todo_id, user_id, ordinal, title, status, blocks, archived_at, created_at, updated_at\
              ) VALUES \
-                 (?, 'task-1', ?, 0, 'old done with corrupt edges', 'completed', 'not-json', NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 1000 DAY))",
+                 (?, 'task-1', ?, 0, 'old done with corrupt edges', 'completed', 'not-json', NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 10000 DAY))",
         )
         .bind(&session_id)
         .bind(&user_id)

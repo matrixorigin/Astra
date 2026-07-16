@@ -713,6 +713,13 @@ fn team_snapshot_page_from_records(
 /// CRUD operations for team definitions, execution history, and snapshots.
 #[async_trait]
 pub trait TeamPersistenceService: Send + Sync {
+    /// Materialize the standard team templates for an authenticated owner.
+    ///
+    /// This is intentionally request-owner scoped. Process startup has no
+    /// legitimate user identity and must never seed templates under a fake
+    /// principal.
+    async fn ensure_builtins(&self, user_id: &str) -> Result<(), String>;
+
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
     async fn load_team_by_id(
@@ -854,6 +861,16 @@ impl Default for InMemoryTeamStore {
 
 #[async_trait]
 impl TeamPersistenceService for InMemoryTeamStore {
+    async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut map = self.teams.write().map_err(|e| e.to_string())?;
+        for team in builtin_teams(user_id, &now) {
+            let key = format!("{}:{}", team.user_id, team.name);
+            map.entry(key).or_insert(team);
+        }
+        Ok(())
+    }
+
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
         let key = format!("{}:{}", team.user_id, team.name);
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
@@ -1082,21 +1099,79 @@ impl MatrixOneTeamStore {
         Self { pool }
     }
 
-    /// Seed built-in teams for a user if they don't already exist.
+    /// Materialize built-in teams without overwriting an owner's existing
+    /// same-name definition.
+    ///
+    /// This uses insert-only admission rather than `load` followed by
+    /// [`TeamPersistenceService::save_team`]. The latter is an upsert and can
+    /// overwrite a user customization when first-request initialization races
+    /// with an explicit create.
     pub async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         for team in builtin_teams(user_id, &now) {
-            let existing = self.load_team(user_id, &team.name).await?;
-            if existing.is_none() {
-                self.save_team(&team).await?;
-            }
+            self.insert_builtin_if_absent(&team).await?;
         }
         Ok(())
+    }
+
+    async fn insert_builtin_if_absent(&self, team: &TeamDefinition) -> Result<(), String> {
+        let coordination_json =
+            serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
+        let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
+        let context_json = serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
+        let worktree_str = serde_json::to_string(&team.worktree_mode)
+            .map_err(|e| e.to_string())?
+            .trim_matches('"')
+            .to_string();
+        let budget_json = team
+            .budget
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+
+        match sqlx::query(
+            "INSERT INTO team_definitions \
+             (team_id, user_id, name, description, coordination, members_json, \
+              context_json, worktree_mode, budget_json, max_parallel, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(&team.team_id)
+        .bind(&team.user_id)
+        .bind(&team.name)
+        .bind(&team.description)
+        .bind(&coordination_json)
+        .bind(&members_json)
+        .bind(&context_json)
+        .bind(&worktree_str)
+        .bind(&budget_json)
+        .bind(team.max_parallel)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_duplicate_key_error(&error) => {
+                if self.load_team(&team.user_id, &team.name).await?.is_some() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "builtin team INSERT failed: team_id {} collides with a different team",
+                        team.team_id
+                    ))
+                }
+            }
+            Err(error) => Err(format!("builtin team INSERT failed: {error}")),
+        }
     }
 }
 
 #[async_trait]
 impl TeamPersistenceService for MatrixOneTeamStore {
+    async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
+        MatrixOneTeamStore::ensure_builtins(self, user_id).await
+    }
+
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
         let coordination_json =
             serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
@@ -1971,6 +2046,40 @@ mod tests {
         assert!(names.contains(&"review"));
         assert!(names.contains(&"research"));
         assert!(names.contains(&"dev"));
+    }
+
+    #[tokio::test]
+    async fn ensure_builtins_is_owner_scoped_idempotent_and_non_destructive() {
+        let store = InMemoryTeamStore::new();
+        let mut existing_review = test_team();
+        existing_review.team_id = "alice-custom-review".to_string();
+        existing_review.user_id = "alice".to_string();
+        existing_review.name = "review".to_string();
+        existing_review.description = "owner customized review".to_string();
+        store.save_team(&existing_review).await.unwrap();
+
+        store.ensure_builtins("alice").await.unwrap();
+        store.ensure_builtins("alice").await.unwrap();
+        store.ensure_builtins("bob").await.unwrap();
+
+        let alice = store.list_teams("alice").await.unwrap();
+        let bob = store.list_teams("bob").await.unwrap();
+        assert_eq!(alice.len(), 3);
+        assert_eq!(bob.len(), 3);
+        assert_eq!(
+            alice
+                .iter()
+                .find(|team| team.name == "review")
+                .map(|team| (team.team_id.as_str(), team.description.as_str())),
+            Some(("alice-custom-review", "owner customized review")),
+            "lazy initialization must not overwrite an owner's existing definition"
+        );
+        assert!(
+            alice
+                .iter()
+                .all(|team| team.user_id == "alice" && !team.team_id.contains("bob"))
+        );
+        assert!(bob.iter().all(|team| team.user_id == "bob"));
     }
 
     #[tokio::test]

@@ -104,7 +104,10 @@ pub struct MemoryExtractionService {
     selector_resolver: Arc<dyn SelectorParamsResolver>,
     memoria_client: Arc<dyn MemoriaPort>,
     ingestion: IngestionSender,
-    user_id: Arc<str>,
+    /// Authenticated owner for an executable service. The process-wide
+    /// template is deliberately unbound and can only create owner-scoped
+    /// services through [`Self::scoped_to_owner`].
+    user_id: Option<Arc<str>>,
     health: Arc<SelectorHealth>,
     memoria_health: Arc<MemoriaHealth>,
     /// Per-session active fingerprint plus one latest-wins queued refresh.
@@ -144,7 +147,7 @@ pub struct MemoryExtractionService {
 impl std::fmt::Debug for MemoryExtractionService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryExtractionService")
-            .field("user_id", &self.user_id)
+            .field("user_id", &self.user_id.as_deref())
             .field("subscribers", &self.broker.subscriber_count())
             .finish()
     }
@@ -162,11 +165,38 @@ impl MemoryExtractionService {
         user_id: impl Into<Arc<str>>,
         broker: Arc<BackgroundActivityBroker>,
     ) -> Self {
+        Self::new_with_owner(
+            selector_resolver,
+            memoria_client,
+            ingestion,
+            Some(user_id.into()),
+            broker,
+        )
+    }
+
+    /// Build an owner-neutral process template. It cannot execute extraction
+    /// itself; callers must bind it to an authenticated owner first.
+    pub(crate) fn new_owner_scoped_template(
+        selector_resolver: Arc<dyn SelectorParamsResolver>,
+        memoria_client: Arc<dyn MemoriaPort>,
+        ingestion: IngestionSender,
+        broker: Arc<BackgroundActivityBroker>,
+    ) -> Self {
+        Self::new_with_owner(selector_resolver, memoria_client, ingestion, None, broker)
+    }
+
+    fn new_with_owner(
+        selector_resolver: Arc<dyn SelectorParamsResolver>,
+        memoria_client: Arc<dyn MemoriaPort>,
+        ingestion: IngestionSender,
+        user_id: Option<Arc<str>>,
+        broker: Arc<BackgroundActivityBroker>,
+    ) -> Self {
         Self {
             selector_resolver,
             memoria_client,
             ingestion,
-            user_id: user_id.into(),
+            user_id,
             health: Arc::new(SelectorHealth::new()),
             memoria_health: Arc::new(MemoriaHealth::new()),
             work: Arc::new(std::sync::Mutex::new(SessionWorkCoordinator::default())),
@@ -211,7 +241,7 @@ impl MemoryExtractionService {
     /// a bootstrap/default tenant.
     pub fn scoped_to_owner(self: &Arc<Self>, user_id: &str) -> Result<Arc<Self>, String> {
         let scope = astra_memoria::MemoryScope::new(user_id, "owner-binding-validation")?;
-        if self.user_id.as_ref() == scope.user_id.as_str() {
+        if self.user_id.as_deref() == Some(scope.user_id.as_str()) {
             return Ok(Arc::clone(self));
         }
 
@@ -219,6 +249,7 @@ impl MemoryExtractionService {
             .owner_scoped_services
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scoped.retain(|_, service| service.strong_count() > 0);
         if let Some(existing) = scoped
             .get(&scope.user_id)
             .and_then(std::sync::Weak::upgrade)
@@ -230,7 +261,7 @@ impl MemoryExtractionService {
             selector_resolver: Arc::clone(&self.selector_resolver),
             memoria_client: self.memoria_client.bind_owner(&scope.user_id)?,
             ingestion: self.ingestion.clone(),
-            user_id: Arc::from(scope.user_id.as_str()),
+            user_id: Some(Arc::from(scope.user_id.as_str())),
             health: Arc::clone(&self.health),
             memoria_health: Arc::clone(&self.memoria_health),
             work: Arc::new(std::sync::Mutex::new(SessionWorkCoordinator::default())),
@@ -247,8 +278,8 @@ impl MemoryExtractionService {
     }
 
     #[must_use]
-    pub fn owner_user_id(&self) -> &str {
-        &self.user_id
+    pub fn owner_user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
     }
 
     fn write_required_local_snapshot(&self, session_id: &str, content: &str) -> Result<(), String> {
@@ -391,6 +422,13 @@ impl MemoryExtractionService {
     ///
     /// **Must run inside a Tokio runtime.**
     pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
+        let Some(user_id) = self.user_id.as_deref() else {
+            tracing::error!(
+                session_id = %req.session_id,
+                "refusing session-memory extraction from an owner-neutral service template"
+            );
+            return SpawnDecision::Skipped;
+        };
         let content_fingerprint = extraction_input_fingerprint(&req);
         // Breadcrumbs for sync-path skip events. `selector_model` and
         // `attempt` only make sense in the async worker after LLM
@@ -482,13 +520,7 @@ impl MemoryExtractionService {
                 } else {
                     Some(req.session_id.as_str())
                 };
-                self.emit_skip_event(
-                    &self.user_id,
-                    sid_opt,
-                    req.turn_number,
-                    reason,
-                    &skip_breadcrumbs,
-                );
+                self.emit_skip_event(user_id, sid_opt, req.turn_number, reason, &skip_breadcrumbs);
                 return SpawnDecision::Skipped;
             }
         }
@@ -523,7 +555,13 @@ impl MemoryExtractionService {
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
         let session_id = req.session_id.clone();
-        let user_id = self.user_id.to_string();
+        let Some(user_id) = self.user_id.as_deref().map(str::to_string) else {
+            tracing::error!(
+                session_id = %session_id,
+                "refusing session-memory worker execution without an authenticated owner"
+            );
+            return;
+        };
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
@@ -1271,11 +1309,10 @@ mod tests {
         let port = Arc::new(OwnerBindingMemoria::default());
         let bindings = Arc::clone(&port.bindings);
         let (tx, _rx) = IngestionSender::for_tests(16);
-        let root = Arc::new(MemoryExtractionService::new(
+        let root = Arc::new(MemoryExtractionService::new_owner_scoped_template(
             Arc::new(ConstSelectorResolver(None)),
             port,
             tx,
-            "bootstrap-owner",
             Arc::new(BackgroundActivityBroker::new()),
         ));
 
@@ -1285,14 +1322,46 @@ mod tests {
 
         assert!(Arc::ptr_eq(&alice_a, &alice_b));
         assert!(!Arc::ptr_eq(&alice_a, &bob));
-        assert_eq!(alice_a.owner_user_id(), "alice");
-        assert_eq!(bob.owner_user_id(), "bob");
+        assert_eq!(root.owner_user_id(), None);
+        assert_eq!(alice_a.owner_user_id(), Some("alice"));
+        assert_eq!(bob.owner_user_id(), Some("bob"));
         assert_eq!(&*bindings.lock().unwrap(), &["alice", "bob"]);
 
         alice_a.mark_session_extracted("same-session", 11, 2);
         assert!(alice_a.peek_state("same-session").is_some());
         assert!(bob.peek_state("same-session").is_none());
         assert!(Arc::ptr_eq(&alice_a.pending, &bob.pending));
+    }
+
+    #[test]
+    fn owner_scoped_service_cache_prunes_dead_owner_keys() {
+        let port = Arc::new(OwnerBindingMemoria::default());
+        let (tx, _rx) = IngestionSender::for_tests(16);
+        let root = Arc::new(MemoryExtractionService::new_owner_scoped_template(
+            Arc::new(ConstSelectorResolver(None)),
+            port,
+            tx,
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+
+        let alice = root.scoped_to_owner("alice").unwrap();
+        assert_eq!(
+            root.owner_scoped_services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        drop(alice);
+
+        let _bob = root.scoped_to_owner("bob").unwrap();
+        let scoped = root
+            .owner_scoped_services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(scoped.len(), 1, "dead owner keys must not accumulate");
+        assert!(scoped.contains_key("bob"));
+        assert!(!scoped.contains_key("alice"));
     }
 
     async fn spawn_json_server_with_status(
@@ -1370,6 +1439,28 @@ mod tests {
             had_user_correction: false,
             turn_number: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn owner_neutral_template_refuses_direct_extraction() {
+        let memoria = Arc::new(OwnerBindingMemoria::default());
+        let (ingestion, _rx) = IngestionSender::for_tests(16);
+        let template = Arc::new(MemoryExtractionService::new_owner_scoped_template(
+            Arc::new(ConstSelectorResolver(None)),
+            memoria,
+            ingestion,
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+
+        assert_eq!(
+            template.maybe_spawn(sample_req("session-without-owner", 1_000, false)),
+            SpawnDecision::Skipped
+        );
+        assert_eq!(template.owner_user_id(), None);
+        assert_eq!(
+            template.wait_for_pending(Duration::from_millis(10)).await,
+            0
+        );
     }
 
     fn meaningful_shutdown_req(session_id: &str, _tokens: usize) -> ExtractionRequest {

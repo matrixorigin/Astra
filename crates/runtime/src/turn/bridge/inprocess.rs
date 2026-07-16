@@ -259,6 +259,36 @@ where
     Some(snapshot)
 }
 
+async fn record_session_local_heuristic_feedback(
+    feedback_store: &astra_pipeline::feedback_store::FeedbackStore,
+    session_id: &str,
+    user_text: &str,
+    signal: &astra_turn_types::ImplicitSignal,
+) -> bool {
+    if session_id.is_empty()
+        || !matches!(
+            signal.signal_type.as_str(),
+            "correction" | "frustration" | "rephrasing"
+        )
+    {
+        return false;
+    }
+    let Some(feedback) = astra_pipeline::feedback_extraction::heuristic_extract(
+        user_text,
+        &signal.signal_type,
+        signal.confidence,
+    ) else {
+        return false;
+    };
+
+    // Heuristic feedback is an unverified observation. This function
+    // deliberately has access only to the session-scoped store: promotion to
+    // cross-session memory requires a separate durable learning workflow with
+    // consent, evaluation, activation, rollback, and deletion lineage.
+    feedback_store.add(session_id, feedback).await;
+    true
+}
+
 /// Build a prompt section for the CLI-injected skill listing.
 ///
 /// Returns `None` when the CLI didn't include a listing (no skills loaded
@@ -2167,46 +2197,13 @@ impl InProcessChatTurnBridge {
                     signal.signal_type.as_str(),
                     "correction" | "frustration" | "rephrasing"
                 );
-                // Store heuristic-extracted feedback only on correction-like signals
-                // and only when we have a valid session_id (avoid cross-session leakage)
-                if !session_id.is_empty() && is_correction_like {
-                    if let Some(fb) = astra_pipeline::feedback_extraction::heuristic_extract(
-                        user_content_for_signal,
-                        &signal.signal_type,
-                        signal.confidence,
-                    ) {
-                        // Persist feedback rule to Memoria L3 (fire-and-forget).
-                        // Closes the reflect→memory loop: correction detected in
-                        // this turn → stored durably → recalled in future sessions.
-                        if let Some(ref mc) = memoria_client_owned {
-                            use crate::turn::cloud::memoria_compact::MemoriaPort;
-                            if let Some(lesson) =
-                                crate::learning::synthesizer::feedback_rule_to_lesson(&fb)
-                            {
-                                let c = mc.clone();
-                                let sid = session_id.clone();
-                                tokio::spawn(async move {
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        c.store(
-                                            &lesson.content,
-                                            lesson.memory_type,
-                                            Some(&sid),
-                                            Some(lesson.trust_tier),
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => tracing::debug!("Persisted feedback rule to Memoria"),
-                                        Ok(Err(e)) => tracing::debug!("Failed to persist feedback rule: {e}"),
-                                        Err(_) => tracing::debug!("Timed out persisting feedback rule to Memoria"),
-                                    }
-                                });
-                            }
-                        }
-                        feedback_store.add(&session_id, fb).await;
-                    }
-                }
+                record_session_local_heuristic_feedback(
+                    feedback_store.as_ref(),
+                    &session_id,
+                    user_content_for_signal,
+                    &signal,
+                )
+                .await;
                 let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
                     .unwrap_or_default();
@@ -5059,6 +5056,54 @@ mod tests {
         .expect("provider model gateway invocation");
 
         assert_eq!(invocation.model, "qwen3.5-flash");
+    }
+
+    #[tokio::test]
+    async fn heuristic_feedback_remains_session_local_and_requires_a_concrete_rule() {
+        let store = astra_pipeline::feedback_store::FeedbackStore::new();
+        let correction = astra_turn_types::detect_implicit_feedback_signal(
+            "wrong, don't use mocks in integration tests",
+            Some("I'll mock the database"),
+        );
+
+        assert!(
+            record_session_local_heuristic_feedback(
+                &store,
+                "session-a",
+                "wrong, don't use mocks in integration tests",
+                &correction,
+            )
+            .await
+        );
+        assert_eq!(store.len("session-a").await, 1);
+        assert!(
+            store.is_empty("session-b").await,
+            "heuristic feedback must not cross session ownership boundaries"
+        );
+
+        assert!(
+            !record_session_local_heuristic_feedback(
+                &store,
+                "",
+                "wrong, don't use mocks in integration tests",
+                &correction,
+            )
+            .await,
+            "feedback without a session owner must be rejected"
+        );
+
+        let neutral = astra_turn_types::detect_implicit_feedback_signal("tell me about Rust", None);
+        assert!(
+            !record_session_local_heuristic_feedback(
+                &store,
+                "session-a",
+                "tell me about Rust",
+                &neutral,
+            )
+            .await,
+            "non-correction observations must not become learned rules"
+        );
+        assert_eq!(store.len("session-a").await, 1);
     }
 
     #[test]

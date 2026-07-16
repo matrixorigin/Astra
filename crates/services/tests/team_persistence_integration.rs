@@ -502,16 +502,15 @@ async fn ensure_builtins_idempotent() {
     let user_id = format!("it-builtins-{}", Uuid::new_v4());
     let store = MatrixOneTeamStore::new(pool.clone());
 
-    // First call seeds built-in teams
-    store
-        .ensure_builtins(&user_id)
-        .await
-        .expect("ensure_builtins");
-    let list1 = store.list_teams(&user_id).await.unwrap();
-    assert!(
-        list1.len() >= 3,
-        "should have at least review, research, dev"
+    // Concurrent first requests must converge without overwriting or errors.
+    let (first, concurrent) = tokio::join!(
+        store.ensure_builtins(&user_id),
+        store.ensure_builtins(&user_id)
     );
+    first.expect("ensure_builtins");
+    concurrent.expect("concurrent ensure_builtins");
+    let list1 = store.list_teams(&user_id).await.unwrap();
+    assert_eq!(list1.len(), 3, "should have review, research, dev once");
 
     // Second call is idempotent
     store
@@ -524,5 +523,43 @@ async fn ensure_builtins_idempotent() {
     // Cleanup
     for t in &list2 {
         cleanup_team(&pool, &t.team_id).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
+async fn ensure_builtins_preserves_existing_owner_customization() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let store = MatrixOneTeamStore::new(pool.clone());
+    let user_id = format!("it-builtins-custom-{}", Uuid::new_v4());
+    let mut customized = test_team("builtin-custom", TeamCoordination::Pipeline);
+    customized.user_id = user_id.clone();
+    customized.name = "review".to_string();
+    customized.description = "owner-defined review workflow".to_string();
+    cleanup_team(&pool, &customized.team_id).await;
+    store
+        .save_team(&customized)
+        .await
+        .expect("save owner customization");
+
+    store
+        .ensure_builtins(&user_id)
+        .await
+        .expect("materialize missing builtins");
+
+    let review = store
+        .load_team(&user_id, "review")
+        .await
+        .expect("load customized review")
+        .expect("customized review remains present");
+    assert_eq!(review.team_id, customized.team_id);
+    assert_eq!(review.description, "owner-defined review workflow");
+    let teams = store.list_teams(&user_id).await.expect("list teams");
+    assert_eq!(teams.len(), 3);
+
+    for team in teams {
+        cleanup_team(&pool, &team.team_id).await;
     }
 }

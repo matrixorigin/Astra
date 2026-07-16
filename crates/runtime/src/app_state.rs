@@ -183,7 +183,7 @@ pub struct AppState {
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
     pub shared_pool: Option<SharedPool>,
-    /// Matrix pool + journal ingestion + [`astra_services::SyncOrchestrator`] (learning/events).
+    /// Owner-neutral Matrix pool, journal ingestion, sync persistence, and shutdown tracking.
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
     pub(crate) edge_callback_ledger:

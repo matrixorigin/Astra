@@ -404,6 +404,66 @@ pub struct EdgeHeartbeatRequest {
     pub last_seen_request_ids: Vec<String>,
 }
 
+/// Server policy for invocations that remain unresolved across an Edge
+/// heartbeat. Pending transport state is not proof that a side effect is safe
+/// to execute again.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeHeartbeatReplayPolicy {
+    /// Older servers returned executable `pending_requests` without durable
+    /// result evidence. Clients must surface these entries and must not replay
+    /// them automatically.
+    #[default]
+    LegacyPendingPayloadRequiresManualReconciliation,
+    /// The server returns identities only. Reconciliation must use the
+    /// canonical durable invocation/result protocol.
+    DurableResultReconciliationRequired,
+    /// A newer server policy unknown to this client. Unknown policy never
+    /// grants replay authority; the client surfaces it for reconciliation.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Minimal shape accepted from the retired executable-pending heartbeat
+/// response. Extra legacy payload fields are intentionally ignored: they are
+/// diagnostic evidence, never execution authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyEdgePendingRequest {
+    pub request_id: String,
+}
+
+/// `POST /agents/edge/heartbeat` response shared by Server and thin clients.
+///
+/// The response never authorizes tool execution. A non-empty unresolved or
+/// legacy pending set requires durable reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EdgeHeartbeatResponse {
+    pub ok: bool,
+    pub user_id: String,
+    pub edge_id: String,
+    pub edge_agent_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_request_ids: Vec<String>,
+    #[serde(default)]
+    pub replay_policy: EdgeHeartbeatReplayPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ack_request_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "pending_requests"
+    )]
+    pub legacy_pending_requests: Vec<LegacyEdgePendingRequest>,
+}
+
+impl EdgeHeartbeatResponse {
+    pub fn requires_reconciliation(&self) -> bool {
+        !self.unresolved_request_ids.is_empty()
+            || !self.legacy_pending_requests.is_empty()
+            || self.replay_policy == EdgeHeartbeatReplayPolicy::Unknown
+    }
+}
+
 /// `POST /agent-jobs/{id}/lease/{claim,release,renew}` — matches server lease handlers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TaskLeaseMutationRequest {
@@ -894,6 +954,73 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn heartbeat_response_decodes_current_identity_only_contract() {
+        let response: EdgeHeartbeatResponse = serde_json::from_value(json!({
+            "ok": true,
+            "user_id": "user-1",
+            "edge_id": "transport-1",
+            "edge_agent_id": "edge-1",
+            "unresolved_request_ids": ["invocation-1"],
+            "replay_policy": "durable_result_reconciliation_required",
+            "ack_request_ids": ["invocation-2"]
+        }))
+        .expect("current heartbeat response");
+
+        assert!(response.requires_reconciliation());
+        assert_eq!(
+            response.replay_policy,
+            EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired
+        );
+        assert!(response.legacy_pending_requests.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_response_decodes_legacy_pending_payload_as_non_executable_evidence() {
+        let response: EdgeHeartbeatResponse = serde_json::from_value(json!({
+            "ok": true,
+            "user_id": "user-1",
+            "edge_id": "transport-1",
+            "edge_agent_id": "edge-1",
+            "pending_requests": [{
+                "request_id": "legacy-request",
+                "tool_name": "bash",
+                "args": {"cmd": "echo must-not-run"}
+            }]
+        }))
+        .expect("legacy heartbeat response");
+
+        assert!(response.requires_reconciliation());
+        assert_eq!(
+            response.replay_policy,
+            EdgeHeartbeatReplayPolicy::LegacyPendingPayloadRequiresManualReconciliation
+        );
+        assert_eq!(
+            response.legacy_pending_requests,
+            vec![LegacyEdgePendingRequest {
+                request_id: "legacy-request".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn heartbeat_response_unknown_policy_fails_safe_without_breaking_heartbeat() {
+        let response: EdgeHeartbeatResponse = serde_json::from_value(json!({
+            "ok": true,
+            "user_id": "user-1",
+            "edge_id": "transport-1",
+            "edge_agent_id": "edge-1",
+            "replay_policy": "future_provider_attested_reconciliation"
+        }))
+        .expect("unknown policy must remain forward compatible");
+
+        assert_eq!(response.replay_policy, EdgeHeartbeatReplayPolicy::Unknown);
+        assert!(
+            response.requires_reconciliation(),
+            "unknown policy must never imply automatic replay authority"
+        );
+    }
 
     #[test]
     fn chat_stream_request_serde_roundtrip() {

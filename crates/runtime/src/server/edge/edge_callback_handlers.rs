@@ -12,9 +12,11 @@ use super::*;
 use astra_services::session_journal::{
     ApprovalDecisionAppendOutcome, append_approval_decision_for_run_if_absent, validate_session_id,
 };
-use astra_thin_client::ASTRA_EDGE_ID_HEADER;
+use astra_thin_client::{
+    ASTRA_EDGE_ID_HEADER, EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
+    EdgeRegisterRequest,
+};
 use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
-use serde::Deserialize;
 use serde_json::Value;
 
 use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
@@ -869,28 +871,6 @@ pub(crate) async fn post_user_prompt_respond_handler(
     })))
 }
 
-#[derive(Deserialize)]
-pub(crate) struct EdgeRegisterRequest {
-    pub edge_agent_id: String,
-    pub hostname: Option<String>,
-    pub worktree_path: Option<String>,
-    pub capabilities: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct EdgeHeartbeatRequest {
-    pub edge_agent_id: String,
-    /// Number of in-flight tool requests on this edge executor (from thin-client).
-    /// Used to detect stalled edges: pending > 0 but no results for > 2 min → warning.
-    #[serde(default)]
-    pub pending_request_count: u32,
-    /// Recently completed request IDs the edge has processed, for deduplication
-    /// on reconnection. Cloud can cross-reference with its pending tool_requests
-    /// table to avoid re-issuing tool calls already completed by this edge.
-    #[serde(default)]
-    pub last_seen_request_ids: Vec<String>,
-}
-
 /// `POST /agents/edge` — upsert `edge_agent_registry` (Phase 3).
 pub(crate) async fn post_agents_edge_register_handler(
     State(state): State<AppState>,
@@ -930,7 +910,7 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<EdgeHeartbeatRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<EdgeHeartbeatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     if body.edge_agent_id.trim().is_empty() {
         return Err(error_response(
@@ -954,9 +934,10 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
             }
         })?;
 
-    // ── Reconnection dedup ──────────────────────────────────────────
-    // 1. Ack completed request IDs: remove from cloud's pending set.
-    //    The edge confirmed these tools were executed, so no re-issue needed.
+    // ── Reconnection reconciliation ─────────────────────────────────
+    // 1. Ack completed request IDs: remove them from the process-local
+    //    delivery tracker. This is cleanup evidence only; it never grants
+    //    authority to execute an invocation.
     //    Server-side scoping: each lookup key is "{user_id}:{request_id}",
     //    so the edge can only remove entries belonging to its authenticated
     //    user. Fabricated IDs for other users have no effect.
@@ -978,19 +959,16 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
             .ack_completed_for_user(&user.user_id, seen_ids);
     }
 
-    // 2. Return pending requests (those still in the set after ack).
-    //    On reconnection, the edge re-executes these and reports results.
-    let pending_requests: Vec<serde_json::Value> = state
+    // 2. Report unresolved request identities without returning executable
+    //    payloads. A request being pending proves neither that it was never
+    //    executed nor that it is safe to retry. Re-execution is therefore
+    //    forbidden until the Edge can reconcile a durable completed/unknown
+    //    journal entry under the canonical invocation protocol.
+    let unresolved_request_ids: Vec<String> = state
         .edge_connection_pool
         .get_pending_requests_for_user(&user.user_id)
         .into_iter()
-        .map(|req| {
-            serde_json::json!({
-                "request_id": req.request_id,
-                "tool_name": req.tool_name,
-                "args": req.args,
-            })
-        })
+        .map(|request| request.request_id)
         .collect();
 
     // Stale edge detection: warn if edge has pending tool requests with no progress.
@@ -1003,23 +981,25 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
         );
     }
 
-    if !pending_requests.is_empty() {
-        tracing::info!(
+    if !unresolved_request_ids.is_empty() {
+        tracing::error!(
             user_id = %user.user_id,
             edge_id = %edge_id,
-            count = pending_requests.len(),
-            "reconnection: returning pending requests to edge"
+            unresolved_request_ids = ?unresolved_request_ids,
+            "edge heartbeat found unresolved invocations; automatic replay is disabled pending durable result reconciliation"
         );
     }
 
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "user_id": user.user_id,
-        "edge_id": edge_id,
-        "edge_agent_id": body.edge_agent_id,
-        "pending_requests": pending_requests,
-        "ack_request_ids": seen_ids,
-    })))
+    Ok(Json(EdgeHeartbeatResponse {
+        ok: true,
+        user_id: user.user_id,
+        edge_id,
+        edge_agent_id: body.edge_agent_id,
+        unresolved_request_ids,
+        replay_policy: EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired,
+        ack_request_ids: seen_ids.to_vec(),
+        legacy_pending_requests: Vec::new(),
+    }))
 }
 
 #[cfg(test)]

@@ -939,7 +939,6 @@ impl<'a> CliSseStreamHost<'a> {
         // The thinking spinner and tool status lines still stream normally,
         // so the terminal is never blank during generation.
         let buffer_from_start = true;
-        crate::cli::edge_lifecycle::register_replay_executor(&ctx.executor, ctx.cancel_token);
         let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             api: ctx.api,

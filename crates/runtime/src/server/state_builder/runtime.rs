@@ -35,12 +35,10 @@ pub(super) async fn build_runtime_wiring(
         )),
         delegation_tracker.clone(),
     ));
-    let user_id = "local";
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
             shared_pool.clone(),
             "default",
-            user_id,
             Arc::clone(lease_hold_cache),
         )
         .with_encryptor(Arc::clone(run_encryptor)),
@@ -150,7 +148,7 @@ pub(super) async fn build_runtime_wiring(
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 
-    let team_store = initialize_team_store(shared_pool, user_id).await;
+    let team_store = initialize_team_store(shared_pool);
     Ok(RuntimeWiring {
         matrix_rt,
         run_lifecycle,
@@ -213,21 +211,12 @@ async fn initialize_resource_governor(
     std::sync::Arc::new(resource_governor)
 }
 
-async fn initialize_team_store(
+fn initialize_team_store(
     shared_pool: &SharedPool,
-    user_id: &str,
 ) -> Arc<dyn astra_services::team_persistence::TeamPersistenceService> {
-    let team_store =
-        astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    if let Err(error) = team_store.ensure_builtins(user_id).await {
-        tracing::warn!(
-            target: "astra_runtime::state_builder",
-            error = %error,
-            user_id = %user_id,
-            "team builtins seed failed"
-        );
-    }
-    Arc::new(team_store)
+    Arc::new(astra_services::team_persistence::MatrixOneTeamStore::new(
+        shared_pool.get().clone(),
+    ))
 }
 
 pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRegistry {

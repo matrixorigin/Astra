@@ -38,7 +38,7 @@ pub struct FeedbackStore {
 
 struct StoreInner {
     sessions: HashMap<String, SessionRules>,
-    /// Insertion-order tracking for LRU eviction of sessions.
+    /// Least-recently-used order, oldest at the front.
     order: VecDeque<String>,
 }
 
@@ -49,6 +49,11 @@ struct SessionRules {
 }
 
 impl FeedbackStore {
+    fn touch_session(inner: &mut StoreInner, session_id: &str) {
+        inner.order.retain(|existing| existing != session_id);
+        inner.order.push_back(session_id.to_string());
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(StoreInner {
@@ -62,15 +67,14 @@ impl FeedbackStore {
     pub async fn add(&self, session_id: &str, feedback: StructuredFeedback) {
         let mut inner = self.inner.lock().await;
 
-        // LRU eviction of oldest session if at capacity
-        if !inner.sessions.contains_key(session_id) {
-            if inner.order.len() >= MAX_SESSIONS
-                && let Some(oldest) = inner.order.pop_front()
-            {
-                inner.sessions.remove(&oldest);
-            }
-            inner.order.push_back(session_id.to_string());
+        // LRU eviction of the least recently used session if at capacity.
+        if !inner.sessions.contains_key(session_id)
+            && inner.order.len() >= MAX_SESSIONS
+            && let Some(oldest) = inner.order.pop_front()
+        {
+            inner.sessions.remove(&oldest);
         }
+        Self::touch_session(&mut inner, session_id);
 
         let entry = inner
             .sessions
@@ -133,6 +137,9 @@ impl FeedbackStore {
         user_message: Option<&str>,
     ) -> String {
         let mut inner = self.inner.lock().await;
+        if inner.sessions.contains_key(session_id) {
+            Self::touch_session(&mut inner, session_id);
+        }
         let Some(entry) = inner.sessions.get_mut(session_id) else {
             return String::new();
         };
@@ -500,6 +507,27 @@ mod tests {
         // Oldest sessions should be evicted
         assert!(store.is_empty("s0").await);
         assert!(!store.is_empty(&format!("s{}", MAX_SESSIONS + 4)).await);
+    }
+
+    #[tokio::test]
+    async fn active_session_is_retained_by_lru_eviction() {
+        let store = FeedbackStore::new();
+        for i in 0..MAX_SESSIONS {
+            store.add(&format!("s{i}"), make_fb("rule")).await;
+        }
+
+        assert!(store.build_injection("s0").await.contains("rule"));
+        store.add("new-session", make_fb("new rule")).await;
+
+        assert!(
+            !store.is_empty("s0").await,
+            "reading a session must refresh its LRU position"
+        );
+        assert!(
+            store.is_empty("s1").await,
+            "the least recently used session should be evicted"
+        );
+        assert!(!store.is_empty("new-session").await);
     }
 
     // ── Injection format ──

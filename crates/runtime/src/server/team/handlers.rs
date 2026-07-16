@@ -35,6 +35,25 @@ fn require_team_store(
     })
 }
 
+async fn require_owner_team_store<'a>(
+    state: &'a AppState,
+    user_id: &str,
+) -> Result<&'a Arc<dyn TeamPersistenceService>, (StatusCode, Json<ErrorResponse>)> {
+    let store = require_team_store(state)?;
+    store.ensure_builtins(user_id).await.map_err(|error| {
+        tracing::error!(
+            user_id,
+            error = %error,
+            "failed to initialize owner-scoped built-in teams"
+        );
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "team templates are temporarily unavailable",
+        )
+    })?;
+    Ok(store)
+}
+
 fn require_delegation_engine(
     state: &AppState,
 ) -> Result<
@@ -76,7 +95,7 @@ pub(crate) async fn list_teams_handler(
     headers: HeaderMap,
 ) -> Result<Json<TeamListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
 
     let teams = store
         .list_teams(&user.user_id)
@@ -95,7 +114,7 @@ pub(crate) async fn get_team_handler(
     headers: HeaderMap,
 ) -> Result<Json<TeamDefinition>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
 
     let team = load_team_by_name_or_id(store, &user.user_id, &name)
         .await?
@@ -113,7 +132,7 @@ pub(crate) async fn upsert_team_handler(
     Json(body): Json<CreateTeamRequest>,
 ) -> Result<Json<TeamDefinition>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let existing = store
@@ -173,7 +192,7 @@ pub(crate) async fn delete_team_handler(
     headers: HeaderMap,
 ) -> Result<Json<DeleteTeamResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
 
     let deleted = store
         .delete_team(&user.user_id, &name)
@@ -265,7 +284,7 @@ pub(crate) async fn list_executions_handler(
     headers: HeaderMap,
 ) -> Result<Json<ExecutionListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
 
     let team = load_team_by_name_or_id(store, &user.user_id, &name)
         .await?
@@ -303,7 +322,10 @@ pub(crate) async fn execute_team_handler(
     Json(body): Json<ExecuteTeamRequest>,
 ) -> Result<Json<TeamExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let team_store: Arc<dyn TeamPersistenceService> = require_team_store(&state)?.clone();
+    let team_store: Arc<dyn TeamPersistenceService> =
+        require_owner_team_store(&state, &user.user_id)
+            .await?
+            .clone();
     let engine = require_delegation_engine(&state)?;
 
     let session_id = body
@@ -484,7 +506,7 @@ pub(crate) async fn list_snapshots_handler(
     headers: HeaderMap,
 ) -> Result<Json<SnapshotListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
     store
         .load_team(&user.user_id, &name)
         .await
@@ -518,7 +540,7 @@ pub(crate) async fn create_snapshot_handler(
     Json(body): Json<CreateSnapshotRequest>,
 ) -> Result<Json<SnapshotEntry>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
     let team = store
         .load_team(&user.user_id, &name)
         .await
@@ -553,7 +575,7 @@ pub(crate) async fn delete_snapshot_handler(
     headers: HeaderMap,
 ) -> Result<Json<DeleteTeamResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let store = require_team_store(&state)?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
     let deleted = store
         .delete_snapshot(&id, &user.user_id)
         .await
