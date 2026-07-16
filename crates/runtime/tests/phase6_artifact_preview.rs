@@ -5,7 +5,6 @@ use astra_services::{
 };
 use serde_json::json;
 use sqlx::{MySql, QueryBuilder, Row};
-use std::time::Instant;
 use uuid::Uuid;
 
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
@@ -15,10 +14,6 @@ fn require_db_it_env() -> astra_core::MatrixOneSettings {
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
     astra_core::MatrixOneSettings::from_env()
-}
-
-fn strict_online_perf_enabled() -> bool {
-    std::env::var("ASTRA_STRICT_ONLINE_PERF").as_deref() != Ok("0")
 }
 
 static SHARED_POOL: tokio::sync::OnceCell<astra_core::SharedPool> =
@@ -553,7 +548,6 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
             items.clear();
         }
     }
-    let started = Instant::now();
     let row = sqlx::query(
         "SELECT
           (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_user_run_created) WHERE user_id = ? AND run_id = ?) AS output_count,
@@ -567,19 +561,9 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     .fetch_one(pool.get())
     .await
     .unwrap();
-    let query_ms = started.elapsed().as_millis();
     assert_eq!(row.try_get::<i64, _>("output_count").unwrap(), 1_000);
     assert!(row.try_get::<i64, _>("dump_count").unwrap() >= 2);
     assert!(row.try_get::<i64, _>("retention_count").unwrap() >= 1);
-    let max_query_ms = if strict_online_perf_enabled() {
-        50
-    } else {
-        500
-    };
-    assert!(
-        query_ms < max_query_ms,
-        "indexed artifact/tool queries took {query_ms}ms; limit={max_query_ms}ms"
-    );
 
     let deadline_before =
         artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;

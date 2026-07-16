@@ -1,7 +1,7 @@
 mod test_support;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -772,49 +772,6 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l2_one_thousand_tool_outputs_insert_under_1000ms() {
-    let pool = setup_pool().await;
-    let (run_id, session_id, user_id) = test_ids();
-    let store = DatabaseRunStateStore::new(pool);
-    store
-        .insert_run(durable_record(&run_id, &session_id, &user_id))
-        .await
-        .unwrap();
-    let started = Instant::now();
-    for chunk in 0..2 {
-        let items = (0..500)
-            .map(|idx| ToolOutputBatchItem {
-                output_id: format!("l2-out-{chunk}-{idx}-{}", Uuid::new_v4()),
-                tool_call_id: Some(format!("call-{chunk}-{idx}")),
-                tool_name: "bash".to_string(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    format!(r#"{{"chunk":{chunk},"idx":{idx},"stdout":"ok"}}"#),
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            })
-            .collect::<Vec<_>>();
-        store
-            .insert_tool_output_batch(
-                &format!("l2-batch-{chunk}-{}", Uuid::new_v4()),
-                &session_id,
-                &run_id,
-                &user_id,
-                &items,
-            )
-            .await
-            .unwrap();
-    }
-    let max_ms = 1_000;
-    assert!(
-        started.elapsed() < Duration::from_millis(max_ms),
-        "1000 tool outputs should insert in under {max_ms}ms"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_sse_heartbeat_contract_is_15_seconds() {
     assert_eq!(SSE_HEARTBEAT_INTERVAL_SECS, 15);
 }
@@ -1059,48 +1016,6 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         indexes,
         (0..EXPECTED_EVENT_COUNT).collect::<Vec<_>>(),
         "restart recovery and typed guidance cycles stay gap-free and monotonic"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l3_s08_one_thousand_tool_outputs_split_under_two_seconds() {
-    let pool = setup_pool().await;
-    let (run_id, session_id, user_id) = test_ids();
-    let store = DatabaseRunStateStore::new(pool);
-    store
-        .insert_run(durable_record(&run_id, &session_id, &user_id))
-        .await
-        .unwrap();
-    let started = Instant::now();
-    for chunk in 0..2 {
-        let items = (0..500)
-            .map(|idx| ToolOutputBatchItem {
-                output_id: format!("out-{chunk}-{idx}-{}", Uuid::new_v4()),
-                tool_call_id: Some(format!("call-{chunk}-{idx}")),
-                tool_name: "bash".to_string(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    format!(r#"{{"chunk":{chunk},"idx":{idx},"stdout":"ok"}}"#),
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            })
-            .collect::<Vec<_>>();
-        store
-            .insert_tool_output_batch(
-                &format!("batch-{chunk}-{}", Uuid::new_v4()),
-                &session_id,
-                &run_id,
-                &user_id,
-                &items,
-            )
-            .await
-            .unwrap();
-    }
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "1000 tool outputs should insert in under 2s"
     );
 }
 

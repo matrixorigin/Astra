@@ -1063,7 +1063,7 @@ test-ignored-integration:
 				--features astra-runtime/bridge-e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not test(/perf_benchmark_/)' \
+				-E 'not binary(perf_benchmarks)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1071,7 +1071,7 @@ test-ignored-integration:
 				--features astra-runtime/bridge-e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) -j 1 \
-				-E 'test(/perf_benchmark_/)' \
+				-E 'binary(perf_benchmarks)' \
 					|| PERF_FAILED=1; \
 		fi; \
 		if [ -n "$$FAILED" ]; then \
