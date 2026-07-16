@@ -29,6 +29,7 @@ const TOOL_INVOCATION_RESULT_PROJECTED_OUTPUT_BYTES: usize = 180 * 1024;
 const TOOL_INVOCATION_RESULT_PROJECTION_CONTRACT_VERSION: &str = "tool-result-projection-v1";
 pub const TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION: &str =
     "tool-invocation-cache-completion-v1";
+pub const TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION: &str = "tool-invocation-run-closure-v1";
 
 const INTERNAL_TRANSPORT_ARGUMENTS: [&str; 3] = ["_run_id", "_tool_call_id", "_turn_chain_id"];
 
@@ -661,6 +662,10 @@ pub enum ToolInvocationCompletionSource {
         cache_key_id: String,
         observation_id: String,
     },
+    RunClosure {
+        contract_version: String,
+        run_status: String,
+    },
 }
 
 impl ToolInvocationCompletionSource {
@@ -672,6 +677,15 @@ impl ToolInvocationCompletionSource {
             contract_version: TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION.to_string(),
             cache_key_id: cache_key_id.into(),
             observation_id: observation_id.into(),
+        };
+        source.validate()?;
+        Ok(source)
+    }
+
+    pub fn run_closure(run_status: impl Into<String>) -> Result<Self, ToolInvocationContractError> {
+        let source = Self::RunClosure {
+            contract_version: TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION.to_string(),
+            run_status: run_status.into(),
         };
         source.validate()?;
         Ok(source)
@@ -694,6 +708,27 @@ impl ToolInvocationCompletionSource {
                 validate_sha256_content_id("cache_key_id", cache_key_id)?;
                 validate_sha256_content_id("observation_id", observation_id)
             }
+            Self::RunClosure {
+                contract_version,
+                run_status,
+            } => {
+                if contract_version != TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION {
+                    return Err(
+                        ToolInvocationContractError::UnsupportedRunClosureContractVersion(
+                            contract_version.clone(),
+                        ),
+                    );
+                }
+                if !matches!(
+                    run_status.as_str(),
+                    "completed" | "delegated" | "failed" | "cancelled"
+                ) {
+                    return Err(ToolInvocationContractError::InvalidRunClosureStatus(
+                        run_status.clone(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -711,6 +746,10 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
                 cache_key_id: String,
                 observation_id: String,
             },
+            RunClosure {
+                contract_version: String,
+                run_status: String,
+            },
         }
 
         let source = match RawSource::deserialize(deserializer)? {
@@ -722,6 +761,13 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
                 contract_version,
                 cache_key_id,
                 observation_id,
+            },
+            RawSource::RunClosure {
+                contract_version,
+                run_status,
+            } => Self::RunClosure {
+                contract_version,
+                run_status,
             },
         };
         source.validate().map_err(serde::de::Error::custom)?;
@@ -841,8 +887,8 @@ impl ToolInvocationRecord {
         if let Some(source) = &self.completion_source {
             source.validate()?;
         }
-        let cache_completion = self.completion_source.is_some();
-        let required_certainty = if cache_completion {
+        let non_dispatch_completion = self.completion_source.is_some();
+        let required_certainty = if non_dispatch_completion {
             DispatchCertainty::NotDispatched
         } else {
             self.state.required_dispatch_certainty()
@@ -863,21 +909,35 @@ impl ToolInvocationRecord {
             }
             _ => {}
         }
-        if cache_completion {
-            if self.state != ToolInvocationState::Succeeded {
-                return Err(ToolInvocationContractError::InvalidCacheCompletionState {
-                    state: self.state,
-                });
+        if let Some(completion_source) = &self.completion_source {
+            match completion_source {
+                ToolInvocationCompletionSource::SemanticReadCache { .. }
+                    if self.state != ToolInvocationState::Succeeded =>
+                {
+                    return Err(ToolInvocationContractError::InvalidCacheCompletionState {
+                        state: self.state,
+                    });
+                }
+                ToolInvocationCompletionSource::RunClosure { .. }
+                    if self.state != ToolInvocationState::Rejected =>
+                {
+                    return Err(
+                        ToolInvocationContractError::InvalidRunClosureCompletionState {
+                            state: self.state,
+                        },
+                    );
+                }
+                _ => {}
             }
             if self.attempt_count != 0 {
                 return Err(
-                    ToolInvocationContractError::InvalidCacheCompletionAttemptCount {
+                    ToolInvocationContractError::InvalidNonDispatchAttemptCount {
                         attempt_count: self.attempt_count,
                     },
                 );
             }
             if self.dispatch_lease.is_some() {
-                return Err(ToolInvocationContractError::CacheCompletionHasDispatchLease);
+                return Err(ToolInvocationContractError::NonDispatchCompletionHasDispatchLease);
             }
         }
         if let Some(outcome) = &self.outcome {
@@ -1280,14 +1340,20 @@ pub enum ToolInvocationContractError {
     UnexpectedDispatchLease,
     #[error("unsupported tool invocation cache-completion contract version '{0}'")]
     UnsupportedCacheCompletionContractVersion(String),
+    #[error("unsupported tool invocation run-closure contract version '{0}'")]
+    UnsupportedRunClosureContractVersion(String),
+    #[error("tool invocation run-closure status is not terminal: '{0}'")]
+    InvalidRunClosureStatus(String),
     #[error("tool invocation cache-completion {field} is not a canonical SHA-256 content ID")]
     InvalidCompletionContentId { field: &'static str },
     #[error("semantic cache completion cannot produce ledger state {state:?}")]
     InvalidCacheCompletionState { state: ToolInvocationState },
-    #[error("semantic cache completion cannot have {attempt_count} provider dispatch attempts")]
-    InvalidCacheCompletionAttemptCount { attempt_count: u32 },
-    #[error("semantic cache completion cannot retain a provider dispatch lease")]
-    CacheCompletionHasDispatchLease,
+    #[error("run closure completion cannot produce ledger state {state:?}")]
+    InvalidRunClosureCompletionState { state: ToolInvocationState },
+    #[error("a non-dispatch completion cannot have {attempt_count} provider dispatch attempts")]
+    InvalidNonDispatchAttemptCount { attempt_count: u32 },
+    #[error("a non-dispatch completion cannot retain a provider dispatch lease")]
+    NonDispatchCompletionHasDispatchLease,
     #[error("serialize tool invocation result payload: {0}")]
     ResultSerialization(String),
     #[error(
@@ -1735,6 +1801,56 @@ mod tests {
         let mut forged = encoded;
         forged["completion_source"]["cache_key_id"] = json!("sha256:short");
         assert!(serde_json::from_value::<ToolInvocationRecord>(forged).is_err());
+    }
+
+    #[test]
+    fn run_closure_rejects_prepared_work_without_fabricating_dispatch() {
+        let decision = decision();
+        let record = ToolInvocationRecord {
+            identity: identity("call-closed"),
+            fingerprint: ToolInvocationFingerprint::new(
+                tool_ref(),
+                &json!({"command": "mutate"}),
+                &decision.decision_id,
+            )
+            .unwrap(),
+            decision,
+            state: ToolInvocationState::Rejected,
+            dispatch_certainty: DispatchCertainty::NotDispatched,
+            attempt_count: 0,
+            dispatch_lease: None,
+            outcome: Some(ToolInvocationTerminalOutcome::Rejected {
+                result: ToolInvocationResultPayload::new(
+                    "run closed".to_string(),
+                    BTreeMap::new(),
+                    None,
+                )
+                .unwrap(),
+                rejection_code: Some("run_closed".to_string()),
+                retryable: false,
+            }),
+            completion_source: Some(
+                ToolInvocationCompletionSource::run_closure("completed").unwrap(),
+            ),
+        };
+        record.validate().unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolInvocationRecord>(encoded.clone()).unwrap(),
+            record
+        );
+
+        let mut wrong_state = encoded.clone();
+        wrong_state["state"] = json!("succeeded");
+        wrong_state["outcome"] = json!({
+            "kind": "succeeded",
+            "result": {"output": "forged"}
+        });
+        assert!(serde_json::from_value::<ToolInvocationRecord>(wrong_state).is_err());
+
+        let mut non_terminal_status = encoded;
+        non_terminal_status["completion_source"]["run_status"] = json!("running");
+        assert!(serde_json::from_value::<ToolInvocationRecord>(non_terminal_status).is_err());
     }
 
     #[test]

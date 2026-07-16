@@ -17,6 +17,7 @@ use super::{
 };
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
+const INVOCATION_LIFECYCLE_REF: &str = "urn:astra:evidence:durable:introspect:invocation_lifecycle";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntrospectReport {
@@ -93,6 +94,25 @@ pub fn build_introspect_report(
         ),
         confidence: ObservationConfidence::evidence(0.75),
     }];
+    if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
+        evidence.push(ObservationEvidence {
+            ref_id: INVOCATION_LIFECYCLE_REF.to_string(),
+            evidence_class: "durable_state_evidence".to_string(),
+            source: "matrixone.tool_invocation_lifecycle".to_string(),
+            summary: format!(
+                "hot={} prepared={} dispatched={} unknown={} archives={} artifact_refs={} reconciliations={} deferred={}",
+                lifecycle.hot_total,
+                lifecycle.prepared,
+                lifecycle.dispatched,
+                lifecycle.outcome_unknown,
+                lifecycle.archive_chunks,
+                lifecycle.durable_artifact_references,
+                lifecycle.reconciliation_events,
+                lifecycle.compaction_deferred_events,
+            ),
+            confidence: ObservationConfidence::evidence(0.99),
+        });
+    }
 
     let mut action_hints = build_introspect_action_hints(snapshot, &observations);
     let budget_result =
@@ -233,7 +253,8 @@ fn runtime_event_count(snapshot: &IntrospectSnapshot) -> i64 {
         .saturating_add(snapshot.tool_errors.len())
         .saturating_add(snapshot.stall_state.events.len())
         .saturating_add(snapshot.alerts.len())
-        .saturating_add(snapshot.semantic_cache_decisions.len()) as i64
+        .saturating_add(snapshot.semantic_cache_decisions.len())
+        .saturating_add(usize::from(snapshot.invocation_lifecycle.is_some())) as i64
 }
 
 fn introspect_data_coverage(
@@ -587,6 +608,34 @@ fn build_introspect_observations(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
     ) {
+        if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
+            let unhealthy = lifecycle.prepared > 0
+                || lifecycle.dispatched > 0
+                || lifecycle.outcome_unknown > 0
+                || lifecycle.compaction_deferred_events > 0;
+            observations.push(ObservationRecord {
+                ref_id: Urn::new("observation", "durable", "introspect")
+                    .seg("invocation_lifecycle")
+                    .build(),
+                topic: "execution".to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "durable_invocation_lifecycle".to_string(),
+                severity: if unhealthy { "warning" } else { "info" }.to_string(),
+                summary: format!(
+                    "hot={} prepared={} dispatched={} unknown={} archives={} artifact_refs={} reconciliations={} deferred={}",
+                    lifecycle.hot_total,
+                    lifecycle.prepared,
+                    lifecycle.dispatched,
+                    lifecycle.outcome_unknown,
+                    lifecycle.archive_chunks,
+                    lifecycle.durable_artifact_references,
+                    lifecycle.reconciliation_events,
+                    lifecycle.compaction_deferred_events,
+                ),
+                confidence: ObservationConfidence::evidence(0.99),
+                evidence_refs: vec![INVOCATION_LIFECYCLE_REF.to_string()],
+            });
+        }
         for (index, decision) in snapshot.semantic_cache_decisions.iter().enumerate() {
             observations.push(ObservationRecord {
                 ref_id: Urn::new("observation", "local", "introspect")

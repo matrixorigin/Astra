@@ -202,6 +202,25 @@ impl RuntimeToolInvocationLedger {
         }
     }
 
+    pub(crate) async fn lifecycle_diagnostics(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<
+        Option<astra_services::tool_invocation_ledger::ToolInvocationLifecycleDiagnostics>,
+        RuntimeInvocationLedgerError,
+    > {
+        match self {
+            Self::Database(ledger) => Ok(Some(
+                ledger
+                    .lifecycle_diagnostics(user_id, session_id, run_id)
+                    .await?,
+            )),
+            Self::InMemory(_) => Ok(None),
+        }
+    }
+
     pub(crate) async fn complete(
         &self,
         identity: &ToolInvocationIdentity,
@@ -712,25 +731,35 @@ fn project_terminal_record(
         ))
     })?;
     let mut result = project_terminal_outcome(outcome, record.state, replay);
-    if let Some(ToolInvocationCompletionSource::SemanticReadCache {
-        cache_key_id,
-        observation_id,
-        ..
-    }) = record.completion_source.as_ref()
-    {
+    if let Some(completion_source) = record.completion_source.as_ref() {
         let metadata = result.metadata.get_or_insert_with(Map::new);
-        metadata.insert(
-            "semantic_read_cache_state".to_string(),
-            Value::String("hit".to_string()),
-        );
-        metadata.insert(
-            "semantic_read_cache_key_id".to_string(),
-            Value::String(cache_key_id.clone()),
-        );
-        metadata.insert(
-            "semantic_read_observation_id".to_string(),
-            Value::String(observation_id.clone()),
-        );
+        match completion_source {
+            ToolInvocationCompletionSource::SemanticReadCache {
+                cache_key_id,
+                observation_id,
+                ..
+            } => {
+                metadata.insert(
+                    "semantic_read_cache_state".to_string(),
+                    Value::String("hit".to_string()),
+                );
+                metadata.insert(
+                    "semantic_read_cache_key_id".to_string(),
+                    Value::String(cache_key_id.clone()),
+                );
+                metadata.insert(
+                    "semantic_read_observation_id".to_string(),
+                    Value::String(observation_id.clone()),
+                );
+            }
+            ToolInvocationCompletionSource::RunClosure { run_status, .. } => {
+                metadata.insert(
+                    "tool_invocation_completion_source".to_string(),
+                    Value::String("run_closure".to_string()),
+                );
+                metadata.insert("run_status".to_string(), Value::String(run_status.clone()));
+            }
+        }
     }
     Ok(result)
 }

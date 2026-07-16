@@ -2570,6 +2570,23 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // Durable keyset cursors keep bounded maintenance jobs fair across pod
+    // changes and process restarts. The cursor is progress, never authority:
+    // every mutation performed by a sweeper remains independently idempotent.
+    query(
+        "CREATE TABLE IF NOT EXISTS maintenance_sweep_cursors (
+            sweep_name VARCHAR(128) PRIMARY KEY,
+            cursor_updated_at DATETIME(6) NOT NULL,
+            cursor_user_id VARCHAR(128) NOT NULL,
+            cursor_run_id VARCHAR(64) NOT NULL,
+            scan_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
     query(
         "CREATE TABLE IF NOT EXISTS context_manifests (

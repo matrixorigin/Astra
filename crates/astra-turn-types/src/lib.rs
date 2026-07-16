@@ -86,11 +86,11 @@ pub use tool_invocation::{
     TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES,
     TOOL_INVOCATION_RESULT_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
     TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH, TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
-    TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, ToolInvocationCompletionSource,
-    ToolInvocationContractError, ToolInvocationDecision, ToolInvocationDispatchLease,
-    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
-    ToolInvocationRecord, ToolInvocationResultPayload, ToolInvocationState,
-    ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
+    TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION,
+    ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
+    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
+    ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
     canonical_public_tool_arguments,
 };
 pub use user_intent::{UserIntentDelivery, UserIntentStatus};

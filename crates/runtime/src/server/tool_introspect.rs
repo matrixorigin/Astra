@@ -2,13 +2,22 @@ use std::sync::RwLock;
 
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) fn handle_introspect(
     args: &Value,
     session_id: &str,
     snapshot: &RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>,
     current_session_turn: u32,
 ) -> String {
-    let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+    let snapshot = current_introspect_snapshot(session_id, snapshot, current_session_turn);
+    render_introspect_snapshot(args, &snapshot)
+}
+
+pub(crate) fn current_introspect_snapshot(
+    session_id: &str,
+    snapshot: &RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>,
+    current_session_turn: u32,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
     let snapshot = snapshot
         .read()
         .unwrap_or_else(|poison| {
@@ -20,14 +29,21 @@ pub(crate) fn handle_introspect(
         })
         .clone();
 
-    let snapshot = match snapshot {
+    match snapshot {
         Some(mut snapshot) => {
             astra_turn_core::introspect::mark_snapshot_age(&mut snapshot, current_session_turn);
             snapshot
         }
         None => astra_turn_core::introspect::IntrospectSnapshot::default(),
-    };
-    astra_turn_core::introspect::render_introspect_request(&snapshot, &request)
+    }
+}
+
+pub(crate) fn render_introspect_snapshot(
+    args: &Value,
+    snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
+) -> String {
+    let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+    astra_turn_core::introspect::render_introspect_request(snapshot, &request)
 }
 
 #[cfg(test)]

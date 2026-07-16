@@ -100,6 +100,13 @@ impl DurableEdgeResult {
         }
     }
 
+    pub(crate) fn with_journal_status(mut self, status: &EdgeInvocationJournalStatus) -> Self {
+        self.tool_result_fields
+            .get_or_insert_with(Map::new)
+            .insert("edgeJournal".to_string(), status.as_json());
+        self
+    }
+
     pub(crate) fn client_message(
         &self,
         request_id: String,
@@ -186,6 +193,35 @@ pub(crate) struct EdgeInvocationJournal {
     wal_entries: usize,
     wal_bytes: usize,
     _lock: std::fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EdgeInvocationJournalStatus {
+    pub(crate) records: usize,
+    pub(crate) prepared: usize,
+    pub(crate) running: usize,
+    pub(crate) awaiting_ack: usize,
+    pub(crate) state_bytes: usize,
+    pub(crate) wal_entries: usize,
+    pub(crate) wal_bytes: usize,
+}
+
+impl EdgeInvocationJournalStatus {
+    fn as_json(self) -> Value {
+        serde_json::json!({
+            "contractVersion": JOURNAL_VERSION,
+            "records": self.records,
+            "prepared": self.prepared,
+            "running": self.running,
+            "awaitingAck": self.awaiting_ack,
+            "recordCapacity": MAX_RECORDS,
+            "stateBytes": self.state_bytes,
+            "stateByteCapacity": MAX_JOURNAL_STATE_BYTES,
+            "walEntries": self.wal_entries,
+            "walBytes": self.wal_bytes,
+            "walByteCapacity": MAX_WAL_BYTES,
+        })
+    }
 }
 
 impl EdgeInvocationJournal {
@@ -309,6 +345,30 @@ impl EdgeInvocationJournal {
             journal.compact().await?;
         }
         Ok(journal)
+    }
+
+    pub(crate) fn status(&self) -> EdgeInvocationJournalStatus {
+        let mut prepared = 0;
+        let mut running = 0;
+        let mut awaiting_ack = 0;
+        for record in self.state.records.values() {
+            match record.state {
+                DurableState::Prepared => prepared += 1,
+                DurableState::Running => running += 1,
+                DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
+                    awaiting_ack += 1;
+                }
+            }
+        }
+        EdgeInvocationJournalStatus {
+            records: self.state.records.len(),
+            prepared,
+            running,
+            awaiting_ack,
+            state_bytes: self.state_bytes,
+            wal_entries: self.wal_entries,
+            wal_bytes: self.wal_bytes,
+        }
     }
 
     pub(crate) async fn prepare(
@@ -1016,5 +1076,27 @@ mod tests {
         ));
         drop(first);
         EdgeInvocationJournal::open(path).await.unwrap();
+    }
+
+    #[test]
+    fn admission_rejection_carries_bounded_journal_capacity_evidence() {
+        let status = EdgeInvocationJournalStatus {
+            records: 1_024,
+            prepared: 3,
+            running: 7,
+            awaiting_ack: 1_014,
+            state_bytes: 42,
+            wal_entries: 88,
+            wal_bytes: 99,
+        };
+        let result =
+            DurableEdgeResult::not_dispatched_rejection("saturated").with_journal_status(&status);
+        let journal = &result.tool_result_fields.unwrap()["edgeJournal"];
+        assert_eq!(journal["records"], 1_024);
+        assert_eq!(journal["prepared"], 3);
+        assert_eq!(journal["running"], 7);
+        assert_eq!(journal["awaitingAck"], 1_014);
+        assert_eq!(journal["recordCapacity"], MAX_RECORDS);
+        assert_eq!(journal["walByteCapacity"], MAX_WAL_BYTES);
     }
 }

@@ -3,6 +3,8 @@
 //! This store owns persistence and atomic compare-and-set. Semantic result
 //! caching is deliberately outside this module.
 
+use std::collections::BTreeMap;
+
 use astra_core::SharedPool;
 use astra_turn_types::{
     DispatchCertainty, ToolInvocationCompletionSource, ToolInvocationDecision,
@@ -26,6 +28,33 @@ pub struct ToolInvocationCompactionOutcome {
     pub archived_records: usize,
     pub remaining_records: u64,
     pub artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocationRunReconciliationOutcome {
+    pub prepared_rejected: u64,
+    pub inconsistent_prepared_unknown: u64,
+    pub expired_dispatches_unknown: u64,
+    pub active_dispatches_remaining: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocationLifecycleDiagnostics {
+    pub run_id: Option<String>,
+    pub hot_total: u64,
+    pub prepared: u64,
+    pub dispatched: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub rejected: u64,
+    pub outcome_unknown: u64,
+    pub rejected_without_dispatch: u64,
+    pub archive_chunks: u64,
+    pub durable_artifact_references: u64,
+    pub reconciliation_events: u64,
+    pub compaction_deferred_events: u64,
+    pub compaction_cursor_generation: Option<u64>,
+    pub compaction_cursor_updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +190,404 @@ impl DatabaseToolInvocationLedger {
         }
     }
 
+    /// Bounded, owner-scoped evidence for introspect/reflect. This is a
+    /// projection of the ledger, archive, reference, event, and maintenance
+    /// authorities; it never controls invocation execution.
+    pub async fn lifecycle_diagnostics(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<ToolInvocationLifecycleDiagnostics, ToolInvocationLedgerStoreError> {
+        let hot: (i64, i64, i64, i64, i64, i64, i64, i64) = if let Some(run_id) = run_id {
+            sqlx::query_as(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0)
+                 FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(self.pool.get())
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0)
+                 FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(self.pool.get())
+            .await?
+        };
+        let archive_chunks: i64 = if let Some(run_id) = run_id {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_invocation_archive_chunks
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(self.pool.get())
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_invocation_archive_chunks
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(self.pool.get())
+            .await?
+        };
+        let durable_artifact_references: i64 = if let Some(run_id) = run_id {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_artifact_references refs
+                 WHERE refs.user_id = ? AND refs.session_id = ?
+                   AND refs.reference_kind = 'invocation_ledger'
+                   AND (
+                       refs.reference_id = ?
+                       OR EXISTS (
+                           SELECT 1 FROM tool_invocation_ledger ledger
+                           WHERE ledger.user_id = refs.user_id
+                             AND ledger.session_id = refs.session_id
+                             AND ledger.run_id = ?
+                             AND ledger.identity_key = refs.reference_id
+                       )
+                   )",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .bind(run_id)
+            .fetch_one(self.pool.get())
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_artifact_references
+                 WHERE user_id = ? AND session_id = ?
+                   AND reference_kind = 'invocation_ledger'",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(self.pool.get())
+            .await?
+        };
+        let events: (i64, i64) = if let Some(run_id) = run_id {
+            sqlx::query_as(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0)
+                 FROM agent_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(self.pool.get())
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0)
+                 FROM agent_events
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(self.pool.get())
+            .await?
+        };
+        let cursor: Option<(u64, String)> = sqlx::query_as(
+            "SELECT scan_generation, CAST(updated_at AS CHAR)
+             FROM maintenance_sweep_cursors
+             WHERE sweep_name = 'tool_invocation_compaction_v1'",
+        )
+        .fetch_optional(self.pool.get())
+        .await?;
+        let counts = [
+            hot.0,
+            hot.1,
+            hot.2,
+            hot.3,
+            hot.4,
+            hot.5,
+            hot.6,
+            hot.7,
+            archive_chunks,
+            durable_artifact_references,
+            events.0,
+            events.1,
+        ]
+        .map(|count| {
+            u64::try_from(count)
+                .map_err(|_| ToolInvocationLedgerStoreError::InvalidCompactionCount(count))
+        });
+        let [
+            hot_total,
+            prepared,
+            dispatched,
+            succeeded,
+            failed,
+            rejected,
+            outcome_unknown,
+            rejected_without_dispatch,
+            archive_chunks,
+            durable_artifact_references,
+            reconciliation_events,
+            compaction_deferred_events,
+        ] = counts;
+        Ok(ToolInvocationLifecycleDiagnostics {
+            run_id: run_id.map(str::to_string),
+            hot_total: hot_total?,
+            prepared: prepared?,
+            dispatched: dispatched?,
+            succeeded: succeeded?,
+            failed: failed?,
+            rejected: rejected?,
+            outcome_unknown: outcome_unknown?,
+            rejected_without_dispatch: rejected_without_dispatch?,
+            archive_chunks: archive_chunks?,
+            durable_artifact_references: durable_artifact_references?,
+            reconciliation_events: reconciliation_events?,
+            compaction_deferred_events: compaction_deferred_events?,
+            compaction_cursor_generation: cursor.as_ref().map(|(generation, _)| *generation),
+            compaction_cursor_updated_at: cursor.map(|(_, updated_at)| updated_at),
+        })
+    }
+
+    /// Reconcile a terminal run before archival. A prepared row proves the
+    /// provider boundary was never crossed and becomes an explicit rejection;
+    /// an expired or malformed dispatch lease cannot prove the provider
+    /// outcome and becomes `OutcomeUnknown`. A live dispatch lease remains
+    /// authoritative until it completes or expires.
+    pub async fn reconcile_terminal_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<ToolInvocationRunReconciliationOutcome, ToolInvocationLedgerStoreError> {
+        let mut tx = self.pool.get().begin().await?;
+        let run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
+        let completion_source = ToolInvocationCompletionSource::run_closure(&run_status)?;
+        let result = ToolInvocationResultPayload::new(
+            serde_json::json!({
+                "status": "rejected",
+                "reason": "run_closed_before_dispatch",
+                "run_status": &run_status,
+            })
+            .to_string(),
+            BTreeMap::from([
+                (
+                    "error_kind".to_string(),
+                    serde_json::Value::String("run_closed".to_string()),
+                ),
+                (
+                    "run_status".to_string(),
+                    serde_json::Value::String(run_status.clone()),
+                ),
+                ("retryable".to_string(), serde_json::Value::Bool(false)),
+            ]),
+            None,
+        )?;
+        let outcome = ToolInvocationTerminalOutcome::Rejected {
+            result,
+            rejection_code: Some("run_closed".to_string()),
+            retryable: false,
+        };
+        let outcome_json = serde_json::to_string(&outcome).map_err(|source| {
+            ToolInvocationLedgerStoreError::Serialization {
+                field: "outcome_json",
+                source,
+            }
+        })?;
+        let completion_source_json =
+            serde_json::to_string(&completion_source).map_err(|source| {
+                ToolInvocationLedgerStoreError::Serialization {
+                    field: "completion_source_json",
+                    source,
+                }
+            })?;
+        let prepared_rejected = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'rejected', dispatch_certainty = 'not_dispatched',
+                 outcome_json = ?, completion_source_json = ?,
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state = 'prepared' AND attempt_count = 0",
+        )
+        .bind(outcome_json)
+        .bind(completion_source_json)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let inconsistent_prepared_unknown = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state = 'prepared' AND attempt_count > 0",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let expired_dispatches_unknown = sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state = 'dispatched'
+               AND (dispatch_owner IS NULL
+                    OR dispatch_lease_expires_at IS NULL
+                    OR dispatch_lease_expires_at <= CURRENT_TIMESTAMP(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let active_dispatches_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state = 'dispatched'",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_dispatches_remaining =
+            u64::try_from(active_dispatches_remaining).map_err(|_| {
+                ToolInvocationLedgerStoreError::InvalidCompactionCount(active_dispatches_remaining)
+            })?;
+
+        if prepared_rejected > 0
+            || inconsistent_prepared_unknown > 0
+            || expired_dispatches_unknown > 0
+        {
+            let event_id = Uuid::new_v4().to_string();
+            let insert = sqlx::query(
+                "INSERT INTO agent_events
+                 (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
+                 VALUES (?, ?, ?, ?, 'tool_invocation_run_reconciled', ?, ?, NOW(6))",
+            )
+            .bind(&event_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(run_id)
+            .bind(format!(
+                "terminal run invocation reconciliation: prepared_rejected={prepared_rejected}, inconsistent_prepared_unknown={inconsistent_prepared_unknown}, expired_dispatches_unknown={expired_dispatches_unknown}, active_dispatches_remaining={active_dispatches_remaining}"
+            ))
+            .bind(
+                serde_json::json!({
+                    "run_status": &run_status,
+                    "prepared_rejected": prepared_rejected,
+                    "inconsistent_prepared_unknown": inconsistent_prepared_unknown,
+                    "expired_dispatches_unknown": expired_dispatches_unknown,
+                    "active_dispatches_remaining": active_dispatches_remaining,
+                })
+                .to_string(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            let inserted_events = crate::storage::rows_affected_to_i64(
+                insert.rows_affected(),
+                "tool invocation reconciliation event",
+            )?;
+            if inserted_events != 1 {
+                return Err(sqlx::Error::Protocol(
+                    "tool invocation reconciliation event was not inserted exactly once".into(),
+                )
+                .into());
+            }
+            crate::storage::add_agent_session_event_count_or_create(
+                &mut *tx,
+                session_id,
+                user_id,
+                inserted_events,
+                Some(&event_id),
+            )
+            .await?;
+        }
+        if active_dispatches_remaining > 0 {
+            let scope = format!("{user_id}\0{session_id}\0{run_id}");
+            let event_id = format!("invocation-deferred-{:x}", Sha256::digest(scope.as_bytes()));
+            let already_recorded: Option<i8> = sqlx::query_scalar(
+                "SELECT 1 FROM agent_events
+                 WHERE user_id = ? AND event_id = ?",
+            )
+            .bind(user_id)
+            .bind(&event_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if already_recorded.is_none() {
+                sqlx::query(
+                    "INSERT INTO agent_events
+                     (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
+                     VALUES (?, ?, ?, ?, 'tool_invocation_compaction_deferred', ?, ?, NOW(6))",
+                )
+                .bind(&event_id)
+                .bind(session_id)
+                .bind(user_id)
+                .bind(run_id)
+                .bind(format!(
+                    "terminal run retains {active_dispatches_remaining} actively leased tool invocation(s)"
+                ))
+                .bind(
+                    serde_json::json!({
+                        "run_status": &run_status,
+                        "active_dispatches_remaining": active_dispatches_remaining,
+                        "resolution": "wait_for_completion_or_lease_expiry",
+                    })
+                    .to_string(),
+                )
+                .execute(&mut *tx)
+                .await?;
+                crate::storage::add_agent_session_event_count_or_create(
+                    &mut *tx,
+                    session_id,
+                    user_id,
+                    1,
+                    Some(&event_id),
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(ToolInvocationRunReconciliationOutcome {
+            prepared_rejected,
+            inconsistent_prepared_unknown,
+            expired_dispatches_unknown,
+            active_dispatches_remaining,
+        })
+    }
+
     /// Move a bounded batch of a terminal run's invocation records from the
     /// hot CAS table into one owner-scoped archive artifact. The artifact,
     /// lookup range, durable reference, and hot-row deletion commit together.
@@ -171,7 +598,7 @@ impl DatabaseToolInvocationLedger {
         run_id: &str,
     ) -> Result<ToolInvocationCompactionOutcome, ToolInvocationLedgerStoreError> {
         let mut tx = self.pool.get().begin().await?;
-        lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
+        let _run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let non_terminal_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tool_invocation_ledger
              WHERE user_id = ? AND session_id = ? AND run_id = ?
@@ -857,7 +1284,7 @@ async fn lock_terminal_run(
     user_id: &str,
     session_id: &str,
     run_id: &str,
-) -> Result<(), ToolInvocationLedgerStoreError> {
+) -> Result<String, ToolInvocationLedgerStoreError> {
     let row = sqlx::query(
         "SELECT session_id, status FROM agent_runs
          WHERE user_id = ? AND run_id = ? FOR UPDATE",
@@ -887,7 +1314,7 @@ async fn lock_terminal_run(
             status,
         });
     }
-    Ok(())
+    Ok(status)
 }
 
 fn select_record_query(

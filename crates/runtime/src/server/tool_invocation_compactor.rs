@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use astra_core::SharedPool;
+use chrono::NaiveDateTime;
 
 const COMPACTION_INTERVAL_SECS: u64 = 300;
+const COMPACTION_CURSOR_NAME: &str = "tool_invocation_compaction_v1";
+const COMPACTION_CURSOR_EPOCH: &str = "1970-01-01 00:00:00.000000";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ToolInvocationCompactionSweepOutcome {
@@ -10,6 +13,10 @@ pub struct ToolInvocationCompactionSweepOutcome {
     pub records_archived: usize,
     pub runs_remaining: usize,
     pub runs_not_quiescent: usize,
+    pub prepared_rejected: usize,
+    pub inconsistent_prepared_unknown: usize,
+    pub expired_dispatches_unknown: usize,
+    pub cursor_wrapped: bool,
     pub expired_archive_references_released: usize,
     pub expired_archive_indexes_purged: usize,
     pub failures: Vec<ToolInvocationCompactionFailure>,
@@ -20,6 +27,7 @@ pub struct ToolInvocationCompactionFailure {
     pub user_id: String,
     pub session_id: String,
     pub run_id: String,
+    pub phase: &'static str,
     pub error: String,
 }
 
@@ -32,30 +40,51 @@ pub async fn run_tool_invocation_compaction_once(
         release_expired_archive_references(&pool, effective_limit).await?;
     let expired_archive_indexes_purged =
         purge_expired_archive_indexes(&pool, effective_limit).await?;
-    let candidates = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT runs.user_id, runs.session_id, runs.run_id
-         FROM agent_runs runs
-         WHERE runs.status IN ('completed', 'delegated', 'failed', 'cancelled')
-           AND EXISTS (
-               SELECT 1 FROM tool_invocation_ledger ledger
-               WHERE ledger.user_id = runs.user_id
-                 AND ledger.session_id = runs.session_id
-                 AND ledger.run_id = runs.run_id
-           )
-         ORDER BY runs.updated_at, runs.user_id, runs.run_id
-         LIMIT ?",
-    )
-    .bind(effective_limit)
-    .fetch_all(pool.get())
-    .await?;
+    let (candidates, cursor_wrapped) =
+        claim_compaction_candidates(&pool, COMPACTION_CURSOR_NAME, effective_limit).await?;
     let ledger = astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(pool);
     let mut outcome = ToolInvocationCompactionSweepOutcome {
         runs_scanned: candidates.len(),
+        cursor_wrapped,
         expired_archive_references_released,
         expired_archive_indexes_purged,
         ..Default::default()
     };
     for (user_id, session_id, run_id) in candidates {
+        match ledger
+            .reconcile_terminal_run(&user_id, &session_id, &run_id)
+            .await
+        {
+            Ok(reconciled) => {
+                outcome.prepared_rejected = outcome.prepared_rejected.saturating_add(
+                    usize::try_from(reconciled.prepared_rejected).unwrap_or(usize::MAX),
+                );
+                outcome.inconsistent_prepared_unknown =
+                    outcome.inconsistent_prepared_unknown.saturating_add(
+                        usize::try_from(reconciled.inconsistent_prepared_unknown)
+                            .unwrap_or(usize::MAX),
+                    );
+                outcome.expired_dispatches_unknown =
+                    outcome.expired_dispatches_unknown.saturating_add(
+                        usize::try_from(reconciled.expired_dispatches_unknown)
+                            .unwrap_or(usize::MAX),
+                    );
+                if reconciled.active_dispatches_remaining > 0 {
+                    outcome.runs_not_quiescent += 1;
+                    continue;
+                }
+            }
+            Err(error) => {
+                outcome.failures.push(ToolInvocationCompactionFailure {
+                    user_id,
+                    session_id,
+                    run_id,
+                    phase: "reconcile",
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        }
         match ledger
             .compact_terminal_run_batch(&user_id, &session_id, &run_id)
             .await
@@ -75,11 +104,133 @@ pub async fn run_tool_invocation_compaction_once(
                 user_id,
                 session_id,
                 run_id,
+                phase: "compact",
                 error: error.to_string(),
             }),
         }
     }
     Ok(outcome)
+}
+
+async fn claim_compaction_candidates(
+    pool: &SharedPool,
+    cursor_name: &str,
+    limit: i64,
+) -> Result<(Vec<(String, String, String)>, bool), sqlx::Error> {
+    let mut tx = pool.get().begin().await?;
+    sqlx::query(
+        "INSERT IGNORE INTO maintenance_sweep_cursors
+         (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
+         VALUES (?, ?, '', '')",
+    )
+    .bind(cursor_name)
+    .bind(COMPACTION_CURSOR_EPOCH)
+    .execute(&mut *tx)
+    .await?;
+    let (mut cursor_updated_at, mut cursor_user_id, mut cursor_run_id): (
+        NaiveDateTime,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT cursor_updated_at, cursor_user_id, cursor_run_id
+         FROM maintenance_sweep_cursors WHERE sweep_name = ? FOR UPDATE",
+    )
+    .bind(cursor_name)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut candidates = load_compaction_candidates_after(
+        &mut tx,
+        cursor_updated_at,
+        &cursor_user_id,
+        &cursor_run_id,
+        limit,
+    )
+    .await?;
+    let cursor_wrapped = candidates.is_empty()
+        && (!cursor_user_id.is_empty()
+            || !cursor_run_id.is_empty()
+            || cursor_updated_at
+                != NaiveDateTime::parse_from_str(COMPACTION_CURSOR_EPOCH, "%Y-%m-%d %H:%M:%S%.f")
+                    .expect("static compaction cursor epoch is valid"));
+    if cursor_wrapped {
+        cursor_updated_at =
+            NaiveDateTime::parse_from_str(COMPACTION_CURSOR_EPOCH, "%Y-%m-%d %H:%M:%S%.f")
+                .expect("static compaction cursor epoch is valid");
+        cursor_user_id.clear();
+        cursor_run_id.clear();
+        candidates = load_compaction_candidates_after(
+            &mut tx,
+            cursor_updated_at,
+            &cursor_user_id,
+            &cursor_run_id,
+            limit,
+        )
+        .await?;
+    }
+
+    if let Some((user_id, _session_id, run_id, updated_at)) = candidates.last() {
+        cursor_updated_at = *updated_at;
+        cursor_user_id.clone_from(user_id);
+        cursor_run_id.clone_from(run_id);
+    }
+    sqlx::query(
+        "UPDATE maintenance_sweep_cursors
+         SET cursor_updated_at = ?, cursor_user_id = ?, cursor_run_id = ?,
+             scan_generation = scan_generation + ?, updated_at = CURRENT_TIMESTAMP(6)
+         WHERE sweep_name = ?",
+    )
+    .bind(cursor_updated_at)
+    .bind(&cursor_user_id)
+    .bind(&cursor_run_id)
+    .bind(u8::from(cursor_wrapped))
+    .bind(cursor_name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((
+        candidates
+            .into_iter()
+            .map(|(user_id, session_id, run_id, _)| (user_id, session_id, run_id))
+            .collect(),
+        cursor_wrapped,
+    ))
+}
+
+async fn load_compaction_candidates_after(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    cursor_updated_at: NaiveDateTime,
+    cursor_user_id: &str,
+    cursor_run_id: &str,
+    limit: i64,
+) -> Result<Vec<(String, String, String, NaiveDateTime)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT runs.user_id, runs.session_id, runs.run_id, runs.updated_at
+         FROM agent_runs runs
+         WHERE runs.status IN ('completed', 'delegated', 'failed', 'cancelled')
+           AND EXISTS (
+               SELECT 1 FROM tool_invocation_ledger ledger
+               WHERE ledger.user_id = runs.user_id
+                 AND ledger.session_id = runs.session_id
+                 AND ledger.run_id = runs.run_id
+           )
+           AND (
+               runs.updated_at > ?
+               OR (runs.updated_at = ? AND runs.user_id > ?)
+               OR (runs.updated_at = ? AND runs.user_id = ? AND runs.run_id > ?)
+           )
+         ORDER BY runs.updated_at, runs.user_id, runs.run_id
+         LIMIT ?",
+    )
+    .bind(cursor_updated_at)
+    .bind(cursor_updated_at)
+    .bind(cursor_user_id)
+    .bind(cursor_updated_at)
+    .bind(cursor_user_id)
+    .bind(cursor_run_id)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await
 }
 
 async fn purge_expired_archive_indexes(
@@ -216,6 +367,7 @@ pub(crate) fn spawn_tool_invocation_compactor(
                                     user_id = %failure.user_id,
                                     session_id = %failure.session_id,
                                     run_id = %failure.run_id,
+                                    phase = failure.phase,
                                     error = %failure.error,
                                     "tool invocation compaction failed for terminal run"
                                 );
@@ -238,6 +390,38 @@ pub(crate) fn spawn_tool_invocation_compactor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::{
+        DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+        ToolInvocationIdentity, ToolInvocationResultPayload, ToolInvocationTerminalOutcome,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    static ONLINE_POOL: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
+    async fn online_pool() -> SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1"
+        );
+        ONLINE_POOL
+            .get_or_init(|| async {
+                let mut settings = astra_core::MatrixOneSettings::from_env();
+                settings.db_pool_max_connections = settings.db_pool_max_connections.clamp(1, 8);
+                settings.db_pool_min_connections = settings
+                    .db_pool_min_connections
+                    .min(settings.db_pool_max_connections);
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .unwrap();
+                SharedPool::new(&settings).await.unwrap()
+            })
+            .await
+            .clone()
+    }
 
     #[test]
     fn compaction_interval_and_batch_are_bounded() {
@@ -249,18 +433,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ASTRA_TEST_DB_IT=1"]
     async fn expired_archive_release_is_owner_scoped_and_idempotent_on_matrixone() {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1"
-        );
-        let settings = astra_core::MatrixOneSettings::from_env();
-        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
-            .unwrap_or_else(|_| "mysql".to_string());
-        astra_services::ensure_core_schema(&settings, &catalog)
-            .await
-            .unwrap();
-        let pool = SharedPool::new(&settings).await.unwrap();
+        let pool = online_pool().await;
         let suffix = uuid::Uuid::new_v4();
         let user_id = format!("archive-release-user-{suffix}");
         let session_id = format!("archive-release-session-{}", suffix.simple());
@@ -411,6 +584,171 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+    async fn durable_keyset_cursor_does_not_let_stranded_runs_starve_later_runs() {
+        let pool = online_pool().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("compaction-fair-user-{suffix}");
+        let session_id = format!("compaction-fair-session-{suffix}");
+        let cursor_name = format!("compaction-fair-cursor-{suffix}");
+        let run_ids = [
+            format!("fair-a-{suffix}"),
+            format!("fair-b-{suffix}"),
+            format!("fair-c-{suffix}"),
+        ];
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
+             VALUES (?, ?, 'compaction-test', 'compaction fairness', 'active', '{}', NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let ledger =
+            astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(pool.clone());
+        let decision = ToolInvocationDecision::new(&json!({"route": "server_local"})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "registry-v1").unwrap(),
+            &json!({"command": "fairness"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        let mut identities = Vec::new();
+        for run_id in &run_ids {
+            sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, root_run_id, ancestor_path, status)
+                 VALUES (?, ?, ?, ?, ?, 'running')",
+            )
+            .bind(run_id)
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(run_id)
+            .bind(format!("/{run_id}"))
+            .execute(pool.get())
+            .await
+            .unwrap();
+            let identity = ToolInvocationIdentity::new(
+                &user_id,
+                &session_id,
+                run_id,
+                format!("turn-{run_id}"),
+                format!("call-{run_id}"),
+            )
+            .unwrap();
+            ledger
+                .prepare(&identity, &fingerprint, &decision)
+                .await
+                .unwrap();
+            identities.push(identity);
+        }
+        ledger
+            .claim_dispatch(&identities[2], "fair-worker", 90_000)
+            .await
+            .unwrap();
+        ledger
+            .compare_and_complete(
+                &identities[2],
+                astra_turn_types::ToolInvocationState::Dispatched,
+                Some("fair-worker"),
+                &ToolInvocationTerminalOutcome::Succeeded {
+                    result: ToolInvocationResultPayload::new(
+                        "done".to_string(),
+                        BTreeMap::new(),
+                        None,
+                    )
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        for (index, run_id) in run_ids.iter().enumerate() {
+            sqlx::query(
+                "UPDATE agent_runs
+                 SET status = 'completed', updated_at = TIMESTAMPADD(SECOND, ?, '2090-01-01 00:00:00')
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(i64::try_from(index + 1).unwrap())
+            .bind(&user_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+            .bind(&cursor_name)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_sweep_cursors
+             (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
+             VALUES (?, '2089-12-31 23:59:59.000000', '', '')",
+        )
+        .bind(&cursor_name)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        let (first, first_wrapped) = claim_compaction_candidates(&pool, &cursor_name, 2)
+            .await
+            .unwrap();
+        assert!(!first_wrapped);
+        assert_eq!(
+            first
+                .iter()
+                .map(|(_, _, run_id)| run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[0].as_str(), run_ids[1].as_str()]
+        );
+        let (second, second_wrapped) = claim_compaction_candidates(&pool, &cursor_name, 2)
+            .await
+            .unwrap();
+        assert!(!second_wrapped);
+        assert_eq!(
+            second
+                .iter()
+                .map(|(_, _, run_id)| run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[2].as_str()],
+            "advancing past a full page of stranded runs must expose later terminal work"
+        );
+        let (_wrapped_page, wrapped) = claim_compaction_candidates(&pool, &cursor_name, 2)
+            .await
+            .unwrap();
+        assert!(
+            wrapped,
+            "the durable cursor must wrap after reaching the end of the keyset"
+        );
+
+        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+            .bind(&cursor_name)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())

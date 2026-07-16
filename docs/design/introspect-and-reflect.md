@@ -48,6 +48,7 @@ Introspection must be factual, structured, and bounded. Reflection may synthesiz
 | `provider` | Provider bindings, selected routes, fallback policy, health, offline reason. |
 | `tool` | Visible tools, why hidden/blocked, expected argument contract, last failures. |
 | `context` | Loaded context blocks, compaction status, memory/artifact references. |
+| `invocation lifecycle` | Prepared/dispatched/terminal counts, dispatch certainty, reconciliation, archive/reference ownership, maintenance progress. |
 | `prompt_cache` | Stable prefix identity, dynamic block changes, cache-affecting differences. |
 | `trace` | Recent causal events, tool lifecycle, retry/cache/provider decisions. |
 | `sync` | Outbox/ack/degraded/poison/action-needed state. |

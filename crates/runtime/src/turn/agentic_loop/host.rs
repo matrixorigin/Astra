@@ -731,6 +731,7 @@ fn build_introspect_snapshot_with_tool_admission(
         lifecycle_summary,
         tool_admission,
         semantic_cache_decisions,
+        invocation_lifecycle: None,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()

@@ -875,7 +875,9 @@ fn filter_evidence_events_for_graph(
     recent_events
         .into_iter()
         .filter(|event| {
-            decision_event_ids.contains(&event.event_id)
+            event.event_type == "tool_invocation_run_reconciled"
+                || event.event_type == "tool_invocation_compaction_deferred"
+                || decision_event_ids.contains(&event.event_id)
                 || event
                     .parent_event_id
                     .as_ref()
@@ -2706,6 +2708,33 @@ mod tests {
                 && edge.to == graph_event_ref("evt-error")
                 && edge.kind == ObservationGraphEdgeKind::Causes
         }));
+    }
+
+    #[test]
+    fn evidence_filter_keeps_durable_invocation_lifecycle_independent_of_decisions() {
+        let decisions = vec![EvidenceDecision {
+            decision_id: "d1".into(),
+            event_id: "evt-unrelated".into(),
+            decision_type: "context".into(),
+            decision_output: serde_json::json!({}),
+            created_at: "2026-07-16T10:00:00".into(),
+        }];
+        let lifecycle = EvidenceEvent {
+            event_id: "evt-lifecycle".into(),
+            event_type: "tool_invocation_run_reconciled".into(),
+            content: "prepared_rejected=1".into(),
+            skill_name: None,
+            parent_event_id: None,
+            causal_chain_id: None,
+            created_at: "2026-07-16T10:00:01".into(),
+        };
+        let filtered = filter_evidence_events_for_graph(
+            &decisions,
+            vec![lifecycle.clone()],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event_id, lifecycle.event_id);
     }
 
     /// Validate that all GROUP BY queries only SELECT grouped columns or aggregate functions.

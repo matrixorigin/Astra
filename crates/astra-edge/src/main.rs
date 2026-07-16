@@ -562,6 +562,18 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let mut invocations = EdgeInvocationTracker::default();
     let journal_path = edge_invocation_journal_path(&config.edge_id, &workspace);
     let mut journal = EdgeInvocationJournal::open(journal_path).await?;
+    let journal_status = journal.status();
+    tracing::info!(
+        target: "astra.edge.invocation_journal",
+        records = journal_status.records,
+        prepared = journal_status.prepared,
+        running = journal_status.running,
+        awaiting_ack = journal_status.awaiting_ack,
+        state_bytes = journal_status.state_bytes,
+        wal_entries = journal_status.wal_entries,
+        wal_bytes = journal_status.wal_bytes,
+        "edge invocation journal restored"
+    );
 
     // Results remain in the durable outbox until the server acknowledges the
     // exact delivery generation. Reconnect therefore starts by replaying them.
@@ -632,9 +644,23 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     }
                                     Ok(PrepareOutcome::Execute) => {}
                                     Err(error @ (JournalError::Full | JournalError::WalFull)) => {
+                                        let journal_status = journal.status();
+                                        tracing::warn!(
+                                            target: "astra.edge.invocation_journal",
+                                            %error,
+                                            records = journal_status.records,
+                                            prepared = journal_status.prepared,
+                                            running = journal_status.running,
+                                            awaiting_ack = journal_status.awaiting_ack,
+                                            state_bytes = journal_status.state_bytes,
+                                            wal_entries = journal_status.wal_entries,
+                                            wal_bytes = journal_status.wal_bytes,
+                                            "edge invocation admission rejected by durable journal capacity"
+                                        );
                                         let result = DurableEdgeResult::not_dispatched_rejection(
                                             format!("Edge invocation admission is temporarily saturated: {error}"),
-                                        );
+                                        )
+                                        .with_journal_status(&journal_status);
                                         let message = result.client_message(
                                             request_id,
                                             identity,

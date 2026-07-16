@@ -22,7 +22,7 @@ use crate::server::tool_file_runtime::{
     execute_server_multi_edit, execute_server_run_script, execute_server_str_replace,
     execute_server_write_file,
 };
-use crate::server::tool_introspect::handle_introspect;
+use crate::server::tool_introspect::{current_introspect_snapshot, render_introspect_snapshot};
 use crate::server::tool_local_execution::memory_args_with_context;
 use crate::server::tool_plan_gate::{execute_enter_plan_mode, execute_exit_plan_mode};
 use crate::server::tool_session_state_rollback::{
@@ -462,12 +462,67 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        tool_result_from_output(handle_introspect(
-            args,
+        let mut snapshot = current_introspect_snapshot(
             &context.session_id,
             &context.introspect_snapshot,
             context.journal_turn_index.load(Ordering::Acquire),
-        ))
+        );
+        let run_id = args
+            .get("_run_id")
+            .or_else(|| args.get("run_id"))
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.trim().is_empty());
+        match context.invocation_ledger.as_ref() {
+            Some(ledger) => match ledger
+                .lifecycle_diagnostics(&context.user_id, &context.session_id, run_id)
+                .await
+            {
+                Ok(Some(diagnostics)) => {
+                    snapshot.invocation_lifecycle = Some(
+                        astra_turn_core::introspect::InvocationLifecycleSnapshot {
+                            run_id: diagnostics.run_id,
+                            hot_total: diagnostics.hot_total,
+                            prepared: diagnostics.prepared,
+                            dispatched: diagnostics.dispatched,
+                            succeeded: diagnostics.succeeded,
+                            failed: diagnostics.failed,
+                            rejected: diagnostics.rejected,
+                            outcome_unknown: diagnostics.outcome_unknown,
+                            rejected_without_dispatch: diagnostics.rejected_without_dispatch,
+                            archive_chunks: diagnostics.archive_chunks,
+                            durable_artifact_references: diagnostics.durable_artifact_references,
+                            reconciliation_events: diagnostics.reconciliation_events,
+                            compaction_deferred_events: diagnostics.compaction_deferred_events,
+                            compaction_cursor_generation: diagnostics
+                                .compaction_cursor_generation,
+                            compaction_cursor_updated_at: diagnostics
+                                .compaction_cursor_updated_at,
+                        },
+                    );
+                }
+                Ok(None) => snapshot.alerts.push(
+                    "durable invocation lifecycle unavailable: in-memory ledger has no durable evidence plane"
+                        .to_string(),
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        user_id = %context.user_id,
+                        session_id = %context.session_id,
+                        ?run_id,
+                        %error,
+                        "introspect durable invocation lifecycle query failed"
+                    );
+                    snapshot.alerts.push(format!(
+                        "durable invocation lifecycle degraded: {error}"
+                    ));
+                }
+            },
+            None => snapshot.alerts.push(
+                "durable invocation lifecycle unavailable: invocation ledger is not configured"
+                    .to_string(),
+            ),
+        }
+        tool_result_from_output(render_introspect_snapshot(args, &snapshot))
     }
 }
 

@@ -200,12 +200,89 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         .prepare(&stranded, &invocation_fingerprint, &invocation_decision)
         .await
         .unwrap();
+    let expired_dispatch = identity(&prefix, "expired-dispatch-at-run-closure");
+    ledger
+        .prepare(
+            &expired_dispatch,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&expired_dispatch, "expired-worker", 90_000)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE tool_invocation_ledger
+         SET dispatch_lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND turn_chain_id = ? AND invocation_id = ?",
+    )
+    .bind(&expired_dispatch.user_id)
+    .bind(&expired_dispatch.session_id)
+    .bind(&expired_dispatch.run_id)
+    .bind(&expired_dispatch.turn_chain_id)
+    .bind(&expired_dispatch.invocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let active_dispatch = identity(&prefix, "active-dispatch-at-run-closure");
+    ledger
+        .prepare(
+            &active_dispatch,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&active_dispatch, "active-worker", 90_000)
+        .await
+        .unwrap();
     sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
         .bind(&identities[0].user_id)
         .bind(&identities[0].run_id)
         .execute(&pool)
         .await
         .unwrap();
+
+    let first_reconciliation = ledger
+        .reconcile_terminal_run(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_reconciliation.prepared_rejected, 1);
+    assert_eq!(first_reconciliation.inconsistent_prepared_unknown, 0);
+    assert_eq!(first_reconciliation.expired_dispatches_unknown, 1);
+    assert_eq!(first_reconciliation.active_dispatches_remaining, 1);
+    let rejected = ledger.get(&stranded).await.unwrap().unwrap();
+    assert_eq!(rejected.state, ToolInvocationState::Rejected);
+    assert_eq!(
+        rejected.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(rejected.attempt_count, 0);
+    assert!(matches!(
+        rejected.completion_source,
+        Some(ToolInvocationCompletionSource::RunClosure { .. })
+    ));
+    assert!(matches!(
+        ledger
+            .prepare(&stranded, &invocation_fingerprint, &invocation_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Rejected
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
+    assert_eq!(
+        ledger.get(&expired_dispatch).await.unwrap().unwrap().state,
+        ToolInvocationState::OutcomeUnknown
+    );
 
     assert!(matches!(
         ledger
@@ -234,18 +311,70 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         "a non-quiescent run must not partially compact"
     );
     sqlx::query(
-        "DELETE FROM tool_invocation_ledger
+        "UPDATE tool_invocation_ledger
+         SET dispatch_lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP(6))
          WHERE user_id = ? AND session_id = ? AND run_id = ?
            AND turn_chain_id = ? AND invocation_id = ?",
     )
-    .bind(&stranded.user_id)
-    .bind(&stranded.session_id)
-    .bind(&stranded.run_id)
-    .bind(&stranded.turn_chain_id)
-    .bind(&stranded.invocation_id)
+    .bind(&active_dispatch.user_id)
+    .bind(&active_dispatch.session_id)
+    .bind(&active_dispatch.run_id)
+    .bind(&active_dispatch.turn_chain_id)
+    .bind(&active_dispatch.invocation_id)
     .execute(&pool)
     .await
     .unwrap();
+    let second_reconciliation = ledger
+        .reconcile_terminal_run(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_reconciliation.prepared_rejected, 0);
+    assert_eq!(second_reconciliation.expired_dispatches_unknown, 1);
+    assert_eq!(second_reconciliation.active_dispatches_remaining, 0);
+    let reconciliation_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND event_type = 'tool_invocation_run_reconciled'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reconciliation_events, 2);
+    let deferred_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND event_type = 'tool_invocation_compaction_deferred'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred_events, 1, "active lease deferral is recorded once");
+    let diagnostics = ledger
+        .lifecycle_diagnostics(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            Some(&identities[0].run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diagnostics.hot_total, 6);
+    assert_eq!(diagnostics.succeeded, 3);
+    assert_eq!(diagnostics.rejected, 1);
+    assert_eq!(diagnostics.rejected_without_dispatch, 1);
+    assert_eq!(diagnostics.outcome_unknown, 2);
+    assert_eq!(diagnostics.durable_artifact_references, 1);
+    assert_eq!(diagnostics.reconciliation_events, 2);
+    assert_eq!(diagnostics.compaction_deferred_events, 1);
 
     let compacted = ledger
         .compact_terminal_run_batch(
@@ -255,9 +384,20 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         )
         .await
         .unwrap();
-    assert_eq!(compacted.archived_records, 3);
+    assert_eq!(compacted.archived_records, 6);
     assert_eq!(compacted.remaining_records, 0);
     assert!(compacted.artifact_id.is_some());
+    let archived_diagnostics = ledger
+        .lifecycle_diagnostics(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            Some(&identities[0].run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_diagnostics.hot_total, 0);
+    assert_eq!(archived_diagnostics.archive_chunks, 1);
+    assert_eq!(archived_diagnostics.durable_artifact_references, 2);
     let result_reference: (String, String) = sqlx::query_as(
         "SELECT refs.reference_id,
                 CAST(artifacts.retention_until AS CHAR)

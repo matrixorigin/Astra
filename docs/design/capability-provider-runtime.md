@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-07-15.
+> Last updated: 2026-07-16.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -433,6 +433,16 @@ Execution rules:
 - keep the independent Edge inbox/outbox crash-safe with a bounded append-only
   WAL and periodic atomic snapshots. Capacity exhaustion is an explicit
   retryable `NotDispatched` admission result, not a fabricated tool outcome;
+  the rejection carries bounded journal occupancy/capacity evidence and the
+  Edge logs the same structured status;
+- reconcile terminal runs before archival: zero-attempt `Prepared` becomes a
+  typed, non-dispatched run-closure rejection; expired or malformed dispatched
+  leases become `OutcomeUnknown`; a valid live dispatch lease remains active
+  until completion or expiry;
+- scan terminal runs through a durable keyset cursor so a bounded page of
+  non-quiescent runs cannot starve later runs after restart or leader change;
+- record reconciliation and first-observed active-lease deferral as durable
+  owner-scoped events without emitting one warning per maintenance interval;
 - reconcile through the provider when supported; otherwise expose uncertainty
   and require an explicit decision.
 
@@ -496,6 +506,13 @@ may reclaim content. A reference prevents collection while it exists but does
 not silently extend or rewrite the artifact's retention policy. Forward and
 reverse edge queries must expose exactly which durable owner keeps an artifact
 reachable.
+
+Introspect and reflect project, but never control, these durable facts. The
+runtime introspect evidence includes hot state counts, non-dispatched closure
+rejections, outcome-unknown rows, archive chunks, artifact-reference counts,
+reconciliation/deferred events, and compaction cursor progress. Reflect keeps
+the lifecycle events in its durable evidence graph even when they are not
+children of a context decision.
 
 ## Resource context
 
