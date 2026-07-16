@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(r.edge_agent_id, "e1");
         assert_eq!(r.edge_id, "hdr");
         assert!(s.heartbeat("u", "e1", "hdr").await.is_ok());
-        assert!(s.unregister("u", "e1", "hdr").await.is_ok());
+        assert_eq!(s.unregister_generation("u", "e1", "hdr").await, Ok(false));
         let listed = s
             .list_by_user("u")
             .await

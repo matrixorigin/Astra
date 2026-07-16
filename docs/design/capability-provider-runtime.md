@@ -455,15 +455,24 @@ Execution rules:
 - never retry a non-idempotent call after ambiguous dispatch;
 - represent a lost acknowledgement after possible external application as
   `OutcomeUnknown`;
-- at an independent execution edge, persist `Prepared` before crossing the
-  local executor boundary and distinguish it from `Running` during recovery:
-  `Prepared` is safe to resume under the same identity, while `Running`
-  becomes `OutcomeUnknown` and is never implicitly redispatched;
+- at an independent execution edge, acquire a separate execution permit and
+  persist `Running` in one WAL sync before crossing the local executor
+  boundary. The execution generation remains fixed while reconnect may update
+  the delivery/ACK generation; restored `Running` becomes `OutcomeUnknown`
+  and is never implicitly redispatched;
 - keep the independent Edge inbox/outbox crash-safe with a bounded append-only
   WAL and periodic atomic snapshots. Capacity exhaustion is an explicit
   retryable `NotDispatched` admission result, not a fabricated tool outcome;
   the rejection carries bounded journal occupancy/capacity evidence and the
   Edge logs the same structured status;
+- every Server-to-Edge path creates or verifies the same durable dispatch row
+  before socket delivery. Existing terminal evidence replays without another
+  socket send, owner/payload conflicts fail loudly, callers are released only
+  after result persistence, and the Edge drops evidence only after the exact
+  ACK generation;
+- connection and registry cleanup are generation-fenced. Result convergence
+  uses one shared bounded batch poller (with same-pod completion wakeup), not
+  one independent database polling loop per invocation;
 - reconcile terminal runs before archival: zero-attempt `Prepared` becomes a
   typed, non-dispatched run-closure rejection; expired or malformed dispatched
   leases become `OutcomeUnknown`; a valid live dispatch lease remains active

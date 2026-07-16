@@ -15,8 +15,8 @@ pub mod task_lease;
 // Explicit re-exports — callers can still use `astra_services::multi_agent::*`
 // but the module boundaries are now clear.
 pub use edge_dispatch::{
-    DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
-    UnconfiguredEdgeDispatchService, refresh_edge_dispatch_backlog_metrics,
+    DatabaseEdgeDispatchService, EdgeDispatchAdmission, EdgeDispatchIdentity, EdgeDispatchRow,
+    EdgeDispatchService, UnconfiguredEdgeDispatchService, refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{
     DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistryService, HeartbeatError,

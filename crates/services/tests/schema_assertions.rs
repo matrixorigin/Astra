@@ -60,7 +60,6 @@ async fn schema_rationalization_runtime_contract() {
         "skill_marketplace_stats",
         "skill_quality_reports",
         "task_verification_results",
-        "tool_exactly_once_results",
     ] {
         assert!(
             !table_exists(&pool, &schema, removed).await,

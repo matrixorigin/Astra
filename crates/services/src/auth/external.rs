@@ -17,7 +17,8 @@ use serde_json::{Map, Value};
 use crate::models::ModelListItem;
 use crate::runs::{
     RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
-    RuntimeMcpBindingRequest, RuntimeSkillBindingRequest, SelectedModelRequest,
+    RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
+    SelectedModelRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +341,8 @@ pub struct ExternalRuntimeCapabilityDescriptor {
     pub transport: String,
     pub endpoint_url: String,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_read: Option<RuntimeSemanticReadCapabilityRequest>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
 }
@@ -352,6 +355,7 @@ impl ExternalRuntimeCapabilityDescriptor {
             transport: self.transport.clone(),
             endpoint_url: self.endpoint_url.clone(),
             protocol: self.protocol.clone(),
+            semantic_read: self.semantic_read.clone(),
             metadata: self.metadata.clone(),
         }
     }

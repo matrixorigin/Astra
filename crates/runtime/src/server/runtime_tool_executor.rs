@@ -6729,12 +6729,12 @@ esac
             Err("MCP tools must not list edge registry".to_string())
         }
 
-        async fn unregister(
+        async fn unregister_generation(
             &self,
             _user_id: &str,
             _edge_agent_id: &str,
-            _edge_id: &str,
-        ) -> Result<(), String> {
+            _edge_id_header: &str,
+        ) -> Result<bool, String> {
             Err("MCP tools must not unregister edge registry".to_string())
         }
     }
@@ -6924,13 +6924,13 @@ esac
             }])
         }
 
-        async fn unregister(
+        async fn unregister_generation(
             &self,
             _user_id: &str,
             _edge_agent_id: &str,
-            _edge_id: &str,
-        ) -> Result<(), String> {
-            Ok(())
+            _edge_id_header: &str,
+        ) -> Result<bool, String> {
+            Ok(true)
         }
     }
 

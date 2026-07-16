@@ -63,7 +63,7 @@ pub(crate) async fn execute_edge_bound(
         &request,
         binding,
         &plan,
-        edge_dispatch_service,
+        edge_dispatch_service.clone(),
         edge_registry_service.as_ref(),
         tool_registry,
         cancel_token.clone(),
@@ -87,6 +87,7 @@ pub(crate) async fn execute_edge_bound(
         binding,
         &plan,
         edge_connection_pool.as_ref(),
+        edge_dispatch_service.as_ref(),
         tool_registry,
         cancel_token.as_deref(),
     )
@@ -111,6 +112,7 @@ async fn try_edge_websocket(
     binding: &astra_runtime_env::RunBinding,
     plan: &EdgeBoundExecutionPlan,
     pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    dispatch: Option<&Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     tool_registry: &astra_runtime_env::ToolRegistry,
     cancel_token: Option<&CancellationToken>,
 ) -> EdgeTransportAttempt {
@@ -123,6 +125,12 @@ async fn try_edge_websocket(
         ));
     }
     let Some(pool) = pool else {
+        return EdgeTransportAttempt::Unavailable;
+    };
+    let Some(dispatch) = dispatch else {
+        // A socket-only result cannot be acknowledged durably and would replay
+        // forever after reconnect. Direct delivery is therefore unavailable
+        // unless the same invocation first has a durable dispatch row.
         return EdgeTransportAttempt::Unavailable;
     };
     let edges = pool.get_user_edges(&request.user_id);
@@ -271,15 +279,59 @@ async fn try_edge_websocket(
             }
         }
     };
-
+    let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        &edge_owner_user_id,
+        &request.session_id,
+        &request.run_id,
+        &request.turn_chain_id,
+        plan.dispatch_request_id(),
+    );
+    let payload_json = match plan.dispatch_payload_json() {
+        Ok(payload) => payload,
+        Err(error) => {
+            return EdgeTransportAttempt::Delivered(astra_tools::ToolResult::error(format!(
+                "dispatch payload serialization failed: {error}"
+            )));
+        }
+    };
+    match dispatch
+        .admit_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
+        .await
+    {
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
+            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+        }
+        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+    }
+    match dispatch
+        .claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return match dispatch
+                .wait_result(&dispatch_identity, plan.wait_timeout())
+                .await
+            {
+                Ok(Some(result_json)) => {
+                    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
+                }
+                Ok(None) | Err(_) => EdgeTransportAttempt::TransportDisconnected,
+            };
+        }
+        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+    }
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
         tool = %request.tool_name,
         edge_agent_id = %edge.edge_agent_id,
-        "edge_dispatch: try_edge_websocket selected edge, sending tool request over WS"
+        edge_owner_user_id = %edge_owner_user_id,
+        invocation_user_id = %plan.identity().user_id,
+        "edge_dispatch: durable direct delivery admitted; sending tool request over WS"
     );
     let edge_result = pool
-        .execute_invocation_on_connection_with_cancel(
+        .execute_durably_admitted_invocation_on_connection_with_cancel(
             &edge_owner_user_id,
             plan.identity(),
             &edge.edge_agent_id,
@@ -455,12 +507,15 @@ async fn try_edge_dispatch(
             )));
         }
     };
-    if dispatch
-        .insert_dispatch(&identity, &agent.edge_agent_id, &payload_json)
+    match dispatch
+        .admit_dispatch(&identity, &agent.edge_agent_id, &payload_json)
         .await
-        .is_err()
     {
-        return EdgeTransportAttempt::TransportDisconnected;
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
+        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
+            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+        }
+        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
     }
     let wait_dispatch = dispatch.clone();
     let wait_identity = identity.clone();
@@ -504,8 +559,16 @@ async fn try_edge_dispatch(
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
+    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
+}
+
+fn delivered_dispatch_result(
+    plan: &EdgeBoundExecutionPlan,
+    result_json: &str,
+    transport: ToolTransportKind,
+) -> EdgeTransportAttempt {
     let parsed_result =
-        serde_json::from_str::<astra_thin_client::ToolResultRequest>(&result_json).ok();
+        serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json).ok();
     let tool_result_fields = parsed_result
         .as_ref()
         .and_then(|request| request.tool_result_fields.clone());
@@ -517,12 +580,12 @@ async fn try_edge_dispatch(
             )
         })
         .unwrap_or_else(|| {
-            astra_thin_client::ToolResultRequest::parse_output_and_error(&result_json)
+            astra_thin_client::ToolResultRequest::parse_output_and_error(result_json)
         });
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         output,
         is_error,
-        ToolTransportKind::EdgeLedger,
+        transport,
         tool_result_fields,
     ))
 }
@@ -578,11 +641,15 @@ fn edge_transport_disconnected_result(
     degraded_executor.status = ExecutorStatus::Degraded;
     let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
+    let message = edge_transport_disconnected_message(request, outcome_may_be_unknown);
+    let error = if outcome_may_be_unknown {
+        astra_runtime_env::RuntimeError::transport_disconnected(message)
+    } else {
+        astra_runtime_env::RuntimeError::transport_unavailable(message)
+    };
     attach_runtime_error_metadata(
         &mut metadata,
-        &astra_runtime_env::RuntimeError::transport_disconnected(
-            edge_transport_disconnected_message(request, outcome_may_be_unknown),
-        ),
+        &error,
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     );
     if !diagnostics.is_empty() {

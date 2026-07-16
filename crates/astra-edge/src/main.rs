@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
     tungstenite::Message,
@@ -37,6 +37,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use invocation_journal::{DurableEdgeResult, EdgeInvocationJournal, JournalError, PrepareOutcome};
+
+const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = 128;
+
+#[derive(Clone)]
+struct EdgeExecutionBudget {
+    permits: Arc<Semaphore>,
+}
+
+impl EdgeExecutionBudget {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_EXECUTIONS)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
+    }
+}
 
 /// Astra remote edge agent — execute tool calls locally for web sessions.
 #[derive(Parser, Debug)]
@@ -111,10 +130,15 @@ impl EdgeInvocationTracker {
         Ok(cancel)
     }
 
-    fn cancel(&self, request_id: &str) -> Option<u64> {
-        let active = self.in_flight.get(request_id)?;
+    fn cancel_if_current(&self, request_id: &str, generation: u64) -> bool {
+        let Some(active) = self.in_flight.get(request_id) else {
+            return false;
+        };
+        if active.generation != generation {
+            return false;
+        }
         active.cancel.cancel();
-        Some(active.generation)
+        true
     }
 
     fn finish_if_current(&mut self, request_id: &str, generation: u64) -> bool {
@@ -559,6 +583,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         Duration::from_secs(30),
     ));
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
+    let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();
     let journal_path = edge_invocation_journal_path(&config.edge_id, &workspace);
     let mut journal = EdgeInvocationJournal::open(journal_path).await?;
@@ -566,7 +591,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     tracing::info!(
         target: "astra.edge.invocation_journal",
         records = journal_status.records,
-        prepared = journal_status.prepared,
         running = journal_status.running,
         awaiting_ack = journal_status.awaiting_ack,
         state_bytes = journal_status.state_bytes,
@@ -615,6 +639,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 args: tool_args,
                                 timeout_secs,
                             }) => {
+                                let execution_permit = execution_budget.try_acquire();
                                 match journal
                                     .prepare(
                                         &request_id,
@@ -622,6 +647,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         delivery_generation,
                                         &tool,
                                         &tool_args,
+                                        execution_permit.is_some(),
                                     )
                                     .await
                                 {
@@ -649,7 +675,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                             target: "astra.edge.invocation_journal",
                                             %error,
                                             records = journal_status.records,
-                                            prepared = journal_status.prepared,
                                             running = journal_status.running,
                                             awaiting_ack = journal_status.awaiting_ack,
                                             state_bytes = journal_status.state_bytes,
@@ -686,7 +711,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     }
                                     Err(error) => return Err(error.into()),
                                 }
-                                journal.mark_running(&request_id, delivery_generation).await?;
+                                let execution_permit = execution_permit.ok_or_else(|| {
+                                    format!(
+                                        "edge invocation journal admitted {request_id} without execution capacity"
+                                    )
+                                })?;
                                 let cancel = match invocations.begin(&request_id, delivery_generation) {
                                     Ok(cancel) => cancel,
                                     Err(active_generation) => {
@@ -699,6 +728,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 let completed_tx = completed_tx.clone();
                                 tracing::info!(tool = %tool, request_id = %request_id, generation = delivery_generation, "Executing tool");
                                 tokio::spawn(async move {
+                                    let _execution_permit = execution_permit;
                                     let start = Instant::now();
                                     let execution = astra_tools::ToolExecutor::execute_with_cancel(
                                         executor.as_ref(),
@@ -732,10 +762,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 // heartbeat ack
                             }
                             Ok(EdgeServerMessage::ToolCancel { request_id, delivery_generation }) => {
-                                if let Some(generation) = invocations.cancel(&request_id).filter(|generation| *generation == delivery_generation) {
+                                let execution_generation = journal
+                                    .running_execution_generation(&request_id, delivery_generation);
+                                if execution_generation.is_some_and(|generation| {
+                                    invocations.cancel_if_current(&request_id, generation)
+                                }) {
                                     tracing::info!(
                                         request_id = %request_id,
-                                        generation,
+                                        delivery_generation,
                                         "Cancelled in-flight edge invocation"
                                     );
                                 } else {
@@ -799,7 +833,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 );
                 let record = journal.pending_results()?.into_iter().find(|pending| {
                     pending.request_id == completed.request_id
-                        && pending.delivery_generation == completed.generation
                 }).ok_or_else(|| format!("durable edge result {} disappeared before delivery", completed.request_id))?;
                 let result_msg = record.result.client_message(
                     record.request_id,
@@ -932,10 +965,29 @@ mod tests {
         let first_cancel = tracker.begin("request-1", first_generation).unwrap();
         let second_cancel = tracker.begin("request-2", 2).unwrap();
 
-        assert_eq!(tracker.cancel("request-1"), Some(first_generation));
+        assert!(!tracker.cancel_if_current("request-1", first_generation + 1));
+        assert!(!first_cancel.is_cancelled());
+        assert!(tracker.cancel_if_current("request-1", first_generation));
         assert!(first_cancel.is_cancelled());
         assert!(!second_cancel.is_cancelled());
-        assert_eq!(tracker.cancel("missing"), None);
+        assert!(!tracker.cancel_if_current("missing", first_generation));
+    }
+
+    #[test]
+    fn execution_budget_admits_exactly_the_configured_concurrency() {
+        let budget = EdgeExecutionBudget::new();
+        let permits = (0..MAX_CONCURRENT_TOOL_EXECUTIONS)
+            .map(|_| budget.try_acquire().expect("configured execution permit"))
+            .collect::<Vec<_>>();
+        assert!(
+            budget.try_acquire().is_none(),
+            "the first invocation beyond the execution budget must be rejected before dispatch"
+        );
+        drop(permits);
+        assert!(
+            budget.try_acquire().is_some(),
+            "completed executions must release capacity"
+        );
     }
 
     #[test]

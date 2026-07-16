@@ -347,6 +347,7 @@ struct StaticEdgeDispatch {
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
     result_status: &'static str,
+    terminal_admission_result: Option<String>,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -356,6 +357,7 @@ impl Default for StaticEdgeDispatch {
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "completed",
+            terminal_admission_result: None,
         }
     }
 }
@@ -367,6 +369,7 @@ impl StaticEdgeDispatch {
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
             result_status: "completed",
+            terminal_admission_result: None,
         }
     }
 
@@ -376,6 +379,19 @@ impl StaticEdgeDispatch {
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "failed",
+            terminal_admission_result: None,
+        }
+    }
+
+    fn terminal_admission(output: &str) -> Self {
+        Self {
+            inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            failed_dispatches: Mutex::new(Vec::new()),
+            return_result: false,
+            result_status: "completed",
+            terminal_admission_result: Some(
+                serde_json::json!({"status":"completed","output":output}).to_string(),
+            ),
         }
     }
 }
@@ -393,6 +409,22 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
         Ok(())
+    }
+
+    async fn admit_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload_json: &str,
+    ) -> Result<astra_services::multi_agent::EdgeDispatchAdmission, String> {
+        self.insert_dispatch(identity, edge_agent_id, payload_json)
+            .await?;
+        Ok(match &self.terminal_admission_result {
+            Some(result) => {
+                astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result.clone())
+            }
+            None => astra_services::multi_agent::EdgeDispatchAdmission::Pending,
+        })
     }
 
     async fn poll_pending(
@@ -760,13 +792,13 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         Ok(self.agents.clone())
     }
 
-    async fn unregister(
+    async fn unregister_generation(
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-        _edge_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
     }
 }
 
@@ -2566,7 +2598,7 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 }
 
 #[tokio::test]
-async fn edge_ws_result_preserves_tool_result_fields() {
+async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
     pool.register_with_capabilities(
@@ -2579,7 +2611,108 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         tx,
     );
     let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert!(
+        rx.try_recv().is_err(),
+        "socket delivery without a durable ACK authority must be rejected before send"
+    );
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(
+        metadata["side_effects_maybe"], false,
+        "an invocation rejected before delivery has a certain not-dispatched outcome"
+    );
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["retryable"], true);
+}
+
+#[tokio::test]
+async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".to_string()),
+        Some("/Users/test/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch)
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "durable-result");
+    assert!(
+        rx.try_recv().is_err(),
+        "terminal durable evidence must replay without crossing the socket boundary again"
+    );
+    assert_eq!(result.metadata.unwrap()["transport"], "edge_ledger");
+}
+
+#[tokio::test]
+async fn edge_ws_result_preserves_tool_result_fields() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".to_string()),
+        Some("/Users/test/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let service = ToolExecutionService::builder()
         .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(dispatch.clone())
         .build();
     let request = request(
         "bash",
@@ -2601,6 +2734,14 @@ async fn edge_ws_result_preserves_tool_result_fields() {
     });
 
     let message = rx.recv().await.expect("edge tool request");
+    assert_eq!(
+        *dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock"),
+        vec!["edge-selected".to_string()],
+        "the durable dispatch row must exist before direct socket delivery"
+    );
     let (request_id, delivery_generation) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,

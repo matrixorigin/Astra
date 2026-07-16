@@ -93,16 +93,14 @@ pub trait EdgeRegistryService: Send + Sync {
     /// List all registered edge agents for a user (for cross-pod dispatch routing).
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String>;
 
-    /// Remove an edge agent from the registry (on disconnect).
-    /// Only removes the row if `edge_id` matches the registered connection's
-    /// edge_id, so a stale cleanup on pod A cannot delete a fresh registration
-    /// that pod B created during a cross-pod reconnect.
-    async fn unregister(
+    /// Remove only the exact connection incarnation registered by this socket.
+    /// Returns false when a newer connection already replaced it.
+    async fn unregister_generation(
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        edge_id: &str,
-    ) -> Result<(), String>;
+        edge_id_header: &str,
+    ) -> Result<bool, String>;
 }
 
 pub struct DatabaseEdgeRegistryService {
@@ -363,26 +361,24 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         }
         Ok(())
     }
-    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id, edge_id = %edge_id))]
-    async fn unregister(
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn unregister_generation(
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        edge_id: &str,
-    ) -> Result<(), String> {
-        // Guard on edge_id to prevent a stale pod A cleanup from deleting a
-        // fresh row created by pod B during a cross-pod reconnect.
-        sqlx::query(
+        edge_id_header: &str,
+    ) -> Result<bool, String> {
+        let deleted = sqlx::query(
             "DELETE FROM edge_agent_registry \
              WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
         )
         .bind(user_id)
         .bind(edge_agent_id)
-        .bind(edge_id)
+        .bind(edge_id_header)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_registry unregister: {e}"))?;
-        Ok(())
+        Ok(deleted.rows_affected() > 0)
     }
 
     #[tracing::instrument(skip(self), fields(edge_agent_id = %edge_agent_id))]
@@ -494,14 +490,14 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
         Ok(Vec::new())
     }
 
-    /// No-op success: nothing was persisted, so nothing to remove.
-    async fn unregister(
+    /// No-op success: nothing was persisted, so nothing can be removed.
+    async fn unregister_generation(
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-        _edge_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
     }
 }
 

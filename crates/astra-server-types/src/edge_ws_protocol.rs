@@ -135,6 +135,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::Pong => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
+            EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
         }
     }
 }

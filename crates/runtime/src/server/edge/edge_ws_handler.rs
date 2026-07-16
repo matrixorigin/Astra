@@ -251,8 +251,8 @@ async fn handle_edge_connection(
     let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
-    // B1: capture generation so cleanup can use unregister_if_generation,
-    // preventing a late-arriving cleanup from removing a newer connection.
+    // Capture the connection incarnation so cleanup cannot remove a faster
+    // reconnect that has already replaced this socket.
     let pool_generation = state.edge_connection_pool.register_with_capabilities(
         &user_id,
         &edge_agent_id,
@@ -290,11 +290,9 @@ async fn handle_edge_connection(
             error = %e,
             "edge WebSocket: DB registry registration failed; rejecting connection"
         );
-        state.edge_connection_pool.unregister_if_generation(
-            &user_id,
-            &edge_agent_id,
-            pool_generation,
-        );
+        state
+            .edge_connection_pool
+            .unregister_generation(&user_id, &edge_agent_id, pool_generation);
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
@@ -414,6 +412,7 @@ async fn handle_edge_connection(
     let pool_for_cleanup = state.edge_connection_pool.clone();
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
+    let edge_id_for_registry_cleanup = edge_id_for_registry.clone();
     let read_inflight = inflight_dispatches.clone();
 
     // Task: forward server → edge messages from the pool channel
@@ -460,18 +459,12 @@ async fn handle_edge_connection(
                                         continue;
                                     }
                                     let inflight = read_inflight.remove(&request_id).await;
-                                    let direct_accepted = state.edge_connection_pool.deliver_tool_result(
-                                        &user_id,
-                                        &edge_agent_id,
-                                        &request_id,
-                                        delivery_generation,
-                                        EdgeToolResult {
-                                            output: output.clone(),
-                                            is_error,
-                                            duration_ms,
-                                            tool_result_fields: tool_result_fields.clone(),
-                                        },
-                                    );
+                                    let direct_result = EdgeToolResult {
+                                        output: output.clone(),
+                                        is_error,
+                                        duration_ms,
+                                        tool_result_fields: tool_result_fields.clone(),
+                                    };
 
                                     let dispatch_identity =
                                         astra_services::multi_agent::EdgeDispatchIdentity::new(
@@ -547,10 +540,22 @@ async fn handle_edge_connection(
                                         }
                                     };
                                     if durable_accepted {
+                                        // A direct same-pod waiter is released only after the
+                                        // exact outcome is durable. Returning it earlier would
+                                        // recreate a caller-visible result with no ACK authority.
+                                        let direct_accepted = state
+                                            .edge_connection_pool
+                                            .deliver_tool_result(
+                                                &user_id,
+                                                &edge_agent_id,
+                                                &request_id,
+                                                delivery_generation,
+                                                direct_result,
+                                            );
                                         if send_edge_msg(
                                             &ws_sink_write,
                                             EdgeServerMessage::ToolResultAck {
-                                                request_id,
+                                                request_id: request_id.clone(),
                                                 delivery_generation,
                                             },
                                         )
@@ -559,13 +564,20 @@ async fn handle_edge_connection(
                                         {
                                             break;
                                         }
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            direct_accepted,
+                                            "Edge WS: result durably accepted"
+                                        );
                                     } else {
                                         tracing::warn!(
                                             target: "astra_runtime::edge_ws",
                                             user_id = %user_id,
                                             edge_agent_id = %edge_agent_id,
                                             request_id = %request_id,
-                                            direct_accepted,
                                             "Edge WS: result was not durably accepted; withholding acknowledgement"
                                         );
                                     }
@@ -659,43 +671,44 @@ async fn handle_edge_connection(
             "Edge disconnected with durable dispatches in flight; preserving them for result replay"
         );
     }
-    // B1: only remove our own pool entry; a faster reconnect may have already
-    // replaced it with a higher-generation entry — leave that intact.
-    let _was_our_entry = pool_for_cleanup.unregister_if_generation(
+    let removed_current_generation = pool_for_cleanup.unregister_generation(
         &user_id_cleanup,
         &edge_agent_id_cleanup,
         pool_generation,
     );
 
-    // Always attempt DB unregister, regardless of whether we still owned the
-    // pool slot. The WHERE edge_id = ? guard in the SQL prevents us from
-    // deleting a newer connection's row written by a cross-pod reconnect.
-    // This also covers the gap where a new connection registered in DB but
-    // then failed and rolled back its pool entry — without this call the old
-    // DB row would linger until the sweeper expires it.
-    if let Err(e) = state
+    // The DB registry has the same generation fence. A stale connection may
+    // finish cleanup after a replacement has already updated the registry.
+    // Always attempt it even if the in-process pool entry was replaced: the
+    // edge_id predicate protects the replacement and cleans up cross-pod rows.
+    match state
         .execution
         .edge_registry_service
-        .unregister(
+        .unregister_generation(
             &user_id_cleanup,
             &edge_agent_id_cleanup,
-            &edge_id_for_registry,
+            &edge_id_for_registry_cleanup,
         )
         .await
     {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            user_id = %user_id_cleanup,
-            edge_agent_id = %edge_agent_id_cleanup,
-            edge_id = %edge_id_for_registry,
-            error = %e,
-            "edge WebSocket cleanup: DB unregister failed; sweeper will expire the record"
-        );
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id_cleanup,
+                edge_agent_id = %edge_agent_id_cleanup,
+                edge_id = %edge_id_for_registry_cleanup,
+                %error,
+                "edge WebSocket cleanup: DB unregister failed; sweeper will expire the record"
+            );
+        }
     }
 
     tracing::info!(
         user_id = %user_id_cleanup,
         edge_agent_id = %edge_agent_id_cleanup,
+        pool_generation,
+        removed_current_generation,
         "Edge agent disconnected"
     );
 }

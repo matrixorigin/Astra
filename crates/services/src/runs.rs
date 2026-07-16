@@ -462,7 +462,7 @@ pub struct SelectedModelRequest {
 
 pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSemanticReadCapabilityRequest {
     pub contract_version: String,

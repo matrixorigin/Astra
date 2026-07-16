@@ -35,6 +35,8 @@ const EDGE_PENDING_DISPATCH_LEGACY_COLUMNS: &[&str] = &[
 const EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY: &[&str] = &["user_id", "request_id"];
 const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
     "edge_pending_dispatch_legacy_owner_request_v1";
+const TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS: &[&str] = &["identity_key"];
+const TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS: &[(&str, u64)] = &[("identity_key", 71)];
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -2032,12 +2034,10 @@ pub async fn ensure_core_schema(
         .await?;
     }
 
-    // Retired semantic name+arguments dedup storage. Durable delivery is owned
-    // by `tool_invocation_ledger`; keeping this table would preserve a second,
-    // contradictory authority for external side effects.
-    query("DROP TABLE IF EXISTS tool_exactly_once_results")
-        .execute(&pool)
-        .await?;
+    // `tool_exactly_once_results` is retired and is not a runtime authority.
+    // Startup deliberately leaves any historical table untouched: removing
+    // side-effect evidence is an explicit administrative lifecycle action,
+    // not schema bootstrap. No compatibility read or migration is performed.
 
     query(
         "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (
@@ -2066,12 +2066,18 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
-    add_column_if_missing(
+    fail_if_required_columns_missing_or_nullable(
         &pool,
         &settings.database,
         "tool_invocation_ledger",
-        "identity_key",
-        "ALTER TABLE tool_invocation_ledger ADD COLUMN identity_key VARCHAR(71) NULL",
+        TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS,
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
     )
     .await?;
     ensure_index_shape(
@@ -6746,6 +6752,15 @@ mod tests {
     }
 
     #[test]
+    fn invocation_ledger_bootstrap_requires_the_canonical_identity_key_shape() {
+        assert_eq!(TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS, &["identity_key"]);
+        assert_eq!(
+            TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
+            &[("identity_key", 71)]
+        );
+    }
+
+    #[test]
     fn retired_external_auth_tables_are_not_dropped_by_schema_bootstrap() {
         let source = include_str!("storage.rs");
         let ensure_body = source
@@ -6753,7 +6768,11 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("#[cfg(test)]").next())
             .expect("ensure_core_schema body");
-        for table in ["auth_external_sessions", "auth_external_identities"] {
+        for table in [
+            "auth_external_sessions",
+            "auth_external_identities",
+            "tool_exactly_once_results",
+        ] {
             assert!(
                 !ensure_body.contains(&format!("DROP TABLE IF EXISTS {table}")),
                 "retired external auth table {table} must be left for an explicit migration, not dropped during startup"

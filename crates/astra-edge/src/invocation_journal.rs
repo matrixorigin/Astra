@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
-const JOURNAL_VERSION: &str = "edge-invocation-journal-v2";
+const JOURNAL_VERSION: &str = "edge-invocation-journal-v3";
 const MAX_RECORDS: usize = 1_024;
 const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
@@ -44,7 +44,6 @@ pub(crate) enum JournalError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DurableState {
-    Prepared,
     Running,
     CompletedAwaitingAck,
     OutcomeUnknownAwaitingAck,
@@ -128,7 +127,14 @@ impl DurableEdgeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableInvocationRecord {
     identity: ToolInvocationIdentity,
+    /// The latest server delivery incarnation. Results and ACKs use this
+    /// generation so reconnect can supersede an older socket safely.
     delivery_generation: u64,
+    /// The incarnation that crossed the side-effect boundary. It is stable
+    /// across redelivery and is absent only for a durable not-dispatched
+    /// admission rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_generation: Option<u64>,
     tool: String,
     canonical_arguments_hash: String,
     state: DurableState,
@@ -198,7 +204,6 @@ pub(crate) struct EdgeInvocationJournal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EdgeInvocationJournalStatus {
     pub(crate) records: usize,
-    pub(crate) prepared: usize,
     pub(crate) running: usize,
     pub(crate) awaiting_ack: usize,
     pub(crate) state_bytes: usize,
@@ -211,7 +216,6 @@ impl EdgeInvocationJournalStatus {
         serde_json::json!({
             "contractVersion": JOURNAL_VERSION,
             "records": self.records,
-            "prepared": self.prepared,
             "running": self.running,
             "awaitingAck": self.awaiting_ack,
             "recordCapacity": MAX_RECORDS,
@@ -348,12 +352,10 @@ impl EdgeInvocationJournal {
     }
 
     pub(crate) fn status(&self) -> EdgeInvocationJournalStatus {
-        let mut prepared = 0;
         let mut running = 0;
         let mut awaiting_ack = 0;
         for record in self.state.records.values() {
             match record.state {
-                DurableState::Prepared => prepared += 1,
                 DurableState::Running => running += 1,
                 DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
                     awaiting_ack += 1;
@@ -362,7 +364,6 @@ impl EdgeInvocationJournal {
         }
         EdgeInvocationJournalStatus {
             records: self.state.records.len(),
-            prepared,
             running,
             awaiting_ack,
             state_bytes: self.state_bytes,
@@ -378,6 +379,7 @@ impl EdgeInvocationJournal {
         delivery_generation: u64,
         tool: &str,
         args: &Value,
+        execution_capacity_available: bool,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
             return Err(JournalError::IdentityConflict {
@@ -395,7 +397,6 @@ impl EdgeInvocationJournal {
             self.commit_record(request_id.to_string(), Some(updated))
                 .await?;
             let outcome = match record.state {
-                DurableState::Prepared => PrepareOutcome::Execute,
                 DurableState::Running => PrepareOutcome::Active,
                 DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
                     PrepareOutcome::Replay(record.result.clone().ok_or_else(|| {
@@ -414,31 +415,28 @@ impl EdgeInvocationJournal {
         let record = DurableInvocationRecord {
             identity: identity.clone(),
             delivery_generation,
+            execution_generation: execution_capacity_available.then_some(delivery_generation),
             tool: tool.to_string(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
-            state: DurableState::Prepared,
-            result: None,
+            state: if execution_capacity_available {
+                DurableState::Running
+            } else {
+                DurableState::CompletedAwaitingAck
+            },
+            result: (!execution_capacity_available).then(|| {
+                DurableEdgeResult::not_dispatched_rejection(
+                    "Edge execution capacity is temporarily saturated before dispatch",
+                )
+            }),
         };
+        let rejection = record.result.clone();
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
-        Ok(PrepareOutcome::Execute)
-    }
-
-    pub(crate) async fn mark_running(
-        &mut self,
-        request_id: &str,
-        delivery_generation: u64,
-    ) -> Result<(), JournalError> {
-        let mut record = self.record(request_id, delivery_generation)?.clone();
-        if record.state != DurableState::Prepared {
-            return Err(JournalError::Corrupt {
-                path: self.path.clone(),
-                detail: format!("record {request_id} is not prepared"),
-            });
+        if let Some(rejection) = rejection {
+            Ok(PrepareOutcome::Replay(rejection))
+        } else {
+            Ok(PrepareOutcome::Execute)
         }
-        record.state = DurableState::Running;
-        self.commit_record(request_id.to_string(), Some(record))
-            .await
     }
 
     pub(crate) async fn complete(
@@ -464,7 +462,9 @@ impl EdgeInvocationJournal {
         } else {
             (DurableState::CompletedAwaitingAck, result)
         };
-        let mut record = self.record(request_id, delivery_generation)?.clone();
+        let mut record = self
+            .execution_record(request_id, delivery_generation)?
+            .clone();
         if record.state != DurableState::Running {
             return Err(JournalError::Corrupt {
                 path: self.path.clone(),
@@ -501,6 +501,17 @@ impl EdgeInvocationJournal {
         Ok(true)
     }
 
+    pub(crate) fn running_execution_generation(
+        &self,
+        request_id: &str,
+        delivery_generation: u64,
+    ) -> Option<u64> {
+        let record = self.state.records.get(request_id)?;
+        (record.state == DurableState::Running && record.delivery_generation == delivery_generation)
+            .then_some(record.execution_generation)
+            .flatten()
+    }
+
     pub(crate) fn pending_results(&self) -> Result<Vec<PendingResult>, JournalError> {
         self.state
             .records
@@ -525,10 +536,10 @@ impl EdgeInvocationJournal {
             .collect()
     }
 
-    fn record(
+    fn execution_record(
         &self,
         request_id: &str,
-        delivery_generation: u64,
+        execution_generation: u64,
     ) -> Result<&DurableInvocationRecord, JournalError> {
         let record = self
             .state
@@ -538,7 +549,7 @@ impl EdgeInvocationJournal {
                 path: self.path.clone(),
                 detail: format!("record {request_id} does not exist"),
             })?;
-        if record.delivery_generation != delivery_generation {
+        if record.execution_generation != Some(execution_generation) {
             return Err(JournalError::IdentityConflict {
                 request_id: request_id.to_string(),
             });
@@ -833,6 +844,16 @@ fn validate_record(
             detail: format!("record {request_id} has inconsistent terminal evidence"),
         });
     }
+    if matches!(
+        record.state,
+        DurableState::Running | DurableState::OutcomeUnknownAwaitingAck
+    ) && record.execution_generation.is_none()
+    {
+        return Err(JournalError::Corrupt {
+            path: path.to_path_buf(),
+            detail: format!("record {request_id} crossed dispatch without an execution generation"),
+        });
+    }
     if let Some(result) = &record.result {
         let result_bytes = serde_json::to_vec(result).map_err(|error| JournalError::Corrupt {
             path: path.to_path_buf(),
@@ -869,12 +890,18 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 7, "read_file", &json!({"path":"a"}))
+                .prepare(
+                    &request_id,
+                    &identity,
+                    7,
+                    "read_file",
+                    &json!({"path":"a"}),
+                    true,
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
-        journal.mark_running(&request_id, 7).await.unwrap();
         journal
             .complete(
                 &request_id,
@@ -898,6 +925,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redelivery_updates_ack_generation_without_stealing_execution_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity("call-redelivered");
+        let request_id = identity.storage_key();
+        let args = json!({"command":"effect"});
+        let mut journal = EdgeInvocationJournal::open(dir.path().join("journal.json"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&request_id, &identity, 4, "bash", &args, true)
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        assert!(matches!(
+            journal
+                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .await
+                .unwrap(),
+            PrepareOutcome::Active
+        ));
+
+        journal
+            .complete(
+                &request_id,
+                4,
+                DurableEdgeResult {
+                    output: "done".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+            .await
+            .unwrap();
+        let pending = journal.pending_results().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_generation, 5);
+        assert!(!journal.acknowledge(&request_id, 4).await.unwrap());
+        assert!(journal.acknowledge(&request_id, 5).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn restart_converts_running_to_outcome_unknown_without_redispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.json");
@@ -906,10 +977,9 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args)
+            .prepare(&request_id, &identity, 4, "bash", &args, true)
             .await
             .unwrap();
-        journal.mark_running(&request_id, 4).await.unwrap();
         drop(journal);
 
         let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
@@ -922,7 +992,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args)
+                .prepare(&request_id, &identity, 5, "bash", &args, true)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -930,32 +1000,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_keeps_prepared_not_dispatched_and_allows_exact_resume() {
+    async fn saturated_admission_is_durable_not_dispatched_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.json");
-        let identity = identity("call-prepared");
+        let identity = identity("call-saturated");
         let request_id = identity.storage_key();
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
-        journal
-            .prepare(&request_id, &identity, 4, "bash", &args)
-            .await
-            .unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&request_id, &identity, 4, "bash", &args, false)
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
         drop(journal);
 
         let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
-        assert!(
-            restored.pending_results().unwrap().is_empty(),
-            "Prepared has not crossed the dispatch boundary and must not fabricate an unknown result"
+        let pending = restored.pending_results().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].result.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
+            "not_dispatched"
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args)
+                .prepare(&request_id, &identity, 5, "bash", &args, true)
                 .await
                 .unwrap(),
-            PrepareOutcome::Execute
+            PrepareOutcome::Replay(_)
         ));
-        restored.mark_running(&request_id, 5).await.unwrap();
     }
 
     #[tokio::test]
@@ -968,7 +1042,7 @@ mod tests {
         let args = json!({"path":"a"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &args)
+            .prepare(&request_id, &identity, 1, "read_file", &args, false)
             .await
             .unwrap();
         drop(journal);
@@ -989,10 +1063,10 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args)
+                .prepare(&request_id, &identity, 2, "read_file", &args, true)
                 .await
                 .unwrap(),
-            PrepareOutcome::Execute
+            PrepareOutcome::Replay(_)
         ));
     }
 
@@ -1005,10 +1079,16 @@ mod tests {
         let request_id = identity.storage_key();
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &json!({"path":"a"}))
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                "read_file",
+                &json!({"path":"a"}),
+                true,
+            )
             .await
             .unwrap();
-        journal.mark_running(&request_id, 1).await.unwrap();
         journal
             .complete(
                 &request_id,
@@ -1040,11 +1120,25 @@ mod tests {
             .await
             .unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "bash", &json!({"command":"a"}))
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                "bash",
+                &json!({"command":"a"}),
+                true,
+            )
             .await
             .unwrap();
         let error = journal
-            .prepare(&request_id, &identity, 2, "bash", &json!({"command":"b"}))
+            .prepare(
+                &request_id,
+                &identity,
+                2,
+                "bash",
+                &json!({"command":"b"}),
+                true,
+            )
             .await
             .err()
             .unwrap();
@@ -1060,6 +1154,21 @@ mod tests {
             EdgeInvocationJournal::open(path).await.err().unwrap(),
             JournalError::Corrupt { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn noncanonical_journal_version_is_rejected_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        tokio::fs::write(
+            &path,
+            br#"{"contract_version":"edge-invocation-journal-v2","last_sequence":0,"records":{}}"#,
+        )
+        .await
+        .unwrap();
+        let error = EdgeInvocationJournal::open(path).await.err().unwrap();
+        assert!(matches!(error, JournalError::Corrupt { .. }));
+        assert!(error.to_string().contains("unsupported contract version"));
     }
 
     #[tokio::test]
@@ -1082,7 +1191,6 @@ mod tests {
     fn admission_rejection_carries_bounded_journal_capacity_evidence() {
         let status = EdgeInvocationJournalStatus {
             records: 1_024,
-            prepared: 3,
             running: 7,
             awaiting_ack: 1_014,
             state_bytes: 42,
@@ -1093,7 +1201,6 @@ mod tests {
             DurableEdgeResult::not_dispatched_rejection("saturated").with_journal_status(&status);
         let journal = &result.tool_result_fields.unwrap()["edgeJournal"];
         assert_eq!(journal["records"], 1_024);
-        assert_eq!(journal["prepared"], 3);
         assert_eq!(journal["running"], 7);
         assert_eq!(journal["awaitingAck"], 1_014);
         assert_eq!(journal["recordCapacity"], MAX_RECORDS);
