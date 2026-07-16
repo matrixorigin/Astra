@@ -951,6 +951,10 @@ pub struct SkillState {
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
     pub quality_tracker: crate::skills::quality::SkillQualityTracker,
+    /// Snapshot at the start of this user turn. Observation emission compares
+    /// against this baseline so historical outcomes are not re-attributed to
+    /// every later turn.
+    pub quality_tracker_baseline: crate::skills::quality::SkillQualityTracker,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
@@ -991,6 +995,7 @@ impl Default for SkillState {
             request_constraints: Default::default(),
             sandbox_policy: None,
             quality_tracker: Default::default(),
+            quality_tracker_baseline: Default::default(),
             improvement_tracker: Default::default(),
             pinned: HashSet::new(),
             discovered: HashSet::new(),

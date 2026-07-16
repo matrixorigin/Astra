@@ -104,9 +104,11 @@ impl FeedbackStore {
 
     /// Number of stored rules for a session.
     pub async fn len(&self, session_id: &str) -> usize {
-        self.inner
-            .lock()
-            .await
+        let mut inner = self.inner.lock().await;
+        if inner.sessions.contains_key(session_id) {
+            Self::touch_session(&mut inner, session_id);
+        }
+        inner
             .sessions
             .get(session_id)
             .map(|s| {
@@ -371,9 +373,11 @@ impl FeedbackStore {
 
     /// Get a snapshot of rules for a session.
     pub async fn rules(&self, session_id: &str) -> Vec<StructuredFeedback> {
-        self.inner
-            .lock()
-            .await
+        let mut inner = self.inner.lock().await;
+        if inner.sessions.contains_key(session_id) {
+            Self::touch_session(&mut inner, session_id);
+        }
+        inner
             .sessions
             .get(session_id)
             .map(|s| {
@@ -528,6 +532,33 @@ mod tests {
             "the least recently used session should be evicted"
         );
         assert!(!store.is_empty("new-session").await);
+    }
+
+    #[tokio::test]
+    async fn every_session_read_refreshes_lru_without_creating_missing_sessions() {
+        for read in ["len", "is_empty", "rules"] {
+            let store = FeedbackStore::new();
+            for i in 0..MAX_SESSIONS {
+                store.add(&format!("s{i}"), make_fb("rule")).await;
+            }
+
+            match read {
+                "len" => assert_eq!(store.len("s0").await, 1),
+                "is_empty" => assert!(!store.is_empty("s0").await),
+                "rules" => assert_eq!(store.rules("s0").await.len(), 1),
+                _ => unreachable!(),
+            }
+            store.add("new-session", make_fb("new rule")).await;
+
+            assert!(!store.is_empty("s0").await, "{read} must refresh LRU");
+            assert!(store.is_empty("s1").await, "oldest session must be evicted");
+
+            let before = store.session_count().await;
+            assert_eq!(store.len("missing").await, 0);
+            assert!(store.is_empty("missing").await);
+            assert!(store.rules("missing").await.is_empty());
+            assert_eq!(store.session_count().await, before);
+        }
     }
 
     // ── Injection format ──

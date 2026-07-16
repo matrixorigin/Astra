@@ -8,8 +8,9 @@ use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{MySql, QueryBuilder};
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::sync::{Arc, RwLock};
 
 use crate::coordination::{
     AgentProfile, AgentProfileRegistry, AgentTier, AggregationStrategy, CoordinationPattern,
@@ -19,6 +20,7 @@ use crate::coordination::{
 const MAX_TEAM_LIST_ROWS: usize = 200;
 const MAX_TEAM_EXECUTION_LIST_ROWS: u32 = 500;
 const MAX_TEAM_SNAPSHOT_LIST_ROWS: u32 = 200;
+const BUILTIN_OWNER_INIT_CACHE_CAPACITY: usize = 4096;
 const TEAM_LIST_SELECT_SQL: &str = "\
     SELECT team_id, user_id, name, description, coordination, \
            members_json, context_json, worktree_mode, \
@@ -1081,6 +1083,64 @@ impl TeamPersistenceService for InMemoryTeamStore {
 
 // ─── MatrixOne-backed Implementation ────────────────────────────────────────
 
+struct OwnerInitializationCache {
+    capacity: usize,
+    inner: tokio::sync::Mutex<OwnerInitializationCacheInner>,
+}
+
+#[derive(Default)]
+struct OwnerInitializationCacheInner {
+    entries: HashMap<String, Arc<tokio::sync::OnceCell<()>>>,
+    order: VecDeque<String>,
+}
+
+impl OwnerInitializationCache {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "owner initialization cache must be bounded");
+        Self {
+            capacity,
+            inner: tokio::sync::Mutex::new(OwnerInitializationCacheInner::default()),
+        }
+    }
+
+    async fn cell_for(&self, user_id: &str) -> Arc<tokio::sync::OnceCell<()>> {
+        let mut inner = self.inner.lock().await;
+        if let Some(cell) = inner.entries.get(user_id).cloned() {
+            inner.order.retain(|owner| owner != user_id);
+            inner.order.push_back(user_id.to_string());
+            return cell;
+        }
+
+        while inner.entries.len() >= self.capacity {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        inner.entries.insert(user_id.to_string(), Arc::clone(&cell));
+        inner.order.push_back(user_id.to_string());
+        cell
+    }
+
+    async fn ensure<F, Fut>(&self, user_id: &str, initialize: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        self.cell_for(user_id)
+            .await
+            .get_or_try_init(|| async { initialize().await })
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.inner.lock().await.entries.len()
+    }
+}
+
 /// Team persistence backed by MatrixOne's `team_definitions` table.
 ///
 /// Uses sqlx connection pool with parameterized queries. The schema is created
@@ -1091,12 +1151,16 @@ impl TeamPersistenceService for InMemoryTeamStore {
 /// "isolated", "staged").
 pub struct MatrixOneTeamStore {
     pool: sqlx::Pool<sqlx::MySql>,
+    owner_initializations: OwnerInitializationCache,
 }
 
 impl MatrixOneTeamStore {
     /// Create from an existing connection pool.
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            owner_initializations: OwnerInitializationCache::new(BUILTIN_OWNER_INIT_CACHE_CAPACITY),
+        }
     }
 
     /// Materialize built-in teams without overwriting an owner's existing
@@ -1107,6 +1171,12 @@ impl MatrixOneTeamStore {
     /// overwrite a user customization when first-request initialization races
     /// with an explicit create.
     pub async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
+        self.owner_initializations
+            .ensure(user_id, || self.ensure_builtins_uncached(user_id))
+            .await
+    }
+
+    async fn ensure_builtins_uncached(&self, user_id: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         for team in builtin_teams(user_id, &now) {
             self.insert_builtin_if_absent(&team).await?;
@@ -1933,6 +2003,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_team() -> TeamDefinition {
         TeamDefinition {
@@ -1970,6 +2041,72 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn owner_initialization_cache_singleflights_concurrent_success() {
+        let cache = Arc::new(OwnerInitializationCache::new(8));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                cache
+                    .ensure("alice", || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_initialization_cache_retries_failures_without_growing_unbounded() {
+        let cache = OwnerInitializationCache::new(2);
+        let calls = AtomicUsize::new(0);
+
+        let first = cache
+            .ensure("alice", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("transient database failure".to_string())
+            })
+            .await;
+        assert_eq!(first, Err("transient database failure".to_string()));
+        cache
+            .ensure("alice", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cache.ensure("bob", || async { Ok(()) }).await.unwrap();
+        cache.ensure("carol", || async { Ok(()) }).await.unwrap();
+        assert_eq!(cache.len().await, 2);
+
+        let alice_reinitialized = AtomicUsize::new(0);
+        cache
+            .ensure("alice", || async {
+                alice_reinitialized.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_reinitialized.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.len().await, 2);
     }
 
     // ── Resolve ──

@@ -84,10 +84,10 @@ pub struct SessionStateCompact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_tracker: Option<Value>,
     /// Legacy CSL storage only. Never use as live execution policy.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub budget_remaining_tokens: u64,
     /// Legacy CSL storage only. Never use as live execution policy.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub budget_remaining_rounds: u32,
     #[serde(default)]
     pub consecutive_ctx_errors: u32,
@@ -126,9 +126,9 @@ pub struct SessionStatePatch {
     pub approval_overrides: Option<Option<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub interruption: Option<Option<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub budget_remaining_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub budget_remaining_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_ctx_errors: Option<u32>,
@@ -802,8 +802,10 @@ mod tests {
             activated_deferred_tool_names: vec!["write_file".into()],
             approval_overrides: Some(json!({"tool": "bash"})),
             compaction_tracker: Some(json!({"version": 1})),
-            budget_remaining_tokens: 50_000,
-            budget_remaining_rounds: 8,
+            // Legacy budget placeholders are deliberately not part of the
+            // serialized continuity contract.
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
             consecutive_ctx_errors: 2,
             delegation: Some(DelegationCompact {
                 id: "del-1".into(),
@@ -973,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_patch_with_budget_fields_roundtrip() {
+    fn serialization_omits_legacy_budget_placeholders() {
         let entry = delta_with_patch(
             1,
             2,
@@ -987,10 +989,46 @@ mod tests {
         );
         let json_str = serde_json::to_string(&entry).unwrap();
         let deser: CslEntry = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(entry, deser);
-        assert!(json_str.contains("budget_remaining_tokens"));
-        assert!(json_str.contains("budget_remaining_rounds"));
+        let CslEntry::TurnDelta { state_patch, .. } = deser else {
+            panic!("expected delta");
+        };
+        let state_patch = state_patch.expect("delta must retain non-budget fields");
+        assert_eq!(state_patch.budget_remaining_tokens, None);
+        assert_eq!(state_patch.budget_remaining_rounds, None);
+        assert!(!json_str.contains("budget_remaining_tokens"));
+        assert!(!json_str.contains("budget_remaining_rounds"));
         assert!(json_str.contains("consecutive_ctx_errors"));
+
+        let snapshot = CslEntry::Snapshot {
+            seq: 1,
+            turn: 1,
+            messages: Vec::new(),
+            session_state: SessionStateCompact {
+                budget_remaining_tokens: 42_000,
+                budget_remaining_rounds: 5,
+                ..Default::default()
+            },
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!snapshot_json.contains("budget_remaining_tokens"));
+        assert!(!snapshot_json.contains("budget_remaining_rounds"));
+    }
+
+    #[test]
+    fn legacy_budget_fields_remain_deserializable() {
+        let patch: SessionStatePatch = serde_json::from_str(
+            r#"{"budget_remaining_tokens":42000,"budget_remaining_rounds":5}"#,
+        )
+        .unwrap();
+        assert_eq!(patch.budget_remaining_tokens, Some(42_000));
+        assert_eq!(patch.budget_remaining_rounds, Some(5));
+
+        let state: SessionStateCompact = serde_json::from_str(
+            r#"{"budget_remaining_tokens":42000,"budget_remaining_rounds":5}"#,
+        )
+        .unwrap();
+        assert_eq!(state.budget_remaining_tokens, 42_000);
+        assert_eq!(state.budget_remaining_rounds, 5);
     }
 
     // ── Bug fix: apply_patch must be able to clear delegation ──

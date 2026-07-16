@@ -869,6 +869,7 @@ pub(crate) async fn stream_chat_sse(
             resolver: skill_resolver,
             executor: skill_executor,
             quality_tracker: p.skill_quality_tracker.clone(),
+            quality_tracker_baseline: p.skill_quality_tracker.clone(),
             improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             discovered: discovered_skills,
             tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&project_root),

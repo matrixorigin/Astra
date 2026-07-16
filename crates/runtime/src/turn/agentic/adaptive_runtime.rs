@@ -10,6 +10,48 @@ use std::collections::HashSet;
 
 use super::super::agentic_loop::host::{AgenticLoopOutcome, AgenticLoopState};
 
+fn per_turn_skill_quality_entries(
+    current: &crate::skills::quality::SkillQualityTracker,
+    baseline: &crate::skills::quality::SkillQualityTracker,
+) -> Vec<(String, crate::skills::quality::SkillQualityEntry)> {
+    current
+        .all_entries()
+        .iter()
+        .filter_map(|(name, current)| {
+            let baseline = baseline.get(name);
+            let invocations = current
+                .invocations
+                .saturating_sub(baseline.map_or(0, |entry| entry.invocations));
+            if invocations == 0 {
+                return None;
+            }
+            Some((
+                name.clone(),
+                crate::skills::quality::SkillQualityEntry {
+                    invocations,
+                    successes: current
+                        .successes
+                        .saturating_sub(baseline.map_or(0, |entry| entry.successes)),
+                    failures: current
+                        .failures
+                        .saturating_sub(baseline.map_or(0, |entry| entry.failures)),
+                    partial: current
+                        .partial
+                        .saturating_sub(baseline.map_or(0, |entry| entry.partial)),
+                    total_tokens: current
+                        .total_tokens
+                        .saturating_sub(baseline.map_or(0, |entry| entry.total_tokens)),
+                    total_duration_ms: current
+                        .total_duration_ms
+                        .saturating_sub(baseline.map_or(0, |entry| entry.total_duration_ms)),
+                    satisfaction_sum: 0.0,
+                    satisfaction_count: 0,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     if state.stall.tool_call_records.is_empty() {
         return (
@@ -207,10 +249,10 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 5. Skill quality signals ──
-    for (name, entry) in state.skills.quality_tracker.all_entries() {
-        if entry.invocations == 0 {
-            continue;
-        }
+    for (name, entry) in per_turn_skill_quality_entries(
+        &state.skills.quality_tracker,
+        &state.skills.quality_tracker_baseline,
+    ) {
         if entry.failures > 0 {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
@@ -311,7 +353,52 @@ pub(crate) fn record_loop_completion_feedback(
 
 #[cfg(test)]
 mod tests {
-    use super::should_emit_acceptance;
+    use super::{per_turn_skill_quality_entries, should_emit_acceptance};
+    use crate::skills::quality::{SkillOutcome, SkillQualityTracker};
+
+    fn record(tracker: &mut SkillQualityTracker, name: &str, succeeded: bool) {
+        tracker.record_outcome(&SkillOutcome {
+            skill_name: name.to_string(),
+            tokens_used: 10,
+            duration_ms: 20,
+            all_required_passed: succeeded,
+            partial: false,
+        });
+    }
+
+    #[test]
+    fn per_turn_skill_quality_ignores_unchanged_history() {
+        let mut tracker = SkillQualityTracker::new();
+        record(&mut tracker, "review", false);
+
+        assert!(per_turn_skill_quality_entries(&tracker, &tracker).is_empty());
+    }
+
+    #[test]
+    fn per_turn_skill_quality_does_not_reattribute_historical_failures() {
+        let mut baseline = SkillQualityTracker::new();
+        record(&mut baseline, "review", false);
+        let mut current = baseline.clone();
+        record(&mut current, "review", true);
+
+        let entries = per_turn_skill_quality_entries(&current, &baseline);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.invocations, 1);
+        assert_eq!(entries[0].1.successes, 1);
+        assert_eq!(entries[0].1.failures, 0);
+    }
+
+    #[test]
+    fn per_turn_skill_quality_reports_only_current_failures() {
+        let baseline = SkillQualityTracker::new();
+        let mut current = baseline.clone();
+        record(&mut current, "review", false);
+
+        let entries = per_turn_skill_quality_entries(&current, &baseline);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.invocations, 1);
+        assert_eq!(entries[0].1.failures, 1);
+    }
 
     #[test]
     fn acceptance_skipped_for_explicit_corrections() {

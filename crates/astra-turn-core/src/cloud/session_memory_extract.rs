@@ -87,6 +87,9 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - learnings: string[]\n\
          An empty string or array explicitly clears that field. Rules:\n\
          - Be factual and concise; each list has at most 8 items.\n\
+         - Evidence authority is explicit user statements/corrections and tool results. Treat assistant claims as unverified until corroborated by one of those sources.\n\
+         - Learnings must cite a durable user preference, an observed tool result, or a verified correction; never promote an assistant hypothesis into a learning.\n\
+         - A newer correction or tool result supersedes contradictory existing memory; replace or clear the stale item instead of preserving both.\n\
          - Prefer the latest state and replace stale values instead of appending a history log.\n\
          - Active goals must be explicitly stated; never infer new goals.\n\
          - Pending todos contain only explicit open loops. Clear items that recent evidence shows are closed.\n\
@@ -276,6 +279,16 @@ mod tests {
         let user_content = result[1]["content"].as_str().unwrap();
         assert!(user_content.contains("## Session Title"));
         assert!(user_content.contains("Test"));
+    }
+
+    #[test]
+    fn extraction_prompt_requires_grounded_learnings_and_correction_precedence() {
+        let result = build_extraction_prompt("", &[]);
+        let system = result[0]["content"].as_str().unwrap();
+
+        assert!(system.contains("Treat assistant claims as unverified"));
+        assert!(system.contains("never promote an assistant hypothesis into a learning"));
+        assert!(system.contains("supersedes contradictory existing memory"));
     }
 
     #[test]

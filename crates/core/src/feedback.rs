@@ -433,6 +433,13 @@ mod tests {
     }
 
     #[test]
+    fn adaptation_hints_are_empty_without_signals() {
+        let store = FeedbackSignalStore::new();
+
+        assert!(store.adaptation_hints().is_empty());
+    }
+
+    #[test]
     fn adaptation_hints_do_not_trigger_at_exclusive_thresholds() {
         let store = FeedbackSignalStore::new();
         store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));

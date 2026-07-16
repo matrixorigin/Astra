@@ -398,26 +398,23 @@ async fn build_reflect_response(
     } else {
         recent_events.len() as i64
     };
-    let mut error_count = 0i64;
-    for event in &recent_events {
-        if event.error.is_some()
-            || event.event_type.contains("error")
-            || event.event_type.contains("stall")
-        {
-            error_count += 1;
-        }
-    }
+    let adverse_count = recent_events
+        .iter()
+        .filter(|event| event_preview_has_adverse_signal(event))
+        .count() as i64;
     let data_coverage =
         local_reflect_data_coverage(&request, total_events, warnings.clone(), &recent_events);
     let summary = if total_events == 0 {
         "No local session observations are available yet.".to_string()
-    } else if error_count > 0 {
+    } else if adverse_count > 0 {
         format!(
-            "Local session artifacts show {} recent error/stall event{} across {} observed event{}.",
-            error_count,
-            if error_count == 1 { "" } else { "s" },
+            "Local session artifacts contain {} observed event{}; {} recent adverse or degraded signal{} appear in {} relevant event{} reviewed.",
             total_events,
-            if total_events == 1 { "" } else { "s" }
+            if total_events == 1 { "" } else { "s" },
+            adverse_count,
+            if adverse_count == 1 { "" } else { "s" },
+            recent_events.len(),
+            if recent_events.len() == 1 { "" } else { "s" },
         )
     } else if data_coverage.overall == "partial" {
         format!(
@@ -427,9 +424,11 @@ async fn build_reflect_response(
         )
     } else {
         format!(
-            "Local session artifacts show {} observed event{} with no local errors detected.",
+            "Local session artifacts contain {} observed event{}; {} recent relevant event{} reviewed contain no explicit adverse signal.",
             total_events,
-            if total_events == 1 { "" } else { "s" }
+            if total_events == 1 { "" } else { "s" },
+            recent_events.len(),
+            if recent_events.len() == 1 { "" } else { "s" },
         )
     };
     let (observations, evidence, graph_slice) =
@@ -611,7 +610,7 @@ fn local_reflect_observation_graph(
         nodes.push(ObservationGraphNode {
             ref_id: event_ref.clone(),
             layer: ObservationGraphLayer::Runtime,
-            kind: if event.error.is_some() || event.event_type.contains("error") {
+            kind: if event_preview_has_adverse_signal(event) {
                 ObservationGraphNodeKind::Outcome
             } else {
                 ObservationGraphNodeKind::Event
@@ -637,11 +636,7 @@ fn local_reflect_observation_graph(
         topic: request.topic.as_str().to_string(),
         facet: request.facet.as_str().to_string(),
         kind: "local_session_summary".to_string(),
-        severity: if recent_events.iter().any(|event| {
-            event.error.is_some()
-                || event.event_type.contains("error")
-                || event.event_type.contains("stall")
-        }) {
+        severity: if recent_events.iter().any(event_preview_has_adverse_signal) {
             "warning".to_string()
         } else {
             "info".to_string()
@@ -823,6 +818,10 @@ fn analysis_view_recent_event_previews(
             JournalEventType::TurnError,
             JournalEventType::Error,
             JournalEventType::StallDetected,
+            JournalEventType::TurnEvaluation,
+            JournalEventType::PipelineAlert,
+            JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentTerminated,
             JournalEventType::VerificationCompleted,
             JournalEventType::Turn,
         ],
@@ -830,10 +829,17 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::StallDetected,
+            JournalEventType::TurnEvaluation,
+            JournalEventType::PipelineAlert,
+            JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentTerminated,
             JournalEventType::AdaptivePerTurnApplied,
         ],
         "execution_tools" => &[
             JournalEventType::Turn,
+            JournalEventType::TurnEvaluation,
+            JournalEventType::PipelineAlert,
+            JournalEventType::AgentTerminated,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
@@ -843,6 +849,10 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Error,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
+            JournalEventType::TurnEvaluation,
+            JournalEventType::PipelineAlert,
+            JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentTerminated,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
             JournalEventType::VerificationCompleted,
@@ -853,6 +863,10 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Error,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
+            JournalEventType::TurnEvaluation,
+            JournalEventType::PipelineAlert,
+            JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentTerminated,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
@@ -1147,13 +1161,85 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 }
 
 fn event_preview_summary(event: &EventPreview) -> String {
+    let metadata_detail =
+        event
+            .metadata
+            .as_ref()
+            .and_then(|metadata| match event.event_type.as_str() {
+                "turn_evaluation" => metadata
+                    .get("signals")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|signals| {
+                        signals.iter().find_map(|signal| {
+                            signal.get("message").and_then(serde_json::Value::as_str)
+                        })
+                    })
+                    .or_else(|| {
+                        (metadata.get("success").and_then(serde_json::Value::as_bool)
+                            == Some(false))
+                        .then_some("turn evaluation reported unsuccessful execution")
+                    }),
+                "pipeline_alert" => metadata
+                    .get("alert_message")
+                    .and_then(serde_json::Value::as_str),
+                "session_memory_extraction" => metadata
+                    .get("llm_detail")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| metadata.get("reason").and_then(serde_json::Value::as_str)),
+                "agent_terminated" => metadata.get("status").and_then(serde_json::Value::as_str),
+                _ => None,
+            });
     event
         .error
         .as_deref()
         .or(event.user_input_preview.as_deref())
         .or(event.assistant_output_preview.as_deref())
+        .or(metadata_detail)
         .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
         .unwrap_or_else(|| event.event_type.clone())
+}
+
+fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
+    if event.error.is_some()
+        || event.event_type.contains("error")
+        || event.event_type.contains("stall")
+    {
+        return true;
+    }
+    let Some(metadata) = event.metadata.as_ref() else {
+        return false;
+    };
+    match event.event_type.as_str() {
+        "turn_evaluation" => {
+            metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                || metadata
+                    .get("verdict_warning")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        }
+        "pipeline_alert" => metadata
+            .get("alert_severity")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|severity| {
+                matches!(
+                    severity.to_ascii_lowercase().as_str(),
+                    "warning" | "error" | "critical"
+                )
+            }),
+        "session_memory_extraction" => {
+            metadata
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|outcome| matches!(outcome, "errored" | "failed"))
+                || metadata.get("source").and_then(serde_json::Value::as_str)
+                    == Some("rule_fallback")
+        }
+        "agent_terminated" => metadata
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| matches!(status, "failed" | "cancelled" | "interrupted")),
+        _ => false,
+    }
 }
 
 fn event_preview_evidence_source(event: &EventPreview) -> &'static str {
@@ -1876,6 +1962,65 @@ mod tests {
             response.evidence[0]
         );
         assert_eq!(response.observations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reflect_reports_failed_turn_evaluation_as_adverse_evidence() {
+        let session_id = "reflect-failed-evaluation-session";
+        let normal_turn = JournalEvent::turn(
+            Some(session_id),
+            1,
+            Some("gpt-5.4"),
+            "double check",
+            "reviewed",
+            1,
+            100,
+            25,
+            300,
+        );
+        let failed_evaluation = JournalEvent::turn_evaluation(
+            Some(session_id),
+            Some(1),
+            "cli_repl",
+            false,
+            false,
+            0.21,
+            0.37,
+            0.05,
+            0,
+            false,
+            23,
+            vec![serde_json::json!({
+                "kind": "llm_round_churn",
+                "message": "Detected 13 LLM rounds with low evidence yield"
+            })],
+        );
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: None,
+            journal_events: vec![normal_turn, failed_evaluation],
+            latest_full_context_trace: None,
+        };
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            None,
+            None,
+            4,
+            "",
+        );
+
+        let response = build_reflect_response(&artifacts, 4, request).await;
+
+        assert_eq!(response.observations[0].severity, "warning");
+        assert!(response.summary.contains("adverse or degraded"));
+        assert!(!response.summary.contains("no local errors detected"));
+        assert!(response.evidence.iter().any(|evidence| {
+            evidence
+                .summary
+                .contains("Detected 13 LLM rounds with low evidence yield")
+        }));
     }
 
     #[tokio::test]
