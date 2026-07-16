@@ -426,17 +426,11 @@ impl ThinClient {
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
-        let http_proxy = std::env::var("HTTP_PROXY")
-            .or_else(|_| std::env::var("http_proxy"))
-            .unwrap_or_else(|_| "(none)".to_string());
-        let no_proxy = std::env::var("NO_PROXY")
-            .or_else(|_| std::env::var("no_proxy"))
-            .unwrap_or_else(|_| "(none)".to_string());
         tracing::debug!(
             target: "astra_cli::http_proxy",
             url = %url,
-            http_proxy = %http_proxy,
-            no_proxy = %no_proxy,
+            http_proxy_set = std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy")).is_ok(),
+            no_proxy_set = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")).is_ok(),
             token_len = token.len(),
             "get_models_response_timeout: sending GET /models via self.http (proxy-aware client)"
         );

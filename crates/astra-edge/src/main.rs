@@ -322,7 +322,7 @@ async fn connect_via_proxy(
     let (proxy_host, proxy_port) = parse_proxy_addr(proxy_url)
         .ok_or_else(|| format!("Cannot parse proxy URL: {proxy_url}"))?;
 
-    tracing::info!(proxy = %proxy_url, target = %format!("{ws_host}:{ws_port}"), "CONNECT via proxy");
+    tracing::info!(proxy_host = %proxy_host, proxy_port, target = %format!("{ws_host}:{ws_port}"), "CONNECT via proxy");
 
     let mut tcp = tokio::net::TcpStream::connect(format!("{proxy_host}:{proxy_port}")).await?;
 
@@ -390,7 +390,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 target: "astra.edge",
                 edge_id = %config.edge_id,
                 url = %url,
-                proxy = %proxy_url,
+                proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
                 error = %e,
                 "WebSocket connect via proxy failed"
             );

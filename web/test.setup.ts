@@ -33,15 +33,28 @@ if (
   };
   const descriptor = Object.getOwnPropertyDescriptor(window, "localStorage");
   if (descriptor && !descriptor.configurable) {
-    throw new Error(
-      "test.setup.ts: window.localStorage is non-configurable in this environment. " +
-        "The fakeStorage mock cannot be installed. " +
-        "Check your Node/jsdom version or update the workaround in test.setup.ts."
-    );
+    // Property is non-configurable (Node 25 WinterCG): cannot replace wholesale.
+    // Patch missing methods on the existing object so tests can proceed.
+    try {
+      const ls = window.localStorage as unknown as Record<string, unknown>;
+      if (typeof ls["clear"] !== "function")
+        ls["clear"] = fakeStorage.clear.bind(fakeStorage);
+      if (typeof ls["getItem"] !== "function")
+        ls["getItem"] = fakeStorage.getItem.bind(fakeStorage);
+      if (typeof ls["setItem"] !== "function")
+        ls["setItem"] = fakeStorage.setItem.bind(fakeStorage);
+      if (typeof ls["removeItem"] !== "function")
+        ls["removeItem"] = fakeStorage.removeItem.bind(fakeStorage);
+      if (typeof ls["key"] !== "function")
+        ls["key"] = fakeStorage.key.bind(fakeStorage);
+    } catch {
+      // Ignore: if patching also fails, individual tests will surface the issue.
+    }
+  } else {
+    Object.defineProperty(window, "localStorage", {
+      value: fakeStorage,
+      writable: true,
+      configurable: true,
+    });
   }
-  Object.defineProperty(window, "localStorage", {
-    value: fakeStorage,
-    writable: true,
-    configurable: true,
-  });
 }

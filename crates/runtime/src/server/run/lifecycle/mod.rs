@@ -6793,6 +6793,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
+        // In agent-binding mode with an EdgeAgent executor, the host only installs
+        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
+        // for any tools explicitly listed in allow_tools so the model can see and call
+        // them via the edge dispatch path.
+        if let Some(snapshot) = execution_bindings.as_ref() {
+            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
+                if let Some(allow_tools) = request.allow_tools.as_deref() {
+                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
+                    host.merge_allowlisted_edge_tool_schemas(&tools);
+                }
+            }
+        }
         let mut loop_state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -7857,6 +7869,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
+        }
+        // In agent-binding mode with an EdgeAgent executor, the host only installs
+        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
+        // for any tools explicitly listed in allow_tools so the model can see and call
+        // them via the edge dispatch path.
+        if let Some(snapshot) = execution_bindings.as_ref() {
+            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
+                if let Some(allow_tools) = request.allow_tools.as_deref() {
+                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
+                    host.merge_allowlisted_edge_tool_schemas(&tools);
+                }
+            }
         }
 
         // Guard: reject if this session already has a blocking run.
