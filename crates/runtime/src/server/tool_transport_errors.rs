@@ -11,11 +11,39 @@ use super::tool_transport_metadata::{
 };
 
 pub(crate) fn edge_unavailable_message(request: &ToolExecutionRequest) -> String {
-    let fallback = "No alternate execution provider is available for this file environment.";
+    let fallback = "This is an executor-route failure shared by tools on the same binding; changing the tool name does not change the route. Reconnect or select a different bound executor/provider, or continue with explicitly degraded coverage.";
     format!(
         "Error: executor '{}' is offline or unreachable for tool '{}'. {}",
         request.executor.display_name, request.tool_name, fallback
     )
+}
+
+pub(crate) fn attach_route_unavailable_metadata(
+    metadata: &mut serde_json::Map<String, Value>,
+    request: &ToolExecutionRequest,
+    adapter_name: &str,
+    diagnostic: &str,
+) {
+    metadata.insert(
+        "failure_scope".to_string(),
+        Value::String("executor_transport".to_string()),
+    );
+    metadata.insert(
+        "disposition".to_string(),
+        Value::String("rejected".to_string()),
+    );
+    metadata.insert(
+        "route_failure".to_string(),
+        json!({
+            "executor_id": request.executor.executor_id,
+            "executor": request.executor.display_name,
+            "transport": request.executor.transport,
+            "workspace": request.workspace.display_name,
+            "adapter": adapter_name,
+            "diagnostic": diagnostic,
+            "shared_across_bound_tools": true,
+        }),
+    );
 }
 
 fn capability_denied_message(
@@ -77,6 +105,14 @@ pub(crate) fn capability_denied_result(
         TOOL_ERROR_KIND_CAPABILITY_DENIED
     };
     attach_runtime_error_metadata(&mut metadata, &runtime_error, runtime_reason);
+    if offline_edge_executor {
+        attach_route_unavailable_metadata(
+            &mut metadata,
+            request,
+            "edge",
+            "executor offline or unreachable",
+        );
+    }
     metadata.insert(
         "capability_denial".to_string(),
         serde_json::to_value(&reason).unwrap_or(Value::String(reason.to_string())),
@@ -208,7 +244,7 @@ pub(crate) fn transport_adapter_unavailable_result(
     let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
     let message = format!(
-        "{adapter_name} transport adapter unavailable for tool '{}' on executor '{}': {diagnostic}",
+        "{adapter_name} transport adapter unavailable for tool '{}' on executor '{}': {diagnostic}. This is an executor-route failure shared by tools on the same binding; changing the tool name does not change the route",
         request.tool_name, request.executor.display_name
     );
     attach_runtime_error_metadata(
@@ -220,8 +256,11 @@ pub(crate) fn transport_adapter_unavailable_result(
         "diagnostics".to_string(),
         Value::Array(vec![Value::String(diagnostic.to_string())]),
     );
+    attach_route_unavailable_metadata(&mut metadata, request, adapter_name, diagnostic);
     astra_tools::ToolResult {
-        output: format!("Error: {message}. No alternate execution provider was attempted."),
+        output: format!(
+            "Error: {message}. Reconnect or select a different bound executor/provider, or continue with explicitly degraded coverage."
+        ),
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),

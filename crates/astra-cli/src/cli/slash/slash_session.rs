@@ -1967,6 +1967,10 @@ pub(crate) async fn handle_session_command(
                             }
                             session_journal::JournalEventType::AgentTerminated => {
                                 let projection = project_agent_terminated(evt.metadata.as_ref());
+                                let turns = projection
+                                    .turns_completed
+                                    .map(|turns| turns.to_string())
+                                    .unwrap_or_else(|| "not reported".to_string());
                                 eprintln!(
                                     "  {} {} agent {} run {} → {} ({} turns)",
                                     ts_short.dim(),
@@ -1974,7 +1978,7 @@ pub(crate) async fn handle_session_command(
                                     projection.agent_id.dim(),
                                     projection.run_id.dim(),
                                     projection.status.magenta(),
-                                    projection.turns_completed,
+                                    turns,
                                 );
                             }
                             // Child conversation items have a dedicated

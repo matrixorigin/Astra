@@ -11,7 +11,7 @@ pub(crate) struct AgentTerminatedProjection {
     pub(crate) agent_id: String,
     pub(crate) run_id: String,
     pub(crate) status: String,
-    pub(crate) turns_completed: u64,
+    pub(crate) turns_completed: Option<u64>,
 }
 
 pub(crate) fn project_agent_spawned(metadata: Option<&Value>) -> AgentSpawnedProjection {
@@ -26,7 +26,7 @@ pub(crate) fn project_agent_terminated(metadata: Option<&Value>) -> AgentTermina
         agent_id: metadata_string(metadata, "agent_id").unwrap_or_else(|| "?".to_string()),
         run_id: metadata_string(metadata, "run_id").unwrap_or_else(|| "?".to_string()),
         status: metadata_string(metadata, "status").unwrap_or_else(|| "?".to_string()),
-        turns_completed: metadata_u64(metadata, "turns_completed").unwrap_or(0),
+        turns_completed: metadata_u64(metadata, "turns_completed"),
     }
 }
 
@@ -61,6 +61,11 @@ mod tests {
         assert_eq!(projection.agent_id, "reviewer@abc");
         assert_eq!(projection.run_id, "run-1");
         assert_eq!(projection.status, "interrupted");
-        assert_eq!(projection.turns_completed, 3);
+        assert_eq!(projection.turns_completed, Some(3));
+        assert!(
+            project_agent_terminated(Some(&json!({})))
+                .turns_completed
+                .is_none()
+        );
     }
 }

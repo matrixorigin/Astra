@@ -4959,7 +4959,7 @@ impl JournalEvent {
         agent_type: &str,
         status: &str,
         finish_reason: Option<&str>,
-        turns_completed: u32,
+        turns_completed: Option<u32>,
         tool_calls: u32,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -4972,12 +4972,14 @@ impl JournalEvent {
             "run_id": run_id,
             "agent_type": agent_type,
             "status": status,
-            "turns_completed": turns_completed,
             "tool_calls": tool_calls,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "duration_ms": duration_ms,
         });
+        if let Some(turns_completed) = turns_completed {
+            metadata["turns_completed"] = serde_json::json!(turns_completed);
+        }
         if let Some(finish_reason) = finish_reason.filter(|reason| !reason.is_empty()) {
             metadata["finish_reason"] = serde_json::Value::String(finish_reason.to_string());
         }
@@ -5920,6 +5922,29 @@ mod approval_tests {
         assert_eq!(metadata["turn_id"], "turn-3");
         assert_eq!(metadata["tool_count"], 1);
         assert_eq!(metadata["total_tokens"], 1234);
+    }
+
+    #[test]
+    fn agent_terminated_omits_unknown_turn_count_instead_of_fabricating_zero() {
+        let event = JournalEvent::agent_terminated(
+            Some("sess"),
+            "agent-1",
+            "run-1",
+            "general-purpose",
+            "interrupted",
+            Some("execution_incomplete"),
+            None,
+            2,
+            100,
+            20,
+            500,
+            None,
+        );
+        let metadata = event.metadata.expect("agent metadata");
+
+        assert!(metadata.get("turns_completed").is_none());
+        assert_eq!(metadata["tool_calls"], 2);
+        assert_eq!(metadata["finish_reason"], "execution_incomplete");
     }
 }
 

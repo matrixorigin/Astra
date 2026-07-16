@@ -1687,7 +1687,7 @@ mod provider_decision_projection_tests {
     }
 
     #[test]
-    fn provider_decision_prefers_edge_web_fetch_over_server_offer() {
+    fn provider_decision_keeps_web_fetch_independent_of_edge_workspace() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let workspace =
             WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
@@ -1706,20 +1706,26 @@ mod provider_decision_projection_tests {
         );
 
         assert!(decision.visible);
-        assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
-        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
+        assert_eq!(
+            decision.selected_route(),
+            ToolExecutionRouteKind::ServerRuntime
+        );
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("web_fetch@server-builtin")
+        );
         assert!(decision.candidates.iter().any(|candidate| {
             candidate.offer.offer_id == "web_fetch@server-builtin"
-                && !candidate.selected
+                && candidate.selected
                 && matches!(
                     candidate.reason,
-                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                    crate::server::tool_admission::ToolOfferCandidateReason::Selected
                 )
         }));
     }
 
     #[test]
-    fn provider_decision_reports_offline_edge_without_server_fallback() {
+    fn provider_decision_keeps_server_web_fetch_when_edge_is_offline() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let workspace =
             WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
@@ -1742,19 +1748,22 @@ mod provider_decision_projection_tests {
             ToolAdmissionContext::default(),
         );
 
-        assert!(!decision.visible);
+        assert!(decision.visible);
+        assert!(decision.hidden_reason.is_none());
         assert_eq!(
-            decision.hidden_reason,
-            Some(ToolHiddenReason::ProviderUnavailable)
+            decision.selected_route(),
+            ToolExecutionRouteKind::ServerRuntime
         );
-        assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
-        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("web_fetch@server-builtin")
+        );
         assert!(decision.candidates.iter().any(|candidate| {
             candidate.offer.offer_id == "web_fetch@server-builtin"
-                && !candidate.selected
+                && candidate.selected
                 && matches!(
                     candidate.reason,
-                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                    crate::server::tool_admission::ToolOfferCandidateReason::Selected
                 )
         }));
     }

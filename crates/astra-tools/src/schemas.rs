@@ -61,7 +61,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "new_status".to_string(),
-        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask status. deleted keeps an audit tombstone."}),
+        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask outcome. Use completed only when the task's definition of done is satisfied; use failed when execution finished but the requested outcome was not achieved; paused when work is resumable. deleted keeps an audit tombstone."}),
     );
     props.insert(
         "status_filter".to_string(),
@@ -115,7 +115,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "reason".to_string(),
-        json!({"type": "string", "description": "(update/stop/archive) Reason or subtask note."}),
+        json!({"type": "string", "description": "(update/stop/archive) Outcome evidence or subtask note. For terminal updates, state what was actually achieved or why it failed."}),
     );
     props.insert(
         "error_message".to_string(),

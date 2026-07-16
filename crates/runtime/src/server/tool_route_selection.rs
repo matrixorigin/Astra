@@ -154,22 +154,22 @@ pub(crate) fn routing_decision_for_binding(
 }
 
 fn shared_service_or_runtime_route_for_binding(
-    tool_name: &str,
+    _tool_name: &str,
     workspace_kind: WorkspaceBindingKind,
-    executor_transport: ToolTransportKind,
+    _executor_transport: ToolTransportKind,
 ) -> ToolExecutionRouteKind {
-    match runtime_executor_route_for_binding(tool_name, workspace_kind, executor_transport) {
+    if matches!(workspace_kind, WorkspaceBindingKind::LocalFilesystem) {
         ToolExecutionRouteKind::Unsupported
-            if matches!(workspace_kind, WorkspaceBindingKind::LocalFilesystem) =>
-        {
-            ToolExecutionRouteKind::Unsupported
-        }
-        ToolExecutionRouteKind::Unsupported => ToolExecutionRouteKind::ServerRuntime,
-        runtime_route => runtime_route,
+    } else {
+        // Shared services (web search/fetch) are workspace-independent. A
+        // file-workspace executor must not become their implicit provider.
+        // Admission can still select an explicit runtime/edge offer when the
+        // server service is unavailable or the caller selected that offer.
+        ToolExecutionRouteKind::ServerRuntime
     }
 }
 
-fn runtime_executor_route_for_binding(
+pub(crate) fn runtime_executor_route_for_binding(
     tool_name: &str,
     workspace_kind: WorkspaceBindingKind,
     executor_transport: ToolTransportKind,
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_network_tools_prefer_current_runtime_executor() {
+    fn shared_network_tools_prefer_workspace_independent_server_service() {
         struct Case {
             tool: &'static str,
             workspace: WorkspaceBindingKind,
@@ -540,31 +540,31 @@ mod tests {
                 tool: "web_fetch",
                 workspace: WorkspaceBindingKind::EdgeWorkspace,
                 transport: ToolTransportKind::EdgeWs,
-                expected: ToolExecutionRouteKind::EdgeBound,
+                expected: ToolExecutionRouteKind::ServerRuntime,
             },
             Case {
                 tool: "web_search",
                 workspace: WorkspaceBindingKind::EdgeWorkspace,
                 transport: ToolTransportKind::EdgeWs,
-                expected: ToolExecutionRouteKind::EdgeBound,
+                expected: ToolExecutionRouteKind::ServerRuntime,
             },
             Case {
                 tool: "web_fetch",
                 workspace: WorkspaceBindingKind::ServerSandbox,
                 transport: ToolTransportKind::ServerLocal,
-                expected: ToolExecutionRouteKind::ServerLocal,
+                expected: ToolExecutionRouteKind::ServerRuntime,
             },
             Case {
                 tool: "web_fetch",
                 workspace: WorkspaceBindingKind::None,
                 transport: ToolTransportKind::GatewayRelay,
-                expected: ToolExecutionRouteKind::GatewayRelay,
+                expected: ToolExecutionRouteKind::ServerRuntime,
             },
             Case {
                 tool: "web_fetch",
                 workspace: WorkspaceBindingKind::None,
                 transport: ToolTransportKind::SandboxResidentAgent,
-                expected: ToolExecutionRouteKind::SandboxResidentAgent,
+                expected: ToolExecutionRouteKind::ServerRuntime,
             },
         ];
 

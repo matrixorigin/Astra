@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::tool_edge_selection::{select_capable_connected_edge, select_capable_edge_agent};
 use super::tool_execution_binding::{ExecutorStatus, ToolExecutionRequest, ToolTransportKind};
-use super::tool_transport_errors::{capability_denied_result, edge_unavailable_message};
+use super::tool_transport_errors::{
+    attach_route_unavailable_metadata, capability_denied_result, edge_unavailable_message,
+};
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED,
     RUN_BLOCKED_REASON_TRANSPORT_UNAVAILABLE, TOOL_ERROR_KIND_CANCELLED,
@@ -639,6 +641,12 @@ fn edge_unavailable_result(
         &astra_runtime_env::RuntimeError::executor_offline(edge_unavailable_message(request)),
         RUN_BLOCKED_REASON_EXECUTOR_OFFLINE,
     );
+    attach_route_unavailable_metadata(
+        &mut metadata,
+        request,
+        "edge",
+        "executor offline or unreachable",
+    );
     astra_tools::ToolResult {
         output: edge_unavailable_message(request),
         metadata: Some(metadata),
@@ -663,7 +671,7 @@ fn edge_transport_failure_message(
         )
     } else {
         format!(
-            "Error: transport '{}' is unavailable before tool '{}' was dispatched to executor '{}'. Configure durable dispatch and reconnect the executor before retrying. No alternate execution provider is available for this file environment.",
+            "Error: transport '{}' is unavailable before tool '{}' was dispatched to executor '{}'. This is an executor-route failure shared by tools on the same binding; changing the tool name does not change the route. Reconnect or select a different bound executor/provider, or continue with explicitly degraded coverage.",
             serde_json::to_value(request.executor.transport)
                 .ok()
                 .and_then(|value| value.as_str().map(ToString::to_string))
@@ -735,8 +743,15 @@ fn edge_transport_failure_result(
     if !diagnostics.is_empty() {
         metadata.insert(
             "diagnostics".to_string(),
-            Value::Array(diagnostics.into_iter().map(Value::String).collect()),
+            Value::Array(diagnostics.iter().cloned().map(Value::String).collect()),
         );
+    }
+    if !outcome_may_be_unknown {
+        let diagnostic = diagnostics
+            .first()
+            .map(String::as_str)
+            .unwrap_or("transport unavailable before dispatch");
+        attach_route_unavailable_metadata(&mut metadata, request, "edge", diagnostic);
     }
     if outcome_may_be_unknown {
         metadata.insert("side_effects_maybe".to_string(), Value::Bool(true));

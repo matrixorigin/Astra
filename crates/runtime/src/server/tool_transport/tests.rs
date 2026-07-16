@@ -1744,6 +1744,13 @@ async fn orchestrator_managed_without_transport_returns_transport_unavailable() 
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["execution_started"], false);
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
+    assert_eq!(metadata["failure_scope"], "executor_transport");
+    assert_eq!(metadata["disposition"], "rejected");
+    assert_eq!(
+        metadata["route_failure"]["executor_id"],
+        "orchestrator:snapshot"
+    );
+    assert_eq!(metadata["route_failure"]["shared_across_bound_tools"], true);
     assert!(
         metadata["runtime_error"]["message"]
             .as_str()
@@ -2592,7 +2599,7 @@ async fn edge_offline_does_not_call_server_local() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("No alternate execution provider"),
+        result.output.contains("changing the tool name"),
         "{}",
         result.output
     );
@@ -2600,6 +2607,8 @@ async fn edge_offline_does_not_call_server_local() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["executor"]["status"], "offline");
+    assert_eq!(metadata["failure_scope"], "executor_transport");
+    assert_eq!(metadata["disposition"], "rejected");
     assert_eq!(local.calls(), 0);
 }
 
@@ -3553,7 +3562,7 @@ async fn server_runtime_tools_bypass_edge_transport() {
 }
 
 #[tokio::test]
-async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_binding() {
+async fn shared_network_tools_use_server_unless_an_edge_offer_is_explicitly_selected() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
@@ -3594,10 +3603,19 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
         );
         assert_eq!(
             service.routing_decision(&edge_request),
-            ToolExecutionRouteKind::EdgeBound,
-            "{tool} must prefer the selected edge executor"
+            ToolExecutionRouteKind::ServerRuntime,
+            "{tool} must not inherit the file workspace route"
         );
-        let edge_result = service.execute(edge_request, &local).await;
+        let edge_result = service
+            .execute(
+                edge_request.with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+                    tool,
+                    "edge-selected",
+                    ToolExecutionRouteKind::EdgeBound,
+                )),
+                &local,
+            )
+            .await;
         assert!(!edge_result.is_error, "{tool}: {edge_result:?}");
         assert_eq!(edge_result.output, "ledger-result");
     }
@@ -3614,7 +3632,7 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
 }
 
 #[tokio::test]
-async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
+async fn disabled_shared_network_server_offer_does_not_block_explicit_edge_offer() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
@@ -3655,7 +3673,12 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
                     ToolTransportKind::EdgeWs,
                     ExecutorStatus::Online,
                 ),
-            ),
+            )
+            .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+                "web_fetch",
+                "edge-selected",
+                ToolExecutionRouteKind::EdgeBound,
+            )),
             &local,
         )
         .await;

@@ -928,8 +928,8 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
 // ── Invariant 7: protocol-shape validity across the full matrix ────────────
 //
 // Failing this is how prod-only regressions slip past green CI. My last
-// fix (bridge volatile preamble) satisfied every byte-level assertion in
-// this file but appended `[user, assistant: "Understood."]` at the tail,
+// A previous bridge volatile-preamble fix satisfied every byte-level assertion
+// in this file but appended a synthetic assistant acknowledgement at the tail,
 // which made the conversation end with `role=assistant` and broke
 // Bedrock Claude with HTTP 400 (session 6f167b47). No unit test caught
 // it because the matrix only hashed messages; it didn't validate the
@@ -1036,13 +1036,12 @@ async fn matrix_tool_loop_wire_payload_is_protocol_valid() {
 
 #[test]
 fn assert_protocol_valid_catches_trailing_assistant() {
-    // Payload ending with role=assistant "Understood." — this is exactly
-    // what my bad bridge_inprocess fix produced, and what Bedrock HTTP
-    // 400'd on.
+    // A synthetic assistant acknowledgement at the tail is invalid provider
+    // framing: Bedrock rejects assistant-prefill.
     let bad = vec![
         json!({"role": "system", "content": "sys"}),
         json!({"role": "user", "content": "hi"}),
-        json!({"role": "assistant", "content": "Understood."}),
+        json!({"role": "assistant", "content": "acknowledged"}),
     ];
     let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
     assert!(

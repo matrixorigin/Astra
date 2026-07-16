@@ -114,7 +114,14 @@ pub fn append_headless_result_quality_feedback(
     } else {
         turn_guard.record_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
     };
-    if let Some(feedback) = turn_guard.result_feedback(name, result_quality) {
+    // Execution errors already received classified recovery evidence in
+    // `enrich_headless_tool_output_for_errors_and_limits`. Appending generic
+    // quality feedback here creates a second, often contradictory instruction
+    // (for example "try another tool" after a route-scoped transport failure).
+    if !execution_failed
+        && !resource_limit_recorded
+        && let Some(feedback) = turn_guard.result_feedback(name, result_quality)
+    {
         result_str.push_str(&format!("\n{feedback}"));
     }
     result_quality
@@ -432,6 +439,10 @@ mod tests {
         let health = tg.health.get("outline").expect("tool health");
         assert_eq!(health.total_failures, 1);
         assert_eq!(health.consecutive_failures, 1);
+        assert!(
+            !out.contains("Use another tool only"),
+            "classified recovery must not receive a second generic error instruction: {out}"
+        );
     }
 
     #[test]

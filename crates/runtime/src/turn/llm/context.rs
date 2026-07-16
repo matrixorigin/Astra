@@ -1295,16 +1295,10 @@ fn volatile_preamble_from_text(text: String, inject: bool) -> Vec<Value> {
     if !inject || text.is_empty() {
         return Vec::new();
     }
-    vec![
-        json!({
-            "role": "user",
-            "content": ensure_system_reminder_wrapper(&text),
-        }),
-        json!({
-            "role": "assistant",
-            "content": "Understood.",
-        }),
-    ]
+    vec![json!({
+        "role": "user",
+        "content": ensure_system_reminder_wrapper(&text),
+    })]
 }
 
 fn ensure_system_reminder_wrapper(text: &str) -> String {
@@ -1564,6 +1558,10 @@ pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> 
         .iter()
         .filter(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message))
         .cloned()
+        .map(|mut message| {
+            crate::turn::wire_assembly::strip_runtime_context_from_tool_message(&mut message);
+            message
+        })
         .collect()
 }
 
@@ -1667,15 +1665,13 @@ pub(crate) fn finalize_bridge_wire_messages(
             }
             synthetic_tail_prefix_end = Some(tail_index);
         } else if tail_role == Some("tool") {
-            synthetic_tail_prefix_end = Some(llm_messages.len());
-            llm_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": "Understood.",
-            }));
-            llm_messages.push(serde_json::json!({
-                "role": "user",
-                "content": text,
-            }));
+            let tail_index = llm_messages.len().saturating_sub(1);
+            if let Some(tail) = llm_messages.last_mut() {
+                crate::turn::wire_assembly::append_runtime_context_to_tail_tool_message(
+                    tail, &text,
+                );
+            }
+            synthetic_tail_prefix_end = Some(tail_index);
         } else {
             synthetic_tail_prefix_end = Some(llm_messages.len());
             llm_messages.push(serde_json::json!({
@@ -2806,10 +2802,14 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[3]["role"], "assistant");
-        assert_eq!(messages[3]["content"], "Understood.");
-        assert_eq!(messages[4]["role"], "user");
-        assert_eq!(messages[4]["content"], "volatile");
+        assert_eq!(messages[2]["role"], "tool");
+        assert!(message_text(&messages[2]).starts_with("tool output"));
+        assert!(message_text(&messages[2]).contains("volatile"));
+        assert_eq!(
+            messages.len(),
+            3,
+            "runtime framing must not invent any conversation turn"
+        );
     }
 
     #[test]
@@ -2847,15 +2847,16 @@ mod context_cache_contract_tests {
             "sess",
         );
 
-        assert_eq!(synthetic_tail_prefix_end, Some(4));
+        assert_eq!(synthetic_tail_prefix_end, Some(3));
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
-            "live tool-loop shape must mark the last real tool result before the synthetic suffix",
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[2]),
+            "live tool-loop shape must mark the stable message before the dynamic tool tail",
         );
         assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&messages[5]),
-            "synthetic reminder tail must remain unannotated",
+            !astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
+            "dynamic tool/runtime tail must remain unannotated",
         );
+        assert!(message_text(&messages[3]).contains("volatile"));
     }
 
     #[test]
@@ -2867,13 +2868,19 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "keep"}),
             required_tail,
             json!({"role": "assistant", "content": "keep too"}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "tool evidence\n\n<runtime-context-after-tool>\nold runtime\n</runtime-context-after-tool>"
+            }),
         ];
 
         let history = bridge_retry_compaction_history(&messages);
 
-        assert_eq!(history.len(), 2);
+        assert_eq!(history.len(), 3);
         assert_eq!(history[0]["content"], "keep");
         assert_eq!(history[1]["content"], "keep too");
+        assert_eq!(history[2]["content"], "tool evidence");
         assert!(
             history
                 .iter()

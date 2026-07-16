@@ -743,14 +743,15 @@ fn disabled_offer_id_for_request(
     admission: &super::tool_admission::ToolAdmissionDecision,
     disabled_offer_ids: &HashSet<String>,
 ) -> Option<String> {
+    if let Some(offer) = request.selected_offer.as_ref() {
+        return disabled_offer_ids
+            .contains(&offer.offer_id)
+            .then(|| offer.offer_id.clone());
+    }
     if admission.hidden_reason == Some(ToolHiddenReason::DisabledOffer) {
         return admission.selected_offer_id().map(str::to_string);
     }
-    request
-        .selected_offer
-        .as_ref()
-        .filter(|offer| disabled_offer_ids.contains(&offer.offer_id))
-        .map(|offer| offer.offer_id.clone())
+    None
 }
 
 fn disallowed_offer_id_for_request(
@@ -758,15 +759,17 @@ fn disallowed_offer_id_for_request(
     admission: &super::tool_admission::ToolAdmissionDecision,
     provider_allowed_tools: &HashMap<String, HashSet<String>>,
 ) -> Option<(String, String)> {
+    if let Some(offer) = request.selected_offer.as_ref() {
+        return provider_allowed_tools
+            .get(&offer.provider_id)
+            .is_some_and(|allowed| !allowed.contains(&request.tool_name))
+            .then(|| (offer.offer_id.clone(), offer.provider_id.clone()));
+    }
     if admission.hidden_reason == Some(ToolHiddenReason::ProviderToolNotAllowed) {
         let offer = admission.selected_offer.as_ref()?;
         return Some((offer.offer_id.clone(), offer.provider_id.clone()));
     }
-    let offer = request.selected_offer.as_ref()?;
-    provider_allowed_tools
-        .get(&offer.provider_id)
-        .is_some_and(|allowed| !allowed.contains(&request.tool_name))
-        .then(|| (offer.offer_id.clone(), offer.provider_id.clone()))
+    None
 }
 
 fn admission_denied_unavailable_reason(

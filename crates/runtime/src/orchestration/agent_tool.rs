@@ -2685,6 +2685,30 @@ mod tests {
         }
     }
 
+    struct ExecutionIncompleteSpawnExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for ExecutionIncompleteSpawnExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "execution_incomplete".into(),
+                cancelled_by_user: None,
+                output: Some("The bound transport was unavailable.".into()),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                tool_calls: 2,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
     struct FailedSpawnExecutor;
 
     #[async_trait::async_trait]
@@ -4381,6 +4405,45 @@ mod tests {
             collected_value["results"][0]["recovery"]["rerun_policy"],
             "resume_existing_agent_or_report_incomplete"
         );
+    }
+
+    #[tokio::test]
+    async fn fanout_reports_execution_incomplete_child_as_an_issue_not_success() {
+        let spawner = test_spawner(Arc::new(ExecutionIncompleteSpawnExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [{
+                    "id": "news",
+                    "description": "Fetch one headline",
+                    "prompt": "Fetch one current headline"
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "interrupted");
+        assert_eq!(value["interrupted"], 1);
+        assert_eq!(value["agents"][0]["finish_reason"], "execution_incomplete");
+        assert_eq!(value["agents"][0]["status"], "interrupted");
+
+        let collected = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": value["group_id"].as_str().unwrap()
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let collected: Value = serde_json::from_str(&collected).unwrap();
+        assert_eq!(collected["status"], "completed_with_issues");
+        assert_eq!(collected["completed"], Value::Null);
+        assert_eq!(collected["interrupted"], 1);
     }
 
     #[tokio::test]

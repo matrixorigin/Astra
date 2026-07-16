@@ -121,7 +121,7 @@ pub fn quality_feedback(tool_name: &str, quality: ResultQuality) -> Option<Strin
     match quality {
         ResultQuality::Success => None,
         ResultQuality::Error => Some(format!(
-            "⚠ {} returned an error. Check the error details and either fix the arguments or try an alternative tool.",
+            "⚠ {} returned an error. Follow the structured failure scope: correct invalid arguments, or change the bound provider/executor when the runtime route failed. Use another tool only when it provides the required capability through a genuinely different available route.",
             tool_name
         )),
         ResultQuality::Empty => Some(format!(

@@ -1010,6 +1010,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let _ = host.flush_agent_transcript(&state);
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        if matches!(&loop_result, Ok(AgenticLoopOutcome::Completed)) {
+            astra_runtime::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
+                &mut state,
+            );
+        }
         // The happy-path hook normally keeps this current. A terminal flush
         // retains tool messages appended after the last successful ingest and
         // partial history from cancelled/failed loops.
@@ -1078,7 +1083,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .interruption
             .as_ref()
             .map(|i| i.kind.label().to_string());
-
         // Helper: tell any live event sink that the sub-agent has
         // reached a terminal state. The TUI's `agent_runs` registry
         // is updated via this signal so the strip row flips from ◦
@@ -1147,25 +1151,44 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Completed) => {
-                // Emit completed event
-                if let Some(ref emitter) = progress_emitter {
-                    let summary = if state.final_text.len() > 100 {
-                        format!(
-                            "{}...",
-                            state.final_text.chars().take(100).collect::<String>()
-                        )
-                    } else {
-                        state.final_text.clone()
-                    };
-                    emitter.completed(
-                        summary,
-                        tool_calls,
-                        (prompt_tokens, completion_tokens),
-                        duration_ms,
+                let summary = if state.final_text.len() > 100 {
+                    format!(
+                        "{}...",
+                        state.final_text.chars().take(100).collect::<String>()
+                    )
+                } else {
+                    state.final_text.clone()
+                };
+                let interrupted =
+                    astra_turn_core::orchestration_types::agent_completion_is_interrupted(
+                        finish_reason_from_state.as_deref(),
                     );
+                if let Some(ref emitter) = progress_emitter {
+                    if interrupted {
+                        emitter.interrupted(
+                            finish_reason_from_state
+                                .clone()
+                                .unwrap_or_else(|| "interrupted".to_string()),
+                            summary,
+                            tool_calls,
+                            (prompt_tokens, completion_tokens),
+                            duration_ms,
+                        );
+                    } else {
+                        emitter.completed(
+                            summary,
+                            tool_calls,
+                            (prompt_tokens, completion_tokens),
+                            duration_ms,
+                        );
+                    }
                 }
                 emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    if interrupted {
+                        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+                    } else {
+                        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
+                    },
                     finish_reason_from_state.clone(),
                 );
                 Ok(SpawnRunResult {

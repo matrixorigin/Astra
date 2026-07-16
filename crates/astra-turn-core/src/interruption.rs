@@ -47,6 +47,9 @@ pub enum InterruptionKind {
     HarnessPaused,
     /// Generic legacy interruption marker from pre-structured agent result paths.
     Interrupted,
+    /// The model produced a terminal response, but structured tool/runtime
+    /// evidence shows the requested execution did not complete.
+    ExecutionIncomplete,
     /// Executor task/channel disappeared before a terminal result was delivered.
     ExecutorDropped,
 }
@@ -73,6 +76,7 @@ impl InterruptionKind {
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
             Self::Interrupted => "interrupted",
+            Self::ExecutionIncomplete => "execution_incomplete",
             Self::ExecutorDropped => "executor_dropped",
         }
     }
@@ -97,6 +101,7 @@ impl InterruptionKind {
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
             "interrupted" => Some(Self::Interrupted),
+            "execution_incomplete" => Some(Self::ExecutionIncomplete),
             "executor_dropped" => Some(Self::ExecutorDropped),
             _ => None,
         }
@@ -118,6 +123,7 @@ impl InterruptionKind {
             | Self::StreamTransport
             | Self::StreamIdle
             | Self::Interrupted
+            | Self::ExecutionIncomplete
             | Self::ExecutorDropped => true,
             Self::ContextOverflow => true, // resumable with compaction
             Self::AuthFailure => false,    // needs external credential refresh

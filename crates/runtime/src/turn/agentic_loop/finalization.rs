@@ -381,6 +381,49 @@ fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>
     blocked_tools
 }
 
+/// Promote unresolved structured tool/runtime failures into child-run
+/// lifecycle before callers project a successful completion.
+///
+/// A model may produce a useful explanation after every tool failed. That is
+/// a completed model response, but not a completed delegated task. Keeping the
+/// projection here gives CLI, Server-only, and Edge+Server the same semantics
+/// without parsing assistant prose.
+pub fn mark_execution_incomplete_from_turn_evaluation(state: &mut AgenticLoopState) -> bool {
+    if state.interruption.is_some() {
+        return false;
+    }
+    let has_verdict_warning = state.stall.verdict_events.iter().any(|verdict| {
+        verdict.severity.eq_ignore_ascii_case("warning")
+            || verdict.severity.eq_ignore_ascii_case("critical")
+    });
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        has_verdict_warning,
+        state.telemetry.first_budget_pressure,
+        crate::pipeline::evaluation::current_evaluation_thresholds(),
+    );
+    if !crate::pipeline::evaluation::turn_evaluation_has_unresolved_execution_failure(&evaluation) {
+        return false;
+    }
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
+            tool_calls_completed: state.total_tool_calls,
+            turns_completed: state.llm_rounds_completed,
+            remaining_turns: u32::try_from(state.remaining_turns).unwrap_or(u32::MAX),
+            error_detail: crate::pipeline::evaluation::turn_evaluation_status_notice(&evaluation),
+            stall_signal: None,
+            resume_restricted_tools: Vec::new(),
+        },
+    ));
+    true
+}
+
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (for example text-only
@@ -1182,6 +1225,38 @@ mod tests {
 
         assert_eq!(state.final_text, "Done.");
         assert!(state.final_text_streamed);
+    }
+
+    #[test]
+    fn unresolved_execution_marks_child_lifecycle_incomplete_without_rewriting_output() {
+        let mut state = make_state();
+        state.message = "fetch one current headline".to_string();
+        state.final_text = "The bound executor is unavailable.".to_string();
+        state.total_tool_calls = 2;
+        state.llm_rounds_completed = 3;
+        state.remaining_turns = 7;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "web_fetch".to_string(),
+                ok: true,
+                result_class: Some("execution_error".to_string()),
+                exit_semantics: Some("domain_negative".to_string()),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                ..Default::default()
+            });
+
+        assert!(mark_execution_incomplete_from_turn_evaluation(&mut state));
+        let interruption = state.interruption.as_ref().expect("interruption");
+        assert_eq!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+        );
+        assert_eq!(interruption.tool_calls_completed, 2);
+        assert_eq!(interruption.turns_completed, 3);
+        assert_eq!(interruption.remaining_turns, 7);
+        assert_eq!(state.final_text, "The bound executor is unavailable.");
     }
 
     #[test]

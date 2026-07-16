@@ -11135,6 +11135,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+        if matches!(&outcome, Ok(AgenticLoopOutcome::Completed)) {
+            crate::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
+                &mut loop_state,
+            );
+        }
 
         // Commit the durable lifecycle fact before slower transcript,
         // observability, and cleanup work. Otherwise a completed child can

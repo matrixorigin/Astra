@@ -27,6 +27,21 @@ use astra_turn_core::tool_result_sanitize::{
     tool_result_content_for_model_unbounded, truncate_tool_result_for_model,
 };
 
+fn tool_call_disposition_from_result_fields(
+    fields: &serde_json::Map<String, Value>,
+    fallback: astra_services::session_journal::ToolCallDisposition,
+) -> astra_services::session_journal::ToolCallDisposition {
+    fields
+        .get("disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| {
+            (fields.get("execution_started").and_then(Value::as_bool) == Some(false))
+                .then_some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        })
+        .unwrap_or(fallback)
+}
+
 fn emit_tool_display_feedback(
     quiet: bool,
     term: &mut dyn HeadlessRoundTerminal,
@@ -218,11 +233,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             rec.tool_call_id = Some(execution.id.clone());
             rec.error_kind = error_kind;
             if let Some(fields) = execution.tool_result_fields.as_ref() {
-                rec.disposition = fields
-                    .get("disposition")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value(value).ok())
-                    .or(rec.disposition);
+                rec.disposition = Some(tool_call_disposition_from_result_fields(
+                    fields,
+                    rec.effective_disposition(),
+                ));
                 rec.exit_semantics = fields
                     .get("exit_semantics")
                     .and_then(serde_json::Value::as_str)
@@ -371,5 +385,45 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::session_journal::ToolCallDisposition;
+    use serde_json::json;
+
+    #[test]
+    fn result_that_never_started_is_rejected_not_executed() {
+        let fields = json!({
+            "execution_started": false,
+            "error_kind": "transport_unavailable",
+            "failure_scope": "executor_transport",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert_eq!(
+            tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
+            ToolCallDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn explicit_disposition_remains_authoritative() {
+        let fields = json!({
+            "execution_started": false,
+            "disposition": "deferred",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert_eq!(
+            tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
+            ToolCallDisposition::Deferred
+        );
     }
 }

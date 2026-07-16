@@ -28,6 +28,8 @@ use crate::turn::cloud::memoria_compact::{
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
+const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
+const TOOL_RUNTIME_CONTEXT_SUFFIX: &str = "</runtime-context-after-tool>";
 
 pub(crate) fn required_runtime_preamble_message(text: &str) -> Option<Value> {
     let text = text.trim();
@@ -416,10 +418,9 @@ fn is_completion_signal(content: &str) -> bool {
 /// 2. `compacted_messages` (conversation history from Memoria).
 /// 3. `volatile_preamble` content is attached as runtime context adjacent to
 ///    the true tail. If the last message is already `role=user`, append the
-///    runtime suffix after the real user text. If the tail is `role=tool`,
-///    append `assistant("Understood.")` and then a synthetic runtime
-///    `role=user` message. This keeps provider wire payloads protocol-valid:
-///    no `role=system` message may appear after `msg[0]`.
+///    runtime suffix after the real user text. If it is `role=tool`, append
+///    inside that tool result. Otherwise append one synthetic runtime
+///    `role=user` message. No assistant acknowledgement is invented.
 /// 4. `strip_stale_reasoning` is applied in place.
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
@@ -487,20 +488,6 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             if content.is_empty() {
                 continue;
             }
-            if message
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user")
-                == "assistant"
-            {
-                // Historical volatile preamble was represented as a
-                // user reminder plus an assistant acknowledgement. The
-                // acknowledgement is a transport shim, not instruction
-                // content, so it must not be folded into the synthetic
-                // reminder user. If the protocol tail requires an assistant
-                // bridge, we synthesize that below from the real tail role.
-                continue;
-            }
             runtime_parts.push(content.to_string());
         }
 
@@ -518,15 +505,14 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
                     );
                 }
             } else if tail_role == Some("tool") {
-                synthetic_tail_start = Some(llm_messages.len());
-                llm_messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": "Understood.",
-                }));
-                llm_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": runtime_tail_text,
-                }));
+                let tool_index = llm_messages.len().saturating_sub(1);
+                if let Some(tail) = llm_messages.last_mut() {
+                    append_runtime_context_to_tail_tool_message(tail, &runtime_tail_text);
+                }
+                // The tool result now contains per-round runtime bytes. Keep
+                // it outside the stable prefix instead of caching volatile
+                // content or inventing an assistant acknowledgement.
+                synthetic_tail_start = Some(tool_index);
                 synthetic_tail_end = Some(llm_messages.len());
             } else {
                 synthetic_tail_start = Some(llm_messages.len());
@@ -569,17 +555,15 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         llm_messages.extend(file_messages);
     }
 
-    // When synthetic runtime context was appended as the final suffix (no
-    // attachments landed after it), place the message-level cache marker on the
-    // last REAL message before the synthetic assistant/user reminder pair.
-    // Otherwise the synthesized reminder would consume the only message marker
-    // and we'd fall back to caching just system+tools on every tool-loop round.
+    // When dynamic runtime context was appended at the final suffix (either as
+    // a synthetic user message or inside the tail tool result), place the
+    // message-level cache marker on the last stable message before it.
     //
     // User-tail volatile context is appended inside the final user message as
     // a post-marker content block. Inserting it before the latest user would
     // put per-round runtime bytes inside the Anthropic cached prefix and churn
     // historical message hashes on the next turn; appending it as a separate
-    // role=system message would violate Anthropic/Bedrock role alternation.
+    // role=system message would violate provider prefix constraints.
     let synthetic_tail_is_final = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
     if cache_cfg.should_annotate() && !tail_user_cache_boundary_applied {
         if synthetic_tail_is_final {
@@ -595,6 +579,84 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         }
     }
     llm_messages
+}
+
+pub(crate) fn append_runtime_context_to_tail_tool_message(message: &mut Value, runtime_text: &str) {
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let runtime_suffix =
+        format!("\n\n{TOOL_RUNTIME_CONTEXT_PREFIX}\n{runtime_text}\n{TOOL_RUNTIME_CONTEXT_SUFFIX}");
+    match object.get_mut("content") {
+        Some(Value::String(text)) => text.push_str(&runtime_suffix),
+        Some(Value::Array(blocks)) => {
+            let appended = blocks.iter_mut().rev().any(|block| {
+                for field in ["text", "content"] {
+                    if let Some(text) = block.get_mut(field).and_then(|value| value.as_str()) {
+                        let mut combined = text.to_string();
+                        combined.push_str(&runtime_suffix);
+                        block[field] = Value::String(combined);
+                        return true;
+                    }
+                }
+                false
+            });
+            if !appended {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": runtime_suffix.trim_start(),
+                }));
+            }
+        }
+        _ => {
+            object.insert(
+                "content".to_string(),
+                Value::String(runtime_suffix.trim_start().to_string()),
+            );
+        }
+    }
+}
+
+pub(crate) fn strip_runtime_context_from_tool_message(message: &mut Value) {
+    if message.get("role").and_then(Value::as_str) != Some("tool") {
+        return;
+    }
+    fn strip_suffix(text: &mut String) {
+        if let Some(index) = text.rfind(TOOL_RUNTIME_CONTEXT_PREFIX)
+            && text[index..]
+                .trim_end()
+                .ends_with(TOOL_RUNTIME_CONTEXT_SUFFIX)
+        {
+            let mut end = index;
+            while end > 0 && text.as_bytes()[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+    }
+
+    match message.get_mut("content") {
+        Some(Value::String(text)) => strip_suffix(text),
+        Some(Value::Array(blocks)) => {
+            for block in blocks.iter_mut() {
+                for field in ["text", "content"] {
+                    if let Some(text) = block.get_mut(field).and_then(|value| value.as_str()) {
+                        let mut stripped = text.to_string();
+                        strip_suffix(&mut stripped);
+                        block[field] = Value::String(stripped);
+                    }
+                }
+            }
+            blocks.retain(|block| {
+                let text_fields = ["text", "content"]
+                    .iter()
+                    .filter_map(|field| block.get(*field).and_then(Value::as_str))
+                    .collect::<Vec<_>>();
+                text_fields.is_empty() || text_fields.iter().any(|text| !text.trim().is_empty())
+            });
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn append_volatile_to_tail_user_message(
@@ -1283,7 +1345,6 @@ mod tests {
         let stable_sys = vec![json!({"role": "system", "content": "stable core rules only"})];
         let volatile_preamble = vec![
             json!({"role": "user", "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
         ];
         let history = vec![
             json!({"role": "user", "content": "first question"}),
@@ -1337,10 +1398,8 @@ mod tests {
     #[test]
     fn volatile_preamble_appends_to_tail_user_content() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
         let msgs = assemble_llm_messages_with_cache_capability(
             system,
@@ -1542,10 +1601,8 @@ mod tests {
     #[test]
     fn volatile_preamble_appends_protocol_valid_tail_after_tool() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
         let compacted = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": ""}),
@@ -1570,23 +1627,49 @@ mod tests {
         );
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[3]["role"], "tool");
-        assert_eq!(msgs[4]["role"], "assistant");
-        assert_eq!(msgs[4]["content"], "Understood.");
-        assert_eq!(msgs[5]["role"], "user");
-        let tail_user = message_text(&msgs[5]);
+        let tail_tool = message_text(&msgs[3]);
         assert!(
-            tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
-            "volatile reminder should be appended as runtime context"
+            tail_tool.starts_with("tool output"),
+            "real tool result must remain first: {tail_tool}"
         );
+        assert!(
+            tail_tool.contains("<system-reminder>volatile</system-reminder>"),
+            "volatile reminder should be appended inside the runtime tool tail"
+        );
+        assert_eq!(
+            msgs.len(),
+            4,
+            "runtime framing must not invent any conversation turn"
+        );
+    }
+
+    #[test]
+    fn retry_stripping_preserves_non_text_tool_content_blocks() {
+        let mut message = json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [
+                {"type": "document", "source": {"type": "base64", "data": "opaque"}},
+                {
+                    "type": "text",
+                    "text": "tool evidence\n\n<runtime-context-after-tool>\nvolatile\n</runtime-context-after-tool>"
+                }
+            ]
+        });
+
+        strip_runtime_context_from_tool_message(&mut message);
+
+        let blocks = message["content"].as_array().expect("content blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "document");
+        assert_eq!(blocks[1]["text"], "tool evidence");
     }
 
     #[test]
     fn volatile_preamble_appends_tail_user_when_no_tail_user_exists() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
         let compacted = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "tail assistant"}),
@@ -1619,10 +1702,8 @@ mod tests {
     #[test]
     fn anthropic_tool_tail_marks_last_real_message_before_synthetic_suffix() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
         let compacted = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": ""}),
@@ -1644,14 +1725,14 @@ mod tests {
 
         assert_eq!(msgs[3]["role"], "tool");
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),
-            "last real tool result must carry the message-level cache marker",
+            astra_turn_core::context_serializer::message_has_cache_control(&msgs[2]),
+            "stable prefix must end before the tool result containing volatile runtime bytes",
         );
-        assert_eq!(msgs[5]["role"], "user");
         assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&msgs[5]),
-            "synthetic runtime tail must stay unannotated",
+            !astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),
+            "dynamic tool/runtime tail must stay unannotated",
         );
+        assert!(message_text(&msgs[3]).contains("volatile"));
     }
 
     #[test]
@@ -1702,10 +1783,8 @@ mod tests {
     #[test]
     fn current_user_only_models_drop_volatile_entirely() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            json!({"role": "assistant", "content": "Understood."}),
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
             payload: json!("## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs"),

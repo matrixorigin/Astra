@@ -274,6 +274,21 @@ pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
     ))
 }
 
+/// Whether the turn ended with unresolved execution evidence.
+///
+/// This is narrower than `!eval.success`: conversational turns and low-quality
+/// answers may score unsuccessfully without having an execution failure. Child
+/// run lifecycle projection uses this predicate so a model-produced explanation
+/// after failed tools is not mislabeled as successful task completion.
+pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -> bool {
+    eval.signals.iter().any(|signal| {
+        matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { .. } | EvalSignal::BlockedToolCall { .. }
+        )
+    })
+}
+
 pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
     match signal {
         EvalSignal::ToolErrorRate(rate) if *rate >= 0.5 => Some("tool error rate is high"),
@@ -854,7 +869,11 @@ fn unresolved_tool_outcome_failure_counts(
     let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
 
     for record in records {
-        if !record_was_executed(record) {
+        if !matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Executed
+                | astra_services::session_journal::ToolCallDisposition::Rejected
+        ) {
             continue;
         }
         let Some(class) = effective_tool_result_class(record) else {
@@ -1779,6 +1798,31 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_execution_failure_is_distinct_from_generic_low_quality() {
+        let low_quality = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.8,
+            signals: vec![EvalSignal::VerdictWarning],
+            thresholds: EvaluationThresholds::default(),
+        };
+        assert!(!turn_evaluation_has_unresolved_execution_failure(
+            &low_quality
+        ));
+
+        let execution_incomplete = TurnEvaluation {
+            signals: vec![EvalSignal::ToolOutcomeFailure {
+                class: "transport_unavailable".to_string(),
+                count: 2,
+            }],
+            ..low_quality
+        };
+        assert!(turn_evaluation_has_unresolved_execution_failure(
+            &execution_incomplete
+        ));
+    }
+
+    #[test]
     fn low_tool_error_rate_is_not_successful() {
         let eval = evaluate_turn(
             &[
@@ -2051,6 +2095,26 @@ mod tests {
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
         );
+    }
+
+    #[test]
+    fn rejected_runtime_route_remains_an_unresolved_execution_failure() {
+        let mut record = journal_ok_call("web_fetch");
+        record.args_full = Some(serde_json::json!({"url": "https://news.example/"}).to_string());
+        record.ok = false;
+        record.result_class = Some("execution_error".to_string());
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+
+        let eval =
+            evaluate_tool_call_records("fetch a current headline", &[], &[record], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == "execution_error" && *count == 1
+        )));
+        assert!(turn_evaluation_has_unresolved_execution_failure(&eval));
     }
 
     #[test]

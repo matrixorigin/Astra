@@ -220,6 +220,9 @@ mod tests {
         assert!(agent_completion_is_interrupted(Some("budget_exhausted")));
         assert!(agent_completion_is_interrupted(Some("empty_completion")));
         assert!(agent_completion_is_interrupted(Some("stream_transport")));
+        assert!(agent_completion_is_interrupted(Some(
+            "execution_incomplete"
+        )));
         assert!(agent_completion_is_interrupted(Some("executor_dropped")));
         assert!(!agent_completion_is_interrupted(Some(
             crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON

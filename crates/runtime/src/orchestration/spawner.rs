@@ -3091,7 +3091,7 @@ impl DynamicAgentSpawner {
             &state.agent_type,
             status,
             finish_reason,
-            state.metrics.turns_completed,
+            (state.metrics.turns_completed > 0).then_some(state.metrics.turns_completed),
             state.metrics.tool_calls,
             state.metrics.prompt_tokens,
             state.metrics.completion_tokens,

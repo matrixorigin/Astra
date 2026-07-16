@@ -211,8 +211,10 @@ pub fn build_recovery_message_with_evidence(
             }
         }
         ErrorCategory::ToolUnavailable => format!(
-            "⚠ {} is not available in this environment. \
-             Do NOT retry — use an alternative tool.",
+            "⚠ {} is not available in the current execution environment. \
+             Treat the structured failure scope as authoritative: if it names an executor or \
+             transport route, changing tool names will not restore that route. Select a different \
+             bound provider/executor, reconnect it, or continue with explicitly degraded coverage.",
             tool_name
         ),
         ErrorCategory::ToolBinding => format!(
@@ -701,7 +703,8 @@ mod tests {
             &[],
         );
         assert!(msg.contains("not available"));
-        assert!(msg.contains("alternative"));
+        assert!(msg.contains("changing tool names"));
+        assert!(msg.contains("bound provider/executor"));
 
         // write_file missing path disallows shell fallback
         let err = "Error: Missing 'path' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.";
