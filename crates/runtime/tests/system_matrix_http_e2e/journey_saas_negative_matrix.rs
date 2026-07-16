@@ -988,7 +988,7 @@ pub async fn run_saas_edges_status_smoke() {
 /// GET /service/edges/status: verifies auth gate and response shape.
 ///
 /// Covers:
-/// 1. Missing key → 403 (endpoint not configured when env var absent).
+/// 1. Missing Authorization header (env var set) → 401.
 /// 2. Invalid key → 401.
 /// 3. Valid key → 200 with `edges` array.
 pub async fn run_saas_service_edges_status_smoke() {
@@ -1003,7 +1003,7 @@ pub async fn run_saas_service_edges_status_smoke() {
     let app = &ctx.app;
     let user_id = &b.ctx.user_id;
 
-    // 1. No Authorization header → 403 (env var set but no key provided).
+    // 1. No Authorization header → 401 (env var set but no key provided).
     let (st_no_key, j_no_key) = get_json(
         app,
         &format!("/service/edges/status?user_id={user_id}"),

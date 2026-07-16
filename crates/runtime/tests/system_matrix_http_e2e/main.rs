@@ -698,7 +698,7 @@ async fn e2e_matrix_saas_edges_status_smoke() {
     journey_saas_negative_matrix::run_saas_edges_status_smoke().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 service/edges/status auth gate"]
 async fn e2e_matrix_saas_service_edges_status_smoke() {
     require_system_e2e_env();
