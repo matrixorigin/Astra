@@ -29,7 +29,6 @@ use astra_runtime::{
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
-    turn::skill_tool::SkillResolver,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
     turn::turn_guard::TurnGuard,
@@ -702,20 +701,13 @@ pub(crate) async fn stream_chat_sse(
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
 
-    // Build skill resolver — shared with sub-run executor for nested skill invocations.
-    let skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> = {
-        let reg_arc = Arc::clone(&p.unified_skill_registry);
-        if reg_arc.is_empty() {
-            let _ = reg_arc.discover_all().await;
-        }
-        let resolver = Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
-        let skills = resolver.available_skills();
-        if skills.is_empty() {
-            None
-        } else {
-            Some(resolver as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
-        }
-    };
+    // Bind the turn to the shared registry without taking ownership of
+    // discovery. Interactive startup converges external providers in a
+    // supervised background task; a turn must use the currently available
+    // snapshot rather than replaying provider retry/backoff before HTTP
+    // dispatch. The resolver observes later registry convergence in place.
+    let skill_resolver =
+        crate::cli::agent_runtime::bind_skill_resolver(Arc::clone(&p.unified_skill_registry));
 
     // Build skill executor — fork sub-runs inherit the resolver for nesting.
     let skill_executor: Option<Arc<dyn astra_skills::SkillExecutor>> = {

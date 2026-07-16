@@ -76,20 +76,48 @@ fn authed_text_request_timeout() -> Duration {
     Duration::from_secs(AUTHED_TEXT_REQUEST_TIMEOUT_SECS)
 }
 
-fn streaming_http_client() -> Result<Client, reqwest::Error> {
+fn base_is_loopback(base: &Url) -> bool {
+    let Some(host) = base.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix(".localhost")
+            .is_some_and(|prefix| !prefix.is_empty())
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn client_builder_for_base(base: &Url) -> reqwest::ClientBuilder {
+    let builder = Client::builder();
+    if base_is_loopback(base) {
+        // Loopback is a process-local control-plane boundary, never an
+        // outbound destination. Bypass inherited proxy variables even when
+        // NO_PROXY is absent so local Astra servers and test harnesses cannot
+        // be redirected to an infrastructure proxy.
+        builder.no_proxy()
+    } else {
+        // Remote Astra endpoints retain reqwest's environment-aware proxy
+        // behavior, including HTTP(S)_PROXY and NO_PROXY.
+        builder
+    }
+}
+
+fn streaming_http_client(base: &Url) -> Result<Client, reqwest::Error> {
     // Auto-decompression is disabled so that Content-Encoding headers on SSE
     // responses do not cause reqwest to buffer chunks before handing them to
     // the caller, which would break streaming.
     //
-    // NOTE: do NOT call `.no_proxy()` here.  In sandbox environments the
-    // process runs inside an isolated network namespace whose only egress path
-    // is the OpenShell HTTP proxy (HTTP_PROXY / http_proxy env var).  Calling
-    // `.no_proxy()` would cause direct-connect attempts that have no route and
-    // fail silently, breaking both model-selection pre-flight (`/models`) and
-    // the SSE chat-turn stream (`/agents/edge/turns`).  When no proxy is
-    // configured the env vars are empty and the behaviour is identical to
-    // `.no_proxy()`.
-    Client::builder()
+    // Remote endpoints remain proxy-aware for OpenShell sandboxes. Loopback
+    // endpoints are explicitly direct so inherited proxy variables cannot
+    // hijack process-local control-plane traffic.
+    client_builder_for_base(base)
         .no_gzip()
         .no_brotli()
         .no_deflate()
@@ -115,10 +143,10 @@ impl ThinClient {
     pub fn new(base: &str, bearer_token: Option<String>) -> Result<Self, ThinClientError> {
         let base =
             Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
-        let http = Client::builder().build()?;
+        let http = client_builder_for_base(&base).build()?;
         // Bound TCP/TLS handshakes while leaving response body streaming uncapped.
         // Chat turns can run for many minutes after the connection is established.
-        let http_stream = streaming_http_client()?;
+        let http_stream = streaming_http_client(&base)?;
         Ok(Self {
             http,
             http_stream,
@@ -3073,7 +3101,8 @@ mod tests {
     #[test]
     fn thin_client_http_stream_connect_timeout_policy_is_bounded() {
         assert_eq!(http_stream_connect_timeout(), Duration::from_secs(60));
-        streaming_http_client().expect("streaming HTTP client builder");
+        streaming_http_client(&Url::parse("https://astra.example.com").unwrap())
+            .expect("streaming HTTP client builder");
     }
 
     #[test]
@@ -3128,28 +3157,14 @@ mod tests {
         assert_eq!(attachment_filename(&headers), None);
     }
 
-    // ── streaming_http_client proxy-transparency guard ────────────────────────
-    //
-    // The SSE chat-turn stream (`post_chat_turn`) and the model-list pre-flight
-    // (`get_models_response_timeout`) both use `http_stream`, which is built by
-    // `streaming_http_client()`.  Inside an OpenShell sandbox the process lives
-    // in an isolated network namespace whose ONLY egress route is the HTTP proxy
-    // injected via the HTTP_PROXY / http_proxy environment variable.  Calling
-    // `.no_proxy()` on the builder bypasses that proxy, making the client
-    // attempt a direct TCP connection that has no route — the request silently
-    // fails and the user sees no LLM response.
-    //
-    // These tests are source-level guards that will break loudly if anyone adds
-    // `.no_proxy()` back to `streaming_http_client`.  They complement the
-    // human-readable comment inside the function itself.
+    // ── HTTP client proxy policy ──────────────────────────────────────────────
 
     /// Extract the body of `streaming_http_client` from the source, with
-    /// single-line comments stripped so guard tests are not confused by
-    /// explanatory comment text that mentions `.no_proxy()`.
+    /// single-line comments stripped for decompression guard assertions.
     fn streaming_http_client_body_no_comments() -> String {
         let src = include_str!("client.rs");
         let fn_start = src
-            .find("fn streaming_http_client()")
+            .find("fn streaming_http_client(base: &Url)")
             .expect("streaming_http_client must exist in client.rs");
         let fn_src = &src[fn_start..];
         let body_start = fn_src.find('{').expect("function body open brace");
@@ -3186,20 +3201,30 @@ mod tests {
     }
 
     #[test]
-    fn streaming_http_client_does_not_suppress_proxy() {
-        // `streaming_http_client` must not call `.no_proxy()`.
-        // Inside an OpenShell sandbox the only egress route is the HTTP proxy
-        // injected via HTTP_PROXY / http_proxy.  Suppressing it causes silent
-        // connection failures for all SSE chat turns and model-list pre-flight.
-        let code = streaming_http_client_body_no_comments();
-        assert!(
-            !code.contains(".no_proxy()"),
-            "streaming_http_client must NOT call .no_proxy(): \
-             inside an OpenShell sandbox the only egress path is the \
-             HTTP_PROXY env-var proxy; suppressing it causes silent \
-             connection failures for all SSE chat turns.\n\
-             Code (comments stripped):\n{code}"
-        );
+    fn proxy_policy_bypasses_only_process_local_base_urls() {
+        for base in [
+            "http://localhost:17001",
+            "http://api.localhost:17001",
+            "http://127.0.0.1:17001",
+            "http://127.42.7.9:17001",
+            "http://[::1]:17001",
+        ] {
+            assert!(
+                base_is_loopback(&Url::parse(base).unwrap()),
+                "{base} must bypass inherited outbound proxies"
+            );
+        }
+        for base in [
+            "https://astra.example.com",
+            "http://10.0.0.8:17001",
+            "http://host.docker.internal:17001",
+            "http://notlocalhost:17001",
+        ] {
+            assert!(
+                !base_is_loopback(&Url::parse(base).unwrap()),
+                "{base} must retain environment-aware proxy routing"
+            );
+        }
     }
 
     #[test]

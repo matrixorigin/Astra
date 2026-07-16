@@ -367,6 +367,20 @@ fn parse_ws_target(ws_url: &str) -> Option<(String, u16)> {
     parse_host_port(authority, default_port)
 }
 
+fn ws_target_is_loopback(ws_url: &str) -> bool {
+    let Some((host, _)) = parse_ws_target(ws_url) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix(".localhost")
+            .is_some_and(|prefix| !prefix.is_empty())
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Parse `host` and `port` from an HTTP(S) proxy URL.
 ///
 /// Accepts `http://` and `https://` schemes, strips userinfo (e.g.
@@ -482,11 +496,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
 
-    // Use HTTP proxy when http_proxy / HTTP_PROXY environment variable is set.
+    // Use the sandbox HTTP proxy for remote endpoints. Process-local control
+    // plane traffic is always direct even when the parent environment injects
+    // HTTP_PROXY without a matching NO_PROXY entry.
     let proxy = std::env::var("http_proxy")
         .or_else(|_| std::env::var("HTTP_PROXY"))
         .ok()
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .filter(|_| !ws_target_is_loopback(&url));
 
     let ws_stream = if let Some(ref proxy_url) = proxy {
         connect_via_proxy(&url, proxy_url).await.map_err(|e| {
@@ -1082,6 +1099,33 @@ mod tests {
         );
         assert!(edge_ws_url("ftp://astra.example.com").is_err());
         assert!(edge_ws_url("").is_err());
+    }
+
+    #[test]
+    fn websocket_proxy_policy_bypasses_only_process_local_targets() {
+        for url in [
+            "ws://localhost:17001/edge/ws",
+            "ws://api.localhost:17001/edge/ws",
+            "ws://127.0.0.1:17001/edge/ws",
+            "ws://127.42.7.9:17001/edge/ws",
+            "ws://[::1]:17001/edge/ws",
+        ] {
+            assert!(
+                ws_target_is_loopback(url),
+                "{url} must bypass inherited outbound proxies"
+            );
+        }
+        for url in [
+            "wss://astra.example.com/edge/ws",
+            "ws://10.0.0.8:17001/edge/ws",
+            "ws://host.docker.internal:17001/edge/ws",
+            "ws://notlocalhost:17001/edge/ws",
+        ] {
+            assert!(
+                !ws_target_is_loopback(url),
+                "{url} must retain sandbox proxy routing"
+            );
+        }
     }
 
     #[test]
