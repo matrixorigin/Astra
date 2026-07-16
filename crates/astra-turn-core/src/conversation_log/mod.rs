@@ -97,6 +97,21 @@ pub struct SessionStateCompact {
     pub interruption: Option<Value>,
 }
 
+impl SessionStateCompact {
+    /// Project state onto the CSL continuity contract.
+    ///
+    /// Budget fields remain deserializable so old logs can be inspected, but
+    /// they are not authoritative runtime state and must not survive a manager
+    /// load/persist boundary as apparent zero-or-remaining budget evidence.
+    pub(crate) fn for_csl_continuity(&self) -> Self {
+        Self {
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            ..self.clone()
+        }
+    }
+}
+
 /// Delegation recovery state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DelegationCompact {

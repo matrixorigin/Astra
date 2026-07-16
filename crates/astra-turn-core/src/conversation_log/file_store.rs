@@ -685,7 +685,7 @@ mod tests {
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 2);
-        assert_eq!(mat.session_state.budget_remaining_tokens, 100_000);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
         assert_eq!(mat.last_seq, 0);
 
         // Simulate: loop ran, produced new messages and changed state
@@ -709,8 +709,8 @@ mod tests {
         assert_eq!(mat.messages[0]["content"], "hello");
         assert_eq!(mat.messages[3]["content"], "resp2");
         assert_eq!(mat.session_state.blocked_tools, vec!["bash"]);
-        assert_eq!(mat.session_state.budget_remaining_tokens, 80_000);
-        assert_eq!(mat.session_state.budget_remaining_rounds, 9);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
+        assert_eq!(mat.session_state.budget_remaining_rounds, 0);
         assert_eq!(mat.last_seq, 1);
 
         // Persist turn 3 delta
@@ -739,7 +739,7 @@ mod tests {
         // State accumulated across turns
         assert_eq!(mat.session_state.blocked_tools, vec!["bash"]);
         assert_eq!(mat.session_state.recent_tools, vec!["read_file"]);
-        assert_eq!(mat.session_state.budget_remaining_tokens, 80_000);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
         assert_eq!(mat.session_state.consecutive_ctx_errors, 1);
         // Tool results preserved
         assert_eq!(mat.messages[4]["role"], "user");
@@ -814,7 +814,7 @@ mod tests {
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.messages[0]["content"], "compacted_summary");
-        assert_eq!(mat.session_state.budget_remaining_tokens, 70_000);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
         assert_eq!(mat.session_state.blocked_tools, vec!["bash"]);
     }
 

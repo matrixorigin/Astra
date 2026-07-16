@@ -99,7 +99,8 @@ impl CslManager {
         if entries.is_empty() {
             return Ok(None);
         }
-        let mat = materialize(&entries)?;
+        let mut mat = materialize(&entries)?;
+        mat.session_state = mat.session_state.for_csl_continuity();
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
         self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
@@ -131,6 +132,7 @@ impl CslManager {
         if !self.loaded {
             self.load().await?;
         }
+        let session_state = session_state.for_csl_continuity();
         let canonical_messages = messages.to_vec();
         let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
@@ -187,7 +189,7 @@ impl CslManager {
             seq: next_seq,
             turn,
             appended,
-            state_patch: Some(SessionStatePatch::from_full(session_state)),
+            state_patch: Some(SessionStatePatch::from_full(&session_state)),
         };
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
@@ -327,7 +329,8 @@ fn common_canonical_prefix_len(
 
 impl SessionStatePatch {
     /// Build a full patch from a complete `SessionStateCompact`.
-    /// Every field is explicitly set — no diffing.
+    /// Every continuity field is explicitly set — no diffing. Legacy runtime
+    /// budget fields are intentionally omitted.
     pub fn from_full(state: &SessionStateCompact) -> Self {
         Self {
             blocked_tools: Some(state.blocked_tools.clone()),
@@ -335,8 +338,8 @@ impl SessionStatePatch {
             activated_deferred_tool_names: Some(state.activated_deferred_tool_names.clone()),
             approval_overrides: Some(state.approval_overrides.clone()),
             interruption: Some(state.interruption.clone()),
-            budget_remaining_tokens: Some(state.budget_remaining_tokens),
-            budget_remaining_rounds: Some(state.budget_remaining_rounds),
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
             consecutive_ctx_errors: Some(state.consecutive_ctx_errors),
             delegation: Some(state.delegation.clone()),
             compaction_tracker: Some(state.compaction_tracker.clone()),
@@ -672,8 +675,8 @@ mod tests {
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.session_state.recent_tools, vec!["write"]);
         assert!(mat.session_state.blocked_tools.is_empty());
-        assert_eq!(mat.session_state.budget_remaining_tokens, 40_000);
-        assert_eq!(mat.session_state.budget_remaining_rounds, 6);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
+        assert_eq!(mat.session_state.budget_remaining_rounds, 0);
         assert_eq!(mat.session_state.consecutive_ctx_errors, 0);
         assert!(mat.session_state.approval_overrides.is_none());
     }
@@ -720,8 +723,8 @@ mod tests {
         );
         assert_eq!(patch.approval_overrides, Some(Some(json!({"x": 1}))));
         assert_eq!(patch.compaction_tracker, Some(Some(json!({"v": 2}))));
-        assert_eq!(patch.budget_remaining_tokens, Some(42));
-        assert_eq!(patch.budget_remaining_rounds, Some(7));
+        assert_eq!(patch.budget_remaining_tokens, None);
+        assert_eq!(patch.budget_remaining_rounds, None);
         assert_eq!(patch.consecutive_ctx_errors, Some(3));
         assert!(patch.delegation.is_some());
         assert_eq!(patch.interruption, Some(Some(json!({"k": "v"}))));
@@ -776,7 +779,7 @@ mod tests {
         assert_eq!(mat.messages.len(), 6);
         assert_eq!(mat.session_state.recent_tools, vec!["exec"]);
         assert_eq!(mat.session_state.blocked_tools, vec!["bash"]);
-        assert_eq!(mat.session_state.budget_remaining_tokens, 80_000);
+        assert_eq!(mat.session_state.budget_remaining_tokens, 0);
         assert_eq!(mat.session_state.consecutive_ctx_errors, 1);
     }
 
@@ -1579,7 +1582,7 @@ mod tests {
         mgr.persist_turn(1, &[user_msg("t1")], &state1)
             .await
             .unwrap();
-        assert_eq!(mgr.last_session_state().budget_remaining_tokens, 100_000);
+        assert_eq!(mgr.last_session_state().budget_remaining_tokens, 0);
 
         let state2 = SessionStateCompact {
             budget_remaining_tokens: 80_000,
@@ -1589,8 +1592,8 @@ mod tests {
         mgr.persist_turn(2, &[user_msg("t1"), user_msg("t2")], &state2)
             .await
             .unwrap();
-        assert_eq!(mgr.last_session_state().budget_remaining_tokens, 80_000);
-        assert_eq!(mgr.last_session_state().budget_remaining_rounds, 8);
+        assert_eq!(mgr.last_session_state().budget_remaining_tokens, 0);
+        assert_eq!(mgr.last_session_state().budget_remaining_rounds, 0);
     }
 
     #[tokio::test]
@@ -1622,7 +1625,7 @@ mod tests {
         .unwrap();
         assert_eq!(mgr2.last_session_state().budget_remaining_tokens, 0);
         mgr2.load().await.unwrap();
-        assert_eq!(mgr2.last_session_state().budget_remaining_tokens, 50_000);
+        assert_eq!(mgr2.last_session_state().budget_remaining_tokens, 0);
         assert_eq!(mgr2.last_session_state().recent_tools, vec!["read"]);
     }
 
