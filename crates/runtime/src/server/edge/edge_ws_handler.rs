@@ -1075,6 +1075,7 @@ mod tests {
             _hostname: Option<&str>,
             _worktree_path: Option<&str>,
             _capabilities: Option<serde_json::Value>,
+            _workspace_id: Option<&str>,
         ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
             unreachable!("register is not used by unregister retry tests")
         }
@@ -1084,8 +1085,16 @@ mod tests {
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
-        ) -> Result<(), String> {
+        ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             unreachable!("heartbeat is not used by unregister retry tests")
+        }
+
+        async fn find_by_agent_id_and_workspace(
+            &self,
+            _edge_agent_id: &str,
+            _workspace_id: Option<&str>,
+        ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            unreachable!("lookup is not used by unregister retry tests")
         }
 
         async fn list_by_user(

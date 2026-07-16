@@ -347,6 +347,7 @@ fn runtime_outcome_for_request(
 
 struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
+    inserted_identities: Mutex<Vec<EdgeDispatchIdentity>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
     result_status: &'static str,
@@ -358,6 +359,7 @@ impl Default for StaticEdgeDispatch {
     fn default() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "completed",
@@ -371,6 +373,7 @@ impl StaticEdgeDispatch {
     fn no_result() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
             result_status: "completed",
@@ -382,6 +385,7 @@ impl StaticEdgeDispatch {
     fn failed_result() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "failed",
@@ -393,6 +397,7 @@ impl StaticEdgeDispatch {
     fn terminal_admission(output: &str) -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
             result_status: "completed",
@@ -430,7 +435,7 @@ impl StaticEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        _identity: &EdgeDispatchIdentity,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         _payload_json: &str,
     ) -> Result<(), String> {
@@ -438,6 +443,10 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .lock()
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
+        self.inserted_identities
+            .lock()
+            .expect("inserted identities lock")
+            .push(identity.clone());
         Ok(())
     }
 
@@ -2758,6 +2767,97 @@ async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
         "terminal durable evidence must replay without crossing the socket boundary again"
     );
     assert_eq!(result.metadata.unwrap()["transport"], "edge_ledger");
+}
+
+#[tokio::test]
+async fn workspace_service_account_edge_separates_route_owner_from_invocation_owner() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "sandbox-service-account",
+        "edge-selected",
+        Some("sandbox".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        Some("workspace-1".to_string()),
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("sandbox", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "edge-selected",
+            "sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.workspace_record = Some(astra_runtime_env::WorkspaceRecord {
+        workspace_id: "workspace-1".to_string(),
+        owner_scope: astra_runtime_env::WorkspaceOwnerScope::Executor,
+        kind: astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace,
+        authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        root_or_volume_ref: "/workspace".to_string(),
+        source: astra_runtime_env::WorkspaceSource::EdgePath {
+            executor_id: "edge-selected".to_string(),
+            path: "/workspace".to_string(),
+        },
+        persistence: astra_runtime_env::WorkspacePersistence::Persistent,
+        revision: "rev-1".to_string(),
+        display_name: "sandbox".to_string(),
+    });
+
+    let handle = tokio::spawn(async move {
+        service
+            .execute(tool_request, &CountingLocalTransport::new())
+            .await
+    });
+
+    let message = rx.recv().await.expect("service-account edge tool request");
+    let (request_id, delivery_generation, identity) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            identity,
+            ..
+        } => (request_id, delivery_generation, identity),
+        other => panic!("expected tool request, got {other:?}"),
+    };
+    assert_eq!(
+        identity.user_id, "user-1",
+        "the protocol must preserve the logical invocation owner"
+    );
+    let admitted = dispatch
+        .inserted_identities
+        .lock()
+        .expect("inserted identities lock");
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(
+        admitted[0].user_id, "sandbox-service-account",
+        "the durable dispatch row must use the authenticated route owner"
+    );
+    drop(admitted);
+
+    assert!(pool.deliver_tool_result(
+        "sandbox-service-account",
+        "edge-selected",
+        &request_id,
+        delivery_generation,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: "sandbox-result".to_string(),
+            is_error: false,
+            duration_ms: Some(3),
+            tool_result_fields: None,
+        },
+    ));
+    let result = handle.await.expect("edge execution join");
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "sandbox-result");
 }
 
 #[tokio::test]
