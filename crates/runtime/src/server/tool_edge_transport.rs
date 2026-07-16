@@ -186,13 +186,64 @@ async fn try_edge_websocket(
         ) {
             Ok(Some(edge)) => (edge.clone(), request.user_id.clone()),
             Ok(None) => {
-                tracing::warn!(
-                    target: "astra_runtime::edge_dispatch_diag",
-                    tool = %request.tool_name,
-                    selected_executor_id = ?plan.selected_executor_id(),
-                    "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
-                );
-                return EdgeTransportAttempt::Unavailable;
+                // The pinned executor was not found among this user's edges.
+                // Fall back to a cross-user lookup — this handles the sandbox
+                // case where the edge agent connects under a service-account
+                // user ID different from the workspace user issuing the request.
+                if let Some(agent_id) = plan.selected_executor_id() {
+                    match pool.find_edge_by_agent_id(agent_id, requesting_workspace_id) {
+                        Some((owner_user_id, found_edge)) => {
+                            match select_capable_connected_edge(
+                                std::slice::from_ref(&found_edge),
+                                Some(agent_id),
+                                request,
+                                tool_registry,
+                            ) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        target: "astra_runtime::edge_dispatch_diag",
+                                        tool = %request.tool_name,
+                                        selected_executor_id = ?plan.selected_executor_id(),
+                                        "edge_dispatch: try_edge_websocket cross-user edge found but capability check failed (Unavailable)"
+                                    );
+                                    return EdgeTransportAttempt::Unavailable;
+                                }
+                                Err(ref err) => {
+                                    return EdgeTransportAttempt::Delivered(
+                                        capability_denied_result(request, &err.0, err.1.clone()),
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                target: "astra_runtime::edge_dispatch_diag",
+                                tool = %request.tool_name,
+                                edge_agent_id = %found_edge.edge_agent_id,
+                                owner_user_id = %owner_user_id,
+                                requester_user_id = %request.user_id,
+                                "edge_dispatch: try_edge_websocket cross-user edge found (user had other edges)"
+                            );
+                            (found_edge, owner_user_id)
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "astra_runtime::edge_dispatch_diag",
+                                tool = %request.tool_name,
+                                selected_executor_id = ?plan.selected_executor_id(),
+                                "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
+                            );
+                            return EdgeTransportAttempt::Unavailable;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_dispatch_diag",
+                        tool = %request.tool_name,
+                        selected_executor_id = ?plan.selected_executor_id(),
+                        "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
+                    );
+                    return EdgeTransportAttempt::Unavailable;
+                }
             }
             Err(ref err) => {
                 return EdgeTransportAttempt::Delivered(capability_denied_result(
