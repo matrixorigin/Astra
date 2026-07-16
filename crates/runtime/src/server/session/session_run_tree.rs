@@ -137,11 +137,14 @@ fn effective_run_status(
                 ),
             ));
         }
-        let (parent_status, _) = effective_run_status(parent, runs_by_id, cache, visiting)?;
+        let (parent_status, parent_inherited_control) =
+            effective_run_status(parent, runs_by_id, cache, visiting)?;
         visiting.remove(&run.run_id);
         effective = match parent_status {
             RunStatus::Cancelled => (RunStatus::Cancelled, true),
-            RunStatus::Paused => (RunStatus::Paused, true),
+            RunStatus::Paused if parent_inherited_control || parent.waiting_for.is_some() => {
+                (RunStatus::Paused, true)
+            }
             _ => effective,
         };
     }
@@ -154,12 +157,19 @@ fn project_run_node_with_status(
     lifecycle_status: RunStatus,
     inherited_control: bool,
 ) -> SessionRunNode {
+    let partial_interruption = lifecycle_status == RunStatus::Failed
+        && run.error_message.as_deref().is_some_and(|message| {
+            message.starts_with(
+                astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
+            )
+        });
     let status = match lifecycle_status {
         RunStatus::Running => SessionRunLifecycleStatus::Running,
         RunStatus::Waiting => SessionRunLifecycleStatus::Waiting,
         RunStatus::Paused => SessionRunLifecycleStatus::Paused,
         RunStatus::Completed => SessionRunLifecycleStatus::Completed,
         RunStatus::Delegated => SessionRunLifecycleStatus::Delegated,
+        RunStatus::Failed if partial_interruption => SessionRunLifecycleStatus::Interrupted,
         RunStatus::Failed => SessionRunLifecycleStatus::Failed,
         RunStatus::Cancelled => SessionRunLifecycleStatus::Cancelled,
     };
@@ -210,7 +220,18 @@ fn project_run_node_with_status(
             .then(|| "ancestor_paused".to_string())
             .or_else(|| run.waiting_for.clone()),
         error_code: run.error_code.clone(),
-        error_message: run.error_message.clone(),
+        error_message: if partial_interruption {
+            run.error_message.as_deref().map(|message| {
+                message
+                    .strip_prefix(
+                        astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
+                    )
+                    .unwrap_or(message)
+                    .to_string()
+            })
+        } else {
+            run.error_message.clone()
+        },
         run_event_high_watermark: run.last_event_idx,
         total_tool_calls: run.total_tool_calls,
         runtime: SessionRunRuntimeFacts {
@@ -499,6 +520,61 @@ mod tests {
             assert_eq!(node.waiting_for.as_deref(), Some("ancestor_paused"));
             assert_eq!(node.available_actions, vec![SessionRunAction::Cancel]);
         }
+    }
+
+    #[test]
+    fn projection_does_not_spread_nonblocking_parent_pause_to_descendants() {
+        let mut root = run("root", STATUS_PAUSED, 0);
+        root.waiting_for = None;
+        let child = run("child", "running", 1);
+        let page = astra_services::runs::DurableSessionRunPage {
+            runs: vec![child, root],
+            limit: 200,
+            truncated: false,
+        };
+
+        let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
+        let root = snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == "root")
+            .unwrap();
+        let child = snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == "child")
+            .unwrap();
+        assert_eq!(root.status, SessionRunLifecycleStatus::Paused);
+        assert_eq!(child.status, SessionRunLifecycleStatus::Running);
+        assert!(
+            child.waiting_for.is_none(),
+            "a resumable parent checkpoint is not a pause command for its children"
+        );
+    }
+
+    #[test]
+    fn projection_recovers_terminal_partial_child_as_interrupted() {
+        let mut child = run("child", STATUS_FAILED, 1);
+        child.error_message = Some(format!(
+            "{}budget_exhausted: adaptive hard turn limit reached",
+            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
+        ));
+        let page = astra_services::runs::DurableSessionRunPage {
+            runs: vec![child],
+            limit: 200,
+            truncated: false,
+        };
+
+        let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
+        assert_eq!(
+            snapshot.runs[0].status,
+            SessionRunLifecycleStatus::Interrupted
+        );
+        assert!(snapshot.runs[0].available_actions.is_empty());
+        assert_eq!(
+            snapshot.runs[0].error_message.as_deref(),
+            Some("budget_exhausted: adaptive hard turn limit reached")
+        );
     }
 
     #[test]

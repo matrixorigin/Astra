@@ -1166,12 +1166,6 @@ impl DelegationTracker {
                 .parents
                 .insert(rec.run_id.clone(), parent_run_id.clone());
             state.runs.insert(rec.run_id.clone(), sub);
-
-            // Re-create pause flags for paused sub-runs
-            if rec.status == STATUS_PAUSED {
-                let flag = Arc::new(AtomicBool::new(true));
-                state.pause_flags.insert(rec.run_id.clone(), flag);
-            }
         }
     }
 
@@ -7875,10 +7869,15 @@ mod tests {
             Some("sub-1")
         );
         assert_eq!(tracker.get_depth("sub-2").await, Some(2));
-        // Paused sub-run gets pause flag
-        let flag = tracker.get_pause_flag("sub-2").await;
-        assert!(flag.is_some());
-        assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
+        // Cooperative flags belong to a live executor task. A recovered
+        // durable pause has no such task, so manufacturing a flag would let
+        // resume_delegation mark the row running without an executor.
+        assert!(tracker.get_pause_flag("sub-2").await.is_none());
+        assert_eq!(
+            tracker.resume_delegation("del-1").await,
+            0,
+            "recovery must not fabricate a resumable live executor"
+        );
 
         // Waiting is a distinct recoverable state and does not recreate a
         // cooperative pause flag.

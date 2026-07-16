@@ -9935,12 +9935,15 @@ fn server_subrun_live_termination(
     loop_state: &AgenticLoopState,
 ) -> Option<AgentLiveTermination> {
     match outcome {
-        Ok(AgenticLoopOutcome::Completed)
-            if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
-        {
-            Some(AgentLiveTermination::Interrupted)
+        Ok(AgenticLoopOutcome::Completed) => {
+            match server_subrun_completed_agent_status(loop_state) {
+                STATUS_COMPLETED => Some(AgentLiveTermination::Completed),
+                STATUS_PAUSED | astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => {
+                    Some(AgentLiveTermination::Interrupted)
+                }
+                _ => Some(AgentLiveTermination::Failed),
+            }
         }
-        Ok(AgenticLoopOutcome::Completed) => Some(AgentLiveTermination::Completed),
         Ok(AgenticLoopOutcome::Cancelled) => Some(AgentLiveTermination::Cancelled),
         Ok(AgenticLoopOutcome::Waiting(_)) => None,
         Ok(AgenticLoopOutcome::Delegated) => Some(AgentLiveTermination::Delegated),
@@ -9955,11 +9958,10 @@ fn server_subrun_live_reason(
     loop_state: &AgenticLoopState,
 ) -> Option<String> {
     match outcome {
-        Ok(AgenticLoopOutcome::Completed)
-            if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
-        {
-            Some("paused".to_string())
-        }
+        Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => loop_state
+            .interruption
+            .as_ref()
+            .map(|interruption| interruption.kind.label().to_string()),
         Ok(AgenticLoopOutcome::Completed) => None,
         Ok(AgenticLoopOutcome::Delegated) => Some("delegated".to_string()),
         Ok(AgenticLoopOutcome::Cancelled) => Some("cancelled".to_string()),
@@ -9977,7 +9979,7 @@ fn server_subrun_outcome_status(
     loop_state: &AgenticLoopState,
 ) -> &'static str {
     match outcome {
-        Ok(AgenticLoopOutcome::Completed) => server_subrun_completed_status(loop_state),
+        Ok(AgenticLoopOutcome::Completed) => server_subrun_completed_agent_status(loop_state),
         Ok(AgenticLoopOutcome::Delegated) => STATUS_DELEGATED,
         Ok(AgenticLoopOutcome::Cancelled) => STATUS_CANCELLED,
         Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_WAITING,
@@ -9987,11 +9989,90 @@ fn server_subrun_outcome_status(
     }
 }
 
-fn server_subrun_completed_status(loop_state: &AgenticLoopState) -> &'static str {
-    let Some(_interruption) = loop_state.interruption.as_ref() else {
+/// Project a loop-level `Completed` outcome into the richer child-result
+/// taxonomy. Structured interruptions are not all pauses: an immediately
+/// resumable cutoff is terminal partial evidence, while an explicit recovery
+/// action remains a durable execution hold.
+fn server_subrun_completed_agent_status(loop_state: &AgenticLoopState) -> &'static str {
+    let Some(interruption) = loop_state.interruption.as_ref() else {
         return STATUS_COMPLETED;
     };
-    STATUS_PAUSED
+    if interruption.kind == InterruptionKind::HarnessPaused {
+        return STATUS_PAUSED;
+    }
+    match interruption.resume_action {
+        ResumeAction::ContinueImmediately => {
+            astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL
+        }
+        ResumeAction::WaitAndRetry { .. }
+        | ResumeAction::RequiresIntervention { .. }
+        | ResumeAction::CompactAndRetry => STATUS_PAUSED,
+        ResumeAction::StartNewSession => STATUS_FAILED,
+    }
+}
+
+fn server_subrun_durable_status(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    loop_state: &AgenticLoopState,
+) -> &'static str {
+    // The durable run lifecycle intentionally has no `partial` state. A
+    // partial child result is terminal and therefore stored as failed while
+    // the richer AgentResult retains `partial`, output, and interruption
+    // reason for parent aggregation and UI projection.
+    match server_subrun_outcome_status(outcome, loop_state) {
+        astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => STATUS_FAILED,
+        status => status,
+    }
+}
+
+fn server_subrun_interruption_reason(loop_state: &AgenticLoopState) -> Option<String> {
+    loop_state.interruption.as_ref().map(|interruption| {
+        let label = interruption.kind.label();
+        match interruption.error_detail.as_deref() {
+            Some(detail) if !detail.trim().is_empty() => format!("{label}: {detail}"),
+            _ => label.to_string(),
+        }
+    })
+}
+
+fn server_subrun_durable_error(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    agent_status: &str,
+    interruption_reason: Option<&str>,
+) -> Option<String> {
+    match outcome {
+        Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
+        Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+            Some(format!("{}: {}", rejection.code, rejection.message))
+        }
+        Err(error) => Some(error.to_string()),
+        Ok(AgenticLoopOutcome::Completed)
+            if agent_status == astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL =>
+        {
+            interruption_reason.map(|reason| {
+                format!(
+                    "{}{reason}",
+                    astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
+                )
+            })
+        }
+        Ok(AgenticLoopOutcome::Completed) if agent_status == STATUS_FAILED => {
+            interruption_reason.map(ToString::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn server_subrun_waiting_for<'a>(
+    outcome: &'a Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    durable_status: &str,
+    interruption_reason: Option<&'a str>,
+) -> Option<&'a str> {
+    match outcome {
+        Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.as_str()),
+        Ok(AgenticLoopOutcome::Completed) if durable_status == STATUS_PAUSED => interruption_reason,
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -10126,7 +10207,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             agent_id: result.agent_id,
             run_id: result.run_id,
             status: projection.status.to_string(),
-            finish_reason: projection.finish_reason.to_string(),
+            finish_reason: projection.finish_reason,
             cancelled_by_user: None,
             output: result.output,
             error: projection.error,
@@ -10940,23 +11021,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // liveness.
         let prompt_tokens = loop_state.provider_input_tokens();
         let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
-        let durable_error = match &outcome {
-            Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
-            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
-                Some(format!("{}: {}", rejection.code, rejection.message))
-            }
-            Err(error) => Some(error.to_string()),
-            _ => None,
-        };
-        let waiting_for = match &outcome {
-            Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.as_str()),
-            _ => None,
-        };
+        let durable_status = server_subrun_durable_status(&outcome, &loop_state);
+        let interruption_reason = server_subrun_interruption_reason(&loop_state);
+        let durable_error =
+            server_subrun_durable_error(&outcome, projected_status, interruption_reason.as_deref());
+        let waiting_for =
+            server_subrun_waiting_for(&outcome, durable_status, interruption_reason.as_deref());
         self.persist_durable_subrun_status(
             &durable_user_id,
             &durable_session_id,
             &durable_run_id,
-            projected_status,
+            durable_status,
             waiting_for,
             durable_error.as_deref(),
         )
@@ -11128,7 +11203,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 } else {
                     Some(loop_state.final_text)
                 },
-                error: None,
+                error: if projected_status == STATUS_COMPLETED {
+                    None
+                } else {
+                    interruption_reason
+                },
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,

@@ -1434,6 +1434,7 @@ fn server_agent_run_status(status: astra_thin_client::SessionRunLifecycleStatus)
         SessionRunLifecycleStatus::Paused => AgentRunStatus::Paused,
         SessionRunLifecycleStatus::Completed => AgentRunStatus::Completed,
         SessionRunLifecycleStatus::Delegated => AgentRunStatus::Delegated,
+        SessionRunLifecycleStatus::Interrupted => AgentRunStatus::Interrupted,
         SessionRunLifecycleStatus::Failed => AgentRunStatus::Failed,
         SessionRunLifecycleStatus::Cancelled => AgentRunStatus::Cancelled,
     }
@@ -7513,6 +7514,14 @@ mod tests {
         );
         assert_eq!(
             widget.agent_monitor_snapshot(5)[0].state.status,
+            AgentRunStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn durable_server_interrupted_status_stays_interrupted_in_agent_monitor() {
+        assert_eq!(
+            server_agent_run_status(astra_thin_client::SessionRunLifecycleStatus::Interrupted),
             AgentRunStatus::Interrupted
         );
     }

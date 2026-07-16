@@ -78,23 +78,34 @@ pub fn spawn_completion_status_from_finish_reason(finish_reason: Option<&str>) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnStatusProjection {
     pub status: &'static str,
-    pub finish_reason: &'static str,
+    pub finish_reason: String,
     pub error: Option<String>,
 }
 
 pub fn project_subrun_status_to_spawn(
     subrun_status: &str,
-    error: Option<String>,
+    mut error: Option<String>,
 ) -> SpawnStatusProjection {
-    let (status, finish_reason) = match subrun_status {
-        astra_core::STATUS_COMPLETED => (SPAWN_STATUS_COMPLETED, "normal"),
-        astra_core::STATUS_WAITING => (SPAWN_STATUS_WAITING, "waiting"),
-        astra_core::STATUS_CANCELLED => (SPAWN_STATUS_CANCELLED, "cancelled"),
-        astra_core::STATUS_FAILED => (SPAWN_STATUS_FAILED, "failed"),
-        astra_core::STATUS_PAUSED => (SPAWN_STATUS_INTERRUPTED, SPAWN_STATUS_INTERRUPTED),
-        _ => (SPAWN_STATUS_FAILED, "unknown"),
+    let (status, default_finish_reason, interruption_reason_from_error) = match subrun_status {
+        astra_core::STATUS_COMPLETED => (SPAWN_STATUS_COMPLETED, "normal", false),
+        astra_core::STATUS_WAITING => (SPAWN_STATUS_WAITING, "waiting", false),
+        astra_core::STATUS_CANCELLED => (SPAWN_STATUS_CANCELLED, "cancelled", false),
+        astra_core::STATUS_FAILED => (SPAWN_STATUS_FAILED, "failed", false),
+        astra_core::STATUS_PAUSED => (SPAWN_STATUS_INTERRUPTED, "paused", true),
+        astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => {
+            (SPAWN_STATUS_INTERRUPTED, "partial", true)
+        }
+        _ => (SPAWN_STATUS_FAILED, "unknown", false),
     };
 
+    let finish_reason = if interruption_reason_from_error {
+        error
+            .take()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| default_finish_reason.to_string())
+    } else {
+        default_finish_reason.to_string()
+    };
     let error = if status == SPAWN_STATUS_FAILED {
         error.or_else(|| Some(format!("server spawned agent ended with {subrun_status}")))
     } else {
@@ -391,6 +402,27 @@ fn durable_agent_status(run: &astra_services::runs::DurableRunRecord) -> AgentSt
             partial_result: String::new(),
             finish_reason: "durable_result_unavailable".into(),
         },
+        astra_core::STATUS_FAILED
+            if run.error_message.as_deref().is_some_and(|message| {
+                message.starts_with(
+                    astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
+                )
+            }) =>
+        {
+            AgentStatus::Interrupted {
+                partial_result: output,
+                finish_reason: run
+                    .error_message
+                    .as_deref()
+                    .and_then(|message| {
+                        message.strip_prefix(
+                            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
+                        )
+                    })
+                    .unwrap_or("partial")
+                    .to_string(),
+            }
+        }
         astra_core::STATUS_FAILED => AgentStatus::Failed {
             error: run
                 .error_message
@@ -3709,6 +3741,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_partial_child_restores_as_interrupted_with_exact_reason() {
+        let mut run = durable_run("partial-child", 1, astra_core::STATUS_FAILED);
+        run.error_message = Some(format!(
+            "{}budget_exhausted: adaptive hard turn limit reached",
+            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
+        ));
+        run.events.push(json!({
+            "event_type": "text_done",
+            "data": {"full_text": "Partial architecture findings."}
+        }));
+
+        assert!(matches!(
+            durable_agent_status(&run),
+            AgentStatus::Interrupted {
+                partial_result,
+                finish_reason,
+            } if partial_result == "Partial architecture findings."
+                && finish_reason == "budget_exhausted: adaptive hard turn limit reached"
+        ));
+    }
+
     struct StaticDurableReconciler {
         runs: Vec<astra_services::runs::DurableRunRecord>,
     }
@@ -4649,8 +4703,22 @@ mod tests {
     fn subrun_status_projection_maps_interruption_cancel_and_unknown_via_spawn_owner() {
         let paused = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
         assert_eq!(paused.status, SPAWN_STATUS_INTERRUPTED);
-        assert_eq!(paused.finish_reason, SPAWN_STATUS_INTERRUPTED);
+        assert_eq!(paused.finish_reason, "paused");
         assert!(paused.error.is_none());
+
+        let partial = project_subrun_status_to_spawn(
+            astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL,
+            Some("budget_exhausted: adaptive hard turn limit reached".to_string()),
+        );
+        assert_eq!(partial.status, SPAWN_STATUS_INTERRUPTED);
+        assert_eq!(
+            partial.finish_reason,
+            "budget_exhausted: adaptive hard turn limit reached"
+        );
+        assert!(
+            partial.error.is_none(),
+            "an interruption reason is evidence, not a spawn failure"
+        );
 
         let waiting = project_subrun_status_to_spawn(astra_core::STATUS_WAITING, None);
         assert_eq!(waiting.status, SPAWN_STATUS_WAITING);

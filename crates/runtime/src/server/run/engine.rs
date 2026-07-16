@@ -1381,7 +1381,9 @@ impl RunEngine {
         for ancestor in ancestors {
             match durable_run_status_kind(&ancestor.status) {
                 DurableRunStatusKind::Cancelled => return Ok(Some(RunControlStatus::Cancelled)),
-                DurableRunStatusKind::Paused => inherited_pause = true,
+                DurableRunStatusKind::Paused if ancestor.waiting_for.is_some() => {
+                    inherited_pause = true;
+                }
                 _ => {}
             }
         }
@@ -3669,6 +3671,45 @@ mod tests {
                 .await
                 .unwrap(),
             Some(RunControlStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_ancestor_pause_does_not_suspend_live_descendants() {
+        let engine = test_engine();
+        engine
+            .start_run("root", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user-1",
+                "session-1",
+                Some("root"),
+                Some("delegation-1"),
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_status("user-1", "root", STATUS_PAUSED, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.check_control_status("user-1", "root").await.unwrap(),
+            Some(RunControlStatus::Paused),
+            "the paused run itself remains paused"
+        );
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "child")
+                .await
+                .unwrap(),
+            None,
+            "budget/recovery pauses that release the session slot are not parent control commands"
         );
     }
 

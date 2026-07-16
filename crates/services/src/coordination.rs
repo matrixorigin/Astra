@@ -43,6 +43,11 @@ pub const AGENT_RESULT_STATUS_PAUSED: &str = "paused";
 pub const AGENT_RESULT_STATUS_CANCELLED: &str = "cancelled";
 pub const AGENT_RESULT_STATUS_PARTIAL: &str = "partial";
 pub const AGENT_RESULT_STATUS_VERIFICATION_FAILED: &str = "verification_failed";
+/// Durable run rows have no `partial` lifecycle state. Server sub-runs store a
+/// terminal failed row with this prefix so recovery and run-tree projection
+/// can reconstruct the richer interrupted/partial child result without
+/// mistaking it for an ordinary failure.
+pub const AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX: &str = "partial:";
 
 pub const DELEGATION_RESULT_STATUS_COMPLETED: &str = "completed";
 pub const DELEGATION_RESULT_STATUS_UNFINISHED: &str = "unfinished";

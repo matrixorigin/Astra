@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const SESSION_RUN_TREE_SCHEMA_VERSION: u32 = 4;
+pub const SESSION_RUN_TREE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +15,7 @@ pub enum SessionRunLifecycleStatus {
     Paused,
     Completed,
     Delegated,
+    Interrupted,
     Failed,
     Cancelled,
 }
@@ -24,7 +25,7 @@ impl SessionRunLifecycleStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Delegated | Self::Failed | Self::Cancelled
+            Self::Completed | Self::Delegated | Self::Interrupted | Self::Failed | Self::Cancelled
         )
     }
 }
@@ -190,6 +191,17 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionRunLifecycleStatus>(payload).unwrap(),
             SessionRunLifecycleStatus::Delegated
+        );
+    }
+
+    #[test]
+    fn interrupted_is_a_distinct_terminal_wire_status() {
+        let payload = serde_json::to_value(SessionRunLifecycleStatus::Interrupted).unwrap();
+        assert_eq!(payload, serde_json::json!("interrupted"));
+        assert!(SessionRunLifecycleStatus::Interrupted.is_terminal());
+        assert_eq!(
+            serde_json::from_value::<SessionRunLifecycleStatus>(payload).unwrap(),
+            SessionRunLifecycleStatus::Interrupted
         );
     }
 

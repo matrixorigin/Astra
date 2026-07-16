@@ -1682,7 +1682,7 @@ fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
 }
 
 #[test]
-fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
+fn server_subrun_immediately_resumable_interruption_is_partial_not_paused() {
     let svc = test_service();
     let request = test_request("subrun task board bookkeeping");
     let mut state = svc.build_initial_state(
@@ -1711,15 +1711,23 @@ fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
         },
     ));
 
-    assert_eq!(server_subrun_completed_status(&state), STATUS_PAUSED);
+    assert_eq!(
+        server_subrun_completed_agent_status(&state),
+        astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL
+    );
     let outcome = Ok(AgenticLoopOutcome::Completed);
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_FAILED,
+        "partial is a terminal child result, not a durable execution hold"
+    );
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
         Some(astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted)
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
-        Some("paused")
+        Some("empty_completion")
     );
 }
 
@@ -1810,20 +1818,24 @@ fn server_subrun_requires_intervention_from_interruption_not_task_board() {
         },
     ));
 
-    assert_eq!(server_subrun_completed_status(&state), STATUS_PAUSED);
+    assert_eq!(server_subrun_completed_agent_status(&state), STATUS_PAUSED);
     let outcome = Ok(AgenticLoopOutcome::Completed);
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_PAUSED
+    );
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
         Some(astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted)
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
-        Some("paused")
+        Some("empty_completion")
     );
 }
 
 #[test]
-fn server_subrun_completed_status_does_not_promote_tool_only_empty_completion() {
+fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
     let svc = test_service();
     let request = test_request("subrun tool-only empty completion");
     let mut state = svc.build_initial_state(
@@ -1852,9 +1864,116 @@ fn server_subrun_completed_status_does_not_promote_tool_only_empty_completion() 
     ));
 
     assert_eq!(
-        server_subrun_completed_status(&state),
-        STATUS_PAUSED,
-        "successful tools alone are not a synthesized agent answer"
+        server_subrun_completed_agent_status(&state),
+        astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL,
+        "successful tools alone are preserved as partial without pretending the child is still paused"
+    );
+}
+
+#[test]
+fn server_subrun_budget_exhaustion_preserves_reason_without_leaving_child_paused() {
+    let svc = test_service();
+    let request = test_request("subrun exhausts its adaptive budget");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-budget",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "Partial review findings.".to_string();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 4,
+            turns_completed: 13,
+            remaining_turns: 0,
+            error_detail: Some("adaptive hard turn limit reached".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+    let outcome = Ok(AgenticLoopOutcome::Completed);
+
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL
+    );
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_FAILED
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("budget_exhausted")
+    );
+    assert_eq!(
+        server_subrun_interruption_reason(&state).as_deref(),
+        Some("budget_exhausted: adaptive hard turn limit reached")
+    );
+    assert_eq!(
+        server_subrun_durable_error(
+            &outcome,
+            server_subrun_outcome_status(&outcome, &state),
+            server_subrun_interruption_reason(&state).as_deref(),
+        )
+        .as_deref(),
+        Some("partial:budget_exhausted: adaptive hard turn limit reached")
+    );
+}
+
+#[test]
+fn server_subrun_nonresumable_interruption_is_failed_not_completed() {
+    let svc = test_service();
+    let request = test_request("subrun blocked by fatal harness verdict");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-blocked",
+        None,
+        None,
+        None,
+    );
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
+        astra_turn_core::interruption::ResumeAction::StartNewSession,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: false,
+            tool_calls_completed: 0,
+            turns_completed: 0,
+            remaining_turns: 13,
+            error_detail: Some("fatal invariant violation".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+    let outcome = Ok(AgenticLoopOutcome::Completed);
+
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        STATUS_FAILED
+    );
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        Some(astra_turn_core::agent_live_event::AgentLiveTermination::Failed)
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("harness_blocked")
+    );
+    assert_eq!(
+        server_subrun_durable_error(
+            &outcome,
+            server_subrun_outcome_status(&outcome, &state),
+            server_subrun_interruption_reason(&state).as_deref(),
+        )
+        .as_deref(),
+        Some("harness_blocked: fatal invariant violation")
     );
 }
 
