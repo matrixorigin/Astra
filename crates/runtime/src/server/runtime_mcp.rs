@@ -19,9 +19,11 @@ use astra_services::{
     runs::RuntimeMcpBindingRequest,
 };
 use astra_turn_types::{
-    NativeToolId, ProviderBindingRef, ProviderClaimTrust, ProviderDiscoverySnapshot,
-    ProviderIdentity, ProviderProtocolId, PublicToolAlias, ResolvedProviderSnapshot,
+    NativeToolId, ProviderBindingRef, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
+    ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderSemanticCacheContract,
+    PublicToolAlias, ResolvedProviderSnapshot, SemanticFreshnessFact, SemanticFreshnessScope,
 };
+use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use regex::Regex;
 use serde::Deserialize;
@@ -29,6 +31,12 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 const AGENT_BINDING_MCP_RPC_TIMEOUT_SECS: u64 = 30;
+const AGENT_BINDING_SEMANTIC_READ_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION: &str =
+    astra_services::runs::RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION;
+const AGENT_BINDING_SEMANTIC_READ_PREPARE_METHOD: &str = "astra/semantic-read/prepare";
+const AGENT_BINDING_SEMANTIC_READ_COMPONENT: &str = "provider_runtime_descriptor.semantic_read";
+const AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY: &str = "astra.semantic_read_condition";
 
 static AGENT_BINDING_MCP_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -41,6 +49,20 @@ pub(crate) struct RuntimeMcpBundle {
     pub stop_after_success_tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     pub manager: Option<Arc<RwLock<McpClientManager>>>,
     pub agent_binding_mcp: Option<Arc<AgentBindingMcpRuntime>>,
+    pub semantic_read_capabilities:
+        crate::server::semantic_read_freshness::ProviderSemanticFreshnessRegistry,
+}
+
+impl RuntimeMcpBundle {
+    pub(crate) fn configure_semantic_read_cache(
+        &self,
+        executor: &mut crate::server::runtime_tool_executor::RuntimeToolExecutor,
+    ) -> Result<crate::server::runtime_tool_executor::SemanticReadCacheActivation, String> {
+        executor.configure_semantic_read_cache(
+            self.semantic_read_capabilities.clone(),
+            astra_turn_types::SemanticReadCacheLimits::default(),
+        )
+    }
 }
 
 pub(crate) fn resolve_mcp_snapshot(
@@ -68,6 +90,46 @@ pub(crate) fn resolve_mcp_snapshot(
         standard_protocols: BTreeMap::from([("mcp".to_string(), ProviderClaimTrust::Advisory)]),
         ..Default::default()
     };
+    resolve_mcp_snapshot_with_policy(discovery, aliases, trust_policy)
+}
+
+fn resolve_agent_binding_mcp_snapshot(
+    tool_namespace: &str,
+    discovery: &ProviderDiscoverySnapshot,
+    semantic_read_enabled: bool,
+) -> Result<ResolvedProviderSnapshot, String> {
+    let aliases = discovery
+        .tool_declarations
+        .iter()
+        .map(|declaration| {
+            let alias = sanitize_tool_name(&format!(
+                "mcp__{}__{}",
+                tool_namespace, declaration.native_tool_name
+            ));
+            Ok((
+                declaration.native_tool_id.clone(),
+                PublicToolAlias::new(alias).map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect::<Result<BTreeMap<NativeToolId, PublicToolAlias>, String>>()?;
+    let mut trust_policy = astra_turn_core::provider_resolution::ProviderClaimTrustPolicy {
+        standard_protocols: BTreeMap::from([("mcp".to_string(), ProviderClaimTrust::Advisory)]),
+        ..Default::default()
+    };
+    if semantic_read_enabled {
+        trust_policy.astra_components.insert(
+            AGENT_BINDING_SEMANTIC_READ_COMPONENT.to_string(),
+            ProviderClaimTrust::Trusted,
+        );
+    }
+    resolve_mcp_snapshot_with_policy(discovery, aliases, trust_policy)
+}
+
+fn resolve_mcp_snapshot_with_policy(
+    discovery: &ProviderDiscoverySnapshot,
+    aliases: BTreeMap<NativeToolId, PublicToolAlias>,
+    trust_policy: astra_turn_core::provider_resolution::ProviderClaimTrustPolicy,
+) -> Result<ResolvedProviderSnapshot, String> {
     astra_turn_core::provider_resolution::resolve_provider_snapshot(
         discovery,
         &trust_policy,
@@ -82,6 +144,7 @@ pub(crate) struct AgentBindingMcpRuntime {
     endpoint_url: String,
     authorization: String,
     tool_names_by_public_name: Arc<HashMap<String, String>>,
+    semantic_read_tools: Arc<HashSet<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,12 +153,73 @@ struct AgentBindingMcpTool {
     metadata: Option<Value>,
 }
 
+fn apply_agent_binding_semantic_read_contract(
+    declarations: &mut [astra_turn_types::ProviderToolDeclaration],
+    capability: Option<&astra_services::runs::RuntimeSemanticReadCapabilityRequest>,
+) -> Result<HashSet<String>, String> {
+    let Some(capability) = capability else {
+        return Ok(HashSet::new());
+    };
+    if capability.contract_version != AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported semantic read contract version '{}'",
+            capability.contract_version
+        ));
+    }
+    if capability.tools.is_empty() {
+        return Err("semantic read capability must name at least one native tool".to_string());
+    }
+    let configured = capability
+        .tools
+        .iter()
+        .map(|tool| {
+            if tool.is_empty() || tool.trim() != tool || tool.chars().any(char::is_control) {
+                return Err(
+                    "semantic read native tool names must be non-empty exact strings".to_string(),
+                );
+            }
+            Ok(tool.clone())
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+    if configured.len() != capability.tools.len() {
+        return Err("semantic read capability contains duplicate native tool names".to_string());
+    }
+
+    let discovered = declarations
+        .iter()
+        .map(|declaration| declaration.native_tool_name.clone())
+        .collect::<HashSet<_>>();
+    if let Some(missing) = configured.difference(&discovered).next() {
+        return Err(format!(
+            "semantic read capability references undiscovered native tool '{missing}'"
+        ));
+    }
+
+    let source = || ProviderClaimSource::AstraOwned {
+        component: AGENT_BINDING_SEMANTIC_READ_COMPONENT.to_string(),
+        field: "tools".to_string(),
+    };
+    for declaration in declarations {
+        if configured.contains(&declaration.native_tool_name) {
+            declaration.claims.read_only = Some(ProviderClaim::new(true, source()));
+            declaration.claims.destructive = Some(ProviderClaim::new(false, source()));
+            declaration.claims.idempotent = Some(ProviderClaim::new(true, source()));
+            declaration.claims.semantic_cache = Some(ProviderClaim::new(
+                ProviderSemanticCacheContract::RevisionBound,
+                source(),
+            ));
+        }
+    }
+    Ok(configured)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{detail}")]
 pub(crate) struct AgentBindingMcpRpcError {
     detail: String,
     outcome_unknown: bool,
     timed_out: bool,
+    provider_acknowledged: bool,
 }
 
 impl AgentBindingMcpRpcError {
@@ -109,6 +233,13 @@ impl AgentBindingMcpRpcError {
 
     fn redacted(mut self, secrets: &Value) -> Self {
         self.detail = redact_known_secrets(&self.detail, secrets);
+        self
+    }
+
+    fn after_send(mut self, risk: AgentBindingMcpRpcRisk) -> Self {
+        if !self.provider_acknowledged {
+            self.outcome_unknown = risk.outcome_unknown_after_send();
+        }
         self
     }
 }
@@ -143,6 +274,16 @@ fn agent_binding_mcp_rpc_error(detail: impl Into<String>) -> AgentBindingMcpRpcE
         detail: detail.into(),
         outcome_unknown: false,
         timed_out: false,
+        provider_acknowledged: false,
+    }
+}
+
+fn agent_binding_mcp_provider_error(detail: impl Into<String>) -> AgentBindingMcpRpcError {
+    AgentBindingMcpRpcError {
+        detail: detail.into(),
+        outcome_unknown: false,
+        timed_out: false,
+        provider_acknowledged: true,
     }
 }
 
@@ -151,6 +292,19 @@ fn agent_binding_mcp_timeout_error(detail: impl Into<String>) -> AgentBindingMcp
         detail: detail.into(),
         outcome_unknown: true,
         timed_out: true,
+        provider_acknowledged: false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AgentBindingMcpRpcRisk {
+    SideEffectFree,
+    ToolInvocation,
+}
+
+impl AgentBindingMcpRpcRisk {
+    fn outcome_unknown_after_send(self) -> bool {
+        matches!(self, Self::ToolInvocation)
     }
 }
 
@@ -672,6 +826,7 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
         stop_after_success_tools: Default::default(),
         manager: Some(Arc::new(RwLock::new(manager))),
         agent_binding_mcp: None,
+        semantic_read_capabilities: Default::default(),
     }))
 }
 
@@ -680,12 +835,28 @@ async fn post_agent_binding_mcp_rpc(
     authorization: &str,
     payload: Value,
 ) -> Result<Value, AgentBindingMcpRpcError> {
+    post_agent_binding_mcp_rpc_with_risk(
+        endpoint_url,
+        authorization,
+        payload,
+        Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
+        AgentBindingMcpRpcRisk::SideEffectFree,
+    )
+    .await
+}
+
+async fn post_agent_binding_mcp_rpc_with_risk(
+    endpoint_url: &str,
+    authorization: &str,
+    payload: Value,
+    timeout: Duration,
+    risk: AgentBindingMcpRpcRisk,
+) -> Result<Value, AgentBindingMcpRpcError> {
     let _permit = crate::capability_endpoint_pool::try_acquire_endpoint_permit(endpoint_url)
         .map_err(agent_binding_mcp_rpc_error)?;
 
-    let response = tokio::time::timeout(
-        Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
-        agent_binding_mcp_http_client()
+    let (status, body) = tokio::time::timeout(timeout, async {
+        let response = agent_binding_mcp_http_client()
             .post(endpoint_url)
             .header(reqwest::header::AUTHORIZATION, authorization)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -694,34 +865,45 @@ async fn post_agent_binding_mcp_rpc(
                 "application/json, text/event-stream",
             )
             .json(&payload)
-            .send(),
-    )
+            .send()
+            .await
+            .map_err(|error| {
+                agent_binding_mcp_rpc_error(format!(
+                    "Agent Binding MCP RPC to '{endpoint_url}' failed: {error}"
+                ))
+                .after_send(risk)
+            })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            agent_binding_mcp_rpc_error(format!(
+                "Agent Binding MCP RPC to '{endpoint_url}' failed while reading response: {error}"
+            ))
+            .after_send(risk)
+        })?;
+        Ok::<_, AgentBindingMcpRpcError>((status, body))
+    })
     .await
     .map_err(|_| {
         agent_binding_mcp_timeout_error(format!(
-            "Agent Binding MCP RPC to '{endpoint_url}' timed out after {AGENT_BINDING_MCP_RPC_TIMEOUT_SECS}s"
+            "Agent Binding MCP RPC to '{endpoint_url}' timed out after {}ms",
+            timeout.as_millis()
         ))
-    })?
-    .map_err(|error| {
-        agent_binding_mcp_rpc_error(format!(
-            "Agent Binding MCP RPC to '{endpoint_url}' failed: {error}"
-        ))
-    })?;
-
-    let status = response.status();
-    let body = response.text().await.map_err(|error| {
-        agent_binding_mcp_rpc_error(format!(
-            "Agent Binding MCP RPC to '{endpoint_url}' failed while reading response: {error}"
-        ))
-    })?;
+        .after_send(risk)
+    })??;
 
     if !status.is_success() {
+        if let Err(error) = decode_agent_binding_mcp_rpc_response(&body)
+            && error.provider_acknowledged
+        {
+            return Err(error);
+        }
         return Err(agent_binding_mcp_rpc_error(format!(
             "Agent Binding MCP RPC to '{endpoint_url}' returned HTTP {status}: {body}"
-        )));
+        ))
+        .after_send(risk));
     }
 
-    decode_agent_binding_mcp_rpc_response(&body)
+    decode_agent_binding_mcp_rpc_response(&body).map_err(|error| error.after_send(risk))
 }
 
 fn decode_agent_binding_mcp_rpc_response(body: &str) -> Result<Value, AgentBindingMcpRpcError> {
@@ -761,7 +943,7 @@ fn json_rpc_result(value: Value) -> Result<Value, AgentBindingMcpRpcError> {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown MCP JSON-RPC error");
-        return Err(agent_binding_mcp_rpc_error(format!(
+        return Err(agent_binding_mcp_provider_error(format!(
             "Agent Binding MCP JSON-RPC error {code}: {message}"
         )));
     }
@@ -962,6 +1144,7 @@ impl AgentBindingMcpRuntime {
             endpoint_url: "http://127.0.0.1:1/mcp".to_string(),
             authorization: "Bearer test".to_string(),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
+            semantic_read_tools: Arc::new(HashSet::new()),
         }
     }
 
@@ -973,28 +1156,41 @@ impl AgentBindingMcpRuntime {
         &self,
         public_name: &str,
         args: &Value,
+        semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
         let tool_name = self
             .tool_names_by_public_name
             .get(public_name)
             .ok_or_else(|| agent_binding_mcp_rpc_error(format!("Tool not found: {public_name}")))?;
+        let mut params = json!({
+            "name": tool_name,
+            "arguments": agent_binding_tool_call_arguments(args),
+        });
+        if let Some(condition) = semantic_read_condition {
+            params["_meta"] = json!({
+                (AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY): condition,
+            });
+        }
         let payload = json!({
             "jsonrpc": "2.0",
             "id": "astra-agent-binding-tools-call",
             "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": agent_binding_tool_call_arguments(args),
-            }
+            "params": params,
         });
-        let result = post_agent_binding_mcp_rpc(&self.endpoint_url, &self.authorization, payload)
-            .await
-            .map_err(|error| {
-                error.redacted(&json!({
-                    "authorization": &self.authorization,
-                    "url": &self.endpoint_url,
-                }))
-            })?;
+        let result = post_agent_binding_mcp_rpc_with_risk(
+            &self.endpoint_url,
+            &self.authorization,
+            payload,
+            Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
+            AgentBindingMcpRpcRisk::ToolInvocation,
+        )
+        .await
+        .map_err(|error| {
+            error.redacted(&json!({
+                "authorization": &self.authorization,
+                "url": &self.endpoint_url,
+            }))
+        })?;
         extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
             error.redacted(&json!({
                 "authorization": &self.authorization,
@@ -1008,10 +1204,117 @@ impl AgentBindingMcpRuntime {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentBindingSemanticReadPrepareResult {
+    facts: Vec<AgentBindingSemanticFreshnessFact>,
+    condition: AgentBindingSemanticReadPreparedCondition,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentBindingSemanticFreshnessFact {
+    scope: SemanticFreshnessScope,
+    subject: String,
+    revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentBindingSemanticReadPreparedCondition {
+    protocol: String,
+    token: String,
+}
+
+#[async_trait]
+impl crate::server::semantic_read_freshness::ProviderSemanticFreshnessSource
+    for AgentBindingMcpRuntime
+{
+    async fn prepare(
+        &self,
+        request: crate::server::semantic_read_freshness::ProviderSemanticFreshnessRequest<'_>,
+    ) -> Result<
+        crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence,
+        crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError,
+    > {
+        let native_tool = request.descriptor.identity.native_tool_id.as_str();
+        if !self.semantic_read_tools.contains(native_tool) {
+            return Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Unavailable,
+            );
+        }
+        let result = post_agent_binding_mcp_rpc_with_risk(
+            &self.endpoint_url,
+            &self.authorization,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "astra-agent-binding-semantic-read-prepare",
+                "method": AGENT_BINDING_SEMANTIC_READ_PREPARE_METHOD,
+                "params": {
+                    "contractVersion": AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION,
+                    "name": native_tool,
+                    "arguments": request.public_arguments,
+                }
+            }),
+            AGENT_BINDING_SEMANTIC_READ_PREPARE_TIMEOUT,
+            AgentBindingMcpRpcRisk::SideEffectFree,
+        )
+        .await
+        .and_then(|value| {
+            serde_json::from_value::<AgentBindingSemanticReadPrepareResult>(value).map_err(
+                |error| {
+                    agent_binding_mcp_rpc_error(format!(
+                        "Agent Binding semantic read prepare result is invalid: {error}"
+                    ))
+                },
+            )
+        })
+        .and_then(|prepared| {
+            let facts = prepared
+                .facts
+                .into_iter()
+                .map(|fact| SemanticFreshnessFact::new(fact.scope, &fact.subject, &fact.revision))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    agent_binding_mcp_rpc_error(format!(
+                        "Agent Binding semantic read freshness evidence is invalid: {error}"
+                    ))
+                })?;
+            if facts.is_empty() {
+                return Err(agent_binding_mcp_rpc_error(
+                    "Agent Binding semantic read freshness evidence must not be empty",
+                ));
+            }
+            Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Conditional {
+                    facts,
+                    protocol: prepared.condition.protocol,
+                    token: prepared.condition.token,
+                },
+            )
+        });
+        result.map_err(|error| {
+            let error = error.redacted(&json!({
+                "authorization": &self.authorization,
+                "url": &self.endpoint_url,
+            }));
+            tracing::warn!(
+                provider_binding = %self.server_name,
+                native_tool,
+                timed_out = error.is_timeout(),
+                transport_outcome_unknown = error.side_effects_maybe(),
+                "Agent Binding semantic read freshness preparation failed; executing uncached"
+            );
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError::SourceFailed
+        })
+    }
+}
+
 pub(crate) async fn prepare_agent_binding_mcp_bundle(
     server_id: &str,
     endpoint_url: &str,
     authorization: &str,
+    semantic_read_capability: Option<&astra_services::runs::RuntimeSemanticReadCapabilityRequest>,
 ) -> Result<RuntimeMcpBundle, (StatusCode, Json<ErrorResponse>)> {
     let tool_namespace = sanitize_tool_name(server_id);
     if tool_namespace.is_empty() {
@@ -1066,7 +1369,7 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
     let (_adapter_schemas, control_tools, stop_after_success_tools) =
         agent_binding_tools_to_schemas_checked(&tool_namespace, &tools)
             .map_err(|(error, code)| mcp_error(StatusCode::BAD_GATEWAY, error, code))?;
-    let declarations = tools
+    let mut declarations = tools
         .iter()
         .map(|tool| {
             let mut declaration = mcp_tool_to_provider_declaration(&tool.tool)?;
@@ -1085,6 +1388,15 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
                 "agent_binding_discovery_invalid",
             )
         })?;
+    let semantic_read_tools =
+        apply_agent_binding_semantic_read_contract(&mut declarations, semantic_read_capability)
+            .map_err(|error| {
+                mcp_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid Agent Binding semantic read capability: {error}"),
+                    "agent_binding_semantic_read_capability_invalid",
+                )
+            })?;
     let provider_snapshot = ProviderDiscoverySnapshot::new(
         ProviderIdentity::new(server_id.to_string()).map_err(|error| {
             mcp_error(
@@ -1116,14 +1428,18 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
             "agent_binding_discovery_invalid",
         )
     })?;
-    let resolved_snapshot =
-        resolve_mcp_snapshot(&tool_namespace, &provider_snapshot).map_err(|error| {
-            mcp_error(
-                StatusCode::BAD_GATEWAY,
-                format!("invalid Agent Binding MCP provider resolution: {error}"),
-                "agent_binding_provider_resolution_failed",
-            )
-        })?;
+    let resolved_snapshot = resolve_agent_binding_mcp_snapshot(
+        &tool_namespace,
+        &provider_snapshot,
+        !semantic_read_tools.is_empty(),
+    )
+    .map_err(|error| {
+        mcp_error(
+            StatusCode::BAD_GATEWAY,
+            format!("invalid Agent Binding MCP provider resolution: {error}"),
+            "agent_binding_provider_resolution_failed",
+        )
+    })?;
     let schemas =
         mcp_resolved_provider_snapshot_to_schemas_checked(&resolved_snapshot).map_err(|error| {
             mcp_error(
@@ -1140,12 +1456,13 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
                 "agent_binding_provider_resolution_failed",
             )
         })?;
-    let agent_binding_mcp = AgentBindingMcpRuntime {
+    let agent_binding_mcp = Arc::new(AgentBindingMcpRuntime {
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
         authorization: authorization.to_string(),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
-    };
+        semantic_read_tools: Arc::new(semantic_read_tools),
+    });
     let provider_snapshots = vec![resolved_snapshot];
     let provider_policy_index =
         astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
@@ -1158,6 +1475,28 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
                 "agent_binding_provider_policy_invalid",
             )
         })?;
+    let mut semantic_read_capabilities =
+        crate::server::semantic_read_freshness::ProviderSemanticFreshnessRegistry::default();
+    if !agent_binding_mcp.semantic_read_tools.is_empty() {
+        semantic_read_capabilities
+            .register(
+                ProviderBindingRef::new(server_id.to_string()).map_err(|error| {
+                    mcp_error(
+                        StatusCode::BAD_REQUEST,
+                        error.to_string(),
+                        "agent_binding_capability_ref_invalid",
+                    )
+                })?,
+                agent_binding_mcp.clone(),
+            )
+            .map_err(|error| {
+                mcp_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                    "agent_binding_semantic_read_capability_conflict",
+                )
+            })?;
+    }
     Ok(RuntimeMcpBundle {
         schemas,
         provider_snapshots,
@@ -1165,7 +1504,8 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
         control_tools,
         stop_after_success_tools,
         manager: None,
-        agent_binding_mcp: Some(Arc::new(agent_binding_mcp)),
+        agent_binding_mcp: Some(agent_binding_mcp),
+        semantic_read_capabilities,
     })
 }
 
@@ -1179,6 +1519,65 @@ mod tests {
 
         assert!(error.side_effects_maybe());
         assert!(error.is_timeout());
+    }
+
+    #[test]
+    fn agent_binding_post_send_certainty_depends_on_rpc_semantics_and_acknowledgement() {
+        let prepare_timeout = agent_binding_mcp_timeout_error("timed out")
+            .after_send(AgentBindingMcpRpcRisk::SideEffectFree);
+        assert!(prepare_timeout.is_timeout());
+        assert!(!prepare_timeout.side_effects_maybe());
+
+        let malformed_tool_response = agent_binding_mcp_rpc_error("malformed response")
+            .after_send(AgentBindingMcpRpcRisk::ToolInvocation);
+        assert!(malformed_tool_response.side_effects_maybe());
+
+        let acknowledged_provider_error = agent_binding_mcp_provider_error("rejected")
+            .after_send(AgentBindingMcpRpcRisk::ToolInvocation);
+        assert!(!acknowledged_provider_error.side_effects_maybe());
+    }
+
+    #[tokio::test]
+    async fn agent_binding_rpc_deadline_preserves_effect_specific_certainty() {
+        use axum::{Router, routing::post};
+
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Json(json!({"jsonrpc": "2.0", "id": "late", "result": {}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let prepare = post_agent_binding_mcp_rpc_with_risk(
+            &endpoint,
+            "Bearer test",
+            json!({"jsonrpc": "2.0", "id": "prepare", "method": "prepare"}),
+            Duration::from_millis(10),
+            AgentBindingMcpRpcRisk::SideEffectFree,
+        )
+        .await
+        .expect_err("side-effect-free preparation must honor its deadline");
+        assert!(prepare.is_timeout());
+        assert!(!prepare.side_effects_maybe());
+
+        let tool_call = post_agent_binding_mcp_rpc_with_risk(
+            &endpoint,
+            "Bearer test",
+            json!({"jsonrpc": "2.0", "id": "call", "method": "tools/call"}),
+            Duration::from_millis(10),
+            AgentBindingMcpRpcRisk::ToolInvocation,
+        )
+        .await
+        .expect_err("tool invocation must honor its deadline");
+        assert!(tool_call.is_timeout());
+        assert!(tool_call.side_effects_maybe());
+        server.abort();
     }
 
     #[test]
@@ -1539,9 +1938,10 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/mcp");
 
-        let bundle = prepare_agent_binding_mcp_bundle("tools", &endpoint, "Bearer runtime-grant")
-            .await
-            .expect("agent binding MCP discovery should succeed");
+        let bundle =
+            prepare_agent_binding_mcp_bundle("tools", &endpoint, "Bearer runtime-grant", None)
+                .await
+                .expect("agent binding MCP discovery should succeed");
 
         assert!(bundle.manager.is_none());
         assert!(bundle.agent_binding_mcp.is_some());
@@ -1574,7 +1974,7 @@ mod tests {
             .agent_binding_mcp
             .as_ref()
             .unwrap()
-            .call_tool_by_mcp_name("mcp__tools__query", &json!({"q": "hello"}))
+            .call_tool_by_mcp_name("mcp__tools__query", &json!({"q": "hello"}), None)
             .await
             .expect("tool call should succeed");
         assert_eq!(output.output, "query-result");
@@ -1602,6 +2002,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_binding_semantic_read_contract_is_authorized_conditioned_and_acknowledged() {
+        use axum::{Router, routing::post};
+        use std::sync::Mutex;
+
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests_for_handler = requests.clone();
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(body): Json<Value>| {
+                let requests = requests_for_handler.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(body.clone());
+                    let id = body.get("id").cloned().unwrap_or(Value::Null);
+                    let result = match body.get("method").and_then(Value::as_str) {
+                        Some("tools/list") => json!({
+                            "tools": [{
+                                "name": "query",
+                                "description": "Query a revisioned resource",
+                                "inputSchema": {"type": "object"}
+                            }]
+                        }),
+                        Some(AGENT_BINDING_SEMANTIC_READ_PREPARE_METHOD) => json!({
+                            "facts": [{
+                                "scope": "resource",
+                                "subject": "catalog/orders",
+                                "revision": "etag-7"
+                            }],
+                            "condition": {
+                                "protocol": "if-match",
+                                "token": "etag-7"
+                            }
+                        }),
+                        Some("tools/call") => {
+                            let condition = body
+                                .pointer("/params/_meta/astra.semantic_read_condition")
+                                .cloned()
+                                .expect("condition must reach the exact provider dispatch");
+                            let condition = serde_json::from_value::<
+                                astra_turn_types::SemanticReadCondition,
+                            >(condition)
+                            .expect("transported condition must remain valid");
+                            json!({
+                                "content": [{"type": "text", "text": "orders-v7"}],
+                                "_meta": {
+                                    "astra.semantic_read_condition_ack":
+                                        astra_turn_types::SemanticReadConditionAck::for_condition(
+                                            &condition
+                                        ),
+                                    "providerPrivate": "must-not-be-authority"
+                                }
+                            })
+                        }
+                        other => panic!("unexpected method: {other:?}"),
+                    };
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let capability = astra_services::runs::RuntimeSemanticReadCapabilityRequest {
+            contract_version: AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION.to_string(),
+            tools: vec!["query".to_string()],
+        };
+
+        let bundle = prepare_agent_binding_mcp_bundle(
+            "tools",
+            &endpoint,
+            "Bearer runtime-grant",
+            Some(&capability),
+        )
+        .await
+        .expect("trusted semantic read adapter should compose");
+        let descriptor = &bundle.provider_snapshots[0].descriptors[0];
+        assert_eq!(
+            descriptor.semantic_baseline.effect,
+            astra_turn_types::ResolvedToolEffect::ReadOnly
+        );
+        assert_eq!(
+            descriptor.semantic_baseline.semantic_cache,
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound
+        );
+        assert_eq!(bundle.semantic_read_capabilities.len(), 1);
+
+        let evidence = crate::server::semantic_read_freshness::prepare_provider_semantic_freshness(
+            Some(&bundle.semantic_read_capabilities),
+            &descriptor.descriptor_ref(),
+            &json!({"z": 1, "_run_id": "must-not-leak", "a": 2}),
+        )
+        .await
+        .expect("provider prepare should return revision evidence");
+        let crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Conditional {
+            facts,
+            protocol,
+            token,
+        } = evidence
+        else {
+            panic!("configured adapter must return conditional evidence");
+        };
+        let freshness = astra_turn_types::SemanticReadFreshnessContext::new("user:u1", facts)
+            .expect("freshness context");
+        let condition = astra_turn_types::SemanticReadCondition::new(&protocol, &token, &freshness)
+            .expect("condition");
+        let result = bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .call_tool_by_mcp_name(
+                "mcp__tools__query",
+                &json!({"a": 2, "z": 1}),
+                Some(&condition),
+            )
+            .await
+            .expect("conditioned tool call should succeed");
+        let acknowledgement = result
+            .protocol_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata.get(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY)
+            })
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<astra_turn_types::SemanticReadConditionAck>(value).ok()
+            })
+            .expect("provider must return a typed acknowledgement");
+        assert!(acknowledgement.confirms(&condition));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "u1".to_string(),
+            "s1".to_string(),
+            None,
+            None,
+        );
+        executor.enable_durable_invocations();
+        assert_eq!(
+            bundle
+                .configure_semantic_read_cache(&mut executor)
+                .expect("production bundle composition should activate cache atomically"),
+            crate::server::runtime_tool_executor::SemanticReadCacheActivation::Enabled {
+                binding_count: 1
+            }
+        );
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prepare = requests
+            .iter()
+            .find(|request| {
+                request.get("method").and_then(Value::as_str)
+                    == Some(AGENT_BINDING_SEMANTIC_READ_PREPARE_METHOD)
+            })
+            .expect("prepare request recorded");
+        assert_eq!(
+            prepare.pointer("/params/arguments"),
+            Some(&json!({"a": 2, "z": 1})),
+            "only canonical public arguments may cross the freshness boundary"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn agent_binding_semantic_read_contract_rejects_unknown_native_tool() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{"name": "query", "inputSchema": {"type": "object"}}]
+        }))
+        .unwrap();
+        let mut declarations = tools
+            .iter()
+            .map(|tool| mcp_tool_to_provider_declaration(&tool.tool).unwrap())
+            .collect::<Vec<_>>();
+        let capability = astra_services::runs::RuntimeSemanticReadCapabilityRequest {
+            contract_version: AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION.to_string(),
+            tools: vec!["missing".to_string()],
+        };
+        let error =
+            apply_agent_binding_semantic_read_contract(&mut declarations, Some(&capability))
+                .expect_err("host capability must match exact discovery identity");
+        assert!(error.contains("undiscovered native tool 'missing'"));
+    }
+
+    #[tokio::test]
     async fn agent_binding_mcp_discovery_allows_empty_tool_list() {
         use axum::{Router, routing::post};
 
@@ -1624,9 +2214,10 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/mcp");
 
-        let bundle = prepare_agent_binding_mcp_bundle("tools", &endpoint, "Bearer runtime-grant")
-            .await
-            .expect("empty Agent Binding MCP discovery should be allowed");
+        let bundle =
+            prepare_agent_binding_mcp_bundle("tools", &endpoint, "Bearer runtime-grant", None)
+                .await
+                .expect("empty Agent Binding MCP discovery should be allowed");
 
         assert!(bundle.schemas.is_empty());
         assert_eq!(bundle.provider_snapshots.len(), 1);
@@ -1667,6 +2258,7 @@ mod tests {
                 "tools",
                 endpoint_url,
                 "Bearer runtime-grant",
+                None,
             )
             .await
             {

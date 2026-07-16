@@ -160,17 +160,22 @@ impl SemanticReadPreparation {
     }
 }
 
+fn take_semantic_read_condition_ack(
+    result: &mut astra_tools::ToolResult,
+) -> Option<astra_turn_types::SemanticReadConditionAck> {
+    let encoded = result.metadata.as_mut().and_then(|metadata| {
+        metadata.remove(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY)
+    })?;
+    serde_json::from_value(encoded).ok()
+}
+
+#[cfg(test)]
 fn consume_semantic_read_condition_ack(
     result: &mut astra_tools::ToolResult,
     condition: &astra_turn_types::SemanticReadCondition,
 ) -> bool {
-    let Some(encoded) = result.metadata.as_mut().and_then(|metadata| {
-        metadata.remove(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY)
-    }) else {
-        return false;
-    };
-    serde_json::from_value::<astra_turn_types::SemanticReadConditionAck>(encoded)
-        .is_ok_and(|acknowledgement| acknowledgement.confirms(condition))
+    take_semantic_read_condition_ack(result)
+        .is_some_and(|acknowledgement| acknowledgement.confirms(condition))
 }
 
 fn attach_semantic_read_decision_evidence(
@@ -396,9 +401,9 @@ pub struct RuntimeToolExecutor {
     /// Logical-invocation delivery ledger. Unlike the legacy semantic cache,
     /// this is keyed by owner/run/turn/invocation identity.
     invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
-    /// Freshness-bound successful read observations. This remains explicitly
-    /// disabled until the cluster rollout proves every ledger reader supports
-    /// non-dispatched cache completion records.
+    /// Freshness-bound successful read observations. Production composition
+    /// enables this only alongside an exact conditional-read provider adapter
+    /// and the durable invocation ledger.
     semantic_read_observation_store: Option<
         crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore,
     >,
@@ -1090,9 +1095,17 @@ impl RuntimeToolExecutor {
         );
     }
 
-    async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+    async fn execute_mcp_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
+    ) -> astra_tools::ToolResult {
         if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
-            return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
+            return match agent_binding_mcp
+                .call_tool_by_mcp_name(name, args, semantic_read_condition)
+                .await
+            {
                 Ok(result) => tool_result_from_mcp_tool_call_result(result),
                 Err(error) => mcp_call_error_result(
                     super::runtime_mcp::redact_mcp_error_text(&format!(
@@ -2339,14 +2352,19 @@ impl RuntimeToolExecutor {
                 });
         let mut executed =
             execute_tool_route_before_completion_events(&route_context, request, route).await;
+        // Provider protocol metadata is never durable authority. Extract the
+        // one allowlisted acknowledgement into a typed value and remove it
+        // from result metadata before any event or ledger persistence.
+        let semantic_read_condition_ack = take_semantic_read_condition_ack(&mut executed.result);
         let durable = durable_invocation.map(
             |(ledger, identity, _, owner_id, mut cache_fill, cache_evidence)| {
                 if let Some(evidence) = cache_evidence {
                     attach_semantic_read_decision_evidence(&mut executed.result, evidence);
                 }
                 if let Some(fill) = cache_fill.as_mut() {
-                    fill.provider_confirmed =
-                        consume_semantic_read_condition_ack(&mut executed.result, &fill.condition);
+                    fill.provider_confirmed = semantic_read_condition_ack
+                        .as_ref()
+                        .is_some_and(|acknowledgement| acknowledgement.confirms(&fill.condition));
                 }
                 PendingDurableToolCompletion {
                     ledger,
@@ -3130,7 +3148,11 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                 return result;
             }
             return self
-                .execute_mcp_tool(&request.tool_name, &request.args)
+                .execute_mcp_tool(
+                    &request.tool_name,
+                    &request.args,
+                    request.policy.semantic_read_condition.as_ref(),
+                )
                 .await;
         }
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
@@ -3259,7 +3281,8 @@ fn tool_result_from_provider_payload(
     }
     if let Some(protocol_metadata) = payload.protocol_metadata {
         let encoded = protocol_metadata.to_string().into_bytes();
-        tool_result.metadata.get_or_insert_with(Map::new).insert(
+        let metadata = tool_result.metadata.get_or_insert_with(Map::new);
+        metadata.insert(
             "providerProtocolMetadataSummary".to_string(),
             json!({
                 "contentHash": format!("{:x}", Sha256::digest(&encoded)),
@@ -3267,6 +3290,19 @@ fn tool_result_from_provider_payload(
                 "rawProjected": false,
             }),
         );
+        if let Some(acknowledgement) = protocol_metadata
+            .get(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY)
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<astra_turn_types::SemanticReadConditionAck>(value).ok()
+            })
+        {
+            metadata.insert(
+                astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY.to_string(),
+                serde_json::to_value(acknowledgement)
+                    .expect("semantic read acknowledgement must serialize"),
+            );
+        }
     }
     tool_result
 }
@@ -3775,6 +3811,40 @@ mod tests {
             Some(64)
         );
         assert!(!Value::Object(metadata).to_string().contains("request-1"));
+    }
+
+    #[test]
+    fn mcp_projection_allowlists_only_typed_semantic_ack_and_consumes_it() {
+        let condition = semantic_read_test_condition("rev-1");
+        let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
+            output: "read-result".to_string(),
+            structured_content: None,
+            protocol_metadata: Some(json!({
+                "astra.semantic_read_condition_ack":
+                    astra_turn_types::SemanticReadConditionAck::for_condition(&condition),
+                "providerSecret": "must-not-be-projected"
+            })),
+            is_error: false,
+        });
+        let metadata = result.metadata.as_ref().expect("bounded metadata");
+        assert!(metadata.contains_key(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY));
+        assert!(
+            !Value::Object(metadata.clone())
+                .to_string()
+                .contains("must-not-be-projected")
+        );
+
+        let mut result = result;
+        let acknowledgement = take_semantic_read_condition_ack(&mut result)
+            .expect("allowlisted acknowledgement should be typed");
+        assert!(acknowledgement.confirms(&condition));
+        assert!(
+            !result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .contains_key(astra_turn_types::SEMANTIC_READ_CONDITION_ACK_METADATA_KEY)
+        );
     }
 
     #[test]

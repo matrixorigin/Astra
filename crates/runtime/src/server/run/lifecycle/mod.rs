@@ -265,6 +265,32 @@ fn wire_reflect_service_into_executor(
     executor.with_reflect_service(Arc::clone(service))
 }
 
+fn configure_runtime_semantic_read_cache(
+    executor: &mut runtime_tool_executor::RuntimeToolExecutor,
+    bundle: Option<&runtime_mcp::RuntimeMcpBundle>,
+) {
+    let Some(bundle) = bundle else {
+        return;
+    };
+    match bundle.configure_semantic_read_cache(executor) {
+        Ok(runtime_tool_executor::SemanticReadCacheActivation::Enabled { binding_count }) => {
+            tracing::debug!(
+                binding_count,
+                "activated production semantic read cache capabilities"
+            );
+        }
+        Ok(runtime_tool_executor::SemanticReadCacheActivation::DisabledNoCapabilities) => {
+            tracing::debug!(
+                "semantic read cache disabled: runtime bundle has no conditional freshness capabilities"
+            );
+        }
+        Err(error) => tracing::error!(
+            %error,
+            "semantic read cache composition failed; provider reads remain uncached"
+        ),
+    }
+}
+
 async fn wait_for_shared_run_interaction(
     run_engine: &RunEngine,
     user_id: &str,
@@ -4091,14 +4117,13 @@ impl AgenticRunLifecycleService {
                 "provider_runtime_context_required",
             )
         })?;
-        let mcp_endpoint_url = Self::agent_binding_runtime_descriptor(
+        let mcp_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.mcp",
             descriptors.mcp.as_ref(),
             &resolved.mcp_server.id,
             "mcp",
-        )?
-        .endpoint_url
-        .clone();
+        )?;
+        let mcp_endpoint_url = mcp_descriptor.endpoint_url.clone();
         let skill_endpoint_url = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.skills",
             descriptors.skills.as_ref(),
@@ -4118,6 +4143,7 @@ impl AgenticRunLifecycleService {
             &resolved.mcp_server.id,
             &mcp_endpoint_url,
             &runtime_auth.authorization,
+            mcp_descriptor.semantic_read.as_ref(),
         )
         .await?;
         let skill_resolver = agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
@@ -6984,6 +7010,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // its shared pool; offline composition selects the in-memory
             // adapter explicitly.
             executor.enable_durable_invocations();
+            configure_runtime_semantic_read_cache(
+                &mut executor,
+                runtime_capabilities.mcp_bundle.as_ref(),
+            );
             // Share the host's plan-resume hint slot so tool-triggered
             // plan-mode changes refresh the system prompt mid-run.
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
@@ -8097,6 +8127,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 ));
             }
             executor.enable_durable_invocations();
+            configure_runtime_semantic_read_cache(
+                &mut executor,
+                runtime_capabilities.mcp_bundle.as_ref(),
+            );
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
                 executor.set_observability_session(observability_session);
             }

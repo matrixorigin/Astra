@@ -4585,6 +4585,7 @@ fn test_runtime_descriptor(
         transport: "http".to_string(),
         endpoint_url: endpoint_url.to_string(),
         protocol: "openai_responses".to_string(),
+        semantic_read: None,
         metadata: serde_json::Map::new(),
     }
 }
@@ -8290,6 +8291,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
             stop_after_success_tools: Default::default(),
             manager: None,
             agent_binding_mcp: None,
+            semantic_read_capabilities: Default::default(),
         }),
         request_scoped_skill_resolver: None,
         agent_binding: Some(PreparedAgentBindingLoopContext {

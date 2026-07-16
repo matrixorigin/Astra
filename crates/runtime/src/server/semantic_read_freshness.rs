@@ -50,7 +50,7 @@ pub enum ProviderSemanticFreshnessSourceError {
 /// Immutable production capability registry keyed by the exact provider
 /// binding carried by a resolved descriptor. Protocol names and model-facing
 /// aliases are deliberately absent from the routing key.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderSemanticFreshnessRegistry {
     sources: BTreeMap<ProviderBindingRef, Arc<dyn ProviderSemanticFreshnessSource>>,
 }

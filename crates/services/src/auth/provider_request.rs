@@ -1,8 +1,9 @@
 use astra_core::{ErrorResponse, error_response_coded};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-use crate::runs::RuntimeCapabilityDescriptorRequest;
+use crate::runs::{RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION, RuntimeCapabilityDescriptorRequest};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +38,35 @@ pub fn validate_runtime_capability_descriptor(
         &descriptor.endpoint_url,
         &descriptor.protocol,
         expected_type,
-    )
+    )?;
+    if let Some(capability) = descriptor.semantic_read.as_ref() {
+        if expected_type != "mcp" {
+            return Err(provider_context_invalid(
+                "semantic_read is only valid for mcp capability descriptors",
+            ));
+        }
+        if capability.contract_version != RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION {
+            return Err(provider_context_invalid(format!(
+                "unsupported semantic_read.contract_version '{}'",
+                capability.contract_version
+            )));
+        }
+        if capability.tools.is_empty() {
+            return Err(provider_context_invalid(
+                "semantic_read.tools must contain at least one native tool name",
+            ));
+        }
+        let mut exact_tools = HashSet::with_capacity(capability.tools.len());
+        for tool in &capability.tools {
+            validate_exact_descriptor_string("semantic_read.tools[]", tool)?;
+            if !exact_tools.insert(tool) {
+                return Err(provider_context_invalid(
+                    "semantic_read.tools must not contain duplicates",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_descriptor_strings(
@@ -112,6 +141,7 @@ mod tests {
             transport: "http".to_string(),
             endpoint_url: endpoint_url.to_string(),
             protocol: "moi-runtime-model-gateway.v1".to_string(),
+            semantic_read: None,
             metadata: Map::new(),
         }
     }
@@ -138,5 +168,34 @@ mod tests {
             body.0.error_code.as_deref(),
             Some("provider_runtime_context_invalid")
         );
+    }
+
+    #[test]
+    fn semantic_read_contract_is_host_validated_before_provider_io() {
+        let mut descriptor = descriptor("mcp", "http://127.0.0.1/mcp");
+        descriptor.semantic_read = Some(crate::runs::RuntimeSemanticReadCapabilityRequest {
+            contract_version: RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION.to_string(),
+            tools: vec!["query".to_string(), "query".to_string()],
+        });
+        let (status, body) = validate_runtime_capability_descriptor(&descriptor, "mcp")
+            .expect_err("duplicate native identities must fail before discovery");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("provider_runtime_context_invalid")
+        );
+
+        descriptor.semantic_read = Some(crate::runs::RuntimeSemanticReadCapabilityRequest {
+            contract_version: "future-contract".to_string(),
+            tools: vec!["query".to_string()],
+        });
+        assert!(validate_runtime_capability_descriptor(&descriptor, "mcp").is_err());
+
+        descriptor.semantic_read = Some(crate::runs::RuntimeSemanticReadCapabilityRequest {
+            contract_version: RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION.to_string(),
+            tools: vec!["query".to_string()],
+        });
+        validate_runtime_capability_descriptor(&descriptor, "mcp")
+            .expect("exact supported capability should pass host validation");
     }
 }

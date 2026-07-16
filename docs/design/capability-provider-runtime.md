@@ -386,6 +386,35 @@ If revalidation changes, fails, or becomes unavailable, Astra retains the
 durable invocation result but abandons the cache fill. This is an observable
 uncached/degraded path, not a tool failure and not a session stop.
 
+Production adapters must negotiate this as one atomic capability, not as
+independent cache and transport switches. For the Astra MCP extension:
+
+- a provider-authorized runtime capability descriptor names the exact native
+  tools covered by `astra-semantic-read-mcp-v1`; model-facing aliases and
+  provider self-declarations cannot grant this authority;
+- Astra calls the side-effect-free `astra/semantic-read/prepare` method with
+  canonical public arguments and receives raw revision facts plus an opaque
+  protocol/token precondition;
+- the resulting content-addressed condition is attached to the exact
+  `tools/call` request under `_meta.astra.semantic_read_condition`;
+- the provider returns `_meta.astra.semantic_read_condition_ack` confirming
+  that exact condition. Astra validates and consumes the acknowledgement
+  before events or durable result persistence; all other raw provider metadata
+  remains non-authoritative and is only represented by a bounded summary.
+
+Malformed evidence, transport failure, missing or mismatched acknowledgement,
+and unsupported providers all execute the underlying read uncached. They do
+not publish an observation, fabricate freshness, or stop the session. Standard
+MCP remains explicitly disabled because its annotations do not define this
+conditional revision contract.
+
+Freshness preparation has its own short end-to-end deadline, including response
+body consumption, so a cache optimization cannot inherit the provider tool's
+execution timeout. Its timeout is side-effect-free and therefore certain. In
+contrast, transport failure after a real tool request may have been sent is
+`OutcomeUnknown`; an explicit JSON-RPC provider error remains an acknowledged
+failure. Retry policy must preserve that distinction.
+
 ## Durable invocation ledger
 
 ```text

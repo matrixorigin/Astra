@@ -460,6 +460,15 @@ pub struct SelectedModelRequest {
     pub gateway: Option<String>,
 }
 
+pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSemanticReadCapabilityRequest {
+    pub contract_version: String,
+    pub tools: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCapabilityDescriptorRequest {
@@ -469,6 +478,10 @@ pub struct RuntimeCapabilityDescriptorRequest {
     pub transport: String,
     pub endpoint_url: String,
     pub protocol: String,
+    /// Provider-authorized, host-owned semantic read contract. Tool names are
+    /// exact provider-native identities, never model-facing aliases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_read: Option<RuntimeSemanticReadCapabilityRequest>,
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
