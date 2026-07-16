@@ -60,11 +60,15 @@ runs:
         fi
 
     - name: Install sccache
+      id: install_sccache
       if: ${{ inputs.use-sccache == 'true' }}
       uses: mozilla-actions/sccache-action@v0.0.10
+      # Compiler caching is an optimization. A transient GitHub API or action
+      # distribution failure must not suppress the actual compile/test gates.
+      continue-on-error: true
 
     - name: Configure sccache
-      if: ${{ inputs.use-sccache == 'true' }}
+      if: ${{ inputs.use-sccache == 'true' && steps.install_sccache.outcome == 'success' }}
       shell: bash
       run: |
         {
@@ -72,6 +76,13 @@ runs:
           echo "SCCACHE_CACHE_SIZE=5G"
           echo "RUSTC_WRAPPER=sccache"
         } >> "$GITHUB_ENV"
+
+    - name: Report sccache fallback
+      if: ${{ always() && inputs.use-sccache == 'true' && steps.install_sccache.outcome != 'success' }}
+      shell: bash
+      run: |
+        echo "::warning::sccache setup failed; continuing with uncached Rust compilation"
+        echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@v2
       with:
