@@ -1,0 +1,73 @@
+# Dockerfile.prebuilt — astra-server runtime image (no Rust compilation)
+#
+# Prerequisites: pre-built binaries must exist at:
+#   rust/target/x86_64-unknown-linux-gnu/release/astra-server
+#   rust/target/x86_64-unknown-linux-gnu/release/astra
+#
+# Build with cargo-zigbuild first:
+#   cd rust
+#   cargo zigbuild --release --no-default-features \
+#     --target x86_64-unknown-linux-gnu \
+#     -p astra-runtime --bin astra-server \
+#     -p astra-cli --bin astra
+#
+# Then build the image:
+#   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t astra-server:TAG .
+
+FROM debian:bookworm-slim
+
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_BRANCH=unknown
+
+LABEL org.opencontainers.image.title="Astra" \
+      org.opencontainers.image.description="Astra API server and CLI runtime image (prebuilt)" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
+
+ARG DEBIAN_MIRROR
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+# Proxy vars are intentionally kept as build-time ARGs only (used by apt/curl
+# during build). They are NOT promoted to ENV to avoid baking proxy URLs —
+# which may contain credentials — into the image layers. Inject proxy settings
+# at runtime via docker run -e or Kubernetes pod env if needed.
+
+WORKDIR /app
+
+RUN set -eux; \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
+        mirror="${DEBIAN_MIRROR%/}"; \
+        case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
+        find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
+            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#${mirror}#g"; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl libssl3; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd -r appgroup; \
+    useradd --system --create-home --home-dir /home/appuser \
+            --shell /usr/sbin/nologin -g appgroup appuser
+
+COPY rust/target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
+COPY rust/target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
+
+RUN chown root:appgroup /app && chmod 0770 /app
+
+USER appuser
+
+EXPOSE 17001
+ENV HOME=/home/appuser
+ENV ASTRA_API_HOST=0.0.0.0
+ENV ASTRA_API_PORT=17001
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS http://localhost:17001/health >/dev/null || exit 1
+
+STOPSIGNAL SIGTERM
+CMD ["astra-server"]

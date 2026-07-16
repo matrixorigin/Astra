@@ -139,13 +139,17 @@ pub use astra_core::composite_snapshot::{
     SnapshotSpec,
 };
 pub use auth::{
-    AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
-    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
+    AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext,
+    AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
     DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
     DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
     DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
-    FernetTokenEncryptor, ProviderRequestDescriptor, SessionCreateRequestData, SessionListFilter,
-    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
+    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
+    ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
+    ExternalRuntimeContextResponse, ExternalSessionRecord, FernetTokenEncryptor,
+    HttpExternalProviderClient, ProviderRequestDescriptor, SessionCreateRequestData,
+    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{
@@ -244,7 +248,7 @@ pub use models::{
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
     EdgeAgentRecord, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
-    EdgeRegistryService, LeaseClaimResult, LeaseRenewalConfig, LeaseRenewalTask,
+    EdgeRegistryService, HeartbeatError, LeaseClaimResult, LeaseRenewalConfig, LeaseRenewalTask,
     NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView,
     TasksPackPushResult, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
     UnconfiguredTaskLeaseService,

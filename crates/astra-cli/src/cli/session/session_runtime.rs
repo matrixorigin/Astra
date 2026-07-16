@@ -424,6 +424,7 @@ fn create_pipeline_modules_inner(
 pub(crate) struct ServerModelSelection {
     pub name: String,
     pub context_window: Option<u32>,
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +478,10 @@ pub(crate) fn default_model_selection_from_models_response(
             model_list_entry_name(entry).map(|name| ServerModelSelection {
                 name: name.to_string(),
                 context_window: model_list_entry_context_window(entry),
+                model_id: entry
+                    .get("model_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
             })
         })
 }
@@ -538,21 +543,53 @@ pub(crate) async fn resolve_server_default_model(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) -> ServerDefaultModel {
+    tracing::debug!(
+        target: "astra_cli::model_selection",
+        "resolve_server_default_model: calling GET /models"
+    );
     let resp = match api
         .get_models_response_timeout(token, std::time::Duration::from_secs(3))
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return ServerDefaultModel::Unavailable,
+        Ok(r) => {
+            tracing::warn!(
+                target: "astra_cli::model_selection",
+                status = %r.status(),
+                "resolve_server_default_model: GET /models returned non-success status → Unavailable"
+            );
+            return ServerDefaultModel::Unavailable;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_cli::model_selection",
+                error = %e,
+                "resolve_server_default_model: GET /models request error → Unavailable"
+            );
+            return ServerDefaultModel::Unavailable;
+        }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return ServerDefaultModel::Unavailable,
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_cli::model_selection",
+                error = %e,
+                "resolve_server_default_model: failed to parse /models JSON → Unavailable"
+            );
+            return ServerDefaultModel::Unavailable;
+        }
     };
-    match default_model_selection_from_models_response(&body) {
+    let result = match default_model_selection_from_models_response(&body) {
         Some(selection) => ServerDefaultModel::Selected(selection),
         None => ServerDefaultModel::NoModels,
-    }
+    };
+    tracing::debug!(
+        target: "astra_cli::model_selection",
+        result = ?result,
+        "resolve_server_default_model: completed"
+    );
+    result
 }
 
 pub(crate) async fn ensure_state_default_model(
@@ -585,6 +622,11 @@ pub(crate) async fn ensure_state_default_model(
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
             state.model = Some(selection.name.clone());
+            if selection.model_id.is_some() {
+                crate::cli::slash::slash_config::set_active_model_id_for_request(
+                    selection.model_id.clone(),
+                );
+            }
             if let Some(context_window) = selection.context_window {
                 state.context_budget =
                     astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
@@ -846,8 +888,16 @@ pub(crate) async fn fresh_access_token(
 ) -> Option<String> {
     let now = chrono::Utc::now().timestamp();
     if let Some(token) = active_env_access_token(now) {
+        tracing::debug!(
+            target: "astra_cli::auth",
+            "fresh_access_token: using ASTRA_ACCESS_TOKEN env var (valid, not expired)"
+        );
         return Some(token);
     }
+    tracing::debug!(
+        target: "astra_cli::auth",
+        "fresh_access_token: ASTRA_ACCESS_TOKEN env var absent/expired, falling back to profile credentials"
+    );
 
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -1193,7 +1243,8 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
-    let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
+    let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some()
+        || active_env_access_token(chrono::Utc::now().timestamp()).is_some();
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
     let skills_count = state.unified_skill_registry.len();
@@ -1317,17 +1368,6 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     if let Some(line) = pending_recovery_status_line(state) {
         let truncated = trunc_vis(&line, right_col_w);
         right.push(truncated.yellow().bold().to_string());
-    }
-    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")) {
-        if !proxy.is_empty() {
-            let max_proxy = right_col_w.saturating_sub(8);
-            let short = if proxy.len() > max_proxy {
-                format!("{}…", &proxy[..max_proxy.saturating_sub(1)])
-            } else {
-                proxy
-            };
-            right.push(format!("proxy: {short}").white().bold().to_string());
-        }
     }
 
     // Equalize heights

@@ -23,7 +23,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+    tungstenite::Message,
+};
 use tracing::Instrument;
 
 /// Astra remote edge agent — execute tool calls locally for web sessions.
@@ -240,6 +244,133 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         .expect("runtime environment advertisement serializes")
 }
 
+// ─── Proxy helpers ───────────────────────────────────────────────────────────
+
+/// Parse `host` and `port` from a WebSocket URL (`ws://` or `wss://`).
+///
+/// Handles IPv6 bracket notation (`[::1]:port`) and strips any path/query
+/// component.  Does not support userinfo — WebSocket URLs with credentials
+/// are not a use-case here.
+fn parse_ws_target(ws_url: &str) -> Option<(String, u16)> {
+    let (rest, default_port) = if let Some(r) = ws_url.strip_prefix("wss://") {
+        (r, 443u16)
+    } else {
+        let r = ws_url.strip_prefix("ws://")?;
+        (r, 80u16)
+    };
+    // Drop path/query/fragment — only the authority matters.
+    let authority = rest.split('/').next()?;
+    parse_host_port(authority, default_port)
+}
+
+/// Parse `host` and `port` from an HTTP(S) proxy URL.
+///
+/// Accepts `http://` and `https://` schemes, strips userinfo (e.g.
+/// `user:pass@`), handles IPv6 bracket notation, and defaults to port 3128
+/// when no explicit port is present.
+fn parse_proxy_addr(proxy_url: &str) -> Option<(String, u16)> {
+    let rest = proxy_url
+        .strip_prefix("http://")
+        .or_else(|| proxy_url.strip_prefix("https://"))?;
+    // Drop path/query/fragment.
+    let authority = rest.split('/').next()?;
+    // Strip optional userinfo (`user:pass@`).
+    let host_port = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    parse_host_port(host_port, 3128)
+}
+
+/// Parse `host:port` from an authority string, handling IPv6 bracket notation.
+fn parse_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if authority.starts_with('[') {
+        // IPv6: `[::1]` or `[::1]:port`
+        let bracket_end = authority.find(']')?;
+        let host = authority.get(1..bracket_end)?.to_string();
+        let port = if authority.as_bytes().get(bracket_end + 1) == Some(&b':') {
+            authority.get(bracket_end + 2..)?.parse().ok()?
+        } else {
+            default_port
+        };
+        Some((host, port))
+    } else if let Some(colon_pos) = authority.rfind(':') {
+        let host = authority[..colon_pos].to_string();
+        let port: u16 = authority[colon_pos + 1..].parse().ok()?;
+        Some((host, port))
+    } else {
+        Some((authority.to_string(), default_port))
+    }
+}
+
+// Connect to the WebSocket server via HTTP CONNECT proxy.
+// Returns the same type as `connect_async` so callers stay uniform.
+async fn connect_via_proxy(
+    ws_url: &str,
+    proxy_url: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
+    if proxy_url.starts_with("https://") {
+        return Err(format!(
+            "HTTPS proxies are not supported for WebSocket CONNECT \
+             (the CONNECT handshake is sent in plaintext over a raw TCP connection). \
+             Configure an http:// proxy instead: {proxy_url}"
+        )
+        .into());
+    }
+    let (ws_host, ws_port) =
+        parse_ws_target(ws_url).ok_or_else(|| format!("Cannot parse WebSocket URL: {ws_url}"))?;
+    let (proxy_host, proxy_port) = parse_proxy_addr(proxy_url)
+        .ok_or_else(|| format!("Cannot parse proxy URL: {proxy_url}"))?;
+
+    tracing::info!(proxy = %proxy_url, target = %format!("{ws_host}:{ws_port}"), "CONNECT via proxy");
+
+    let mut tcp = tokio::net::TcpStream::connect(format!("{proxy_host}:{proxy_port}")).await?;
+
+    // HTTP CONNECT handshake
+    let req = format!("CONNECT {ws_host}:{ws_port} HTTP/1.1\r\nHost: {ws_host}:{ws_port}\r\n\r\n");
+    tcp.write_all(req.as_bytes()).await?;
+
+    // Read proxy response headers (200 Connection Established). Read until
+    // end-of-headers (\r\n\r\n) so we don't mis-parse when the status line is
+    // split across TCP packets.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while buf.len() < 16 * 1024 {
+        let n = tcp.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp = String::from_utf8_lossy(&buf);
+    if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
+        let first_line = resp.lines().next().unwrap_or("(empty)").to_string();
+        return Err(format!("Proxy CONNECT rejected: {first_line}").into());
+    }
+
+    // For wss://, the CONNECT tunnel is plain TCP — we must perform a TLS
+    // handshake inside the tunnel before sending the WebSocket upgrade.
+    // For ws://, no TLS is needed; send the upgrade directly over the tunnel.
+    if ws_url.starts_with("wss://") {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = Connector::Rustls(std::sync::Arc::new(tls_config));
+        let (ws_stream, _) =
+            client_async_tls_with_config(ws_url, tcp, None, Some(connector)).await?;
+        Ok(ws_stream)
+    } else {
+        let (ws_stream, _) =
+            tokio_tungstenite::client_async(ws_url, MaybeTlsStream::Plain(tcp)).await?;
+        Ok(ws_stream)
+    }
+}
+
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
 async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -247,16 +378,37 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
 
-    let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
-        tracing::error!(
-            target: "astra.edge",
-            edge_id = %config.edge_id,
-            url = %url,
-            error = %e,
-            "WebSocket connect failed"
-        );
-        e
-    })?;
+    // Use HTTP proxy when http_proxy / HTTP_PROXY environment variable is set.
+    let proxy = std::env::var("http_proxy")
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .ok()
+        .filter(|p| !p.is_empty());
+
+    let ws_stream = if let Some(ref proxy_url) = proxy {
+        connect_via_proxy(&url, proxy_url).await.map_err(|e| {
+            tracing::error!(
+                target: "astra.edge",
+                edge_id = %config.edge_id,
+                url = %url,
+                proxy = %proxy_url,
+                error = %e,
+                "WebSocket connect via proxy failed"
+            );
+            e
+        })?
+    } else {
+        let (ws, _) = connect_async(&url).await.map_err(|e| {
+            tracing::error!(
+                target: "astra.edge",
+                edge_id = %config.edge_id,
+                url = %url,
+                error = %e,
+                "WebSocket connect failed"
+            );
+            e
+        })?;
+        ws
+    };
     let (mut write, mut read) = ws_stream.split();
 
     tracing::info!("WebSocket connected, authenticating...");
@@ -341,6 +493,10 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        tracing::debug!(
+                            frame_len = text.len(),
+                            "edge received server text frame"
+                        );
                         match serde_json::from_str::<EdgeServerMessage>(&text) {
                             Ok(EdgeServerMessage::ToolRequest {
                                 request_id,

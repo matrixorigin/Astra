@@ -1154,14 +1154,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconfigured_edge_registry_errors() {
+    async fn unconfigured_edge_registry_is_noop_success() {
+        // With no cross-pod registry configured (single-pod), all mutating
+        // operations and list_by_user are successful no-ops so edge connections
+        // are never rejected and callers get empty results rather than errors.
         let s = UnconfiguredEdgeRegistryService;
         let r = s
-            .register_or_update("u", "e1", "hdr", None, None, None)
-            .await;
-        assert!(r.is_err());
-        let h = s.heartbeat("u", "e1", "hdr").await;
-        assert!(h.is_err());
+            .register_or_update("u", "e1", "hdr", None, None, None, None)
+            .await
+            .expect("unconfigured register_or_update is a no-op success");
+        assert_eq!(r.edge_agent_id, "e1");
+        assert_eq!(r.edge_id, "hdr");
+        assert!(s.heartbeat("u", "e1", "hdr").await.is_ok());
+        assert!(s.unregister("u", "e1", "hdr").await.is_ok());
+        let listed = s
+            .list_by_user("u")
+            .await
+            .expect("unconfigured list_by_user is a no-op returning empty vec");
+        assert!(listed.is_empty());
     }
 
     #[tokio::test]

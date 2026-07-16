@@ -1,3 +1,4 @@
+#![allow(unstable_name_collisions)]
 //! Core turn types, contracts, and pure helpers extracted from the runtime crate.
 //!
 //! This crate contains modules that have no dependency on the runtime's

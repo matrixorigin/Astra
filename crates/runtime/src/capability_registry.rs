@@ -535,6 +535,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -561,6 +562,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let result = reg.resolve(&request).await;
@@ -596,6 +598,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -639,6 +642,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         // Should pick "with-storage" even though it has higher priority,
@@ -683,6 +687,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -718,6 +723,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await;
@@ -749,6 +755,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await;
@@ -783,6 +790,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
         assert!(
             reg.resolve(&task_request).await.is_ok(),
@@ -799,6 +807,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
         assert!(
             matches!(
@@ -834,6 +843,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await;
@@ -950,6 +960,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let resolved = reg.resolve(&request).await.unwrap();
@@ -990,6 +1001,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
 
         let result = reg.resolve(&request).await;

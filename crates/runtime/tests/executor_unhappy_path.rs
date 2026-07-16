@@ -181,6 +181,7 @@ async fn all_unhealthy_providers_resolve_returns_unhealthy() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await;
     assert!(matches!(resolved, Err(ProviderError::Unhealthy(_))));
@@ -199,6 +200,7 @@ async fn empty_registry_not_capable_vs_all_unhealthy() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let result = reg.resolve(&request).await;
     assert!(matches!(result, Err(ProviderError::NotCapable { .. })));
@@ -317,6 +319,7 @@ async fn provider_degrades_between_resolve_and_execute() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -367,6 +370,7 @@ async fn lease_expired_provider_is_rejected_by_resolve() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await;
     assert!(matches!(resolved, Err(ProviderError::Unhealthy(_))));
@@ -402,6 +406,7 @@ async fn all_providers_lease_expired_resolve_returns_unhealthy() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await;
     assert!(
@@ -442,6 +447,7 @@ async fn hung_transport_times_out_at_caller_level() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await.unwrap();
 
@@ -478,6 +484,7 @@ async fn network_partition_all_providers_hung() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await.unwrap();
 

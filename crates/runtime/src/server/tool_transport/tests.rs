@@ -719,6 +719,7 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         _hostname: Option<&str>,
         _worktree_path: Option<&str>,
         _capabilities: Option<serde_json::Value>,
+        _workspace_id: Option<&str>,
     ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
         Err("not needed for this test".to_string())
     }
@@ -728,8 +729,28 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         Ok(())
+    }
+
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        let record = self
+            .agents
+            .iter()
+            .find(|a| {
+                a.edge_agent_id == edge_agent_id
+                    && match (workspace_id, a.workspace_id.as_deref()) {
+                        (Some(req), Some(edge)) => req == edge,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+            .cloned();
+        Ok(record)
     }
 
     async fn list_by_user(
@@ -739,7 +760,12 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         Ok(self.agents.clone())
     }
 
-    async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+    async fn unregister(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -753,6 +779,7 @@ fn edge_agent_record(edge_agent_id: &str) -> astra_services::multi_agent::EdgeAg
         hostname: Some("MacBook Pro".to_string()),
         worktree_path: Some("/Users/test/project".to_string()),
         capabilities: Some(edge_runtime_environment_advertisement(edge_agent_id)),
+        workspace_id: None,
         registered_at: "2026-06-11T00:00:00Z".to_string(),
         last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
     }
@@ -2558,6 +2585,7 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         Some("MacBook Pro".to_string()),
         Some("/Users/test/project".to_string()),
         Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
         tx,
     );
     let service = ToolExecutionService::builder()

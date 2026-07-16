@@ -31,8 +31,8 @@ fn build_request(
     token: Option<&str>,
 ) -> Result<reqwest::RequestBuilder, String> {
     let client = reqwest::Client::builder()
-        .no_proxy() // astra server is local/intranet; bypass http_proxy env
         .timeout(std::time::Duration::from_secs(PREFS_HTTP_TIMEOUT_SECS))
+        .no_proxy()
         .build()
         .map_err(|e| format!("http client init: {e}"))?;
     let mut req = client.request(method, url);

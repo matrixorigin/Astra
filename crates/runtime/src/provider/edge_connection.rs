@@ -16,6 +16,7 @@ use crate::server::tool_execution_binding::{
     ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind,
     WorkspaceAuthority, WorkspaceBinding,
 };
+use astra_runtime_env::WorkspaceRecord;
 
 // ---------------------------------------------------------------------------
 // EdgeConnectionProvider
@@ -139,6 +140,25 @@ impl CapabilityProvider for EdgeConnectionProvider {
         request: ToolRequest,
         cancel_token: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
     ) -> ToolResult {
+        // Synthesise a minimal WorkspaceRecord from the request's workspace_id
+        // so that workspace isolation checks in the edge transport layer work
+        // correctly on the MOI provider-authorized turn path (where the caller's
+        // turn does not carry a full WorkspaceRecord).
+        let workspace_record = request
+            .workspace_id
+            .as_deref()
+            .map(|ws_id| WorkspaceRecord {
+                workspace_id: ws_id.to_string(),
+                owner_scope: astra_runtime_env::WorkspaceOwnerScope::None,
+                kind: astra_runtime_env::WorkspaceBindingKind::None,
+                authority: WorkspaceAuthority::None,
+                root_or_volume_ref: String::new(),
+                source: astra_runtime_env::WorkspaceSource::None,
+                persistence: astra_runtime_env::WorkspacePersistence::None,
+                revision: String::new(),
+                display_name: String::new(),
+            });
+
         // Build a ToolExecutionRequest from the provider's ToolRequest.
         let exec_request = ToolExecutionRequest {
             user_id: request.user_id.clone(),
@@ -149,7 +169,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
             tool_call_id: request.tool_call_id.clone(),
             args: request.parameters.clone(),
             workspace: WorkspaceBinding::edge_workspace("edge", "/", WorkspaceAuthority::None),
-            workspace_record: None,
+            workspace_record,
             executor: ExecutorBinding::edge_agent(
                 "edge-agent",
                 "Edge Agent",
@@ -310,6 +330,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         };
         let result = provider.execute(request, None).await;
         match result {
@@ -400,6 +421,7 @@ mod tests {
                 _hostname: Option<&str>,
                 _worktree_path: Option<&str>,
                 _capabilities: Option<serde_json::Value>,
+                _workspace_id: Option<&str>,
             ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
                 Err("mock".into())
             }
@@ -408,16 +430,29 @@ mod tests {
                 _user_id: &str,
                 _edge_agent_id: &str,
                 _edge_id_header: &str,
-            ) -> Result<(), String> {
+            ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
                 Ok(())
             }
+            async fn find_by_agent_id_and_workspace(
+                &self,
+                _edge_agent_id: &str,
+                _workspace_id: Option<&str>,
+            ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+                Ok(None)
+            }
+
             async fn list_by_user(
                 &self,
                 _user_id: &str,
             ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
                 Ok(vec![])
             }
-            async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+            async fn unregister(
+                &self,
+                _user_id: &str,
+                _edge_agent_id: &str,
+                _edge_id: &str,
+            ) -> Result<(), String> {
                 Ok(())
             }
         }

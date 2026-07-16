@@ -284,13 +284,6 @@ mod tests {
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
 
-    /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
-    /// MUST notify the server so the durable run does not keep running on the
-    /// backend after the local SSE stream is dropped. Asserting on the source
-    /// is the only stable way to prove this short of a full E2E test against
-    /// a live server — and the regression risk (silent removal during a
-    /// refactor) is exactly the failure mode that produced this bug.
-
     #[tokio::test]
     async fn prepare_turn_stream_state_does_not_inject_task_board_prompt() {
         let state = SessionState::default();

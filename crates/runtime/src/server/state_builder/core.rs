@@ -221,11 +221,11 @@ pub(super) fn install_execution_services(
         .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
         .with_edge_registry_service(edge_registry_service)
         .with_edge_dispatch_service(edge_dispatch_service)
-        .with_tool_execution_service(tool_execution_service)
         .with_task_lease_service(Arc::new(
             DatabaseTaskLeaseService::from_shared(shared_pool, Arc::clone(lease_hold_cache))
                 .with_metrics(metrics),
         ))
+        .with_tool_execution_service(tool_execution_service)
 }
 
 fn build_shared_tool_execution_service(
@@ -327,6 +327,7 @@ mod tests {
             Some("MacBook Pro".to_string()),
             Some("/Users/test/project".to_string()),
             Some(edge_runtime_environment_advertisement("edge-selected")),
+            None,
             tx,
         );
 

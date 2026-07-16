@@ -191,6 +191,7 @@ mod tests {
             user_id: "test-user".into(),
             run_id: "test-run".into(),
             session_id: "test-session".into(),
+            workspace_id: None,
         }
     }
 

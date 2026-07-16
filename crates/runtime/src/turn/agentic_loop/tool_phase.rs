@@ -1915,6 +1915,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     tool_execution_ms: tool_exec_ms,
                     total_ms,
                 };
+                tracing::debug!(
+                    target: "astra_timing",
+                    session_turn = timing.turn,
+                    total_ms = timing.total_ms,
+                    ctx_assembly_ms = timing.context_assembly_ms,
+                    ttft_ms = timing.ttft_ms,
+                    llm_ms = timing.llm_total_ms,
+                    tool_exec_ms = timing.tool_execution_ms,
+                    "turn completed"
+                );
                 let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
                 crate::observability::on_turn_end(hub, &mut session_guard, timing);
             }

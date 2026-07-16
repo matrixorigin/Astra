@@ -162,6 +162,7 @@ async fn edge_registry_register_twice_keeps_registry_id() {
             Some("h1"),
             Some("/tmp/a"),
             Some(serde_json::json!({ "k": 1 })),
+            Some("ws-1"),
         )
         .await
         .expect("register 1");
@@ -175,6 +176,7 @@ async fn edge_registry_register_twice_keeps_registry_id() {
             Some("h2"),
             Some("/tmp/b"),
             Some(serde_json::json!({ "k": 2 })),
+            Some("ws-1"),
         )
         .await
         .expect("register 2");

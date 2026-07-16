@@ -54,8 +54,8 @@ impl HttpTaskService {
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, String> {
         let url = self.rpc_url();
         let client = reqwest::Client::builder()
-            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
+            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
         let mut req = client
@@ -426,8 +426,8 @@ impl HttpTaskLeaseService {
         edge_id: Option<&str>,
     ) -> Result<Value, String> {
         let client = reqwest::Client::builder()
-            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
+            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
         let mut req = client.post(self.url(path)).json(&body);
@@ -453,8 +453,8 @@ impl HttpTaskLeaseService {
 
     async fn get(&self, path: &str) -> Result<Value, String> {
         let client = reqwest::Client::builder()
-            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
+            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
         let mut req = client.get(self.url(path));

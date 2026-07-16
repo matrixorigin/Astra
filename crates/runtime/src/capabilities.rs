@@ -366,9 +366,19 @@ impl RemoteSkillCatalogProvider {
             .get_skills_query_text(&token, &params)
             .await
             .map_err(|source| {
-                SkillError::LoadFailed(format!(
-                    "failed to list remote skill catalog page: {source}"
-                ))
+                use std::error::Error;
+                let mut chain = format!("{source}");
+                let mut e: &dyn Error = &source;
+                while let Some(next) = e.source() {
+                    chain.push_str(&format!(" → {next}"));
+                    e = next;
+                }
+                tracing::warn!(
+                    target: "astra_runtime::skill_discovery",
+                    error = %chain,
+                    "skill-discovery: HTTP request failed listing remote skill catalog page"
+                );
+                SkillError::LoadFailed(format!("failed to list remote skill catalog page: {chain}"))
             })?;
         serde_json::from_str(&body).map_err(|source| {
             SkillError::ParseFailed(format!(
@@ -403,13 +413,70 @@ impl SkillProvider for RemoteSkillCatalogProvider {
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
         let mut cursor = None;
         let mut manifests = Vec::new();
+        let mut first_page = true;
         loop {
             let remaining = REMOTE_SKILL_MAX_ROWS.saturating_sub(manifests.len() as u32);
             if remaining == 0 {
                 break;
             }
             let limit = remaining.min(REMOTE_SKILL_PAGE_SIZE);
-            let page = self.list_page(limit, cursor).await?;
+            let page = match self.list_page(limit, cursor.clone()).await {
+                Ok(p) => p,
+                // Retry the first page with exponential backoff on transport
+                // failure (e.g. sandbox pod startup race where network routing
+                // isn't fully ready within the first couple of seconds).
+                Err(first_err) if first_page => {
+                    tracing::warn!(
+                        target: "astra_runtime::skill_discovery",
+                        error = %first_err,
+                        "skill-discovery: first page fetch failed; retrying with backoff"
+                    );
+                    let retry_delays_secs: &[u64] = &[2, 5, 10, 20];
+                    let mut recovered = None;
+                    let mut last_err_msg = String::new();
+                    for (attempt, &delay) in retry_delays_secs.iter().enumerate() {
+                        tracing::info!(
+                            target: "astra_runtime::skill_discovery",
+                            attempt = attempt + 1,
+                            attempts = retry_delays_secs.len(),
+                            delay_secs = delay,
+                            "skill-discovery: retrying first page"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        match self.list_page(limit, cursor.clone()).await {
+                            Ok(p) => {
+                                tracing::info!(
+                                    target: "astra_runtime::skill_discovery",
+                                    attempt = attempt + 1,
+                                    "skill-discovery: first page retry succeeded"
+                                );
+                                recovered = Some(p);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::skill_discovery",
+                                    attempt = attempt + 1,
+                                    error = %e,
+                                    "skill-discovery: first page retry failed"
+                                );
+                                last_err_msg = e.to_string();
+                            }
+                        }
+                    }
+                    match recovered {
+                        Some(p) => p,
+                        None => {
+                            return Err(SkillError::LoadFailed(format!(
+                                "skill discovery failed after {} retries: {last_err_msg}",
+                                retry_delays_secs.len()
+                            )));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            first_page = false;
             let page_len = page.skills.len() as u32;
             cursor = page.next_cursor.clone();
             manifests.extend(page.skills.into_iter().map(|item| SkillManifest {

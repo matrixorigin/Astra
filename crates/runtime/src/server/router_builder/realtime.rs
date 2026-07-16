@@ -153,6 +153,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(edge::edge_status_handler::edge_status_handler),
         )
         .route(
+            "/service/edges/status",
+            get(edge::edge_service_status_handler::edge_service_status_handler),
+        )
+        .route(
             "/chat/runs/{run_id}",
             get(crate::server::run::handlers::get_run_status_handler)
                 .delete(crate::server::run::handlers::cancel_run_handler),

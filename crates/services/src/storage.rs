@@ -3779,12 +3779,14 @@ pub async fn ensure_core_schema(
             edge_id VARCHAR(128) NOT NULL,
             hostname VARCHAR(255) NULL,
             worktree_path VARCHAR(512) NULL,
-            capabilities_json JSON NULL,
+            capabilities_json TEXT NULL,
+            workspace_id VARCHAR(512) NULL,
             registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
             UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
-            INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at)
+            INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
+            INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)
         )",
     )
     .execute(&pool)
@@ -3795,6 +3797,22 @@ pub async fn ensure_core_schema(
         "edge_agent_registry",
         &["user_id", "registry_id"],
         "ALTER TABLE edge_agent_registry ADD PRIMARY KEY (user_id, registry_id)",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "workspace_id",
+        "ALTER TABLE edge_agent_registry ADD COLUMN workspace_id VARCHAR(512) NULL",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "idx_edge_registry_agent_workspace",
+        "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)",
     )
     .await?;
 

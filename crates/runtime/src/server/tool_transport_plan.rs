@@ -17,6 +17,7 @@ pub(crate) enum EdgeTransportAttempt {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeBoundExecutionPlan {
+    #[allow(dead_code)]
     user_id: String,
     selected_executor_id: Option<String>,
     dispatch_request_id: String,
@@ -68,6 +69,7 @@ impl EdgeBoundExecutionPlan {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn user_id(&self) -> &str {
         &self.user_id
     }

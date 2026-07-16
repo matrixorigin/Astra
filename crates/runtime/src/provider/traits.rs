@@ -40,6 +40,12 @@ pub struct ToolRequest {
     pub run_id: String,
     /// Session-scoped session identifier.
     pub session_id: String,
+    /// Owning workspace identifier (provider_scope_id from edge-registration
+    /// token binding).  Set by the capability registry caller when the turn
+    /// originates from a provider-authorized context so that edge workspace
+    /// isolation checks work correctly even when a full WorkspaceRecord is
+    /// not available on the turn.
+    pub workspace_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

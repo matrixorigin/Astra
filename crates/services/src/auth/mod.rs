@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 mod admin;
 mod encryption;
+pub mod external;
 mod jwt;
 pub mod provider_request;
 pub mod session;
@@ -55,6 +56,15 @@ pub use admin::{
 };
 pub use encryption::FernetTokenEncryptor;
 use encryption::sha256_hex;
+pub use external::{
+    ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
+    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
+    ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
+    ExternalRuntimeContextResponse, ExternalSessionRecord, HttpExternalProviderClient,
+};
+use external::{
+    encrypt_provider_session_handle, resolve_selected_scope, validate_provider_runtime_context,
+};
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
@@ -316,6 +326,90 @@ pub trait AuthService: Send + Sync {
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         self.current_principal(headers).await
     }
+
+    /// Resolve the edge binding for the presented credential when it is an
+    /// edge-registration token.  Returns `Ok(Some((edge_agent_id, workspace_id)))`
+    /// on success, `Ok(None)` when the token carries no binding (internal tokens,
+    /// backends without external-provider edge support), and `Err` when the
+    /// credential is rejected (revoked or invalid).
+    ///
+    /// The `workspace_id` in the tuple is the owning workspace (`provider_scope_id`
+    /// from the external auth response).  Callers store it in the edge connection
+    /// pool for workspace-level authorization of cross-user lookups.
+    ///
+    /// The default returns `Ok(None)` so backends and test stubs that do not
+    /// support edge registration impose no binding.
+    async fn edge_registration_binding(
+        &self,
+        _token: &str,
+    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(None)
+    }
+
+    async fn external_providers(
+        &self,
+    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External auth providers are not configured",
+        ))
+    }
+
+    async fn external_login(
+        &self,
+        _request: ExternalLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External auth providers are not configured",
+        ))
+    }
+
+    async fn external_catalog(
+        &self,
+        _principal: &AuthPrincipal,
+    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External runtime catalog is not configured",
+        ))
+    }
+
+    async fn external_runtime_context(
+        &self,
+        _principal: &AuthPrincipal,
+        _request: ExternalRuntimeContextRequestData,
+    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External runtime context is not configured",
+        ))
+    }
+
+    /// List catalog for an authorized-request principal (edge-JWT) using scope and subject
+    /// directly, without a session handle.
+    async fn external_catalog_by_scope(
+        &self,
+        _principal: &AuthPrincipal,
+    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External runtime catalog (by scope) is not configured",
+        ))
+    }
+
+    /// Issue runtime context for an authorized-request principal (edge-JWT) using scope and
+    /// subject directly, without a session handle.
+    async fn external_runtime_context_by_scope(
+        &self,
+        _principal: &AuthPrincipal,
+        _request: ExternalRuntimeContextRequestData,
+    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "External runtime context (by scope) is not configured",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,6 +461,16 @@ impl AuthPrincipal {
             AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         )
     }
+
+    /// Returns true when the principal was authenticated via an edge-registration
+    /// token (i.e. a long-lived token bound to a specific edge_agent_id, issued
+    /// by moi-backend). False for runtime tokens (short-lived, server-to-server).
+    pub fn is_edge_registration(&self) -> bool {
+        matches!(
+            &self.origin,
+            AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) if ctx.edge_agent_id.is_some()
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +485,10 @@ pub struct AuthProviderAuthorizedRequestContext {
     pub external_subject: String,
     pub provider_scope_id: String,
     pub request_authorization_id: String,
+    /// Present when the token is an edge-registration token; the bound edge
+    /// agent id verified by Phase 1.5 of edge WebSocket auth. `None` for
+    /// runtime tokens (matrixflow server-to-server calls).
+    pub edge_agent_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,6 +505,8 @@ pub struct DatabaseAuthService {
     pool: Option<SharedPool>,
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
+    ext_providers: Vec<ExternalAuthProviderConfig>,
+    external_client: std::sync::Arc<dyn ExternalProviderClient>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
     provider_request_replay_cache: Arc<Mutex<HashMap<String, i64>>>,
 }
@@ -460,6 +570,8 @@ impl DatabaseAuthService {
             jwt,
             pool: None,
             encryptor: None,
+            ext_providers: Vec::new(),
+            external_client: HttpExternalProviderClient::shared(),
             provider_request_auth: Vec::new(),
             provider_request_replay_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -628,6 +740,36 @@ impl DatabaseAuthService {
         self
     }
 
+    pub fn with_external_providers(mut self, providers: Vec<ExternalAuthProviderConfig>) -> Self {
+        self.ext_providers = providers;
+        self
+    }
+
+    #[allow(dead_code)]
+    fn encryptor(&self) -> Result<&FernetTokenEncryptor, (StatusCode, Json<ErrorResponse>)> {
+        self.encryptor.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "External auth session encryption is not configured",
+            )
+        })
+    }
+
+    fn external_provider_config(
+        &self,
+        provider_id: &str,
+    ) -> Result<&ExternalAuthProviderConfig, (StatusCode, Json<ErrorResponse>)> {
+        self.ext_providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("External provider '{provider_id}' not configured"),
+                )
+            })
+    }
+
     pub fn with_provider_request_auth(mut self, auth: Vec<ProviderRequestAuthConfig>) -> Self {
         self.provider_request_auth = auth;
         self
@@ -787,6 +929,255 @@ impl DatabaseAuthService {
             )),
         }
     }
+
+    #[allow(dead_code)]
+    fn parse_provider_expires_at(
+        &self,
+        raw: &str,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|dt| {
+                dt.with_timezone(&Utc)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .map_err(|error| {
+                error_response_coded(
+                    StatusCode::BAD_GATEWAY,
+                    format!("external provider session expiry is invalid: {error}"),
+                    "external_provider_response_invalid",
+                )
+            })
+    }
+
+    #[allow(dead_code)]
+    async fn complete_external_auth(
+        &self,
+        provider: &ExternalAuthProviderConfig,
+        requested_scope_id: Option<&str>,
+        response: external::ExternalProviderAuthResponse,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        let selected_scope = resolve_selected_scope(requested_scope_id, &response)?;
+        let encrypted_handle =
+            encrypt_provider_session_handle(self.encryptor()?, &response.provider_session_handle)?;
+        let external_subject = response.external_subject.id.clone();
+        let external_username = response.display_info.username.clone();
+        let external_email = response.display_info.email.clone();
+        let external_display_name = response.display_info.nickname.clone();
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let now = Utc::now();
+        let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
+        let astra_session_id = Uuid::new_v4().to_string();
+        let astra_user_id = Uuid::new_v4().to_string();
+        let internal_username = format!("ext_{}", astra_user_id.replace('-', ""));
+        let internal_email = format!("{internal_username}@external.astra.invalid");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
+        let existing_identity = query(
+            "SELECT astra_user_id FROM auth_external_identities \
+             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
+        )
+        .bind(&provider.id)
+        .bind(&external_subject)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "external.fetch_identity", Some(&pool)))?;
+
+        let astra_user_id = if let Some(row) = existing_identity {
+            let existing_user_id: String = row.try_get("astra_user_id").unwrap_or_default();
+            query(
+                "UPDATE auth_external_identities \
+                 SET username = ?, email = ?, display_name = ?, updated_at = NOW() \
+                 WHERE provider_id = ? AND external_subject = ?",
+            )
+            .bind(&external_username)
+            .bind(&external_email)
+            .bind(&external_display_name)
+            .bind(&provider.id)
+            .bind(&external_subject)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
+            existing_user_id
+        } else {
+            query(
+                "INSERT INTO auth_users \
+                 (user_id, username, email, password_hash, display_name, is_active) \
+                 VALUES (?, ?, ?, '', ?, 1)",
+            )
+            .bind(&astra_user_id)
+            .bind(&internal_username)
+            .bind(&internal_email)
+            .bind(&external_display_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "external.insert_auth_user", Some(&pool)))?;
+            query(
+                "INSERT INTO auth_external_identities \
+                 (provider_id, external_subject, astra_user_id, username, email, display_name) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&provider.id)
+            .bind(&external_subject)
+            .bind(&astra_user_id)
+            .bind(&external_username)
+            .bind(&external_email)
+            .bind(&external_display_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "external.insert_identity", Some(&pool)))?;
+            astra_user_id
+        };
+
+        query(
+            "INSERT INTO auth_external_sessions \
+             (external_session_id, provider_id, astra_user_id, external_subject, \
+              provider_scope_id, provider_scope_display_name, encrypted_provider_session_handle, \
+              status, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+        )
+        .bind(&astra_session_id)
+        .bind(&provider.id)
+        .bind(&astra_user_id)
+        .bind(&external_subject)
+        .bind(&selected_scope.id)
+        .bind(&selected_scope.name)
+        .bind(&encrypted_handle)
+        .bind(&external_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "external.insert_session", Some(&pool)))?;
+
+        let access_token = self
+            .create_access_token(
+                &astra_user_id,
+                &external_username,
+                &astra_session_id,
+                "external",
+            )
+            .map_err(internal_error)?;
+        let refresh_token = self
+            .create_refresh_token(&astra_user_id, &astra_session_id, "external")
+            .map_err(internal_error)?;
+        let refresh_token_hash = sha256_hex(&refresh_token);
+        let refresh_expires_at = self.refresh_token_expires_at_string(now);
+
+        query(
+            "INSERT INTO auth_refresh_tokens \
+             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
+             VALUES (?, ?, ?, ?, ?, 0)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&astra_user_id)
+        .bind(&astra_session_id)
+        .bind(&refresh_token_hash)
+        .bind(refresh_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "external.insert_refresh_token", Some(&pool)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "external.commit_tx", Some(&pool)))?;
+
+        Ok(AuthTokenRecord {
+            access_token,
+            refresh_token,
+            token_type: "bearer".to_string(),
+            expires_in: self.access_token_expires_in_seconds(),
+        })
+    }
+
+    /// Resolve an [`AuthPrincipal`] from a moi-backend edge-registration token
+    /// (`moi-user-token-v1.*`) via the external auth provider.  Called from
+    /// [`current_principal`] when the Bearer token is not an astra session JWT.
+    async fn principal_from_edge_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
+        let provider = self
+            .ext_providers
+            .iter()
+            .find(|p| p.id == "moi")
+            .or_else(|| self.ext_providers.first())
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "No external provider configured for edge token auth",
+                )
+            })?
+            .clone();
+        let authorized = self
+            .external_client
+            .authorize_request(
+                &provider,
+                ExternalAuthorizeRequestData {
+                    provider_id: provider.id.clone(),
+                    token: format!("Bearer {token}"),
+                    request: ExternalRequestDescriptor {
+                        method: "GET".to_string(),
+                        path: "/api".to_string(),
+                        route: Some("/api".to_string()),
+                        request_id: None,
+                        body_digest: None,
+                    },
+                },
+            )
+            .await?;
+        tracing::debug!(
+            target: "astra_services::auth",
+            provider_id = %authorized.provider_id,
+            external_subject = %authorized.external_subject,
+            "principal_from_edge_token: edge token authorized for HTTP API"
+        );
+        let user_id = format!(
+            "external_authorized:{}:{}",
+            authorized.provider_id, authorized.external_subject
+        );
+        Ok(AuthPrincipal {
+            user: AuthUserRecord {
+                user_id,
+                username: authorized.external_subject.clone(),
+                email: String::new(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                AuthProviderAuthorizedRequestContext {
+                    provider_id: authorized.provider_id,
+                    external_subject: authorized.external_subject,
+                    provider_scope_id: authorized.provider_scope_id,
+                    request_authorization_id: authorized.request_authorization_id,
+                    edge_agent_id: authorized.edge_agent_id,
+                },
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct ExternalSessionDbRecord {
+    session: ExternalSessionRecord,
+    provider_expires_at: String,
+    encrypted_provider_session_handle: String,
+    external_username: String,
+    external_email: Option<String>,
+    external_display_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct ExternalSessionRefreshUpdate {
+    encrypted_provider_session_handle: String,
+    provider_scope_id: String,
+    expires_at: String,
 }
 
 fn header_exact(
@@ -1198,6 +1589,14 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let token = bearer_token(headers)?;
+        // Edge-registration tokens (moi-user-token-v1.*) are issued by
+        // moi-backend and cannot be decoded with the astra JWT secret.
+        // Verify them via the external auth provider instead so that astra CLI
+        // running inside a sandbox can access HTTP APIs with the same token
+        // it uses for the WebSocket /chat/stream connection.
+        if token.starts_with("moi-user-token-v1") {
+            return self.principal_from_edge_token(token).await;
+        }
         let claims = decode_jwt_claims(token, &self.jwt)?;
 
         if claims.token_type.as_deref() != Some("access") {
@@ -1298,9 +1697,147 @@ impl AuthService for DatabaseAuthService {
                     external_subject: authorized.external_subject,
                     provider_scope_id: authorized.provider_scope_id,
                     request_authorization_id: authorized.request_authorization_id,
+                    // Provider-request (HMAC server-to-server) calls carry no edge binding.
+                    edge_agent_id: None,
                 },
             ),
         })
+    }
+
+    async fn edge_registration_binding(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+        // Only moi-issued tokens carry an edge_agent_id binding. Anything else
+        // (e.g. an Astra JWT used by a managed sandbox) imposes no binding and
+        // keeps its existing identity resolution untouched.
+        const MOI_USER_TOKEN_PREFIX: &str = "moi-user-token-v1";
+        if !token.starts_with(MOI_USER_TOKEN_PREFIX) {
+            return Ok(None);
+        }
+        // Resolve the MOI external provider. Without one configured we cannot
+        // verify the binding via authorize_request; impose none rather than
+        // failing closed (matches deployments where external auth is disabled).
+        let provider = match self
+            .ext_providers
+            .iter()
+            .find(|p| p.id == "moi")
+            .or_else(|| self.ext_providers.first())
+        {
+            Some(provider) => provider.clone(),
+            None => {
+                tracing::warn!(
+                    target: "astra_services::auth",
+                    "edge_registration_binding: no external provider configured; cannot verify edge binding"
+                );
+                return Ok(None);
+            }
+        };
+        // authorize_request verifies the token (signature, expiry, jti
+        // revocation) and returns the bound edge_agent_id and provider_scope_id
+        // (workspace_id). A revoked or invalid edge token yields an Err here,
+        // which the caller treats as a denial.
+        tracing::debug!(
+            target: "astra_services::auth",
+            provider_id = %provider.id,
+            "edge_registration_binding: verifying moi edge token via provider authorize_request"
+        );
+        let authorized = match self
+            .external_client
+            .authorize_request(
+                &provider,
+                ExternalAuthorizeRequestData {
+                    provider_id: provider.id.clone(),
+                    token: format!("Bearer {token}"),
+                    request: ExternalRequestDescriptor {
+                        method: "GET".to_string(),
+                        path: "/edge/ws".to_string(),
+                        route: Some("/edge/ws".to_string()),
+                        request_id: None,
+                        body_digest: None,
+                    },
+                },
+            )
+            .await
+        {
+            Ok(authorized) => authorized,
+            Err((status, err)) => {
+                tracing::warn!(
+                    target: "astra_services::auth",
+                    provider_id = %provider.id,
+                    status = %status,
+                    error = ?err,
+                    "edge_registration_binding: provider rejected edge token (revoked/invalid/expired)"
+                );
+                return Err((status, err));
+            }
+        };
+        tracing::debug!(
+            target: "astra_services::auth",
+            provider_id = %provider.id,
+            edge_agent_id = ?authorized.edge_agent_id,
+            workspace_id = %authorized.provider_scope_id,
+            "edge_registration_binding: provider accepted edge token"
+        );
+        Ok(authorized
+            .edge_agent_id
+            .map(|eid| (eid, authorized.provider_scope_id)))
+    }
+
+    async fn external_providers(
+        &self,
+    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(self
+            .ext_providers
+            .iter()
+            .map(ExternalProviderPublicRecord::from)
+            .collect())
+    }
+
+    async fn external_catalog_by_scope(
+        &self,
+        principal: &AuthPrincipal,
+    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin else {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "ExternalAuthorizedRequest principal is required for catalog by scope",
+            ));
+        };
+        let provider = self.external_provider_config(&context.provider_id)?.clone();
+        self.external_client
+            .list_catalog_by_scope(
+                &provider,
+                context.provider_scope_id.clone(),
+                context.external_subject.clone(),
+            )
+            .await
+    }
+
+    async fn external_runtime_context_by_scope(
+        &self,
+        principal: &AuthPrincipal,
+        request: ExternalRuntimeContextRequestData,
+    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin else {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "ExternalAuthorizedRequest principal is required for runtime context by scope",
+            ));
+        };
+        let provider = self.external_provider_config(&context.provider_id)?.clone();
+        let requested_model_id = request.requested_model_id.clone();
+        let runtime_context = self
+            .external_client
+            .issue_runtime_context_by_scope(
+                &provider,
+                context.provider_scope_id.clone(),
+                context.external_subject.clone(),
+                request,
+            )
+            .await?;
+        validate_provider_runtime_context(&provider, &requested_model_id, &runtime_context)?;
+        Ok(runtime_context)
     }
 }
 
@@ -1410,7 +1947,11 @@ impl AuthService for StubAuthService {
 
 #[cfg(test)]
 mod tests {
+    use super::external::{
+        ExternalLogoutResponse, ExternalProviderAuthResponse, ExternalRefreshSessionResponse,
+    };
     use super::*;
+    use crate::auth::external::ExternalProviderSessionHandle;
     use astra_core::ProviderRequestAuthConfig;
     use chrono::Utc;
     use serde_json::json;
@@ -1418,6 +1959,99 @@ mod tests {
     const TEST_PROVIDER_HMAC_KEY: &str = "test-provider-hmac-key";
     const GOLDEN_PROVIDER_HMAC_KEY: &str = "WrE2irtwGEq1Ih2stZUtgFfLFNv2gVhOAwsBD999QLI";
     const GOLDEN_PROVIDER_TOKEN: &str = "moi-provider-v1.eyJzdWIiOiJ1c2VyXzEiLCJzY29wZSI6IndvcmtzcGFjZV8xIiwicHJvdmlkZXIiOiJtb2kiLCJpYXQiOjQxMDI0NDQ1MDAsImV4cCI6NDEwMjQ0NDgwMH0.wZS9mRKasIEmreqhzGheguYYPbq1URTYkJoSK3nfW3M";
+
+    #[allow(dead_code)]
+    struct AuthorizingProviderClient;
+
+    #[async_trait]
+    impl ExternalProviderClient for AuthorizingProviderClient {
+        async fn authorize_request(
+            &self,
+            provider: &ExternalAuthProviderConfig,
+            request: ExternalAuthorizeRequestData,
+        ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)> {
+            assert_eq!(provider.id, "moi");
+            assert_eq!(request.token, "Bearer provider-token");
+            assert_eq!(request.request.method, "POST");
+            assert_eq!(request.request.path, "/chat/stream");
+            assert!(request.request.body_digest.is_none());
+            Ok(ExternalAuthorizedRequest {
+                provider_id: "moi".to_string(),
+                external_subject: "moi-user-1".to_string(),
+                provider_scope_id: "workspace-1".to_string(),
+                request_authorization_id: "authz-1".to_string(),
+                edge_agent_id: None,
+            })
+        }
+
+        async fn authenticate(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _request: ExternalLoginRequestData,
+        ) -> Result<ExternalProviderAuthResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("AuthorizingProviderClient stub: authenticate not used in these tests")
+        }
+
+        async fn list_catalog(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _session: ExternalProviderSessionHandle,
+        ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("AuthorizingProviderClient stub: list_catalog not used in these tests")
+        }
+
+        async fn issue_runtime_context(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _session: ExternalProviderSessionHandle,
+            _request: ExternalRuntimeContextRequestData,
+        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!(
+                "AuthorizingProviderClient stub: issue_runtime_context not used in these tests"
+            )
+        }
+
+        async fn refresh_session(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _session: ExternalProviderSessionHandle,
+        ) -> Result<ExternalRefreshSessionResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!(
+                "AuthorizingProviderClient stub: refresh_session not used in these tests"
+            )
+        }
+
+        async fn logout(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _session: ExternalProviderSessionHandle,
+        ) -> Result<ExternalLogoutResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("AuthorizingProviderClient stub: logout not used in these tests")
+        }
+
+        async fn list_catalog_by_scope(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _provider_scope_id: String,
+            _external_subject: String,
+        ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!(
+                "AuthorizingProviderClient stub: list_catalog_by_scope not used in these tests"
+            )
+        }
+
+        async fn issue_runtime_context_by_scope(
+            &self,
+            _provider: &ExternalAuthProviderConfig,
+            _provider_scope_id: String,
+            _external_subject: String,
+            _request: ExternalRuntimeContextRequestData,
+        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!(
+                "AuthorizingProviderClient stub: issue_runtime_context_by_scope not used in these tests"
+            )
+        }
+    }
 
     fn hmac_provider_token(
         subject: &str,

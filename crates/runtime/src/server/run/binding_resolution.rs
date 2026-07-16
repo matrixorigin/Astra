@@ -37,6 +37,27 @@ pub(crate) fn request_uses_server_workspace(
     }
 }
 
+/// MOI runner chat supplies `allow_tools` with executor_binding.transport=edge_ws.
+/// ServerToolExecutor still needs an internal scratch workspace even though tool
+/// execution is routed to the connected edge agent.
+#[allow(dead_code)]
+pub(crate) fn request_needs_edge_bound_server_executor(
+    request: &astra_services::runs::ChatRequestData,
+    execution_bindings: Option<&ExecutionBindingSnapshot>,
+) -> bool {
+    let has_allow_tools = request
+        .allow_tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_allow_tools {
+        return false;
+    }
+    execution_bindings.is_some_and(|snapshot| {
+        matches!(snapshot.executor.kind, ExecutorBindingKind::EdgeAgent)
+            && matches!(snapshot.executor.transport, ToolTransportKind::EdgeWs)
+    })
+}
+
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
     edge_profile: &Map<String, Value>,
@@ -251,6 +272,14 @@ pub(crate) fn executor_binding_from_request(
 ) -> ExecutorBinding {
     match workspace.kind {
         WorkspaceBindingKind::ServerSandbox => {
+            // When the caller explicitly requests an edge agent executor (e.g. a sandbox
+            // connected via WebSocket), honour that kind instead of forcing server_local.
+            if matches!(
+                binding,
+                Some(b) if b.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            ) {
+                return edge_executor_binding_from_request(binding);
+            }
             let mut executor = ExecutorBinding::server_local();
             if let Some(binding) = binding {
                 if let Some(executor_id) = non_empty_string(binding.executor_id.as_deref()) {
@@ -562,6 +591,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
+            provider_workspace_id: None,
         }
     }
 

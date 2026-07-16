@@ -19,12 +19,42 @@ pub struct EdgeAgentRecord {
     pub hostname: Option<String>,
     pub worktree_path: Option<String>,
     pub capabilities: Option<serde_json::Value>,
+    /// Owning workspace (provider_scope_id from edge-registration token binding).
+    /// None for legacy rows written before this field was added.
+    pub workspace_id: Option<String>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
 }
 
+/// Structured error for `EdgeRegistryService::heartbeat`.
+///
+/// Callers must treat these two variants differently:
+/// - `Superseded`: this connection's `edge_id` no longer owns the DB row — a
+///   newer connection has taken over. Close the WebSocket immediately.
+/// - `StorageFailure`: transient DB problem (network blip, pool exhaustion).
+///   Log and allow a limited number of retries before closing.
+#[derive(Debug)]
+pub enum HeartbeatError {
+    /// A newer connection has replaced this one in the registry.
+    Superseded,
+    /// Transient storage failure; the connection may still be valid.
+    StorageFailure(String),
+}
+
+impl std::fmt::Display for HeartbeatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeartbeatError::Superseded => {
+                write!(f, "edge connection superseded by newer registration")
+            }
+            HeartbeatError::StorageFailure(e) => write!(f, "edge heartbeat storage failure: {e}"),
+        }
+    }
+}
+
 #[async_trait]
 pub trait EdgeRegistryService: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn register_or_update(
         &self,
         user_id: &str,
@@ -33,6 +63,7 @@ pub trait EdgeRegistryService: Send + Sync {
         hostname: Option<&str>,
         worktree_path: Option<&str>,
         capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String>;
 
     async fn heartbeat(
@@ -40,13 +71,38 @@ pub trait EdgeRegistryService: Send + Sync {
         user_id: &str,
         edge_agent_id: &str,
         edge_id_header: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), HeartbeatError>;
+
+    /// Find the most-recently-active registry record for a given edge_agent_id,
+    /// scoped to a workspace when `workspace_id` is `Some`.  Used by the
+    /// cross-pod dispatch path to locate a sandbox edge registered under a
+    /// service-account user.
+    ///
+    /// Workspace isolation is fail-closed:
+    /// - `Some(ws)` only matches rows with the same `workspace_id = ws`.
+    /// - `None` only matches legacy/unscoped rows where `workspace_id IS NULL`.
+    ///
+    /// A request without workspace context cannot resolve a workspace-bound
+    /// sandbox edge; pass `Some` whenever workspace context is available.
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String>;
 
     /// List all registered edge agents for a user (for cross-pod dispatch routing).
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String>;
 
     /// Remove an edge agent from the registry (on disconnect).
-    async fn unregister(&self, user_id: &str, edge_agent_id: &str) -> Result<(), String>;
+    /// Only removes the row if `edge_id` matches the registered connection's
+    /// edge_id, so a stale cleanup on pod A cannot delete a fresh registration
+    /// that pod B created during a cross-pod reconnect.
+    async fn unregister(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id: &str,
+    ) -> Result<(), String>;
 }
 
 pub struct DatabaseEdgeRegistryService {
@@ -110,6 +166,9 @@ fn decode_edge_agent_record(row: &impl EdgeRegistryDbRow) -> Result<EdgeAgentRec
             .optional_string_column("worktree_path")
             .map_err(|e| edge_registry_decode_error("list_by_user row", "worktree_path", e))?,
         capabilities,
+        workspace_id: row
+            .optional_string_column("workspace_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "workspace_id", e))?,
         registered_at: row
             .string_column("registered_at")
             .map_err(|e| edge_registry_decode_error("list_by_user row", "registered_at", e))?,
@@ -130,6 +189,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         hostname: Option<&str>,
         worktree_path: Option<&str>,
         capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
         let capabilities_for_record = capabilities.clone();
         let cap_json = capabilities
@@ -174,13 +234,16 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                 let n = sqlx::query(
                     "UPDATE edge_agent_registry \
                      SET edge_id = ?, hostname = ?, worktree_path = ?, \
-                         capabilities_json = ?, last_heartbeat_at = NOW(6) \
+                         capabilities_json = ?, \
+                         workspace_id = COALESCE(?, workspace_id), \
+                         last_heartbeat_at = NOW(6) \
                      WHERE user_id = ? AND registry_id = ?",
                 )
                 .bind(edge_id_header)
                 .bind(hostname)
                 .bind(worktree_path)
                 .bind(&cap_json)
+                .bind(workspace_id)
                 .bind(user_id)
                 .bind(&reg_id)
                 .execute(&self.pool)
@@ -201,6 +264,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     hostname: hostname.map(|s| s.to_string()),
                     worktree_path: worktree_path.map(|s| s.to_string()),
                     capabilities: capabilities_for_record.clone(),
+                    workspace_id: workspace_id.map(|s| s.to_string()),
                     registered_at,
                     last_heartbeat_at: now,
                 });
@@ -211,8 +275,8 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             match sqlx::query(
                 "INSERT INTO edge_agent_registry \
                  (registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-                  capabilities_json, registered_at, last_heartbeat_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                  capabilities_json, workspace_id, registered_at, last_heartbeat_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&registry_id)
             .bind(user_id)
@@ -221,6 +285,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .bind(hostname)
             .bind(worktree_path)
             .bind(&cap_json)
+            .bind(workspace_id)
             .execute(&self.pool)
             .await
             {
@@ -245,6 +310,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                         hostname: hostname.map(|s| s.to_string()),
                         worktree_path: worktree_path.map(|s| s.to_string()),
                         capabilities: capabilities_for_record.clone(),
+                        workspace_id: workspace_id.map(|s| s.to_string()),
                         registered_at,
                         last_heartbeat_at,
                     });
@@ -268,40 +334,97 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         user_id: &str,
         edge_agent_id: &str,
         edge_id_header: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), HeartbeatError> {
+        // Guard on edge_id so a stale connection cannot refresh (or resurrect)
+        // the row after a newer connection has replaced it. register_or_update
+        // already set edge_id to the current connection's value, so we only
+        // touch last_heartbeat_at and never rewrite edge_id here. If a newer
+        // connection has taken over (edge_id differs), this matches 0 rows and
+        // the stale connection's heartbeat correctly returns Superseded.
         let n = sqlx::query(
-            "UPDATE edge_agent_registry SET edge_id = ?, last_heartbeat_at = NOW(6) \
-             WHERE user_id = ? AND edge_agent_id = ?",
+            "UPDATE edge_agent_registry SET last_heartbeat_at = NOW(6) \
+             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
         )
-        .bind(edge_id_header)
         .bind(user_id)
         .bind(edge_agent_id)
+        .bind(edge_id_header)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("edge heartbeat: {e}"))?
+        .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat: {e}")))?
         .rows_affected();
         if n == 0 {
-            tracing::warn!("edge_registry: heartbeat for unregistered agent");
-            return Err("edge agent not registered".to_string());
+            // The row is gone or belongs to a newer connection — this connection
+            // has been superseded and must not keep the DB entry alive.
+            tracing::warn!(
+                edge_id = %edge_id_header,
+                "edge_registry: heartbeat matched no row (unregistered or superseded by newer connection)"
+            );
+            return Err(HeartbeatError::Superseded);
         }
         Ok(())
     }
-    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
-    async fn unregister(&self, user_id: &str, edge_agent_id: &str) -> Result<(), String> {
-        sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
-            .bind(user_id)
-            .bind(edge_agent_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("edge_registry unregister: {e}"))?;
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id, edge_id = %edge_id))]
+    async fn unregister(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id: &str,
+    ) -> Result<(), String> {
+        // Guard on edge_id to prevent a stale pod A cleanup from deleting a
+        // fresh row created by pod B during a cross-pod reconnect.
+        sqlx::query(
+            "DELETE FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .bind(edge_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry unregister: {e}"))?;
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(edge_agent_id = %edge_agent_id))]
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        // Fail-closed workspace isolation:
+        //   request has workspace_id  → edge.workspace_id must match exactly
+        //   request has no workspace_id → only reach edges that are also unscoped (workspace_id IS NULL)
+        // This prevents a request without workspace context from resolving a
+        // workspace-bound sandbox edge (e.g. when workspace_record is None on
+        // the MOI provider-authorized path).
+        let row = sqlx::query(
+            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+             capabilities_json, workspace_id, \
+             CAST(registered_at AS CHAR) AS registered_at, \
+             CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
+             FROM edge_agent_registry \
+             WHERE edge_agent_id = ? \
+               AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
+             ORDER BY last_heartbeat_at DESC LIMIT 1",
+        )
+        .bind(edge_agent_id)
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry find_by_agent_id_and_workspace: {e}"))?;
+
+        row.as_ref().map(decode_edge_agent_record).transpose()
     }
 
     #[tracing::instrument(skip(self), fields(user_id = %user_id))]
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
         let rows = sqlx::query(
-            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, capabilities_json, \
-             CAST(registered_at AS CHAR) AS registered_at, CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
+            "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+             capabilities_json, workspace_id, \
+             CAST(registered_at AS CHAR) AS registered_at, \
+             CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
              FROM edge_agent_registry WHERE user_id = ? ORDER BY last_heartbeat_at DESC",
         )
         .bind(user_id)
@@ -317,33 +440,68 @@ pub struct UnconfiguredEdgeRegistryService;
 
 #[async_trait]
 impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
+    /// When no cross-pod registry is configured (single-pod deployment), edge
+    /// registration is a successful no-op: the connection is tracked in the
+    /// in-memory pool and there is no cross-pod source of truth to fail. This is
+    /// distinct from a *configured* registry (e.g. DB-backed) whose failure
+    /// returns an error and — per the edge WS handler — rejects the connection.
     async fn register_or_update(
         &self,
-        _user_id: &str,
-        _edge_agent_id: &str,
-        _edge_id_header: &str,
-        _hostname: Option<&str>,
-        _worktree_path: Option<&str>,
-        _capabilities: Option<serde_json::Value>,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
-        Err("edge registry service not configured".to_string())
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S%.6f")
+            .to_string();
+        Ok(EdgeAgentRecord {
+            registry_id: edge_id_header.to_string(),
+            user_id: user_id.to_string(),
+            edge_agent_id: edge_agent_id.to_string(),
+            edge_id: edge_id_header.to_string(),
+            hostname: hostname.map(|s| s.to_string()),
+            worktree_path: worktree_path.map(|s| s.to_string()),
+            capabilities,
+            workspace_id: workspace_id.map(|s| s.to_string()),
+            registered_at: now.clone(),
+            last_heartbeat_at: now,
+        })
     }
 
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        _edge_agent_id: &str,
+        _workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        Ok(None)
+    }
+
+    /// No-op success: there is no cross-pod row to refresh.
     async fn heartbeat(
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
-    ) -> Result<(), String> {
-        Err("edge registry service not configured".to_string())
+    ) -> Result<(), HeartbeatError> {
+        Ok(())
     }
 
     async fn list_by_user(&self, _user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
-        Err("edge registry service not configured".to_string())
+        Ok(Vec::new())
     }
 
-    async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
-        Err("edge registry service not configured".to_string())
+    /// No-op success: nothing was persisted, so nothing to remove.
+    async fn unregister(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -419,6 +577,7 @@ mod tests {
                 "hostname" => self.hostname,
                 "worktree_path" => self.worktree_path,
                 "capabilities_json" => self.capabilities_json,
+                "workspace_id" => None,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .map(str::to_string))

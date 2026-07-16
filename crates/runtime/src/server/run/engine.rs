@@ -3020,6 +3020,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
+            provider_workspace_id: None,
         };
         let context = crate::server::run::binding_resolution::run_start_context_from_request(
             &request, None, None,

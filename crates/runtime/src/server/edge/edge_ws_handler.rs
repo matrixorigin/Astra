@@ -169,14 +169,69 @@ async fn handle_edge_connection(
 
     let user_id = user.user_id.clone();
 
-    // Send auth success
-    let _ = send_edge_msg(
-        &ws_sink,
-        EdgeServerMessage::AuthOk {
-            user_id: user_id.clone(),
-        },
-    )
-    .await;
+    // ── Phase 1.5: Verify self-reported edge_agent_id matches token binding ──
+    // For moi-user-token-v1 tokens, ask the provider to confirm which
+    // edge_agent_id the token is bound to. A legitimate edge will always
+    // match; a forged or replayed token with a fabricated edge_agent_id is
+    // rejected here before it can hijack another edge's connection slot.
+    let workspace_id: Option<String> = if token.starts_with("moi-user-token-v1") {
+        match state.auth_service.edge_registration_binding(&token).await {
+            Ok(Some((bound_edge_agent_id, bound_workspace_id))) => {
+                if bound_edge_agent_id != edge_agent_id {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        edge_agent_id = %edge_agent_id,
+                        bound_edge_agent_id = %bound_edge_agent_id,
+                        "edge WebSocket auth failed: self-reported edge_agent_id does not match token binding"
+                    );
+                    let _ = send_edge_msg(
+                        &ws_sink,
+                        EdgeServerMessage::AuthError {
+                            message: "edge_agent_id does not match token binding".into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                Some(bound_workspace_id)
+            }
+            Ok(None) => {
+                // moi-user-token-v1 tokens must always carry an edge_agent_id binding.
+                // Ok(None) means the provider issued a runtime token (server-to-server),
+                // which must never be accepted on the WebSocket path.
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    edge_agent_id = %edge_agent_id,
+                    "edge WebSocket auth failed: moi-user-token-v1 token has no edge_agent_id binding (runtime token on WS path)"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "edge registration token required; runtime token not accepted on WebSocket path".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    edge_agent_id = %edge_agent_id,
+                    "edge WebSocket auth failed: edge token binding verification failed"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "edge token binding verification failed".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Phase 1a: Validate & sanitize self-reported capabilities ─────
     // Edge nodes self-report their capabilities; a malicious edge could
@@ -196,19 +251,27 @@ async fn handle_edge_connection(
     let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
-    state.edge_connection_pool.register_with_capabilities(
+    // B1: capture generation so cleanup can use unregister_if_generation,
+    // preventing a late-arriving cleanup from removing a newer connection.
+    let pool_generation = state.edge_connection_pool.register_with_capabilities(
         &user_id,
         &edge_agent_id,
         hostname.clone(),
         workspace_dir.clone(),
         capabilities.clone(),
+        workspace_id.clone(),
         pool_tx,
     );
 
     // ── Phase 2a: Register in DB edge registry for cross-pod routing ─
+    // B2: if DB registration fails, roll back the pool entry and reject the
+    // WebSocket connection. This ensures there is no "online in-memory but
+    // invisible to other pods" split-brain state.
+    // B4 counterpart: UnconfiguredEdgeRegistryService always returns Ok here,
+    // so single-pod deployments without a DB registry are unaffected.
     let edge_registry = state.execution.edge_registry_service.clone();
     let edge_id_for_registry = format!("ws-{}", uuid::Uuid::new_v4());
-    let _ = edge_registry
+    if let Err(e) = edge_registry
         .register_or_update(
             &user_id,
             &edge_agent_id,
@@ -216,8 +279,40 @@ async fn handle_edge_connection(
             hostname.as_deref(),
             workspace_dir.as_deref(),
             capabilities,
+            workspace_id.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            user_id = %user_id,
+            edge_agent_id = %edge_agent_id,
+            error = %e,
+            "edge WebSocket: DB registry registration failed; rejecting connection"
+        );
+        state.edge_connection_pool.unregister_if_generation(
+            &user_id,
+            &edge_agent_id,
+            pool_generation,
+        );
+        let _ = send_edge_msg(
+            &ws_sink,
+            EdgeServerMessage::AuthError {
+                message: "edge registry registration failed".into(),
+            },
         )
         .await;
+        return;
+    }
+
+    // Auth + pool + DB all succeeded — notify the edge client.
+    let _ = send_edge_msg(
+        &ws_sink,
+        EdgeServerMessage::AuthOk {
+            user_id: user_id.clone(),
+        },
+    )
+    .await;
 
     // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
     let inflight_dispatches = InflightEdgeDispatchTracker::default();
@@ -469,6 +564,37 @@ async fn handle_edge_connection(
                     if send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong).await.is_err() {
                         break;
                     }
+                    // B3: update last_heartbeat_at in DB registry, guarded by
+                    // edge_id so a stale connection cannot refresh a row that a
+                    // newer connection has already claimed.
+                    match edge_registry
+                        .heartbeat(&user_id, &edge_agent_id, &edge_id_for_registry)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(astra_services::multi_agent::HeartbeatError::Superseded) => {
+                            tracing::info!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %user_id,
+                                edge_agent_id = %edge_agent_id,
+                                "edge WebSocket: connection superseded by newer registration; closing"
+                            );
+                            break;
+                        }
+                        Err(astra_services::multi_agent::HeartbeatError::StorageFailure(e)) => {
+                            tracing::warn!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %user_id,
+                                edge_agent_id = %edge_agent_id,
+                                error = %e,
+                                "edge WebSocket: heartbeat DB failure (transient); connection remains open"
+                            );
+                            // Transient storage failure — do not disconnect. The
+                            // next tick will retry. Persistent failures will
+                            // eventually be caught by the sweeper's stale-record
+                            // expiry, which uses last_heartbeat_at.
+                        }
+                    }
                 }
             }
         }
@@ -495,14 +621,39 @@ async fn handle_edge_connection(
         "edge_ws_disconnected",
     )
     .await;
-    pool_for_cleanup.unregister(&user_id_cleanup, &edge_agent_id_cleanup);
+    // B1: only remove our own pool entry; a faster reconnect may have already
+    // replaced it with a higher-generation entry — leave that intact.
+    let _was_our_entry = pool_for_cleanup.unregister_if_generation(
+        &user_id_cleanup,
+        &edge_agent_id_cleanup,
+        pool_generation,
+    );
 
-    // Unregister from DB edge registry so other pods stop routing to this edge.
-    let _ = state
+    // Always attempt DB unregister, regardless of whether we still owned the
+    // pool slot. The WHERE edge_id = ? guard in the SQL prevents us from
+    // deleting a newer connection's row written by a cross-pod reconnect.
+    // This also covers the gap where a new connection registered in DB but
+    // then failed and rolled back its pool entry — without this call the old
+    // DB row would linger until the sweeper expires it.
+    if let Err(e) = state
         .execution
         .edge_registry_service
-        .unregister(&user_id_cleanup, &edge_agent_id_cleanup)
-        .await;
+        .unregister(
+            &user_id_cleanup,
+            &edge_agent_id_cleanup,
+            &edge_id_for_registry,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            user_id = %user_id_cleanup,
+            edge_agent_id = %edge_agent_id_cleanup,
+            edge_id = %edge_id_for_registry,
+            error = %e,
+            "edge WebSocket cleanup: DB unregister failed; sweeper will expire the record"
+        );
+    }
 
     tracing::info!(
         user_id = %user_id_cleanup,

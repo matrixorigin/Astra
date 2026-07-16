@@ -438,7 +438,15 @@ async fn edge_registry_register_list_unregister() {
 
     // Register
     let record = svc
-        .register_or_update(&user_id, &edge_agent_id, &edge_id_header, None, None, None)
+        .register_or_update(
+            &user_id,
+            &edge_agent_id,
+            &edge_id_header,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("register");
     assert_eq!(record.user_id, user_id);
@@ -450,8 +458,8 @@ async fn edge_registry_register_list_unregister() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].edge_agent_id, edge_agent_id);
 
-    // Unregister
-    svc.unregister(&user_id, &edge_agent_id)
+    // Unregister (guarded by edge_id so cross-pod stale cleanup cannot delete a newer row)
+    svc.unregister(&user_id, &edge_agent_id, &edge_id_header)
         .await
         .expect("unregister");
 
@@ -474,8 +482,10 @@ async fn edge_registry_heartbeat_unregistered() {
     let result = svc
         .heartbeat(&user_id, &edge_agent_id, &edge_id_header)
         .await;
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "edge agent not registered");
+    assert!(matches!(
+        result.unwrap_err(),
+        astra_services::HeartbeatError::Superseded
+    ));
 }
 
 #[tokio::test]
@@ -493,8 +503,8 @@ async fn edge_registry_concurrent_register() {
 
     // Concurrent registration with same key
     let (r1, r2) = tokio::join!(
-        svc1.register_or_update(&user_id, &edge_agent_id, &edge_id1, None, None, None),
-        svc2.register_or_update(&user_id, &edge_agent_id, &edge_id2, None, None, None)
+        svc1.register_or_update(&user_id, &edge_agent_id, &edge_id1, None, None, None, None),
+        svc2.register_or_update(&user_id, &edge_agent_id, &edge_id2, None, None, None, None)
     );
 
     let rec1 = r1.expect("register1");
@@ -525,7 +535,15 @@ async fn edge_registry_register_twice_updates() {
 
     // First register
     let rec1 = svc
-        .register_or_update(&user_id, &edge_agent_id, &edge_id1, hostname1, None, None)
+        .register_or_update(
+            &user_id,
+            &edge_agent_id,
+            &edge_id1,
+            hostname1,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("register1");
     assert_eq!(rec1.edge_id, edge_id1);
@@ -533,7 +551,15 @@ async fn edge_registry_register_twice_updates() {
 
     // Second register updates
     let rec2 = svc
-        .register_or_update(&user_id, &edge_agent_id, &edge_id2, hostname2, None, None)
+        .register_or_update(
+            &user_id,
+            &edge_agent_id,
+            &edge_id2,
+            hostname2,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("register2");
     assert_eq!(rec2.edge_id, edge_id2);

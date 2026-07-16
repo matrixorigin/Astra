@@ -915,6 +915,7 @@ pub(crate) async fn post_agents_edge_register_handler(
             body.hostname.as_deref(),
             body.worktree_path.as_deref(),
             body.capabilities,
+            None, // workspace_id not available via REST callback path
         )
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
@@ -943,7 +944,15 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
         .edge_registry_service
         .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
         .await
-        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(|e| match e {
+            astra_services::multi_agent::HeartbeatError::Superseded => error_response(
+                StatusCode::CONFLICT,
+                "edge connection superseded by newer registration",
+            ),
+            astra_services::multi_agent::HeartbeatError::StorageFailure(msg) => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
+            }
+        })?;
 
     // ── Reconnection dedup ──────────────────────────────────────────
     // 1. Ack completed request IDs: remove from cloud's pending set.

@@ -38,9 +38,10 @@ use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     SelectedToolOfferSnapshot, ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind,
     WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filter_edge_provided_tool_schemas_for_binding_with_context,
-    capability_filtered_server_tool_schemas_with_context, projected_tool_end_event_fields,
-    projected_tool_start_event_fields,
+    capability_filtered_server_tool_schemas, capability_filtered_server_tool_schemas_with_context,
+    projected_tool_end_event_fields, projected_tool_start_event_fields,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
@@ -2152,6 +2153,130 @@ impl ServerAgenticLoopHost {
         tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     ) {
         self.runtime_stop_after_success_tools = tools;
+    }
+
+    fn tool_schema_visible_for_current_binding(&self, schema: &Value) -> bool {
+        !capability_filter_edge_provided_tool_schemas_for_binding(
+            vec![schema.clone()],
+            &self.workspace_binding,
+            &self.executor_binding,
+            self.runtime_binding.as_ref(),
+        )
+        .is_empty()
+    }
+
+    fn install_admissible_tool_schema(&mut self, schema: Value, admit_as_extra: bool) -> bool {
+        let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
+            tracing::warn!(
+                "install_admissible_tool_schema: rejected malformed schema (no valid function name)"
+            );
+            return false;
+        };
+        if !self.tool_schema_visible_for_current_binding(&schema) {
+            tracing::debug!(
+                tool_name = %name,
+                executor_kind = ?self.executor_binding.kind,
+                executor_status = ?self.executor_binding.status,
+                workspace_kind = ?self.workspace_binding.kind,
+                "edge_tool_schema: install_admissible_tool_schema: schema rejected — not visible for current binding"
+            );
+            return false;
+        }
+        tracing::debug!(tool_name = %name, "edge_tool_schema: install_admissible_tool_schema: admitted");
+
+        self.valid_tools.insert(name.clone());
+        if admit_as_extra && !self.admissible_extras.iter().any(|extra| extra == &name) {
+            self.admissible_extras.push(name.clone());
+        }
+        if let Some(existing) = self
+            .tool_schemas
+            .iter_mut()
+            .find(|tool| tool_schema_name(tool) == Some(name.as_str()))
+        {
+            *existing = schema;
+        } else {
+            self.tool_schemas.push(schema);
+        }
+        true
+    }
+
+    /// Merge edge-resident builtin tool schemas when MOI (or similar) callers
+    /// supply `allow_tools` together with an explicit edge executor binding.
+    /// Agent-binding mode only installs MCP schemas by default; without this
+    /// merge the model never sees bash/read_file even though dispatch targets
+    /// the selected edge agent.
+    ///
+    /// `allow_tools` is treated strictly as an explicit tool-name allowlist and
+    /// is intersected with the edge's capability-filtered tool set: the effective
+    /// set is `allow_tools ∩ capability_set`. There is no wildcard — a caller
+    /// cannot expand tool admission beyond the names it enumerates, so a mistaken
+    /// or malicious capability declaration cannot by itself grant a tool.
+    pub fn merge_allowlisted_edge_tool_schemas(&mut self, allow_tools: &[String]) {
+        if allow_tools.is_empty()
+            || !matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
+        {
+            tracing::debug!(
+                allow_tools_empty = allow_tools.is_empty(),
+                executor_kind = ?self.executor_binding.kind,
+                "edge_tool_schema: merge_allowlisted_edge_tool_schemas: guard failed, returning early"
+            );
+            return;
+        }
+        let allow_set: std::collections::HashSet<String> = allow_tools
+            .iter()
+            .map(|tool| tool.trim().to_ascii_lowercase())
+            .filter(|tool| !tool.is_empty() && tool != "*")
+            .collect();
+        if allow_set.is_empty() {
+            tracing::debug!(
+                "edge_tool_schema: merge_allowlisted_edge_tool_schemas: allow_set is empty after normalization"
+            );
+            return;
+        }
+        let candidates = capability_filtered_server_tool_schemas(
+            &self.capabilities,
+            &self.workspace_binding,
+            &self.executor_binding,
+            self.runtime_binding.as_ref(),
+        );
+        tracing::debug!(
+            allow_set = ?allow_set,
+            candidates_count = candidates.len(),
+            workspace_kind = ?self.workspace_binding.kind,
+            workspace_cwd = ?self.workspace_binding.cwd,
+            executor_kind = ?self.executor_binding.kind,
+            executor_status = ?self.executor_binding.status,
+            executor_transport = ?self.executor_binding.transport,
+            "edge_tool_schema: merge_allowlisted_edge_tool_schemas: candidates filtered"
+        );
+        let merged: Vec<Value> = candidates
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema)
+                    .map(|name| allow_set.contains(&name.to_ascii_lowercase()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let merged_count = merged.len();
+        tracing::debug!(
+            merged_count,
+            "edge_tool_schema: merge_allowlisted_edge_tool_schemas: merged {} tools",
+            merged_count
+        );
+        for schema in merged {
+            self.install_admissible_tool_schema(schema, true);
+        }
+        // MOI runner chat sends `allow_tools` + executor_binding.transport=edge_ws.
+        // Those tools must execute via ServerToolExecutor → edge websocket, not the
+        // browser ledger path (which blocks up to 300s waiting for POST /tools/result).
+        if merged_count > 0
+            && matches!(
+                self.executor_binding.transport,
+                crate::server::tool_transport::ToolTransportKind::EdgeWs
+            )
+        {
+            self.server_side_tools = true;
+        }
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -4821,6 +4946,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         } else {
             None
         };
+        tracing::debug!(
+            target: "astra_runtime::server_loop",
+            session_id = %self.session_id,
+            turn = state.session_turn,
+            has_session_memory = initial_session_memory_entry.is_some(),
+            "turn pipeline: session memory loaded"
+        );
         let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             &visible_tools,
@@ -7376,6 +7508,75 @@ mod tests {
                 "server-service tool {hidden} must not leak when server-service capacity is disabled: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_allowlisted_edge_tool_schemas_adds_edge_builtins_after_mcp_install() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_service_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__catalog__read_artifact",
+                    "description": "MOI catalog MCP tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })],
+            Default::default(),
+        );
+
+        host.merge_allowlisted_edge_tool_schemas(&["bash".to_string(), "read_file".to_string()]);
+
+        assert!(
+            host.valid_tool_names()
+                .contains("mcp__catalog__read_artifact")
+        );
+        assert!(host.valid_tool_names().contains("bash"));
+        assert!(host.valid_tool_names().contains("read_file"));
+        assert!(
+            host.server_side_tools,
+            "edge_ws allow_tools must route through ServerToolExecutor, not edge ledger"
+        );
+    }
+
+    #[test]
+    fn merge_allowlisted_edge_tool_schemas_enables_server_side_tools_without_mcp() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_service_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        assert!(!host.server_side_tools);
+
+        host.merge_allowlisted_edge_tool_schemas(&["bash".to_string()]);
+
+        assert!(host.valid_tool_names().contains("bash"));
+        assert!(
+            host.server_side_tools,
+            "MOI runner allow_tools without MCP must not use edge ledger delivery"
+        );
     }
 
     fn schema_names(tools: &[Value]) -> HashSet<String> {

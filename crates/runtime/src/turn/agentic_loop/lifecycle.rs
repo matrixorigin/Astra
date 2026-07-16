@@ -1401,8 +1401,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     let turn_start_time = Instant::now();
-
-    // Initialize turn event buffer for fine-grained observability (once per turn).
+    tracing::debug!(
+        target: "astra_timing",
+        turn_index = turn_index,
+        session_turn = session_turn_number(state),
+        "agentic turn started"
+    );
     if state.turn_event_buffer.is_none() {
         state.turn_event_buffer = Some(
             astra_services::session_journal::TurnEventBuffer::begin_turn(

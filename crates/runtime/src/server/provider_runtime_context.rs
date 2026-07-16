@@ -7,23 +7,184 @@ pub(crate) async fn inject_effective_runtime_context(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
+        // Thread provider_scope_id into the request so the run lifecycle can
+        // propagate it into ToolExecutionRequest.workspace_record, enabling
+        // workspace isolation checks on the edge transport path even when the
+        // turn carries no full WorkspaceRecord (MOI provider-authorized turns).
+        if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
+            request.provider_workspace_id = Some(ctx.provider_scope_id.clone());
+        }
         return apply_provider_supplied_runtime_context(request);
     }
     reject_unauthorized_capability_descriptors(request)
 }
 
 pub(crate) async fn inject_effective_runtime_context_body(
-    _state: &AppState,
+    state: &AppState,
     principal: &AuthPrincipal,
     body: Bytes,
 ) -> Result<Bytes, (StatusCode, Json<ErrorResponse>)> {
     if principal.is_provider_authorized_request() {
+        if principal.is_edge_registration() {
+            return inject_edge_registration_runtime_context_body(state, principal, body).await;
+        }
         return Ok(body);
     }
     if body_has_capability_descriptors(&body)? {
         return Err(provider_runtime_authorization_required());
     }
     Ok(body)
+}
+
+async fn inject_edge_registration_runtime_context_body(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    body: Bytes,
+) -> Result<Bytes, (StatusCode, Json<ErrorResponse>)> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("chat turn request body must be JSON for edge runtime context: {error}"),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "chat turn request body must be a JSON object for edge runtime context",
+        )
+    })?;
+    // Strip any caller-supplied runtime context fields. Edge-registration tokens
+    // are not allowed to provide runtime auth, capability descriptors, or
+    // runtime bindings directly; the provider issues all of these below.
+    object.remove("runtime_auth");
+    object.remove("capability_descriptors");
+    object.remove("llm_token_service");
+    object.remove("runtime_profile");
+    object.remove("runtime_mcp_bindings");
+    object.remove("runtime_skill_binding");
+    object.remove("runtime_system_prompt");
+
+    let requested_model_id = match object
+        .get("selected_model")
+        .and_then(|s| s.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    {
+        Some(id) => id,
+        None => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "edge chat turn request must specify selected_model.id",
+            ));
+        }
+    };
+    // Replace caller-supplied selected_model wholesale with the provider-issued one below.
+    object.remove("selected_model");
+    let requested_tool_ids = string_array_field(object, "allow_tools")?;
+    let requested_skill_ids = string_array_field(object, "allow_skills")?;
+    let t0 = std::time::Instant::now();
+    tracing::info!("astra_timing: issue_runtime_context started (edge-jwt path)");
+    let context = state
+        .auth_service
+        .external_runtime_context_by_scope(
+            principal,
+            astra_services::ExternalRuntimeContextRequestData {
+                requested_model_id,
+                requested_tool_ids,
+                requested_skill_ids: requested_skill_ids.clone(),
+                requested_knowledge_base_ids: Vec::new(),
+            },
+        )
+        .await?;
+    tracing::info!(
+        elapsed_ms = t0.elapsed().as_millis(),
+        "astra_timing: issue_runtime_context completed (edge-jwt path)"
+    );
+    let authorization = context.runtime_auth.authorization.clone();
+    let selected_model = context.selected_model.to_selected_model_request();
+    let runtime_auth = context.runtime_auth.to_runtime_auth_request();
+    if let Some(runtime_system_prompt) = context.runtime_system_prompt {
+        object.insert(
+            "runtime_system_prompt".to_string(),
+            serde_json::Value::String(runtime_system_prompt),
+        );
+    }
+    object.insert(
+        "selected_model".to_string(),
+        serde_json::to_value(&selected_model).map_err(internal_error)?,
+    );
+    object.insert(
+        "runtime_auth".to_string(),
+        serde_json::to_value(&runtime_auth).map_err(internal_error)?,
+    );
+    object.insert(
+        "capability_descriptors".to_string(),
+        serde_json::to_value(context.capability_descriptors.to_request_descriptors())
+            .map_err(internal_error)?,
+    );
+    if let Some(model_gateway) = context.capability_descriptors.model_gateway.as_ref() {
+        object.insert(
+            "llm_token_service".to_string(),
+            serde_json::json!({
+                "url": model_gateway.endpoint_url,
+            }),
+        );
+    }
+    if let Some(mcp) = context.capability_descriptors.mcp {
+        object.insert(
+            "runtime_profile".to_string(),
+            serde_json::Value::String("request_scoped_runtime_mcp".to_string()),
+        );
+        object.insert(
+            "runtime_mcp_bindings".to_string(),
+            serde_json::to_value(vec![mcp.into_runtime_mcp_binding(authorization.clone())])
+                .map_err(internal_error)?,
+        );
+    }
+    if !requested_skill_ids.is_empty() {
+        if let Some(skills) = context.capability_descriptors.skills {
+            object.insert(
+                "runtime_skill_binding".to_string(),
+                serde_json::json!({
+                    "id": skills.id,
+                    "url": skills.endpoint_url,
+                    "authorization": authorization,
+                }),
+            );
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(internal_error)
+}
+
+fn string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let array = value.as_array().ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be an array of string ids"),
+        )
+    })?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("{field} must contain only string ids"),
+                )
+            })
+        })
+        .collect()
 }
 
 fn apply_provider_supplied_runtime_context(
@@ -132,4 +293,127 @@ fn body_has_capability_descriptors(
         .as_object()
         .and_then(|object| object.get("capability_descriptors"))
         .is_some_and(|value| !value.is_null()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::auth::{AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext};
+    use axum::http::StatusCode;
+
+    struct AlwaysHealthy;
+    #[async_trait::async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    struct StubEdgeAuth;
+    #[async_trait::async_trait]
+    impl AuthService for StubEdgeAuth {
+        async fn register(
+            &self,
+            _req: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+            unreachable!()
+        }
+        async fn login(
+            &self,
+            _req: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+            unreachable!()
+        }
+        async fn refresh(
+            &self,
+            _req: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+            unreachable!()
+        }
+        async fn logout(
+            &self,
+            _req: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+            unreachable!()
+        }
+        async fn current_user(
+            &self,
+            _headers: &axum::http::HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    fn edge_principal() -> AuthPrincipal {
+        AuthPrincipal {
+            user: AuthUserRecord {
+                user_id: "u1".to_string(),
+                username: "edge".to_string(),
+                email: "edge@test".to_string(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                AuthProviderAuthorizedRequestContext {
+                    provider_id: "p1".to_string(),
+                    external_subject: "s1".to_string(),
+                    provider_scope_id: "ws-1".to_string(),
+                    request_authorization_id: "r1".to_string(),
+                    edge_agent_id: Some("edge-test".to_string()),
+                },
+            ),
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(
+            ServiceInfo::new("prc-test", "0.0.0-test", ""),
+            std::sync::Arc::new(AlwaysHealthy),
+        )
+        .with_auth_service(std::sync::Arc::new(StubEdgeAuth))
+    }
+
+    #[tokio::test]
+    async fn missing_selected_model_id_returns_400() {
+        let state = test_state();
+        let principal = edge_principal();
+        let body = Bytes::from_static(b"{}");
+
+        let err = inject_edge_registration_runtime_context_body(&state, &principal, body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.0.detail.contains("selected_model.id"),
+            "error message must mention selected_model.id: {:?}",
+            err.1.0.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_runtime_auth_and_capability_descriptors_are_stripped_before_model_id_check() {
+        let state = test_state();
+        let principal = edge_principal();
+        // Attacker injects both reserved fields but omits selected_model.id.
+        // The handler must strip the injected fields without error and then
+        // fail on the missing model id — not on unexpected field presence.
+        let body = Bytes::from(
+            serde_json::json!({
+                "runtime_auth": {"authorization": "attacker-token"},
+                "capability_descriptors": {"mcp": {"id": "evil"}},
+                "selected_model": {}
+            })
+            .to_string(),
+        );
+
+        let err = inject_edge_registration_runtime_context_body(&state, &principal, body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.0.detail.contains("selected_model.id"),
+            "must fail on missing selected_model.id, not on injected fields: {:?}",
+            err.1.0.detail
+        );
+    }
 }

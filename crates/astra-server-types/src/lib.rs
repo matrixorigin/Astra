@@ -1197,6 +1197,16 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         request.plan_subtask_id.take(),
         request.is_plan_subtask,
     );
+    // Prefer an explicit edge_executor_id; fall back to the id carried in
+    // capability_descriptors.edge_agent when moi-core sets the executor via
+    // capability descriptor rather than the legacy field.
+    let edge_executor_id = request.edge_executor_id.take().or_else(|| {
+        request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|cd| cd.edge_agent.as_ref())
+            .map(|ea| ea.id.clone())
+    });
     ChatRequestData {
         message: request.message,
         user_intent: request.user_intent,
@@ -1227,9 +1237,10 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         mcp_binding_ids: request.mcp_binding_ids,
         context,
-        edge_executor_id: request.edge_executor_id,
+        edge_executor_id,
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
+        provider_workspace_id: None,
         execution_budget: request.execution_budget,
         execution_policy: request.execution_policy,
         explain: request.explain,

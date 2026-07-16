@@ -33,6 +33,20 @@ pub(crate) async fn execute_edge_bound(
     }
     let plan = EdgeBoundExecutionPlan::from_request_with_binding(&request, binding);
 
+    tracing::info!(
+        target: "astra_runtime::edge_dispatch_diag",
+        tool = %request.tool_name,
+        user_id = %request.user_id,
+        selected_executor_id = ?plan.selected_executor_id(),
+        executor_transport = ?request.executor.transport,
+        executor_status = ?request.executor.status,
+        connected_edges = edge_connection_pool
+            .as_ref()
+            .map(|p| p.get_user_edges(&request.user_id).len())
+            .unwrap_or(0),
+        "edge_dispatch: begin edge-bound tool execution"
+    );
+
     let mut diagnostics = Vec::new();
     match try_edge_websocket(
         &request,
@@ -95,31 +109,123 @@ async fn try_edge_websocket(
         return EdgeTransportAttempt::Unavailable;
     };
     let edges = pool.get_user_edges(&request.user_id);
-    let edge = match select_capable_connected_edge(
-        &edges,
-        plan.selected_executor_id(),
-        request,
-        tool_registry,
-    ) {
-        Ok(Some(edge)) => edge,
-        Ok(None) => return EdgeTransportAttempt::Unavailable,
-        Err(ref err) => {
-            return EdgeTransportAttempt::Delivered(capability_denied_result(
-                request,
-                &err.0,
-                err.1.clone(),
-            ));
+    tracing::info!(
+        target: "astra_runtime::edge_dispatch_diag",
+        tool = %request.tool_name,
+        selected_executor_id = ?plan.selected_executor_id(),
+        edge_ids = ?edges.iter().map(|e| e.edge_agent_id.as_str()).collect::<Vec<_>>(),
+        "edge_dispatch: try_edge_websocket connected edges for user"
+    );
+
+    // When the user-scoped lookup returns nothing but a specific executor is
+    // requested, attempt a cross-user lookup by agent ID.  This handles the
+    // case where a sandbox edge agent connects using a service-account user ID
+    // that is different from the workspace user issuing the chat request.
+    // The requesting workspace_id is passed so that the pool can enforce that
+    // the edge agent belongs to the same workspace (workspace-level authorization).
+    let requesting_workspace_id = request
+        .workspace_record
+        .as_ref()
+        .map(|w| w.workspace_id.as_str());
+    let (edge, edge_owner_user_id) = if edges.is_empty() {
+        if let Some(agent_id) = plan.selected_executor_id() {
+            match pool.find_edge_by_agent_id(agent_id, requesting_workspace_id) {
+                Some((owner_user_id, found_edge)) => {
+                    // Enforce capability surface checks even on cross-user lookups.
+                    match select_capable_connected_edge(
+                        std::slice::from_ref(&found_edge),
+                        Some(agent_id),
+                        request,
+                        tool_registry,
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return EdgeTransportAttempt::Unavailable,
+                        Err(ref err) => {
+                            return EdgeTransportAttempt::Delivered(capability_denied_result(
+                                request,
+                                &err.0,
+                                err.1.clone(),
+                            ));
+                        }
+                    }
+                    tracing::info!(
+                        target: "astra_runtime::edge_dispatch_diag",
+                        tool = %request.tool_name,
+                        edge_agent_id = %found_edge.edge_agent_id,
+                        owner_user_id = %owner_user_id,
+                        requester_user_id = %request.user_id,
+                        "edge_dispatch: try_edge_websocket cross-user edge found"
+                    );
+                    (found_edge, owner_user_id)
+                }
+                None => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_dispatch_diag",
+                        tool = %request.tool_name,
+                        selected_executor_id = ?plan.selected_executor_id(),
+                        "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
+                    );
+                    return EdgeTransportAttempt::Unavailable;
+                }
+            }
+        } else {
+            tracing::warn!(
+                target: "astra_runtime::edge_dispatch_diag",
+                tool = %request.tool_name,
+                selected_executor_id = ?plan.selected_executor_id(),
+                "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
+            );
+            return EdgeTransportAttempt::Unavailable;
+        }
+    } else {
+        match select_capable_connected_edge(
+            &edges,
+            plan.selected_executor_id(),
+            request,
+            tool_registry,
+        ) {
+            Ok(Some(edge)) => (edge.clone(), request.user_id.clone()),
+            Ok(None) => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_dispatch_diag",
+                    tool = %request.tool_name,
+                    selected_executor_id = ?plan.selected_executor_id(),
+                    "edge_dispatch: try_edge_websocket no capable connected edge matched (Unavailable)"
+                );
+                return EdgeTransportAttempt::Unavailable;
+            }
+            Err(ref err) => {
+                return EdgeTransportAttempt::Delivered(capability_denied_result(
+                    request,
+                    &err.0,
+                    err.1.clone(),
+                ));
+            }
         }
     };
+
+    tracing::info!(
+        target: "astra_runtime::edge_dispatch_diag",
+        tool = %request.tool_name,
+        edge_agent_id = %edge.edge_agent_id,
+        "edge_dispatch: try_edge_websocket selected edge, sending tool request over WS"
+    );
     let edge_result = pool
         .execute_tool_with_cancel(
-            plan.user_id(),
+            &edge_owner_user_id,
             &edge.edge_agent_id,
             &request.tool_name,
             &request.args,
             cancel_token,
         )
         .await;
+    tracing::info!(
+        target: "astra_runtime::edge_dispatch_diag",
+        tool = %request.tool_name,
+        edge_agent_id = %edge.edge_agent_id,
+        got_result = edge_result.is_some(),
+        "edge_dispatch: try_edge_websocket execute_tool_with_cancel returned"
+    );
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
             request,
@@ -162,39 +268,85 @@ async fn try_edge_dispatch(
             false,
         ));
     }
-    let list_agents = registry.list_by_user(&request.user_id);
-    let agents_result = if let Some(token) = cancel_token.as_ref() {
-        tokio::select! {
-            _ = token.cancelled() => {
-                return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
-                    request,
-                    binding,
-                    ToolTransportKind::EdgeLedger,
-                    false,
-                ));
+    // Cross-user dispatch: if the plan names a specific executor (sandbox edge),
+    // look it up directly by agent_id so we find a service-account-owned edge
+    // even when the tool request comes from a different (real) user.
+    // Workspace filtering prevents cross-workspace agent hijacking.
+    // Fallback to list_by_user when no executor is pinned (same-user dispatch).
+    let requesting_workspace_id = request
+        .workspace_record
+        .as_ref()
+        .map(|w| w.workspace_id.as_str());
+    let agent = if let Some(executor_id) = plan.selected_executor_id() {
+        let find_agent =
+            registry.find_by_agent_id_and_workspace(executor_id, requesting_workspace_id);
+        let agent_result = if let Some(token) = cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
+                        request,
+                        binding,
+                        ToolTransportKind::EdgeLedger,
+                        false,
+                    ));
+                }
+                result = find_agent => result,
             }
-            result = list_agents => result,
+        } else {
+            find_agent.await
+        };
+        match agent_result {
+            Ok(Some(agent)) => {
+                match select_capable_edge_agent(
+                    std::slice::from_ref(&agent),
+                    None,
+                    request,
+                    tool_registry,
+                ) {
+                    Ok(Some(_)) => agent,
+                    Ok(None) => return EdgeTransportAttempt::Unavailable,
+                    Err(ref err) => {
+                        return EdgeTransportAttempt::Delivered(capability_denied_result(
+                            request,
+                            &err.0,
+                            err.1.clone(),
+                        ));
+                    }
+                }
+            }
+            Ok(None) => return EdgeTransportAttempt::Unavailable,
+            Err(_) => return EdgeTransportAttempt::Unavailable,
         }
     } else {
-        list_agents.await
-    };
-    let Ok(agents) = agents_result else {
-        return EdgeTransportAttempt::Unavailable;
-    };
-    let agent = match select_capable_edge_agent(
-        &agents,
-        plan.selected_executor_id(),
-        request,
-        tool_registry,
-    ) {
-        Ok(Some(agent)) => agent,
-        Ok(None) => return EdgeTransportAttempt::Unavailable,
-        Err(ref err) => {
-            return EdgeTransportAttempt::Delivered(capability_denied_result(
-                request,
-                &err.0,
-                err.1.clone(),
-            ));
+        let list_agents = registry.list_by_user(&request.user_id);
+        let agents_result = if let Some(token) = cancel_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
+                        request,
+                        binding,
+                        ToolTransportKind::EdgeLedger,
+                        false,
+                    ));
+                }
+                result = list_agents => result,
+            }
+        } else {
+            list_agents.await
+        };
+        let Ok(agents) = agents_result else {
+            return EdgeTransportAttempt::Unavailable;
+        };
+        match select_capable_edge_agent(&agents, None, request, tool_registry) {
+            Ok(Some(agent)) => agent.clone(),
+            Ok(None) => return EdgeTransportAttempt::Unavailable,
+            Err(ref err) => {
+                return EdgeTransportAttempt::Delivered(capability_denied_result(
+                    request,
+                    &err.0,
+                    err.1.clone(),
+                ));
+            }
         }
     };
     if cancel_token
@@ -209,8 +361,12 @@ async fn try_edge_dispatch(
         ));
     }
     let request_id = plan.dispatch_request_id().to_string();
+    // Use the edge owner's user_id (from the registry record) for the dispatch
+    // identity, not the request user_id. The edge relay polls its own user_id,
+    // so sandbox service-account edges would never see rows keyed to the real
+    // user. request.user_id is preserved in session/run/turn fields for tracing.
     let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-        &request.user_id,
+        &agent.user_id,
         &request.session_id,
         &request.run_id,
         &request.turn_chain_id,

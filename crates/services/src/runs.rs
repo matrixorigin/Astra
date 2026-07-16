@@ -479,6 +479,11 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     pub mcp: Option<RuntimeCapabilityDescriptorRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<RuntimeCapabilityDescriptorRequest>,
+    // edge_agent: astra-edge executor descriptor injected by moi-core catalog when
+    // a sandbox or runner is selected. The astra-server routes tool callbacks to
+    // the edge agent identified by id via the existing edge WebSocket registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +570,12 @@ pub struct ChatRequestData {
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
+    /// Owning workspace from the provider-authorized turn's edge-registration
+    /// token (`provider_scope_id`).  Injected at the request-injection layer
+    /// and propagated into `ToolExecutionRequest.workspace_record` by the run
+    /// lifecycle so that edge workspace isolation checks work correctly on the
+    /// MOI provider-authorized turn path.
+    pub provider_workspace_id: Option<String>,
     pub execution_budget: Option<ExecutionBudget>,
     pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
@@ -10045,6 +10056,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
+            provider_workspace_id: None,
         };
 
         let rendered = format!("{request:?}");
@@ -10111,6 +10123,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
+            provider_workspace_id: None,
         };
 
         let rendered = format!("{request:?}");
@@ -10196,6 +10209,7 @@ mod tests {
                     explain: false,
                     interaction_mode: None,
                     interactive_client: false,
+                    provider_workspace_id: None,
                 },
             )
             .await

@@ -1512,6 +1512,7 @@ impl InProcessChatTurnBridge {
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
         client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
+        tracing::debug!(target: "astra_timing", "bridge forward() called (pre-stream)");
         // Extract trusted context injected by dispatch_chat_turn_bridge
         let user_id = required_bridge_header(headers, "x-mo-user-id")?;
         let session_id = required_bridge_header(headers, "x-mo-session-id")?;
@@ -1689,6 +1690,7 @@ impl InProcessChatTurnBridge {
                 .as_ref()
                 .map(|t| crate::turn::llm::client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
+            tracing::debug!(target: "astra_timing", "bridge stream started");
             let run_id = uuid::Uuid::new_v4().to_string();
             let mut turn_event_buffer = bridge_should_create_turn_event_buffer(
                 full_llm_capture,
@@ -2051,6 +2053,12 @@ impl InProcessChatTurnBridge {
                         .as_ref()
                         .map(|s| s.fetch_ms)
                         .unwrap_or(0);
+                tracing::debug!(
+                    target: "astra_timing",
+                    elapsed_ms = turn_started.elapsed().as_millis(),
+                    memory_fetch_ms = memory_fetch_ms,
+                    "memoria prefetch done"
+                );
 
                 let mut recall_entries = cached_session_start
                     .as_ref()
@@ -2697,6 +2705,7 @@ impl InProcessChatTurnBridge {
                 let mut loop_reasoning = String::new();
                 let mut loop_reasoning_signature = String::new();
                 let mut attempt_in_round = 0_u32;
+                let mut ttft_logged = false;
                 let request_capture_model = if resolved_model.is_empty() {
                     model_name.clone()
                 } else {
@@ -3050,6 +3059,13 @@ impl InProcessChatTurnBridge {
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
                     ));
+                    tracing::debug!(
+                        target: "astra_timing",
+                        elapsed_ms = turn_started.elapsed().as_millis(),
+                        memory_fetch_ms = memory_fetch_ms,
+                        model = %model_name,
+                        "context assembled, starting LLM call"
+                    );
                     let mut client_stopped = false;
                     let llm_stream = if let Some(blocks) = bridge_e2e_stream_blocks
                         .clone()
@@ -3487,6 +3503,14 @@ impl InProcessChatTurnBridge {
                                             for b in chunks {
                                                 if terminal_error_event.is_none() {
                                                     terminal_error_event = forwarded_sse_error_event(&b);
+                                                }
+                                                if !ttft_logged && !loop_text.is_empty() {
+                                                    tracing::debug!(
+                                                        target: "astra_timing",
+                                                        elapsed_ms = turn_started.elapsed().as_millis(),
+                                                        "first text token (TTFT from stream start)"
+                                                    );
+                                                    ttft_logged = true;
                                                 }
                                                 yield b;
                                             }
@@ -4145,6 +4169,13 @@ impl InProcessChatTurnBridge {
 
 
             let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
+            tracing::debug!(
+                target: "astra_timing",
+                total_turn_ms = turn_started.elapsed().as_millis(),
+                llm_phase_ms = llm_duration_ms,
+                memory_fetch_ms = memory_fetch_ms,
+                "bridge turn completed"
+            );
 
             // Persist events (fire-and-forget)
             let user_content = latest_user_message_text(&messages).map(ToString::to_string);

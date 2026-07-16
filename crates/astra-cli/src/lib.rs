@@ -1,3 +1,4 @@
+#![allow(unstable_name_collisions)]
 //! `astra-cli` library crate.
 //!
 //! Provides the CLI application logic shared between the main `astra` binary

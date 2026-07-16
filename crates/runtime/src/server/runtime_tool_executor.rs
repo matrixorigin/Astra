@@ -374,6 +374,8 @@ pub struct RuntimeToolExecutor {
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
     /// Optional auxiliary event writer for ask_user-specific audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
+    /// Tool names explicitly admitted for edge dispatch (bypass capability check).
+    edge_admitted_tools: HashSet<String>,
 }
 
 impl RuntimeToolExecutor {
@@ -456,6 +458,7 @@ impl RuntimeToolExecutor {
             control_plane_tools_enabled: true,
             invocation_ledger: None,
             semantic_read_observation_store: None,
+            edge_admitted_tools: HashSet::new(),
         }
     }
 
@@ -614,6 +617,24 @@ impl RuntimeToolExecutor {
 
     pub fn with_server_service_tools_disabled(mut self) -> Self {
         self.server_service_tools_enabled = false;
+        self
+    }
+
+    /// Mark explicit tool names as admitted for edge dispatch.  These tools
+    /// bypass the capability surface check so the model sees them in its tool
+    /// list even when server builtin tools are disabled (agent-binding mode).
+    /// Execution is still routed through `ToolExecutionService` to the edge
+    /// agent via WebSocket — server-local execution is never attempted.
+    pub fn with_edge_admitted_tools(mut self, tools: &[String]) -> Self {
+        self.edge_admitted_tools = tools
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        tracing::debug!(
+            edge_admitted_tools = ?self.edge_admitted_tools,
+            "edge_tool_schema: ServerToolExecutor::with_edge_admitted_tools"
+        );
         self
     }
 
@@ -1007,6 +1028,18 @@ impl RuntimeToolExecutor {
         let runtime_registry_knows_tool = runtime_registry.get(name).is_some();
         if let Some(denial) = self.runtime_environment_tool_denial(name, args) {
             return ExecutorToolReadiness::RuntimeEnvironmentDenied(denial);
+        }
+
+        // Tools explicitly admitted for edge dispatch bypass the server
+        // capability surface check.  The capability filter was already applied
+        // upstream (merge_allowlisted_edge_tool_schemas) and execution is routed
+        // to the connected edge agent, not executed server-local.
+        if self
+            .edge_admitted_tools
+            .contains(&name.to_ascii_lowercase())
+        {
+            tracing::debug!(tool_name = %name, "edge_tool_schema: tool_admission: edge_admitted → Ready");
+            return ExecutorToolReadiness::Ready;
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
@@ -5594,6 +5627,7 @@ esac
             _hostname: Option<&str>,
             _worktree_path: Option<&str>,
             _capabilities: Option<serde_json::Value>,
+            _workspace_id: Option<&str>,
         ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
             Err("MCP tools must not update edge registry".to_string())
         }
@@ -5603,8 +5637,18 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
-        ) -> Result<(), String> {
-            Err("MCP tools must not heartbeat edge registry".to_string())
+        ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+            Err(astra_services::multi_agent::HeartbeatError::StorageFailure(
+                "MCP tools must not heartbeat edge registry".to_string(),
+            ))
+        }
+
+        async fn find_by_agent_id_and_workspace(
+            &self,
+            _edge_agent_id: &str,
+            _workspace_id: Option<&str>,
+        ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            Ok(None)
         }
 
         async fn list_by_user(
@@ -5614,7 +5658,12 @@ esac
             Err("MCP tools must not list edge registry".to_string())
         }
 
-        async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+        async fn unregister(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id: &str,
+        ) -> Result<(), String> {
             Err("MCP tools must not unregister edge registry".to_string())
         }
     }
@@ -5745,6 +5794,7 @@ esac
             _hostname: Option<&str>,
             _worktree_path: Option<&str>,
             _capabilities: Option<serde_json::Value>,
+            _workspace_id: Option<&str>,
         ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
             Err("not needed for this test".to_string())
         }
@@ -5754,8 +5804,35 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
-        ) -> Result<(), String> {
+        ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             Ok(())
+        }
+
+        async fn find_by_agent_id_and_workspace(
+            &self,
+            edge_agent_id: &str,
+            workspace_id: Option<&str>,
+        ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            if edge_agent_id != self.edge_agent_id {
+                return Ok(None);
+            }
+            // This registry has no workspace scope (workspace_id = None).
+            // Fail-closed: only match unscoped requests.
+            if workspace_id.is_some() {
+                return Ok(None);
+            }
+            Ok(Some(astra_services::multi_agent::EdgeAgentRecord {
+                registry_id: format!("registry-{}", self.edge_agent_id),
+                user_id: "test-user".to_string(),
+                edge_agent_id: self.edge_agent_id.clone(),
+                edge_id: format!("edge-id-{}", self.edge_agent_id),
+                hostname: Some("MacBook Pro".to_string()),
+                worktree_path: Some("/Users/test/project".to_string()),
+                capabilities: Some(edge_runtime_environment_advertisement(&self.edge_agent_id)),
+                workspace_id: None,
+                registered_at: "2026-06-11T00:00:00Z".to_string(),
+                last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
+            }))
         }
 
         async fn list_by_user(
@@ -5770,12 +5847,18 @@ esac
                 hostname: Some("MacBook Pro".to_string()),
                 worktree_path: Some("/Users/test/project".to_string()),
                 capabilities: Some(edge_runtime_environment_advertisement(&self.edge_agent_id)),
+                workspace_id: None,
                 registered_at: "2026-06-11T00:00:00Z".to_string(),
                 last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
             }])
         }
 
-        async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
+        async fn unregister(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id: &str,
+        ) -> Result<(), String> {
             Ok(())
         }
     }

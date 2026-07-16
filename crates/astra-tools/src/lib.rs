@@ -1,3 +1,4 @@
+#![allow(unstable_name_collisions)]
 //! # astra-tools
 //!
 //! Extracted tool execution library for astra-engine. This crate contains the
@@ -8,6 +9,9 @@
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
 pub mod agent_tool_contract;
+pub mod char_boundary;
+pub use char_boundary::CharBoundaryExt;
+
 pub mod ask_user;
 pub mod display_sixel;
 pub mod memoria;

@@ -2943,6 +2943,7 @@ fn test_request(message: &str) -> ChatRequestData {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
+        provider_workspace_id: None,
     }
 }
 
@@ -4610,6 +4611,7 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
             )),
             mcp: None,
             skills: None,
+            edge_agent: None,
         });
 
     service
@@ -4651,6 +4653,7 @@ async fn validate_request_constraints_rejects_provider_descriptor_with_selected_
             )),
             mcp: None,
             skills: None,
+            edge_agent: None,
         });
 
     let err = service
@@ -4685,6 +4688,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             )),
             mcp: None,
             skills: None,
+            edge_agent: None,
         });
 
     let err = service
@@ -7208,6 +7212,7 @@ fn extract_edge_tools_from_context() {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
+        provider_workspace_id: None,
     };
     let tools = AgenticRunLifecycleService::extract_edge_tools(&req).expect("edge tools");
     assert_eq!(tools.len(), 1);
@@ -7378,6 +7383,7 @@ fn extract_edge_profile_from_context() {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
+        provider_workspace_id: None,
     };
     let profile = AgenticRunLifecycleService::extract_edge_profile(&req).expect("edge profile");
     assert_eq!(profile["cwd"], "/tmp");
@@ -8117,6 +8123,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
                 "skills",
                 &format!("http://{addr}/skills"),
             )),
+            edge_agent: None,
         });
 
     let capabilities = service

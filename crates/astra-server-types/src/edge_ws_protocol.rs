@@ -110,6 +110,20 @@ pub enum EdgeServerMessage {
     ToolCancel { request_id: String },
 }
 
+impl EdgeServerMessage {
+    /// Short stable label for diagnostic logging (no payload).
+    pub fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            EdgeServerMessage::AuthOk { .. } => "auth_ok",
+            EdgeServerMessage::AuthError { .. } => "auth_error",
+            EdgeServerMessage::ToolRequest { .. } => "tool_request",
+            EdgeServerMessage::Pong => "pong",
+            EdgeServerMessage::Closing { .. } => "closing",
+            EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
+        }
+    }
+}
+
 fn default_tool_timeout_secs() -> u64 {
     EDGE_TOOL_TIMEOUT_SECS
 }

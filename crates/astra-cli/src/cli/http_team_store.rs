@@ -158,8 +158,8 @@ impl HttpTeamStore {
             crate::cli::session::session_runtime::current_access_token(self.profile.as_deref())
                 .ok_or(TeamHttpError::AuthenticationRequired)?;
         let client = reqwest::Client::builder()
-            .no_proxy()
             .timeout(std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS))
+            .no_proxy()
             .build()
             .map_err(|e| TeamHttpError::ClientInit(e.to_string()))?;
         Ok((client, token))

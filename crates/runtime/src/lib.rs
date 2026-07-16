@@ -1,4 +1,5 @@
 // Clippy 1.94 tightened several lints; clean up incrementally rather than blocking CI.
+#![allow(unstable_name_collisions)]
 #![allow(
     deprecated,
     clippy::await_holding_lock,

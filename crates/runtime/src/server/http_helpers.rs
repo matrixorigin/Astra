@@ -18,15 +18,33 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    tracing::warn!(
+        target: "astra_runtime::sse",
+        http_status = status.as_u16(),
+        error_code = status_to_sse_error_code(status),
+        retryable = status_to_sse_retryable(status),
+        message = %message,
+        "sse error response emitted to client",
+    );
     sse_json_response(vec![serde_json::json!({
         "type": "error",
-        "message": message.into(),
+        "message": message,
         "code": status_to_sse_error_code(status),
         "retryable": status_to_sse_retryable(status),
     })])
 }
 
 pub(super) fn sse_error_response_from_error(status: StatusCode, error: ErrorResponse) -> Response {
+    tracing::warn!(
+        target: "astra_runtime::sse",
+        http_status = status.as_u16(),
+        error_code = status_to_sse_error_code(status),
+        retryable = status_to_sse_retryable(status),
+        domain_error_code = error.error_code.as_deref().unwrap_or(""),
+        message = %error.detail,
+        "sse error response emitted to client",
+    );
     let mut event = serde_json::json!({
         "type": "error",
         "message": error.detail,
@@ -119,11 +137,23 @@ pub(super) fn sse_streaming_response(
                     .and_then(|data| data.get("error"))
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned);
+                tracing::warn!(
+                    target: "astra_runtime::sse",
+                    run_id = %run_id,
+                    error = pending_terminal_error.as_deref().unwrap_or(""),
+                    "run failed mid-stream (run_error)",
+                );
             } else if event.get("type").and_then(serde_json::Value::as_str) == Some("error") {
                 pending_terminal_error = event
                     .get("message")
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned);
+                tracing::warn!(
+                    target: "astra_runtime::sse",
+                    run_id = %run_id,
+                    error = pending_terminal_error.as_deref().unwrap_or(""),
+                    "error event emitted mid-stream",
+                );
             }
 
             let events = handlers::transform_stream_run_events_for_client_with_pending(

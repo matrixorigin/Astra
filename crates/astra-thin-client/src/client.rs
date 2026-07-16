@@ -77,8 +77,19 @@ fn authed_text_request_timeout() -> Duration {
 }
 
 fn streaming_http_client() -> Result<Client, reqwest::Error> {
+    // Auto-decompression is disabled so that Content-Encoding headers on SSE
+    // responses do not cause reqwest to buffer chunks before handing them to
+    // the caller, which would break streaming.
+    //
+    // NOTE: do NOT call `.no_proxy()` here.  In sandbox environments the
+    // process runs inside an isolated network namespace whose only egress path
+    // is the OpenShell HTTP proxy (HTTP_PROXY / http_proxy env var).  Calling
+    // `.no_proxy()` would cause direct-connect attempts that have no route and
+    // fail silently, breaking both model-selection pre-flight (`/models`) and
+    // the SSE chat-turn stream (`/agents/edge/turns`).  When no proxy is
+    // configured the env vars are empty and the behaviour is identical to
+    // `.no_proxy()`.
     Client::builder()
-        .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_deflate()
@@ -104,7 +115,7 @@ impl ThinClient {
     pub fn new(base: &str, bearer_token: Option<String>) -> Result<Self, ThinClientError> {
         let base =
             Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
-        let http = Client::builder().no_proxy().build()?;
+        let http = Client::builder().build()?;
         // Bound TCP/TLS handshakes while leaving response body streaming uncapped.
         // Chat turns can run for many minutes after the connection is established.
         let http_stream = streaming_http_client()?;
@@ -415,13 +426,42 @@ impl ThinClient {
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
-        Ok(self
+        let http_proxy = std::env::var("HTTP_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .unwrap_or_else(|_| "(none)".to_string());
+        let no_proxy = std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .unwrap_or_else(|_| "(none)".to_string());
+        tracing::debug!(
+            target: "astra_cli::http_proxy",
+            url = %url,
+            http_proxy = %http_proxy,
+            no_proxy = %no_proxy,
+            token_len = token.len(),
+            "get_models_response_timeout: sending GET /models via self.http (proxy-aware client)"
+        );
+        let result = self
             .http
-            .get(url)
+            .get(url.clone())
             .headers(Self::bearer_headers(token)?)
             .timeout(timeout)
             .send()
-            .await?)
+            .await;
+        match &result {
+            Ok(resp) => tracing::debug!(
+                target: "astra_cli::http_proxy",
+                url = %url,
+                status = %resp.status(),
+                "get_models_response_timeout: response received"
+            ),
+            Err(e) => tracing::warn!(
+                target: "astra_cli::http_proxy",
+                url = %url,
+                error = %e,
+                "get_models_response_timeout: request failed"
+            ),
+        }
+        Ok(result?)
     }
 
     pub async fn get_models_text(&self, token: &str) -> Result<String, ThinClientError> {
@@ -702,6 +742,7 @@ impl ThinClient {
             .get(url)
             .headers(Self::bearer_headers(token)?)
             .query(query)
+            .timeout(authed_text_request_timeout())
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -719,6 +760,7 @@ impl ThinClient {
             .get(url)
             .headers(Self::bearer_headers(token)?)
             .query(query)
+            .timeout(authed_text_request_timeout())
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -887,18 +929,38 @@ impl ThinClient {
         payload: &Value,
     ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::CHAT_TURN)?;
+        tracing::debug!(
+            target: "astra_cli::http_proxy",
+            url = %url,
+            "post_chat_turn: sending POST /chat/turn via http_stream (proxy-aware streaming client)"
+        );
         let mut headers = Self::bearer_headers(token)?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
-        Ok(self
+        let result = self
             .http_stream
-            .post(url)
+            .post(url.clone())
             .headers(headers)
             .json(payload)
             .send()
-            .await?)
+            .await;
+        match &result {
+            Ok(resp) => tracing::debug!(
+                target: "astra_cli::http_proxy",
+                url = %url,
+                status = %resp.status(),
+                "post_chat_turn: response received"
+            ),
+            Err(e) => tracing::warn!(
+                target: "astra_cli::http_proxy",
+                url = %url,
+                error = %e,
+                "post_chat_turn: request failed"
+            ),
+        }
+        Ok(result?)
     }
 
     /// Same as [`Self::post_chat_turn`] but with a per-request timeout (e.g. LLM tool-selection probe).
@@ -3070,5 +3132,100 @@ mod tests {
             "attachment; filename=\"\"".parse().unwrap(),
         );
         assert_eq!(attachment_filename(&headers), None);
+    }
+
+    // ── streaming_http_client proxy-transparency guard ────────────────────────
+    //
+    // The SSE chat-turn stream (`post_chat_turn`) and the model-list pre-flight
+    // (`get_models_response_timeout`) both use `http_stream`, which is built by
+    // `streaming_http_client()`.  Inside an OpenShell sandbox the process lives
+    // in an isolated network namespace whose ONLY egress route is the HTTP proxy
+    // injected via the HTTP_PROXY / http_proxy environment variable.  Calling
+    // `.no_proxy()` on the builder bypasses that proxy, making the client
+    // attempt a direct TCP connection that has no route — the request silently
+    // fails and the user sees no LLM response.
+    //
+    // These tests are source-level guards that will break loudly if anyone adds
+    // `.no_proxy()` back to `streaming_http_client`.  They complement the
+    // human-readable comment inside the function itself.
+
+    /// Extract the body of `streaming_http_client` from the source, with
+    /// single-line comments stripped so guard tests are not confused by
+    /// explanatory comment text that mentions `.no_proxy()`.
+    fn streaming_http_client_body_no_comments() -> String {
+        let src = include_str!("client.rs");
+        let fn_start = src
+            .find("fn streaming_http_client()")
+            .expect("streaming_http_client must exist in client.rs");
+        let fn_src = &src[fn_start..];
+        let body_start = fn_src.find('{').expect("function body open brace");
+        let body_src = &fn_src[body_start..];
+        let mut depth = 0usize;
+        let mut body_end = 0usize;
+        for (i, ch) in body_src.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let fn_body = &body_src[..body_end];
+        // Strip single-line comments so guard assertions are not tripped by
+        // comment text that intentionally mentions the forbidden pattern.
+        fn_body
+            .lines()
+            .map(|line| {
+                if let Some(pos) = line.find("//") {
+                    &line[..pos]
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn streaming_http_client_does_not_suppress_proxy() {
+        // `streaming_http_client` must not call `.no_proxy()`.
+        // Inside an OpenShell sandbox the only egress route is the HTTP proxy
+        // injected via HTTP_PROXY / http_proxy.  Suppressing it causes silent
+        // connection failures for all SSE chat turns and model-list pre-flight.
+        let code = streaming_http_client_body_no_comments();
+        assert!(
+            !code.contains(".no_proxy()"),
+            "streaming_http_client must NOT call .no_proxy(): \
+             inside an OpenShell sandbox the only egress path is the \
+             HTTP_PROXY env-var proxy; suppressing it causes silent \
+             connection failures for all SSE chat turns.\n\
+             Code (comments stripped):\n{code}"
+        );
+    }
+
+    #[test]
+    fn streaming_http_client_disables_auto_decompression() {
+        // Auto-decompression must stay disabled on `http_stream`.  If
+        // Content-Encoding headers on SSE responses cause reqwest to buffer
+        // chunks, streaming breaks.  This guard prevents accidental re-addition
+        // of `.gzip(true)` / `.brotli(true)` / `.deflate(true)`.
+        let code = streaming_http_client_body_no_comments();
+        assert!(
+            code.contains(".no_gzip()"),
+            "streaming_http_client must call .no_gzip() to disable auto-decompression"
+        );
+        assert!(
+            code.contains(".no_brotli()"),
+            "streaming_http_client must call .no_brotli() to disable auto-decompression"
+        );
+        assert!(
+            code.contains(".no_deflate()"),
+            "streaming_http_client must call .no_deflate() to disable auto-decompression"
+        );
     }
 }

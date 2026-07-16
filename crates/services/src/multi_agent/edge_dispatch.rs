@@ -381,6 +381,27 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
+        // Fast path: non-locking COUNT before opening any transaction.
+        // MatrixOne can acquire a table-level lock on SELECT FOR UPDATE even
+        // when the result set is empty, adding significant latency (seconds)
+        // per 2-second poll cycle when there is nothing to claim. Skipping
+        // the transaction when the count is zero avoids that entirely. The
+        // tiny TOCTOU window (a new row arriving between COUNT and FOR UPDATE)
+        // is benign: we will pick it up in the next poll interval.
+        let fast_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edge_pending_dispatch \
+             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending'",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("edge_dispatch poll COUNT: {e}"))?;
+
+        if fast_count == 0 {
+            return Ok(vec![]);
+        }
+
         // Atomically claim pending dispatches using SELECT FOR UPDATE
         // within a transaction. This eliminates the race window between
         // poll and mark — two pods polling simultaneously cannot both

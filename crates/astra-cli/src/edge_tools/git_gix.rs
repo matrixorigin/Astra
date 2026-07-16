@@ -1125,9 +1125,11 @@ mod tests {
 
     #[test]
     fn git_action_show_stat_only() {
-        let root = repo_root();
+        // Use an isolated temp repo so the test is not affected by the
+        // current branch state (e.g. a merge commit at HEAD has no diff stat).
+        let dir = init_temp_repo();
         let result = show(
-            &root,
+            dir.path(),
             &json!({"revision": "HEAD", "stat_only": true}),
             0.0,
             0,
@@ -1381,9 +1383,11 @@ mod tests {
 
     #[test]
     fn git_action_show_stat_only_has_stats() {
-        let root = repo_root();
+        // Use an isolated temp repo so the test is not affected by the
+        // current branch state (e.g. a merge commit at HEAD has no diff stat).
+        let dir = init_temp_repo();
         let result = show(
-            &root,
+            dir.path(),
             &json!({"revision": "HEAD", "stat_only": true}),
             0.0,
             0,

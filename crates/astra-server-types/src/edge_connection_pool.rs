@@ -6,6 +6,7 @@
 //! whether to route tool calls to a remote edge or fall back to the server.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,8 +61,17 @@ pub struct EdgeConnection {
     pub hostname: Option<String>,
     pub workspace_dir: Option<String>,
     pub capabilities: Option<Value>,
+    /// Workspace that owns this edge agent, captured at connect time from the
+    /// edge registration token's `provider_scope_id`.  Used to authorize
+    /// cross-user lookups: only workspace members may dispatch to a shared
+    /// edge agent (e.g. a sandbox edge that connected via a service account).
+    pub workspace_id: Option<String>,
     pub sender: EdgeWsSender,
     pub connected_at: std::time::Instant,
+    /// Monotonically increasing generation counter assigned at registration.
+    /// Used by `unregister_if_generation` to guard against stale cleanup
+    /// overwriting a newer connection that replaced this one in the pool.
+    pub generation: u64,
     /// Pending tool call responses: request_id → oneshot sender.
     pending_results: Arc<DashMap<String, oneshot::Sender<EdgeToolResult>>>,
 }
@@ -94,6 +104,10 @@ pub struct EdgeConnectionPool {
     /// Global FIFO of dispatched request IDs for O(1)-amortized eviction when
     /// the pending set reaches capacity. Stale IDs are lazily skipped.
     pending_request_order: Arc<Mutex<VecDeque<String>>>,
+    /// Monotonically increasing counter used to assign a unique generation to
+    /// each registered connection. Guards `unregister_if_generation` against
+    /// stale cleanup overwriting a newer connection.
+    next_generation: Arc<AtomicU64>,
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
@@ -114,12 +128,14 @@ impl EdgeConnectionPool {
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),
             pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
+            next_generation: Arc::new(AtomicU64::new(1)),
             max_pending: MAX_PENDING_REQUESTS,
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
         }
     }
 
     /// Register a new edge connection. Replaces any existing connection for the same key.
+    /// Returns the generation ID assigned to this connection.
     pub fn register(
         &self,
         user_id: &str,
@@ -127,12 +143,13 @@ impl EdgeConnectionPool {
         hostname: Option<String>,
         workspace_dir: Option<String>,
         sender: EdgeWsSender,
-    ) {
+    ) -> u64 {
         self.register_with_capabilities(
             user_id,
             edge_agent_id,
             hostname,
             workspace_dir,
+            None,
             None,
             sender,
         )
@@ -140,6 +157,12 @@ impl EdgeConnectionPool {
 
     /// Register a new edge connection with its structured runtime capability advertisement.
     /// Replaces any existing connection for the same key.
+    /// Returns the generation ID assigned to this connection for use with
+    /// `unregister_if_generation` during cleanup.
+    ///
+    /// `workspace_id` is the owning workspace, captured from the edge registration
+    /// token's `provider_scope_id`.  Pass `None` for internal (non-moi) tokens.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_with_capabilities(
         &self,
         user_id: &str,
@@ -147,8 +170,10 @@ impl EdgeConnectionPool {
         hostname: Option<String>,
         workspace_dir: Option<String>,
         capabilities: Option<Value>,
+        workspace_id: Option<String>,
         sender: EdgeWsSender,
-    ) {
+    ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let key = pool_key(user_id, edge_agent_id);
         self.connections.insert(
             key,
@@ -158,11 +183,39 @@ impl EdgeConnectionPool {
                 hostname,
                 workspace_dir,
                 capabilities,
+                workspace_id,
                 sender,
                 connected_at: std::time::Instant::now(),
+                generation,
                 pending_results: Arc::new(DashMap::new()),
             },
         );
+        generation
+    }
+
+    /// Remove an edge connection only if its generation matches `expected_gen`.
+    ///
+    /// Returns `true` if the entry was removed, `false` if the generation did not
+    /// match (meaning a newer connection has already replaced this one in the pool).
+    ///
+    /// Follow-up cleanup is the caller's responsibility. It is safe when
+    /// additionally guarded by a connection-unique identifier (e.g. `edge_id`)
+    /// so that it cannot affect the replacement connection.
+    pub fn unregister_if_generation(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        expected_gen: u64,
+    ) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        if let Some((_, conn)) = self
+            .connections
+            .remove_if(&key, |_, conn| conn.generation == expected_gen)
+        {
+            conn.pending_results.clear();
+            return true;
+        }
+        false
     }
 
     /// Remove an edge connection. Cancels any pending tool requests.
@@ -179,6 +232,53 @@ impl EdgeConnectionPool {
         self.connections
             .iter()
             .any(|entry| entry.value().user_id == user_id && !entry.value().sender.is_closed())
+    }
+
+    /// Find a connected edge agent by its agent ID across all users.
+    ///
+    /// Returns the owner user_id and connection info, or `None` if the agent
+    /// is not connected or the workspace does not match.
+    ///
+    /// `workspace_id` is the requesting workspace.  Workspace isolation is
+    /// fail-closed: a workspace-bound edge (edge.workspace_id is Some) is only
+    /// reachable from a request that carries the matching workspace_id.  A
+    /// request without workspace context can only reach edges that are also
+    /// unscoped (edge.workspace_id is None).  This prevents a request that
+    /// lacks workspace context (e.g. workspace_record: None on a
+    /// provider-authorized turn) from silently resolving a workspace-bound
+    /// sandbox edge.
+    pub fn find_edge_by_agent_id(
+        &self,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Option<(String, EdgeConnectionInfo)> {
+        self.connections
+            .iter()
+            .find(|entry| {
+                let conn = entry.value();
+                if conn.edge_agent_id != edge_agent_id || conn.sender.is_closed() {
+                    return false;
+                }
+                // Fail-closed workspace isolation:
+                //   request has workspace_id  → edge must have the same workspace_id
+                //   request has no workspace_id → edge must also be unscoped (None)
+                match (workspace_id, conn.workspace_id.as_deref()) {
+                    (Some(req_ws), Some(edge_ws)) => req_ws == edge_ws,
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .map(|entry| {
+                let conn = entry.value();
+                let info = EdgeConnectionInfo {
+                    edge_agent_id: conn.edge_agent_id.clone(),
+                    hostname: conn.hostname.clone(),
+                    workspace_dir: conn.workspace_dir.clone(),
+                    capabilities: conn.capabilities.clone(),
+                    connected_at: conn.connected_at,
+                };
+                (conn.user_id.clone(), info)
+            })
     }
 
     /// Get all connected edge agents for a user.
@@ -232,9 +332,21 @@ impl EdgeConnectionPool {
         }
         let key = pool_key(user_id, edge_agent_id);
         let (pending_results, sender) = {
-            let entry = self.connections.get(&key)?;
+            let Some(entry) = self.connections.get(&key) else {
+                tracing::warn!(
+                    target: "astra_runtime::edge_dispatch_diag",
+                    key = %key,
+                    "edge_dispatch: execute_tool_with_cancel no pool entry for key"
+                );
+                return None;
+            };
             let conn = entry.value();
             if conn.sender.is_closed() {
+                tracing::warn!(
+                    target: "astra_runtime::edge_dispatch_diag",
+                    key = %key,
+                    "edge_dispatch: execute_tool_with_cancel pool entry sender already closed"
+                );
                 drop(entry);
                 self.connections.remove(&key);
                 return None;
@@ -262,11 +374,25 @@ impl EdgeConnectionPool {
         };
         self.insert_pending_request(user_id, &request_id, dispatched);
 
-        if sender.send(msg).await.is_err() {
+        if let Err(e) = sender.send(msg).await {
+            tracing::warn!(
+                target: "astra_runtime::edge_dispatch_diag",
+                key = %key,
+                request_id = %request_id,
+                error = %e,
+                "edge_dispatch: execute_tool_with_cancel channel send failed"
+            );
             pending_results.remove(&request_id);
             self.remove_pending_request(&request_id);
             return None;
         }
+        tracing::info!(
+            target: "astra_runtime::edge_dispatch_diag",
+            key = %key,
+            request_id = %request_id,
+            tool = %tool,
+            "edge_dispatch: execute_tool_with_cancel queued tool request into edge channel, awaiting result"
+        );
 
         // Helper: notify the edge that it should abort the in-flight request
         // and drop any partial result. Best-effort: if the send fails (edge
@@ -300,6 +426,13 @@ impl EdgeConnectionPool {
                 // Timed out waiting for the edge. Tell it to abort so the
                 // (possibly still running) tool does not write to a file or
                 // run a destructive command after the caller has given up.
+                tracing::warn!(
+                    target: "astra_runtime::edge_dispatch_diag",
+                    key = %key,
+                    request_id = %request_id,
+                    timeout_secs = EDGE_TOOL_TIMEOUT_SECS,
+                    "edge_dispatch: execute_tool_with_cancel timed out waiting for edge tool result"
+                );
                 cancel_edge();
                 pending_results.remove(&request_id);
                 self.remove_pending_request(&request_id);
@@ -645,6 +778,7 @@ mod tests {
                     "capabilities": {"runtime": {"shell": true, "git": true}}
                 }
             })),
+            None,
             tx,
         );
 
@@ -955,5 +1089,198 @@ mod tests {
         assert!(c1 <= 1);
         assert!(c2 <= 1);
         assert_eq!(pool.connection_count(), 0);
+    }
+
+    // ── generation race condition ─────────────────────────────────────
+
+    /// Register gen-1 then gen-2 for the same edge; cleaning up with gen-1 must
+    /// leave gen-2 intact. Only a subsequent gen-2 cleanup removes the entry.
+    #[test]
+    fn unregister_if_generation_skips_stale_cleanup() {
+        let pool = EdgeConnectionPool::new();
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let gen1 = pool.register("user-1", "edge-a", None, None, tx1);
+
+        // Second connection replaces the first in the pool.
+        let (tx2, _rx2) = mpsc::channel(1);
+        let gen2 = pool.register("user-1", "edge-a", None, None, tx2);
+
+        assert!(gen2 > gen1, "generations must be strictly increasing");
+
+        // Old connection's cleanup fires with gen-1: must be a no-op.
+        let removed = pool.unregister_if_generation("user-1", "edge-a", gen1);
+        assert!(
+            !removed,
+            "stale gen-1 cleanup must not remove the gen-2 entry"
+        );
+        assert!(
+            pool.has_connected_edge("user-1"),
+            "gen-2 connection must still be in the pool"
+        );
+
+        // Current connection's cleanup fires with gen-2: must remove the entry.
+        let removed = pool.unregister_if_generation("user-1", "edge-a", gen2);
+        assert!(removed, "gen-2 cleanup must remove the entry");
+        assert!(
+            !pool.has_connected_edge("user-1"),
+            "pool must be empty after gen-2 cleanup"
+        );
+    }
+
+    /// A single connection registered and cleaned up with its own generation
+    /// removes the entry normally.
+    #[test]
+    fn unregister_if_generation_removes_own_entry() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let my_gen = pool.register("user-1", "edge-a", None, None, tx);
+
+        let removed = pool.unregister_if_generation("user-1", "edge-a", my_gen);
+        assert!(removed);
+        assert!(!pool.has_connected_edge("user-1"));
+    }
+
+    /// Three rapid reconnects: gen-1 and gen-2 cleanups must both be no-ops;
+    /// only gen-3 cleanup drains the pool.
+    #[test]
+    fn unregister_if_generation_multiple_replacements() {
+        let pool = EdgeConnectionPool::new();
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let gen1 = pool.register("user-1", "edge-a", None, None, tx1);
+
+        let (tx2, _rx2) = mpsc::channel(1);
+        let gen2 = pool.register("user-1", "edge-a", None, None, tx2);
+
+        let (tx3, _rx3) = mpsc::channel(1);
+        let gen3 = pool.register("user-1", "edge-a", None, None, tx3);
+
+        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen1));
+        assert!(pool.has_connected_edge("user-1"));
+
+        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen2));
+        assert!(pool.has_connected_edge("user-1"));
+
+        assert!(pool.unregister_if_generation("user-1", "edge-a", gen3));
+        assert!(!pool.has_connected_edge("user-1"));
+    }
+
+    #[test]
+    fn find_edge_by_agent_id_matches_connected_edge() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-a",
+            "edge-x",
+            None,
+            None,
+            None,
+            Some("ws-1".into()),
+            tx,
+        );
+
+        let result = pool.find_edge_by_agent_id("edge-x", Some("ws-1"));
+        assert!(result.is_some());
+        let (owner, info) = result.unwrap();
+        assert_eq!(owner, "user-a");
+        assert_eq!(info.edge_agent_id, "edge-x");
+    }
+
+    #[test]
+    fn find_edge_by_agent_id_workspace_mismatch_returns_none() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-a",
+            "edge-x",
+            None,
+            None,
+            None,
+            Some("ws-1".into()),
+            tx,
+        );
+
+        // Requesting workspace differs from the edge's registered workspace.
+        let result = pool.find_edge_by_agent_id("edge-x", Some("ws-2"));
+        assert!(result.is_none(), "different workspace must not match");
+    }
+
+    #[test]
+    fn find_edge_by_agent_id_workspace_mismatch_request_has_ws_edge_unscoped_returns_none() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        // Unscoped edge (no workspace binding).
+        pool.register_with_capabilities("user-a", "edge-x", None, None, None, None, tx);
+
+        // A request that carries a workspace_id must NOT silently resolve an
+        // unscoped edge — fail-closed prevents workspace confusion.
+        let result = pool.find_edge_by_agent_id("edge-x", Some("ws-any"));
+        assert!(
+            result.is_none(),
+            "scoped request must not resolve an unscoped edge"
+        );
+    }
+
+    #[test]
+    fn find_edge_by_agent_id_no_workspace_context_resolves_unscoped_edge() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register_with_capabilities("user-a", "edge-x", None, None, None, None, tx);
+
+        // Neither side has workspace_id — legacy / single-tenant path is allowed.
+        let result = pool.find_edge_by_agent_id("edge-x", None);
+        assert!(
+            result.is_some(),
+            "unscoped request must resolve unscoped edge"
+        );
+    }
+
+    #[test]
+    fn find_edge_by_agent_id_no_workspace_context_does_not_resolve_scoped_edge() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-a",
+            "edge-x",
+            None,
+            None,
+            None,
+            Some("ws-sandbox".to_string()),
+            tx,
+        );
+
+        // A request without workspace context must NOT resolve a workspace-bound
+        // sandbox edge (fail-closed: workspace_record: None on provider turn).
+        let result = pool.find_edge_by_agent_id("edge-x", None);
+        assert!(
+            result.is_none(),
+            "unscoped request must not resolve a workspace-bound edge"
+        );
+    }
+
+    /// Cleanups for different edges must be fully independent.
+    #[test]
+    fn unregister_if_generation_different_edges_are_independent() {
+        let pool = EdgeConnectionPool::new();
+
+        let (tx_a1, _rx_a1) = mpsc::channel(1);
+        let gen_a1 = pool.register("user-1", "edge-a", None, None, tx_a1);
+
+        let (tx_a2, _rx_a2) = mpsc::channel(1);
+        let _gen_a2 = pool.register("user-1", "edge-a", None, None, tx_a2);
+
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        let gen_b = pool.register("user-1", "edge-b", None, None, tx_b);
+
+        // Stale cleanup for edge-a must not touch edge-b.
+        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen_a1));
+        assert!(pool.has_connected_edge("user-1")); // edge-b is still present
+
+        // Cleaning up edge-b with its own generation succeeds.
+        assert!(pool.unregister_if_generation("user-1", "edge-b", gen_b));
+
+        // edge-a's gen-2 is still present.
+        assert!(pool.has_connected_edge("user-1"));
     }
 }

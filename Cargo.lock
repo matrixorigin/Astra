@@ -282,6 +282,7 @@ dependencies = [
  "futures-util",
  "hostname",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -289,6 +290,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

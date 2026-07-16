@@ -43,12 +43,21 @@ impl McpToolCallResult {
     }
 }
 
+/// Returns the largest byte index <= `index` that lies on a UTF-8 char boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let index = index.min(s.len());
+    (0..=index)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
+}
+
 fn truncate_with_marker(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
     }
     let content_budget = max_len.saturating_sub(TRUNCATION_MARKER.len());
-    let end = s.floor_char_boundary(content_budget);
+    let end = floor_char_boundary(s, content_budget);
     format!("{}{TRUNCATION_MARKER}", &s[..end])
 }
 
@@ -354,7 +363,7 @@ pub fn extract_tool_call_result_with_limit(
                 total_len += text.text.len();
                 parts.push(text.text.clone());
             } else {
-                let end = text.text.floor_char_boundary(remaining);
+                let end = floor_char_boundary(&text.text, remaining);
                 parts.push(text.text[..end].to_string());
                 total_len += end;
                 break;

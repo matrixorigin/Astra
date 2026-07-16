@@ -149,6 +149,7 @@ async fn priority_routing_lower_wins() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -186,6 +187,7 @@ async fn priority_routing_three_providers() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -223,6 +225,7 @@ async fn cross_kind_priority_routing() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -249,6 +252,7 @@ async fn server_builtin_default_does_not_overclaim_lsp_symbols_category() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -296,6 +300,7 @@ async fn storage_unavailable_returns_not_capable() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -328,6 +333,7 @@ async fn no_storage_request_matches_all() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -360,6 +366,7 @@ async fn server_builtin_rejects_storage_request_for_agent() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -408,6 +415,7 @@ async fn isolation_filters_out_insufficient_providers() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -453,6 +461,7 @@ async fn isolation_container_only_sandbox_qualifies() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -482,6 +491,7 @@ async fn isolation_sandbox_only_highest_qualifies() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -511,6 +521,7 @@ async fn isolation_none_available_returns_error() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -543,6 +554,7 @@ async fn empty_registry_returns_not_capable() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -585,6 +597,7 @@ async fn capability_match_but_isolation_excludes() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -630,6 +643,7 @@ async fn named_capability_matches_category_provider() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -696,6 +710,7 @@ async fn combined_storage_isolation_priority() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await.unwrap();
@@ -726,6 +741,7 @@ async fn combined_capability_match_but_isolation_excluded() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let result = reg.resolve(&request).await;
@@ -828,6 +844,7 @@ async fn all_providers_unhealthy_health_check_reports_all_down() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
     let resolved = reg.resolve(&request).await;
     assert!(
@@ -870,6 +887,7 @@ async fn resolve_rejects_when_all_providers_are_degraded() {
         user_id: "test-user".into(),
         run_id: "test-run".into(),
         session_id: "test-session".into(),
+        workspace_id: None,
     };
 
     let resolved = reg.resolve(&request).await;

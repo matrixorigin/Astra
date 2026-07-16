@@ -23,6 +23,7 @@ pub async fn build_server_state(
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     ensure_core_schema(&settings.matrixone, &settings.database_bootstrap_catalog).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
+
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
     let shared_encryptor = Arc::new(
         FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref())

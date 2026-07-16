@@ -1205,6 +1205,7 @@ mod tests {
             Some("MacBook Pro".to_string()),
             Some("/Users/test/project".to_string()),
             Some(edge_runtime_environment_advertisement("edge-selected")),
+            None,
             tx,
         );
 

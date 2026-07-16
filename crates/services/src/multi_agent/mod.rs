@@ -19,7 +19,7 @@ pub use edge_dispatch::{
     UnconfiguredEdgeDispatchService, refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{
-    DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistryService,
+    DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistryService, HeartbeatError,
     UnconfiguredEdgeRegistryService,
 };
 pub use hold_cache::TaskLeaseHoldCache;

@@ -797,6 +797,11 @@ pub(crate) async fn complete_session_startup(
                             Some(&selection.name),
                             selection.context_window,
                         );
+                    if selection.model_id.is_some() {
+                        crate::cli::slash::slash_config::set_active_model_id_for_request(
+                            selection.model_id.clone(),
+                        );
+                    }
                     state.model = Some(selection.name);
                 }
                 session_runtime::ServerDefaultModel::NoModels => {

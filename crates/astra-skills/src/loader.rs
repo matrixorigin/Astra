@@ -7,6 +7,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let index = index.min(s.len());
+    (0..=index)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
+}
+
 use super::hooks::SkillHooks;
 use super::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillResources, SkillSourceKind,
@@ -310,7 +318,7 @@ fn validate_skill_name(name: &str) -> Result<(), SkillError> {
         return Err(SkillError::ParseFailed(format!(
             "skill name too long ({} chars, max 128): {}",
             name.len(),
-            &name[..name.floor_char_boundary(32)]
+            &name[..floor_char_boundary(name, 32)]
         )));
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {

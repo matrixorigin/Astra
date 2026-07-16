@@ -113,3 +113,5 @@ benchmarks/
 
 investigation/
 tools/
+monorepo/target/
+react-app/target/

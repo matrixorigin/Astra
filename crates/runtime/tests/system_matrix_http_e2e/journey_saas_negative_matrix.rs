@@ -985,6 +985,73 @@ pub async fn run_saas_edges_status_smoke() {
     ctx.pool.close().await;
 }
 
+/// GET /service/edges/status: verifies auth gate and response shape.
+///
+/// Covers:
+/// 1. Missing key → 403 (endpoint not configured when env var absent).
+/// 2. Invalid key → 401.
+/// 3. Valid key → 200 with `edges` array.
+pub async fn run_saas_service_edges_status_smoke() {
+    const SERVICE_KEY: &str = "test-service-key-e2e";
+    // Safety: test-only env mutation, isolated to this process.
+    unsafe {
+        std::env::set_var("ASTRA_BACKEND_SERVICE_KEY", SERVICE_KEY);
+    }
+
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let user_id = &b.ctx.user_id;
+
+    // 1. No Authorization header → 403 (env var set but no key provided).
+    let (st_no_key, j_no_key) = get_json(
+        app,
+        &format!("/service/edges/status?user_id={user_id}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_no_key,
+        StatusCode::UNAUTHORIZED,
+        "missing key should be 401: {j_no_key}"
+    );
+
+    // 2. Wrong key → 401.
+    let (st_bad, j_bad) = get_json(
+        app,
+        &format!("/service/edges/status?user_id={user_id}"),
+        Some("Bearer wrong-key"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_bad,
+        StatusCode::UNAUTHORIZED,
+        "invalid key should be 401: {j_bad}"
+    );
+
+    // 3. Valid key → 200 with edges array (may be empty; no live WS in this test).
+    let valid_auth = format!("Bearer {SERVICE_KEY}");
+    let (st_ok, ok_j) = get_json(
+        app,
+        &format!("/service/edges/status?user_id={user_id}"),
+        Some(&valid_auth),
+        &[],
+    )
+    .await;
+    assert_eq!(st_ok, StatusCode::OK, "valid key should be 200: {ok_j}");
+    assert!(
+        ok_j["edges"].is_array(),
+        "edges field must be array: {ok_j}"
+    );
+
+    unsafe {
+        std::env::remove_var("ASTRA_BACKEND_SERVICE_KEY");
+    }
+    ctx.pool.close().await;
+}
+
 /// Valid approval respond commits one owner-scoped durable interaction decision.
 pub async fn run_saas_approval_respond_success_path() {
     let b = bootstrap().await;

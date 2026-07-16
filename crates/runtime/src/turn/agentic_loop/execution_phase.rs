@@ -1125,7 +1125,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
     // calls for guidance-threshold purposes, not just successful ones).
+    let t_llm_start = std::time::Instant::now();
+    tracing::debug!(
+        target: "astra_timing",
+        llm_round = llm_attempt_index,
+        messages = pre_llm_messages.len(),
+        "LLM call started"
+    );
     let turn_result = host.execute_turn(state).await;
+    tracing::debug!(
+        target: "astra_timing",
+        llm_round = llm_attempt_index,
+        elapsed_ms = t_llm_start.elapsed().as_millis(),
+        ok = turn_result.is_ok(),
+        "LLM call completed"
+    );
     state.llm_rounds_completed += 1;
     // Capture finish_reason before the match consumes turn_result.
     // Used by textless-stop retry (loop level) and ensure_terminal_text
