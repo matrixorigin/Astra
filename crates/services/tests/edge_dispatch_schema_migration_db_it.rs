@@ -7,7 +7,7 @@
 mod common;
 
 use astra_core::MatrixOneSettings;
-use astra_services::storage::ensure_core_schema;
+use astra_services::storage::{CORE_SCHEMA_CONTRACT_VERSION, ensure_core_schema};
 use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query};
 use uuid::Uuid;
 
@@ -25,6 +25,12 @@ const LEGACY_EDGE_PENDING_DISPATCH_DDL: &str = "CREATE TABLE edge_pending_dispat
     PRIMARY KEY (user_id, request_id),
     INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id),
     INDEX idx_edge_dispatch_created (created_at)
+)";
+const SCHEMA_BOOTSTRAP_LEASE_DDL: &str = "CREATE TABLE astra_schema_bootstrap_leases (
+    component VARCHAR(64) NOT NULL PRIMARY KEY,
+    holder_id VARCHAR(64) NOT NULL,
+    lease_expires_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 )";
 
 struct IsolatedDatabase {
@@ -81,6 +87,18 @@ impl IsolatedDatabase {
 async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
     db: &IsolatedDatabase,
 ) -> Result<(), String> {
+    query(SCHEMA_BOOTSTRAP_LEASE_DDL)
+        .execute(&db.pool)
+        .await
+        .map_err(|error| format!("create schema bootstrap lease table: {error}"))?;
+    query(
+        "INSERT INTO astra_schema_bootstrap_leases \
+         (component, holder_id, lease_expires_at) \
+         VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("insert expired schema bootstrap lease: {error}"))?;
     query(LEGACY_EDGE_PENDING_DISPATCH_DDL)
         .execute(&db.pool)
         .await
@@ -100,6 +118,31 @@ async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
     ensure_core_schema(&db.settings, "mysql")
         .await
         .map_err(|error| format!("repeat upgraded schema bootstrap: {error}"))?;
+
+    let contract_versions =
+        query("SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'")
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|error| format!("load completed core schema contract: {error}"))?;
+    if contract_versions.len() != 1
+        || contract_versions[0]
+            .try_get::<String, _>("contract_version")
+            .map_err(|error| format!("decode completed core schema contract: {error}"))?
+            != CORE_SCHEMA_CONTRACT_VERSION
+    {
+        return Err("successful repeated bootstrap must publish one current contract".to_string());
+    }
+    let remaining_leases = query(
+        "SELECT COUNT(*) AS row_count FROM astra_schema_bootstrap_leases WHERE component = 'astra-core'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load remaining core schema leases: {error}"))?
+    .try_get::<i64, _>("row_count")
+    .map_err(|error| format!("decode remaining core schema leases: {error}"))?;
+    if remaining_leases != 0 {
+        return Err("expired bootstrap owner must be replaced and released".to_string());
+    }
 
     let archived = query(
         "SELECT COUNT(*) AS row_count FROM edge_pending_dispatch_legacy_owner_request_v1 \
@@ -167,6 +210,17 @@ async fn assert_active_legacy_schema_blocks_upgrade(db: &IsolatedDatabase) -> Re
         || !detail.contains("without session/run/turn identity")
     {
         return Err(format!("active legacy schema error = {detail}"));
+    }
+    let published_contracts = query(
+        "SELECT COUNT(*) AS row_count FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load failed-bootstrap schema contract count: {error}"))?
+    .try_get::<i64, _>("row_count")
+    .map_err(|error| format!("decode failed-bootstrap schema contract count: {error}"))?;
+    if published_contracts != 0 {
+        return Err("failed bootstrap must not publish schema completion".to_string());
     }
     let archive_exists = query(
         "SELECT COUNT(*) AS row_count FROM information_schema.TABLES \

@@ -147,11 +147,19 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
             .await
             .expect("terminal result")
     );
+    let EdgeDispatchAdmission::Terminal(replayed_json) = svc
+        .admit_dispatch(&identity, &agent_id, payload)
+        .await
+        .expect("terminal replay admission")
+    else {
+        panic!("terminal identity must replay its durable result");
+    };
     assert_eq!(
-        svc.admit_dispatch(&identity, &agent_id, payload)
-            .await
-            .expect("terminal replay admission"),
-        EdgeDispatchAdmission::Terminal(result_json.to_string())
+        serde_json::from_str::<serde_json::Value>(&replayed_json)
+            .expect("persisted terminal result must remain valid JSON"),
+        serde_json::from_str::<serde_json::Value>(result_json)
+            .expect("fixture terminal result must be valid JSON"),
+        "durable replay preserves JSON meaning independently of object-key storage order"
     );
 }
 

@@ -381,7 +381,8 @@ const WORKSPACE_RECORDS_CREATE_SQL: &str = r#"
                 source_key          VARCHAR(512) NULL,
                 record_json         LONGTEXT     NOT NULL,
                 created_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                updated_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                updated_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                UNIQUE INDEX ux_source_key (source_key)
             )
             "#;
 
@@ -418,57 +419,44 @@ pub(crate) async fn ensure_workspace_record_tables(
     sqlx::query(WORKSPACE_RECORDS_CREATE_SQL)
         .execute(pool)
         .await?;
-    ensure_workspace_records_column(
-        pool,
-        "ALTER TABLE workspace_records ADD COLUMN source_key VARCHAR(512) NULL",
-    )
-    .await?;
-    ensure_workspace_records_source_key_unique(pool).await?;
+    verify_workspace_records_source_key_contract(pool).await?;
     sqlx::query(WORKSPACE_CLEANUP_DEBTS_CREATE_SQL)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-async fn ensure_workspace_records_column(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    sql: &str,
-) -> Result<(), sqlx::Error> {
-    match sqlx::query(sql).execute(pool).await {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let message = error.to_string();
-            // 1060: duplicate column, 1061: duplicate key name (index exists).
-            // Both are benign for idempotent DDL.
-            if message.contains("1060")
-                || message.contains("1061")
-                || message.contains("Duplicate column")
-                || message.contains("duplicate column")
-                || message.contains("Duplicate key name")
-                || message.contains("duplicate key name")
-            {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
-/// Enforce a UNIQUE index on `source_key` so that two workspaces cannot bind
-/// to the same volume/source concurrently. Without this, the conflict check in
-/// `upsert_workspace_record` is a racy SELECT-then-INSERT and two concurrent
-/// upserts can both succeed.
-/// MySQL permits multiple NULLs in a UNIQUE index, so nullable source_key is
-/// safe.
-async fn ensure_workspace_records_source_key_unique(
+async fn verify_workspace_records_source_key_contract(
     pool: &sqlx::Pool<sqlx::MySql>,
 ) -> Result<(), sqlx::Error> {
-    ensure_workspace_records_column(
-        pool,
-        "ALTER TABLE workspace_records ADD UNIQUE INDEX ux_source_key (source_key)",
+    let column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'workspace_records' \
+           AND COLUMN_NAME = 'source_key' AND IS_NULLABLE = 'YES' \
+           AND UPPER(DATA_TYPE) = 'VARCHAR' AND CHARACTER_MAXIMUM_LENGTH >= 512",
     )
-    .await
+    .fetch_one(pool)
+    .await?;
+    if column_count != 1 {
+        return Err(sqlx::Error::Protocol(
+            "workspace_records.source_key must be nullable VARCHAR(512) in the canonical schema"
+                .to_string(),
+        ));
+    }
+    let index_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'workspace_records' \
+           AND INDEX_NAME = 'ux_source_key' AND NON_UNIQUE = 0 \
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .fetch_all(pool)
+    .await?;
+    if index_columns != ["source_key"] {
+        return Err(sqlx::Error::Protocol(
+            "workspace_records.ux_source_key must uniquely index only source_key".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
