@@ -9,8 +9,9 @@ use super::*;
 const SERVICE_KEY_ENV: &str = "ASTRA_BACKEND_SERVICE_KEY";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Fold length difference into diff to avoid early return leaking length info.
-    let mut diff: u8 = (a.len() ^ b.len()) as u8;
+    // Use a boolean inequality so the length mismatch contributes exactly 0 or 1
+    // to diff — XOR-then-cast would truncate to 0 for lengths differing by 256.
+    let mut diff: u8 = (a.len() != b.len()) as u8;
     let max = a.len().max(b.len());
     for i in 0..max {
         let av = *a.get(i).unwrap_or(&0);
