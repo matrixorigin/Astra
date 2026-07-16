@@ -303,7 +303,10 @@ pub use session_artifact_store::{
     SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
     StoredSessionArtifact, local_owner_user_id, local_session_artifact_store,
 };
-pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
+pub use session_fork::{
+    ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
+    ForkSessionResult, SessionForkBasisEvidenceV1, fork_local_session, verify_local_fork_basis,
+};
 pub use skill_auto_route_judge::{
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
     SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,

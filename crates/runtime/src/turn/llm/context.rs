@@ -625,57 +625,76 @@ pub(crate) struct ContextManifestProjectionInput<'a> {
     pub context_window_tokens: u32,
 }
 
-const CONTEXT_RESOURCE_MANIFEST_MAX_ENTRIES: usize = 64;
+struct LlmArtifactEvidenceCollection {
+    manifest: Option<astra_turn_types::LlmArtifactEvidenceManifestV1>,
+    status: &'static str,
+}
 
-fn resource_manifest_from_tool_results(
+fn llm_artifact_evidence_from_tool_results(
     input: &ContextManifestProjectionInput<'_>,
-) -> Result<Option<astra_turn_types::ResourceManifestV1>, &'static str> {
+) -> LlmArtifactEvidenceCollection {
     let mut entries = Vec::new();
+    let mut seen_artifacts = std::collections::HashSet::new();
+    let mut observed_reference_count = 0_usize;
+    let mut invalid_reference_count = 0_usize;
     for tool_result in input.tool_results {
         let Some(reference) =
             tool_result.get(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         else {
             continue;
         };
-        if entries.len() >= CONTEXT_RESOURCE_MANIFEST_MAX_ENTRIES {
-            return Err("resource_manifest_entry_limit_exceeded");
-        }
+        observed_reference_count = observed_reference_count.saturating_add(1);
         let Some(reference) = reference.as_object() else {
-            return Err("invalid_resource_artifact_evidence");
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
         };
-        let artifact_id = reference
+        let Some(artifact_id) = reference
             .get("artifactId")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or("invalid_resource_artifact_evidence")?;
-        let content_hash = reference
-            .get("contentHash")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                value.len() == 71
-                    && value.starts_with("sha256:")
-                    && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            .ok_or("invalid_resource_artifact_evidence")?;
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        let Some(content_hash) =
+            reference
+                .get("contentHash")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 71
+                        && value.starts_with("sha256:")
+                        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
         let tool_name = tool_result
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("tool_result");
-        let mut entry = astra_turn_types::ResourceManifestEntryV1::new(
-            artifact_id,
-            format!("{tool_name} result artifact"),
-            format!("session-artifact://{}/{}", input.session_id, artifact_id),
-            content_hash,
-        )
-        .map_err(|_| "invalid_resource_artifact_evidence")?;
+        let Ok(mut entry) =
+            astra_turn_types::LlmArtifactEvidenceEntryV1::new(artifact_id, tool_name, content_hash)
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        if !seen_artifacts.insert(artifact_id.to_string())
+            || entries.len() >= astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES
+        {
+            continue;
+        }
         entry.media_type = Some("application/json".to_string());
-        entry.byte_len = reference.get("encodedBytes").and_then(Value::as_u64);
+        entry.encoded_bytes = reference.get("encodedBytes").and_then(Value::as_u64);
         entries.push(entry);
     }
-    if entries.is_empty() {
-        return Ok(None);
+    if observed_reference_count == 0 {
+        return LlmArtifactEvidenceCollection {
+            manifest: None,
+            status: "absent",
+        };
     }
-    astra_turn_types::ResourceManifestV1::new(
+    let manifest = astra_turn_types::LlmArtifactEvidenceManifestV1::new(
         input.owner_id,
         input.session_id,
         format!(
@@ -683,9 +702,30 @@ fn resource_manifest_from_tool_results(
             input.run_id, input.turn_index, input.llm_attempt_index
         ),
         entries,
-    )
-    .map(Some)
-    .map_err(|_| "invalid_resource_artifact_evidence")
+        observed_reference_count,
+        invalid_reference_count,
+    );
+    match manifest {
+        Ok(manifest) => {
+            let status = if manifest.invalid_reference_count == manifest.observed_reference_count {
+                "all_invalid"
+            } else if manifest.invalid_reference_count > 0 {
+                "partial_invalid"
+            } else if manifest.omitted_reference_count > 0 {
+                "partial_bounded"
+            } else {
+                "ready"
+            };
+            LlmArtifactEvidenceCollection {
+                manifest: Some(manifest),
+                status,
+            }
+        }
+        Err(_) => LlmArtifactEvidenceCollection {
+            manifest: None,
+            status: "identity_invalid",
+        },
+    }
 }
 
 pub(crate) struct ContextManifestProjection {
@@ -721,11 +761,7 @@ pub(crate) fn build_context_manifest_projection(
             .saturating_add(tool_result_tokens)
             .saturating_add(input.schema_tokens)
     });
-    let (resource_manifest, resource_manifest_status) =
-        match resource_manifest_from_tool_results(&input) {
-            Ok(manifest) => (manifest, "ready"),
-            Err(status) => (None, status),
-        };
+    let artifact_evidence = llm_artifact_evidence_from_tool_results(&input);
 
     let mut items = vec![
         astra_services::ContextManifestItemWrite {
@@ -791,23 +827,20 @@ pub(crate) fn build_context_manifest_projection(
             raw_ref: None,
         });
     }
-    if let Some(manifest) = resource_manifest.as_ref() {
+    if let Some(manifest) = artifact_evidence.manifest.as_ref() {
         items.push(astra_services::ContextManifestItemWrite {
             session_id: input.session_id.to_string(),
             item_order: 4,
-            zone: "resource_manifest".to_string(),
+            zone: "llm_artifact_evidence".to_string(),
             source_table: "session_artifacts".to_string(),
             source_id: manifest.content_id.clone(),
             source_hash: Some(manifest.content_id.clone()),
             included: true,
             token_estimate: 0,
             budget_tokens: 0,
-            reason: "content_addressed_resource_manifest".to_string(),
-            render_mode: "reference_only".to_string(),
-            raw_ref: Some(format!(
-                "context-resource-manifest://{}",
-                manifest.content_id
-            )),
+            reason: "content_addressed_attempt_artifact_evidence".to_string(),
+            render_mode: "inline_manifest_evidence".to_string(),
+            raw_ref: None,
         });
     }
 
@@ -859,8 +892,8 @@ pub(crate) fn build_context_manifest_projection(
             "output_tokens": input.observed_output_tokens
         },
         "normalized_prompt_cache_usage": normalized_prompt_cache_usage,
-        "resource_manifest_status": resource_manifest_status,
-        "resource_manifest": resource_manifest,
+        "llm_artifact_evidence_status": artifact_evidence.status,
+        "llm_artifact_evidence": artifact_evidence.manifest,
         "assembly_trace": input.assembly_trace,
         "budget_template_id": "budget_v1_8k",
         "budget_flex": {
@@ -2434,7 +2467,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn context_manifest_persists_content_addressed_resource_evidence_and_invalidity() {
+    fn context_manifest_persists_bounded_attempt_artifact_evidence_without_all_or_nothing_loss() {
         let artifact_result = json!({
             "name": "catalog_read",
             "result": "bounded preview",
@@ -2465,18 +2498,20 @@ mod context_cache_contract_tests {
             context_window_tokens: 64_000,
         });
         assert_eq!(
-            projection.manifest_json["resource_manifest_status"],
+            projection.manifest_json["llm_artifact_evidence_status"],
             "ready"
         );
-        let manifest = serde_json::from_value::<astra_turn_types::ResourceManifestV1>(
-            projection.manifest_json["resource_manifest"].clone(),
+        let manifest = serde_json::from_value::<astra_turn_types::LlmArtifactEvidenceManifestV1>(
+            projection.manifest_json["llm_artifact_evidence"].clone(),
         )
-        .expect("persisted resource manifest revalidates");
-        assert_eq!(manifest.entries[0].resource_id, "artifact-7");
-        assert_eq!(manifest.entries[0].byte_len, Some(4096));
+        .expect("persisted attempt artifact evidence revalidates");
+        assert_eq!(manifest.entries[0].artifact_id, "artifact-7");
+        assert_eq!(manifest.entries[0].tool_name, "catalog_read");
+        assert_eq!(manifest.entries[0].encoded_bytes, Some(4096));
         assert!(projection.items.iter().any(|item| {
-            item.zone == "resource_manifest"
+            item.zone == "llm_artifact_evidence"
                 && item.source_hash.as_deref() == Some(manifest.content_id.as_str())
+                && item.raw_ref.is_none()
         }));
 
         let invalid_results = vec![json!({
@@ -2506,10 +2541,61 @@ mod context_cache_contract_tests {
             context_window_tokens: 64_000,
         });
         assert_eq!(
-            invalid.manifest_json["resource_manifest_status"],
-            "invalid_resource_artifact_evidence"
+            invalid.manifest_json["llm_artifact_evidence_status"],
+            "all_invalid"
         );
-        assert!(invalid.manifest_json["resource_manifest"].is_null());
+        let invalid_manifest = serde_json::from_value::<
+            astra_turn_types::LlmArtifactEvidenceManifestV1,
+        >(invalid.manifest_json["llm_artifact_evidence"].clone())
+        .expect("invalid references remain explicit evidence instead of disappearing");
+        assert_eq!(invalid_manifest.observed_reference_count, 1);
+        assert_eq!(invalid_manifest.invalid_reference_count, 1);
+        assert!(invalid_manifest.entries.is_empty());
+
+        let bounded_results = (0..=astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES)
+            .map(|index| {
+                json!({
+                    "name": "catalog_read",
+                    (astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY): {
+                        "artifactId": format!("artifact-{index:03}"),
+                        "contentHash": format!("sha256:{index:064x}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let bounded = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &[],
+            tool_results: &bounded_results,
+            schema_tokens: 0,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+        assert_eq!(
+            bounded.manifest_json["llm_artifact_evidence_status"],
+            "partial_bounded"
+        );
+        let bounded_manifest = serde_json::from_value::<
+            astra_turn_types::LlmArtifactEvidenceManifestV1,
+        >(bounded.manifest_json["llm_artifact_evidence"].clone())
+        .expect("bounded evidence revalidates");
+        assert_eq!(
+            bounded_manifest.entries.len(),
+            astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES
+        );
+        assert_eq!(bounded_manifest.observed_reference_count, 65);
+        assert_eq!(bounded_manifest.omitted_reference_count, 1);
     }
 
     #[test]

@@ -545,8 +545,9 @@ children of a context decision.
 
 ## Resource context
 
-Provider resources, request attachments, catalog files, and authoring resources
-are normalized into a typed, versioned, owner-scoped resource manifest.
+A complete provider-resource subsystem must normalize provider resources,
+request attachments, catalog files, and authoring resources into a typed,
+versioned, owner-scoped resource manifest.
 
 The complete manifest is durable and addressable. Prompt projection is bounded
 by aggregate encoded-byte/token budget and includes manifest identity, version,
@@ -558,6 +559,34 @@ This avoids both failure extremes:
 - unbounded request-controlled prompt growth.
 
 Replay records the exact manifest and projected entry set the model saw.
+
+That target contract must not be simulated by an in-memory helper. The current
+production boundary is narrower and is named accordingly: each LLM attempt
+records content-addressed evidence only for governed tool-result artifacts that
+actually occur in that attempt. Collection retains at most 64 valid unique
+entries and records observed, omitted, and invalid counts; one malformed or
+overflowing reference never discards the other evidence. The evidence is
+stored inline with the context manifest and does not publish a fake locator,
+page, search, or read API. A general resource manifest becomes real only when
+ingestion, durable lookup, authorization, paging, and prompt projection share
+one production authority.
+
+## Local session fork boundary
+
+A local fork is not a portable session snapshot. Fork creation freezes
+immutable transcript, workspace, and eligible checkpoint bytes, records their
+canonical local paths and hashes in a content-addressed fork-basis evidence
+file, and verifies both the frozen bytes and active child files before the
+child can be activated. Task, artifact, invocation, and memory dimensions stay
+explicit gaps until they have real immutable materialization semantics. Task
+copying is a post-basis child-state transition, not evidence that task state was
+part of the fork cursor.
+
+This local evidence is owned by the session-fork domain, not the edge/cloud
+sync wire protocol. Cross-machine synchronization or migration requires a
+separate portable manifest, common as-of transaction, transfer/materialization
+consumer, and restore verification; local paths and explicit gaps must never be
+presented as that capability.
 
 ## Prompt-cache interaction
 

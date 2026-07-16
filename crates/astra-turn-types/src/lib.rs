@@ -29,11 +29,10 @@ pub use agent_communication::{
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
 pub use context_identity::{
-    ContextIdentityError, NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION,
-    PromptCacheIdentityV1, PromptCacheInvalidationReason, RESOURCE_MANIFEST_CONTRACT_VERSION,
-    RESOURCE_MANIFEST_MAX_ENTRIES, RESOURCE_MANIFEST_PAGE_MAX_ENTRIES,
-    RESOURCE_MANIFEST_PROJECTION_MAX_BYTES, ResourceManifestEntryV1, ResourceManifestPageV1,
-    ResourceManifestProjectionEntryV1, ResourceManifestProjectionV1, ResourceManifestV1,
+    ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
+    LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES, LlmArtifactEvidenceEntryV1, LlmArtifactEvidenceManifestV1,
+    NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION, PromptCacheIdentityV1,
+    PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
 pub use correction_signal::{

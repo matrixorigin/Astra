@@ -68,14 +68,242 @@ pub struct ForkSessionResult {
     /// Composite snapshot at the fork point — references to all state dimensions
     /// that were captured. The caller can use this to restore any subset.
     pub fork_snapshot: Option<CompositeSnapshot>,
-    /// Frozen, content-addressed state evidence at the fork cursor. Missing
-    /// dimensions are explicit gaps rather than silent partial recovery.
-    pub state_manifest: astra_sync_protocol::SessionStateManifestV1,
+    /// Frozen, content-addressed evidence for the local bytes used to create
+    /// this fork. It is not a portable session snapshot; unsupported state
+    /// dimensions are explicit gaps.
+    pub fork_basis_evidence: SessionForkBasisEvidenceV1,
 }
 
 pub use astra_core::composite_snapshot::{
     CompositeSnapshot, DataSnapshotRef, MemorySnapshotRef, SnapshotRef, SnapshotSpec,
 };
+
+const SESSION_FORK_BASIS_SCHEMA_VERSION: u32 = 1;
+const SESSION_FORK_BASIS_ID_MAX_BYTES: usize = 512;
+const SESSION_FORK_BASIS_LOCATOR_MAX_BYTES: usize = 2_048;
+const SESSION_FORK_BASIS_GAP_REASON_MAX_BYTES: usize = 1_024;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkBasisDimension {
+    Transcript,
+    Checkpoint,
+    Workspace,
+    Task,
+    Artifact,
+    Invocation,
+    Memory,
+}
+
+impl ForkBasisDimension {
+    const ALL: [Self; 7] = [
+        Self::Transcript,
+        Self::Checkpoint,
+        Self::Workspace,
+        Self::Task,
+        Self::Artifact,
+        Self::Invocation,
+        Self::Memory,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ForkBasisDimensionEvidence {
+    LocalFile {
+        locator: String,
+        content_hash: String,
+    },
+    Gap {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkBasisEntry {
+    pub dimension: ForkBasisDimension,
+    pub evidence: ForkBasisDimensionEvidence,
+}
+
+impl ForkBasisEntry {
+    fn local_file_hash(
+        dimension: ForkBasisDimension,
+        locator: impl Into<String>,
+        content_hash: impl Into<String>,
+    ) -> Result<Self, String> {
+        let entry = Self {
+            dimension,
+            evidence: ForkBasisDimensionEvidence::LocalFile {
+                locator: locator.into(),
+                content_hash: content_hash.into(),
+            },
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn gap(dimension: ForkBasisDimension, reason: impl Into<String>) -> Self {
+        Self {
+            dimension,
+            evidence: ForkBasisDimensionEvidence::Gap {
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match &self.evidence {
+            ForkBasisDimensionEvidence::LocalFile {
+                locator,
+                content_hash,
+            } if !locator.trim().is_empty()
+                && locator.len() <= SESSION_FORK_BASIS_LOCATOR_MAX_BYTES
+                && content_hash.len() == 71
+                && content_hash.starts_with("sha256:")
+                && content_hash[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Ok(())
+            }
+            ForkBasisDimensionEvidence::LocalFile { .. } => Err(format!(
+                "session fork basis {:?} local file reference is invalid",
+                self.dimension
+            )),
+            ForkBasisDimensionEvidence::Gap { reason }
+                if !reason.trim().is_empty()
+                    && reason.len() <= SESSION_FORK_BASIS_GAP_REASON_MAX_BYTES =>
+            {
+                Ok(())
+            }
+            ForkBasisDimensionEvidence::Gap { .. } => Err(format!(
+                "session fork basis {:?} gap reason is invalid",
+                self.dimension
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionForkBasisEvidenceV1 {
+    pub schema_version: u32,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub as_of_cursor: String,
+    pub entries: Vec<ForkBasisEntry>,
+    pub content_id: String,
+}
+
+impl SessionForkBasisEvidenceV1 {
+    fn new(
+        source_session_id: impl Into<String>,
+        target_session_id: impl Into<String>,
+        as_of_cursor: impl Into<String>,
+        mut entries: Vec<ForkBasisEntry>,
+    ) -> Result<Self, String> {
+        let source_session_id = source_session_id.into();
+        let target_session_id = target_session_id.into();
+        let as_of_cursor = as_of_cursor.into();
+        for (field, value) in [
+            ("source_session_id", source_session_id.as_str()),
+            ("target_session_id", target_session_id.as_str()),
+            ("as_of_cursor", as_of_cursor.as_str()),
+        ] {
+            if value.trim().is_empty() || value.len() > SESSION_FORK_BASIS_ID_MAX_BYTES {
+                return Err(format!("session fork basis {field} is invalid"));
+            }
+        }
+        entries.sort_by_key(|entry| entry.dimension);
+        if entries.len() != ForkBasisDimension::ALL.len()
+            || entries
+                .iter()
+                .map(|entry| entry.dimension)
+                .ne(ForkBasisDimension::ALL)
+        {
+            return Err("session fork basis must contain every dimension exactly once".to_string());
+        }
+        for entry in &entries {
+            entry.validate()?;
+        }
+        let content_id = session_fork_basis_content_id(
+            &source_session_id,
+            &target_session_id,
+            &as_of_cursor,
+            &entries,
+        );
+        Ok(Self {
+            schema_version: SESSION_FORK_BASIS_SCHEMA_VERSION,
+            source_session_id,
+            target_session_id,
+            as_of_cursor,
+            entries,
+            content_id,
+        })
+    }
+
+    pub fn gaps(&self) -> impl Iterator<Item = &ForkBasisEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.evidence, ForkBasisDimensionEvidence::Gap { .. }))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SessionForkBasisEvidenceV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            schema_version: u32,
+            source_session_id: String,
+            target_session_id: String,
+            as_of_cursor: String,
+            entries: Vec<ForkBasisEntry>,
+            content_id: String,
+        }
+        let raw = <Raw as serde::Deserialize>::deserialize(deserializer)?;
+        if raw.schema_version != SESSION_FORK_BASIS_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported session fork basis version",
+            ));
+        }
+        let rebuilt = Self::new(
+            raw.source_session_id,
+            raw.target_session_id,
+            raw.as_of_cursor,
+            raw.entries,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if rebuilt.content_id != raw.content_id {
+            return Err(serde::de::Error::custom(
+                "session fork basis content id mismatch",
+            ));
+        }
+        Ok(rebuilt)
+    }
+}
+
+fn session_fork_basis_content_id(
+    source_session_id: &str,
+    target_session_id: &str,
+    as_of_cursor: &str,
+    entries: &[ForkBasisEntry],
+) -> String {
+    let value = serde_json::json!({
+        "schema_version": SESSION_FORK_BASIS_SCHEMA_VERSION,
+        "source_session_id": source_session_id,
+        "target_session_id": target_session_id,
+        "as_of_cursor": as_of_cursor,
+        "entries": entries,
+    });
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(astra_core::canonical_json_string(&value))
+    )
+}
 
 struct ForkArtifactGuard {
     session_id: String,
@@ -167,33 +395,221 @@ fn checkpoint_directory_hash(path: &std::path::Path) -> Result<Option<String>, S
     Ok((count > 0).then(|| format!("sha256:{:x}", hasher.finalize())))
 }
 
-fn persist_state_manifest(
+const FORK_BASIS_DIRECTORY: &str = "fork-basis-v1";
+const FORK_BASIS_EVIDENCE_FILE: &str = "fork-basis-evidence-v1.json";
+
+fn write_immutable_fork_basis_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("create immutable fork basis {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("write immutable fork basis {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync immutable fork basis {}: {error}", path.display()))
+}
+
+fn persist_fork_basis_evidence(
     session_id: &str,
-    manifest: &astra_sync_protocol::SessionStateManifestV1,
+    evidence: &SessionForkBasisEvidenceV1,
 ) -> Result<(), String> {
     let directory = session_workspace::workspace_dir_for(session_id);
     std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("create state manifest directory: {error}"))?;
-    let path = directory.join("state-manifest-v1.json");
-    let temporary = directory.join("state-manifest-v1.json.tmp");
-    let bytes = serde_json::to_vec(manifest)
-        .map_err(|error| format!("serialize state manifest: {error}"))?;
+        .map_err(|error| format!("create fork basis evidence directory: {error}"))?;
+    let path = directory.join(FORK_BASIS_EVIDENCE_FILE);
+    let temporary = directory.join(format!("{FORK_BASIS_EVIDENCE_FILE}.tmp"));
+    let bytes = serde_json::to_vec(evidence)
+        .map_err(|error| format!("serialize fork basis evidence: {error}"))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&temporary)
-        .map_err(|error| format!("open state manifest temp file: {error}"))?;
+        .map_err(|error| format!("open fork basis evidence temp file: {error}"))?;
     file.write_all(&bytes)
-        .map_err(|error| format!("write state manifest: {error}"))?;
+        .map_err(|error| format!("write fork basis evidence: {error}"))?;
     file.sync_all()
-        .map_err(|error| format!("sync state manifest: {error}"))?;
+        .map_err(|error| format!("sync fork basis evidence: {error}"))?;
     drop(file);
     std::fs::rename(&temporary, &path)
-        .map_err(|error| format!("commit state manifest: {error}"))?;
+        .map_err(|error| format!("commit fork basis evidence: {error}"))?;
     std::fs::File::open(&directory)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync state manifest directory: {error}"))
+        .map_err(|error| format!("sync fork basis evidence directory: {error}"))
+}
+
+struct FrozenLocalForkBasis {
+    transcript_path: PathBuf,
+    workspace_path: PathBuf,
+    checkpoint: Option<(PathBuf, String)>,
+}
+
+fn freeze_local_fork_basis(
+    session_id: &str,
+    child_journal: &std::path::Path,
+    child_workspace: &std::path::Path,
+    child_checkpoint_dir: &std::path::Path,
+) -> Result<FrozenLocalForkBasis, String> {
+    let basis_dir = session_workspace::workspace_dir_for(session_id).join(FORK_BASIS_DIRECTORY);
+    std::fs::create_dir(&basis_dir)
+        .map_err(|error| format!("create immutable fork basis directory: {error}"))?;
+
+    let transcript_path = basis_dir.join("transcript.jsonl");
+    let transcript = std::fs::read(child_journal)
+        .map_err(|error| format!("read child transcript for fork basis: {error}"))?;
+    write_immutable_fork_basis_file(&transcript_path, &transcript)?;
+
+    let workspace_path = basis_dir.join("workspace.yaml");
+    let workspace = std::fs::read(child_workspace)
+        .map_err(|error| format!("read child workspace for fork basis: {error}"))?;
+    write_immutable_fork_basis_file(&workspace_path, &workspace)?;
+
+    let checkpoint = if checkpoint_directory_hash(child_checkpoint_dir)?.is_some() {
+        let frozen_checkpoint_dir = basis_dir.join("step_checkpoints");
+        std::fs::create_dir(&frozen_checkpoint_dir)
+            .map_err(|error| format!("create frozen checkpoint directory: {error}"))?;
+        let entries = collect_step_checkpoint_entries(
+            std::fs::read_dir(child_checkpoint_dir)
+                .map_err(|error| format!("read child checkpoint directory: {error}"))?
+                .map(|entry| entry.map(StepCheckpointDirEntry::from_dir_entry)),
+        )?;
+        for entry in entries {
+            if !is_step_checkpoint_file_name(&entry.name) {
+                continue;
+            }
+            let bytes = std::fs::read(&entry.path).map_err(|error| {
+                format!("read child checkpoint {}: {error}", entry.path.display())
+            })?;
+            write_immutable_fork_basis_file(&frozen_checkpoint_dir.join(entry.name), &bytes)?;
+        }
+        std::fs::File::open(&frozen_checkpoint_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync frozen checkpoint directory: {error}"))?;
+        let hash = checkpoint_directory_hash(&frozen_checkpoint_dir)?.ok_or_else(|| {
+            "frozen checkpoint basis unexpectedly contains no checkpoints".to_string()
+        })?;
+        Some((frozen_checkpoint_dir, hash))
+    } else {
+        None
+    };
+    std::fs::File::open(&basis_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync immutable fork basis directory: {error}"))?;
+    Ok(FrozenLocalForkBasis {
+        transcript_path,
+        workspace_path,
+        checkpoint,
+    })
+}
+
+/// Verify that a local fork was created from the exact immutable basis recorded
+/// at its cursor and that the active child files still match before activation.
+/// This deliberately does not claim portability or materialize missing state.
+pub fn verify_local_fork_basis(
+    source_session_id: &str,
+    target_session_id: &str,
+    forked_at_turn: u32,
+) -> Result<SessionForkBasisEvidenceV1, String> {
+    validate_session_id(source_session_id)
+        .map_err(|error| format!("invalid fork basis source session ID: {error}"))?;
+    validate_session_id(target_session_id)
+        .map_err(|error| format!("invalid fork basis target session ID: {error}"))?;
+    let workspace_dir = session_workspace::workspace_dir_for(target_session_id);
+    let evidence_path = workspace_dir.join(FORK_BASIS_EVIDENCE_FILE);
+    let evidence: SessionForkBasisEvidenceV1 = serde_json::from_slice(
+        &std::fs::read(&evidence_path)
+            .map_err(|error| format!("read {}: {error}", evidence_path.display()))?,
+    )
+    .map_err(|error| format!("validate {}: {error}", evidence_path.display()))?;
+    if evidence.source_session_id != source_session_id
+        || evidence.target_session_id != target_session_id
+        || evidence.as_of_cursor != format!("turn:{forked_at_turn}")
+    {
+        return Err("fork basis identity does not match the requested fork".to_string());
+    }
+
+    use ForkBasisDimension as Dimension;
+    use ForkBasisDimensionEvidence as DimensionEvidence;
+    let basis_dir = workspace_dir.join(FORK_BASIS_DIRECTORY);
+    let active_journal = journal_file_path(target_session_id);
+    let active_workspace = session_workspace::workspace_file_path(target_session_id)
+        .map_err(|error| format!("resolve active child workspace: {error}"))?;
+    let active_checkpoints = crate::local_session_artifact_store()
+        .session_dir(target_session_id)?
+        .join("step_checkpoints");
+
+    for entry in &evidence.entries {
+        let DimensionEvidence::LocalFile {
+            locator,
+            content_hash,
+        } = &entry.evidence
+        else {
+            if matches!(
+                entry.dimension,
+                Dimension::Transcript | Dimension::Workspace
+            ) {
+                return Err(format!(
+                    "fork basis {:?} must be locally referenced",
+                    entry.dimension
+                ));
+            }
+            if entry.dimension == Dimension::Checkpoint
+                && checkpoint_directory_hash(&active_checkpoints)?.is_some()
+            {
+                return Err(
+                    "fork basis reports a checkpoint gap while child checkpoints exist".to_string(),
+                );
+            }
+            continue;
+        };
+        let (expected_path, frozen_hash, active_hash) = match entry.dimension {
+            Dimension::Transcript => {
+                let expected = basis_dir.join("transcript.jsonl");
+                (
+                    expected.clone(),
+                    sha256_file(&expected)?,
+                    sha256_file(&active_journal)?,
+                )
+            }
+            Dimension::Workspace => {
+                let expected = basis_dir.join("workspace.yaml");
+                (
+                    expected.clone(),
+                    sha256_file(&expected)?,
+                    sha256_file(&active_workspace)?,
+                )
+            }
+            Dimension::Checkpoint => {
+                let expected = basis_dir.join("step_checkpoints");
+                let frozen = checkpoint_directory_hash(&expected)?.ok_or_else(|| {
+                    "fork basis checkpoint reference has no frozen checkpoints".to_string()
+                })?;
+                let active = checkpoint_directory_hash(&active_checkpoints)?.ok_or_else(|| {
+                    "fork basis checkpoint reference has no active checkpoints".to_string()
+                })?;
+                (expected, frozen, active)
+            }
+            unsupported => {
+                return Err(format!(
+                    "local fork basis has unsupported referenced dimension {unsupported:?}"
+                ));
+            }
+        };
+        if std::path::Path::new(locator) != expected_path {
+            return Err(format!(
+                "fork basis {:?} locator is not the canonical local basis path",
+                entry.dimension
+            ));
+        }
+        if frozen_hash != *content_hash || active_hash != *content_hash {
+            return Err(format!(
+                "fork basis {:?} content does not match the frozen cursor",
+                entry.dimension
+            ));
+        }
+    }
+    Ok(evidence)
 }
 
 /// Fork parent journal into a new session file and workspace metadata.
@@ -361,60 +777,44 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         )
     });
 
-    use astra_sync_protocol::{
-        SessionStateDimension as Dimension, SessionStateManifestEntry as Entry,
-        SessionStateManifestV1,
-    };
+    use ForkBasisDimension as Dimension;
+    use ForkBasisEntry as Entry;
     let child_journal = journal_file_path(&new_id);
     let child_workspace = session_workspace::workspace_file_path(&new_id)
         .map_err(|error| format!("resolve child workspace manifest: {error}"))?;
     let checkpoint_dir = crate::local_session_artifact_store()
         .session_dir(&new_id)?
         .join("step_checkpoints");
-    let checkpoint_entry = match checkpoint_directory_hash(&checkpoint_dir)? {
-        Some(hash) => Entry::referenced_hash(
-            Dimension::Checkpoint,
-            checkpoint_dir.to_string_lossy(),
-            hash,
-        )?,
+    let frozen_basis =
+        freeze_local_fork_basis(&new_id, &child_journal, &child_workspace, &checkpoint_dir)?;
+    let checkpoint_entry = match frozen_basis.checkpoint {
+        Some((path, hash)) => {
+            Entry::local_file_hash(Dimension::Checkpoint, path.to_string_lossy(), hash)?
+        }
         None => Entry::gap(
             Dimension::Checkpoint,
             "no checkpoint covers the frozen fork cursor",
         ),
     };
-    let memory_entry = match fork_snapshot
-        .as_ref()
-        .and_then(CompositeSnapshot::memory_snapshot)
-    {
-        Some(memory) => Entry::referenced(
-            Dimension::Memory,
-            memory
-                .path
-                .clone()
-                .unwrap_or_else(|| format!("memory://{}@{}", memory.profile, memory.epoch)),
-            &serde_json::to_vec(memory)
-                .map_err(|error| format!("serialize memory snapshot reference: {error}"))?,
-        ),
-        None => Entry::gap(
-            Dimension::Memory,
-            "no memory snapshot was frozen at the fork cursor",
-        ),
-    };
-    let state_manifest = SessionStateManifestV1::new(
+    let memory_entry = Entry::gap(
+        Dimension::Memory,
+        "memory is not materialized as immutable local fork-basis bytes",
+    );
+    let fork_basis_evidence = SessionForkBasisEvidenceV1::new(
         &parent,
         &new_id,
         format!("turn:{forked_at_turn}"),
         vec![
-            Entry::referenced_hash(
+            Entry::local_file_hash(
                 Dimension::Transcript,
-                child_journal.to_string_lossy(),
-                sha256_file(&child_journal)?,
+                frozen_basis.transcript_path.to_string_lossy(),
+                sha256_file(&frozen_basis.transcript_path)?,
             )?,
             checkpoint_entry,
-            Entry::referenced_hash(
+            Entry::local_file_hash(
                 Dimension::Workspace,
-                child_workspace.to_string_lossy(),
-                sha256_file(&child_workspace)?,
+                frozen_basis.workspace_path.to_string_lossy(),
+                sha256_file(&frozen_basis.workspace_path)?,
             )?,
             Entry::gap(
                 Dimension::Task,
@@ -431,7 +831,8 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
             memory_entry,
         ],
     )?;
-    persist_state_manifest(&new_id, &state_manifest)?;
+    persist_fork_basis_evidence(&new_id, &fork_basis_evidence)?;
+    verify_local_fork_basis(&parent, &new_id, forked_at_turn)?;
 
     artifact_guard.commit();
     Ok(ForkSessionResult {
@@ -440,7 +841,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         forked_at_turn,
         data_branch_name,
         fork_snapshot,
-        state_manifest,
+        fork_basis_evidence,
     })
 }
 
@@ -465,6 +866,30 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let guard = JournalDirGuard::new(tmp.path());
         (tmp, guard)
+    }
+
+    #[test]
+    fn fork_basis_contract_requires_exact_dimensions_and_rejects_tampering() {
+        let entries = ForkBasisDimension::ALL
+            .into_iter()
+            .map(|dimension| {
+                ForkBasisEntry::local_file_hash(
+                    dimension,
+                    format!("/tmp/{dimension:?}"),
+                    format!("sha256:{:064x}", dimension as u8),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let evidence =
+            SessionForkBasisEvidenceV1::new("source", "target", "turn:7", entries.clone()).unwrap();
+        let mut tampered = serde_json::to_value(evidence).unwrap();
+        tampered["as_of_cursor"] = serde_json::json!("turn:8");
+        assert!(serde_json::from_value::<SessionForkBasisEvidenceV1>(tampered).is_err());
+
+        let mut duplicate = entries;
+        duplicate[1] = duplicate[0].clone();
+        assert!(SessionForkBasisEvidenceV1::new("source", "target", "turn:7", duplicate).is_err());
     }
 
     /// Create a test session with N turns in its journal + workspace.
@@ -560,23 +985,37 @@ mod tests {
         };
         let result = fork_local_session(opts).expect("fork should succeed");
         assert_eq!(result.events_copied, 5, "all turn events should be copied");
-        assert_eq!(result.state_manifest.as_of_cursor, "turn:5");
-        assert!(!result.state_manifest.is_complete());
+        assert_eq!(result.fork_basis_evidence.as_of_cursor, "turn:5");
+        assert_eq!(
+            result
+                .fork_basis_evidence
+                .gaps()
+                .map(|entry| entry.dimension)
+                .collect::<Vec<_>>(),
+            vec![
+                ForkBasisDimension::Checkpoint,
+                ForkBasisDimension::Task,
+                ForkBasisDimension::Artifact,
+                ForkBasisDimension::Invocation,
+                ForkBasisDimension::Memory,
+            ]
+        );
         assert!(
             session_workspace::workspace_dir_for(&result.new_session_id)
-                .join("state-manifest-v1.json")
+                .join(FORK_BASIS_EVIDENCE_FILE)
                 .is_file()
         );
-        let restored_manifest: astra_sync_protocol::SessionStateManifestV1 =
-            serde_json::from_slice(
-                &std::fs::read(
-                    session_workspace::workspace_dir_for(&result.new_session_id)
-                        .join("state-manifest-v1.json"),
-                )
-                .unwrap(),
+        let restored_evidence: SessionForkBasisEvidenceV1 = serde_json::from_slice(
+            &std::fs::read(
+                session_workspace::workspace_dir_for(&result.new_session_id)
+                    .join(FORK_BASIS_EVIDENCE_FILE),
             )
-            .unwrap();
-        assert_eq!(restored_manifest, result.state_manifest);
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_evidence, result.fork_basis_evidence);
+        verify_local_fork_basis(&parent_id, &result.new_session_id, 5)
+            .expect("fresh child matches its immutable fork basis");
 
         let forked_events = read_journal(&result.new_session_id).unwrap();
         let turn_events: Vec<_> = forked_events
@@ -584,6 +1023,19 @@ mod tests {
             .filter(|e| e.event_type == JournalEventType::Turn)
             .collect();
         assert_eq!(turn_events.len(), 5);
+
+        std::fs::write(
+            session_workspace::workspace_dir_for(&result.new_session_id)
+                .join(FORK_BASIS_DIRECTORY)
+                .join("transcript.jsonl"),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(
+            verify_local_fork_basis(&parent_id, &result.new_session_id, 5)
+                .unwrap_err()
+                .contains("content does not match")
+        );
 
         cleanup_session(&parent_id);
         cleanup_session(&result.new_session_id);

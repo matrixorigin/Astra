@@ -5185,6 +5185,8 @@ async fn load_prepared_fork_restore(
             "missing session journal for forked child {new_sid}"
         ));
     }
+    astra_services::session_fork::verify_local_fork_basis(parent_id, new_sid, forked_at_turn)
+        .map_err(|error| format!("verify forked child basis before activation: {error}"))?;
     let base_dir = session_journal::local_owner_sessions_dir();
     let store = std::sync::Arc::new(
         astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
@@ -7124,6 +7126,42 @@ mod resume_tests {
             };
 
         assert!(error.contains("missing session journal"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn load_prepared_fork_restore_verifies_the_service_owned_fork_basis() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
+        let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&parent_id, 1);
+        let fork = astra_services::fork_local_session(astra_services::ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: Some(child_id.clone()),
+            label: None,
+            forked_after_turn: Some(1),
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect("service creates and verifies the child fork basis");
+
+        load_prepared_fork_restore(&parent_id, &child_id, fork.forked_at_turn)
+            .await
+            .expect("CLI accepts a child whose active state matches its immutable basis");
+
+        std::fs::write(
+            session_workspace::workspace_dir_for(&child_id)
+                .join("fork-basis-v1")
+                .join("workspace.yaml"),
+            b"tampered",
+        )
+        .unwrap();
+        let error =
+            match load_prepared_fork_restore(&parent_id, &child_id, fork.forked_at_turn).await {
+                Ok(_) => panic!("CLI must reject tampered fork basis before activation"),
+                Err(error) => error,
+            };
+        assert!(error.contains("content does not match"), "{error}");
     }
 
     #[serial_test::serial]
