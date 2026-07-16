@@ -1,9 +1,11 @@
 use super::*;
 use astra_services::db_row::{RowDecoder, RowExt};
+use futures_util::{StreamExt, stream};
 use sqlx::Row;
 use uuid::Uuid;
 
 const SWEEP_INTERVAL_SECS: u64 = 3_600;
+const RETENTION_APPLY_MAX_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArtifactRetentionSweepOutcome {
@@ -113,26 +115,52 @@ pub async fn run_artifact_retention_gc_once(
             );
         }
     }
-    for row in rows {
-        let artifact = match decode_artifact_retention_row(&row) {
-            Ok(artifact) => artifact,
-            Err(error) => {
+    // Each artifact is an independent lifecycle CAS. Bound concurrency to the
+    // same order of magnitude as the service DB pool so a large retention
+    // batch does not turn one network round trip per artifact into a serial
+    // head-of-line delay, while still preserving explicit backpressure.
+    let mut pending = stream::iter(rows)
+        .map(|row| {
+            let pool = pool.clone();
+            async move {
+                let artifact = match decode_artifact_retention_row(&row) {
+                    Ok(artifact) => artifact,
+                    Err(error) => {
+                        return Ok(ArtifactRetentionProcessOutcome::Corrupt(error));
+                    }
+                };
+                apply_artifact_retention_policy(&pool, &artifact)
+                    .await
+                    .map(ArtifactRetentionProcessOutcome::Applied)
+            }
+        })
+        .buffer_unordered(RETENTION_APPLY_MAX_CONCURRENCY);
+    let mut first_apply_error = None;
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(ArtifactRetentionProcessOutcome::Corrupt(error)) => {
                 outcome.corrupt_rows_skipped += 1;
                 tracing::warn!(
                     target: "astra_runtime::artifact_retention_sweeper",
                     error = %error,
                     "skipping corrupt artifact retention row"
                 );
-                continue;
             }
-        };
-        match apply_artifact_retention_policy(&pool, &artifact).await? {
-            ArtifactRetentionAction::MarkedExpiring => outcome.marked_expiring += 1,
-            ArtifactRetentionAction::ReferencedRetained => outcome.referenced_retained += 1,
-            ArtifactRetentionAction::Extended => outcome.extended += 1,
-            ArtifactRetentionAction::Expired => outcome.expired += 1,
-            ArtifactRetentionAction::Noop => {}
+            Ok(ArtifactRetentionProcessOutcome::Applied(action)) => {
+                record_artifact_retention_action(&mut outcome, action);
+            }
+            Err(error) if first_apply_error.is_none() => first_apply_error = Some(error),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::artifact_retention_sweeper",
+                    error = %error,
+                    "additional artifact retention update failed while draining bounded batch"
+                );
+            }
         }
+    }
+    if let Some(error) = first_apply_error {
+        return Err(error);
     }
     Ok(outcome)
 }
@@ -197,6 +225,24 @@ enum ArtifactRetentionAction {
     ReferencedRetained,
     Extended,
     Expired,
+}
+
+enum ArtifactRetentionProcessOutcome {
+    Corrupt(String),
+    Applied(ArtifactRetentionAction),
+}
+
+fn record_artifact_retention_action(
+    outcome: &mut ArtifactRetentionSweepOutcome,
+    action: ArtifactRetentionAction,
+) {
+    match action {
+        ArtifactRetentionAction::MarkedExpiring => outcome.marked_expiring += 1,
+        ArtifactRetentionAction::ReferencedRetained => outcome.referenced_retained += 1,
+        ArtifactRetentionAction::Extended => outcome.extended += 1,
+        ArtifactRetentionAction::Expired => outcome.expired += 1,
+        ArtifactRetentionAction::Noop => {}
+    }
 }
 
 async fn apply_artifact_retention_policy(

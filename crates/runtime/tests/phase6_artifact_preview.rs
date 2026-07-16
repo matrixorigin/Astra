@@ -4,7 +4,7 @@ use astra_services::{
     content_hash_with_normalize_version, expired_artifact_placeholder, runs::ToolOutputBatchItem,
 };
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{MySql, QueryBuilder, Row};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -599,35 +599,57 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
-    for i in 0..250 {
+    let seeded_at = chrono::Utc::now();
+    let mut insert = QueryBuilder::<MySql>::new(
+        "INSERT INTO session_artifacts
+         (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
+          retention_policy, retention_until, status, referenced_by_manifest_count,
+          created_at, updated_at) ",
+    );
+    insert.push_values(0..250, |mut row, i| {
+        let kind = if i % 2 == 0 { "fetch_url" } else { "parse_pdf" };
         let policy = if i % 25 == 0 {
             "project_long_term"
         } else {
             "default"
         };
-        let artifact_id = format!("review-artifact-{i}-{}", Uuid::new_v4());
-        insert_artifact(
-            &pool,
-            ArtifactSeed {
-                user_id: &user_id,
-                session_id: &session_id,
-                artifact_id: &artifact_id,
-                kind: if i % 2 == 0 { "fetch_url" } else { "parse_pdf" },
-                policy,
-                status: "active",
-                retention_days: (i % 14) as i64 - 7,
-                manifest_refs: 0,
-            },
-        )
-        .await;
-    }
+        let retention_until = (seeded_at + chrono::Duration::days((i % 14) as i64 - 7)).naive_utc();
+        row.push_bind(format!("review-artifact-{i}-{}", Uuid::new_v4()))
+            .push_bind(&session_id)
+            .push_bind(&user_id)
+            .push_bind(kind)
+            .push_bind(json!({"summary": kind}).to_string())
+            .push_bind(json!({"byte_size": 3_221_225_472_u64}).to_string())
+            .push_bind(policy)
+            .push_bind(retention_until)
+            .push_bind("active")
+            .push_bind(0_i64)
+            .push("NOW(6)")
+            .push("NOW(6)");
+    });
+    insert.build().execute(pool.get()).await.unwrap();
+
     run_artifact_retention_gc_once(pool.clone(), 500)
         .await
         .unwrap();
     let row = sqlx::query(
         "SELECT
            COUNT(*) AS total_artifacts,
-           SUM(CASE WHEN retention_policy = 'project_long_term' AND status = 'active' THEN 1 ELSE 0 END) AS long_term_active
+           SUM(CASE
+                 WHEN retention_policy = 'project_long_term'
+                  AND status = 'active'
+                  AND retention_until > DATE_ADD(NOW(6), INTERVAL 300 DAY)
+                 THEN 1 ELSE 0
+               END) AS long_term_extended,
+           SUM(CASE
+                 WHEN retention_policy = 'default'
+                  AND (status = 'expired' OR status = 'expiring')
+                 THEN 1 ELSE 0
+               END) AS default_processed,
+           SUM(CASE
+                 WHEN retention_policy = 'default' AND status = 'active'
+                 THEN 1 ELSE 0
+               END) AS default_still_active
          FROM session_artifacts WHERE user_id = ? AND session_id = ?",
     )
     .bind(&user_id)
@@ -636,7 +658,9 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     .await
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("total_artifacts").unwrap(), 250);
-    assert_eq!(row.try_get::<i64, _>("long_term_active").unwrap(), 10);
+    assert_eq!(row.try_get::<i64, _>("long_term_extended").unwrap(), 10);
+    assert_eq!(row.try_get::<i64, _>("default_processed").unwrap(), 240);
+    assert_eq!(row.try_get::<i64, _>("default_still_active").unwrap(), 0);
     let budget = budget_for_turn_intent(Some("benchmark_comparison"));
     assert_eq!(budget.budget.tool_previews, 2_500);
     assert!(budget.borrowed_from_recent_tail > 0);
