@@ -654,6 +654,11 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
             biased;
             _ = cancel_token.cancelled() => {
                 cancelled = true;
+                // Cancellation owns the request from this point onward. Drop
+                // any callback that raced with the cancellation boundary so
+                // a result that can no longer be consumed does not occupy the
+                // process ledger until the lazy five-minute expiry sweep.
+                let _ = take_ledger_entry(ledger, &t_key, Duration::ZERO).await;
                 None
             }
             entry = take_ledger_entry(ledger, &t_key, ledger_wait) => entry,
@@ -1537,6 +1542,10 @@ mod tests {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let tc = read_tool("c_cancelled");
         let identity = test_identity("u1_cancelled", "c_cancelled");
+        ledger.lock().await.insert(
+            crate::edge_ledger::tool_callback_key(&identity),
+            json!({"kind": "tool_result", "body": {"status": "completed", "output": "raced"}}),
+        );
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
 
@@ -1567,6 +1576,10 @@ mod tests {
             delivery.tool_messages[0]["content"]
                 .as_str()
                 .is_some_and(|content| content.contains("cancelled before completion"))
+        );
+        assert!(
+            ledger.lock().await.is_empty(),
+            "cancellation must consume a callback that raced with the terminal boundary"
         );
     }
 

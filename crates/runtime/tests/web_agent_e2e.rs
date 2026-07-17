@@ -3283,14 +3283,17 @@ async fn tool_call_with_empty_id_gets_auto_assigned() {
 }
 
 #[tokio::test]
-async fn tool_result_for_unknown_request_id_does_not_crash() {
+async fn tool_result_for_unknown_run_is_rejected_without_side_effects() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, ledger) = build_test_app();
 
-    // Post a tool result with an ID that no stream is waiting for.
+    // Authentication alone must not authorize an arbitrary callback identity.
     let st = post_unmatched_tool_result(&app, "nonexistent-id-12345", "output", "ok").await;
-    // Should succeed (ledger accepts it even if nobody consumes it).
-    assert_eq!(st, 200);
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert!(
+        ledger.lock().await.is_empty(),
+        "an unknown run must not create an orphan callback entry"
+    );
 }
 
 #[tokio::test]

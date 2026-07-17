@@ -101,17 +101,6 @@ impl AuthService for E2eAuth {
     }
 }
 
-fn e2e_app() -> (
-    Router,
-    Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
-) {
-    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
-        .with_auth_service(Arc::new(E2eAuth));
-    let ledger = state.edge_callback_ledger();
-    let app = build_app(state);
-    (app, ledger)
-}
-
 #[derive(Clone, Default)]
 struct E2eRunLifecycle {
     runs: Arc<StdMutex<std::collections::HashMap<String, String>>>,
@@ -120,6 +109,13 @@ struct E2eRunLifecycle {
 }
 
 impl E2eRunLifecycle {
+    fn add_run(&self, session_id: &str, run_id: &str) {
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), session_id.to_string());
+    }
+
     fn add_approval_required(&self, session_id: &str, run_id: &str, request_id: &str) {
         self.add_approval_required_with_tool(
             session_id,
@@ -138,10 +134,7 @@ impl E2eRunLifecycle {
         tool: &str,
         approval_kind: &str,
     ) {
-        self.runs
-            .lock()
-            .unwrap()
-            .insert(run_id.to_string(), session_id.to_string());
+        self.add_run(session_id, run_id);
         self.required.lock().unwrap().insert(
             (run_id.to_string(), request_id.to_string()),
             json!({
@@ -386,7 +379,9 @@ fn tool_result_payload(
 
 #[tokio::test]
 async fn post_tools_result_populates_ledger_then_take_consumes() {
-    let (app, ledger) = e2e_app();
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_run("sess-tool", "run-tool");
+    let (app, ledger) = e2e_app_with_lifecycle(lifecycle);
     let key = scoped_tool_key("sess-tool", "run-tool", "chain-tool", "tc-1");
     let (st, j) = post_json(
         app.clone(),
@@ -642,7 +637,9 @@ async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
 
 #[tokio::test]
 async fn post_tool_result_rejects_when_ledger_is_full() {
-    let (app, ledger) = e2e_app();
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_run("sess-overflow", "run-overflow");
+    let (app, ledger) = e2e_app_with_lifecycle(lifecycle);
     {
         let mut guard = ledger.lock().await;
         for idx in 0..LEDGER_MAX_ENTRIES {

@@ -481,8 +481,11 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
 //
 // Session d0640d3d regression: agentic tool loops append (assistant_tc,
 // tool_result) pairs within the same user-turn. Under reference-agent semantics
-// the sole message marker must move to the newest tail message, while the
-// already-sent history stays byte-identical across rounds.
+// the sole message marker advances behind the previous round. The current
+// tool-result tail is intentionally outside that marker: provider-valid
+// runtime context must be merged into the user-like tool result rather than
+// emitted as an adjacent synthetic user message. Therefore only the history
+// strictly before the prior dynamic tail is byte-stable across the next round.
 //
 // Here we simulate a two-round tool loop by mocking two turns where the
 // second turn has one extra (assistant_tc, tool) pair appended and
@@ -545,15 +548,16 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         let guard = capture.lock().unwrap();
         let r1 = &guard[0];
         let r2 = &guard[1];
-        // The original seeded history is exactly
-        // [user, assistant(tool_call), tool]. Tail-only reminder synthesis may
-        // append extra messages, but must never rewrite those first three
-        // historical entries across rounds.
+        // Round 1's dynamic suffix is merged into seeded msg[2], because a
+        // separate user message after a tool result would violate Anthropic
+        // role alternation. The cacheable history strictly before that suffix
+        // (msg[0..2]) must remain byte-identical when the suffix moves to the
+        // newly appended tool result in round 2.
         assert!(
             r1.message_sha256.len() >= 3 && r2.message_sha256.len() >= 3,
             "tool-loop rounds must preserve at least the seeded 3-message history"
         );
-        for i in 0..3 {
+        for i in 0..2 {
             assert_eq!(
                 r1.message_sha256[i],
                 r2.message_sha256[i],
@@ -565,19 +569,37 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                 label = case.label,
             );
         }
+        let r1_old_tail = serde_json::to_string(&r1.messages[2]).unwrap();
+        let r2_old_tail = serde_json::to_string(&r2.messages[2]).unwrap();
+        let r2_current_tail = serde_json::to_string(r2.messages.last().unwrap()).unwrap();
+        assert!(
+            r1_old_tail.contains("<runtime-context-after-tool>"),
+            "[{label}] round 1 runtime context must ride the provider-valid current tool tail",
+            label = case.label,
+        );
+        assert!(
+            !r2_old_tail.contains("<runtime-context-after-tool>"),
+            "[{label}] runtime context must not persist on a historical tool result",
+            label = case.label,
+        );
+        assert!(
+            r2_current_tail.contains("<runtime-context-after-tool>"),
+            "[{label}] round 2 runtime context must move to the new current tool tail",
+            label = case.label,
+        );
         if case.is_marker_isolated {
             assert_eq!(
                 r1.message_cache_control_indices,
-                vec![2],
-                "[{label}] tool-loop round 1 must mark the last real tool result, \
-                 not skip message annotation because of the synthetic suffix",
+                vec![0],
+                "[{label}] round 1 must mark the last stable message before the \
+                 dynamic tool tail",
                 label = case.label,
             );
             assert_eq!(
                 r2.message_cache_control_indices,
-                vec![4],
-                "[{label}] tool-loop round 2 must advance the marker to the new \
-                 tool result while preserving earlier bytes",
+                vec![2],
+                "[{label}] round 2 must advance the marker through the prior \
+                 stable tool result while excluding the new dynamic tail",
                 label = case.label,
             );
         }

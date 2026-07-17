@@ -174,6 +174,42 @@ pub(crate) async fn post_tool_result_handler(
     let edge_id = edge_id_from_headers(&headers);
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    // A bearer token authenticates the caller, but does not make the
+    // session/run identity in an arbitrary callback body trustworthy. Resolve
+    // the durable run before touching either delivery lane. Late callbacks for
+    // terminal runs are acknowledged and discarded: retrying cannot make them
+    // consumable, while enqueueing them would create a five-minute orphan.
+    let target = state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(body.run_id.clone(), user.user_id.clone())
+        .await?;
+    if target.session_id != body.session_id {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Tool result request not found in this session",
+        ));
+    }
+    if astra_services::runs::durable_run_status_is_terminal(&target.status) {
+        tracing::info!(
+            target: "astra_runtime::edge_callback",
+            request_id = %trace.request_id,
+            user_id = %user.user_id,
+            session_id = %body.session_id,
+            run_id = %body.run_id,
+            callback_request_id = %body.request_id,
+            run_status = %target.status,
+            "late tool result acknowledged without enqueueing after run termination"
+        );
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "request_id": body.request_id,
+            "ledger_enqueued": false,
+            "dispatch_delivered": false,
+            "delivery_route": "terminal_discard",
+            "terminal_status": target.status,
+        })));
+    }
     let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &user.user_id,
         &body.session_id,
@@ -1693,6 +1729,10 @@ mod edge_callback_insert_tests {
         });
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(Arc::new(
+                ApprovalTargetRunLifecycle::new("run-tool-dispatch", "sess-tool-dispatch")
+                    .with_running_edge_wait(),
+            ))
             .with_edge_dispatch_service(dispatch.clone());
         {
             let mut ledger = state.edge_callback_ledger.lock().await;
@@ -1743,6 +1783,85 @@ mod edge_callback_insert_tests {
         assert_eq!(delivered[0].1, "req-tool-dispatch");
         assert_eq!(delivered[0].2, "edge-a");
         assert!(delivered[0].3.contains("tool output"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_tool_result_for_cancelled_run_is_idempotently_discarded() {
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new("run-cancelled", "sess-cancelled")
+                .with_running_edge_wait(),
+        );
+        *lifecycle.status.lock().unwrap() = astra_core::STATUS_CANCELLED.to_string();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle);
+
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-late-tool-result".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "sess-cancelled".into(),
+                    run_id: "run-cancelled".into(),
+                    turn_chain_id: "chain-cancelled".into(),
+                    request_id: "req-cancelled".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "cancelled".into(),
+                    output: "late result".into(),
+                    duration_ms: 12,
+                    tool_result_fields: None,
+                },
+            )),
+        )
+        .await
+        .expect("late terminal callback should be acknowledged without retry");
+
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["delivery_route"], "terminal_discard");
+        assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "a terminal run has no consumer, so its callback must not enter the ledger"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_cannot_cross_the_authenticated_run_session_boundary() {
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new("run-owned", "sess-owned").with_running_edge_wait(),
+        );
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle);
+
+        let error = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-cross-session-tool-result".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "sess-forged".into(),
+                    run_id: "run-owned".into(),
+                    turn_chain_id: "chain-owned".into(),
+                    request_id: "req-forged".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output: "forged result".into(),
+                    duration_ms: 12,
+                    tool_result_fields: None,
+                },
+            )),
+        )
+        .await
+        .expect_err("a run cannot receive a tool result through another session identity");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
