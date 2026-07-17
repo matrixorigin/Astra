@@ -178,6 +178,19 @@ describe("ComposerPlusMenu environment selection", () => {
 });
 
 describe("ComposerPlusMenu connectors", () => {
+  it("presents search and fetch as one user-facing Web capability", async () => {
+    const user = userEvent.setup();
+    const onWebSearchChange = vi.fn();
+    renderMenu({ onWebSearchChange });
+
+    await user.click(screen.getByRole("button", { name: "Open add menu" }));
+    await user.click(screen.getByRole("button", { name: /Web access/i }));
+
+    expect(onWebSearchChange).toHaveBeenCalledWith(true);
+    expect(screen.getByText(/Search and read public pages/i)).toBeInTheDocument();
+    expect(screen.queryByText("Web search")).not.toBeInTheDocument();
+  });
+
   it("lets the user attach the GitHub connector for the next turn", async () => {
     const user = userEvent.setup();
     const onActiveToolsChange = vi.fn();

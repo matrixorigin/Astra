@@ -239,12 +239,12 @@ export const MessageBubble = memo(function MessageBubble({
           />
           {message.activeTools?.length ? (
             <div className="mt-2 flex flex-wrap justify-end gap-1.5 border-t border-border/60 pt-2 font-ui text-[11px] text-text-muted">
-              {message.activeTools.map((tool) => (
+              {toolCapabilityLabels(message.activeTools).map((tool) => (
                 <span
                   key={tool}
                   className="rounded-full border border-border/70 bg-surface px-2 py-0.5"
                 >
-                  {toolLabel(tool)}
+                  {tool}
                 </span>
               ))}
             </div>
@@ -301,10 +301,22 @@ function toolLabel(tool: string) {
       return "GitHub";
     case "web_search":
     case "web_fetch":
-      return "Web research";
+      return "Web access";
     default:
       return tool.replace(/[_-]+/g, " ");
   }
+}
+
+function toolCapabilityLabels(tools: string[]) {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    const label = toolLabel(tool);
+    if (seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  return labels;
 }
 
 function AssistantTypingIndicator() {

@@ -147,6 +147,7 @@ export function WorkSurfacePanel({
   const toolActivityCount = state.tools.length;
   const insightCount = insightRecommendationCount(insightsState.payload);
   const visibleRunStatus = activeRun?.status ?? state.runStatus;
+  const workbenchActivity = workbenchActivitySummary(state);
   const selectedAgent = selectedAgentId
     ? visibleAgents.find((agent) => agent.agentId === selectedAgentId)
     : undefined;
@@ -318,7 +319,7 @@ export function WorkSurfacePanel({
 
   const body = (
     <>
-      <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border/70 px-4">
+      <div className="flex h-16 shrink-0 items-center gap-2 border-b border-border/70 px-4">
         <button
           type="button"
           className="hidden size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:inline-flex"
@@ -333,18 +334,35 @@ export function WorkSurfacePanel({
         </button>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <ClipboardList className="size-4 text-accent" />
-            <h2 className="truncate text-sm font-semibold text-text">
-              Run workspace
+            <span
+              className={cn(
+                "relative flex size-5 shrink-0 items-center justify-center rounded-[6px] bg-accent/10 text-accent",
+                visibleRunStatus && !isTerminalRunStatus(visibleRunStatus)
+                  ? "after:absolute after:-right-0.5 after:-top-0.5 after:size-1.5 after:animate-pulse after:rounded-full after:bg-accent after:ring-2 after:ring-surface"
+                  : "",
+              )}
+            >
+              <Activity className="size-3.5" />
+            </span>
+            <h2 className="truncate text-sm font-semibold tracking-[-0.01em] text-text">
+              Astra Workbench
             </h2>
           </div>
-          <p className="mt-0.5 truncate text-xs text-text-muted">
-            {visibleRunStatus
-              ? runStatusHeadline(visibleRunStatus)
-              : state.hydrated
-                ? "Session activity"
-                : "Waiting for session"}
-          </p>
+          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-xs text-text-muted">
+            <span className="shrink-0 text-text-secondary">
+              {visibleRunStatus
+                ? runStatusHeadline(visibleRunStatus)
+                : state.hydrated
+                  ? "Session activity"
+                  : "Waiting for session"}
+            </span>
+            {workbenchActivity ? (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="truncate">{workbenchActivity}</span>
+              </>
+            ) : null}
+          </div>
         </div>
         <button
           type="button"
@@ -366,7 +384,7 @@ export function WorkSurfacePanel({
 
       <RunBlockedBanner blocked={state.blocked} />
 
-      <div className="flex shrink-0 border-b border-border/70 px-2 py-2">
+      <div className="flex shrink-0 gap-1 border-b border-border/70 bg-bg/45 px-2 py-2">
         <TabButton
           active={tab === "tasks"}
           icon={ClipboardList}
@@ -560,9 +578,9 @@ function TabButton({
       type="button"
       onClick={onClick}
       className={cn(
-        "inline-flex flex-1 items-center justify-center gap-1.5 rounded-control px-2.5 py-2 text-xs font-medium transition",
+        "relative inline-flex flex-1 items-center justify-center gap-1.5 rounded-control px-2.5 py-2 text-xs font-medium transition",
         active
-          ? "bg-bg text-text shadow-sm"
+          ? "bg-surface text-text shadow-[0_1px_3px_rgba(15,23,42,0.08)] ring-1 ring-border/70 after:absolute after:inset-x-3 after:-bottom-2 after:h-0.5 after:rounded-full after:bg-accent"
           : "text-text-muted hover:bg-surface-muted hover:text-text",
       )}
     >
@@ -902,7 +920,7 @@ function TaskBoard({
   const sorted = [...tasks].sort(taskSort);
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-3 gap-2 text-center">
+      <div className="grid grid-cols-3 divide-x divide-border/70 rounded-card border border-border/70 bg-bg p-1 text-center shadow-sm">
         <Metric label="Working" value={counts.working} />
         <Metric label="Queued" value={counts.queued} />
         <Metric label="Done" value={counts.done} />
@@ -919,16 +937,19 @@ function TaskBoard({
 function TaskCard({ task }: { task: SessionTask }) {
   const subtasks = task.subtasks ?? [];
   const done = subtasks.filter((item) => isDone(item.status)).length;
-  const progress = subtasks.length
-    ? Math.round((done / subtasks.length) * 100)
-    : isDone(task.status)
-      ? 100
-      : task.status === "in_progress"
-        ? 45
-        : 8;
+  const progress = taskObservedProgress(task, done);
   const running = task.status === "in_progress";
   return (
-    <section className="rounded-card border border-border/70 bg-bg p-3 shadow-sm">
+    <section
+      className={cn(
+        "rounded-card border bg-bg p-3 shadow-sm transition-colors",
+        taskNeedsAttention(task)
+          ? "border-warning/30 bg-warning/[0.025]"
+          : running
+            ? "border-accent/25 bg-accent/[0.02]"
+            : "border-border/70",
+      )}
+    >
       <div className="flex items-start gap-3">
         <StatusIcon status={task.status} />
         <div className="min-w-0 flex-1 space-y-2">
@@ -945,35 +966,45 @@ function TaskCard({ task }: { task: SessionTask }) {
             </div>
             <StatusPill status={task.status} active={running} />
           </div>
-          <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
-            <div
-              className={cn(
-                "h-full rounded-full transition-all duration-500",
-                isDone(task.status)
-                  ? "bg-success"
-                  : running
-                    ? "bg-accent"
-                    : "bg-border-strong",
-              )}
-              style={{ width: `${Math.max(5, progress)}%` }}
-            />
-          </div>
+          {progress ? (
+            <div>
+              <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-medium text-text-muted">
+                <span>{progress.label}</span>
+                <span className="tabular-nums">{progress.value}%</span>
+              </div>
+              <div className="h-1 overflow-hidden rounded-full bg-surface-muted">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all duration-500",
+                    isDone(task.status)
+                      ? "bg-success"
+                      : running
+                        ? "bg-accent"
+                        : "bg-border-strong",
+                  )}
+                  style={{ width: `${progress.value}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-muted">
             {subtasks.length ? (
               <span>
                 {done}/{subtasks.length} subtasks
               </span>
             ) : (
-              <span>{progress}%</span>
+              <span>Updated {formatTaskUpdatedAt(task.updated_at)}</span>
             )}
             {task.owner ? <span>Owner {task.owner}</span> : null}
             {task.blocked_by?.length ? (
-              <span>{task.blocked_by.length} blockers</span>
+              <span className="rounded-full bg-warning/10 px-2 py-0.5 font-medium text-warning">
+                {task.blocked_by.length} blockers
+              </span>
             ) : null}
           </div>
           {subtasks.length ? (
             <div className="space-y-1">
-              {subtasks.slice(0, 6).map((subtask) => (
+              {subtasks.slice(0, 4).map((subtask) => (
                 <div
                   key={subtask.id}
                   className="flex items-center gap-2 text-xs"
@@ -992,9 +1023,9 @@ function TaskCard({ task }: { task: SessionTask }) {
                   </span>
                 </div>
               ))}
-              {subtasks.length > 6 ? (
+              {subtasks.length > 4 ? (
                 <div className="pl-5 text-[11px] text-text-muted">
-                  +{subtasks.length - 6} more
+                  +{subtasks.length - 4} more
                 </div>
               ) : null}
             </div>
@@ -1059,7 +1090,7 @@ function AgentCard({
   const display = agentDisplayState(agent);
   const waiting = display.tone === "warning";
   const failed = display.tone === "danger";
-  const progress =
+  const turnBudgetUsed =
     agent.turn && agent.maxTurns
       ? Math.min(100, Math.round((agent.turn / agent.maxTurns) * 100))
       : undefined;
@@ -1170,21 +1201,27 @@ function AgentCard({
               </span>
             </div>
           ) : null}
-          {progress !== undefined ? (
-            <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface-muted">
-              <div
-                className={cn(
-                  "h-full rounded-full transition-all duration-500",
-                  failed
-                    ? "bg-danger"
-                    : waiting
-                      ? "bg-warning"
-                      : agent.status === "completed"
-                        ? "bg-success"
+          {turnBudgetUsed !== undefined ? (
+            <div className="mt-2">
+              <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-medium text-text-muted">
+                <span>Turn budget</span>
+                <span className="tabular-nums">
+                  {agent.turn}/{agent.maxTurns}
+                </span>
+              </div>
+              <div className="h-1 overflow-hidden rounded-full bg-surface-muted">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all duration-500",
+                    failed
+                      ? "bg-danger"
+                      : waiting
+                        ? "bg-warning"
                         : "bg-accent",
-                )}
-                style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
-              />
+                  )}
+                  style={{ width: `${turnBudgetUsed}%` }}
+                />
+              </div>
             </div>
           ) : null}
           {summary ? (
@@ -2098,8 +2135,16 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
   const failed = tool.status === "error";
   const cancelled = tool.status === "cancelled";
   const skipped = tool.status === "skipped";
+  const [expanded, setExpanded] = useState(running || failed || cancelled);
   const finishedAt = tool.finishedAt ?? tool.startedAt;
   const displayResult = toolResultForDisplay(tool);
+
+  useEffect(() => {
+    if (running || failed || cancelled) {
+      setExpanded(true);
+    }
+  }, [cancelled, failed, running]);
+
   return (
     <section className="relative pl-9">
       <div
@@ -2130,7 +2175,7 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
       </div>
       <div
         className={cn(
-          "rounded-card border bg-bg p-3 shadow-sm",
+          "overflow-hidden rounded-card border bg-bg shadow-sm transition-colors",
           running
             ? "border-accent/35 bg-accent/5"
             : cancelled
@@ -2142,20 +2187,41 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
                   : "border-border/70",
         )}
       >
-        <div className="flex items-start gap-2">
+        <button
+          type="button"
+          className="group flex w-full items-start gap-2 p-3 text-left transition-colors hover:bg-surface/70"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${tool.tool} details`}
+          onClick={() => setExpanded((value) => !value)}
+        >
           <Terminal className="mt-0.5 size-4 shrink-0 text-text-muted" />
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <h3 className="min-w-0 flex-1 truncate font-mono text-xs font-semibold text-text">
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate font-mono text-xs font-semibold text-text">
                 {tool.tool}
-              </h3>
+              </span>
               <time className="shrink-0 text-[10px] text-text-muted">
                 {formatEventTime(finishedAt)}
               </time>
               <StatusPill status={tool.status} active={running} />
-            </div>
+              <ChevronRight
+                className={cn(
+                  "size-3.5 shrink-0 text-text-muted transition-transform",
+                  expanded ? "rotate-90" : "group-hover:translate-x-0.5",
+                )}
+              />
+            </span>
+            {!expanded ? <ToolCompactMeta tool={tool} /> : null}
+          </span>
+        </button>
+        {failed ? (
+          <div className="px-3 pb-3">
+            <ToolFailureNotice tool={tool} />
+          </div>
+        ) : null}
+        {expanded ? (
+          <div className="border-t border-border/60 px-3 pb-3 pt-1">
             <ToolExecutionMeta tool={tool} />
-            {failed ? <ToolFailureNotice tool={tool} /> : null}
             {tool.arguments ? (
               <StructuredPayload label="Args" value={tool.arguments} />
             ) : null}
@@ -2166,12 +2232,36 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
                 tone={failed ? "danger" : "muted"}
               />
             ) : running ? (
-              <p className="mt-2 text-xs text-text-muted">Executing...</p>
+              <div className="mt-2 flex items-center gap-2 text-xs text-text-muted">
+                <MiniLiveDots className="text-accent" />
+                Executing
+              </div>
             ) : null}
           </div>
-        </div>
+        ) : null}
       </div>
     </section>
+  );
+}
+
+function ToolCompactMeta({ tool }: { tool: ToolSurfaceItem }) {
+  const items = [
+    tool.durationMs !== undefined ? formatDuration(tool.durationMs) : undefined,
+    tool.route ? statusLabel(tool.route) : undefined,
+    executorMetaValue(tool.executor, tool.workspace),
+  ].filter((item): item is string => Boolean(item));
+  if (!items.length) {
+    return null;
+  }
+  return (
+    <span className="mt-1 flex min-w-0 items-center gap-1.5 truncate text-[10px] text-text-muted">
+      {items.slice(0, 3).map((item, index) => (
+        <span key={`${item}:${index}`} className="contents">
+          {index > 0 ? <span aria-hidden="true">·</span> : null}
+          <span className="truncate">{item}</span>
+        </span>
+      ))}
+    </span>
   );
 }
 
@@ -2454,9 +2544,11 @@ function StructuredValue({
 
 function Metric({ label, value }: { label: string; value: number }) {
   return (
-    <div className="rounded-card border border-border/70 bg-bg px-2 py-2">
-      <div className="text-base font-semibold text-text">{value}</div>
-      <div className="text-[11px] text-text-muted">{label}</div>
+    <div className="px-2 py-1.5">
+      <div className="text-sm font-semibold tabular-nums text-text">{value}</div>
+      <div className="text-[10px] font-medium uppercase tracking-[0.06em] text-text-muted">
+        {label}
+      </div>
     </div>
   );
 }
@@ -2573,6 +2665,48 @@ function taskCounts(tasks: SessionTask[]) {
   return { working, queued, done, open: working + queued };
 }
 
+function taskObservedProgress(task: SessionTask, completedSubtasks: number) {
+  const subtasks = task.subtasks ?? [];
+  if (subtasks.length) {
+    return {
+      value: Math.round((completedSubtasks / subtasks.length) * 100),
+      label: "Subtask completion",
+    };
+  }
+  if (isDone(task.status)) {
+    return { value: 100, label: "Completed" };
+  }
+  return null;
+}
+
+function formatTaskUpdatedAt(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "recently"
+    : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function workbenchActivitySummary(state: WorkSurfaceState) {
+  const parts: string[] = [];
+  const openTasks = state.tasks.filter(
+    (task) => !isDone(task.status) && task.status !== "cancelled",
+  ).length;
+  const activeAgents = state.agents.filter((agent) =>
+    isAgentActive(agent.status),
+  ).length;
+  const activeTools = state.tools.filter(
+    (tool) => tool.status === "running" && !tool.finishedAt,
+  ).length;
+  if (openTasks) parts.push(`${openTasks} open task${openTasks === 1 ? "" : "s"}`);
+  if (activeAgents) {
+    parts.push(`${activeAgents} active agent${activeAgents === 1 ? "" : "s"}`);
+  }
+  if (activeTools) {
+    parts.push(`${activeTools} running tool${activeTools === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
+}
+
 function tabItemCount(tab: WorkSurfaceTab, state: WorkSurfaceState) {
   if (tab === "tasks") return state.tasks.length;
   if (tab === "agents") return state.agents.length;
@@ -2678,6 +2812,12 @@ function runStatusHeadline(status: string) {
       return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
     }
   }
+}
+
+function isTerminalRunStatus(status: string) {
+  return ["completed", "failed", "cancelled", "stopped"].includes(
+    status.trim().toLowerCase(),
+  );
 }
 
 function workspaceMetaValue(workspace: WorkspaceBindingLike) {

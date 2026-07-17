@@ -483,8 +483,8 @@ export function ComposerPlusMenu({
           />
           <Row
             icon={Globe}
-            label="Web search"
-            description={webAccess.description}
+            label="Web access"
+            description={`${webAccess.description} · Search and read public pages`}
             disabled={!webAccess.available}
             onClick={() => onWebSearchChange(!webSearch)}
             trailing={webSearch ? <Check className="size-4 text-accent" /> : null}

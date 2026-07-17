@@ -254,6 +254,67 @@ describe("WorkSurfacePanel", () => {
     ).toBeTruthy();
   });
 
+  it("never fabricates task completion when no measured progress exists", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "task-unmeasured",
+              title: "Investigate the production failure",
+              status: "in_progress",
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Investigate the production failure")).toBeInTheDocument();
+    expect(screen.queryByText("45%")).not.toBeInTheDocument();
+    expect(screen.getByText(/Updated/)).toBeInTheDocument();
+  });
+
+  it("labels measured subtask completion as evidence-backed progress", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "task-measured",
+              title: "Ship the runtime repair",
+              status: "in_progress",
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+              subtasks: [
+                { id: "sub-1", title: "Fix", status: "completed" },
+                { id: "sub-2", title: "Verify", status: "pending" },
+              ],
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Subtask completion")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
   it("orders tool cards by most recent activity first", () => {
     render(
       <WorkSurfacePanel
@@ -294,6 +355,42 @@ describe("WorkSurfacePanel", () => {
       completedLater.compareDocumentPosition(startedEarlier) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("keeps successful tool evidence compact until the user expands it", async () => {
+    const user = userEvent.setup();
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tools: [
+            {
+              callId: "call-read",
+              tool: "read_file",
+              arguments: '{"path":"src/main.rs"}',
+              result: "fn main() {}",
+              status: "done",
+              startedAt: 1_000,
+              finishedAt: 2_000,
+              durationMs: 1_000,
+            },
+          ],
+        }}
+        tab="tools"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Args")).not.toBeInTheDocument();
+    expect(screen.queryByText("Result")).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Expand read_file details" }),
+    );
+    expect(screen.getByText("Args")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
   });
 
   it("focuses tool failures when an activity link opens the tools tab", async () => {
@@ -454,6 +551,37 @@ describe("WorkSurfacePanel", () => {
     await waitFor(() => {
       expect(loadAgentRun).toHaveBeenCalledWith("run-new");
     });
+  });
+
+  it("presents agent turns as budget usage rather than completion progress", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-budget",
+              agentType: "research",
+              description: "Investigate the incident",
+              status: "running",
+              turn: 2,
+              maxTurns: 8,
+              updatedAt: 2_000,
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Turn budget")).toBeInTheDocument();
+    expect(screen.getByText("2/8")).toBeInTheDocument();
+    expect(screen.queryByText("25%")).not.toBeInTheDocument();
   });
 
   it("opens the first active subagent instead of chasing latest timestamps", async () => {
