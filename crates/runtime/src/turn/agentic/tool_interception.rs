@@ -195,6 +195,70 @@ fn intercept_disallowed_tool_calls(
     (blocked, remaining)
 }
 
+fn intercept_same_turn_detached_task_poll(
+    state: &AgenticLoopState,
+    tool_calls: &[Value],
+) -> (
+    Vec<crate::turn::skill_tool::InterceptedToolResult>,
+    Vec<Value>,
+) {
+    if state.stall.same_turn_detached_task_ids.is_empty() {
+        return (Vec::new(), tool_calls.to_vec());
+    }
+
+    let mut blocked = Vec::new();
+    let mut remaining = Vec::new();
+    for tool_call in tool_calls {
+        let raw_tool_name = tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str);
+        let tool_name =
+            raw_tool_name.and_then(astra_turn_core::tool_allowlist::normalize_tool_name);
+        let target_task_id = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            .and_then(|arguments| {
+                arguments
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .map(ToString::to_string)
+            });
+        let targets_detached_task = tool_name.as_deref() == Some("task_output")
+            && target_task_id
+                .as_ref()
+                .is_some_and(|task_id| state.stall.same_turn_detached_task_ids.contains(task_id));
+        if !targets_detached_task {
+            remaining.push(tool_call.clone());
+            continue;
+        }
+
+        let tool_call_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let detached_task_id = target_task_id.expect("matched detached task id");
+        blocked.push(crate::turn::skill_tool::InterceptedToolResult {
+            tool_call_id,
+            tool_name: "task_output".to_string(),
+            ok: false,
+            result_class: Some(
+                astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+            ),
+            result: format!(
+                "DEFERRED: Background task {detached_task_id} was detached in this turn and is still owned by the runtime. Do not poll it now. Continue independent work or finish your response; the runtime will deliver a <task_notification> when its state materially changes. A later user turn may inspect it once when explicitly requested."
+            ),
+        });
+    }
+
+    (blocked, remaining)
+}
+
 pub(crate) async fn prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
@@ -205,8 +269,11 @@ pub(crate) async fn prepare_intercepted_tool_round(
     let tool_calls =
         astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls)
             .into_owned();
-    let (blocked_tool_results, allowed_tool_calls) =
-        intercept_disallowed_tool_calls(state, &tool_calls);
+    let (mut blocked_tool_results, post_detach_tool_calls) =
+        intercept_same_turn_detached_task_poll(state, &tool_calls);
+    let (allowlist_blocked_tool_results, allowed_tool_calls) =
+        intercept_disallowed_tool_calls(state, &post_detach_tool_calls);
+    blocked_tool_results.extend(allowlist_blocked_tool_results);
     let (mut pre_resolved_results, post_send_tool_calls, communication_events) =
         intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
@@ -243,7 +310,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             name: result.tool_name.clone(),
             ok: false,
             ms: 0,
-            error: Some("tool blocked by active request/skill allowlist".to_string()),
+            error: Some("tool intercepted by runtime control policy".to_string()),
             input_bytes: None,
             output_bytes: Some(result.result.len() as u32),
             args_preview,

@@ -79,29 +79,31 @@ fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<Stri
     })
 }
 
-fn detached_background_task_wait_reason(
+fn detached_background_task_id(
     edge_tool_round: &[astra_turn_core::sse_stream_host::EdgeToolExecResult],
     tool_results: &[Value],
 ) -> Option<String> {
     edge_tool_round
         .iter()
-        .find_map(detached_background_task_reason_from_edge_result)
+        .find_map(detached_background_task_id_from_edge_result)
         .or_else(|| {
             tool_results
                 .iter()
-                .find_map(detached_background_task_reason_from_tool_result)
+                .find_map(detached_background_task_id_from_tool_result)
         })
 }
 
-fn detached_background_task_reason_from_edge_result(
+fn detached_background_task_id_from_edge_result(
     result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
 ) -> Option<String> {
     let fields = result.tool_result_fields.as_ref()?;
-    (fields.get("bash_detached").and_then(Value::as_bool) == Some(true))
-        .then(|| detached_background_task_reason(background_task_id_from_map(fields)))
+    if fields.get("bash_detached").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    background_task_id_from_map(fields)
 }
 
-fn detached_background_task_reason_from_tool_result(result: &Value) -> Option<String> {
+fn detached_background_task_id_from_tool_result(result: &Value) -> Option<String> {
     let result = result.as_object()?;
     let metadata = result.get("metadata").and_then(Value::as_object);
     let detached = result.get("bash_detached").and_then(Value::as_bool) == Some(true)
@@ -111,10 +113,7 @@ fn detached_background_task_reason_from_tool_result(result: &Value) -> Option<St
     if !detached {
         return None;
     }
-    Some(detached_background_task_reason(
-        background_task_id_from_map(result)
-            .or_else(|| metadata.and_then(background_task_id_from_map)),
-    ))
+    background_task_id_from_map(result).or_else(|| metadata.and_then(background_task_id_from_map))
 }
 
 fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<String> {
@@ -124,34 +123,6 @@ fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-fn detached_background_task_reason(task_id: Option<String>) -> String {
-    match task_id {
-        Some(task_id) => format!("background_task_detached:{task_id}"),
-        None => "background_task_detached".to_string(),
-    }
-}
-
-fn agent_fanout_wait_reason(
-    edge_tool_round: &[astra_turn_core::sse_stream_host::EdgeToolExecResult],
-    tool_results: &[Value],
-) -> Option<String> {
-    edge_tool_round
-        .iter()
-        .find_map(agent_fanout_reason_from_edge_result)
-        .or_else(|| {
-            tool_results
-                .iter()
-                .find_map(agent_fanout_reason_from_tool_result)
-        })
-}
-
-fn agent_fanout_reason_from_edge_result(result: &EdgeToolExecResult) -> Option<String> {
-    if result.tool != "agent_fanout" {
-        return None;
-    }
-    agent_fanout_reason_from_text(&result.output)
 }
 
 fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
@@ -272,67 +243,6 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
             "{recovery_kind}"
         );
     }
-}
-
-fn agent_fanout_reason_from_tool_result(result: &Value) -> Option<String> {
-    agent_fanout_reason_from_value(result).or_else(|| {
-        result.as_object().and_then(|object| {
-            ["output", "result", "content"]
-                .iter()
-                .filter_map(|key| object.get(*key).and_then(Value::as_str))
-                .find_map(agent_fanout_reason_from_text)
-        })
-    })
-}
-
-fn agent_fanout_reason_from_text(text: &str) -> Option<String> {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|value| agent_fanout_reason_from_value(&value))
-}
-
-fn agent_fanout_reason_from_value(value: &Value) -> Option<String> {
-    let root = value.as_object()?;
-    let fanout = root.get("fanout")?.as_object()?;
-    let accepted = fanout.get("accepted").and_then(Value::as_u64).unwrap_or(0);
-    let active = fanout.get("active").and_then(Value::as_u64).unwrap_or(0);
-    let terminal = fanout
-        .get("terminal")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            let completed = fanout.get("completed").and_then(Value::as_u64).unwrap_or(0);
-            let failed = fanout.get("failed").and_then(Value::as_u64).unwrap_or(0);
-            let cancelled_by_user = fanout
-                .get("cancelled_by_user")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let cancelled_by_parent_budget = fanout
-                .get("cancelled_by_parent_budget")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let timed_out = fanout.get("timed_out").and_then(Value::as_u64).unwrap_or(0);
-            Some(completed + failed + cancelled_by_user + cancelled_by_parent_budget + timed_out)
-        })
-        .unwrap_or(0);
-    let root_status = root.get("status").and_then(Value::as_str).unwrap_or("");
-    let fanout_status = fanout.get("status").and_then(Value::as_str).unwrap_or("");
-    let running = active > 0
-        || matches!(root_status, "running")
-        || matches!(fanout_status, "planned" | "running")
-        || (accepted > 0 && terminal < accepted);
-    if !running {
-        return None;
-    }
-    let group_id = root
-        .get("group_id")
-        .and_then(Value::as_str)
-        .or_else(|| fanout.get("group_id").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|group_id| !group_id.is_empty());
-    Some(match group_id {
-        Some(group_id) => format!("agent_fanout_running:{group_id}"),
-        None => "agent_fanout_running".to_string(),
-    })
 }
 
 fn build_runtime_session_quality_assessment(
@@ -1687,9 +1597,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
-    let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results)
-        .or_else(|| detached_background_task_wait_reason(&edge_tool_round, &new_tool_results))
-        .or_else(|| agent_fanout_wait_reason(&edge_tool_round, &new_tool_results));
+    if let Some(task_id) = detached_background_task_id(&edge_tool_round, &new_tool_results) {
+        state.stall.same_turn_detached_task_ids.insert(task_id);
+    }
+
+    let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
 
     let _ = evo_records_before;
 
@@ -2195,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_background_wait_uses_structured_edge_fields() {
+    fn detached_background_task_id_uses_structured_edge_fields() {
         let structured = astra_turn_core::sse_stream_host::EdgeToolExecResult {
             request_id: "req-1".into(),
             tool: "bash".into(),
@@ -2209,8 +2121,8 @@ mod tests {
             duration_ms: 1,
         };
         assert_eq!(
-            detached_background_task_reason_from_edge_result(&structured).as_deref(),
-            Some("background_task_detached:bg-shell-1")
+            detached_background_task_id_from_edge_result(&structured).as_deref(),
+            Some("bg-shell-1")
         );
 
         let text_only = astra_turn_core::sse_stream_host::EdgeToolExecResult {
@@ -2219,7 +2131,7 @@ mod tests {
             ..structured
         };
         assert_eq!(
-            detached_background_task_reason_from_edge_result(&text_only),
+            detached_background_task_id_from_edge_result(&text_only),
             None
         );
     }

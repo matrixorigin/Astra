@@ -4858,12 +4858,17 @@ impl ToolExecutor {
                             .await
                         }
                         astra_tools::agent_tool_contract::AgentAction::SendMessage => {
-                            let ctx = self
+                            let mailbox_ctx = self
                                 .send_message_context
                                 .lock()
-                                .ok()
-                                .and_then(|g| g.clone());
-                            agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            agent_spawning::handle_agent_send_message_action(
+                                args,
+                                self.spawn_context.as_ref(),
+                                mailbox_ctx.as_ref(),
+                            )
+                            .await
                         }
                     }
                 }
@@ -6284,7 +6289,8 @@ mod tests {
             )
             .await;
         let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "completed", "{started}");
+        assert_eq!(started_value["status"], "started", "{started}");
+        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
 
         let result = executor
             .task_output(&serde_json::json!({
@@ -6328,8 +6334,15 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
 
-        assert_eq!(parsed["status"], "completed", "{result}");
-        assert_eq!(parsed["result"], "child result", "{result}");
+        assert_eq!(parsed["status"], "launched", "{result}");
+        assert_eq!(parsed["lifecycle"], "running", "{result}");
+        assert_eq!(parsed["delivery"], "asynchronous", "{result}");
+        assert!(
+            parsed["agent_id"]
+                .as_str()
+                .is_some_and(|agent_id| !agent_id.is_empty()),
+            "{result}"
+        );
         assert!(
             !result.contains("multi-agent runtime is not connected"),
             "bound spawn context must not be treated as missing: {result}"
@@ -6358,7 +6371,8 @@ mod tests {
             )
             .await;
         let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "completed", "{started}");
+        assert_eq!(started_value["status"], "started", "{started}");
+        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
 
         let result = executor.task_list_bg().await;
 

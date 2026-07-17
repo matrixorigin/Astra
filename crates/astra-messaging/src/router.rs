@@ -305,8 +305,17 @@ pub struct AgentMailboxRouter {
     delegation_tracker: Arc<dyn DelegationLookup>,
     /// run_id → registered AgentAddress (for resolving Parent targets).
     address_registry: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
+    /// Causal/turn run_id → stable mailbox address. Interactive parents can
+    /// launch children from a turn-scoped run while receiving their eventual
+    /// results through a session-scoped mailbox.
+    parent_delivery_aliases: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
     /// Serializes check-and-register so registration ownership is atomic.
     registration_gate: tokio::sync::Mutex<()>,
+    /// Bounded terminal/checkpoint delivery waiting for a temporarily idle
+    /// parent mailbox to register again. Direct guidance is never queued here:
+    /// a missing child target must remain an explicit rejection.
+    pending_parent_messages:
+        tokio::sync::Mutex<std::collections::HashMap<String, VecDeque<AgentMessage>>>,
 }
 
 impl AgentMailboxRouter {
@@ -318,7 +327,9 @@ impl AgentMailboxRouter {
             transport,
             delegation_tracker,
             address_registry: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            parent_delivery_aliases: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             registration_gate: tokio::sync::Mutex::new(()),
+            pending_parent_messages: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -366,6 +377,54 @@ impl AgentMailboxRouter {
             }
         };
 
+        // A root/parent mailbox is turn-scoped in some clients while child
+        // work can outlive that turn. Flush only messages that were explicitly
+        // addressed to this parent run, rewriting the transient agent label to
+        // the newly registered canonical address.
+        let pending = self
+            .pending_parent_messages
+            .lock()
+            .await
+            .remove(&addr.run_id)
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let mut retry = VecDeque::new();
+            for message in pending {
+                if message.is_expired() {
+                    tracing::debug!(
+                        target: "astra_runtime::messaging",
+                        message_id = %message.id,
+                        parent_run_id = %addr.run_id,
+                        "dropping expired deferred parent message before replay"
+                    );
+                    continue;
+                }
+                let message = AgentMessage {
+                    to: MessageTarget::Direct {
+                        address: addr.clone(),
+                    },
+                    ..message
+                };
+                if let Err(error) = self.transport.send(Arc::new(message.clone())).await {
+                    tracing::warn!(
+                        target: "astra_runtime::messaging",
+                        parent_run_id = %addr.run_id,
+                        error = %error,
+                        "deferred parent message replay failed; retaining for next registration"
+                    );
+                    retry.push_back(message);
+                }
+            }
+            if !retry.is_empty() {
+                self.pending_parent_messages
+                    .lock()
+                    .await
+                    .entry(addr.run_id.clone())
+                    .or_default()
+                    .extend(retry);
+            }
+        }
+
         Ok(AgentMailbox {
             address: addr,
             delegation_id,
@@ -408,6 +467,45 @@ impl AgentMailboxRouter {
         self.transport.resolve_agent(delegation_id, agent_id).await
     }
 
+    /// Resolve an exact run identity already owned by this router.
+    pub async fn registered_address(&self, run_id: &str) -> Option<AgentAddress> {
+        self.address_registry.read().await.get(run_id).cloned()
+    }
+
+    /// Resolve one unambiguous live mailbox owned by `agent_id`.
+    pub async fn registered_address_for_agent(&self, agent_id: &str) -> Option<AgentAddress> {
+        let registry = self.address_registry.read().await;
+        let mut matches = registry
+            .values()
+            .filter(|address| address.agent_id == agent_id);
+        let address = matches.next()?.clone();
+        matches.next().is_none().then_some(address)
+    }
+
+    /// Bind a turn-scoped parent run to the stable mailbox that should receive
+    /// its child messages after that turn has settled.
+    pub async fn record_parent_delivery_alias(
+        &self,
+        parent_run_id: &str,
+        mailbox_address: &AgentAddress,
+    ) {
+        if parent_run_id.is_empty()
+            || mailbox_address.run_id.is_empty()
+            || parent_run_id == mailbox_address.run_id.as_str()
+        {
+            return;
+        }
+        self.parent_delivery_aliases
+            .write()
+            .await
+            .insert(parent_run_id.to_string(), mailbox_address.clone());
+    }
+
+    /// Return the canonical parent run identity for a child run.
+    pub async fn parent_run_id(&self, child_run_id: &str) -> Option<String> {
+        self.delegation_tracker.get_parent(child_run_id).await
+    }
+
     /// Check whether a specific run_id is registered in the address registry.
     pub async fn is_run_registered(&self, run_id: &str) -> bool {
         self.address_registry.read().await.contains_key(run_id)
@@ -444,9 +542,28 @@ impl AgentMailboxRouter {
             .await
             .ok_or(MailboxError::NoParent)?;
 
-        // Try address registry first (includes root agents).
-        if let Some(addr) = self.address_registry.read().await.get(&parent_run_id) {
+        let delivery_address = self
+            .parent_delivery_aliases
+            .read()
+            .await
+            .get(&parent_run_id)
+            .cloned();
+        let delivery_run_id = delivery_address
+            .as_ref()
+            .map(|address| address.run_id.as_str())
+            .unwrap_or(parent_run_id.as_str());
+
+        // Try address registry first (includes root agents and stable aliases).
+        if let Some(addr) = self.address_registry.read().await.get(delivery_run_id) {
             return Ok(addr.clone());
+        }
+
+        if let Some(delivery_address) = delivery_address {
+            // The alias remains useful while the stable root mailbox is idle:
+            // retain the full canonical identity. Durable transports route by
+            // both run_id and agent_id, so synthesizing either field here
+            // would persist the message to an address that never registers.
+            return Ok(delivery_address);
         }
 
         // Fall back to delegation tracker (for agents registered before router).
@@ -459,17 +576,14 @@ impl AgentMailboxRouter {
         match agent_id {
             Some(id) => Ok(AgentAddress::new(&parent_run_id, &id)),
             None => {
-                // Parent is the orchestrator/root run — not itself a sub-run,
-                // so it has no agent_id in the tracker. Use a synthetic address
-                // so progress messages can still be routed (best-effort).
-                tracing::debug!(
-                    target: "astra_runtime::messaging",
-                    parent_run_id = %parent_run_id,
-                    child_run_id = %child_run_id,
-                    "parent run_id not found in address registry or tracker; \
-                     using synthetic 'orchestrator' agent_id",
-                );
-                Ok(AgentAddress::new(&parent_run_id, "orchestrator"))
+                // A durable direct address includes both run and agent id.
+                // Guessing a root label here can report success while a DB
+                // transport persists the message for a mailbox that will
+                // never register. Reject explicitly and require callers to
+                // register/alias the canonical root mailbox first.
+                Err(MailboxError::Protocol(format!(
+                    "parent run '{parent_run_id}' has no canonical mailbox address (child '{child_run_id}')"
+                )))
             }
         }
     }
@@ -492,13 +606,64 @@ impl AgentMailboxRouter {
             }
             MessageTarget::Parent => {
                 let parent_addr = self.resolve_parent_addr(&msg.from.run_id).await?;
+                let parent_run_id = parent_addr.run_id.clone();
                 let resolved_msg = AgentMessage {
                     to: MessageTarget::Direct {
                         address: parent_addr,
                     },
                     ..msg
                 };
-                self.transport.send(Arc::new(resolved_msg)).await
+                match self.transport.send(Arc::new(resolved_msg.clone())).await {
+                    Ok(()) => Ok(()),
+                    Err(MailboxError::AgentNotFound(_)) => {
+                        // Close the send-failed → parent-registers → queue-late
+                        // race. Registration/unregistration use the same gate:
+                        // if registration already won, retry its canonical
+                        // address now; if this branch wins, registration will
+                        // flush the message after we enqueue it.
+                        let _registration = self.registration_gate.lock().await;
+                        let queued_message = if let Some(current_addr) = self
+                            .address_registry
+                            .read()
+                            .await
+                            .get(&parent_run_id)
+                            .cloned()
+                        {
+                            let retry_message = AgentMessage {
+                                to: MessageTarget::Direct {
+                                    address: current_addr,
+                                },
+                                ..resolved_msg.clone()
+                            };
+                            match self.transport.send(Arc::new(retry_message.clone())).await {
+                                Ok(()) => return Ok(()),
+                                Err(MailboxError::AgentNotFound(_)) => retry_message,
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            resolved_msg
+                        };
+                        const MAX_PENDING_PARENT_MESSAGES: usize = 256;
+                        const MAX_PENDING_PARENT_RUNS: usize = 256;
+                        let mut pending = self.pending_parent_messages.lock().await;
+                        if !pending.contains_key(&parent_run_id)
+                            && pending.len() >= MAX_PENDING_PARENT_RUNS
+                        {
+                            return Err(MailboxError::Transport(format!(
+                                "pending parent mailbox run capacity reached ({MAX_PENDING_PARENT_RUNS}); message was not accepted"
+                            )));
+                        }
+                        let queue = pending.entry(parent_run_id).or_default();
+                        if queue.len() >= MAX_PENDING_PARENT_MESSAGES {
+                            return Err(MailboxError::Transport(format!(
+                                "pending parent mailbox message capacity reached ({MAX_PENDING_PARENT_MESSAGES}); message was not accepted"
+                            )));
+                        }
+                        queue.push_back(queued_message);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
     }

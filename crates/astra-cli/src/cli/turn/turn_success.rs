@@ -376,9 +376,11 @@ fn apply_turn_success_primary_sync(
     state.total_session_cost += turn_cost;
     let effective_user_input = result.effective_user_input(line);
     let latest_user_input = result.latest_user_input(line);
-    state.continuation_anchor = build_continuation_anchor(state, &latest_user_input, &result);
-    state.pending_followup_suggestion =
-        crate::cli::followup_suggestion::suggest_followup(&latest_user_input, state, &result);
+    if !latest_user_input.trim().is_empty() {
+        state.continuation_anchor = build_continuation_anchor(state, &latest_user_input, &result);
+        state.pending_followup_suggestion =
+            crate::cli::followup_suggestion::suggest_followup(&latest_user_input, state, &result);
+    }
 
     state.redo_stack.clear();
     let recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);

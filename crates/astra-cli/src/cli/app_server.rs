@@ -18,7 +18,7 @@ use crate::cli::cli_config::cli_utils::get_profile_and_token;
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
 use crate::cli::session::session_continuation::load_session_messages_for_continuation;
 use crate::cli::session::session_runtime;
-use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
 type JsonWriter = Arc<Mutex<std::io::Stdout>>;
@@ -471,6 +471,9 @@ async fn run_turn(
         turn_options,
     )
     .await;
+    let background_agent_results = spawner_for_drain
+        .shutdown_and_wait(std::time::Duration::from_secs(30))
+        .await;
     drop(chat_ctx);
     drop(approval_tx);
     join_or_abort_app_server_task(event_task, Duration::from_millis(250)).await;
@@ -479,7 +482,12 @@ async fn run_turn(
     let mut sr = match result {
         Ok(sr) => sr,
         Err(err) => {
-            write_notification(&writer, "error", serde_json::json!({"message": err.error})).await?;
+            let mut error = err.error;
+            if let Some(section) = format_background_agent_results(&background_agent_results) {
+                error.push_str("\n\n");
+                error.push_str(&section);
+            }
+            write_notification(&writer, "error", serde_json::json!({"message": error})).await?;
             write_notification(
                 &writer,
                 "turn/completed",
@@ -489,9 +497,8 @@ async fn run_turn(
             return Ok(());
         }
     };
-    sr.background_agent_results = spawner_for_drain
-        .shutdown_and_wait(std::time::Duration::from_secs(30))
-        .await;
+    sr.background_agent_results = background_agent_results;
+    sr.integrate_background_agent_results();
     let next_thread_id = next_thread_id_after_turn(&thread_id, sr.session_id.as_deref());
     state.lock().await.thread_id = Some(next_thread_id.clone());
     write_turn_result(&writer, &thread_id, &next_thread_id, &turn_id, &sr).await?;

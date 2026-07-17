@@ -371,10 +371,8 @@ impl AgenticLoopHost for SubRunHost {
                     .unwrap_or_else(|| mailbox.address.run_id.clone());
                 crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
                     agent_id: mailbox.address.agent_id.clone(),
-                    run_id: run_id.clone(),
+                    run_id,
                     router: mailbox.router(),
-                    metrics: state.messaging.metrics.clone(),
-                    delegation_id: mailbox.delegation_id.clone().or(Some(run_id)),
                 }
             }));
 

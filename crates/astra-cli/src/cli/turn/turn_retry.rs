@@ -10,6 +10,13 @@ use super::turn_settlement::{
 use super::turn_stream_runner::{TurnAttempt, TurnExecutionInput, TurnExecutionRequest};
 use crate::cli::session::session_state::SessionState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnSettlementOutcome {
+    Succeeded,
+    Interrupted,
+    Failed,
+}
+
 pub(crate) async fn settle_turn_attempt(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
@@ -19,28 +26,36 @@ pub(crate) async fn settle_turn_attempt(
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
-) -> Result<(), String> {
+) -> Result<TurnSettlementOutcome, String> {
     match attempt {
-        TurnAttempt::Interrupted(result) => settle_interrupted_turn(state, dispatch, *result).await,
+        TurnAttempt::Interrupted(result) => {
+            settle_interrupted_turn(state, dispatch, *result).await;
+            Ok(TurnSettlementOutcome::Interrupted)
+        }
         TurnAttempt::Completed(result) => match *result {
-            Ok(result) => settle_successful_turn(state, dispatch, result).await,
+            Ok(result) => {
+                settle_successful_turn(state, dispatch, result).await;
+                Ok(TurnSettlementOutcome::Succeeded)
+            }
             Err(failure) => {
-                if try_retry_after_session_not_found(state, dispatch, &failure, &run_chat_turn)
-                    .await
+                if let Some(outcome) =
+                    try_retry_after_session_not_found(state, dispatch, &failure, &run_chat_turn)
+                        .await
                 {
-                    return Ok(());
+                    return Ok(outcome);
                 }
 
-                if try_retry_after_auth_refresh(state, dispatch, &failure, &run_chat_turn).await {
-                    return Ok(());
+                if let Some(outcome) =
+                    try_retry_after_auth_refresh(state, dispatch, &failure, &run_chat_turn).await
+                {
+                    return Ok(outcome);
                 }
 
                 settle_failed_turn(state, dispatch, &failure);
+                Ok(TurnSettlementOutcome::Failed)
             }
         },
     }
-
-    Ok(())
 }
 
 async fn try_retry_after_session_not_found(
@@ -52,9 +67,9 @@ async fn try_retry_after_session_not_found(
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
-) -> bool {
+) -> Option<TurnSettlementOutcome> {
     if !should_retry_after_session_not_found(&failure.error, state.session_id.is_some()) {
-        return false;
+        return None;
     }
 
     prepare_session_not_found_retry(state, dispatch.ctx.profile).await;
@@ -77,8 +92,7 @@ async fn try_retry_after_session_not_found(
         },
     })
     .await;
-    settle_retry_attempt(state, dispatch, retry).await;
-    true
+    Some(settle_retry_attempt(state, dispatch, retry).await)
 }
 
 async fn try_retry_after_auth_refresh(
@@ -90,13 +104,10 @@ async fn try_retry_after_auth_refresh(
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
-) -> bool {
-    let Some(new_token) =
+) -> Option<TurnSettlementOutcome> {
+    let new_token =
         prepare_auth_refresh_retry(dispatch.ctx.api, dispatch.ctx.profile, failure, dispatch.ui)
-            .await
-    else {
-        return false;
-    };
+            .await?;
 
     let retry = run_chat_turn(TurnExecutionRequest {
         state,
@@ -113,20 +124,28 @@ async fn try_retry_after_auth_refresh(
         },
     })
     .await;
-    settle_retry_attempt(state, dispatch, retry).await;
-    true
+    Some(settle_retry_attempt(state, dispatch, retry).await)
 }
 
 async fn settle_retry_attempt(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
     retry: TurnAttempt,
-) {
+) -> TurnSettlementOutcome {
     match retry {
-        TurnAttempt::Interrupted(result) => settle_interrupted_turn(state, dispatch, *result).await,
+        TurnAttempt::Interrupted(result) => {
+            settle_interrupted_turn(state, dispatch, *result).await;
+            TurnSettlementOutcome::Interrupted
+        }
         TurnAttempt::Completed(result) => match *result {
-            Ok(result) => settle_successful_turn(state, dispatch, result).await,
-            Err(retry_failure) => settle_failed_turn(state, dispatch, &retry_failure),
+            Ok(result) => {
+                settle_successful_turn(state, dispatch, result).await;
+                TurnSettlementOutcome::Succeeded
+            }
+            Err(retry_failure) => {
+                settle_failed_turn(state, dispatch, &retry_failure);
+                TurnSettlementOutcome::Failed
+            }
         },
     }
 }

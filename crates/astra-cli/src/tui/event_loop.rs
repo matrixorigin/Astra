@@ -53,6 +53,7 @@ use super::{
 const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
+const RUNTIME_NOTIFICATION_TURN_SENTINEL: &str = "\u{2063}astra-runtime-notification-turn\u{2063}";
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
 
@@ -1180,6 +1181,31 @@ async fn submit_active_run_guidance(
         .clone()
         .ok_or_else(|| "Run is changing state. Try again, or press Ctrl+C to stop.".to_string())?;
     provider.accept_guidance(text)
+}
+
+async fn submit_active_runtime_notification(
+    run_control: &std::sync::Arc<
+        std::sync::Mutex<
+            Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
+        >,
+    >,
+    content: &str,
+) -> Result<(), String> {
+    let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
+        .clone()
+        .ok_or_else(|| "active run control is settling".to_string())?;
+    provider.accept_runtime_notification(content)
+}
+
+fn background_task_event_requires_model_attention(
+    event: &super::background_tasks::BgTaskEvent,
+) -> bool {
+    matches!(
+        event,
+        super::background_tasks::BgTaskEvent::Completed { .. }
+            | super::background_tasks::BgTaskEvent::Failed { .. }
+            | super::background_tasks::BgTaskEvent::Killed { .. }
+    )
 }
 
 fn transcript_snapshot(
@@ -4502,6 +4528,8 @@ pub(crate) async fn run_tui_session(
     // FIFO order and re-enter the ordinary submit path rather than presenting
     // an "accepted" acknowledgement that never produces a response.
     let mut queued_followup_submissions = VecDeque::<String>::new();
+    let mut runtime_notification_turn_pending = false;
+    let mut runtime_notification_wake_at: Option<std::time::Instant> = None;
     let mut last_plan_interrupt: Option<std::time::Instant> = None;
 
     // Task board observer + toggle state. Observer is tick-driven
@@ -4825,6 +4853,30 @@ pub(crate) async fn run_tui_session(
                                 frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
+                                let runtime_notification_submission =
+                                    runtime_notification_turn_pending
+                                        && text == RUNTIME_NOTIFICATION_TURN_SENTINEL;
+                                if runtime_notification_turn_pending {
+                                    // The scheduled wake is consumed either by its
+                                    // sentinel or by a real user submission that won
+                                    // the race. In the latter case ordinary input
+                                    // finalization normally carries the pending runtime
+                                    // facts. Re-arm as a fallback because the real input
+                                    // may instead be a local slash/shell action that does
+                                    // not enter a model boundary.
+                                    runtime_notification_turn_pending = false;
+                                    if !runtime_notification_submission {
+                                        runtime_notification_wake_at.get_or_insert_with(|| {
+                                            std::time::Instant::now()
+                                                + Duration::from_millis(200)
+                                        });
+                                    }
+                                }
+                                let text = if runtime_notification_submission {
+                                    String::new()
+                                } else {
+                                    text
+                                };
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
                                 match classify_local_shell_submission(&text) {
@@ -4916,7 +4968,9 @@ pub(crate) async fn run_tui_session(
                                 // composer bytes: local slash actions belong to the
                                 // durable workbench transcript, while only actual
                                 // conversational input becomes a User turn.
-                                commit_submission_projection(&mut chat_widget, &text);
+                                if !runtime_notification_submission {
+                                    commit_submission_projection(&mut chat_widget, &text);
+                                }
                                 begin_submission_dispatch_feedback(
                                     &mut bottom_pane,
                                     &mut status_indicator,
@@ -5178,9 +5232,11 @@ pub(crate) async fn run_tui_session(
                                 } else {
                                     let submit_was_inline_plan_goal = inline_chat_submit.is_some();
                                     let submit_text = inline_chat_submit.unwrap_or(text);
-                                    if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
-                                        &state,
-                                    ) {
+                                    if !runtime_notification_submission
+                                        && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
+                                            &state,
+                                        )
+                                    {
                                         let Some(token) =
                                             crate::cli::plan::plan_lifecycle::fresh_token_for_plan(api, profile)
                                                 .await
@@ -5495,6 +5551,7 @@ pub(crate) async fn run_tui_session(
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
                                     let mut active_bash_description: Option<String> = None;
+                                    let mut deferred_active_bg_notifications = Vec::new();
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -5518,7 +5575,7 @@ pub(crate) async fn run_tui_session(
                                             crate::cli::turn::local_run_control::LocalRunControl::shared();
                                         *astra_core::sync_poison::recover_mutex_lock(
                                             &active_turn_local_run_control,
-                                        ) = Some(preinstalled_run_control);
+                                        ) = Some(preinstalled_run_control.clone());
                                         let bash_detach_slot_for_ctrl_b =
                                             state.bash_detach_slot.clone();
                                         let background_registry_turn_session_id =
@@ -5536,14 +5593,24 @@ pub(crate) async fn run_tui_session(
                                         // responsive while the visible state remains `Sending`.
                                         let fut = async {
                                             let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
-                                            crate::cli::turn::turn_entry::handle_chat_input_with_ui(
-                                                submit_text,
-                                                token.as_deref(),
-                                                &mut state,
-                                                ctx,
-                                                &mut tui_ui,
-                                            )
-                                            .await
+                                            if runtime_notification_submission {
+                                                crate::cli::turn::turn_entry::handle_runtime_notifications_with_ui(
+                                                    token.as_deref(),
+                                                    &mut state,
+                                                    ctx,
+                                                    &mut tui_ui,
+                                                )
+                                                .await
+                                            } else {
+                                                crate::cli::turn::turn_entry::handle_chat_input_with_ui(
+                                                    submit_text,
+                                                    token.as_deref(),
+                                                    &mut state,
+                                                    ctx,
+                                                    &mut tui_ui,
+                                                )
+                                                .await
+                                            }
                                         };
                                         tokio::pin!(fut);
 
@@ -5629,10 +5696,10 @@ pub(crate) async fn run_tui_session(
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
-                                                            // Ctrl+B is a single verb: show the background panel.
-                                                            // Promotion is a side effect when a foreground bash or
-                                                            // sync agent can actually be moved there. The key never
-                                                            // dead-ends on an "unavailable" toast.
+                                                            // Ctrl+B backgrounds foreground work without replacing
+                                                            // the user's composer with a management view. The task
+                                                            // panel remains an explicit navigation action when there
+                                                            // is no foreground work to promote.
                                                             if is_ctrl_b_background_key(&k) {
                                                                 let detach_fired = if !bash_detach_request_pending
                                                                     && background_registry.can_spawn_shell_task()
@@ -5687,32 +5754,12 @@ pub(crate) async fn run_tui_session(
                                                                     let pending_title = active_bash_description
                                                                         .as_deref()
                                                                         .unwrap_or("Bash");
-                                                                    let pending_rows = vec![
-                                                                        pending_bash_handoff_row(pending_title, 0),
-                                                                    ];
-                                                                    let _ = reveal_background_task_view_with_extra_rows(
-                                                                        &mut background_registry,
-                                                                        agent_spawner_for_cancel.as_ref(),
-                                                                        &restored_local_agent_task_projections,
-                                                                        &mut bottom_pane,
-                                                                        &frame_requester,
-                                                                        pending_rows,
-                                                                        Some(PENDING_BASH_HANDOFF_TASK_ID),
-                                                                    )
-                                                                    .await;
-                                                                } else if let Some(agent_id) =
-                                                                    promoted_agent_id.as_deref()
-                                                                {
-                                                                    let _ = reveal_background_task_view(
-                                                                        &mut background_registry,
-                                                                        agent_spawner_for_cancel.as_ref(),
-                                                                        &restored_local_agent_task_projections,
-                                                                        &mut bottom_pane,
-                                                                        &frame_requester,
-                                                                        Some(agent_id),
-                                                                    )
-                                                                    .await;
-                                                                } else {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::background_task(
+                                                                            format!("Moving {pending_title} to the background…"),
+                                                                        ),
+                                                                    );
+                                                                } else if promoted_agent_id.is_none() {
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::info(
                                                                             "Ctrl+B: Nothing to background. Opening task panel.",
@@ -6216,7 +6263,7 @@ pub(crate) async fn run_tui_session(
 
                                                             chat_widget.commit_system(
                                                                 history_cell::system::SystemCell::background_task(
-                                                                    format!("Opened {id} details · S stop · Esc list · Q close")
+                                                                    format!("Running in background · {id} · open the task panel to inspect")
                                                                 ),
                                                             );
                                                             set_bash_background_hint_enabled(
@@ -6230,15 +6277,7 @@ pub(crate) async fn run_tui_session(
                                                                 background_registry_turn_model.as_deref(),
                                                                 &mut background_task_projection_cache,
                                                             ).await;
-                                                            let _ = reveal_background_task_view(
-                                                                &mut background_registry,
-                                                                agent_spawner_for_cancel.as_ref(),
-                                                                &restored_local_agent_task_projections,
-                                                                &mut bottom_pane,
-                                                                &frame_requester,
-                                                                Some(id.as_str()),
-                                                            )
-                                                            .await;
+                                                            frame_requester.schedule_frame();
                                                         }
                                                         Err(error) => {
                                                             *bash_detach_slot_for_ctrl_b.lock().await = None;
@@ -6573,6 +6612,104 @@ pub(crate) async fn run_tui_session(
                                                         terminal_size.map(|size| size.height).unwrap_or(0),
                                                     )
                                                     .await;
+
+                                                    if std::time::Instant::now()
+                                                        >= next_local_agent_reconcile
+                                                    {
+                                                        let next_snapshot =
+                                                            super::local_agent_snapshot::LocalAgentSnapshot::capture(
+                                                                agent_spawner_for_cancel.as_ref(),
+                                                            )
+                                                            .await;
+                                                        let notifications = next_snapshot
+                                                            .attention_notifications_since(
+                                                                &local_agent_snapshot,
+                                                            );
+                                                        for notification in notifications {
+                                                            if submit_active_runtime_notification(
+                                                                &active_turn_local_run_control,
+                                                                &notification,
+                                                            )
+                                                            .await
+                                                            .is_err()
+                                                            {
+                                                                deferred_active_bg_notifications
+                                                                    .push(notification);
+                                                            }
+                                                        }
+                                                        local_agent_snapshot = next_snapshot;
+                                                        let changed = chat_widget
+                                                            .reconcile_local_agent_snapshot(
+                                                                &local_agent_snapshot,
+                                                                &restored_local_agent_task_projections,
+                                                            );
+                                                        next_local_agent_reconcile =
+                                                            std::time::Instant::now()
+                                                                + LOCAL_AGENT_RECONCILE_INTERVAL;
+                                                        if changed {
+                                                            refresh_open_agent_views(
+                                                                &chat_widget,
+                                                                &mut bottom_pane,
+                                                            );
+                                                        }
+                                                    }
+
+                                                    // Background terminal facts are consumed even
+                                                    // while the foreground agent owns `&mut state`.
+                                                    // Route them through local run control so the
+                                                    // next model boundary sees them without polling;
+                                                    // if output has already settled, preserve them for
+                                                    // the next turn instead of fabricating user input.
+                                                    let bg_events = background_registry.poll_completions();
+                                                    for event in &bg_events {
+                                                        if !background_task_event_requires_model_attention(event) {
+                                                            continue;
+                                                        }
+                                                        let notification =
+                                                            super::background_tasks::format_notification_xml(event);
+                                                        if notification.is_empty() {
+                                                            continue;
+                                                        }
+                                                        let delivered = output_settled_at.is_none()
+                                                            && submit_active_runtime_notification(
+                                                                &active_turn_local_run_control,
+                                                                &notification,
+                                                            )
+                                                            .await
+                                                            .is_ok();
+                                                        if !delivered {
+                                                            deferred_active_bg_notifications
+                                                                .push(notification);
+                                                        }
+                                                    }
+                                                    for message in
+                                                        background_task_event_system_messages(&bg_events)
+                                                    {
+                                                        chat_widget.commit_system(
+                                                            history_cell::system::SystemCell::info(&message),
+                                                        );
+                                                    }
+                                                    if !bg_events.is_empty() {
+                                                        persist_background_task_projections_if_changed(
+                                                            &mut background_registry,
+                                                            background_registry_turn_session_id.as_deref(),
+                                                            background_registry_turn_model.as_deref(),
+                                                            &mut background_task_projection_cache,
+                                                        )
+                                                        .await;
+                                                        let rows = background_task_rows_with_agent_snapshot(
+                                                            &mut background_registry,
+                                                            &local_agent_snapshot,
+                                                            &restored_local_agent_task_projections,
+                                                        );
+                                                        if bottom_pane.accepts_background_task_rows() {
+                                                            bottom_pane.refresh_background_task_rows(rows.clone());
+                                                        }
+                                                        let counts =
+                                                            status_line::BackgroundTaskCounts::from_rows(&rows);
+                                                        bottom_pane.footer.bg_task_counts =
+                                                            (!counts.is_empty()).then_some(counts);
+                                                    }
                                                     // Refresh the permission-mode chip via the
                                                     // lock-free mirror — the agentic loop holds
                                                     // `&mut state` so reading `state.perm_manager`
@@ -6600,11 +6737,25 @@ pub(crate) async fn run_tui_session(
                                                 }
                                             }
                                         };
+                                        deferred_active_bg_notifications.extend(
+                                            preinstalled_run_control
+                                                .take_pending_runtime_notifications(),
+                                        );
                                         // Turn fully settled: blit any images display_sixel
                                         // queued this turn on a paused screen (see fn docs).
                                         render_pending_sixel_images(&mut guard).await;
                                         r
                                     };
+
+                                    if !deferred_active_bg_notifications.is_empty() {
+                                        state
+                                            .pending_bg_notifications
+                                            .extend(deferred_active_bg_notifications);
+                                        runtime_notification_wake_at.get_or_insert_with(|| {
+                                            std::time::Instant::now()
+                                                + Duration::from_millis(200)
+                                        });
+                                    }
 
                                     if let Some(mode) = bottom_pane.take_staged_permission_mode() {
                                         slash_dispatch::apply_permission_mode_selection(
@@ -7699,11 +7850,20 @@ pub(crate) async fn run_tui_session(
                     }
                 }
                 if std::time::Instant::now() >= next_local_agent_reconcile {
-                    local_agent_snapshot =
+                    let next_local_agent_snapshot =
                         super::local_agent_snapshot::LocalAgentSnapshot::capture(
                             state.agent_spawner.as_ref(),
                         )
                         .await;
+                    let agent_notifications = next_local_agent_snapshot
+                        .attention_notifications_since(&local_agent_snapshot);
+                    if !agent_notifications.is_empty() {
+                        state.pending_bg_notifications.extend(agent_notifications);
+                        runtime_notification_wake_at.get_or_insert_with(|| {
+                            std::time::Instant::now() + Duration::from_millis(200)
+                        });
+                    }
+                    local_agent_snapshot = next_local_agent_snapshot;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
                         &local_agent_snapshot,
                         &restored_local_agent_task_projections,
@@ -7771,9 +7931,15 @@ pub(crate) async fn run_tui_session(
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
+                    if !background_task_event_requires_model_attention(ev) {
+                        continue;
+                    }
                     let notification = super::background_tasks::format_notification_xml(ev);
                     if !notification.is_empty() {
                         state.pending_bg_notifications.push(notification);
+                        runtime_notification_wake_at.get_or_insert_with(|| {
+                            std::time::Instant::now() + Duration::from_millis(200)
+                        });
                     }
                 }
                 for msg in background_task_event_system_messages(&bg_events) {
@@ -7781,6 +7947,28 @@ pub(crate) async fn run_tui_session(
                         history_cell::system::SystemCell::info(&msg),
                     );
                     frame_requester.schedule_frame();
+                }
+                if state.pending_bg_notifications.is_empty() {
+                    runtime_notification_wake_at = None;
+                }
+                if runtime_notification_wake_at
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    && !state.pending_bg_notifications.is_empty()
+                    && bottom_pane.composer.is_empty()
+                    && !bottom_pane.has_active_view()
+                    && !runtime_notification_turn_pending
+                {
+                    runtime_notification_wake_at = None;
+                    runtime_notification_turn_pending = true;
+                    bottom_pane
+                        .composer
+                        .set_text(RUNTIME_NOTIFICATION_TURN_SENTINEL);
+                    event_stream.push_front(TuiEvent::Key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    ));
                 }
                 persist_background_task_projections_if_changed(
                     &mut background_registry,

@@ -20,6 +20,9 @@ pub(crate) struct LocalUserIntentReceipt {
 struct LocalRunControlState {
     next_event_index: usize,
     intents: Vec<QueuedUserIntent>,
+    /// Runtime facts that reached a model boundary but are not safe to forget
+    /// until the enclosing turn settles successfully.
+    applied_runtime_notifications: Vec<String>,
     status: Option<RunControlStatus>,
 }
 
@@ -76,6 +79,53 @@ impl LocalRunControl {
         ))
     }
 
+    pub(crate) fn accept_runtime_notification(&self, content: &str) -> Result<(), String> {
+        if content.trim().is_empty() {
+            return Err("Runtime notification cannot be empty.".to_string());
+        }
+        if content.chars().count() > MAX_USER_INTENT_CHARS {
+            return Err(format!(
+                "Runtime notification is too large. Limit it to {MAX_USER_INTENT_CHARS} characters."
+            ));
+        }
+        self.accept_intent(
+            UserIntentDelivery::GuideCurrentRun,
+            astra_runtime::turn::run_control::runtime_notification_input(content),
+        );
+        Ok(())
+    }
+
+    /// Recover runtime facts that never reached a model boundary before the
+    /// active turn settled. Applied items have already been evicted by the
+    /// provider acknowledgement path, so this returns only genuinely pending
+    /// notifications and prevents a completion from disappearing in the
+    /// active→idle handoff.
+    pub(crate) fn take_pending_runtime_notifications(&self) -> Vec<String> {
+        let mut guard = recover_mutex_lock(&self.state);
+        let mut pending = std::mem::take(&mut guard.applied_runtime_notifications);
+        guard.intents.retain(|event| {
+            if let Some(content) =
+                astra_runtime::turn::run_control::runtime_notification_content(&event.input)
+            {
+                pending.push(content);
+                false
+            } else {
+                true
+            }
+        });
+        pending
+    }
+
+    /// Commit runtime facts only after the enclosing turn has produced and
+    /// settled a successful answer. Guidance acknowledgements still mean
+    /// "applied at a model boundary"; this extra local checkpoint prevents a
+    /// later model/persistence failure from losing the background fact.
+    pub(crate) fn commit_applied_runtime_notifications(&self) {
+        recover_mutex_lock(&self.state)
+            .applied_runtime_notifications
+            .clear();
+    }
+
     fn accept_intent(&self, delivery: UserIntentDelivery, input: Value) -> LocalUserIntentReceipt {
         let mut guard = recover_mutex_lock(&self.state);
         guard.next_event_index += 1;
@@ -109,6 +159,10 @@ impl RunStatusProvider for LocalRunControl {
 
 #[async_trait::async_trait]
 impl UserIntentProvider for LocalRunControl {
+    fn has_pending_inputs(&self) -> bool {
+        !recover_mutex_lock(&self.state).intents.is_empty()
+    }
+
     async fn poll_user_intents(
         &self,
         _user_id: &str,
@@ -144,9 +198,21 @@ impl UserIntentProvider for LocalRunControl {
             .copied()
             .collect::<std::collections::HashSet<_>>();
         let mut guard = recover_mutex_lock(&self.state);
+        let mut applied_runtime_notifications = Vec::new();
+        guard.intents.retain(|event| {
+            if !released.contains(&event.event_index) {
+                return true;
+            }
+            if let Some(content) =
+                astra_runtime::turn::run_control::runtime_notification_content(&event.input)
+            {
+                applied_runtime_notifications.push(content);
+            }
+            false
+        });
         guard
-            .intents
-            .retain(|event| !released.contains(&event.event_index));
+            .applied_runtime_notifications
+            .extend(applied_runtime_notifications);
         Ok(astra_runtime::turn::run_control::UserIntentApplyAck::Applied)
     }
 }

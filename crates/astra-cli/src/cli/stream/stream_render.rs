@@ -6882,7 +6882,7 @@ mod tests {
             outcome.output
         );
         assert!(
-            outcome.output.contains("end your turn now"),
+            outcome.output.contains("continue with independent work"),
             "{}",
             outcome.output
         );

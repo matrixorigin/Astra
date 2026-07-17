@@ -495,7 +495,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── send_message: Inter-agent messaging ────────────────────────────────
+        // ── Language Server Protocol ───────────────────────────────────────────
         json!({
             "type": "function",
             "function": {
@@ -853,25 +853,25 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground; no background arg); get_result needs returned agent_id; run_chain needs steps.\n\n\
+                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; asynchronous; no background arg); get_result needs returned agent_id; run_chain needs steps.\n\n\
          Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
          ## Required fields per action\n\
          - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
-         `spawn` is foreground by contract: it blocks until the sub-agent's final result is ready, and the sub-agent's tool calls stream back inline. Backgrounding is user-controlled from the UI with Ctrl+B while the live agent is running; do not pass a background flag in tool arguments.\n\n\
+         `spawn` is asynchronous by contract: it returns after the child has a stable agent_id/run_id and keeps the parent agent free to continue independent work. Terminal child results are delivered to the parent mailbox automatically. Use `send_message` for corrections and `get_result` only for an explicit observe/wait step; do not pass a background flag.\n\n\
          ## Parallel sub-agent fan-out\n\
          For a fixed-size parallel group, call `agent_fanout` with its JSON object schema; do not simulate it with an `agents:[...]` payload on `agent`. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## agent vs shell work vs task
-         - `agent(spawn)` + `agent(get_result)`: one synchronous or background sub-agent you plan to collect results from.
+         - `agent(spawn)` + optional `agent(get_result)`: one asynchronous sub-agent; completion also returns through the parent mailbox.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
@@ -890,10 +890,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
-                        "to": {"type": "string", "description": "REQUIRED for action='send_message'. Recipient agent_id, or '*' for broadcast."},
+                        "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Message content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
-                        "priority": {"type": "string", "enum": ["low","normal","high"]}
+                        "request_id": {"type": "string", "description": "Optional correlation id when answering or following up on an earlier message."}
                     },
                     "required": ["action"],
                     "additionalProperties": false,
@@ -915,7 +915,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id`. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
-         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Foreground results wait for accepted children; Ctrl+B is the user-controlled background action.",
+         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start returns stable child identities without waiting for the full group to finish; terminal results flow back through parent mailboxes and get_results remains available for explicit inspection.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1350,7 +1350,7 @@ mod tests {
     // `execute_code` is NOT in the schema list (so the model doesn't
     // hallucinate it).
 
-    // ── agent tool: foreground default + Ctrl+B backgrounding contract ─────
+    // ── agent tool: asynchronous spawn contract ────────────────────────────
 
     #[test]
     fn agent_schema_does_not_expose_model_background_parameter() {
@@ -1363,18 +1363,12 @@ mod tests {
             .expect("agent must expose parameters.properties");
         assert!(
             props.get("run_in_background").is_none(),
-            "backgrounding must be user-controlled with Ctrl+B, not model-controlled by schema"
+            "spawn is asynchronous by contract; the model should not control scheduling policy"
         );
     }
 
     #[test]
-    fn agent_schema_description_documents_sync_default() {
-        // Hard assertion that the tool description spells out the
-        // sync-default contract — this is the behaviour that
-        // separates astra's TaskCell UX from a fire-and-forget worker
-        // queue. If a future refactor collapses the description
-        // without the sync/async paragraph, the cache-safe short
-        // description would lose the load-bearing semantics.
+    fn agent_schema_description_documents_async_spawn() {
         let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
@@ -1383,12 +1377,12 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("synchronous") || desc.contains("blocks until"),
-            "agent description must state that spawn is sync by default"
+            desc.contains("asynchronous") && desc.contains("parent mailbox"),
+            "agent description must state that spawn returns before completion"
         );
         assert!(
-            desc.contains("Ctrl+B"),
-            "agent description must point backgrounding at the user-controlled Ctrl+B path"
+            desc.contains("get_result") && desc.contains("send_message"),
+            "agent description must explain explicit wait and correction paths"
         );
     }
 
@@ -1436,8 +1430,8 @@ mod tests {
 
         assert!(desc.contains("one complete JSON object"));
         assert!(desc.contains("`id`"));
-        assert!(desc.contains("Ctrl+B"));
-        assert!(desc.contains("Foreground results"));
+        assert!(desc.contains("without waiting for the full group"));
+        assert!(desc.contains("parent mailboxes"));
         assert!(desc.contains("bounded result window"));
         assert!(desc.contains("results[].next_call"));
         assert!(desc.contains("top-level `brief`"));

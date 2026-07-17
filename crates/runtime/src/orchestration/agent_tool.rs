@@ -2,8 +2,9 @@
 //!
 //! CLI and server execution environments own different child-loop
 //! executors, but the `agent(action='spawn'|'get_result')` contract is
-//! runtime semantics. Keep parsing, normalization, lifecycle dispatch, and
-//! result rendering here so Web/server cannot drift from CLI behavior.
+//! runtime semantics. Keep parsing, normalization, mailbox routing, lifecycle
+//! dispatch, and result rendering here so Web/server cannot drift from CLI
+//! behavior.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +32,9 @@ use astra_turn_core::orchestration_fanout_group::{
 use super::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnAgentOutput, SpawnContext,
     SpawnError, WaitForAgentOutcome,
+};
+use astra_messaging::{
+    AgentAddress, AgentMessage, MessagePayload, MessageTarget, types::RequestType,
 };
 use astra_turn_core::trace_event::TraceContext;
 
@@ -74,6 +78,23 @@ fn render_spawn_agent_output(
         "transcript_location".to_string(),
         Value::String(transcript_location.wire_value().to_string()),
     );
+    if object.get("status").and_then(Value::as_str) == Some("launched") {
+        object.insert(
+            "lifecycle".to_string(),
+            Value::String("running".to_string()),
+        );
+        object.insert(
+            "delivery".to_string(),
+            Value::String("asynchronous".to_string()),
+        );
+        object.insert(
+            "instruction".to_string(),
+            Value::String(
+                "The child is running independently. Continue useful parent work; its terminal result will be delivered to the parent mailbox. Use send_message to correct it, and get_result only when an explicit wait or inspection is valuable."
+                    .to_string(),
+            ),
+        );
+    }
     if object.get("status").and_then(Value::as_str) == Some("failed")
         && object.get("finish_reason").and_then(Value::as_str) == Some("executor_dropped")
     {
@@ -267,7 +288,7 @@ pub struct AgentToolContext {
 ///
 /// Environment-specific actions such as `run_chain` can still be handled by
 /// the caller before/after this function. This shared handler intentionally
-/// owns spawn/get_result validation and rendering.
+/// owns spawn/get_result/send_message validation and rendering.
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
     if has_malformed_tool_args(args) {
         return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent");
@@ -279,12 +300,224 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
     match action {
         AgentAction::Spawn => handle_agent_spawn_action(args, ctx).await,
         AgentAction::GetResult => handle_agent_get_result_action(args, ctx).await,
-        AgentAction::SendMessage => render_agent_runtime_binding_error("agent", "send_message"),
+        AgentAction::SendMessage => handle_agent_send_message_action(args, ctx).await,
         AgentAction::RunChain => render_agent_tool_error(
             None,
             "agent.run_chain is owned by the executor chain engine and cannot be handled by the shared agent lifecycle handler.",
         ),
     }
+}
+
+fn rejected_agent_message(reason: impl Into<String>) -> String {
+    json!({
+        "success": false,
+        "status": "rejected",
+        "reason": reason.into(),
+    })
+    .to_string()
+}
+
+fn agent_message_content(args: &Value) -> Result<String, String> {
+    let message = args
+        .get("message")
+        .ok_or_else(|| "send_message requires `message`".to_string())?;
+    let content = match message {
+        Value::String(content) => content.clone(),
+        other => serde_json::to_string(other)
+            .map_err(|_| "send_message could not serialize `message`".to_string())?,
+    };
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("send_message requires a non-empty `message`".to_string());
+    }
+    if content.chars().count() > 20_000 {
+        return Err("send_message `message` exceeds 20000 characters".to_string());
+    }
+    Ok(content.to_string())
+}
+
+fn agent_message_payload(message_type: &str, content: &str) -> Result<MessagePayload, String> {
+    match message_type {
+        "text" | "answer" | "instruction" | "shutdown_response" => Ok(MessagePayload::Text {
+            content: content.to_string(),
+            summary: Some(message_type.replace('_', " ")),
+        }),
+        "progress" => Ok(MessagePayload::Progress {
+            turn_index: 0,
+            tool_calls: 0,
+            status: "in_progress".to_string(),
+            detail: Some(content.to_string()),
+        }),
+        "question" => Ok(MessagePayload::Request {
+            request_type: RequestType::Custom("question".to_string()),
+            data: json!({"content": content}),
+        }),
+        // Runtime owns lifecycle truth and automatically emits the real
+        // terminal Completed/Failed signal. A model-authored "result" is a
+        // semantic report, not proof that the child run has terminated.
+        "result" => Ok(MessagePayload::Text {
+            content: content.to_string(),
+            summary: Some("result report".to_string()),
+        }),
+        "shutdown_request" => Ok(MessagePayload::Request {
+            request_type: RequestType::Shutdown,
+            data: json!({"reason": content}),
+        }),
+        other => Err(format!(
+            "unsupported message_type '{other}'; use text, question, answer, instruction, progress, result, shutdown_request, or shutdown_response"
+        )),
+    }
+}
+
+async fn resolve_agent_message_target(
+    router: &astra_messaging::router::AgentMailboxRouter,
+    run_id: &str,
+    recipient: &str,
+) -> Result<(MessageTarget, String, Option<Vec<String>>), String> {
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        return Err("send_message requires a non-empty `to`".to_string());
+    }
+    match recipient.to_ascii_lowercase().as_str() {
+        "parent" | "orchestrator" => {
+            if router.parent_run_id(run_id).await.is_none() {
+                return Err("the root agent has no parent target".to_string());
+            }
+            return Ok((MessageTarget::Parent, "parent".to_string(), None));
+        }
+        "*" | "broadcast" | "all" | "peers" => {
+            // Broadcast has one stable meaning: peers in the sender's current
+            // delegation. A root's delegation is its children; a child uses
+            // its parent's namespace. Do not switch meaning merely because a
+            // nested agent happened to spawn children of its own.
+            let namespace = router
+                .parent_run_id(run_id)
+                .await
+                .unwrap_or_else(|| run_id.to_string());
+            let recipients = router
+                .list_registered_agents(&namespace)
+                .await
+                .map_err(|error| format!("broadcast target lookup failed: {error}"))?;
+            let recipient_ids = recipients
+                .iter()
+                .filter(|address| address.run_id != run_id)
+                .map(|address| address.agent_id.clone())
+                .collect::<Vec<_>>();
+            if recipient_ids.is_empty() {
+                return Err("no active peer agents are available for broadcast".to_string());
+            }
+            return Ok((
+                MessageTarget::Broadcast {
+                    delegation_id: namespace,
+                },
+                "broadcast".to_string(),
+                Some(recipient_ids),
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(address) = router.registered_address(recipient).await {
+        let sender_parent = router.parent_run_id(run_id).await;
+        let target_parent = router.parent_run_id(&address.run_id).await;
+        let related = target_parent.as_deref() == Some(run_id)
+            || sender_parent.as_deref() == Some(address.run_id.as_str())
+            || sender_parent.is_some() && sender_parent == target_parent;
+        if !related {
+            return Err(format!(
+                "target run_id '{recipient}' is outside the sender's parent/child/peer delegation boundary"
+            ));
+        }
+        let display = format!("{}@{}", address.agent_id, address.run_id);
+        return Ok((MessageTarget::Direct { address }, display, None));
+    }
+    if let Ok(address) = router.resolve_agent(run_id, recipient).await {
+        let display = format!("{}@{}", address.agent_id, address.run_id);
+        return Ok((MessageTarget::Direct { address }, display, None));
+    }
+    if let Some(parent_run_id) = router.parent_run_id(run_id).await
+        && let Ok(address) = router.resolve_agent(&parent_run_id, recipient).await
+    {
+        let display = format!("{}@{}", address.agent_id, address.run_id);
+        return Ok((MessageTarget::Direct { address }, display, None));
+    }
+    Err(format!(
+        "target '{recipient}' is not an active child, peer, or exact run_id"
+    ))
+}
+
+async fn handle_agent_send_message_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    let Some(ctx) = ctx else {
+        return render_agent_runtime_binding_error("agent", "send_message");
+    };
+    let router = ctx.spawner.mailbox_router();
+    handle_agent_send_message_with_router(args, router.as_ref(), &ctx.run_id, &ctx.agent_id).await
+}
+
+/// Canonical mailbox-backed `agent.send_message` implementation. Callers
+/// that own a mailbox but do not expose a dynamic-agent spawn context (for
+/// example skill sub-runs) use this entry point so routing and receipts do not
+/// fork into a second protocol.
+pub async fn handle_agent_send_message_with_router(
+    args: &Value,
+    router: &astra_messaging::router::AgentMailboxRouter,
+    run_id: &str,
+    agent_id: &str,
+) -> String {
+    let content = match agent_message_content(args) {
+        Ok(content) => content,
+        Err(error) => return rejected_agent_message(error),
+    };
+    let message_type = args
+        .get("message_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text");
+    let payload = match agent_message_payload(message_type, &content) {
+        Ok(payload) => payload,
+        Err(error) => return rejected_agent_message(error),
+    };
+    let recipient = match args.get("to").and_then(Value::as_str) {
+        Some(recipient) => recipient,
+        None => return rejected_agent_message("send_message requires string field `to`"),
+    };
+    let (target, target_display, recipients) =
+        match resolve_agent_message_target(router, run_id, recipient).await {
+            Ok(target) => target,
+            Err(error) => return rejected_agent_message(error),
+        };
+
+    // Replies/acks must target a mailbox that actually survives long enough
+    // to receive them. Interactive root execution uses a turn-scoped run_id,
+    // while its mailbox is session-scoped; child/server agents normally use
+    // the same identity for both.
+    let from = router
+        .registered_address_for_agent(agent_id)
+        .await
+        .unwrap_or_else(|| AgentAddress::new(run_id, agent_id));
+    let mut message = AgentMessage::new(from, target, payload).with_ack_required();
+    if let Some(request_id) = args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+    {
+        message = message.with_correlation(request_id);
+    }
+    let message_id = message.id.clone();
+    if let Err(error) = router.send(message).await {
+        return rejected_agent_message(format!("delivery rejected: {error}"));
+    }
+
+    json!({
+        "success": true,
+        "status": "queued",
+        "message_id": message_id,
+        "target": target_display,
+        "recipients": recipients,
+        "message_type": message_type,
+        "acknowledgement": "The target runtime will emit applied acknowledgement after injecting this guidance at a model boundary.",
+    })
+    .to_string()
 }
 
 /// Handle the atomic `agent_fanout` tool.
@@ -553,7 +786,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
     "max_bytes",
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Backgrounding is user-controlled with Ctrl+B; do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Fanout start is asynchronous by contract; do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 
@@ -1790,6 +2023,10 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     if input.model.is_none() {
         input.model = ctx.current_model.clone();
     }
+    // Public spawn is a launch operation, not a remote function call. The
+    // spawner already owns a durable background lifecycle and returns only
+    // after the child has a stable run/agent identity.
+    input.run_in_background = true;
     if let Err(e) = input.validate_fanout_metadata() {
         return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
@@ -1802,6 +2039,21 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     // (e.g., A spawns B, B spawns C, C tries to spawn A → detected).
     let mut child_delegation_chain = ctx.delegation_chain.clone();
     child_delegation_chain.push(ctx.agent_id.clone());
+
+    // CLI parents have a turn-scoped execution run_id but a stable root
+    // mailbox. Record that relationship before the child is registered so
+    // terminal/checkpoint messages never target an address that disappears
+    // with the spawning turn. Server/child contexts normally resolve to the
+    // same run_id and therefore need no alias.
+    let mailbox_router = ctx.spawner.mailbox_router();
+    if let Some(parent_mailbox) = mailbox_router
+        .registered_address_for_agent(&ctx.agent_id)
+        .await
+    {
+        mailbox_router
+            .record_parent_delivery_alias(&ctx.run_id, &parent_mailbox)
+            .await;
+    }
 
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
@@ -1957,24 +2209,11 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
             .to_string());
     }
 
-    if let Some(run_in_background) = obj.get("run_in_background") {
-        match run_in_background.as_bool() {
-            Some(false) => {
-                obj.remove("run_in_background");
-            }
-            Some(true) => {
-                return Err(
-                    "unsupported `run_in_background: true` for `agent(action='spawn')`. Backgrounding is a user-controlled UI action: omit this field and let the user press Ctrl+B while the live agent is running."
-                        .to_string(),
-                );
-            }
-            None => {
-                return Err(
-                    "invalid `run_in_background` field for `agent(action='spawn')`: expected boolean false or omit the field."
-                        .to_string(),
-                );
-            }
-        }
+    if obj.contains_key("run_in_background") {
+        return Err(
+            "unsupported `run_in_background` field for `agent(action='spawn')`: spawn is asynchronous by contract, so omit the field. Use get_result only for an explicit observe/wait step."
+                .to_string(),
+        );
     }
 
     obj.remove("action");
@@ -1999,6 +2238,43 @@ pub async fn handle_agent_get_result_action(
     ctx: Option<&AgentToolContext>,
 ) -> String {
     handle_agent_get_result_action_inner(args, ctx, true).await
+}
+
+async fn enrich_collected_agent_result(
+    rendered: String,
+    ctx: &AgentToolContext,
+    agent_id: &str,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(&rendered) else {
+        return rendered;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return rendered;
+    };
+    if let Some(state) = ctx.spawner.get_agent_state_any(agent_id).await {
+        object.insert("run_id".into(), json!(state.run_id));
+        object.insert("tool_calls".into(), json!(state.metrics.tool_calls));
+        let duration_ms = state
+            .ended_at
+            .unwrap_or_else(std::time::SystemTime::now)
+            .duration_since(state.started_at)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        object.insert("duration_ms".into(), json!(duration_ms));
+    }
+    if object.get("status").and_then(Value::as_str) == Some("failed")
+        && object.get("finish_reason").and_then(Value::as_str) == Some("executor_dropped")
+    {
+        object.insert("diagnostic".into(), json!("executor_dropped"));
+        object.insert("retryable".into(), json!(false));
+        object.insert(
+            "instruction".into(),
+            json!(
+                "The child run was scheduled but its completion payload was lost. Do not retry the agent spawn or create a replacement sub-agent; that could duplicate side effects. Report the incomplete child result or continue with currently bound tools."
+            ),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or(rendered)
 }
 
 async fn handle_agent_get_result_action_inner(
@@ -2052,7 +2328,9 @@ async fn handle_agent_get_result_action_inner(
                 )
                 .await;
             let group = ctx.spawner.fanout_group_for_agent(agent_id).await;
-            attach_fanout_to_agent_result(render_wait_for_agent_status(agent_id, &status), group)
+            let rendered = render_wait_for_agent_status(agent_id, &status);
+            let rendered = enrich_collected_agent_result(rendered, ctx, agent_id).await;
+            attach_fanout_to_agent_result(rendered, group)
         }
         WaitForAgentOutcome::TimedOut => {
             let live_status = ctx
@@ -2264,30 +2542,19 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_rejects_run_in_background_true() {
-        let err = normalize_agent_spawn_args(&json!({
+    fn spawn_arg_normalization_rejects_redundant_background_policy_field() {
+        for value in [true, false] {
+            let err = normalize_agent_spawn_args(&json!({
             "action": "spawn",
             "description": "Review one",
             "prompt": "p1",
-            "run_in_background": true,
+            "run_in_background": value,
             "_tool_call_id": "call-1"
-        }))
-        .expect_err("model-facing spawn must not background itself");
-        assert!(err.contains("run_in_background"), "{err}");
-        assert!(err.contains("Ctrl+B"), "{err}");
-    }
-
-    #[test]
-    fn spawn_arg_normalization_ignores_run_in_background_false() {
-        let normalized = normalize_agent_spawn_args(&json!({
-            "action": "spawn",
-            "description": "Review one",
-            "prompt": "p1",
-            "run_in_background": false,
-            "_tool_call_id": "call-1"
-        }))
-        .expect("false is the synchronous default and should be accepted");
-        assert!(normalized.get("run_in_background").is_none());
+            }))
+            .expect_err("spawn owns its asynchronous scheduling policy");
+            assert!(err.contains("run_in_background"), "{err}");
+            assert!(err.contains("asynchronous"), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -2532,6 +2799,32 @@ mod tests {
         }
     }
 
+    async fn collect_spawn_receipt(receipt: &str, ctx: &AgentToolContext) -> Value {
+        let launched: Value = serde_json::from_str(receipt).expect("spawn receipt must be JSON");
+        assert_eq!(launched["status"], "launched", "{receipt}");
+        let agent_id = launched["agent_id"]
+            .as_str()
+            .expect("launch receipt must carry agent_id");
+        let result =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(ctx)).await;
+        serde_json::from_str(&result).expect("collected agent result must be JSON")
+    }
+
+    async fn collect_fanout_start(start: &str, ctx: &AgentToolContext) -> Value {
+        let started: Value =
+            serde_json::from_str(start).expect("fanout start receipt must be JSON");
+        assert_eq!(started["status"], "started", "{start}");
+        let group_id = started["group_id"]
+            .as_str()
+            .expect("fanout start receipt must carry group_id");
+        let result = handle_agent_fanout_tool(
+            &json!({"action": "get_results", "group_id": group_id}),
+            Some(ctx),
+        )
+        .await;
+        serde_json::from_str(&result).expect("collected fanout result must be JSON")
+    }
+
     #[tokio::test]
     async fn handle_spawn_agent_tool_inherits_parent_model_when_omitted() {
         let executor = Arc::new(CapturingModelExecutor::new());
@@ -2545,7 +2838,12 @@ mod tests {
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
-        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["status"],
+            "launched"
+        );
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
@@ -2588,7 +2886,8 @@ mod tests {
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
-        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(
             executor.take_captured_max_turns(),
             Some(60),
@@ -2625,7 +2924,8 @@ mod tests {
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
-        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
         let metadata = executor
             .take_captured_execution_metadata()
             .expect("execution metadata");
@@ -2709,7 +3009,10 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let started: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(started["status"], "started", "{result}");
+        assert_eq!(started["agents"].as_array().unwrap().len(), 2);
+        let value = collect_fanout_start(&result, &ctx).await;
 
         assert_eq!(value["status"], "completed");
         assert_eq!(value["group_id"], "review-atomic");
@@ -2750,7 +3053,7 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let value = collect_fanout_start(&result, &ctx).await;
         assert_eq!(value["status"], "completed");
         assert_eq!(value["target_count"], 3);
         assert_eq!(value["completed"], 3);
@@ -2797,7 +3100,9 @@ mod tests {
         )
         .await;
         let allowed_value: Value = serde_json::from_str(&allowed).unwrap();
-        assert_eq!(allowed_value["status"], "completed");
+        assert_eq!(allowed_value["status"], "launched");
+        let completed = collect_spawn_receipt(&allowed, &next_ctx).await;
+        assert_eq!(completed["status"], "completed");
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
@@ -2818,7 +3123,7 @@ mod tests {
         let first = handle_agent_fanout_tool(&first_args, Some(&ctx)).await;
         assert_eq!(
             serde_json::from_str::<Value>(&first).unwrap()["status"],
-            "completed"
+            "started"
         );
 
         let replay = handle_agent_fanout_tool(&first_args, Some(&ctx)).await;
@@ -2909,14 +3214,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_fanout_start_defaults_to_foreground_results() {
+    async fn agent_fanout_start_is_async_and_results_are_collected_explicitly() {
         let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
         let result = handle_agent_fanout_tool(
             &json!({
                 "action": "start",
-                "_tool_call_id": "call-foreground",
-                "group_id": "review-foreground",
+                "_tool_call_id": "call-async",
+                "group_id": "review-async",
                 "target_count": 1,
                 "slots": [
                     {
@@ -2929,10 +3234,15 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let started: Value = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["group_id"], "review-async");
+        assert_eq!(started["fanout"]["status"], "running");
+        assert_eq!(started["agents"][0]["status"], "launched");
+
+        let value = collect_fanout_start(&result, &ctx).await;
         assert_eq!(value["status"], "completed");
-        assert_eq!(value["group_id"], "review-foreground");
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["id"], "storage");
         assert_eq!(value["results"][0]["result"]["status"], "completed");
@@ -3232,7 +3542,7 @@ mod tests {
         )
         .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        assert_eq!(start_value["status"], "started");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -3298,7 +3608,7 @@ mod tests {
         )
         .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        assert_eq!(start_value["status"], "started");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -3350,7 +3660,7 @@ mod tests {
         )
         .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        assert_eq!(start_value["status"], "started");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -3401,8 +3711,8 @@ mod tests {
             ]
         });
         let start = handle_agent_fanout_tool(&start_args, Some(&ctx)).await;
-        let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        let completed = collect_fanout_start(&start, &ctx).await;
+        assert_eq!(completed["status"], "completed");
         assert_eq!(executor.spawn_count(), 2);
 
         let recovered =
@@ -3478,8 +3788,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let first_value: Value = serde_json::from_str(&first).unwrap();
-        assert_eq!(first_value["status"], "completed");
+        let completed = collect_fanout_start(&first, &ctx).await;
+        assert_eq!(completed["status"], "completed");
 
         let second = handle_agent_fanout_tool(
             &json!({
@@ -3528,6 +3838,8 @@ mod tests {
         .await;
         let existing_value: Value = serde_json::from_str(&existing).unwrap();
         assert_eq!(existing_value["group_id"], "existing-review");
+        let completed = collect_fanout_start(&existing, &ctx).await;
+        assert_eq!(completed["status"], "completed");
         assert_eq!(executor.spawn_count(), 1);
 
         let recovered = recover_agent_fanout_tool_result(
@@ -3576,8 +3888,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(value["status"], "completed");
+        let completed = collect_fanout_start(&start, &ctx).await;
+        assert_eq!(completed["status"], "completed");
         assert_eq!(executor.spawn_count(), 1);
 
         let recovered = recover_agent_fanout_tool_result(
@@ -3623,7 +3935,7 @@ mod tests {
         )
         .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        assert_eq!(start_value["status"], "started");
         assert!(
             start_value["budget_adjustment"]
                 .as_str()
@@ -3680,7 +3992,7 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"failed_to_start\""), "{start}");
+        assert!(start.contains("\"status\":\"started\""), "{start}");
         assert!(start.contains("\"spawn_rejected\":1"), "{start}");
 
         let result = handle_agent_fanout_tool(
@@ -3722,7 +4034,7 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"failed\""), "{start}");
+        assert!(start.contains("\"status\":\"started\""), "{start}");
 
         let result = handle_agent_fanout_tool(
             &json!({"action": "get_results", "group_id": "review-atomic"}),
@@ -3819,8 +4131,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "completed");
+        let completed = collect_fanout_start(&start, &ctx).await;
+        assert_eq!(completed["status"], "completed");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -3844,38 +4156,19 @@ mod tests {
     #[tokio::test]
     async fn agent_fanout_stop_slot_then_get_results_reports_stopped_by_user() {
         let spawner = test_spawner(Arc::new(PendingExecutor));
-        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
-        let ctx_for_start = ctx.clone();
-        let start_task = tokio::spawn(async move {
-            handle_agent_fanout_tool(
-                &json!({
-                    "action": "start",
-                    "group_id": "review-atomic",
-                    "target_count": 1,
-                    "slots": [
-                        {"description": "Review storage", "prompt": "Review storage changes"}
-                    ]
-                }),
-                Some(&ctx_for_start),
-            )
-            .await
-        });
-
-        for _ in 0..50 {
-            if !spawner.list_agents("run-parent").await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let promoted = spawner
-            .promote_foreground_work_to_background(Some("run-parent"))
-            .await
-            .into_iter()
-            .next()
-            .expect("Ctrl+B promotion should background the running fanout slot");
-        assert!(promoted.run_in_background);
-
-        let start = start_task.await.expect("fanout start task should join");
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-atomic",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review storage", "prompt": "Review storage changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
         let start_value: Value = serde_json::from_str(&start).unwrap();
         assert_eq!(start_value["status"], "started");
         assert_eq!(start_value["fanout"]["parent_run_id"], "run-parent");
@@ -4002,7 +4295,8 @@ mod tests {
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
 
-        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("claude-sonnet-4.6")
@@ -4020,7 +4314,7 @@ mod tests {
         });
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let value = collect_spawn_receipt(&result, &ctx).await;
 
         assert_eq!(value["status"], "interrupted");
         assert_eq!(value["finish_reason"], "budget_exhausted");
@@ -4046,23 +4340,13 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(value["status"], "interrupted");
-        assert_eq!(value["cancelled_by_parent_budget"], 1);
-        assert!(value.get("cancelled_by_user").is_none(), "{value}");
-        assert_eq!(value["agents"][0]["finish_reason"], "budget_exhausted");
-        assert!(
-            value["interruption_causes"]
-                .as_array()
-                .is_some_and(|causes| causes.iter().any(|cause| cause == "parent_budget")),
-            "{value}"
-        );
+        let started: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(started["status"], "started", "{started}");
 
         let collected = handle_agent_fanout_tool(
             &json!({
                 "action": "get_results",
-                "group_id": value["group_id"].as_str().unwrap()
+                "group_id": started["group_id"].as_str().unwrap()
             }),
             Some(&ctx),
         )
@@ -4070,9 +4354,17 @@ mod tests {
         let collected_value: Value = serde_json::from_str(&collected).unwrap();
         assert_eq!(collected_value["status"], "completed_with_issues");
         assert_eq!(collected_value["cancelled_by_parent_budget"], 1);
+        assert!(
+            collected_value.get("cancelled_by_user").is_none(),
+            "{collected_value}"
+        );
         assert_eq!(
             collected_value["results"][0]["result"]["status"],
             "interrupted"
+        );
+        assert_eq!(
+            collected_value["results"][0]["result"]["finish_reason"],
+            "budget_exhausted"
         );
         assert_eq!(collected_value["incomplete_results"], 1);
         assert_eq!(
@@ -4114,7 +4406,7 @@ mod tests {
         });
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let value = collect_spawn_receipt(&result, &ctx).await;
 
         assert_eq!(value["status"], "failed");
         assert_eq!(value["finish_reason"], "executor_dropped");
@@ -4176,37 +4468,20 @@ mod tests {
     async fn get_result_includes_fanout_summary_for_user_cancelled_slot() {
         let spawner = test_spawner(Arc::new(PendingExecutor));
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
-        let ctx_for_spawn = ctx.clone();
-        let spawn_task = tokio::spawn(async move {
-            handle_agent_spawn_action(
-                &json!({
-                    "description": "Storage review",
-                    "prompt": "Review storage layer",
-                    "agent_type": "general-purpose",
-                    "fanout_group_id": "review-1",
-                    "fanout_target_count": 3,
-                    "fanout_slot_index": 1
-                }),
-                Some(&ctx_for_spawn),
-            )
-            .await
-        });
-
-        for _ in 0..50 {
-            if !spawner.list_agents("run-parent").await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        spawner
-            .promote_foreground_work_to_background(Some("run-parent"))
-            .await
-            .into_iter()
-            .next()
-            .expect("Ctrl+B promotion should background the running fanout slot");
-
-        let spawn = spawn_task.await.expect("spawn task should join");
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Storage review",
+                "prompt": "Review storage layer",
+                "agent_type": "general-purpose",
+                "fanout_group_id": "review-1",
+                "fanout_target_count": 3,
+                "fanout_slot_index": 1
+            }),
+            Some(&ctx),
+        )
+        .await;
         let spawned: Value = serde_json::from_str(&spawn).unwrap();
+        assert_eq!(spawned["status"], "launched", "{spawn}");
         let agent_id = spawned["agent_id"].as_str().unwrap();
 
         assert!(

@@ -18,9 +18,9 @@ pub use agent_result_status::{
 };
 pub use agent_tool::{
     AgentToolContext, AgentTranscriptLocation, handle_agent_fanout_tool,
-    handle_agent_get_result_action, handle_agent_spawn_action, handle_agent_tool,
-    normalize_agent_spawn_args, recover_agent_fanout_tool_result,
-    render_agent_runtime_binding_error,
+    handle_agent_get_result_action, handle_agent_send_message_with_router,
+    handle_agent_spawn_action, handle_agent_tool, normalize_agent_spawn_args,
+    recover_agent_fanout_tool_result, render_agent_runtime_binding_error,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,

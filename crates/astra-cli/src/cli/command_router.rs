@@ -46,7 +46,7 @@ use crate::cli::slash::slash_inspect;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
 use crate::cli::slash::{slash_agent, slash_router, slash_task, slash_team, slash_telemetry};
-use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
 use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
 use crate::cli::task::task_command_utils::task_run_title;
 use crate::cli::task::task_result_artifact::write_task_output;
@@ -672,7 +672,7 @@ async fn execute_headless_task_body(
         pre_loaded_messages: continuation_messages.take(),
         ..Default::default()
     };
-    let mut sr = match crate::cli::turn::execute_basic_cli_turn(
+    let turn_result = crate::cli::turn::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
@@ -681,11 +681,26 @@ async fn execute_headless_task_body(
         &mut skill_qt,
         turn_options,
     )
-    .await
-    {
+    .await;
+    let background_agent_results = spawner_handle_for_drain
+        .shutdown_and_wait(std::time::Duration::from_secs(30))
+        .await;
+
+    // Keep child progress/approval channels alive through the drain, then
+    // flush the event stream before publishing either success or failure.
+    drop(chat_ctx);
+    if let Some(handle) = stream_event_writer {
+        let _ = handle.await;
+    }
+
+    let mut sr = match turn_result {
         Ok(sr) => sr,
         Err(e) => {
-            let error = e.error;
+            let mut error = e.error;
+            if let Some(section) = format_background_agent_results(&background_agent_results) {
+                error.push_str("\n\n");
+                error.push_str(&section);
+            }
             let returned_error = mark_headless_task_failed(
                 svc.as_ref(),
                 user_id.as_str(),
@@ -708,14 +723,8 @@ async fn execute_headless_task_body(
         }
     };
 
-    sr.background_agent_results = spawner_handle_for_drain
-        .shutdown_and_wait(std::time::Duration::from_secs(30))
-        .await;
-
-    drop(chat_ctx);
-    if let Some(handle) = stream_event_writer {
-        let _ = handle.await;
-    }
+    sr.background_agent_results = background_agent_results;
+    sr.integrate_background_agent_results();
 
     persist_one_shot_session_state(
         Some(&profile_name),
@@ -2017,7 +2026,7 @@ async fn execute_cli_command_impl(
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let mut sr = match crate::cli::turn::execute_basic_cli_turn(
+            let turn_result = crate::cli::turn::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
@@ -2026,19 +2035,7 @@ async fn execute_cli_command_impl(
                 &mut skill_qt,
                 turn_options,
             )
-            .await
-            {
-                Ok(sr) => sr,
-                Err(e) => return Err(e.error),
-            };
-
-            let exit_code = finalize_one_shot_stream_result(
-                profile.as_deref(),
-                effective_model.as_deref(),
-                &message,
-                &mut sr,
-                turn_start,
-            );
+            .await;
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
@@ -2052,16 +2049,40 @@ async fn execute_cli_command_impl(
             // [fork-cache] stderr lines (if any) appear before the
             // JSON/text result — operators grepping stderr don't
             // see the order swap.
-            sr.background_agent_results = spawner_handle_for_drain
+            let background_agent_results = spawner_handle_for_drain
                 .shutdown_and_wait(std::time::Duration::from_secs(30))
                 .await;
 
-            // Drain stream event writer: drop sender, then await writer task
-            // so all JSONL events are flushed to stderr before stdout output.
+            // Child progress shares the root stream. Close and flush it only
+            // after every terminal child event has had a chance to arrive.
             drop(chat_ctx);
             if let Some(handle) = _stream_event_writer {
                 let _ = handle.await;
             }
+
+            let mut sr = match turn_result {
+                Ok(sr) => sr,
+                Err(e) => {
+                    let mut error = e.error;
+                    if let Some(section) =
+                        format_background_agent_results(&background_agent_results)
+                    {
+                        error.push_str("\n\n");
+                        error.push_str(&section);
+                    }
+                    return Err(error);
+                }
+            };
+            sr.background_agent_results = background_agent_results;
+            let background_agent_section = sr.integrate_background_agent_results();
+
+            let exit_code = finalize_one_shot_stream_result(
+                profile.as_deref(),
+                effective_model.as_deref(),
+                &message,
+                &mut sr,
+                turn_start,
+            );
 
             #[cfg(feature = "harness")]
             append_headless_inspect_snapshot(&mut sr, &message, &harness_sink);
@@ -2093,6 +2114,10 @@ async fn execute_cli_command_impl(
             } else if quiet {
                 // Quiet mode: just print the text without formatting
                 println!("{}", sr.full_text);
+            } else if let Some(section) = background_agent_section {
+                // The primary assistant response was already streamed. Surface
+                // only the newly reconciled child section here.
+                println!("\n\n{section}");
             }
             // Normal mode output is already handled by stream_chat_sse
 

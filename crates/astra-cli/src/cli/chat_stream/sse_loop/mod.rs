@@ -449,8 +449,6 @@ pub(crate) async fn stream_chat_sse(
             agent_id: root_agent_id.to_string(),
             run_id: root_agent_id.to_string(),
             router: spawner.mailbox_router(),
-            metrics: p.messaging_metrics.clone(),
-            delegation_id: None,
         }
     });
 
@@ -818,6 +816,7 @@ pub(crate) async fn stream_chat_sse(
         repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
+            same_turn_detached_task_ids: Default::default(),
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),

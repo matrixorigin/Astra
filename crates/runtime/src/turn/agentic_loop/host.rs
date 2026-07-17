@@ -1071,6 +1071,10 @@ pub struct ContextTracePersistenceContext {
 /// Stall and verdict tracking state for the agentic loop.
 #[derive(Default)]
 pub struct StallTrackingState {
+    /// Background task detached by Bash during this agentic turn. The runtime
+    /// uses this turn-scoped fact to reject immediate `task_output` polling
+    /// while still allowing the model to continue independent work.
+    pub same_turn_detached_task_ids: BTreeSet<String>,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<String>>,
     /// Per-turn tool name sets.
@@ -1725,6 +1729,9 @@ pub enum VolatileKind {
     BehaviorAdvisory,
     /// Mailbox / agent-to-agent volatile drop-offs.
     Mailbox,
+    /// Runtime-owned terminal/needs-input facts from background work. These
+    /// are required context, never synthetic user intent.
+    BackgroundTaskNotification,
     /// Structured policy evidence suggesting a possible budget review. It does
     /// not mutate the active runtime budget.
     BudgetReview,
@@ -1806,6 +1813,7 @@ impl VolatileKind {
             | Self::ActiveTurnFrame
             | Self::CompactResume
             | Self::Mailbox
+            | Self::BackgroundTaskNotification
             | Self::SessionHookContext
             | Self::PlanModeMarker
             | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
@@ -5429,7 +5437,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn detached_bash_edge_tool_stops_without_followup_poll_round() {
+    async fn detached_bash_continues_and_rejects_same_turn_poll() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -5438,7 +5446,11 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool("task_output", "should not run")],
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({"task_id": "bg-shell-1", "block": false}),
+                    "should not run",
+                )],
                 10,
                 5,
                 None,
@@ -5451,21 +5463,23 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(
-            matches!(
-                outcome,
-                Ok(AgenticLoopOutcome::Waiting(ref reason))
-                    if reason == "background_task_detached:bg-shell-1"
-            ),
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
             "{outcome:?}"
         );
         assert_eq!(
             host.turn_count(),
-            1,
-            "detached bash must stop the current turn without a follow-up poll round"
+            3,
+            "detached bash should leave the agentic turn available for independent work"
         );
-        assert_eq!(state.total_tool_calls, 1);
+        assert_eq!(
+            state.total_tool_calls, 2,
+            "the intercepted task_output is still a model-issued tool call"
+        );
         assert!(state.telemetry.all_tools_used.contains("bash"));
-        assert!(!state.telemetry.all_tools_used.contains("task_output"));
+        assert!(
+            state.telemetry.all_tools_used.contains("task_output"),
+            "tool telemetry tracks model-issued calls even when runtime interception avoids execution"
+        );
         assert!(
             state
                 .messages
@@ -5473,10 +5487,17 @@ pub(crate) mod tests {
                 .any(|message| message.to_string().contains("bg-shell-1")),
             "background task id must remain visible in the tool result messages"
         );
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| { message.to_string().contains("Do not poll it now") }),
+            "same-turn task_output must resolve to the runtime anti-poll receipt"
+        );
     }
 
     #[tokio::test]
-    async fn running_agent_fanout_stops_without_followup_poll_round() {
+    async fn running_agent_fanout_leaves_parent_free_for_independent_work() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_running_agent_fanout_edge_tool("review-group")],
@@ -5485,33 +5506,30 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool("agent_fanout", "should not poll")],
+                vec![make_edge_tool("read_file", "independent evidence")],
                 10,
                 5,
                 None,
             ),
             text_result("done", 10, 5, None),
         ])
-        .with_valid_tools(&["agent_fanout"]);
+        .with_valid_tools(&["agent_fanout", "read_file"]);
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(
-            matches!(
-                outcome,
-                Ok(AgenticLoopOutcome::Waiting(ref reason))
-                    if reason == "agent_fanout_running:review-group"
-            ),
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
             "{outcome:?}"
         );
         assert_eq!(
             host.turn_count(),
-            1,
-            "running fanout must stop the current turn instead of polling get_results"
+            3,
+            "running fanout should not stop unrelated parent work"
         );
-        assert_eq!(state.total_tool_calls, 1);
+        assert_eq!(state.total_tool_calls, 2);
         assert!(state.telemetry.all_tools_used.contains("agent_fanout"));
+        assert!(state.telemetry.all_tools_used.contains("read_file"));
         assert!(
             state
                 .messages

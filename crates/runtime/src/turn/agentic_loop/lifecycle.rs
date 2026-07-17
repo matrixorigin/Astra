@@ -28,6 +28,22 @@ use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 const CHILD_AGENT_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 const PAUSE_LOOP_LOCAL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAILBOX_MODEL_PREVIEW_CHARS: usize = 4_000;
+
+fn push_mailbox_model_preview(parts: &mut Vec<String>, value: String) {
+    let mut chars = value.chars();
+    let preview = chars
+        .by_ref()
+        .take(MAILBOX_MODEL_PREVIEW_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        parts.push(format!(
+            "{preview}… [message preview truncated; use agent.get_result for a full child terminal result]"
+        ));
+    } else {
+        parts.push(preview);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
@@ -1481,7 +1497,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         let (pending, has_more) = mailbox.drain_bounded(MAX_MAILBOX_DRAIN_PER_TURN);
         if !pending.is_empty() {
             let mut parts = Vec::with_capacity(pending.len());
+            let mut delivered_count = 0usize;
             for msg in &pending {
+                // Transport-level broadcast groups include every subscriber,
+                // including the sender. `broadcast` is a peer-coordination
+                // intent, so consume/ack the sender echo without reinjecting
+                // its own guidance or generating a meaningless self-ack.
+                if msg.from == mailbox.address
+                    && matches!(
+                        msg.to,
+                        astra_messaging::types::MessageTarget::Broadcast { .. }
+                    )
+                {
+                    continue;
+                }
+                delivered_count += 1;
                 let from_label = &msg.from.agent_id;
                 host.on_agent_communication(astra_messaging::agent_communication_event(
                     &mailbox.address,
@@ -1498,7 +1528,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                             metrics.acks_received.fetch_add(1, Ordering::Relaxed);
                         }
                         parts.push(format!(
-                            "[{from_label} ack]: message {message_id} acknowledged"
+                            "[{from_label} applied]: message {message_id} reached the receiver model boundary"
                         ));
                         continue;
                     }
@@ -1582,20 +1612,47 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
                 match &msg.payload {
                     astra_messaging::types::MessagePayload::Text { content, .. } => {
-                        parts.push(format!("[{from_label}]: {content}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!("[{from_label}]: {content}"),
+                        );
                     }
                     astra_messaging::types::MessagePayload::Progress { status, detail, .. } => {
                         let extra = detail.as_deref().unwrap_or("");
-                        parts.push(format!("[{from_label} progress]: {status} {extra}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!("[{from_label} progress]: {status} {extra}"),
+                        );
                     }
-                    astra_messaging::types::MessagePayload::Request { request_type, .. } => {
-                        parts.push(format!("[{from_label} request]: {request_type:?}"));
+                    astra_messaging::types::MessagePayload::Request { request_type, data } => {
+                        let data = (!data.is_null()).then(|| format!(" · {data}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!(
+                                "[{from_label} request]: {request_type:?}{}",
+                                data.as_deref().unwrap_or("")
+                            ),
+                        );
                     }
-                    astra_messaging::types::MessagePayload::Response { accepted, .. } => {
-                        parts.push(format!("[{from_label} response]: accepted={accepted}"));
+                    astra_messaging::types::MessagePayload::Response {
+                        request_id,
+                        accepted,
+                        data,
+                    } => {
+                        let data = data.as_ref().map(|data| format!(" · {data}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!(
+                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
+                                data.as_deref().unwrap_or("")
+                            ),
+                        );
                     }
                     astra_messaging::types::MessagePayload::Signal(sig) => {
-                        parts.push(format!("[{from_label} signal]: {sig:?}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!("[{from_label} signal]: {sig:?}"),
+                        );
                     }
                     astra_messaging::types::MessagePayload::Ack { .. } => {}
                     astra_messaging::types::MessagePayload::Nack { .. } => {}
@@ -1610,7 +1667,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             if !parts.is_empty() {
                 let mailbox_text = format!(
                     "📬 Messages from other agents ({}{}):\n{}",
-                    pending.len(),
+                    delivered_count,
                     if has_more { "+, more queued" } else { "" },
                     parts.join("\n")
                 );

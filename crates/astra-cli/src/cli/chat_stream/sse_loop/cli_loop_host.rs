@@ -695,18 +695,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .clone()
                         .unwrap_or_else(|| mailbox.address.run_id.clone()),
                     router: mailbox.router(),
-                    metrics: state.messaging.metrics.clone(),
-                    delegation_id: mailbox
-                        .delegation_id
-                        .clone()
-                        .or_else(|| state.current_run_id.clone()),
                 },
             )
             .or_else(|| self.root_send_message_context.clone())
             .map(|mut context| {
                 if let Some(run_id) = state.current_run_id.clone() {
-                    context.run_id = run_id.clone();
-                    context.delegation_id.get_or_insert(run_id);
+                    context.run_id = run_id;
                 }
                 context
             });

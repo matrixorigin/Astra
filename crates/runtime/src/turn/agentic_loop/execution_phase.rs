@@ -123,10 +123,6 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
     let poll_started = tokio::time::Instant::now();
-    if !state.user_intents.should_poll_user_intents(poll_started) {
-        return Ok(());
-    }
-
     let (run_control, user_id, run_id) = match (
         state.run_control.as_ref(),
         state.context_manifest_user_id.as_ref(),
@@ -137,7 +133,13 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
         }
         _ => return Ok(()),
     };
-    let poll = run_control
+    if !state.user_intents.should_poll_user_intents(poll_started)
+        && !run_control.has_pending_inputs()
+    {
+        return Ok(());
+    }
+
+    let mut poll = run_control
         .poll_user_intents(&user_id, &run_id, state.user_intents.user_intent_cursor())
         .await;
     if let Some(error) = &poll.error {
@@ -148,6 +150,17 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
         tracing::warn!(run_id, error = %error, "user intent poll failed");
         return Ok(());
     }
+
+    let mut runtime_notifications = Vec::new();
+    poll.inputs.retain(|event| {
+        if let Some(content) = crate::turn::run_control::runtime_notification_content(&event.input)
+        {
+            runtime_notifications.push((event.clone(), content));
+            false
+        } else {
+            true
+        }
+    });
     let observed = state
         .user_intents
         .observe_polled_user_intents(poll, crate::turn::run_control::user_intent_content);
@@ -160,13 +173,15 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
             "invalid durable user intent was isolated"
         );
     }
-    let has_new_apply_events = !observed.accepted.is_empty();
+    let has_new_apply_events = !observed.accepted.is_empty() || !runtime_notifications.is_empty();
     for event in &observed.accepted {
         host.apply_user_intent_context(event);
     }
+    let mut accepted_for_ack = observed.accepted.clone();
+    accepted_for_ack.extend(runtime_notifications.iter().map(|(event, _)| event.clone()));
     state
         .user_intents
-        .stage_pending_apply_events(&observed.accepted);
+        .stage_pending_apply_events(&accepted_for_ack);
     let release_event_indices = state.user_intents.pending_apply_event_indices();
     state
         .user_intents
@@ -177,7 +192,10 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
     state
         .user_intents
         .commit_observed_cursor(observed.next_cursor);
-    if observed.accepted.is_empty() && release_event_indices.is_empty() {
+    if observed.accepted.is_empty()
+        && runtime_notifications.is_empty()
+        && release_event_indices.is_empty()
+    {
         return Ok(());
     }
 
@@ -204,6 +222,21 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
         }
     }
 
+    if !runtime_notifications.is_empty() {
+        state.push_volatile_payload(
+            super::host::VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": "background_task_notification.v1",
+                "priority": "below_latest_user_intent",
+                "updates": runtime_notifications
+                    .iter()
+                    .map(|(_, content)| content)
+                    .collect::<Vec<_>>(),
+                "instruction": "Reconcile these runtime facts with the latest user goal. Do not let a stale completion override newer user steering.",
+            }),
+        );
+    }
+
     if release_event_indices.is_empty() {
         return Ok(());
     }
@@ -223,7 +256,9 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
                 .user_intents
                 .acknowledge_apply_events(&release_event_indices);
             for event in &acknowledged {
-                host.on_user_intent_applied(event);
+                if crate::turn::run_control::runtime_notification_content(&event.input).is_none() {
+                    host.on_user_intent_applied(event);
+                }
             }
         }
         Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminal) => {

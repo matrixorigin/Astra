@@ -195,6 +195,22 @@ pub(crate) struct StreamResult {
 }
 
 impl StreamResult {
+    /// Merge terminal background-agent outputs into the user-facing aggregate
+    /// response used by one-shot CLI and server surfaces.
+    ///
+    /// Interactive turns reconcile the same facts through the root mailbox on
+    /// a later model step. One-shot surfaces have no later step, so leaving the
+    /// drain results only in an internal field would make completed work
+    /// invisible to text consumers.
+    pub(crate) fn integrate_background_agent_results(&mut self) -> Option<String> {
+        let section = format_background_agent_results(&self.background_agent_results)?;
+        if !self.full_text.is_empty() {
+            self.full_text.push_str("\n\n");
+        }
+        self.full_text.push_str(&section);
+        Some(section)
+    }
+
     /// User input that should represent this committed turn in durable history.
     ///
     /// The runtime can apply user guidance while a turn is executing.
@@ -229,6 +245,21 @@ impl StreamResult {
         self.routing_domain_hint = routing_domain_hint;
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
     }
+}
+
+pub(crate) fn format_background_agent_results(results: &[(String, String)]) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let mut section = String::from("## Background agent results");
+    for (agent_id, result) in results {
+        section.push_str("\n\n### Agent `");
+        section.push_str(agent_id);
+        section.push_str("`\n\n");
+        section.push_str(result.trim());
+    }
+    Some(section)
 }
 
 fn effective_user_input_from_applied_user_intents(

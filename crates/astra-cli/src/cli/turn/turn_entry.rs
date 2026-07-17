@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use super::turn_retry::settle_turn_attempt;
+use super::turn_retry::{TurnSettlementOutcome, settle_turn_attempt};
 use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{
     TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
@@ -292,6 +292,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     }
 
     let resume_guidance = state.resume_guidance.take();
+    let consumed_bg_notifications = state.pending_bg_notifications.clone();
     let finalized_input = finalize_effective_line(
         build_effective_line(&line, state, ui),
         line.clone(),
@@ -301,6 +302,8 @@ pub(crate) async fn handle_chat_input_with_ui(
     .await;
     let turn_start = Instant::now();
     let session_id = state.session_id.clone();
+    let local_run_control =
+        astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     let attempt = run_chat_turn(TurnExecutionRequest {
         state,
         input: TurnExecutionInput {
@@ -316,6 +319,13 @@ pub(crate) async fn handle_chat_input_with_ui(
         },
     })
     .await;
+    if let Some(run_control) = &local_run_control {
+        // The stream runner releases the active slot at transport close. Put
+        // the same provider back for auth/session retries and for facts that
+        // arrive during slower post-stream settlement.
+        *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
+            Some(run_control.clone());
+    }
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &line,
@@ -330,7 +340,113 @@ pub(crate) async fn handle_chat_input_with_ui(
         ui,
     };
 
-    settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await
+    let settlement =
+        settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
+    if settlement == TurnSettlementOutcome::Succeeded
+        && let Some(run_control) = &local_run_control
+    {
+        run_control.commit_applied_runtime_notifications();
+    }
+    if settlement != TurnSettlementOutcome::Succeeded && !consumed_bg_notifications.is_empty() {
+        let notifications_arriving_during_settlement =
+            std::mem::take(&mut state.pending_bg_notifications);
+        state.pending_bg_notifications = consumed_bg_notifications;
+        state
+            .pending_bg_notifications
+            .extend(notifications_arriving_during_settlement);
+    }
+    Ok(())
+}
+
+/// Resume an idle root from runtime-owned background facts without inventing
+/// a visible user submission. A non-empty runtime envelope keeps provider
+/// message validation happy, while settlement still uses an empty logical
+/// user line so the envelope is never persisted as user speech. Notifications
+/// ride the required runtime lane and the latest real user goal remains the
+/// semantic anchor.
+pub(crate) async fn handle_runtime_notifications_with_ui(
+    current_token: Option<&str>,
+    state: &mut SessionState,
+    ctx: TurnContext<'_>,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+) -> Result<(), String> {
+    if state.pending_bg_notifications.is_empty() {
+        return Ok(());
+    }
+    let token = match current_token {
+        Some(token) => token,
+        None => {
+            ui.show_warning("  Background work finished, but Astra is not logged in; the update will be kept for your next turn.");
+            return Ok(());
+        }
+    };
+
+    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    let notification_count = state.pending_bg_notifications.len();
+    let notifications = state.pending_bg_notifications.join("\n");
+    let runtime_required_texts = vec![format!(
+        "Background task updates since the last model boundary:\n{notifications}\n\
+         Reconcile these facts with the latest user goal. Newer user steering always has priority."
+    )];
+    let user_intent = state
+        .history
+        .iter()
+        .rev()
+        .map(|(user, _)| user.trim())
+        .find(|user| !user.is_empty())
+        .unwrap_or("Continue the current goal after reconciling background task updates.")
+        .to_string();
+    let logical_user_line = String::new();
+    let runtime_envelope =
+        "Reconcile the runtime-owned updates and continue the latest user goal.".to_string();
+    let turn_start = Instant::now();
+    let session_id = state.session_id.clone();
+    let local_run_control =
+        astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
+    ui.blank_line();
+
+    let attempt = run_chat_turn(TurnExecutionRequest {
+        state,
+        input: TurnExecutionInput {
+            api: ctx.api,
+            profile: ctx.profile,
+            token,
+            message: &runtime_envelope,
+            user_intent: &user_intent,
+            input_runtime_required_texts: &runtime_required_texts,
+            input_runtime_volatile_texts: &[],
+            session_id: session_id.as_deref(),
+            semantic_query_override: Some(user_intent.as_str()),
+        },
+    })
+    .await;
+    if let Some(run_control) = &local_run_control {
+        *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
+            Some(run_control.clone());
+    }
+    let mut dispatch = TurnDispatch {
+        ctx: &ctx,
+        line: &logical_user_line,
+        effective_line: &runtime_envelope,
+        user_intent: &user_intent,
+        input_runtime_required_texts: &runtime_required_texts,
+        input_runtime_volatile_texts: &[],
+        token,
+        session_id: session_id.as_deref(),
+        semantic_query_override: Some(user_intent.as_str()),
+        turn_start,
+        ui,
+    };
+    let settlement =
+        settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
+    if settlement == TurnSettlementOutcome::Succeeded {
+        if let Some(run_control) = &local_run_control {
+            run_control.commit_applied_runtime_notifications();
+        }
+        let consumed = notification_count.min(state.pending_bg_notifications.len());
+        state.pending_bg_notifications.drain(..consumed);
+    }
+    Ok(())
 }
 
 async fn ensure_multi_agent_runtime_for_turn(

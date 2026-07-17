@@ -942,7 +942,7 @@ mod tests {
         assert!(
             desc.contains("description+prompt")
                 && desc.contains("agent_id")
-                && desc.contains("foreground")
+                && desc.contains("asynchronous")
                 && desc.contains("run_chain"),
             "keyword summary must keep agent action constraints: {desc}"
         );

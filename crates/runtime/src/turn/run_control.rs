@@ -2,6 +2,10 @@ use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 use async_trait::async_trait;
 use serde_json::Value;
 
+const RUNTIME_NOTIFICATION_INPUT_KIND: &str = "astra_runtime_notification_v1";
+static RUNTIME_NOTIFICATION_NONCE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::now_v7().simple().to_string());
+
 /// Run status for cross-pod control polling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunControlStatus {
@@ -60,6 +64,37 @@ pub fn user_intent_content(input: &Value) -> Option<String> {
     }
 }
 
+/// Build an internal run-control payload for runtime-owned context. It shares
+/// the existing delivery queue so active local runs wake at the same safe
+/// model boundary as user guidance, but is identified explicitly so it never
+/// becomes a synthetic user message or replaces the latest user goal. The
+/// process-local nonce prevents a remote user-intent payload from spoofing
+/// this internal lane; local notifications are turn-scoped and never need to
+/// survive a process restart.
+pub fn runtime_notification_input(content: impl Into<String>) -> Value {
+    serde_json::json!({
+        "_astra_input_kind": RUNTIME_NOTIFICATION_INPUT_KIND,
+        "_astra_runtime_nonce": RUNTIME_NOTIFICATION_NONCE.as_str(),
+        "content": content.into(),
+    })
+}
+
+pub fn runtime_notification_content(input: &Value) -> Option<String> {
+    (input.get("_astra_input_kind").and_then(Value::as_str)
+        == Some(RUNTIME_NOTIFICATION_INPUT_KIND)
+        && input.get("_astra_runtime_nonce").and_then(Value::as_str)
+            == Some(RUNTIME_NOTIFICATION_NONCE.as_str()))
+    .then(|| {
+        input
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .map(ToString::to_string)
+    })
+    .flatten()
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UserIntentPoll {
     pub next_cursor: usize,
@@ -114,6 +149,13 @@ pub trait RunStatusProvider: Send + Sync {
 /// Polls durable user intents accepted while a run is executing.
 #[async_trait]
 pub trait UserIntentProvider: Send + Sync {
+    /// Cheap local wake hint. Durable providers may keep the default and use
+    /// the bounded poll cadence; in-process providers override it so newly
+    /// queued guidance/runtime facts reach the very next model boundary.
+    fn has_pending_inputs(&self) -> bool {
+        false
+    }
+
     /// Poll `user_intent` events appended to a durable run after the
     /// provided exclusive cursor.
     async fn poll_user_intents(

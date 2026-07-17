@@ -2,7 +2,7 @@
 
 use crate::messaging::SubRunInfo;
 use astra_messaging::router::AgentMailboxRouter;
-use astra_messaging::types::AgentAddress;
+use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
 use astra_turn_core::fork_prefix_store::PrefixCaptureSink;
 use astra_turn_core::fork_reconstruct::reconstruct_messages;
 use astra_turn_core::fork_resolve::{
@@ -2122,7 +2122,7 @@ impl DynamicAgentSpawner {
         if content.is_empty() {
             return Err("guidance cannot be empty".into());
         }
-        let (from, to) = {
+        let (parent_run_id, parent_agent_id, to) = {
             let active = self.active_agents.read().await;
             let state = active
                 .get(agent_id)
@@ -2131,9 +2131,17 @@ impl DynamicAgentSpawner {
                 .messaging_address
                 .clone()
                 .ok_or_else(|| "this agent has no active mailbox".to_string())?;
-            let from = AgentAddress::new(&state.parent_run_id, &state.parent_agent_id);
-            (from, to)
+            (
+                state.parent_run_id.clone(),
+                state.parent_agent_id.clone(),
+                to,
+            )
         };
+        let from = self
+            .mailbox_router
+            .registered_address_for_agent(&parent_agent_id)
+            .await
+            .unwrap_or_else(|| AgentAddress::new(parent_run_id, parent_agent_id));
         let mut message = astra_messaging::AgentMessage::new(
             from,
             astra_messaging::MessageTarget::Direct { address: to },
@@ -2530,6 +2538,13 @@ impl DynamicAgentSpawner {
             super::permission_sync::PermissionSyncContext::shared(inherited_permissions.clone());
 
         // 8. Build run config
+        let coordination_addendum = format!(
+            "{}\n\n## Parent coordination\n\
+             Your run_id is `{run_id}` and agent_id is `{agent_id}`. Your parent is agent `{}` on run `{}`. \
+             Stay within the delegated task boundary. Use `agent(action=\"send_message\", to=\"parent\", ...)` only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
+             Routine tool-by-tool progress does not need reporting. Your terminal result is delivered to the parent automatically.",
+            agent_def.system_prompt_addendum, context.parent_agent_id, context.parent_run_id,
+        );
         let run_config = SpawnRunConfig {
             run_id: run_id.clone(),
             agent_id: agent_id.clone(),
@@ -2537,7 +2552,7 @@ impl DynamicAgentSpawner {
             recursion_depth: child_recursion_depth,
             agent_type: input.agent_type.clone(),
             task: input.prompt.clone(),
-            system_prompt_addendum: agent_def.system_prompt_addendum.clone(),
+            system_prompt_addendum: coordination_addendum,
             model,
             max_turns,
             allowed_tools: agent_def.allowed_tools.iter().cloned().collect(),
@@ -2792,6 +2807,10 @@ impl DynamicAgentSpawner {
     /// Cancel a single background agent by id. Returns true only when this call
     /// actually owned the cancellation and archived the agent as cancelled.
     pub async fn cancel_agent(&self, agent_id: &str, reason: &str) -> bool {
+        self.cancel_agent_with_origin(agent_id, reason, true).await
+    }
+
+    async fn cancel_agent_with_origin(&self, agent_id: &str, reason: &str, by_user: bool) -> bool {
         // Single write-lock scope that *atomically* removes both the abort
         // handle and the agent state.  This prevents a TOCTOU race where the
         // monitor finalises the agent between handle removal and state
@@ -2818,14 +2837,14 @@ impl DynamicAgentSpawner {
         };
 
         abort_handle.abort();
-        // `cancel_agent` is the user-driven cancel surface (Ctrl+G x,
-        // /agent cancel, etc.). Propagate the user-driven flag so the
-        // wire output tells the LLM not to respawn.
-        self.finalize_cancelled_agent(&mut state, agent_id, reason)
+        // Public `cancel_agent` is user-driven (Ctrl+G x, /agent cancel,
+        // etc.); bounded one-shot shutdown uses the same atomic finalization
+        // without mislabeling the deadline as user intent.
+        self.finalize_cancelled_agent(&mut state, agent_id, reason, by_user)
             .await
     }
 
-    /// Finalize an agent that was atomically seized by [`cancel_agent`].
+    /// Finalize an agent atomically seized by the cancellation path.
     /// Performs all the same cleanup as [`finalize_background_agent`] but
     /// operates on a pre-extracted [`SpawnedAgentState`] — the caller already
     /// owns the state and the abort handle is already removed from the book.
@@ -2834,6 +2853,7 @@ impl DynamicAgentSpawner {
         state: &mut SpawnedAgentState,
         agent_id: &str,
         reason: &str,
+        by_user: bool,
     ) -> bool {
         self.foreground_promotion_requests
             .write()
@@ -2841,7 +2861,14 @@ impl DynamicAgentSpawner {
             .remove(agent_id);
         self.remove_background_agent_id(agent_id);
 
-        let status = AgentStatus::cancelled_by_user(reason);
+        let status = if by_user {
+            AgentStatus::cancelled_by_user(reason)
+        } else {
+            AgentStatus::Cancelled {
+                by_user: false,
+                reason: reason.to_string(),
+            }
+        };
         state.status = status;
         state.ended_at = Some(SystemTime::now());
         let messaging_address = state.messaging_address.take();
@@ -2867,13 +2894,14 @@ impl DynamicAgentSpawner {
                 metadata: state.execution_metadata.clone(),
             });
         }
-        if let Some(addr) = messaging_address
-            && let Err(err) = self.mailbox_router.unregister(&addr).await
-        {
-            eprintln!(
-                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
-                agent_id, err
-            );
+        if let Some(addr) = messaging_address {
+            self.deliver_terminal_result_to_parent(state, &addr).await;
+            if let Err(err) = self.mailbox_router.unregister(&addr).await {
+                eprintln!(
+                    "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
+                    agent_id, err
+                );
+            }
         }
         let worktree_path = state.worktree_path.take();
         self.archive_state(state.clone()).await;
@@ -2942,19 +2970,70 @@ impl DynamicAgentSpawner {
                 metadata: state.execution_metadata.clone(),
             });
         }
-        if let Some(addr) = messaging_address
-            && let Err(err) = self.mailbox_router.unregister(&addr).await
-        {
-            eprintln!(
-                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
-                agent_id, err
-            );
+        if let Some(addr) = messaging_address {
+            self.deliver_terminal_result_to_parent(&state, &addr).await;
+            if let Err(err) = self.mailbox_router.unregister(&addr).await {
+                eprintln!(
+                    "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
+                    agent_id, err
+                );
+            }
         }
         let worktree_path = state.worktree_path.take();
         self.archive_state(state).await;
         self.spawn_worktree_cleanup(worktree_path, agent_id);
         self.notify_completion(agent_id).await;
         true
+    }
+
+    async fn deliver_terminal_result_to_parent(
+        &self,
+        state: &SpawnedAgentState,
+        from: &AgentAddress,
+    ) {
+        if !state.run_in_background {
+            return;
+        }
+        let payload = match &state.status {
+            AgentStatus::Completed { result, .. } => {
+                MessagePayload::Signal(astra_messaging::AgentSignal::Completed {
+                    output: result.clone(),
+                })
+            }
+            AgentStatus::Failed { error, .. } => {
+                MessagePayload::Signal(astra_messaging::AgentSignal::Failed {
+                    error: error.clone(),
+                })
+            }
+            AgentStatus::Interrupted {
+                partial_result,
+                finish_reason,
+            } => MessagePayload::Signal(astra_messaging::AgentSignal::Failed {
+                error: format!("{finish_reason}: {partial_result}"),
+            }),
+            AgentStatus::Cancelled { reason, .. } => {
+                MessagePayload::Signal(astra_messaging::AgentSignal::Failed {
+                    error: format!("cancelled: {reason}"),
+                })
+            }
+            AgentStatus::Waiting { reason } => {
+                MessagePayload::Signal(astra_messaging::AgentSignal::Stalled {
+                    reason: reason.clone(),
+                })
+            }
+            AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => return,
+        };
+        let message = AgentMessage::new(from.clone(), MessageTarget::Parent, payload);
+        if let Err(error) = self.mailbox_router.send(message).await {
+            tracing::warn!(
+                target: "astra_runtime::messaging",
+                agent_id = %state.agent_id,
+                run_id = %state.run_id,
+                parent_run_id = %state.parent_run_id,
+                error = %error,
+                "failed to deliver terminal child result to parent mailbox"
+            );
+        }
     }
 
     fn remove_background_agent_id(&self, agent_id: &str) {
@@ -3192,11 +3271,13 @@ impl DynamicAgentSpawner {
     }
 
     /// Drain all background agents, wait up to `deadline`, and return
-    /// completed results so the caller can surface them.
+    /// terminal results so the caller can surface them.
     ///
-    /// Returns `(agent_id, result_text)` for every background child that
-    /// finished with `AgentStatus::Completed`. Aborts tasks that exceed
-    /// `deadline`; panics inside a background task are caught and logged.
+    /// Returns `(agent_id, result_text)` for every terminal background child.
+    /// Failed, interrupted, cancelled, and deadline-exceeded runs are rendered
+    /// explicitly instead of disappearing from the one-shot caller's output.
+    /// Tasks that exceed `deadline` are cancelled through the normal
+    /// finalization path before their host tasks are reaped.
     pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) -> Vec<(String, String)> {
         let mut set = self
             .background_tasks
@@ -3226,9 +3307,30 @@ impl DynamicAgentSpawner {
             Err(_) => {
                 astra_core::agent_warn!(
                     "spawner",
-                    "background agent drain timed out after {deadline:?}; aborting remaining tasks"
+                    "background agent drain timed out after {deadline:?}; cancelling remaining tasks"
                 );
+
+                // Do not abort the JoinSet first: dropping an agent future
+                // bypasses its terminal finalizer and leaves both a zombie
+                // active-agent projection and no user-visible explanation.
+                // `cancel_agent` atomically owns and archives each live child,
+                // emits its terminal event, and then aborts the host task.
+                let unfinished = self
+                    .background_agent_ids
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                for agent_id in unfinished {
+                    let _ = self
+                        .cancel_agent_with_origin(
+                            &agent_id,
+                            "one-shot caller deadline elapsed while waiting for background agent",
+                            false,
+                        )
+                        .await;
+                }
                 set.abort_all();
+                while set.join_next().await.is_some() {}
             }
         }
 
@@ -3242,11 +3344,24 @@ impl DynamicAgentSpawner {
             .iter()
             .filter(|s| s.run_in_background)
             .filter_map(|s| {
-                if let AgentStatus::Completed { ref result, .. } = s.status {
-                    Some((s.agent_id.clone(), result.clone()))
-                } else {
-                    None
-                }
+                let result = match &s.status {
+                    AgentStatus::Completed { result, .. } => result.clone(),
+                    AgentStatus::Failed { error, .. } => format!("Agent failed: {error}"),
+                    AgentStatus::Interrupted {
+                        partial_result,
+                        finish_reason,
+                    } => format!("Agent interrupted ({finish_reason}): {partial_result}"),
+                    AgentStatus::Cancelled { reason, .. } => {
+                        format!("Agent cancelled: {reason}")
+                    }
+                    AgentStatus::Waiting { reason } => {
+                        format!("Agent needs input or cannot continue: {reason}")
+                    }
+                    AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
+                        return None;
+                    }
+                };
+                Some((s.agent_id.clone(), result))
             })
             .collect()
     }
@@ -6511,9 +6626,13 @@ mod tests {
         let bg_results = spawner
             .shutdown_and_wait(std::time::Duration::from_secs(1))
             .await;
-        assert!(
-            bg_results.iter().all(|(id, _)| id != &agent_id),
-            "cancelled agent must not surface as completed result: {bg_results:?}"
+        assert_eq!(
+            bg_results,
+            vec![(
+                agent_id,
+                "Agent cancelled: turn budget exhausted".to_string()
+            )],
+            "shutdown aggregation must surface cancellation instead of silently dropping it"
         );
     }
 

@@ -1159,6 +1159,96 @@ async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
     }
 }
 
+/// Bind a turn-scoped Server root run to one session-stable mailbox. Child
+/// runs can report checkpoints and terminal results while the parent is
+/// active, or queue them for the next turn after it settles.
+async fn install_server_root_mailbox(
+    state: &mut AgenticLoopState,
+    router: &Arc<astra_messaging::router::AgentMailboxRouter>,
+    session_id: &str,
+    run_id: &str,
+    agent_id: &str,
+) {
+    if state.messaging.mailbox.is_some() {
+        return;
+    }
+    let address = astra_messaging::AgentAddress::new(session_id, agent_id);
+    match router.register(address.clone(), None).await {
+        Ok(mailbox) => {
+            router.record_parent_delivery_alias(run_id, &address).await;
+            state.messaging.mailbox = Some(mailbox);
+        }
+        Err(error) => tracing::warn!(
+            target: "astra_runtime::messaging",
+            session_id,
+            run_id,
+            agent_id,
+            error = %error,
+            "server root mailbox registration failed; child delivery will remain observable only through lifecycle events"
+        ),
+    }
+}
+
+/// Unregister the Server root mailbox without losing messages that arrived
+/// after the final model boundary. Those messages are acknowledged on the old
+/// stream and re-sent through Parent routing, which parks them under the same
+/// stable session mailbox for the next turn.
+async fn park_server_root_mailbox(state: &mut AgenticLoopState) {
+    const MAX_LATE_ROOT_MESSAGES: usize = 256;
+    let Some(mut mailbox) = state.messaging.mailbox.take() else {
+        return;
+    };
+    let address = mailbox.address.clone();
+    let router = mailbox.router();
+    let (late_messages, has_more) = mailbox.drain_bounded(MAX_LATE_ROOT_MESSAGES);
+    if let Err(error) = mailbox.acknowledge_received(&late_messages).await {
+        // Durable transports will release unacknowledged claims when this
+        // stream drops. Re-inserting as well would create two deliveries, so
+        // leave recovery to the transport in this branch.
+        tracing::warn!(
+            target: "astra_runtime::messaging",
+            address = %address,
+            error = %error,
+            "late server root messages could not be acknowledged; transport recovery will retain them"
+        );
+        let _ = router.unregister(&address).await;
+        return;
+    }
+    if let Err(error) = router.unregister(&address).await {
+        tracing::warn!(
+            target: "astra_runtime::messaging",
+            address = %address,
+            error = %error,
+            "server root mailbox unregister failed"
+        );
+    }
+    for message in late_messages {
+        let mut parked = (*message).clone();
+        // The durable queue keys rows by message id. The original delivery is
+        // now acknowledged, so parking is a new delivery attempt with the
+        // same semantic/correlation payload but a fresh envelope identity.
+        parked.id = uuid::Uuid::now_v7().to_string();
+        parked.ack_message_id = message.requires_ack.then(|| message.id.clone());
+        parked.to = astra_messaging::MessageTarget::Parent;
+        if let Err(error) = router.send(parked).await {
+            tracing::warn!(
+                target: "astra_runtime::messaging",
+                message_id = %message.id,
+                error = %error,
+                "late server root message could not be parked for the next turn"
+            );
+        }
+    }
+    if has_more {
+        tracing::warn!(
+            target: "astra_runtime::messaging",
+            address = %address,
+            limit = MAX_LATE_ROOT_MESSAGES,
+            "server root mailbox exceeded the bounded late-message parking window"
+        );
+    }
+}
+
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
 type ServerSkillResolverBundle = (
@@ -7153,6 +7243,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
         let bg_llm_cancel_token = llm_cancel_token.clone();
+        let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
+        let bg_root_mailbox_agent_id = request
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "root-agent".to_string());
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -7268,6 +7363,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
+                install_server_root_mailbox(
+                    &mut loop_state,
+                    &bg_root_mailbox_router,
+                    &bg_session_id,
+                    &bg_run_id,
+                    &bg_root_mailbox_agent_id,
+                )
+                .await;
                 let _control_watcher = start_active_run_control_watcher(
                     loop_state.run_control.clone(),
                     bg_user_id.clone(),
@@ -7279,6 +7382,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
+                park_server_root_mailbox(&mut loop_state).await;
                 let loop_success = outcome.is_ok();
                 let (events, final_status, error_msg) =
                     Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
@@ -8265,6 +8369,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_pause_flag = pause_flag.clone();
         let bg_llm_cancel_token = llm_cancel_token.clone();
         let bg_client_event_tx = client_event_tx.clone();
+        let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
+        let bg_root_mailbox_agent_id = request
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "root-agent".to_string());
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -8376,6 +8485,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
+                install_server_root_mailbox(
+                    &mut state,
+                    &bg_root_mailbox_router,
+                    &bg_session_id,
+                    &bg_run_id,
+                    &bg_root_mailbox_agent_id,
+                )
+                .await;
                 let _control_watcher = start_active_run_control_watcher(
                     state.run_control.clone(),
                     bg_user_id.clone(),
@@ -8392,6 +8509,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                park_server_root_mailbox(&mut state).await;
                 let loop_success = loop_result.is_ok();
                 drop(client_disconnect_watcher);
 

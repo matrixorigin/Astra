@@ -1,6 +1,6 @@
 //! CLI bridge for the shared dynamic-agent tool handler.
 //!
-//! The `agent(action='spawn'|'get_result')` protocol lives in
+//! The `agent(action='spawn'|'get_result'|'send_message')` protocol lives in
 //! `astra_runtime::orchestration::agent_tool`. Keep this module thin so CLI
 //! and Web/server cannot drift in parsing, normalization, or result rendering.
 
@@ -19,6 +19,31 @@ pub async fn handle_agent_get_result_action(
     ctx: Option<&AgentActionContext>,
 ) -> String {
     astra_runtime::orchestration::handle_agent_get_result_action(args, ctx).await
+}
+
+/// Handle `agent(action='send_message')` using the same mailbox contract as
+/// the server tool surface.
+pub async fn handle_agent_send_message_action(
+    args: &Value,
+    ctx: Option<&AgentActionContext>,
+    mailbox_ctx: Option<&super::agent_messaging::SendMessageRuntimeContext>,
+) -> String {
+    if let Some(ctx) = ctx {
+        return astra_runtime::orchestration::handle_agent_tool(args, Some(ctx)).await;
+    }
+    let Some(mailbox_ctx) = mailbox_ctx else {
+        return astra_runtime::orchestration::render_agent_runtime_binding_error(
+            "agent",
+            "send_message",
+        );
+    };
+    astra_runtime::orchestration::handle_agent_send_message_with_router(
+        args,
+        mailbox_ctx.router.as_ref(),
+        &mailbox_ctx.run_id,
+        &mailbox_ctx.agent_id,
+    )
+    .await
 }
 
 /// Handle `agent_fanout(...)` using the shared runtime contract.

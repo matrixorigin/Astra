@@ -46,17 +46,16 @@ pub const ADOPTION_ACK_SLOW_WARN: Duration = Duration::from_secs(1);
 
 /// Render the model-facing marker the bash tool returns after a
 /// successful detach. Encodes the anti-polling contract: the runtime
-/// will deliver a `<task_notification>` when the task terminates, and
-/// the model must end its turn instead of polling `task_output` or
-/// rerunning the command.
+/// will deliver a `<task_notification>` when the task terminates, while
+/// the model remains free to continue independent work in the same turn.
 pub fn render_bash_detached_marker(task_id: &str) -> String {
     format!(
         "<bash_detached>The bash command was promoted to background task {task_id}. \
          The runtime will deliver a <task_notification> when the task terminates — \
-         end your turn now and let the user drive next steps. \
-         Do NOT poll: do not call `task_output`, do not rerun the bash command, \
+         continue with independent work or briefly tell the user it is still running. \
+         Do NOT poll this task in the same turn: do not call `task_output`, do not rerun the bash command, \
          and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
-         If the user explicitly asks for partial progress, call `task_output` ONCE with \
+         On a later turn, if the user explicitly asks for partial progress, call `task_output` ONCE with \
          block=false; if they ask you to wait, use `task_output` with block=true. \
          Use `task_stop` only when the user wants the task cancelled.\
          </bash_detached>"
