@@ -372,6 +372,9 @@ impl RunLifecycleService for JointRunLifecycle {
         Ok(RunStatusRecord {
             run_id,
             session_id: run.session_id,
+            parent_run_id: run.parent_run_id,
+            root_run_id: run.root_run_id,
+            depth: run.depth,
             status: run.status,
             waiting_for: run.waiting_for,
             events_count: run.events.len() as i64,

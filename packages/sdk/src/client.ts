@@ -133,6 +133,9 @@ type SessionListWire = RuntimeSessionListResponse;
 type RunStatusWire = {
   run_id: string;
   session_id: string;
+  parent_run_id?: string | null;
+  root_run_id?: string | null;
+  depth?: number;
   status: string;
   waiting_for?: string | null;
   events_count: number;
@@ -178,6 +181,9 @@ function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
     runId: w.run_id,
     sessionId: w.session_id,
+    parentRunId: w.parent_run_id ?? null,
+    rootRunId: w.root_run_id ?? w.run_id,
+    depth: Number.isSafeInteger(w.depth) && Number(w.depth) >= 0 ? Number(w.depth) : 0,
     status: w.status as RunStatus["status"],
     eventsCount: Number(w.events_count),
     waitingFor: w.waiting_for ?? undefined,
@@ -773,6 +779,9 @@ export class AstraClient {
     return {
       runId: raw.run_id,
       sessionId: raw.session_id,
+      parentRunId: null,
+      rootRunId: raw.run_id,
+      depth: 0,
       status: raw.status,
       eventsCount: 0,
     };

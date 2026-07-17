@@ -913,6 +913,10 @@ export type ModelGatewayRecord = {
 export type RunStatus = {
   runId: string;
   sessionId: string;
+  /** Durable run-tree identity. `null` means this is a root conversation run. */
+  parentRunId: string | null;
+  rootRunId: string;
+  depth: number;
   status:
     | "running"
     | "input-queued"

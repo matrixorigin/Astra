@@ -1,7 +1,7 @@
 use crate::db_row::RowExt as PromptDeltaDbRow;
 use astra_core::SharedPool;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -623,7 +623,7 @@ fn build_chunk_plan(
     position: i32,
     payload: &Value,
 ) -> Result<PromptChunkPlan, String> {
-    let payload_json = canonical_json_string(payload);
+    let payload_json = astra_core::canonical_json_string(payload);
     let chunk_hash = sha256_hex(payload_json.as_bytes());
     Ok(PromptChunkPlan {
         logical_key: logical_key.to_string(),
@@ -675,42 +675,9 @@ fn content_kind(content: Option<&Value>) -> &'static str {
 }
 
 fn hash_json_value(value: &Value) -> Result<String, String> {
-    Ok(sha256_hex(canonical_json_string(value).as_bytes()))
-}
-
-fn canonical_json_string(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
-        Value::Array(values) => {
-            let inner = values
-                .iter()
-                .map(canonical_json_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{inner}]")
-        }
-        Value::Object(values) => canonical_json_object(values),
-    }
-}
-
-fn canonical_json_object(values: &Map<String, Value>) -> String {
-    let mut entries = values.iter().collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    let inner = entries
-        .into_iter()
-        .map(|(key, value)| {
-            format!(
-                "{}:{}",
-                serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
-                canonical_json_string(value)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{inner}}}")
+    Ok(sha256_hex(
+        astra_core::canonical_json_string(value).as_bytes(),
+    ))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

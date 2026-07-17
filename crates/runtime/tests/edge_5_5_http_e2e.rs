@@ -205,8 +205,11 @@ impl RunLifecycleService for E2eRunLifecycle {
             ));
         };
         Ok(RunStatusRecord {
+            root_run_id: Some(run_id.clone()),
             run_id,
             session_id,
+            parent_run_id: None,
+            depth: 0,
             status: "waiting".into(),
             waiting_for: Some("tool_approval".into()),
             events_count: 1,

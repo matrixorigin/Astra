@@ -97,9 +97,9 @@ pub struct SpawnAgentInput {
     /// files, multi-step refactors, or anything that would
     /// routinely exhaust the default budget).
     ///
-    /// `max_turns` always wins when both are set. `complexity`
-    /// exists so callers that don't want to guess a numeric budget
-    /// can still pick the right shape.
+    /// `max_turns` is the numeric ceiling; when `complexity` is also set,
+    /// the smaller ceiling wins. This prevents an internally inconsistent
+    /// `normal + 2×default` request from silently becoming a deep run.
     ///
     /// APPENDED at the end of the struct: earlier fields are
     /// load-bearing for schema cache; do NOT reorder.
@@ -240,11 +240,13 @@ impl Default for SpawnAgentInput {
 /// Resolve the effective turn budget given an explicit `max_turns`,
 /// an optional `complexity` hint, and the agent-type default. Rules:
 ///
-///  * the agent-type default is the floor for every spawned child;
-///  * `max_turns=Some(n)` may raise the budget but may not make the
-///    child too small to be useful;
-///  * `complexity=Some("light")` / `"normal"` / None → default;
+///  * an explicit `max_turns=Some(n)` is authoritative when it is the only
+///    constraint (with a minimum of 1);
+///  * `complexity=Some("light")` → at most 10 turns;
+///  * `complexity=Some("normal")` / None → default;
 ///  * `complexity=Some("deep")` / `"thorough"` → `2 × default`;
+///  * when both are present, constraints compose by taking the smaller value;
+///    a `normal` classification cannot accidentally expand into a deep run;
 ///  * Unknown complexity strings fall back to default + a
 ///    `tracing::debug!` so operators can spot typos.
 ///
@@ -257,15 +259,12 @@ pub fn resolve_turn_budget(
     default_max_turns: u32,
 ) -> u32 {
     let default_max_turns = default_max_turns.max(1);
-    if let Some(n) = explicit_max_turns {
-        return n.max(default_max_turns);
-    }
-    match complexity
+    let complexity_budget = match complexity
         .map(str::trim)
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("light") | Some("short") | Some("quick") => default_max_turns,
+        Some("light") | Some("short") | Some("quick") => default_max_turns.min(10),
         Some("normal") | Some("default") | None | Some("") => default_max_turns,
         Some("deep") | Some("thorough") | Some("heavy") => default_max_turns.saturating_mul(2),
         Some(other) => {
@@ -276,6 +275,11 @@ pub fn resolve_turn_budget(
             );
             default_max_turns
         }
+    };
+    match (explicit_max_turns, complexity) {
+        (Some(n), Some(_)) => n.max(1).min(complexity_budget),
+        (Some(n), None) => n.max(1),
+        (None, _) => complexity_budget,
     }
 }
 
@@ -284,15 +288,25 @@ mod budget_resolve_tests {
     use super::resolve_turn_budget;
 
     #[test]
-    fn explicit_max_turns_can_raise_but_not_shrink_default() {
-        assert_eq!(resolve_turn_budget(Some(40), Some("deep"), 20), 40);
-        assert_eq!(resolve_turn_budget(Some(7), Some("deep"), 20), 20);
+    fn explicit_max_turns_is_authoritative_when_it_is_the_only_constraint() {
+        assert_eq!(resolve_turn_budget(Some(40), None, 20), 40);
+        assert_eq!(resolve_turn_budget(Some(7), None, 20), 7);
+        assert_eq!(resolve_turn_budget(Some(0), None, 20), 1);
     }
 
     #[test]
-    fn complexity_light_uses_agent_default() {
-        assert_eq!(resolve_turn_budget(None, Some("light"), 20), 20);
-        assert_eq!(resolve_turn_budget(None, Some("light"), 60), 60);
+    fn numeric_and_complexity_constraints_compose_by_minimum() {
+        assert_eq!(resolve_turn_budget(Some(40), Some("deep"), 20), 40);
+        assert_eq!(resolve_turn_budget(Some(7), Some("deep"), 20), 7);
+        assert_eq!(resolve_turn_budget(Some(0), Some("deep"), 20), 1);
+        assert_eq!(resolve_turn_budget(Some(24), Some("normal"), 12), 12);
+        assert_eq!(resolve_turn_budget(Some(24), Some("light"), 12), 10);
+    }
+
+    #[test]
+    fn complexity_light_caps_large_defaults_without_inflating_small_ones() {
+        assert_eq!(resolve_turn_budget(None, Some("light"), 20), 10);
+        assert_eq!(resolve_turn_budget(None, Some("light"), 60), 10);
         assert_eq!(resolve_turn_budget(None, Some("light"), 4), 4);
         assert_eq!(resolve_turn_budget(None, Some("light"), 8), 8);
     }

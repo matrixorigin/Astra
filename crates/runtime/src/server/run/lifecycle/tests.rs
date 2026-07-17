@@ -1428,6 +1428,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         spawn_tool_call_id: None,
         recursion_depth: 1,
         agent_type: "test".to_string(),
+        description: "Test child task".to_string(),
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
         model: Some("test-model".to_string()),
@@ -1652,7 +1653,7 @@ async fn server_spawn_runtime_context_requires_parent_lineage() {
 }
 
 #[test]
-fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
+fn subrun_turn_budget_treats_spawn_budget_as_authoritative_ceiling() {
     let profile =
         astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
             true,
@@ -1661,18 +1662,10 @@ fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
         );
     let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
 
-    assert!(
-        budget.initial_turns > 3,
-        "server sub-runs must mirror CLI: spawn max_turns starts the child state, but profile policy still controls adaptive budget"
-    );
-    assert!(
-        budget.hard_turn_limit > budget.initial_turns,
-        "small spawn budgets must not become a hard server-only ceiling"
-    );
-    assert!(
-        budget.max_extensions > 0,
-        "server sub-runs must retain adaptive extension room like CLI sub-agents"
-    );
+    assert_eq!(budget.initial_turns, 3);
+    assert_eq!(budget.hard_turn_limit, 3);
+    assert_eq!(budget.extension_turns, 0);
+    assert_eq!(budget.max_extensions, 0);
 }
 
 #[test]
@@ -2574,6 +2567,86 @@ fn test_service() -> AgenticRunLifecycleService {
         engine,
     )
     .with_model_service(Arc::new(ActiveTestModelService))
+}
+
+#[tokio::test]
+async fn session_dynamic_agent_executor_inherits_live_and_durable_edge_transports() {
+    let service = test_service()
+        .with_edge_connection_pool(
+            astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+        )
+        .with_edge_dispatch_service(Arc::new(astra_services::UnconfiguredEdgeDispatchService))
+        .with_edge_registry_service(Arc::new(astra_services::UnconfiguredEdgeRegistryService));
+
+    let entry = service
+        .server_agent_spawner_for_session("user-1", "session-1")
+        .await;
+    assert!(entry.executor.edge_connection_pool.is_some());
+    assert!(entry.executor.edge_dispatch_service.is_some());
+    assert!(entry.executor.edge_registry_service.is_some());
+}
+
+#[tokio::test]
+async fn durable_descendant_cancellation_sweep_converges_nested_active_runs() {
+    let service = test_service();
+    let engine = service.run_engine.clone();
+    engine
+        .start_run("root", "user-1", "session-1")
+        .await
+        .unwrap();
+    engine
+        .start_run_ext(
+            "child",
+            "user-1",
+            "session-1",
+            Some("root"),
+            None,
+            Some("reviewer"),
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .start_run_ext(
+            "grandchild",
+            "user-1",
+            "session-1",
+            Some("child"),
+            None,
+            Some("verifier"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        AgenticRunLifecycleService::cancel_durable_run_descendants(
+            &engine,
+            "user-1",
+            "session-1",
+            "root",
+            "ancestor cancelled",
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        engine
+            .load_run("user-1", "root")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RUNNING
+    );
+    for run_id in ["child", "grandchild"] {
+        let run = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert!(run.events.iter().any(|event| {
+            event["event_type"] == "run_finished" && event["data"]["ancestor_run_id"] == "root"
+        }));
+    }
 }
 
 #[test]
@@ -7050,52 +7123,6 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
     assert!(
         !cancel_token.is_cancelled(),
         "pause must not abort in-flight work"
-    );
-}
-
-#[tokio::test]
-async fn client_stream_disconnect_watcher_cancels_active_run() {
-    let (client_event_tx, client_event_rx) = mpsc::channel::<Value>(1);
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let cancel_token = Arc::new(CancellationToken::new());
-    let _watcher = start_client_stream_disconnect_watcher(
-        "run-1".to_string(),
-        client_event_tx,
-        cancel_flag.clone(),
-        cancel_token.clone(),
-    );
-
-    drop(client_event_rx);
-    cancel_token.cancelled().await;
-
-    assert!(cancel_flag.load(Ordering::Acquire));
-    assert!(cancel_token.is_cancelled());
-}
-
-#[tokio::test]
-async fn client_stream_disconnect_watcher_does_not_cancel_on_backpressure() {
-    let (client_event_tx, _client_event_rx) = mpsc::channel::<Value>(1);
-    client_event_tx
-        .try_send(json!({"type": "buffered"}))
-        .expect("pre-fill client channel");
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let cancel_token = Arc::new(CancellationToken::new());
-    let _watcher = start_client_stream_disconnect_watcher(
-        "run-1".to_string(),
-        client_event_tx,
-        cancel_flag.clone(),
-        cancel_token.clone(),
-    );
-
-    tokio::task::yield_now().await;
-
-    assert!(
-        !cancel_flag.load(Ordering::Acquire),
-        "a full client channel is backpressure, not a disconnect"
-    );
-    assert!(
-        !cancel_token.is_cancelled(),
-        "a full client channel must not cancel active work"
     );
 }
 
@@ -12264,5 +12291,45 @@ async fn child_client_tool_delivery_forwards_requests_without_leaking_child_tran
             .await
             .is_err(),
         "child text must remain on the typed agent-live transcript lane"
+    );
+}
+
+#[test]
+fn child_edge_ws_uses_runtime_dispatch_while_thin_client_uses_callback_lane() {
+    let edge_ws = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::edge_workspace(
+            "Developer edge",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Developer edge",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    assert!(
+        !child_uses_client_tool_delivery(true, Some(&edge_ws)),
+        "a connected edge executor must receive child tools through runtime dispatch"
+    );
+
+    let thin_client = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::edge_workspace(
+            "Thin client",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "browser-1",
+            "Browser callback",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    assert!(child_uses_client_tool_delivery(true, Some(&thin_client)));
+    assert!(
+        !child_uses_client_tool_delivery(false, Some(&thin_client)),
+        "a callback transport is not executable when the parent has no delivery lane"
     );
 }

@@ -584,6 +584,13 @@ fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
 }
 
 fn is_workspace_out_path(path: &str) -> bool {
+    // Standard device sinks are part of the sandbox contract, not host-file
+    // writes. Classifying `2>/dev/null` as an external mutation made harmless
+    // read-only review commands require approval even though the execution
+    // policy already mounts and explicitly allows this device.
+    if matches!(path, "/dev/null" | "/dev/zero" | "/dev/full") {
+        return false;
+    }
     path.starts_with("../") || path.starts_with("..\\") || path.starts_with('/')
 }
 
@@ -871,6 +878,8 @@ mod tests {
     fn safe_workspace_local_write_has_no_workspace_out_risk() {
         for command in [
             "echo ok > reports/out.txt",
+            "git status --short 2>/dev/null",
+            "cargo check >/dev/null",
             "cp -p report.txt reports/out.txt",
             "curl -o reports/payload.tgz https://example.com/payload.tgz",
             "rsync build/out.txt reports/out.txt",

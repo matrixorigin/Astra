@@ -1162,8 +1162,11 @@ mod edge_callback_insert_tests {
                 ));
             }
             Ok(RunStatusRecord {
+                root_run_id: Some(run_id.clone()),
                 run_id,
                 session_id: self.session_id.clone(),
+                parent_run_id: None,
+                depth: 0,
                 status: self.status.lock().unwrap().clone(),
                 waiting_for: self.waiting_for.lock().unwrap().clone(),
                 events_count: 1,

@@ -533,7 +533,7 @@ impl RunEngine {
     }
 
     /// Extended version of `start_run` with delegation metadata and interaction context.
-    async fn start_run_ext_with_context(
+    pub(crate) async fn start_run_ext_with_context(
         &self,
         run_id: &str,
         user_id: &str,

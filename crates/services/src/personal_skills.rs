@@ -641,7 +641,7 @@ impl DatabasePersonalSkillStore {
 
 pub fn normalize_skill_md(manifest_json: &Value, content_markdown: &str) -> String {
     let mut canonical = String::new();
-    canonical.push_str(&canonical_json(manifest_json));
+    canonical.push_str(&astra_core::canonical_json_string(manifest_json));
     canonical.push('\n');
     canonical.push_str(&normalize_markdown(content_markdown));
     canonical
@@ -649,32 +649,6 @@ pub fn normalize_skill_md(manifest_json: &Value, content_markdown: &str) -> Stri
 
 pub fn skill_md_content_hash(manifest_json: &Value, content_markdown: &str) -> String {
     sha256_prefixed(&normalize_skill_md(manifest_json, content_markdown))
-}
-
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(v) => v.to_string(),
-        Value::Number(v) => v.to_string(),
-        Value::String(v) => serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string()),
-        Value::Array(values) => {
-            let parts = values.iter().map(canonical_json).collect::<Vec<_>>();
-            format!("[{}]", parts.join(","))
-        }
-        Value::Object(map) => {
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            let parts = keys
-                .into_iter()
-                .map(|key| {
-                    let key_json =
-                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
-                    format!("{key_json}:{}", canonical_json(&map[key]))
-                })
-                .collect::<Vec<_>>();
-            format!("{{{}}}", parts.join(","))
-        }
-    }
 }
 
 fn normalize_markdown(content: &str) -> String {

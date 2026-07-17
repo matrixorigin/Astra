@@ -325,6 +325,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-recovered',
           sessionId: 'chat-1',
+          parentRunId: null,
+          rootRunId: 'run-recovered',
+          depth: 0,
           status: 'running',
           waitingFor: null,
         },
@@ -425,6 +428,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-open',
           sessionId: 'chat-open',
+          parentRunId: null,
+          rootRunId: 'run-open',
+          depth: 0,
           status: 'input-queued',
           waitingFor: 'user_input',
         },
@@ -485,6 +491,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-stop',
           sessionId: 'chat-stop',
+          parentRunId: null,
+          rootRunId: 'run-stop',
+          depth: 0,
           status: 'running',
           waitingFor: null,
         },
@@ -796,6 +805,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-stop',
           sessionId: 'chat-stop',
+          parentRunId: null,
+          rootRunId: 'run-stop',
+          depth: 0,
           status: 'running',
           waitingFor: null,
         },
@@ -877,6 +889,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-stop',
           sessionId: 'chat-stop',
+          parentRunId: null,
+          rootRunId: 'run-stop',
+          depth: 0,
           status: 'running',
           waitingFor: null,
         },
@@ -950,6 +965,9 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-resume',
           sessionId: 'chat-resume',
+          parentRunId: null,
+          rootRunId: 'run-resume',
+          depth: 0,
           status: 'paused',
           waitingFor: null,
         },

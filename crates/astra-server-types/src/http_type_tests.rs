@@ -600,6 +600,9 @@ fn run_status_response_serializes() {
     let resp = RunStatusResponse {
         run_id: "r1".into(),
         session_id: "s1".into(),
+        parent_run_id: None,
+        root_run_id: Some("r1".into()),
+        depth: 0,
         status: "waiting".into(),
         waiting_for: Some("tool_call".into()),
         events_count: 3,
@@ -609,6 +612,9 @@ fn run_status_response_serializes() {
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["waiting_for"], "tool_call");
+    assert!(v["parent_run_id"].is_null());
+    assert_eq!(v["root_run_id"], "r1");
+    assert_eq!(v["depth"], 0);
     assert_eq!(v["events_count"], 3);
     assert_eq!(v["workspace"]["kind"], "server_sandbox");
     assert_eq!(v["executor"]["kind"], "server_local");
@@ -988,6 +994,9 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
         runs: vec![RunStatusRecord {
             run_id: "run-1".into(),
             session_id: "session-1".into(),
+            parent_run_id: None,
+            root_run_id: Some("run-1".into()),
+            depth: 0,
             status: "running".into(),
             waiting_for: None,
             events_count: 3,
@@ -1052,6 +1061,9 @@ fn run_status_record_to_response() {
     let record = RunStatusRecord {
         run_id: "r1".into(),
         session_id: "s1".into(),
+        parent_run_id: Some("root".into()),
+        root_run_id: Some("root".into()),
+        depth: 1,
         status: "waiting".into(),
         waiting_for: Some("tool_call".into()),
         events_count: 7,
@@ -1063,11 +1075,17 @@ fn run_status_record_to_response() {
     assert_eq!(resp.status, "waiting");
     assert_eq!(resp.waiting_for.as_deref(), Some("tool_call"));
     assert_eq!(resp.events_count, 7);
+    assert_eq!(resp.parent_run_id.as_deref(), Some("root"));
+    assert_eq!(resp.root_run_id.as_deref(), Some("root"));
+    assert_eq!(resp.depth, 1);
 
     // without waiting_for
     let record = RunStatusRecord {
         run_id: "r2".into(),
         session_id: "s2".into(),
+        parent_run_id: None,
+        root_run_id: Some("r2".into()),
+        depth: 0,
         status: "completed".into(),
         waiting_for: None,
         events_count: 10,

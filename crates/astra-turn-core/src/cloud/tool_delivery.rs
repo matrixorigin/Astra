@@ -615,6 +615,20 @@ pub async fn wait_tool_result_ledger_for_tool(
     tc: &Value,
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
+    wait_tool_result_ledger_for_tool_with_cancel(ledger, identity, tc, ledger_wait, None).await
+}
+
+/// Wait for a thin-client tool callback without turning run cancellation into
+/// a five-minute transport stall. `edge_ledger` is an interactive delivery
+/// transport, so the owning run's cancellation boundary must win over a
+/// callback that can no longer be useful.
+pub async fn wait_tool_result_ledger_for_tool_with_cancel(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    identity: &EdgeDispatchIdentity,
+    tc: &Value,
+    ledger_wait: Duration,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+) -> EdgeToolRoundDelivery {
     let mut out = EdgeToolRoundDelivery::default();
     let Some(tc_map) = tc.as_object() else {
         return out;
@@ -634,11 +648,36 @@ pub async fn wait_tool_result_ledger_for_tool(
         );
     }
     let t_key = tool_callback_key(identity);
-    let tr_entry = take_ledger_entry(ledger, &t_key, ledger_wait).await;
-    let timed_out = tr_entry.is_none();
+    let mut cancelled = false;
+    let tr_entry = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                cancelled = true;
+                None
+            }
+            entry = take_ledger_entry(ledger, &t_key, ledger_wait) => entry,
+        }
+    } else {
+        take_ledger_entry(ledger, &t_key, ledger_wait).await
+    };
+    let cancelled_entry = cancelled.then(|| {
+        json!({
+            "kind": "tool_result",
+            "body": {
+                "status": "cancelled",
+                "output": format!("Tool '{tool_name}' cancelled before completion"),
+                "error_kind": "cancelled",
+                "cancelled": true,
+            }
+        })
+    });
+    let effective_entry = tr_entry.as_ref().or(cancelled_entry.as_ref());
+    let timed_out = tr_entry.is_none() && !cancelled;
     let raw_content = tr_entry
         .as_ref()
         .map(tool_content_from_ledger_entry)
+        .or_else(|| cancelled_entry.as_ref().map(tool_content_from_ledger_entry))
         .unwrap_or_else(|| MSG_TOOL_LEDGER_TIMEOUT.to_string());
     let content = llm_safe_tool_content(&raw_content, tool_name);
     out.tool_messages.push(json!({
@@ -650,8 +689,7 @@ pub async fn wait_tool_result_ledger_for_tool(
     // Pass the full body (with status + output) for status extraction, then
     // override the SSE `result` field with just the output text so the protocol
     // contract ("result is a string") is preserved.
-    let result_for_status = tr_entry
-        .as_ref()
+    let result_for_status = effective_entry
         .and_then(|entry| entry.get("body"))
         .cloned()
         .unwrap_or_else(|| Value::String(raw_content.clone()));
@@ -661,11 +699,11 @@ pub async fn wait_tool_result_ledger_for_tool(
     out.persist_tool_results
         .push(persist_value_for_ledger_tool_result(
             tc,
-            tr_entry.as_ref(),
+            effective_entry,
             timed_out,
         ));
     out.tool_results
-        .push(structured_tool_result(id, tr_entry.as_ref(), timed_out));
+        .push(structured_tool_result(id, effective_entry, timed_out));
     out
 }
 
@@ -1491,6 +1529,44 @@ mod tests {
         assert_eq!(
             fields.get("output").and_then(Value::as_str),
             Some("permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_interrupts_thin_client_tool_result_wait() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let tc = read_tool("c_cancelled");
+        let identity = test_identity("u1_cancelled", "c_cancelled");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let delivery = tokio::time::timeout(
+            Duration::from_millis(100),
+            super::wait_tool_result_ledger_for_tool_with_cancel(
+                &ledger,
+                &identity,
+                &tc,
+                Duration::from_secs(300),
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancellation must beat the callback timeout");
+
+        assert_eq!(delivery.tool_results.len(), 1);
+        assert_eq!(delivery.tool_results[0].status, "cancelled");
+        assert_eq!(
+            delivery.tool_results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("cancelled"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            delivery.tool_messages[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("cancelled before completion"))
         );
     }
 

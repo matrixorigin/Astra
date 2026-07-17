@@ -2139,35 +2139,6 @@ impl Drop for ActiveRunControlWatcher {
     }
 }
 
-struct ClientStreamDisconnectWatcher {
-    join: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for ClientStreamDisconnectWatcher {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
-}
-
-fn start_client_stream_disconnect_watcher(
-    run_id: String,
-    client_event_tx: mpsc::Sender<Value>,
-    cancel_flag: Arc<AtomicBool>,
-    cancel_token: Arc<CancellationToken>,
-) -> ClientStreamDisconnectWatcher {
-    let join = tokio::spawn(async move {
-        client_event_tx.closed().await;
-        cancel_flag.store(true, Ordering::SeqCst);
-        cancel_token.cancel();
-        tracing::info!(
-            target: "astra_runtime::run_lifecycle",
-            run_id = %run_id,
-            "client SSE stream disconnected; cancelling active run"
-        );
-    });
-    ClientStreamDisconnectWatcher { join }
-}
-
 fn start_active_run_control_watcher(
     run_control: Option<Arc<dyn RunControlProvider>>,
     user_id: String,
@@ -2704,19 +2675,24 @@ impl AgenticRunLifecycleService {
             return entry;
         }
 
-        let executor = Arc::new(
-            ServerSpawnAgentExecutor::new(
-                self.matrixone.clone(),
-                Arc::clone(&self.encryptor),
-                Arc::clone(&self.edge_callback_ledger),
-            )
-            .with_run_engine(self.run_engine.clone())
-            .with_pool(self.shared_pool.clone())
-            .with_edge_connection_pool(self.edge_connection_pool.clone())
-            .with_skill_service(self.skill_service.clone())
-            .with_memory_extraction_service(self.memory_extraction_service.clone())
-            .with_reflect_service(Arc::clone(&self.reflect_service)),
-        );
+        let mut executor = ServerSpawnAgentExecutor::new(
+            self.matrixone.clone(),
+            Arc::clone(&self.encryptor),
+            Arc::clone(&self.edge_callback_ledger),
+        )
+        .with_run_engine(self.run_engine.clone())
+        .with_pool(self.shared_pool.clone())
+        .with_edge_connection_pool(self.edge_connection_pool.clone())
+        .with_skill_service(self.skill_service.clone())
+        .with_memory_extraction_service(self.memory_extraction_service.clone())
+        .with_reflect_service(Arc::clone(&self.reflect_service));
+        if let Some(service) = self.edge_dispatch_service.clone() {
+            executor = executor.with_edge_dispatch_service(service);
+        }
+        if let Some(service) = self.edge_registry_service.clone() {
+            executor = executor.with_edge_registry_service(service);
+        }
+        let executor = Arc::new(executor);
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
             Arc::clone(&self.server_agent_mailbox_router),
@@ -2750,6 +2726,144 @@ impl AgenticRunLifecycleService {
         };
         guard.insert(registry_key, entry.clone());
         entry
+    }
+
+    async fn existing_server_agent_spawner_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Option<Arc<DynamicAgentSpawner>> {
+        let registry_key = format!("{user_id}\0{session_id}");
+        self.server_agent_spawners
+            .read()
+            .await
+            .get(&registry_key)
+            .map(|entry| Arc::clone(&entry.spawner))
+    }
+
+    async fn cancel_durable_run_descendants(
+        run_engine: &RunEngine,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        reason: &str,
+    ) -> Result<usize, String> {
+        const PAGE_LIMIT: u32 = 200;
+        const MAX_PAGES: usize = 32;
+        let mut cancelled = 0;
+
+        for _ in 0..MAX_PAGES {
+            let page = run_engine
+                .list_session_runs(user_id, session_id, PAGE_LIMIT)
+                .await?;
+            let mut descendants = page
+                .runs
+                .into_iter()
+                .filter(|run| {
+                    run.run_id != parent_run_id
+                        && matches!(
+                            run.status.as_str(),
+                            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                        )
+                        && run.ancestor_path.as_deref().is_some_and(|path| {
+                            path.split('/').any(|segment| segment == parent_run_id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                return Ok(cancelled);
+            }
+            descendants.sort_by(|left, right| right.depth.cmp(&left.depth));
+
+            let mut page_updates = 0;
+            for descendant in descendants {
+                let event = json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "cancelled": true,
+                        "reason": reason,
+                        "source": "ancestor_run",
+                        "ancestor_run_id": parent_run_id,
+                    }
+                });
+                if run_engine
+                    .transition_status_with_event_if_current(
+                        user_id,
+                        &descendant.run_id,
+                        &[descendant.status.as_str()],
+                        STATUS_CANCELLED,
+                        None,
+                        None,
+                        event,
+                    )
+                    .await?
+                {
+                    page_updates += 1;
+                    cancelled += 1;
+                }
+            }
+            if page_updates == 0 {
+                break;
+            }
+        }
+        Ok(cancelled)
+    }
+
+    async fn converge_cancelled_run_descendants(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) {
+        if let Some(de) = &self.delegation_engine {
+            de.cancel_children_of(run_id).await;
+        }
+        if let Some(spawner) = self
+            .existing_server_agent_spawner_for_session(user_id, session_id)
+            .await
+        {
+            let cancelled_children = spawner
+                .cancel_descendants_of_parent_run(
+                    run_id,
+                    "ancestor run cancelled before child completion",
+                )
+                .await;
+            if cancelled_children > 0 {
+                tracing::info!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    cancelled_children,
+                    "cancel endpoint converged dynamic-agent descendants"
+                );
+            }
+        }
+        match Self::cancel_durable_run_descendants(
+            &self.run_engine,
+            user_id,
+            session_id,
+            run_id,
+            "ancestor run cancelled before child completion",
+        )
+        .await
+        {
+            Ok(cancelled_children) if cancelled_children > 0 => {
+                tracing::info!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    cancelled_children,
+                    "cancel endpoint converged durable descendants"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    error = %error,
+                    "cancel endpoint durable descendant sweep failed"
+                );
+            }
+        }
     }
 
     async fn prune_idle_server_agent_spawners(&self) {
@@ -6075,6 +6189,9 @@ impl AgenticRunLifecycleService {
         RunStatusRecord {
             run_id: run.run_id.clone(),
             session_id: run.session_id.clone(),
+            parent_run_id: run.parent_run_id.clone(),
+            root_run_id: run.root_run_id.clone(),
+            depth: run.depth,
             status: run.status.clone(),
             waiting_for: run.waiting_for.clone(),
             events_count: run.events.len() as i64,
@@ -8490,7 +8607,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
         let bg_llm_cancel_token = llm_cancel_token.clone();
-        let bg_client_event_tx = client_event_tx.clone();
         let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
         let bg_root_mailbox_agent_id = request
             .agent_id
@@ -8623,17 +8739,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
-                let client_disconnect_watcher = start_client_stream_disconnect_watcher(
-                    bg_run_id.clone(),
-                    bg_client_event_tx,
-                    bg_cancel_flag.clone(),
-                    bg_llm_cancel_token.clone(),
-                );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 park_server_root_mailbox(&mut state).await;
                 let loop_success = loop_result.is_ok();
-                drop(client_disconnect_watcher);
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
@@ -8648,6 +8757,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let (final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+                if matches!(&final_status, RunStatus::Cancelled) {
+                    let cancelled_children = missing_lifecycle_spawner
+                        .cancel_descendants_of_parent_run(
+                            &bg_run_id,
+                            "ancestor run cancelled before child completion",
+                        )
+                        .await;
+                    if cancelled_children > 0 {
+                        tracing::info!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            cancelled_children,
+                            "cancelled dynamic-agent descendants with parent run"
+                        );
+                    }
+                    if let Err(error) = Self::cancel_durable_run_descendants(
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        "ancestor run cancelled before child completion",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            error = %error,
+                            "durable descendant cancellation sweep failed"
+                        );
+                    }
+                }
                 // Ensure fast synchronous child-agent progress has reached both
                 // durable replay and the live SSE stream before parent terminal
                 // markers close the turn.
@@ -9448,6 +9589,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         let Some(cancelled_status) = durable_status.control_action_target(RunControlAction::Cancel)
         else {
+            if durable_status == RunStatus::Cancelled {
+                self.converge_cancelled_run_descendants(&user_id, &durable.session_id, &run_id)
+                    .await;
+            }
             return Ok(CancelRunRecord {
                 run_id,
                 status: durable.status,
@@ -9478,6 +9623,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     | RunStatus::Failed
                     | RunStatus::Cancelled
             ) {
+                if current_status == RunStatus::Cancelled {
+                    self.converge_cancelled_run_descendants(&user_id, &current.session_id, &run_id)
+                        .await;
+                }
                 return Ok(CancelRunRecord {
                     run_id,
                     status: current.status,
@@ -9498,9 +9647,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        if let Some(de) = &self.delegation_engine {
-            de.cancel_children_of(&run_id).await;
-        }
+        self.converge_cancelled_run_descendants(&user_id, &durable.session_id, &run_id)
+            .await;
         Self::schedule_run_eviction(&self.runs, run_id.clone());
 
         Ok(CancelRunRecord {
@@ -10320,6 +10468,52 @@ fn server_subrun_waiting_for<'a>(
 
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn cancel_spawned_run(
+        &self,
+        run_id: &str,
+        user_id: Option<&str>,
+        reason: &str,
+    ) -> Result<(), String> {
+        let runtime_context = self.runtime_contexts.read().await.get(run_id).cloned();
+        if let Some(token) = runtime_context
+            .as_ref()
+            .and_then(|context| context.cancel_token.as_ref())
+        {
+            token.cancel();
+        }
+
+        let resolved_user_id = user_id.map(str::to_string).or_else(|| {
+            runtime_context
+                .as_ref()
+                .map(|context| context.user_id.clone())
+        });
+        if let (Some(run_engine), Some(user_id)) =
+            (self.run_engine.as_ref(), resolved_user_id.as_deref())
+        {
+            let event = json!({
+                "event_type": "run_finished",
+                "data": {
+                    "cancelled": true,
+                    "reason": reason,
+                    "source": "ancestor_run",
+                }
+            });
+            run_engine
+                .transition_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    event,
+                )
+                .await?;
+        }
+        self.remove_runtime_context(run_id).await;
+        Ok(())
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let context = self.runtime_context_for_config(&config).await?;
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
@@ -10332,7 +10526,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             .await;
 
         let mut profile =
-            AgentProfile::new(&config.agent_id, &config.agent_type, AgentTier::System);
+            AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
         profile.model_override = config.model.clone();
         profile.skill_filter = config.allowed_tools.clone();
@@ -10475,6 +10669,16 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
 
 struct ChildClientToolDeliveryBridge {
     join: tokio::task::JoinHandle<()>,
+}
+
+fn child_uses_client_tool_delivery(
+    parent_delivery_available: bool,
+    bindings: Option<&ExecutionBindingSnapshot>,
+) -> bool {
+    parent_delivery_available
+        && bindings.is_some_and(|snapshot| {
+            matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
+        })
 }
 
 impl Drop for ChildClientToolDeliveryBridge {
@@ -10682,7 +10886,7 @@ impl ServerSubRunExecutor {
             return Ok(());
         }
         run_engine
-            .start_run_ext(
+            .start_run_ext_with_context(
                 &config.run_id,
                 &config.user_id,
                 &config.session_id,
@@ -10690,6 +10894,10 @@ impl ServerSubRunExecutor {
                 config.context.get("delegation_id").and_then(Value::as_str),
                 Some(config.agent_profile.agent_id.as_str()),
                 None,
+                crate::server::run::engine::RunStartContext {
+                    agent_binding_name: Some(config.agent_profile.name.clone()),
+                    ..Default::default()
+                },
             )
             .await
     }
@@ -10794,17 +11002,20 @@ fn resolve_subrun_agentic_turn_budget(
     explicit_max_turns: Option<u32>,
 ) -> astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
     let runtime_ceiling = astra_core::RuntimeLimits::global().max_turns;
-    let base = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-        task_profile,
-        runtime_ceiling,
-        None,
-    );
     let Some(explicit_max_turns) = explicit_max_turns.map(|turns| turns as usize) else {
-        return base;
+        return astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+            task_profile,
+            runtime_ceiling,
+            None,
+        );
     };
-    if explicit_max_turns <= base.hard_turn_limit {
-        return base;
-    }
+
+    // A child budget is an execution boundary selected by the caller after
+    // agent-type and complexity resolution. Treating small values as mere
+    // hints silently inflated focused review children from 12 turns to the
+    // generic 60/90-turn profile budget. Preserve one source of truth all the
+    // way into the child loop; the shared resolver still clamps an excessive
+    // value to the process-wide runtime ceiling.
     astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
         task_profile,
         runtime_ceiling,
@@ -10918,11 +11129,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
             self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
         let execution_bindings =
             execution_bindings_from_metadata(config.execution_metadata.as_ref(), &subrun_workspace);
-        let client_tool_delivery_available = self.client_tool_delivery_tx.is_some()
-            && execution_bindings.as_ref().is_some_and(|snapshot| {
-                matches!(snapshot.workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
-                    || matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
-            });
+        // Only a true thin-client callback transport may borrow the parent's
+        // SSE `/tools/result` lane. An `edge_ws` workspace has an executable
+        // server-to-edge dispatch service and must use RuntimeToolExecutor;
+        // routing it through the browser callback lane waits forever because
+        // the browser is not the selected workspace executor.
+        let client_tool_delivery_available = child_uses_client_tool_delivery(
+            self.client_tool_delivery_tx.is_some(),
+            execution_bindings.as_ref(),
+        );
 
         // Build the host with agent-specific configuration.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -10965,6 +11180,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         let mut host = builder.build();
+        host.set_client_cancel(local_cancel_flag.clone(), local_cancel_token.clone());
         if let Some(sink) = config.live_event_sink.clone() {
             host.set_agent_live_event_sink(
                 config.run_id.clone(),

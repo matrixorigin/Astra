@@ -417,6 +417,9 @@ pub struct ChatResponse {
 pub struct RunStatusResponse {
     pub run_id: String,
     pub session_id: String,
+    pub parent_run_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub depth: u32,
     pub status: String,
     pub waiting_for: Option<String>,
     pub events_count: i64,
@@ -1121,6 +1124,9 @@ impl From<RunStatusRecord> for RunStatusResponse {
         Self {
             run_id: value.run_id,
             session_id: value.session_id,
+            parent_run_id: value.parent_run_id,
+            root_run_id: value.root_run_id,
+            depth: value.depth,
             status: value.status,
             waiting_for: value.waiting_for,
             events_count: value.events_count,

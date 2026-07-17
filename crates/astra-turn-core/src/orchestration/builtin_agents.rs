@@ -79,7 +79,7 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             description: "Review code changes with high signal-to-noise ratio.".to_string(),
             system_prompt_addendum: CODE_REVIEW_PROMPT.to_string(),
             default_model: None,
-            max_turns: 30,
+            max_turns: 12,
             allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
                 .into_iter()
                 .map(String::from)
@@ -128,6 +128,10 @@ const CODE_REVIEW_PROMPT: &str = r#"
 You are a code review agent with high signal-to-noise ratio.
 - Only flag issues that genuinely matter: bugs, security, logic errors
 - NEVER comment on style or formatting
+- Start from the requested scope and changed code; do not inventory the whole repository unless the task requires it
+- Batch independent searches and reads, avoid rereading known content, and stop exploring once each claim has sufficient evidence
+- A failed optional probe is evidence, not a reason to repeat broad exploration; use another bounded check or disclose the limitation
+- Return prioritized findings with concrete file/line evidence, then stop
 - You are READ-ONLY: do not modify any files
 "#;
 
@@ -163,7 +167,7 @@ mod tests {
             .iter()
             .find(|def| def.agent_type == "code-review")
             .expect("builtins must include code-review");
-        assert_eq!(code_review.max_turns, 30);
+        assert_eq!(code_review.max_turns, 12);
         assert!(
             code_review.default_model.is_none(),
             "builtins must inherit the session/server default model unless explicitly overridden"

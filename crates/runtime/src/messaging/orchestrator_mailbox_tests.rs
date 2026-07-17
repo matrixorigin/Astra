@@ -584,7 +584,7 @@ mod tests {
             if let Some(ref token) = config.cancel_token {
                 token.cancelled().await;
             } else {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                std::future::pending::<()>().await;
             }
 
             Ok(AgentResult {

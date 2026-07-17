@@ -1776,6 +1776,7 @@ export async function ensureChatBackendSession(
 
   const model = selectedWebModel(params.model ?? chat.model);
   const session = await createBackendSession({
+    chatId: chat.id,
     title: chat.title,
     projectId: chat.projectId,
     model,
@@ -1880,7 +1881,10 @@ function chatRecordFromBackendSession(
     : existing?.workspaceSelection;
 
   return {
-    id: existing?.id ?? session.session_id,
+    id:
+      existing?.id ??
+      metadataString(session.metadata, "web_chat_id") ??
+      session.session_id,
     title,
     projectId,
     createdAt,
@@ -2002,6 +2006,12 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (isLocallyStoppedRun(existingForRun, run.runId, syncNow)) {
       continue;
     }
+    // One chat owns one root run at a time. Child runs share its session but
+    // are managed through the agent workbench; selecting one here makes Stop,
+    // input routing, and refresh target the wrong execution.
+    if (run.parentRunId !== null || run.depth !== 0) {
+      continue;
+    }
     if (!runBlocksChatTurn(run.status)) {
       continue;
     }
@@ -2080,6 +2090,12 @@ function transcriptItemToMessage(
   }
   const reasoning =
     typeof item.reasoning === "string" ? item.reasoning.trim() : "";
+  // Canonical transcripts retain assistant tool-call scaffolding even when it
+  // has no user-visible text. It is valid replay state, but rendering it as a
+  // blank chat message makes a cancelled/refreshed turn look like data loss.
+  if (item.role === "assistant" && !item.content.trim() && !reasoning) {
+    return null;
+  }
   const reasoningStatus =
     item.reasoning_status === "streaming" ||
     item.reasoning_status === "complete"
@@ -2140,13 +2156,67 @@ async function syncBackendTranscript(
   if (!messages.length) {
     return;
   }
+
+  // The transcript is authoritative for committed history, while the active
+  // run is authoritative for the in-flight turn. A turn's assistant row is
+  // not committed until output arrives, so replacing local state with the
+  // transcript during refresh leaves no message for SSE resume to target.
+  // Preserve that overlay, and synthesize it after a Web process restart.
+  const activeRun = chat.activeRun;
+  if (activeRun && runBlocksChatTurn(activeRun.status)) {
+    const localAssistant =
+      (activeRun.assistantMessageId
+        ? chat.messages.find(
+            (message) =>
+              message.id === activeRun.assistantMessageId &&
+              message.role === "assistant",
+          )
+        : undefined) ??
+      [...chat.messages]
+        .reverse()
+        .find(
+          (message) =>
+            message.role === "assistant" && message.status === "streaming",
+        );
+    const localAssistantIndex = localAssistant
+      ? chat.messages.findIndex((message) => message.id === localAssistant.id)
+      : -1;
+    const localUser =
+      localAssistantIndex > 0 &&
+      chat.messages[localAssistantIndex - 1]?.role === "user"
+        ? chat.messages[localAssistantIndex - 1]
+        : undefined;
+    const canonicalTail = messages[messages.length - 1];
+    const canonicalHasCurrentUser =
+      canonicalTail?.role === "user" &&
+      (!localUser || canonicalTail.content === localUser.content);
+
+    if (!canonicalHasCurrentUser && localUser) {
+      messages.push(localUser);
+    }
+    const assistant =
+      localAssistant ??
+      ({
+        id: `inflight:${activeRun.runId}`,
+        role: "assistant",
+        content: "",
+        createdAt: nowIso(),
+        reasoning: "",
+        reasoningStatus: "streaming",
+        status: "streaming",
+      } satisfies ChatMessage);
+    messages.push(assistant);
+    activeRun.assistantMessageId = assistant.id;
+  }
+
   chat.messages = messages;
   const latest = messages[messages.length - 1];
   chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
-  chat.lastMessagePreview = latest?.content ?? chat.lastMessagePreview;
+  chat.lastMessagePreview = latest?.content || chat.lastMessagePreview;
 }
 
 async function createBackendSession(params: {
+  chatId: string;
   title: string | null;
   projectId: string | null;
   model: string;
@@ -2166,6 +2236,7 @@ async function createBackendSession(params: {
       title: params.title,
       metadata: {
         source: "web_v1",
+        web_chat_id: params.chatId,
         project_id: params.projectId,
         initial_model: params.model,
         current_model: params.model,

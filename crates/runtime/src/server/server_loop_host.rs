@@ -1168,11 +1168,9 @@ pub struct ServerAgenticLoopHost {
     /// requests use that lane; ordinary child output stays on the typed live
     /// mirror.
     prefer_client_tool_delivery: bool,
-    /// When the SSE channel's receiver is dropped (client disconnected),
-    /// this flag is set so the agentic loop cancels at the next turn boundary.
+    /// Explicit run cancellation flag. Observer disconnects never mutate it.
     client_cancel_flag: Option<Arc<AtomicBool>>,
-    /// Low-latency cancellation token — cancelled alongside `client_cancel_flag`
-    /// for immediate LLM abort on client disconnect.
+    /// Low-latency explicit run cancellation token.
     client_cancel_token: Option<Arc<CancellationToken>>,
 
     // ── Agent progress ──
@@ -2467,9 +2465,8 @@ impl ServerAgenticLoopHost {
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
-    /// If the streaming channel is closed (client disconnected), triggers
-    /// cancellation so the agentic loop stops at the next turn boundary. If the
-    /// channel is full, live streaming is detached but the run continues.
+    /// If the observer channel is closed or full, detach live delivery. The
+    /// durable run continues and may be observed again through run replay.
     fn emit_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
@@ -2478,13 +2475,7 @@ impl ServerAgenticLoopHost {
             match tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Client disconnected — cancel the loop to stop wasting LLM tokens.
-                    if let Some(flag) = &self.client_cancel_flag {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(token) = &self.client_cancel_token {
-                        token.cancel();
-                    }
+                    tracing::debug!(target: "sse_channel", "SSE observer disconnected; detaching live stream while durable run continues");
                     self.event_tx = None;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2672,8 +2663,7 @@ impl ServerAgenticLoopHost {
     }
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
-    /// When the channel closes (client disconnect), `cancel_flag` and
-    /// `cancel_token` are triggered to stop the agentic loop.
+    /// Channel closure detaches this observer; it does not cancel the run.
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         // In live streaming mode, run_lifecycle owns the dedicated progress
         // bridge. Keeping the host subscription active would replay the same
@@ -2714,7 +2704,7 @@ impl ServerAgenticLoopHost {
         });
     }
 
-    /// Set the cancellation handles used when client disconnects.
+    /// Set the handles used by explicit run cancellation and runtime boundaries.
     pub fn set_client_cancel(&mut self, flag: Arc<AtomicBool>, token: Arc<CancellationToken>) {
         self.client_cancel_flag = Some(flag);
         self.client_cancel_token = Some(token);
@@ -3793,12 +3783,17 @@ impl ServerAgenticLoopHost {
         identity: &astra_services::multi_agent::EdgeDispatchIdentity,
         ledger_wait: Duration,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
-        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
         use astra_turn_core::edge_ledger::tool_callback_key;
 
-        let delivery =
-            wait_tool_result_ledger_for_tool(&self.edge_callback_ledger, identity, tc, ledger_wait)
-                .await;
+        let delivery = wait_tool_result_ledger_for_tool_with_cancel(
+            &self.edge_callback_ledger,
+            identity,
+            tc,
+            ledger_wait,
+            self.client_cancel_token.as_deref(),
+        )
+        .await;
         if !edge_tool_delivery_timed_out(&delivery) {
             return delivery;
         }
@@ -3844,11 +3839,12 @@ impl ServerAgenticLoopHost {
             });
         }
 
-        wait_tool_result_ledger_for_tool(
+        wait_tool_result_ledger_for_tool_with_cancel(
             &self.edge_callback_ledger,
             identity,
             tc,
             Duration::from_millis(0),
+            self.client_cancel_token.as_deref(),
         )
         .await
     }
@@ -12547,6 +12543,30 @@ mod tests {
             host.event_tx.is_none(),
             "live stream sender should be detached after bounded channel backpressure"
         );
+        assert_eq!(host.emitted_events.len(), 1);
+    }
+
+    #[test]
+    fn disconnected_sse_observer_detaches_without_cancelling_durable_run() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+        host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        host.set_event_tx(tx);
+        host.emit_event(json!({"type": "text_delta", "content": "detached"}));
+
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!cancel_token.is_cancelled());
+        assert!(host.event_tx.is_none());
         assert_eq!(host.emitted_events.len(), 1);
     }
 

@@ -52,10 +52,18 @@ function runtimeRun(
   sessionId: string,
   status: string,
   waitingFor?: string | null,
+  lineage?: {
+    parentRunId: string | null;
+    rootRunId: string;
+    depth: number;
+  },
 ) {
   return {
     run_id: runId,
     session_id: sessionId,
+    parent_run_id: lineage?.parentRunId ?? null,
+    root_run_id: lineage?.rootRunId ?? runId,
+    depth: lineage?.depth ?? 0,
     status,
     waiting_for: waitingFor ?? null,
     events_count: 0,
@@ -378,6 +386,40 @@ describe("web store user scoping", () => {
     });
   });
 
+  it("keeps the root conversation run authoritative when a child agent is newer and active", async () => {
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeSessionList([
+            runtimeSession("session-fanout", "user-a", "fanout"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun("child-newer", "session-fanout", "waiting", "tool", {
+              parentRunId: "root-run",
+              rootRunId: "root-run",
+              depth: 1,
+            }),
+            runtimeRun("root-run", "session-fanout", "running"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+
+    const detail = await getChatHydrated("user-a", "session-fanout");
+
+    expect(detail?.activeRun).toEqual({
+      runId: "root-run",
+      status: "running",
+      waitingFor: null,
+      nextEventIndex: 0,
+    });
+  });
+
   it("preserves fresher local run state when backend polling lags behind the stream", async () => {
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
     fetchMock
@@ -464,5 +506,129 @@ describe("web store user scoping", () => {
 
     const detail = await getChatHydrated("user-a", "session-terminal-sync");
     expect(detail?.activeRun).toBeUndefined();
+  });
+
+  it("preserves the in-flight assistant overlay when durable transcript has only committed user input", async () => {
+    const timestamp = "2026-07-17T09:54:04.000Z";
+    getStore("user-a").chats.push({
+      id: "chat-refresh",
+      title: "Refresh",
+      projectId: null,
+      createdAt: timestamp,
+      lastMessageAt: timestamp,
+      lastMessagePreview: "run agents",
+      model: "sonnet-4.6-adaptive",
+      backendSessionId: "session-refresh",
+      messages: [
+        {
+          id: "local-user",
+          role: "user",
+          content: "run agents",
+          createdAt: timestamp,
+          status: "complete",
+        },
+        {
+          id: "local-assistant",
+          role: "assistant",
+          content: "",
+          createdAt: timestamp,
+          reasoning: "",
+          reasoningStatus: "streaming",
+          status: "streaming",
+        },
+      ],
+    });
+    setChatActiveRun("user-a", "chat-refresh", {
+      runId: "root-refresh",
+      status: "running",
+      waitingFor: null,
+      assistantMessageId: "local-assistant",
+    });
+
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeSessionList([
+            runtimeSession("session-refresh", "user-a", "Refresh"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun("root-refresh", "session-refresh", "running"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeTranscript([
+            {
+              item_seq: 1,
+              role: "user",
+              content: "run agents",
+              created_at: timestamp,
+            },
+          ]),
+        ),
+      );
+
+    const detail = await getChatHydrated("user-a", "chat-refresh");
+
+    expect(detail?.messages.map(({ role, status }) => ({ role, status }))).toEqual([
+      { role: "user", status: "complete" },
+      { role: "assistant", status: "streaming" },
+    ]);
+    expect(detail?.messages[1]?.id).toBe("local-assistant");
+    expect(detail?.activeRun?.assistantMessageId).toBe("local-assistant");
+  });
+
+  it("synthesizes a resumable assistant target after Web process state is lost", async () => {
+    const timestamp = "2026-07-17T09:54:04.000Z";
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeSessionList([
+            {
+              ...runtimeSession("session-restart", "user-a", "Restart"),
+              metadata: { source: "web_v1", web_chat_id: "web-stable" },
+            },
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun("root-restart", "session-restart", "running"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeTranscript([
+            {
+              item_seq: 1,
+              role: "user",
+              content: "run agents",
+              created_at: timestamp,
+            },
+          ]),
+        ),
+      );
+
+    const detail = await getChatHydrated("user-a", "web-stable");
+
+    expect(detail?.chat.id).toBe("web-stable");
+    expect(detail?.session?.backendSessionId).toBe("session-restart");
+    expect(detail?.messages.at(-1)).toMatchObject({
+      id: "inflight:root-restart",
+      role: "assistant",
+      status: "streaming",
+    });
+    expect(detail?.activeRun?.assistantMessageId).toBe(
+      "inflight:root-restart",
+    );
   });
 });

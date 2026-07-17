@@ -48,7 +48,6 @@ const MAX_AGENT_ID_BYTES: usize = 256;
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
 const FANOUT_RESULT_DEFAULT_MAX_BYTES: usize = 8_192;
 const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
-const FANOUT_CODE_REVIEW_MIN_TURNS: u32 = 30;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
@@ -1113,9 +1112,6 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         })
         .to_string();
     }
-    // Budget transparency: detect silent max_turns inflation before slots
-    // are moved, then surface it in every response branch below.
-    let budget_notice = fanout_budget_adjustment_notice(&input);
     let slots = std::mem::take(&mut input.slots);
     let tool_call_id = input._tool_call_id.clone();
     if let Err(error) = ctx
@@ -1167,20 +1163,6 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
     let mut agents: Vec<Value> = join_all(futs).await;
     // Restore slot-index order.
     agents.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
-    if budget_notice.is_some() {
-        let stored = ctx
-            .spawner
-            .set_fanout_group_budget_adjustment(&group_id, budget_notice.clone())
-            .await;
-        if !stored {
-            tracing::warn!(
-                target: "fanout",
-                group_id = %group_id,
-                "budget adjustment dropped: group evicted before result aggregation",
-            );
-        }
-    }
-
     // If any agent is still running asynchronously, return a lightweight
     // "started" response with spawn status only (no full results yet).
     let any_launched = agents
@@ -1198,11 +1180,6 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             "agents": agents,
             "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
         });
-        if let Some(notice) = &budget_notice {
-            resp.as_object_mut()
-                .unwrap()
-                .insert("budget_adjustment".into(), json!(notice));
-        }
         if terminal_causes.has_stopped_slots() {
             let obj = resp.as_object_mut().unwrap();
             terminal_causes.insert_json_fields(obj);
@@ -1248,11 +1225,6 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                 "instruction": "One or more fanout slots were rejected at spawn time. Do not retry or respawn replacements. Use agent_fanout(action='get_results', group_id=...) to collect any available partial results.",
             });
             terminal_causes.insert_json_fields(resp.as_object_mut().unwrap());
-            if let Some(notice) = &budget_notice {
-                resp.as_object_mut()
-                    .unwrap()
-                    .insert("budget_adjustment".into(), json!(notice));
-            }
             return resp.to_string();
         }
     }
@@ -1271,32 +1243,18 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             "instruction": "One or more fanout slots stopped before normal completion. Do not retry or respawn replacements. Use the structured cause counts in this result, collect any available partial output, or ask the user how to proceed.",
         });
         terminal_causes.insert_json_fields(resp.as_object_mut().unwrap());
-        if let Some(notice) = &budget_notice {
-            resp.as_object_mut()
-                .unwrap()
-                .insert("budget_adjustment".into(), json!(notice));
-        }
         return resp.to_string();
     }
 
     // All agents completed synchronously — return the full results directly.
     // No separate "agents[]" field: results[] already contains status per slot.
-    let mut results = render_agent_fanout_results(
+    render_agent_fanout_results(
         ctx,
         &group_id,
         tool_call_id,
         FanoutResultReadOptions::default(),
     )
-    .await;
-    if let Some(notice) = &budget_notice {
-        if let Ok(mut value) = serde_json::from_str::<Value>(&results) {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("budget_adjustment".into(), json!(notice));
-                results = value.to_string();
-            }
-        }
-    }
-    results
+    .await
 }
 
 async fn handle_agent_fanout_get_results_action(
@@ -1577,9 +1535,6 @@ async fn render_agent_fanout_results(
     if summary.spawn_rejected > 0 {
         obj.insert("spawn_rejected".into(), json!(summary.spawn_rejected));
     }
-    if let Some(notice) = updated.budget_adjustment.as_ref() {
-        obj.insert("budget_adjustment".into(), json!(notice));
-    }
     if summary.timed_out > 0 {
         obj.insert("timed_out".into(), json!(summary.timed_out));
     }
@@ -1810,82 +1765,8 @@ fn fanout_effective_max_turns(
     slot: &AgentFanoutStartSlot,
     defaults: Option<&AgentFanoutDefaults>,
 ) -> Option<u32> {
-    let requested = slot
-        .max_turns
-        .or_else(|| defaults.and_then(|d| d.max_turns));
-    let agent_type = slot
-        .agent_type
-        .as_deref()
-        .or_else(|| defaults.and_then(|d| d.agent_type.as_deref()))
-        .map(str::trim)
-        .filter(|agent_type| !agent_type.is_empty())
-        .unwrap_or("general-purpose");
-    let complexity = slot
-        .complexity
-        .as_deref()
-        .or_else(|| defaults.and_then(|d| d.complexity.as_deref()))
-        .map(str::trim)
-        .map(str::to_ascii_lowercase);
-
-    let is_deep = matches!(complexity.as_deref(), Some("deep" | "thorough" | "heavy"));
-    let is_code_review = agent_type == "code-review";
-    let agent_default = builtin_agent_default_max_turns(agent_type);
-    let min_turns = agent_default.or(if is_deep || is_code_review {
-        Some(FANOUT_CODE_REVIEW_MIN_TURNS)
-    } else {
-        None
-    });
-
-    match (requested, min_turns, is_deep) {
-        (Some(requested), Some(min_turns), _) => Some(requested.max(min_turns)),
-        (None, Some(min_turns), false) => Some(min_turns),
-        (None, _, _) => None,
-        (Some(requested), None, _) => Some(requested),
-    }
-}
-
-fn builtin_agent_default_max_turns(agent_type: &str) -> Option<u32> {
-    astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
-        .into_iter()
-        .find(|definition| definition.agent_type == agent_type)
-        .map(|definition| definition.max_turns)
-}
-
-/// Detect whether the effective `max_turns` diverged from what the caller
-/// requested, and if so, produce a human-readable transparency notice.
-///
-/// First principles: a silent budget override breaks the caller's mental model
-/// of cost. When we raise a too-small request to the agent-type floor, the
-/// caller must be told so the parent agent can report the actual execution
-/// shape instead of pretending the smaller budget was used.
-fn fanout_budget_adjustment_notice(input: &AgentFanoutStartInput) -> Option<String> {
-    let defaults = input.defaults.as_ref();
-    let mut adjustments: Vec<String> = Vec::new();
-    for (i, slot) in input.slots.iter().enumerate() {
-        let requested = slot
-            .max_turns
-            .or_else(|| defaults.and_then(|d| d.max_turns));
-        let effective = fanout_effective_max_turns(slot, defaults);
-        match (requested, effective) {
-            (Some(req), Some(eff)) if eff > req => {
-                let label = slot
-                    .slot_id
-                    .as_deref()
-                    .map(|id| format!("id={id}"))
-                    .unwrap_or_else(|| format!("slot[{i}]"));
-                adjustments.push(format!("{label}: max_turns {req} → {eff}"));
-            }
-            _ => {}
-        }
-    }
-    if adjustments.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "Budget adjusted — agent-type minimum turn budget enforced ({}).",
-            adjustments.join("; ")
-        ))
-    }
+    slot.max_turns
+        .or_else(|| defaults.and_then(|defaults| defaults.max_turns))
 }
 
 fn insert_optional_string(
@@ -1935,7 +1816,7 @@ async fn find_fanout_group(
 
 fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
     let summary = group.summary();
-    let mut value = json!({
+    json!({
         "group_id": group.group_id,
         "title": group.title,
         "parent_run_id": group.parent_run_id,
@@ -1965,14 +1846,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
             "result_collected": slot.result_collected,
             "terminal_reason": &slot.terminal_reason,
         })).collect::<Vec<_>>(),
-    });
-    if let Some(notice) = group.budget_adjustment.as_ref() {
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("budget_adjustment".into(), json!(notice));
-    }
-    value
+    })
 }
 
 fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'static str {
@@ -2907,7 +2781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_floors_too_small_turn_budget_to_agent_default() {
+    async fn handle_spawn_agent_tool_preserves_explicit_turn_budget() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -2925,8 +2799,8 @@ mod tests {
         assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(
             executor.take_captured_max_turns(),
-            Some(60),
-            "general-purpose children must not inherit a model-supplied 10-turn cap"
+            Some(10),
+            "the child loop must preserve an explicit caller-selected ceiling"
         );
     }
 
@@ -3481,7 +3355,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_slot_spawn_args_raise_too_small_deep_review_budget() {
+    fn fanout_slot_spawn_args_preserve_explicit_deep_review_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -3513,11 +3387,11 @@ mod tests {
 
         assert_eq!(args["agent_type"], "code-review");
         assert_eq!(args["complexity"], "deep");
-        assert_eq!(args["max_turns"], 30);
+        assert_eq!(args["max_turns"], 15);
     }
 
     #[test]
-    fn fanout_slot_spawn_args_floor_general_purpose_budget_to_agent_default() {
+    fn fanout_slot_spawn_args_preserve_explicit_general_purpose_budget() {
         let input = AgentFanoutStartInput {
             _action: Some("start".into()),
             _tool_call_id: None,
@@ -3557,7 +3431,7 @@ mod tests {
 
         assert_eq!(args["agent_type"], "general-purpose");
         assert_eq!(args["complexity"], "light");
-        assert_eq!(args["max_turns"], 60);
+        assert_eq!(args["max_turns"], 10);
     }
 
     #[tokio::test]

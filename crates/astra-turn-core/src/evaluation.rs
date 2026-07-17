@@ -88,6 +88,10 @@ pub enum EvalSignal {
     /// orchestration incomplete class). Carries the normalized result class and
     /// number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
+    /// Coverage for classified outcome failures across materially attempted
+    /// tool calls. This distinguishes one failed optional probe in a productive
+    /// review from a turn where most execution evidence is unavailable.
+    ToolOutcomeFailureCoverage { unresolved: usize, observed: usize },
     /// One or more tool calls were rejected before execution by policy or
     /// runtime admission. They are not material `tools_used`, but they are
     /// still user-visible failed tool attempts and must not be evaluated as
@@ -281,12 +285,52 @@ pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
 /// run lifecycle projection uses this predicate so a model-produced explanation
 /// after failed tools is not mislabeled as successful task completion.
 pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -> bool {
-    eval.signals.iter().any(|signal| {
+    let has_nested_incomplete_run = eval.signals.iter().any(|signal| {
+        matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, .. }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE
+                    || class == RESULT_CLASS_FANOUT_INCOMPLETE
+        )
+    });
+    if has_nested_incomplete_run {
+        return true;
+    }
+
+    let has_execution_failure = eval.signals.iter().any(|signal| {
         matches!(
             signal,
             EvalSignal::ToolOutcomeFailure { .. } | EvalSignal::BlockedToolCall { .. }
         )
-    })
+    });
+    if !has_execution_failure {
+        return false;
+    }
+
+    // A minority failure in an otherwise productive turn remains visible as
+    // evaluation evidence, but must not poison the child lifecycle. Fanout
+    // review agents commonly use optional probes; one unavailable probe among
+    // dozens of successful reads does not make the review itself incomplete.
+    // Majority failure still means the delegated task lacks reliable execution
+    // evidence. Evaluations without a rate are treated conservatively because
+    // hand-built/external evaluations cannot prove successful recovery.
+    if let Some(is_majority) = eval.signals.iter().find_map(|signal| match signal {
+        EvalSignal::ToolOutcomeFailureCoverage {
+            unresolved,
+            observed,
+        } => Some(*observed == 0 || unresolved.saturating_mul(2) >= *observed),
+        _ => None,
+    }) {
+        return is_majority;
+    }
+
+    eval.signals
+        .iter()
+        .find_map(|signal| match signal {
+            EvalSignal::ToolErrorRate(rate) => Some(*rate >= 0.5),
+            _ => None,
+        })
+        .unwrap_or(true)
 }
 
 pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
@@ -971,6 +1015,14 @@ fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[
         eval.signals
             .push(EvalSignal::ToolOutcomeFailure { class, count });
     }
+    let observed = records
+        .iter()
+        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
+        .count();
+    eval.signals.push(EvalSignal::ToolOutcomeFailureCoverage {
+        unresolved: total,
+        observed,
+    });
 
     let penalty = (0.25 + 0.08 * total.saturating_sub(1) as f64).clamp(0.25, 0.50);
     eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
@@ -1554,6 +1606,17 @@ pub fn eval_signal_to_json_with_thresholds(
                 "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
             ),
         }),
+        EvalSignal::ToolOutcomeFailureCoverage {
+            unresolved,
+            observed,
+        } => json!({
+            "kind": "tool_outcome_failure_coverage",
+            "unresolved": unresolved,
+            "observed": observed,
+            "message": format!(
+                "{unresolved} unresolved classified tool outcome failure(s) across {observed} materially attempted call(s)"
+            ),
+        }),
         EvalSignal::BlockedToolCall { count } => json!({
             "kind": "blocked_tool_call",
             "count": count,
@@ -1849,10 +1912,39 @@ mod tests {
                 class: "transport_unavailable".to_string(),
                 count: 2,
             }],
-            ..low_quality
+            ..low_quality.clone()
         };
         assert!(turn_evaluation_has_unresolved_execution_failure(
             &execution_incomplete
+        ));
+
+        let recovered_with_partial_evidence = TurnEvaluation {
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.01),
+                EvalSignal::ToolOutcomeFailure {
+                    class: "execution_error".to_string(),
+                    count: 1,
+                },
+            ],
+            ..low_quality.clone()
+        };
+        assert!(
+            !turn_evaluation_has_unresolved_execution_failure(&recovered_with_partial_evidence),
+            "a minority optional-probe failure is advisory evidence, not a failed child lifecycle"
+        );
+
+        let nested_agent_incomplete = TurnEvaluation {
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.01),
+                EvalSignal::ToolOutcomeFailure {
+                    class: RESULT_CLASS_AGENT_INCOMPLETE.to_string(),
+                    count: 1,
+                },
+            ],
+            ..low_quality
+        };
+        assert!(turn_evaluation_has_unresolved_execution_failure(
+            &nested_agent_incomplete
         ));
     }
 
@@ -2149,6 +2241,41 @@ mod tests {
                 if class == "execution_error" && *count == 1
         )));
         assert!(turn_evaluation_has_unresolved_execution_failure(&eval));
+    }
+
+    #[test]
+    fn minority_optional_probe_failure_does_not_poison_completed_execution() {
+        let mut failed_probe = journal_ok_call("bash");
+        failed_probe.args_full =
+            Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
+        failed_probe.ok = false;
+        failed_probe.result_class = Some("execution_error".to_string());
+
+        let successful_reads = ["src/lib.rs", "src/runtime.rs", "tests/e2e.rs"]
+            .into_iter()
+            .map(|path| {
+                let mut record = journal_ok_call("read_file");
+                record.args_full = Some(serde_json::json!({"path": path}).to_string());
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut records = vec![failed_probe];
+        records.extend(successful_reads);
+
+        let eval =
+            evaluate_tool_call_records("review the implementation", &[], &records, 0, false, 0.2);
+
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailureCoverage {
+                unresolved: 1,
+                observed: 4
+            }
+        )));
+        assert!(
+            !turn_evaluation_has_unresolved_execution_failure(&eval),
+            "the failed probe remains advisory evidence, while the productive child lifecycle completes"
+        );
     }
 
     #[test]

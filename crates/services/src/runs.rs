@@ -691,6 +691,11 @@ pub struct ChatStreamRecord {
 pub struct RunStatusRecord {
     pub run_id: String,
     pub session_id: String,
+    /// Durable run-tree identity. A missing parent identifies the root
+    /// conversation run; clients must not infer lineage from event timing.
+    pub parent_run_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub depth: u32,
     pub status: String,
     pub waiting_for: Option<String>,
     pub events_count: i64,

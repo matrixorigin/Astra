@@ -205,21 +205,21 @@ async fn load_compaction_candidates_after(
     limit: i64,
 ) -> Result<Vec<(String, String, String, NaiveDateTime)>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT runs.user_id, runs.session_id, runs.run_id, runs.updated_at
-         FROM agent_runs runs
-         WHERE runs.status IN ('completed', 'delegated', 'failed', 'cancelled')
+        "SELECT ar.user_id, ar.session_id, ar.run_id, ar.updated_at
+         FROM agent_runs ar
+         WHERE ar.status IN ('completed', 'delegated', 'failed', 'cancelled')
            AND EXISTS (
                SELECT 1 FROM tool_invocation_ledger ledger
-               WHERE ledger.user_id = runs.user_id
-                 AND ledger.session_id = runs.session_id
-                 AND ledger.run_id = runs.run_id
+               WHERE ledger.user_id = ar.user_id
+                 AND ledger.session_id = ar.session_id
+                 AND ledger.run_id = ar.run_id
            )
            AND (
-               runs.updated_at > ?
-               OR (runs.updated_at = ? AND runs.user_id > ?)
-               OR (runs.updated_at = ? AND runs.user_id = ? AND runs.run_id > ?)
+               ar.updated_at > ?
+               OR (ar.updated_at = ? AND ar.user_id > ?)
+               OR (ar.updated_at = ? AND ar.user_id = ? AND ar.run_id > ?)
            )
-         ORDER BY runs.updated_at, runs.user_id, runs.run_id
+         ORDER BY ar.updated_at, ar.user_id, ar.run_id
          LIMIT ?",
     )
     .bind(cursor_updated_at)

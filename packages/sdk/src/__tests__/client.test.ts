@@ -512,6 +512,9 @@ describe("AstraClient — Runs", () => {
         {
           run_id: "r1",
           session_id: "s1",
+          parent_run_id: "root-1",
+          root_run_id: "root-1",
+          depth: 1,
           status: "running",
           waiting_for: null,
           events_count: 3,
@@ -539,6 +542,9 @@ describe("AstraClient — Runs", () => {
     });
     const r = await createClient().listRuns();
     expect(r.runs[0].runId).toBe("r1");
+    expect(r.runs[0].parentRunId).toBe("root-1");
+    expect(r.runs[0].rootRunId).toBe("root-1");
+    expect(r.runs[0].depth).toBe(1);
     expect(r.runs[0].eventsCount).toBe(3);
     expect(r.runs[0].workspace?.kind).toBe("server_sandbox");
     expect(r.runs[0].executor?.kind).toBe("server_local");
