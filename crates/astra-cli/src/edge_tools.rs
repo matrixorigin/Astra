@@ -647,6 +647,18 @@ pub struct BgTaskOutputSnapshot {
     pub output_ref: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BgTaskOutputSearchSnapshot {
+    pub kind: String,
+    pub title: Option<String>,
+    pub output: String,
+    pub matching_lines: u64,
+    pub truncated: bool,
+    pub status: String,
+    pub terminal: bool,
+    pub output_ref: String,
+}
+
 pub(crate) enum BgTaskCommand {
     Kill {
         task_id: String,
@@ -657,6 +669,14 @@ pub(crate) enum BgTaskCommand {
         offset: u64,
         max_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Result<BgTaskOutputSnapshot, BackgroundTaskError>>,
+    },
+    SearchOutput {
+        task_id: String,
+        pattern: String,
+        context_lines: usize,
+        max_bytes: usize,
+        reply:
+            tokio::sync::oneshot::Sender<Result<BgTaskOutputSearchSnapshot, BackgroundTaskError>>,
     },
     List {
         reply: tokio::sync::oneshot::Sender<String>,
@@ -701,6 +721,36 @@ async fn request_background_task_output_snapshot(
         commands.push(BgTaskCommand::GetOutputSince {
             task_id: task_id.to_string(),
             offset,
+            max_bytes,
+            reply: tx,
+        });
+    }
+    match await_bg_task_command_reply(rx, reply_timeout).await {
+        Ok(Ok(snapshot)) => Ok(snapshot),
+        Ok(Err(error)) => Err(format_background_task_error(&error)),
+        Err(BgTaskReplyError::Closed) => Err(format_background_task_registry_closed(Some(task_id))),
+        Err(BgTaskReplyError::TimedOut) => Err(format_background_task_output_registry_timeout(
+            task_id,
+            reply_timeout,
+        )),
+    }
+}
+
+async fn request_background_task_output_search(
+    bg_commands: &std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    task_id: &str,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+    reply_timeout: Duration,
+) -> Result<BgTaskOutputSearchSnapshot, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut commands = bg_commands.lock_recover();
+        commands.push(BgTaskCommand::SearchOutput {
+            task_id: task_id.to_string(),
+            pattern: pattern.to_string(),
+            context_lines,
             max_bytes,
             reply: tx,
         });
@@ -951,6 +1001,10 @@ fn format_background_task_output(
     if !snapshot.output_ref.trim().is_empty() {
         metadata_parts.push(format!("output_ref {}", snapshot.output_ref));
     }
+    if kind == "shell" && snapshot.status == "failed" {
+        metadata_parts.push("failure_cause unverified".to_string());
+        metadata_parts.push("diagnostic_search_available true".to_string());
+    }
     if let Some(title) = snapshot
         .title
         .as_deref()
@@ -979,14 +1033,77 @@ fn format_background_task_output(
             (_, "unavailable") => "Unavailable · stale handle or unsupported runner",
             _ => "No output yet",
         };
-        return format!("{header}\n{state} · {metadata}");
+        let diagnosis = (kind == "shell" && snapshot.status == "failed").then_some(
+            "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
+        );
+        return format!("{header}\n{state} · {metadata}{}", diagnosis.unwrap_or(""));
     }
 
     let chunk = snapshot.output.trim_end();
     let line_count = chunk.lines().count();
+    let diagnosis = (kind == "shell" && snapshot.status == "failed").then_some(
+        "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
+    );
     format!(
         "{header}\n{line_count} new {} · {metadata} · {status_label}\nOutput chunk:\n{chunk}",
         if line_count == 1 { "line" } else { "lines" }
+    ) + diagnosis.unwrap_or("")
+}
+
+fn format_background_task_output_search(
+    task_id: &str,
+    pattern: &str,
+    context_lines: usize,
+    snapshot: &BgTaskOutputSearchSnapshot,
+) -> String {
+    let kind = snapshot.kind.trim();
+    let kind = if kind.is_empty() { "shell" } else { kind };
+    let status_label = match snapshot.status.as_str() {
+        "pending" => "pending",
+        "running" => "still running",
+        "waiting_for_input" => "needs input",
+        "completed" => "completed",
+        "failed" => "failed",
+        "killed" => "killed",
+        other => other,
+    };
+    let title = snapshot
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| format!(" · title {}", title.trim()))
+        .unwrap_or_default();
+    let output_ref = if snapshot.output_ref.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" · output_ref {}", snapshot.output_ref)
+    };
+    let truncation = if snapshot.truncated {
+        " · result_truncated true"
+    } else {
+        ""
+    };
+    let header = format!(
+        "Search {kind} output {task_id}\npattern {pattern:?} · {} matching {} · context_lines {context_lines} · terminal {} · {status_label}{truncation}{title}{output_ref}",
+        snapshot.matching_lines,
+        if snapshot.matching_lines == 1 {
+            "line"
+        } else {
+            "lines"
+        },
+        snapshot.terminal,
+    );
+    let evidence_contract = if snapshot.status == "failed" {
+        "\nDiagnostic search returns evidence, not a classification. Call a test flaky only after a controlled rerun succeeds or equivalent repeatability evidence exists."
+    } else {
+        ""
+    };
+    if snapshot.output.trim().is_empty() {
+        return format!("{header}\nNo matching output lines.{evidence_contract}");
+    }
+    format!(
+        "{header}\nMatched output:\n{}{evidence_contract}",
+        snapshot.output.trim_end()
     )
 }
 
@@ -1024,6 +1141,26 @@ fn background_task_output_result_fields(
             "status": snapshot.status,
             "terminal": snapshot.terminal,
             "mode": observation_mode,
+        }),
+    )])
+}
+
+fn background_task_output_search_result_fields(
+    task_id: &str,
+    pattern: &str,
+    snapshot: &BgTaskOutputSearchSnapshot,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "background_task_observation".to_string(),
+        serde_json::json!({
+            "task_id": task_id,
+            "task_kind": snapshot.kind,
+            "status": snapshot.status,
+            "terminal": snapshot.terminal,
+            "mode": "diagnostic",
+            "pattern": pattern,
+            "matching_lines": snapshot.matching_lines,
+            "truncated": snapshot.truncated,
         }),
     )])
 }
@@ -3580,6 +3717,29 @@ impl ToolExecutor {
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
         let requested_offset = args.get("offset").and_then(Value::as_u64);
+        let pattern = match args.get("pattern") {
+            None => None,
+            Some(Value::String(pattern)) => {
+                let pattern = pattern.trim();
+                if pattern.is_empty() {
+                    return format_background_task_argument_error("pattern must not be empty");
+                }
+                if pattern.chars().count() > 512 {
+                    return format_background_task_argument_error(
+                        "pattern must be at most 512 characters",
+                    );
+                }
+                Some(pattern.to_string())
+            }
+            Some(_) => {
+                return format_background_task_argument_error("pattern must be a string");
+            }
+        };
+        if pattern.is_some() && (block || requested_offset.is_some()) {
+            return format_background_task_argument_error(
+                "pattern cannot be combined with block or offset",
+            );
+        }
         let read_mode = if requested_offset.is_some() {
             BgTaskOutputReadMode::Historical
         } else {
@@ -3589,24 +3749,31 @@ impl ToolExecutor {
             .get("max_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(8_192)
-            .min(65_536) as usize;
+            .clamp(1, 65_536) as usize;
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
             .clamp(1, 300_000);
+        let context_lines = args
+            .get("context_lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+            .min(20) as usize;
 
-        if let Some(output) = self
-            .fanout_group_task_output_response(
-                &task_id,
-                requested_offset.unwrap_or(0),
-                max_bytes,
-                read_mode,
-                None,
-            )
-            .await
-        {
-            return output;
+        if pattern.is_none() {
+            if let Some(output) = self
+                .fanout_group_task_output_response(
+                    &task_id,
+                    requested_offset.unwrap_or(0),
+                    max_bytes,
+                    read_mode,
+                    None,
+                )
+                .await
+            {
+                return output;
+            }
         }
 
         let Some(ref bg_commands) = self.bg_task_commands else {
@@ -3614,6 +3781,31 @@ impl ToolExecutor {
         };
 
         let reply_timeout = background_task_reply_timeout(timeout_ms);
+        if let Some(pattern) = pattern.as_deref() {
+            return match request_background_task_output_search(
+                bg_commands,
+                &task_id,
+                pattern,
+                context_lines,
+                max_bytes,
+                reply_timeout,
+            )
+            .await
+            {
+                Ok(snapshot) => {
+                    *tool_result_fields = Some(background_task_output_search_result_fields(
+                        &task_id, pattern, &snapshot,
+                    ));
+                    format_background_task_output_search(
+                        &task_id,
+                        pattern,
+                        context_lines,
+                        &snapshot,
+                    )
+                }
+                Err(error) => error,
+            };
+        }
         if !block {
             return match background_task_output_view(
                 bg_commands,
@@ -6017,10 +6209,10 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSnapshot,
-        PERSIST_THRESHOLD, ToolExecutor, all_tool_schemas, cli_tool_output_is_error,
-        detect_git_remote_repos, extract_github_owner_repo, file_checkpoint_dir_for,
-        format_background_task_error, format_background_task_output,
+        AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot,
+        BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor, all_tool_schemas,
+        cli_tool_output_is_error, detect_git_remote_repos, extract_github_owner_repo,
+        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
         format_background_task_output_wait_timeout, format_background_task_stop_error,
         git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
@@ -6843,6 +7035,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_pattern_uses_typed_bounded_diagnostic_search() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({
+            "task_id": "bg-shell-1",
+            "pattern": "failing_test_name",
+            "context_lines": 5,
+            "max_bytes": 4096,
+            "timeout_ms": 10_000
+        });
+        let mut result_fields = None;
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let output_fut = executor.task_output_with_fields(&args, &mut result_fields);
+            tokio::pin!(output_fut);
+            loop {
+                tokio::select! {
+                    output = &mut output_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        if let Some(BgTaskCommand::SearchOutput {
+                            task_id,
+                            pattern,
+                            context_lines,
+                            max_bytes,
+                            reply,
+                        }) = commands.lock_recover().pop()
+                        {
+                            assert_eq!(task_id, "bg-shell-1");
+                            assert_eq!(pattern, "failing_test_name");
+                            assert_eq!(context_lines, 5);
+                            assert_eq!(max_bytes, 4096);
+                            let _ = reply.send(Ok(BgTaskOutputSearchSnapshot {
+                                kind: "shell".to_string(),
+                                title: Some("cargo test".to_string()),
+                                output: "[stdout lines 40-42]\n41: panic detail\n".to_string(),
+                                matching_lines: 1,
+                                truncated: false,
+                                status: "failed".to_string(),
+                                terminal: true,
+                                output_ref: "stdout: /tmp/bg-shell-1.stdout".to_string(),
+                            }));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("diagnostic search should return promptly");
+
+        assert!(
+            output.contains("Search shell output bg-shell-1"),
+            "{output}"
+        );
+        assert!(output.contains("pattern \"failing_test_name\""), "{output}");
+        assert!(output.contains("panic detail"), "{output}");
+        assert!(output.contains("not a classification"), "{output}");
+        let observation = result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("background_task_observation"))
+            .expect("diagnostic search observation must be structured");
+        assert_eq!(observation["mode"], "diagnostic");
+        assert_eq!(observation["terminal"], true);
+        assert_eq!(observation["matching_lines"], 1);
+    }
+
+    #[tokio::test]
+    async fn task_output_pattern_rejects_cursor_or_wait_combinations() {
+        let executor = test_executor();
+        for args in [
+            serde_json::json!({
+                "task_id": "bg-shell-1",
+                "pattern": "failure",
+                "offset": 0
+            }),
+            serde_json::json!({
+                "task_id": "bg-shell-1",
+                "pattern": "failure",
+                "block": true
+            }),
+        ] {
+            let output = executor.task_output(&args).await;
+            let result = parse_control_result(&output);
+            assert_eq!(result["status"], "invalid_argument", "{output}");
+            assert_eq!(
+                result["error"], "pattern cannot be combined with block or offset",
+                "{output}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn task_output_blocking_waits_for_terminal_not_ordinary_output_growth() {
         let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let executor = test_executor().with_bg_task_commands(commands.clone());
@@ -7421,6 +7703,12 @@ mod tests {
         assert!(killed.contains("Stopped with no output"), "{killed}");
         assert!(!failed.contains("Completed with no output"), "{failed}");
         assert!(!killed.contains("Completed with no output"), "{killed}");
+        assert!(failed.contains("failure_cause unverified"), "{failed}");
+        assert!(failed.contains("task_output(pattern=...)"), "{failed}");
+        assert!(
+            failed.contains("not evidence that a test is flaky"),
+            "{failed}"
+        );
     }
 
     #[test]

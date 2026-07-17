@@ -1152,7 +1152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
+                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. For a terminal shell failure, set pattern to search the captured output with bounded context instead of reading its files through Bash; terminal diagnostics remain available after a status snapshot. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1169,6 +1169,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "integer",
                             "minimum": 0,
                             "description": "Explicit output cursor. For shell tasks, omit it for one current latest-tail status snapshot and set it only when the user asked to page historical output. For bounded agent results, reuse the returned next_offset to continue the semantic result."
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Literal text to find in a terminal shell task's captured stdout/stderr. Returns bounded matching lines with context. Use an exact failing test, error, or panic fragment from the terminal summary. Cannot be combined with block or offset. A failed status alone is not evidence that a test is flaky."
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 20,
+                            "description": "Lines before and after each literal match. Used only with pattern. Default 3, max 20."
                         },
                         "max_bytes": {
                             "type": "integer",

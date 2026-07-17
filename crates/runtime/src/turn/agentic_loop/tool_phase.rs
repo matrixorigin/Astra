@@ -125,7 +125,7 @@ fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<S
         .map(ToString::to_string)
 }
 
-fn current_shell_background_task_observation_id(
+fn live_shell_background_task_observation_id(
     result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
 ) -> Option<String> {
     let tool_name = astra_turn_core::tool_allowlist::normalize_tool_name(&result.tool)?;
@@ -139,7 +139,8 @@ fn current_shell_background_task_observation_id(
         .as_object()?;
     let mode = observation.get("mode").and_then(Value::as_str)?;
     if observation.get("task_kind").and_then(Value::as_str)? != "shell"
-        || !matches!(mode, "current" | "wait")
+        || observation.get("terminal").and_then(Value::as_bool) != Some(false)
+        || !matches!(mode, "current" | "wait" | "diagnostic")
     {
         return None;
     }
@@ -1627,7 +1628,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state.stall.same_turn_detached_task_ids.insert(task_id);
     }
     for result in &edge_tool_round {
-        if let Some(task_id) = current_shell_background_task_observation_id(result) {
+        if let Some(task_id) = live_shell_background_task_observation_id(result) {
             state
                 .stall
                 .observed_background_task_snapshots

@@ -1080,9 +1080,10 @@ pub struct StallTrackingState {
     /// short running acknowledgement; a second attempt closes the loop with
     /// a runtime-owned acknowledgement instead of burning dozens of rounds.
     pub same_turn_detached_poll_attempts: u32,
-    /// Shell background tasks already observed through a current `task_output`
-    /// snapshot or runtime-owned wait in this turn. These are status
-    /// observations, not requests to page through the task's full log.
+    /// Non-terminal shell background tasks already observed through
+    /// `task_output` in this turn. These are live-status observations, not
+    /// requests to page through the task's full log. Terminal observations
+    /// are intentionally excluded so failure diagnosis remains available.
     pub observed_background_task_snapshots: BTreeSet<String>,
     /// Repeated attempts to page a task after a current snapshot was already
     /// returned. The first attempt is corrected; the second closes the
@@ -3929,14 +3930,24 @@ pub(crate) mod tests {
         mode: &str,
         output: &str,
     ) -> EdgeToolExecResult {
+        make_shell_task_output_observation_with_status(task_id, mode, "running", false, output)
+    }
+
+    fn make_shell_task_output_observation_with_status(
+        task_id: &str,
+        mode: &str,
+        status: &str,
+        terminal: bool,
+        output: &str,
+    ) -> EdgeToolExecResult {
         let mut fields = edge_runtime_environment_fields();
         fields.insert(
             "background_task_observation".to_string(),
             json!({
                 "task_id": task_id,
                 "task_kind": "shell",
-                "status": "running",
-                "terminal": false,
+                "status": status,
+                "terminal": terminal,
                 "mode": mode,
             }),
         );
@@ -5636,6 +5647,60 @@ pub(crate) mod tests {
                     && message.contains("Do not page historical output")
             }),
             "a cursor follow-up after a current snapshot must be intercepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_background_snapshot_keeps_same_turn_diagnostics_available() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_shell_task_output_observation_with_status(
+                    "bg-shell-1",
+                    "current",
+                    "failed",
+                    true,
+                    "test summary names one failure",
+                )],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({
+                        "task_id": "bg-shell-1",
+                        "pattern": "failing_test_name"
+                    }),
+                    "diagnostic match with panic context",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("The failure is now supported by diagnostics.", 10, 5, None),
+        ])
+        .with_valid_tools(&["task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(host.turn_count(), 3);
+        assert_eq!(state.total_tool_calls, 2);
+        assert!(
+            state.stall.observed_background_task_snapshots.is_empty(),
+            "terminal observations must not arm the live-poll guard"
+        );
+        assert_eq!(state.stall.repeated_background_task_snapshot_attempts, 0);
+        assert!(
+            state.messages.iter().all(|message| !message
+                .to_string()
+                .contains("already has a current status snapshot")),
+            "terminal failure diagnostics must execute instead of being treated as live polling"
         );
     }
 

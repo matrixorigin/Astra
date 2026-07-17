@@ -5244,6 +5244,7 @@ mod tests {
                 "{command} -> {result}"
             );
             assert!(result.contains("task_output"), "{command} -> {result}");
+            assert!(result.contains("pattern"), "{command} -> {result}");
         }
         assert!(
             executor

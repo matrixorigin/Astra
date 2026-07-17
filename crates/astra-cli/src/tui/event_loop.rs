@@ -1305,6 +1305,24 @@ async fn drain_background_task_commands(
                     .await,
                 );
             }
+            crate::edge_tools::BgTaskCommand::SearchOutput {
+                task_id,
+                pattern,
+                context_lines,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(
+                    background_task_output_search_snapshot(
+                        background_registry,
+                        &task_id,
+                        &pattern,
+                        context_lines,
+                        max_bytes,
+                    )
+                    .await,
+                );
+            }
             crate::edge_tools::BgTaskCommand::List { reply } => {
                 let rendered = render_background_task_list_xml_with_agents(
                     background_registry,
@@ -10059,6 +10077,54 @@ mod tests {
             .expect("foreground tick must answer command")
             .expect("background output must be readable");
         assert_eq!(snapshot.output, "progress\n");
+        assert!(snapshot.terminal);
+        assert!(commands.lock_recover().is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreground_tick_services_background_output_search_commands() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let task_id = registry.spawn_shell(
+            "printf 'before\\nfailing_test_name\\npanic detail\\n'",
+            "failing test",
+        );
+        for _ in 0..100 {
+            registry.poll_completions();
+            if registry
+                .get(&task_id)
+                .is_some_and(|task| task.status().as_str() != "running")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let commands = Arc::new(std::sync::Mutex::new(vec![
+            crate::edge_tools::BgTaskCommand::SearchOutput {
+                task_id: task_id.clone(),
+                pattern: "failing_test_name".to_string(),
+                context_lines: 1,
+                max_bytes: 8192,
+                reply: reply_tx,
+            },
+        ]));
+        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
+
+        drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await;
+
+        let snapshot = reply_rx
+            .await
+            .expect("foreground tick must answer search command")
+            .expect("background output must be searchable");
+        assert_eq!(snapshot.matching_lines, 1);
+        assert!(
+            snapshot.output.contains("panic detail"),
+            "{}",
+            snapshot.output
+        );
         assert!(snapshot.terminal);
         assert!(commands.lock_recover().is_empty());
     }

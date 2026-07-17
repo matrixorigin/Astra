@@ -923,6 +923,50 @@ impl BackgroundTaskRegistry {
         })?
     }
 
+    pub async fn search_combined_output_async(
+        &mut self,
+        id: &str,
+        pattern: &str,
+        context_lines: usize,
+        max_bytes: usize,
+    ) -> Result<(String, u64, bool), BackgroundTaskError> {
+        self.drain_join_set();
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        let stdout_path = handle.stdout_path.clone();
+        let stderr_path = handle.stderr_path.clone();
+        let terminal = handle.status().is_terminal();
+        let task_id = id.to_string();
+        let pattern = pattern.to_string();
+        tokio::task::spawn_blocking(move || {
+            let stdout_missing = !stdout_path.exists();
+            let stderr_has_output = file_len(&stderr_path) > 0;
+            if terminal && stdout_missing && !stderr_has_output {
+                return Err(BackgroundTaskError::output_artifact_missing(
+                    &task_id,
+                    &stdout_path,
+                ));
+            }
+            search_combined_output(
+                &stdout_path,
+                &stderr_path,
+                &pattern,
+                context_lines,
+                max_bytes,
+            )
+            .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
+        })
+        .await
+        .map_err(|error| {
+            BackgroundTaskError::output_unavailable(
+                id,
+                format!("background output search task failed: {error}"),
+            )
+        })?
+    }
+
     /// Read stderr from a task.
     pub fn get_stderr(
         &self,
@@ -2020,6 +2064,81 @@ fn read_combined_from_str(
     ))
 }
 
+fn search_combined_output(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+) -> Result<(String, u64, bool), String> {
+    let mut output = String::new();
+    let mut matching_lines = 0_u64;
+    let mut truncated = false;
+
+    for (label, path) in [("stdout", stdout_path), ("stderr", stderr_path)] {
+        if !path.exists() || file_len(path) == 0 {
+            continue;
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains(pattern).then_some(index))
+            .collect();
+        matching_lines = matching_lines.saturating_add(hits.len() as u64);
+
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for hit in hits {
+            let start = hit.saturating_sub(context_lines);
+            let end = hit
+                .saturating_add(context_lines)
+                .saturating_add(1)
+                .min(lines.len());
+            if let Some((_, previous_end)) = ranges.last_mut()
+                && start <= *previous_end
+            {
+                *previous_end = (*previous_end).max(end);
+            } else {
+                ranges.push((start, end));
+            }
+        }
+
+        for (start, end) in ranges {
+            if output.len() >= max_bytes {
+                truncated = true;
+                continue;
+            }
+            let mut block = format!("[{label} lines {}-{}]\n", start + 1, end);
+            for (index, line) in lines[start..end].iter().enumerate() {
+                block.push_str(&format!("{}: {line}\n", start + index + 1));
+            }
+            if append_utf8_bounded(&mut output, &block, max_bytes) {
+                truncated = true;
+            }
+        }
+    }
+
+    Ok((output, matching_lines, truncated))
+}
+
+/// Append as much UTF-8 text as fits and report whether any bytes were omitted.
+fn append_utf8_bounded(output: &mut String, text: &str, max_bytes: usize) -> bool {
+    let remaining = max_bytes.saturating_sub(output.len());
+    if text.len() <= remaining {
+        output.push_str(text);
+        return false;
+    }
+    let mut end = remaining.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&text[..end]);
+    true
+}
+
 fn count_file_lines(path: &Path) -> Result<u64, String> {
     use std::io::Read;
     let mut file =
@@ -2876,6 +2995,47 @@ mod tests {
                 .0
                 .contains("completed output")
         );
+    }
+
+    #[test]
+    fn output_search_returns_literal_matches_with_bounded_context() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(
+            &stdout,
+            "before one\nfailing_test_name\nafter one\nunrelated\nfailing_test_name again\nafter two\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr, "panic detail for failing_test_name\n").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "failing_test_name", 1, 4096)
+                .expect("search captured output");
+
+        assert_eq!(matching_lines, 3, "{output}");
+        assert!(!truncated, "{output}");
+        assert!(output.contains("[stdout lines 1-6]"), "{output}");
+        assert!(output.contains("1: before one"), "{output}");
+        assert!(output.contains("5: failing_test_name again"), "{output}");
+        assert!(output.contains("[stderr lines 1-1]"), "{output}");
+    }
+
+    #[test]
+    fn output_search_enforces_utf8_safe_result_bound() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(&stdout, "needle 中文中文中文中文中文中文\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "needle", 0, 24)
+                .expect("bounded search captured output");
+
+        assert_eq!(matching_lines, 1);
+        assert!(truncated, "{output}");
+        assert!(output.len() <= 24, "{} bytes: {output}", output.len());
     }
 
     #[test]

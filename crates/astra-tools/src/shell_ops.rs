@@ -59,6 +59,8 @@ pub fn background_task_output_dir_read_error(command: &str) -> Option<String> {
     Some(
         "Error: bash cannot read background task output files directly. \
          Call the `task_output` tool with the task_id (e.g. `bg-shell-1`) instead. \
+         For a terminal failure, use its `pattern` argument to search an exact test or error \
+         with bounded context. \
          The runtime delivers a <task_notification> when the task terminates; \
          polling the on-disk files via bash returns stale partial bytes and \
          bypasses terminal-status reporting."
@@ -4845,6 +4847,7 @@ printf 'probe.txt:1:needle\n'
                 "{command}: {error}"
             );
             assert!(error.contains("task_output"), "{command}: {error}");
+            assert!(error.contains("pattern"), "{command}: {error}");
         }
         assert!(
             validate_execute_bash_command("echo bg_tasks is not a path here").is_ok(),
