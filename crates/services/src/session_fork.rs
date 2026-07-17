@@ -728,6 +728,11 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     ws.correlation_id = ws.correlation_id.clone().or_else(|| Some(parent.clone()));
     ws.turn_count = forked_at_turn;
     ws.agent_role = None;
+    // Runtime handles and their last-observed projections belong to the
+    // parent execution. A fork inherits durable conversational state, not
+    // ownership or control of work still running in another session.
+    ws.background_shell_tasks.clear();
+    ws.background_local_agent_tasks.clear();
     let now = chrono::Utc::now().to_rfc3339();
     ws.created_at = now.clone();
     ws.updated_at = now;
@@ -1067,6 +1072,64 @@ mod tests {
 
         let ws = session_workspace::read_workspace(&result.new_session_id).unwrap();
         assert_eq!(ws.turn_count, 3);
+
+        cleanup_session(&parent_id);
+        cleanup_session(&result.new_session_id);
+    }
+
+    #[test]
+    fn fork_does_not_inherit_parent_runtime_task_projections() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 1);
+        let mut parent = session_workspace::read_workspace(&parent_id).unwrap();
+        parent.background_shell_tasks = vec![session_workspace::BackgroundShellTaskProjection {
+            id: "shell-parent".into(),
+            status: "running".into(),
+            title: "make test-online".into(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            stdout_path: "/tmp/shell-parent.stdout".into(),
+            stderr_path: "/tmp/shell-parent.stderr".into(),
+            exit_code: None,
+            terminal_reason: None,
+        }];
+        parent.background_local_agent_tasks =
+            vec![session_workspace::BackgroundLocalAgentTaskProjection {
+                id: "agent-parent".into(),
+                run_id: "run-parent".into(),
+                parent_run_id: "root-parent".into(),
+                status: "working".into(),
+                title: "review parent".into(),
+                started_at_ms: 2,
+                ended_at_ms: None,
+                output_tail: None,
+                terminal_reason: None,
+                fanout: None,
+            }];
+        session_workspace::write_workspace(&parent).unwrap();
+
+        let result = fork_local_session(ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: None,
+            label: Some("independent-runtime".into()),
+            forked_after_turn: None,
+            data_branch: None,
+            snapshot_spec: None,
+        })
+        .expect("fork should succeed");
+
+        let child = session_workspace::read_workspace(&result.new_session_id).unwrap();
+        assert!(child.background_shell_tasks.is_empty());
+        assert!(child.background_local_agent_tasks.is_empty());
+        assert_eq!(
+            session_workspace::read_workspace(&parent_id)
+                .unwrap()
+                .background_shell_tasks
+                .len(),
+            1,
+            "fork must not mutate the parent projection"
+        );
 
         cleanup_session(&parent_id);
         cleanup_session(&result.new_session_id);

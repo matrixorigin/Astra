@@ -228,18 +228,16 @@ async fn persist_context_trace_to_workspace_if_present(
     let workspace_session_id = session_id.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::io::Result<Option<astra_services::session_workspace::WorkspaceMetadata>> {
-            let workspace_path =
-                astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
-                    .join("workspace.yaml");
-            if !workspace_path.is_file() {
-                return Ok(None);
-            }
-            let mut workspace =
-                astra_services::session_workspace::read_workspace(&workspace_session_id)?;
-            workspace.last_context_trace = Some(signal);
-            workspace.updated_at = chrono::Utc::now().to_rfc3339();
-            astra_services::session_workspace::write_workspace(&workspace)?;
-            Ok(Some(workspace))
+            let mut updated_workspace = None;
+            let existed = astra_services::session_workspace::update_existing_workspace(
+                &workspace_session_id,
+                |workspace| {
+                    workspace.last_context_trace = Some(signal);
+                    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+                    updated_workspace = Some(workspace.clone());
+                },
+            )?;
+            Ok(existed.then_some(updated_workspace).flatten())
         },
     )
     .await;

@@ -266,83 +266,86 @@ impl DeferredTurnSidecarWork {
             .map(session_journal::JournalDirGuard::new);
         let mut projection_errors = Vec::new();
         let mut sidecar_events = self.sidecar_events.clone();
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(&self.session_id) {
-                Ok(Some(workspace)) => workspace,
-                Ok(None) => astra_services::session_workspace::WorkspaceMetadata::new(
+        let recovered_workspace = match astra_services::session_workspace::read_workspace_optional(
+            &self.session_id,
+        ) {
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    %error,
+                    "rebuilding deferred workspace projection after read failure"
+                );
+                astra_services::session_workspace::backup_invalid_workspace_file(
+                        &self.session_id,
+                    )
+                    .map_err(|backup_error| {
+                        DeferredTurnSidecarError::retryable(format!(
+                            "failed to write workspace metadata: could not preserve invalid workspace before rebuilding: {backup_error}"
+                        ))
+                    })?;
+                Some(astra_services::session_workspace::WorkspaceMetadata::new(
                     &self.session_id,
                     &self.model,
-                ),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        %error,
-                        "rebuilding deferred workspace projection after read failure"
-                    );
+                ))
+            }
+        };
+        let mut written_checkpoint = None;
+        let workspace_write = astra_services::session_workspace::update_workspace(
+            &self.session_id,
+            || {
+                recovered_workspace.unwrap_or_else(|| {
                     astra_services::session_workspace::WorkspaceMetadata::new(
                         &self.session_id,
                         &self.model,
                     )
-                }
-            };
-        workspace.turn_count = workspace.turn_count.max(self.turn);
-        workspace.total_tokens_in = workspace.total_tokens_in.max(self.total_prompt_tokens);
-        workspace.total_tokens_out = workspace.total_tokens_out.max(self.total_completion_tokens);
-        workspace.total_cache_read_tokens = workspace
-            .total_cache_read_tokens
-            .max(self.total_cache_read_tokens);
-        workspace.total_cache_creation_tokens = workspace
-            .total_cache_creation_tokens
-            .max(self.total_cache_creation_tokens);
-        workspace.status = "active".to_string();
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        workspace.permission_mode = Some(self.permission_mode.clone());
-        workspace.discovered_skills = self.discovered_skills.clone();
-        workspace.contract_json = self.contract_state_json.clone();
+                })
+            },
+            |workspace| {
+                workspace.turn_count = workspace.turn_count.max(self.turn);
+                workspace.total_tokens_in = workspace.total_tokens_in.max(self.total_prompt_tokens);
+                workspace.total_tokens_out =
+                    workspace.total_tokens_out.max(self.total_completion_tokens);
+                workspace.total_cache_read_tokens = workspace
+                    .total_cache_read_tokens
+                    .max(self.total_cache_read_tokens);
+                workspace.total_cache_creation_tokens = workspace
+                    .total_cache_creation_tokens
+                    .max(self.total_cache_creation_tokens);
+                workspace.status = "active".to_string();
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+                workspace.permission_mode = Some(self.permission_mode.clone());
+                workspace.discovered_skills = self.discovered_skills.clone();
+                workspace.contract_json = self.contract_state_json.clone();
 
-        let mut written_checkpoint = None;
-        if astra_services::session_checkpoint::should_checkpoint(
-            self.turn,
-            astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
-        ) {
-            let existing_checkpoint = workspace
-                .checkpoints
-                .iter()
-                .position(|turn| *turn == self.turn);
-            let checkpoint = astra_services::session_checkpoint::Checkpoint {
-                number: existing_checkpoint
-                    .map(|index| index as u32 + 1)
-                    .unwrap_or(workspace.checkpoints.len() as u32 + 1),
-                turn: self.turn,
-                title: format!("Turn {} checkpoint", self.turn),
-                summary: format!(
-                    "Accumulated {} tokens ({} in, {} out). Tools: {}",
-                    workspace.total_tokens_in + workspace.total_tokens_out,
-                    workspace.total_tokens_in,
-                    workspace.total_tokens_out,
-                    self.tools_used.join(", "),
-                ),
-                tools_used: self.tools_used.clone(),
-                total_tokens: workspace.total_tokens_in + workspace.total_tokens_out,
-                had_stalls: false,
-                error_count: 0,
-                contract_state_json: workspace.contract_json.clone(),
-            };
-            if existing_checkpoint.is_some() {
-                sidecar_events.push(session_journal::JournalEvent::checkpoint(
-                    Some(&self.session_id),
+                if astra_services::session_checkpoint::should_checkpoint(
                     self.turn,
-                    &checkpoint.summary,
-                    checkpoint.total_tokens,
-                    checkpoint.tools_used.len(),
-                ));
-            } else {
-                match astra_services::session_checkpoint::write_checkpoint(
-                    &self.session_id,
-                    &checkpoint,
+                    astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
                 ) {
-                    Ok(_) => {
-                        workspace.record_checkpoint();
+                    let existing_checkpoint = workspace
+                        .checkpoints
+                        .iter()
+                        .position(|turn| *turn == self.turn);
+                    let checkpoint = astra_services::session_checkpoint::Checkpoint {
+                        number: existing_checkpoint
+                            .map(|index| index as u32 + 1)
+                            .unwrap_or(workspace.checkpoints.len() as u32 + 1),
+                        turn: self.turn,
+                        title: format!("Turn {} checkpoint", self.turn),
+                        summary: format!(
+                            "Accumulated {} tokens ({} in, {} out). Tools: {}",
+                            workspace.total_tokens_in + workspace.total_tokens_out,
+                            workspace.total_tokens_in,
+                            workspace.total_tokens_out,
+                            self.tools_used.join(", "),
+                        ),
+                        tools_used: self.tools_used.clone(),
+                        total_tokens: workspace.total_tokens_in + workspace.total_tokens_out,
+                        had_stalls: false,
+                        error_count: 0,
+                        contract_state_json: workspace.contract_json.clone(),
+                    };
+                    if existing_checkpoint.is_some() {
                         sidecar_events.push(session_journal::JournalEvent::checkpoint(
                             Some(&self.session_id),
                             self.turn,
@@ -350,17 +353,32 @@ impl DeferredTurnSidecarWork {
                             checkpoint.total_tokens,
                             checkpoint.tools_used.len(),
                         ));
-                        written_checkpoint = Some(checkpoint);
+                    } else {
+                        match astra_services::session_checkpoint::write_checkpoint(
+                            &self.session_id,
+                            &checkpoint,
+                        ) {
+                            Ok(_) => {
+                                workspace.record_checkpoint();
+                                sidecar_events.push(session_journal::JournalEvent::checkpoint(
+                                    Some(&self.session_id),
+                                    self.turn,
+                                    &checkpoint.summary,
+                                    checkpoint.total_tokens,
+                                    checkpoint.tools_used.len(),
+                                ));
+                                written_checkpoint = Some(checkpoint);
+                            }
+                            Err(error) => projection_errors
+                                .push(format!("failed to write session checkpoint: {error}")),
+                        }
                     }
-                    Err(error) => projection_errors
-                        .push(format!("failed to write session checkpoint: {error}")),
                 }
-            }
-        }
-
-        workspace.last_persistence_error =
-            (!projection_errors.is_empty()).then(|| projection_errors.join("; "));
-        if let Err(error) = astra_services::session_workspace::write_workspace(&workspace) {
+                workspace.last_persistence_error =
+                    (!projection_errors.is_empty()).then(|| projection_errors.join("; "));
+            },
+        );
+        if let Err(error) = workspace_write {
             if let Some(checkpoint) = written_checkpoint.as_ref()
                 && let Err(cleanup_error) = astra_services::session_checkpoint::remove_checkpoint(
                     &self.session_id,
@@ -388,9 +406,15 @@ impl DeferredTurnSidecarWork {
             Err(error) => {
                 let error = format!("failed to build bridge pipeline journal events: {error}");
                 projection_errors.push(error.clone());
-                workspace.last_persistence_error = Some(projection_errors.join("; "));
+                let detail = projection_errors.join("; ");
                 if let Err(rewrite_error) =
-                    astra_services::session_workspace::write_workspace(&workspace)
+                    astra_services::session_workspace::update_existing_workspace(
+                        &self.session_id,
+                        |workspace| {
+                            workspace.last_persistence_error = Some(detail);
+                            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+                        },
+                    )
                 {
                     tracing::warn!(
                         session_id = %self.session_id,
@@ -428,11 +452,14 @@ impl DeferredTurnSidecarWork {
             DeferredTurnSidecarError::retryable(format!("failed to open sidecar journal: {error}"))
         })?;
         if let Err(error) = journal.append_bulk(&sidecar_events) {
-            workspace.last_persistence_error =
-                Some(format!("failed to append turn sidecar events: {error}"));
-            if let Err(rewrite_error) =
-                astra_services::session_workspace::write_workspace(&workspace)
-            {
+            let detail = format!("failed to append turn sidecar events: {error}");
+            if let Err(rewrite_error) = astra_services::session_workspace::update_existing_workspace(
+                &self.session_id,
+                |workspace| {
+                    workspace.last_persistence_error = Some(detail);
+                    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+                },
+            ) {
                 tracing::warn!(
                     session_id = %self.session_id,
                     %rewrite_error,
@@ -776,6 +803,53 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
         );
+    }
+
+    #[test]
+    fn deferred_sidecar_update_preserves_background_task_projection() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("sidecar-preserves-background-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 1,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("durable answer");
+        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        let sidecars = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        )
+        .deferred_sidecars
+        .expect("durable turn should enqueue derived projections");
+
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        workspace.background_shell_tasks = vec![
+            astra_services::session_workspace::BackgroundShellTaskProjection {
+                id: "shell-1".into(),
+                status: "running".into(),
+                title: "make test-online".into(),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                stdout_path: "/tmp/shell-1.stdout".into(),
+                stderr_path: "/tmp/shell-1.stderr".into(),
+                exit_code: None,
+                terminal_reason: None,
+            },
+        ];
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        sidecars.execute(false).unwrap();
+
+        let persisted = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(persisted.background_shell_tasks.len(), 1);
+        assert_eq!(persisted.turn_count, 1);
     }
 
     #[test]

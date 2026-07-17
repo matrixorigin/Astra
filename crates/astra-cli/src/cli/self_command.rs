@@ -711,23 +711,33 @@ fn persist_config_mutation_value(
     new_value: serde_json::Value,
     preview: &MutatePreviewResponse,
 ) -> Result<(), String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    let ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let base_config = effective_runtime_config(Some(&ws))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
     replace_json_path(&mut value, path, new_value)?;
     let candidate_config: RuntimeConfig =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
-    ws.tuned_config_json = if value == baseline_json {
+    let tuned_config_json = if value == baseline_json {
         None
     } else {
         Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
     };
-    ws.updated_at = Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
+    let mut turn = ws.turn_count;
+    let existed = session_workspace::update_existing_workspace(session_id, |workspace| {
+        workspace.tuned_config_json = tuned_config_json;
+        workspace.updated_at = Utc::now().to_rfc3339();
+        turn = workspace.turn_count;
+    })
+    .map_err(|e| e.to_string())?;
+    if !existed {
+        return Err(format!(
+            "workspace disappeared while persisting config for session {session_id}"
+        ));
+    }
     append_config_change_event(
         session_id,
-        ws.turn_count,
+        turn,
         path,
         &preview.new_value,
         Some(preview.old_value.clone()),
@@ -1267,7 +1277,7 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
 mod tests {
     use super::{
         build_reflect_response, cli_provider_visible_tool_names, execute_self_command,
-        replace_json_path, resolve_session_id, verify_runtime_config,
+        persist_config_override, replace_json_path, resolve_session_id, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
     use crate::cli::cli_config::cli_utils::{
@@ -1296,6 +1306,42 @@ mod tests {
             }
             Self { key, old }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_override_preserves_background_task_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-config-preserves-background";
+        let mut workspace = WorkspaceMetadata::new(session_id, "gpt-5");
+        workspace.background_shell_tasks = vec![session_workspace::BackgroundShellTaskProjection {
+            id: "shell-1".into(),
+            status: "running".into(),
+            title: "make check".into(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            stdout_path: "/tmp/shell-1.stdout".into(),
+            stderr_path: "/tmp/shell-1.stderr".into(),
+            exit_code: None,
+            terminal_reason: None,
+        }];
+        session_workspace::write_workspace(&workspace).unwrap();
+        let current = astra_config::runtime_config::RuntimeConfig::load()
+            .memory
+            .retrieval_top_k;
+        let replacement = if current == 5 { 6 } else { 5 };
+
+        persist_config_override(
+            session_id,
+            "memory.retrieval_top_k",
+            serde_json::json!(replacement),
+        )
+        .unwrap();
+
+        let persisted = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(persisted.background_shell_tasks.len(), 1);
+        assert!(persisted.tuned_config_json.is_some());
     }
 
     impl Drop for EnvGuard {

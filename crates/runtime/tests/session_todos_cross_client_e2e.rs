@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use astra_core::MatrixOneSettings;
 use astra_services::storage::ensure_core_schema;
-use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind, TaskManager, TaskStore};
+use astra_tools::task_mgmt::{
+    SessionTask, SessionTaskStatusKind, TaskManager, TaskMutationStatus, TaskStore,
+};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use serde_json::{Value, json};
 
@@ -1204,6 +1206,10 @@ async fn archive_detaches_dependency_edges_through_matrixone_store() {
         serde_json::from_str(&mgr.get(&json!({"task_id": "task-1"})).await).unwrap();
     assert_eq!(producer.status, SessionTaskStatusKind::Archived);
     assert!(
+        producer.archived_at.is_some(),
+        "MatrixOne load must preserve the durable archive timestamp: {producer:?}"
+    );
+    assert!(
         producer.blocks.is_empty() && producer.blocked_by.is_empty(),
         "archived MatrixOne task should be detached: {producer:?}"
     );
@@ -1212,6 +1218,12 @@ async fn archive_detaches_dependency_edges_through_matrixone_store() {
     assert!(
         consumer.blocked_by.is_empty(),
         "MatrixOne archive should unblock open dependents: {consumer:?}"
+    );
+    let replay = mgr.archive_outcome(&json!({"task_id": "task-1"})).await;
+    assert_eq!(
+        replay.status,
+        TaskMutationStatus::Unchanged,
+        "a DB round-trip must not manufacture an archive repair: {replay:?}"
     );
 
     cleanup(&pool, &session_id, &user_id).await;

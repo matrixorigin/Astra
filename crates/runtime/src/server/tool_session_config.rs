@@ -261,7 +261,7 @@ pub(crate) fn persist_config_override(
     new_value: Value,
     source: &str,
 ) -> Result<(), String> {
-    let mut workspace =
+    let workspace =
         astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let base_config = effective_runtime_config(Some(&workspace))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
@@ -270,21 +270,25 @@ pub(crate) fn persist_config_override(
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     let baseline_json = serde_json::to_value(astra_config::runtime_config::RuntimeConfig::load())
         .map_err(|e| e.to_string())?;
-    workspace.tuned_config_json = if value == baseline_json {
+    let tuned_config_json = if value == baseline_json {
         None
     } else {
         Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
     };
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
-    append_config_change_event(
-        session_id,
-        workspace.turn_count,
-        path,
-        &new_value,
-        Some(old_value),
-        source,
-    )
+    let mut turn = workspace.turn_count;
+    let existed =
+        astra_services::session_workspace::update_existing_workspace(session_id, |workspace| {
+            workspace.tuned_config_json = tuned_config_json;
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            turn = workspace.turn_count;
+        })
+        .map_err(|e| e.to_string())?;
+    if !existed {
+        return Err(format!(
+            "workspace disappeared while persisting config for session {session_id}"
+        ));
+    }
+    append_config_change_event(session_id, turn, path, &new_value, Some(old_value), source)
 }
 
 #[derive(Debug, Clone)]
@@ -720,10 +724,22 @@ mod tests {
         let sessions = tempfile::TempDir::new().expect("sessions tempdir");
         let _journal_guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
         let session_id = "sess-adjust-config";
-        astra_services::session_workspace::write_workspace(
-            &astra_services::session_workspace::WorkspaceMetadata::new(session_id, "test-model"),
-        )
-        .expect("workspace");
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(session_id, "test-model");
+        workspace.background_shell_tasks = vec![
+            astra_services::session_workspace::BackgroundShellTaskProjection {
+                id: "shell-1".into(),
+                status: "running".into(),
+                title: "make check".into(),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                stdout_path: "/tmp/shell-1.stdout".into(),
+                stderr_path: "/tmp/shell-1.stderr".into(),
+                exit_code: None,
+                terminal_reason: None,
+            },
+        ];
+        astra_services::session_workspace::write_workspace(&workspace).expect("workspace");
         let session = Arc::new(RwLock::new(
             crate::observability::ObservabilitySession::new_simple(session_id),
         ));
@@ -776,6 +792,7 @@ mod tests {
         let workspace =
             astra_services::session_workspace::read_workspace(session_id).expect("workspace read");
         assert!(workspace.tuned_config_json.is_some());
+        assert_eq!(workspace.background_shell_tasks.len(), 1);
     }
 
     #[test]

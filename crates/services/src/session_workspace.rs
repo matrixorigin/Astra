@@ -658,16 +658,115 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
         ));
     }
     let content = std::fs::read_to_string(&path)?;
-    serde_yaml_ng::from_str(&content)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let metadata: WorkspaceMetadata = serde_yaml_ng::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_workspace_identity(session_id, &metadata)?;
+    Ok(metadata)
 }
 
 /// Write workspace metadata to disk.
 pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
-    let metadata = canonical_workspace_metadata(metadata);
     let dir = validated_workspace_dir(&metadata.session_id)?;
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
+    let _lock = lock_workspace(&dir)?;
+    write_workspace_unlocked(metadata, &dir)
+}
+
+/// Atomically read, update, and rewrite a workspace under its per-session lock.
+///
+/// Use this for field-level projections whose writer does not own the complete
+/// workspace snapshot. A plain read followed by [`write_workspace`] is not an
+/// atomic update and can otherwise erase fields written by another runtime.
+pub fn update_workspace(
+    session_id: &str,
+    initialize: impl FnOnce() -> WorkspaceMetadata,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<()> {
+    let dir = validated_workspace_dir(session_id)?;
+    std::fs::create_dir_all(&dir)?;
+    sync_parent_dir(&dir)?;
+    let _lock = lock_workspace(&dir)?;
+    let mut metadata = match read_workspace_optional(session_id)? {
+        Some(metadata) => metadata,
+        None => initialize(),
+    };
+    validate_workspace_identity(session_id, &metadata)?;
+    update(&mut metadata);
+    validate_workspace_identity(session_id, &metadata)?;
+    write_workspace_unlocked(&metadata, &dir)
+}
+
+/// Update an existing workspace under its per-session lock.
+///
+/// Returns `false` when the workspace does not exist. Corrupt workspaces remain
+/// errors and are never silently replaced.
+pub fn update_existing_workspace(
+    session_id: &str,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<bool> {
+    let dir = validated_workspace_dir(session_id)?;
+    if !dir.exists() {
+        return Ok(false);
+    }
+    let _lock = lock_workspace(&dir)?;
+    let Some(mut metadata) = read_workspace_optional(session_id)? else {
+        return Ok(false);
+    };
+    validate_workspace_identity(session_id, &metadata)?;
+    update(&mut metadata);
+    validate_workspace_identity(session_id, &metadata)?;
+    write_workspace_unlocked(&metadata, &dir)?;
+    Ok(true)
+}
+
+fn validate_workspace_identity(
+    expected_session_id: &str,
+    metadata: &WorkspaceMetadata,
+) -> std::io::Result<()> {
+    if metadata.session_id == expected_session_id {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "workspace session_id mismatch: expected {expected_session_id}, found {}",
+            metadata.session_id
+        ),
+    ))
+}
+
+fn lock_workspace(dir: &Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+
+    let lock_path = dir.join(".workspace.lock");
+    let create_attempt = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path);
+    let (file, created) = match create_attempt {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)?,
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    if created {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        sync_parent_dir(&lock_path)?;
+    }
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn write_workspace_unlocked(metadata: &WorkspaceMetadata, dir: &Path) -> std::io::Result<()> {
+    let metadata = canonical_workspace_metadata(metadata);
     let path = dir.join("workspace.yaml");
     let yaml = serde_yaml_ng::to_string(&metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -690,7 +789,9 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
         writer.get_ref().sync_all()?; // fsync data to disk
     }
     // Atomic rename
-    std::fs::rename(&tmp_path, &path)?;
+    std::fs::rename(&tmp_path, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
     sync_parent_dir(&path)?;
     Ok(())
 }
@@ -713,8 +814,19 @@ pub fn workspace_file_path(session_id: &str) -> std::io::Result<PathBuf> {
 ///
 /// Returns the backup path when a workspace file existed and was renamed.
 pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option<PathBuf>> {
-    let path = workspace_file_path(session_id)?;
+    let dir = validated_workspace_dir(session_id)?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let _lock = lock_workspace(&dir)?;
+    let path = dir.join("workspace.yaml");
     if !path.exists() {
+        return Ok(None);
+    }
+    // The caller's read happened before this lock was acquired. Another
+    // writer may have repaired the file meanwhile, so revalidate under the
+    // lock before moving anything aside.
+    if read_workspace(session_id).is_ok() {
         return Ok(None);
     }
 
@@ -857,15 +969,16 @@ pub fn format_project_context(summaries: &[ProjectSessionSummary]) -> String {
 /// Finalize workspace at session end: extract summary from journal and mark completed.
 /// Returns the summary string if one was found.
 pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
-    // Read current workspace; bail if it doesn't exist
-    let mut ws = match read_workspace_optional(session_id) {
-        Ok(Some(ws)) => ws,
+    // Validate the current workspace and bail if it does not exist. The actual
+    // mutation below re-reads it under the workspace lock.
+    match read_workspace_optional(session_id) {
+        Ok(Some(_)) => {}
         Ok(None) => return None,
         Err(error) => {
             eprintln!("[knowledge-backflow] Failed to read workspace on end: {error}");
             return None;
         }
-    };
+    }
 
     // Extract summary from the last compact event's metadata
     let summary = match extract_last_compact_summary(session_id) {
@@ -878,10 +991,15 @@ pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
         }
     };
 
-    ws.mark_completed(summary.as_deref());
-
-    if let Err(e) = write_workspace(&ws) {
-        eprintln!("[knowledge-backflow] Failed to update workspace on end: {e}");
+    let summary_for_update = summary.clone();
+    match update_existing_workspace(session_id, |workspace| {
+        workspace.mark_completed(summary_for_update.as_deref());
+    }) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            eprintln!("[knowledge-backflow] Failed to update workspace on end: {error}");
+        }
     }
 
     summary
@@ -909,7 +1027,7 @@ fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_journal::JournalDirGuard;
+    use crate::session_journal::{JournalDirGuard, ProcessJournalDirGuard};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1682,6 +1800,46 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn update_existing_workspace_does_not_create_a_missing_session_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-update-existing-missing";
+        let dir = workspace_dir_for(session_id);
+
+        assert!(!update_existing_workspace(session_id, |_| {}).unwrap());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_identity_is_validated_and_healthy_files_are_never_backed_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-identity-owner";
+        let valid = WorkspaceMetadata::with_context(session_id, "gpt-5", "/repo", None);
+        write_workspace(&valid).unwrap();
+        assert!(backup_invalid_workspace_file(session_id).unwrap().is_none());
+        assert_eq!(read_workspace(session_id).unwrap().session_id, session_id);
+
+        let misplaced =
+            WorkspaceMetadata::with_context("different-session", "gpt-5", "/repo", None);
+        std::fs::write(
+            workspace_file_path(session_id).unwrap(),
+            serde_yaml_ng::to_string(&misplaced).unwrap(),
+        )
+        .unwrap();
+        let error = read_workspace(session_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("session_id mismatch"));
+        assert!(backup_invalid_workspace_file(session_id).unwrap().is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn backup_invalid_workspace_file_preserves_corrupt_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let sessions_dir = temp.path().join("sessions");
@@ -1706,6 +1864,91 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("workspace.yaml.corrupt-"))
         );
+    }
+
+    #[test]
+    #[serial_test::serial(process_journal_dir_guard)]
+    fn concurrent_workspace_field_updates_are_serialized_without_lost_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = ProcessJournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-concurrent-field-updates";
+        write_workspace(&WorkspaceMetadata::with_context(
+            session_id, "gpt-5", "/repo", None,
+        ))
+        .unwrap();
+
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_session_id = session_id.to_string();
+        let first = std::thread::spawn(move || {
+            update_workspace(
+                &first_session_id,
+                || panic!("workspace should already exist"),
+                |workspace| {
+                    workspace.background_shell_tasks = vec![BackgroundShellTaskProjection {
+                        id: "shell-1".into(),
+                        status: "running".into(),
+                        title: "make check".into(),
+                        started_at_ms: 1,
+                        ended_at_ms: None,
+                        stdout_path: "/tmp/shell-1.stdout".into(),
+                        stderr_path: "/tmp/shell-1.stderr".into(),
+                        exit_code: None,
+                        terminal_reason: None,
+                    }];
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+            .unwrap();
+        });
+        first_entered_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_session_id = session_id.to_string();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            update_workspace(
+                &second_session_id,
+                || panic!("workspace should already exist"),
+                |workspace| {
+                    second_entered_tx.send(()).unwrap();
+                    workspace.background_local_agent_tasks =
+                        vec![BackgroundLocalAgentTaskProjection {
+                            id: "agent-1".into(),
+                            run_id: "run-1".into(),
+                            parent_run_id: "parent-1".into(),
+                            status: "working".into(),
+                            title: "review persistence".into(),
+                            started_at_ms: 2,
+                            ended_at_ms: None,
+                            output_tail: None,
+                            terminal_reason: None,
+                            fanout: None,
+                        }];
+                },
+            )
+            .unwrap();
+        });
+        second_started_rx.recv().unwrap();
+        assert!(
+            matches!(
+                second_entered_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a second field update entered while the first still held the workspace lock"
+        );
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let workspace = read_workspace(session_id).unwrap();
+        assert_eq!(workspace.background_shell_tasks.len(), 1);
+        assert_eq!(workspace.background_local_agent_tasks.len(), 1);
     }
 
     #[test]

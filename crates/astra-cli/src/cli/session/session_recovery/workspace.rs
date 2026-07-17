@@ -1,5 +1,4 @@
 //! Workspace metadata: build, sync plan/session/context-trace fields, snapshot.
-use super::io::with_workspace_lock;
 use crate::cli::session::session_state::SessionState;
 
 pub(crate) fn sync_plan_fields_to_workspace(
@@ -201,6 +200,15 @@ pub(crate) fn workspace_metadata_from_live_state(
         Ok(None) => fresh_workspace_metadata(state, sid),
         Err(error) => workspace_metadata_from_live_state_after_read_failure(state, sid, &error),
     };
+    sync_live_state_into_workspace(state, sid, &mut ws);
+    ws
+}
+
+fn sync_live_state_into_workspace(
+    state: &SessionState,
+    sid: &str,
+    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
+) {
     let journal_state = match super::super::session_runtime::session_state_from_journal(sid) {
         Ok(state) => state,
         Err(error) => {
@@ -243,19 +251,25 @@ pub(crate) fn workspace_metadata_from_live_state(
             );
         }
     }
-    sync_plan_fields_to_workspace(state, &mut ws);
-    sync_context_trace_to_workspace(state, &mut ws);
-    sync_session_state_to_workspace(state, &mut ws);
-    ws
+    sync_plan_fields_to_workspace(state, ws);
+    sync_context_trace_to_workspace(state, ws);
+    sync_session_state_to_workspace(state, ws);
 }
 
 pub(crate) fn persist_recovery_workspace_snapshot(
     state: &SessionState,
     sid: &str,
 ) -> Result<(), String> {
-    with_workspace_lock(sid, || {
-        let ws = workspace_metadata_from_live_state(state, sid);
-        astra_services::session_workspace::write_workspace(&ws)
-            .map_err(|e| format!("write workspace: {e}"))
-    })
+    let recovered = match astra_services::session_workspace::read_workspace_optional(sid) {
+        Ok(_) => None,
+        Err(error) => Some(workspace_metadata_from_live_state_after_read_failure(
+            state, sid, &error,
+        )),
+    };
+    astra_services::session_workspace::update_workspace(
+        sid,
+        || recovered.unwrap_or_else(|| fresh_workspace_metadata(state, sid)),
+        |workspace| sync_live_state_into_workspace(state, sid, workspace),
+    )
+    .map_err(|e| format!("write workspace: {e}"))
 }

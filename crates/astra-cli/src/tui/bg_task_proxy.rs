@@ -310,17 +310,14 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
-                Some(workspace) => workspace,
-                None => astra_services::session_workspace::WorkspaceMetadata::new(
-                    &session_id_owned,
-                    &model,
-                ),
-            };
-        workspace.background_shell_tasks = projections_for_write;
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
+        astra_services::session_workspace::update_workspace(
+            &session_id_owned,
+            || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
+            |workspace| {
+                workspace.background_shell_tasks = projections_for_write;
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            },
+        )
     })
     .await;
     match persisted {
@@ -380,17 +377,14 @@ pub(crate) async fn persist_background_local_agent_task_projections_from_snapsho
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
-                Some(workspace) => workspace,
-                None => astra_services::session_workspace::WorkspaceMetadata::new(
-                    &session_id_owned,
-                    &model,
-                ),
-            };
-        workspace.background_local_agent_tasks = projections_for_write;
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
+        astra_services::session_workspace::update_workspace(
+            &session_id_owned,
+            || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
+            |workspace| {
+                workspace.background_local_agent_tasks = projections_for_write;
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            },
+        )
     })
     .await;
     match persisted {

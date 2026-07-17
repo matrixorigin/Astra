@@ -129,18 +129,12 @@ pub(crate) fn format_denied_message(reason: &str) -> String {
 }
 
 fn persist_permission_mode_to_workspace(session_id: &str, mode: PermissionMode) {
-    let update = || -> std::io::Result<()> {
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(session_id)? {
-                Some(workspace) => workspace,
-                None => return Ok(()),
-            };
-        workspace.permission_mode = Some(mode.to_string());
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
-    };
-
-    if let Err(error) = update() {
+    if let Err(error) =
+        astra_services::session_workspace::update_existing_workspace(session_id, |workspace| {
+            workspace.permission_mode = Some(mode.to_string());
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        })
+    {
         tracing::warn!(
             session_id,
             mode = %mode,
@@ -3735,7 +3729,7 @@ mod tests {
         PermissionSettings, PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
         content_aware_fingerprint, decode_mode_for_mirror, encode_mode_for_mirror,
         format_denied_message, is_read_only_allowlisted, parse_sandbox_target_path,
-        safe_alternative_for,
+        persist_permission_mode_to_workspace, safe_alternative_for,
     };
     use crate::cli::workspace_trust::{
         TrustState, WorkspaceTrustLedger, WorkspaceTrustReason, project_permissions_hash,
@@ -5014,6 +5008,35 @@ mod tests {
         assert_eq!(PermissionMode::AcceptEdits.to_string(), "accept_edits");
         assert_eq!(PermissionMode::Prompt.to_string(), "prompt");
         assert_eq!(PermissionMode::Deny.to_string(), "deny");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn permission_mode_update_preserves_background_task_projection() {
+        let (_temp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("permission-workspace-{}", uuid::Uuid::new_v4());
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&session_id, "gpt-5");
+        workspace.background_shell_tasks = vec![
+            astra_services::session_workspace::BackgroundShellTaskProjection {
+                id: "shell-1".into(),
+                status: "running".into(),
+                title: "make check".into(),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                stdout_path: "/tmp/shell-1.stdout".into(),
+                stderr_path: "/tmp/shell-1.stderr".into(),
+                exit_code: None,
+                terminal_reason: None,
+            },
+        ];
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        persist_permission_mode_to_workspace(&session_id, PermissionMode::Plan);
+
+        let persisted = astra_services::session_workspace::read_workspace(&session_id).unwrap();
+        assert_eq!(persisted.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(persisted.background_shell_tasks.len(), 1);
     }
 
     #[test]

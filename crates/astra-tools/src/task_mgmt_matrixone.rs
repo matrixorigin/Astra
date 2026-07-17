@@ -58,6 +58,26 @@ struct EncodedTaskDatetimes {
     updated_at: String,
 }
 
+fn encode_task_datetimes(task: &SessionTask) -> Result<EncodedTaskDatetimes, String> {
+    let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
+    let archived_at = if task.status == SessionTaskStatusKind::Archived {
+        match task.archived_at.as_deref() {
+            Some(value) => Some(to_mo_datetime(value, "archived_at", &task.id)?),
+            // Compatibility for legacy archive rows created before the field
+            // was part of SessionTask. The first durable rewrite makes the
+            // inferred value explicit; subsequent loads preserve it exactly.
+            None => Some(updated_at.clone()),
+        }
+    } else {
+        None
+    };
+    Ok(EncodedTaskDatetimes {
+        archived_at,
+        created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
+        updated_at,
+    })
+}
+
 fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
     EncodedTaskJsonFields {
         metadata: task
@@ -93,15 +113,7 @@ async fn insert_session_tasks(
     for (start, end) in task_insert_batch_ranges(tasks.len()) {
         let encoded_datetimes = tasks[start..end]
             .iter()
-            .map(|task| {
-                let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
-                Ok(EncodedTaskDatetimes {
-                    archived_at: (task.status == SessionTaskStatusKind::Archived)
-                        .then(|| updated_at.clone()),
-                    created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
-                    updated_at,
-                })
-            })
+            .map(encode_task_datetimes)
             .collect::<Result<Vec<_>, String>>()?;
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
@@ -285,6 +297,7 @@ impl MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -337,6 +350,11 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
             .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
         let created_at = from_mo_datetime(&created_at_raw, "created_at")?;
         let updated_at = from_mo_datetime(&updated_at_raw, "updated_at")?;
+        let archived_at = row
+            .try_get::<Option<String>, _>("archived_at")?
+            .as_deref()
+            .map(|value| from_mo_datetime(value, "archived_at"))
+            .transpose()?;
 
         Ok(SessionTask {
             id,
@@ -351,7 +369,7 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
             metadata,
             blocks,
             blocked_by,
-            archived_at: None, // populated on load from column below
+            archived_at,
         })
     })();
 
@@ -454,6 +472,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -617,6 +636,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = match sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -995,6 +1015,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT session_id, todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -1037,6 +1058,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT session_id, todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -1223,6 +1245,44 @@ mod tests {
                 r#"[{"id":"sub-1","title":"subtask","description":null,"status":"pending","depends_on":["sub-0"],"reason":"waiting on dependency"}]"#
             )
         );
+    }
+
+    #[test]
+    fn archived_datetime_round_trip_preserves_original_archive_time() {
+        let mut task = SessionTask {
+            id: "task-archive".into(),
+            title: "historical".into(),
+            description: None,
+            status: SessionTaskStatusKind::Archived,
+            subtasks: vec![],
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-03-01T00:00:00Z".into(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: vec![],
+            blocked_by: vec![],
+            archived_at: Some("2025-02-01T00:00:00Z".into()),
+        };
+
+        let encoded = encode_task_datetimes(&task).expect("archive datetimes");
+        assert_eq!(
+            encoded.archived_at.as_deref(),
+            Some("2025-02-01 00:00:00.000000")
+        );
+        assert_eq!(encoded.updated_at, "2025-03-01 00:00:00.000000");
+
+        task.archived_at = None;
+        let legacy = encode_task_datetimes(&task).expect("legacy archive fallback");
+        assert_eq!(
+            legacy.archived_at.as_deref(),
+            Some(legacy.updated_at.as_str())
+        );
+
+        task.status = SessionTaskStatusKind::Completed;
+        task.archived_at = Some("2025-02-01T00:00:00Z".into());
+        let active = encode_task_datetimes(&task).expect("non-archive datetime");
+        assert_eq!(active.archived_at, None);
     }
 
     #[test]
