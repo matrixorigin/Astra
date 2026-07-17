@@ -4250,17 +4250,15 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
+        let started: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "interrupted");
-        assert_eq!(value["interrupted"], 1);
-        assert_eq!(value["agents"][0]["finish_reason"], "execution_incomplete");
-        assert_eq!(value["agents"][0]["status"], "interrupted");
+        assert_eq!(started["status"], "started", "{started}");
+        assert_eq!(started["agents"][0]["status"], "launched", "{started}");
 
         let collected = handle_agent_fanout_tool(
             &json!({
                 "action": "get_results",
-                "group_id": value["group_id"].as_str().unwrap()
+                "group_id": started["group_id"].as_str().unwrap()
             }),
             Some(&ctx),
         )
@@ -4269,6 +4267,11 @@ mod tests {
         assert_eq!(collected["status"], "completed_with_issues");
         assert_eq!(collected["completed"], Value::Null);
         assert_eq!(collected["interrupted"], 1);
+        assert_eq!(
+            collected["results"][0]["result"]["finish_reason"],
+            "execution_incomplete"
+        );
+        assert_eq!(collected["results"][0]["result"]["status"], "interrupted");
     }
 
     #[tokio::test]
