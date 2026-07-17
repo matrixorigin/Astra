@@ -1682,6 +1682,31 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .record_tool_result(&edge_result.tool, &edge_result.output);
     }
 
+    // Preserve normal tool accounting and observability above, then close a
+    // repeated anti-poll violation at the runtime boundary. The detached task
+    // remains live; only this wasteful agentic turn is settled.
+    if state.stall.same_turn_detached_poll_attempts >= 2 {
+        let task_ids = state
+            .stall
+            .same_turn_detached_task_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.final_text = format!(
+            "Background task {task_ids} is still running. Its completion will be surfaced automatically; ask for progress in a later turn if needed."
+        );
+        tracing::info!(
+            target: "astra::loop_guard",
+            task_ids,
+            attempts = state.stall.same_turn_detached_poll_attempts,
+            "closing repeated same-turn background polling with a runtime acknowledgement"
+        );
+        state.step_recorder.end_turn(false);
+        finalize_and_render(host, state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
+
     if let Some(tool_name) =
         host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results)
     {

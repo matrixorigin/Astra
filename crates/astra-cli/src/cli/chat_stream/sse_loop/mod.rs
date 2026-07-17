@@ -817,6 +817,7 @@ pub(crate) async fn stream_chat_sse(
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
             same_turn_detached_task_ids: Default::default(),
+            same_turn_detached_poll_attempts: 0,
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),

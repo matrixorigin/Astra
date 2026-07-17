@@ -1075,6 +1075,11 @@ pub struct StallTrackingState {
     /// uses this turn-scoped fact to reject immediate `task_output` polling
     /// while still allowing the model to continue independent work.
     pub same_turn_detached_task_ids: BTreeSet<String>,
+    /// Number of attempts to inspect a task detached by this same agentic
+    /// turn. One rejected attempt gives the model a chance to produce the
+    /// short running acknowledgement; a second attempt closes the loop with
+    /// a runtime-owned acknowledgement instead of burning dozens of rounds.
+    pub same_turn_detached_poll_attempts: u32,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<String>>,
     /// Per-turn tool name sets.
@@ -5491,9 +5496,68 @@ pub(crate) mod tests {
             state
                 .messages
                 .iter()
-                .any(|message| { message.to_string().contains("Do not poll it now") }),
+                .any(|message| { message.to_string().contains("Do not poll or list it again") }),
             "same-turn task_output must resolve to the runtime anti-poll receipt"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_same_turn_background_polling_is_bounded_by_runtime() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_detached_bash_edge_tool("bg-shell-1")],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_list",
+                    json!({"include_terminal": true}),
+                    "should not run",
+                )],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({"task_id": "bg-shell-1", "block": false}),
+                    "should not run",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("unreachable model response", 10, 5, None),
+        ])
+        .with_valid_tools(&["bash", "task_list", "task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "a second same-turn polling violation must close the loop without another model call"
+        );
+        assert_eq!(state.total_tool_calls, 3);
+        assert!(
+            state.final_text.contains("bg-shell-1"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state.final_text.contains("surfaced automatically"),
+            "{}",
+            state.final_text
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]

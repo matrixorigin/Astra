@@ -694,44 +694,117 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 }
 
 fn format_background_task_error(error: &BackgroundTaskError) -> String {
-    match error {
-        BackgroundTaskError::NotFound { task_id } => {
-            format!("Background task not found: {task_id}")
-        }
-        BackgroundTaskError::OutputArtifactMissing { task_id, path } => format!(
-            "Read shell output {task_id}\nOutput artifact missing · {}",
-            path.display()
+    let (task_id, status, detail) = match error {
+        BackgroundTaskError::NotFound { task_id } => (
+            task_id.as_str(),
+            "not_found",
+            format!("Background task not found: {task_id}"),
         ),
-        BackgroundTaskError::OutputUnavailable { detail, .. } => {
-            format!("Background task output unavailable: {detail}")
+        BackgroundTaskError::OutputArtifactMissing { task_id, path } => (
+            task_id.as_str(),
+            "output_missing",
+            format!("Output artifact missing: {}", path.display()),
+        ),
+        BackgroundTaskError::OutputUnavailable { task_id, detail } => {
+            (task_id.as_str(), "output_unavailable", detail.clone())
         }
-        BackgroundTaskError::AlreadyTerminated { .. }
-        | BackgroundTaskError::StaleHandle { .. }
-        | BackgroundTaskError::CannotStop { .. } => {
-            format!("Background task output unavailable: {error}")
+        BackgroundTaskError::AlreadyTerminated { task_id } => {
+            (task_id.as_str(), "already_terminal", error.to_string())
         }
-    }
+        BackgroundTaskError::StaleHandle { task_id } => {
+            (task_id.as_str(), "stale_handle", error.to_string())
+        }
+        BackgroundTaskError::CannotStop { task_id } => {
+            (task_id.as_str(), "cannot_read", error.to_string())
+        }
+    };
+    serde_json::json!({
+        "ok": false,
+        "kind": "background_task",
+        "task_id": task_id,
+        "status": status,
+        "error": detail,
+    })
+    .to_string()
 }
 
 fn format_background_task_stop_error(error: &BackgroundTaskError) -> String {
-    match error {
-        BackgroundTaskError::NotFound { task_id } => {
-            format!("Background task not found: {task_id}")
-        }
-        BackgroundTaskError::AlreadyTerminated { task_id } => {
-            format!("Background task {task_id} already finished.")
-        }
-        BackgroundTaskError::StaleHandle { task_id } => format!(
-            "Background task {task_id} cannot be stopped because it was restored from a previous session and no live process handle is available."
+    let (task_id, status, ok, terminal, detail) = match error {
+        BackgroundTaskError::NotFound { task_id } => (
+            task_id.as_str(),
+            "not_found",
+            false,
+            false,
+            format!("Background task not found: {task_id}"),
         ),
-        BackgroundTaskError::CannotStop { task_id } => {
-            format!("Background task {task_id} cannot be stopped in its current state.")
-        }
-        BackgroundTaskError::OutputArtifactMissing { .. }
-        | BackgroundTaskError::OutputUnavailable { .. } => {
-            format!("Background task stop failed: {error}")
-        }
+        BackgroundTaskError::AlreadyTerminated { task_id } => (
+            task_id.as_str(),
+            "already_terminal",
+            true,
+            true,
+            format!("Background task {task_id} already finished."),
+        ),
+        BackgroundTaskError::StaleHandle { task_id } => (
+            task_id.as_str(),
+            "stale_handle",
+            false,
+            false,
+            format!(
+                "Background task {task_id} cannot be stopped because no live process handle is available."
+            ),
+        ),
+        BackgroundTaskError::CannotStop { task_id } => (
+            task_id.as_str(),
+            "cannot_stop",
+            false,
+            false,
+            format!("Background task {task_id} cannot be stopped in its current state."),
+        ),
+        BackgroundTaskError::OutputArtifactMissing { task_id, .. }
+        | BackgroundTaskError::OutputUnavailable { task_id, .. } => (
+            task_id.as_str(),
+            "stop_failed",
+            false,
+            false,
+            format!("Background task stop failed: {error}"),
+        ),
+    };
+    let mut response = serde_json::json!({
+        "ok": ok,
+        "kind": "background_task",
+        "task_id": task_id,
+        "status": status,
+        "terminal": terminal,
+    });
+    if ok {
+        response["message"] = serde_json::Value::String(detail);
+    } else {
+        response["error"] = serde_json::Value::String(detail);
     }
+    response.to_string()
+}
+
+fn format_background_task_argument_error(error: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "kind": "background_task",
+        "status": "invalid_argument",
+        "error": error,
+    })
+    .to_string()
+}
+
+fn format_background_task_registry_closed(task_id: Option<&str>) -> String {
+    let mut response = serde_json::json!({
+        "ok": false,
+        "kind": if task_id.is_some() { "background_task" } else { "background_task_list" },
+        "status": "registry_unavailable",
+        "error": "background task registry is not available",
+    });
+    if let Some(task_id) = task_id {
+        response["task_id"] = serde_json::Value::String(task_id.to_string());
+    }
+    response.to_string()
 }
 
 fn format_background_task_output(
@@ -761,6 +834,7 @@ fn format_background_task_output(
     };
     let mut metadata_parts = vec![
         format!("offset {offset} -> {}", snapshot.end_offset),
+        format!("next_offset {}", snapshot.end_offset),
         format!("total {} bytes", snapshot.total_bytes),
         format!("{} total lines", snapshot.total_lines),
         format!(
@@ -768,6 +842,12 @@ fn format_background_task_output(
             if snapshot.terminal { "true" } else { "false" }
         ),
     ];
+    if !snapshot.terminal || snapshot.end_offset < snapshot.total_bytes {
+        metadata_parts.push(format!(
+            "next_call task_output(task_id='{task_id}', offset={}, block=false)",
+            snapshot.end_offset
+        ));
+    }
     if !snapshot.output_ref.trim().is_empty() {
         metadata_parts.push(format!("output_ref {}", snapshot.output_ref));
     }
@@ -810,38 +890,69 @@ fn format_background_task_output(
     )
 }
 
-fn format_background_task_output_timeout(task_id: &str, timeout_ms: u64) -> String {
-    format!("Read shell output {task_id}\nNo output yet · still running after {timeout_ms}ms")
+fn format_background_task_output_timeout(task_id: &str, offset: u64, timeout_ms: u64) -> String {
+    format!(
+        "Read shell output {task_id}\nNo new output after offset {offset} · still running after {timeout_ms}ms · next_offset {offset} · next_call task_output(task_id='{task_id}', offset={offset}, block=false)"
+    )
 }
 
 fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
-    format!(
-        "Read shell output {task_id}\nBackground task registry did not respond within {}ms. Output polling is unavailable for this turn; the task may still be running.",
-        duration_ms_u64(timeout)
-    )
+    serde_json::json!({
+        "ok": false,
+        "kind": "background_task",
+        "task_id": task_id,
+        "status": "registry_timeout",
+        "error": format!(
+            "Background task registry did not respond within {}ms. The task may still be running.",
+            duration_ms_u64(timeout)
+        ),
+    })
+    .to_string()
 }
 
 fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration) -> String {
-    format!(
-        "Background task {task_id} stop status unknown\nBackground task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
-        duration_ms_u64(timeout)
-    )
+    serde_json::json!({
+        "ok": false,
+        "kind": "background_task",
+        "task_id": task_id,
+        "status": "stop_status_unknown",
+        "error": format!(
+            "Background task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
+            duration_ms_u64(timeout)
+        ),
+    })
+    .to_string()
 }
 
 fn format_background_task_list_registry_timeout(timeout: Duration) -> String {
-    format!(
-        "Background task registry unavailable\nTimed out after {}ms waiting for the interactive session to answer. Background tasks may still be running; retry task_list later.",
-        duration_ms_u64(timeout)
-    )
+    serde_json::json!({
+        "ok": false,
+        "kind": "background_task_list",
+        "status": "registry_timeout",
+        "error": format!(
+            "Timed out after {}ms waiting for the interactive session to answer. Background tasks may still be running; retry task_list later.",
+            duration_ms_u64(timeout)
+        ),
+    })
+    .to_string()
 }
 
-fn format_background_task_unavailable(cloud_session: bool) -> String {
-    if cloud_session {
-        "Background task unavailable\nno edge runner is attached to this cloud session".to_string()
+fn format_background_task_unavailable(cloud_session: bool, task_id: Option<&str>) -> String {
+    let error = if cloud_session {
+        "no edge runner is attached to this cloud session"
     } else {
-        "Background task unavailable\nlocal background tasks require an interactive CLI session"
-            .to_string()
+        "local background tasks require an interactive CLI session"
+    };
+    let mut response = serde_json::json!({
+        "ok": false,
+        "kind": if task_id.is_some() { "background_task" } else { "background_task_list" },
+        "status": "unavailable",
+        "error": error,
+    });
+    if let Some(task_id) = task_id {
+        response["task_id"] = serde_json::Value::String(task_id.to_string());
     }
+    response.to_string()
 }
 
 fn background_task_status_is_terminal(status: &str) -> bool {
@@ -3198,7 +3309,7 @@ impl ToolExecutor {
             if let Some(addendum) = self.recoverable_fanout_task_list_addendum().await {
                 return Self::empty_background_task_list_with_fanouts(&addendum);
             }
-            return format_background_task_unavailable(self.cloud_base.is_some());
+            return format_background_task_unavailable(self.cloud_base.is_some(), None);
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -3208,9 +3319,7 @@ impl ToolExecutor {
         let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
         match await_bg_task_command_reply(rx, reply_timeout).await {
             Ok(output) => self.attach_recoverable_fanouts_to_task_list(output).await,
-            Err(BgTaskReplyError::Closed) => {
-                "Error: background task registry not available".to_string()
-            }
+            Err(BgTaskReplyError::Closed) => format_background_task_registry_closed(None),
             Err(BgTaskReplyError::TimedOut) => {
                 format_background_task_list_registry_timeout(reply_timeout)
             }
@@ -3324,8 +3433,8 @@ impl ToolExecutor {
     async fn task_output(&self, args: &Value) -> String {
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
-            Err(error) => return error.to_string(),
-            Ok(None) => return "Task id is required".to_string(),
+            Err(error) => return format_background_task_argument_error(error),
+            Ok(None) => return format_background_task_argument_error("task_id is required"),
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -3348,7 +3457,7 @@ impl ToolExecutor {
         }
 
         let Some(ref bg_commands) = self.bg_task_commands else {
-            return format_background_task_unavailable(self.cloud_base.is_some());
+            return format_background_task_unavailable(self.cloud_base.is_some(), Some(&task_id));
         };
 
         if block {
@@ -3356,7 +3465,7 @@ impl ToolExecutor {
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                    return format_background_task_output_timeout(&task_id, offset, timeout_ms);
                 }
                 let reply_timeout = background_task_reply_timeout(timeout_ms).min(remaining);
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3381,7 +3490,7 @@ impl ToolExecutor {
                     }
                     Ok(Err(e)) => return format_background_task_error(&e),
                     Err(BgTaskReplyError::Closed) => {
-                        return "Error: background task registry not available".to_string();
+                        return format_background_task_registry_closed(Some(&task_id));
                     }
                     Err(BgTaskReplyError::TimedOut) => {
                         return format_background_task_output_registry_timeout(
@@ -3391,12 +3500,12 @@ impl ToolExecutor {
                     }
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                    return format_background_task_output_timeout(&task_id, offset, timeout_ms);
                 }
                 let sleep_for = Duration::from_millis(500)
                     .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
                 if sleep_for.is_zero() {
-                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                    return format_background_task_output_timeout(&task_id, offset, timeout_ms);
                 }
                 tokio::time::sleep(sleep_for).await;
             }
@@ -3416,7 +3525,7 @@ impl ToolExecutor {
                 Ok(Ok(snapshot)) => format_background_task_output(&task_id, offset, &snapshot),
                 Ok(Err(e)) => format_background_task_error(&e),
                 Err(BgTaskReplyError::Closed) => {
-                    "Error: background task registry not available".to_string()
+                    format_background_task_registry_closed(Some(&task_id))
                 }
                 Err(BgTaskReplyError::TimedOut) => {
                     format_background_task_output_registry_timeout(&task_id, reply_timeout)
@@ -3551,13 +3660,13 @@ impl ToolExecutor {
     }
 
     async fn task_kill_bg(&self, args: &Value) -> String {
-        let Some(ref bg_commands) = self.bg_task_commands else {
-            return format_background_task_unavailable(self.cloud_base.is_some());
-        };
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
-            Err(error) => return error.to_string(),
-            Ok(None) => return "Task id is required".to_string(),
+            Err(error) => return format_background_task_argument_error(error),
+            Ok(None) => return format_background_task_argument_error("task_id is required"),
+        };
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return format_background_task_unavailable(self.cloud_base.is_some(), Some(&task_id));
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -3569,10 +3678,18 @@ impl ToolExecutor {
         }
         let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
         match await_bg_task_command_reply(rx, reply_timeout).await {
-            Ok(Ok(())) => format!("Background task {task_id} stopped."),
+            Ok(Ok(())) => serde_json::json!({
+                "ok": true,
+                "kind": "background_task",
+                "task_id": task_id,
+                "status": "stop_requested",
+                "terminal": false,
+                "message": "Cancellation was accepted; terminal status will be surfaced automatically.",
+            })
+            .to_string(),
             Ok(Err(e)) => format_background_task_stop_error(&e),
             Err(BgTaskReplyError::Closed) => {
-                "Error: background task registry not available".to_string()
+                format_background_task_registry_closed(Some(&task_id))
             }
             Err(BgTaskReplyError::TimedOut) => {
                 format_background_task_stop_registry_timeout(&task_id, reply_timeout)
@@ -5708,16 +5825,22 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 mod tests {
     use super::{
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor,
-        all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
-        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_timeout, format_background_task_stop_error,
-        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
+        all_tool_schemas, cli_tool_output_is_error, detect_git_remote_repos,
+        extract_github_owner_repo, file_checkpoint_dir_for, format_background_task_error,
+        format_background_task_output, format_background_task_output_timeout,
+        format_background_task_stop_error, git_stash_sub_action_args, memoria,
+        parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn parse_control_result(output: &str) -> serde_json::Value {
+        serde_json::from_str(output)
+            .unwrap_or_else(|error| panic!("expected structured control result: {error}: {output}"))
+    }
 
     #[test]
     fn git_stash_bridge_remaps_canonical_sub_action() {
@@ -6201,10 +6324,12 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
-        assert_eq!(
-            result,
-            "Background task unavailable\nlocal background tasks require an interactive CLI session"
-        );
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["kind"], "background_task", "{result}");
+        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
+        assert!(cli_tool_output_is_error(&result), "{result}");
     }
 
     #[tokio::test]
@@ -6219,10 +6344,12 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
-        assert_eq!(
-            result,
-            "Background task unavailable\nlocal background tasks require an interactive CLI session"
-        );
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["kind"], "background_task", "{result}");
+        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
+        assert!(cli_tool_output_is_error(&result), "{result}");
     }
 
     #[tokio::test]
@@ -6237,9 +6364,14 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["kind"], "background_task", "{result}");
+        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
         assert_eq!(
-            result,
-            "Background task unavailable\nno edge runner is attached to this cloud session"
+            parsed["error"],
+            "no edge runner is attached to this cloud session"
         );
     }
 
@@ -6488,7 +6620,11 @@ mod tests {
         .await
         .expect("typed registry error should return promptly");
 
-        assert_eq!(output, "Background task not found: bg-shell-missing");
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "not_found", "{output}");
+        assert_eq!(result["task_id"], "bg-shell-missing", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]
@@ -6500,9 +6636,14 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["kind"], "background_task", "{result}");
+        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
         assert_eq!(
-            result,
-            "Background task unavailable\nno edge runner is attached to this cloud session"
+            parsed["error"],
+            "no edge runner is attached to this cloud session"
         );
     }
 
@@ -6517,14 +6658,11 @@ mod tests {
         .await
         .expect("registry reply timeout should bound task_stop");
 
-        assert!(
-            result.contains("Background task bg-shell-1 stop status unknown"),
-            "{result}"
-        );
-        assert!(
-            result.contains("Background task registry did not respond within"),
-            "{result}"
-        );
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["status"], "stop_status_unknown", "{result}");
+        assert_eq!(parsed["task_id"], "bg-shell-1", "{result}");
+        assert!(cli_tool_output_is_error(&result), "{result}");
     }
 
     #[tokio::test]
@@ -6554,7 +6692,43 @@ mod tests {
         .await
         .expect("typed registry error should return promptly");
 
-        assert_eq!(output, "Background task bg-shell-1 already finished.");
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], true, "{output}");
+        assert_eq!(result["status"], "already_terminal", "{output}");
+        assert_eq!(result["terminal"], true, "{output}");
+        assert!(!cli_tool_output_is_error(&output), "{output}");
+    }
+
+    #[tokio::test]
+    async fn task_stop_reports_accepted_request_without_claiming_terminal_state() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({"task_id": "bg-shell-1"});
+
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let stop_fut = executor.task_kill_bg(&args);
+            tokio::pin!(stop_fut);
+            loop {
+                tokio::select! {
+                    output = &mut stop_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        if let Some(BgTaskCommand::Kill { reply, .. }) =
+                            commands.lock_recover().pop()
+                        {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed stop receipt should return promptly");
+
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], true, "{output}");
+        assert_eq!(result["status"], "stop_requested", "{output}");
+        assert_eq!(result["terminal"], false, "{output}");
+        assert!(!cli_tool_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]
@@ -6566,9 +6740,13 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["kind"], "background_task_list", "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
         assert_eq!(
-            result,
-            "Background task unavailable\nno edge runner is attached to this cloud session"
+            parsed["error"],
+            "no edge runner is attached to this cloud session"
         );
     }
 
@@ -6583,12 +6761,13 @@ mod tests {
         .await
         .expect("registry reply timeout should bound task_list");
 
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["status"], "registry_timeout", "{result}");
         assert!(
-            result.contains("Background task registry unavailable"),
-            "{result}"
-        );
-        assert!(
-            result.contains("Timed out after") && result.contains("retry task_list"),
+            parsed["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("retry task_list")),
             "{result}"
         );
     }
@@ -6602,9 +6781,12 @@ mod tests {
         )
         .await
         .expect("should fail fast, not hang");
+        let parsed = parse_control_result(&result);
+        assert_eq!(parsed["ok"], false, "{result}");
+        assert_eq!(parsed["status"], "unavailable", "{result}");
         assert_eq!(
-            result,
-            "Background task unavailable\nlocal background tasks require an interactive CLI session"
+            parsed["error"],
+            "local background tasks require an interactive CLI session"
         );
     }
 
@@ -6615,7 +6797,10 @@ mod tests {
         let output = executor
             .task_output(&serde_json::json!({"task_id": "   ", "block": false}))
             .await;
-        assert_eq!(output, "Task id is required");
+        let result = parse_control_result(&output);
+        assert_eq!(result["status"], "invalid_argument", "{output}");
+        assert_eq!(result["error"], "Task id is required", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]
@@ -6625,7 +6810,10 @@ mod tests {
         let output = executor
             .task_kill_bg(&serde_json::json!({"task_id": "   "}))
             .await;
-        assert_eq!(output, "Task id is required");
+        let result = parse_control_result(&output);
+        assert_eq!(result["status"], "invalid_argument", "{output}");
+        assert_eq!(result["error"], "Task id is required", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]
@@ -6635,7 +6823,9 @@ mod tests {
         let output = executor
             .task_output(&serde_json::json!({"task_id": 123, "block": false}))
             .await;
-        assert_eq!(output, "task_id must be a non-empty string");
+        let result = parse_control_result(&output);
+        assert_eq!(result["status"], "invalid_argument", "{output}");
+        assert_eq!(result["error"], "task_id must be a non-empty string");
     }
 
     #[tokio::test]
@@ -6645,7 +6835,9 @@ mod tests {
         let output = executor
             .task_kill_bg(&serde_json::json!({"task_id": 123}))
             .await;
-        assert_eq!(output, "task_id must be a non-empty string");
+        let result = parse_control_result(&output);
+        assert_eq!(result["status"], "invalid_argument", "{output}");
+        assert_eq!(result["error"], "task_id must be a non-empty string");
     }
 
     #[tokio::test]
@@ -6811,15 +7003,20 @@ mod tests {
         assert!(output.contains("Output chunk:"), "{output}");
         assert!(output.contains("hello"), "{output}");
         assert!(output.contains("world"), "{output}");
+        assert!(output.contains("next_offset 12"), "{output}");
+        assert!(
+            output.contains("task_output(task_id='bg-shell-1', offset=12, block=false)"),
+            "{output}"
+        );
         assert!(!output.contains("\n└ world"), "{output}");
     }
 
     #[test]
     fn background_task_output_projection_names_timeout_without_job_vocabulary() {
-        let output = format_background_task_output_timeout("bg-shell-1", 250);
+        let output = format_background_task_output_timeout("bg-shell-1", 42, 250);
         assert_eq!(
             output,
-            "Read shell output bg-shell-1\nNo output yet · still running after 250ms"
+            "Read shell output bg-shell-1\nNo new output after offset 42 · still running after 250ms · next_offset 42 · next_call task_output(task_id='bg-shell-1', offset=42, block=false)"
         );
         assert!(!output.contains("Job"), "{output}");
     }
@@ -6829,7 +7026,11 @@ mod tests {
         let output = format_background_task_error(&BackgroundTaskError::NotFound {
             task_id: "bg-shell-missing".into(),
         });
-        assert_eq!(output, "Background task not found: bg-shell-missing");
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "not_found", "{output}");
+        assert_eq!(result["task_id"], "bg-shell-missing", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[test]
@@ -6839,9 +7040,15 @@ mod tests {
             path: PathBuf::from("/tmp/astra/bg-shell-1.stdout"),
         });
 
-        assert_eq!(
-            output,
-            "Read shell output bg-shell-1\nOutput artifact missing · /tmp/astra/bg-shell-1.stdout"
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "output_missing", "{output}");
+        assert_eq!(result["task_id"], "bg-shell-1", "{output}");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("/tmp/astra/bg-shell-1.stdout")),
+            "{output}"
         );
     }
 
@@ -6852,10 +7059,10 @@ mod tests {
             detail: "permission denied".into(),
         });
 
-        assert_eq!(
-            output,
-            "Background task output unavailable: permission denied"
-        );
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "output_unavailable", "{output}");
+        assert_eq!(result["error"], "permission denied", "{output}");
     }
 
     #[test]
@@ -6863,7 +7070,10 @@ mod tests {
         let output = format_background_task_stop_error(&BackgroundTaskError::NotFound {
             task_id: "bg-shell-missing".into(),
         });
-        assert_eq!(output, "Background task not found: bg-shell-missing");
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "not_found", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[test]
@@ -6871,7 +7081,11 @@ mod tests {
         let output = format_background_task_stop_error(&BackgroundTaskError::AlreadyTerminated {
             task_id: "bg-shell-1".into(),
         });
-        assert_eq!(output, "Background task bg-shell-1 already finished.");
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], true, "{output}");
+        assert_eq!(result["status"], "already_terminal", "{output}");
+        assert_eq!(result["terminal"], true, "{output}");
+        assert!(!cli_tool_output_is_error(&output), "{output}");
     }
 
     #[test]
@@ -6880,10 +7094,10 @@ mod tests {
             task_id: "bg-shell-1".into(),
         });
 
-        assert_eq!(
-            output,
-            "Background task bg-shell-1 cannot be stopped because it was restored from a previous session and no live process handle is available."
-        );
+        let result = parse_control_result(&output);
+        assert_eq!(result["ok"], false, "{output}");
+        assert_eq!(result["status"], "stale_handle", "{output}");
+        assert!(cli_tool_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]

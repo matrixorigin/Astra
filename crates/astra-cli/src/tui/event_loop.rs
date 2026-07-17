@@ -51,6 +51,7 @@ use super::{
 };
 
 const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
+const BACKGROUND_REGISTRY_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
 const RUNTIME_NOTIFICATION_TURN_SENTINEL: &str = "\u{2063}astra-runtime-notification-turn\u{2063}";
@@ -840,6 +841,13 @@ fn should_reset_agent_scope(previous: Option<&str>, next: Option<&str>) -> bool 
         .is_some_and(|previous_session_id| {
             next.filter(|session_id| !session_id.is_empty()) != Some(previous_session_id)
         })
+}
+
+fn is_initial_session_binding(previous: Option<&str>, next: Option<&str>) -> bool {
+    previous
+        .filter(|session_id| !session_id.is_empty())
+        .is_none()
+        && next.is_some_and(|session_id| !session_id.is_empty())
 }
 
 async fn rebuild_local_agent_runtime_after_session_rebind(
@@ -7795,11 +7803,10 @@ pub(crate) async fn run_tui_session(
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
                 if state.session_id != background_registry_session_id {
-                    let first_session_binding = background_registry_session_id.is_none()
-                        && state
-                            .session_id
-                            .as_deref()
-                            .is_some_and(|session_id| !session_id.trim().is_empty());
+                    let first_session_binding = is_initial_session_binding(
+                        background_registry_session_id.as_deref(),
+                        state.session_id.as_deref(),
+                    );
                     rebind_workbench_observers(
                         state.session_id.as_deref(),
                         &task_board,
@@ -7811,29 +7818,60 @@ pub(crate) async fn run_tui_session(
                         background_registry_session_id.as_deref(),
                         state.session_id.as_deref(),
                     );
-                    persist_background_task_projections_if_changed(
-                        &mut background_registry,
-                        background_registry_session_id.as_deref(),
-                        state.model.as_deref(),
-                        &mut background_task_projection_cache,
-                    )
-                    .await;
-                    let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
-                        &local_agent_snapshot,
-                        &restored_local_agent_task_projections,
-                        background_registry_session_id.as_deref(),
-                        state.model.as_deref(),
-                        &mut background_local_agent_projection_cache,
-                    )
-                    .await;
-                    if reset_agent_scope {
-                        if let Some(retired_snapshot) =
-                            rebuild_local_agent_runtime_after_session_rebind(
-                                &mut state,
-                                api,
-                                profile,
+                    if first_session_binding {
+                        // The server assigning this conversation's durable id
+                        // is not a session switch. Keep live shell handles and
+                        // agents intact, scope only future output to the real
+                        // id, and force the current projections into the new
+                        // workspace. Resetting the registry here used to kill
+                        // a just-detached command and make it disappear before
+                        // the user's next "status?" turn.
+                        background_registry.rebind_output_dir_for_new_tasks(
+                            background_task_output_dir(state.session_id.as_deref()),
+                        );
+                        background_registry_session_id = state.session_id.clone();
+                        background_task_projection_cache.clear();
+                        background_local_agent_projection_cache.clear();
+                        persist_background_task_projections_if_changed(
+                            &mut background_registry,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_task_projection_cache,
+                        )
+                        .await;
+                        restored_local_agent_task_projections =
+                            persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                &local_agent_snapshot,
+                                &restored_local_agent_task_projections,
+                                background_registry_session_id.as_deref(),
+                                state.model.as_deref(),
+                                &mut background_local_agent_projection_cache,
                             )
-                            .await
+                            .await;
+                    } else {
+                        persist_background_task_projections_if_changed(
+                            &mut background_registry,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_task_projection_cache,
+                        )
+                        .await;
+                        let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_local_agent_projection_cache,
+                        )
+                        .await;
+                        if reset_agent_scope
+                            && let Some(retired_snapshot) =
+                                rebuild_local_agent_runtime_after_session_rebind(
+                                    &mut state,
+                                    api,
+                                    profile,
+                                )
+                                .await
                         {
                             let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
                                 &retired_snapshot,
@@ -7844,21 +7882,33 @@ pub(crate) async fn run_tui_session(
                             )
                             .await;
                         }
+                        background_registry
+                            .kill_all_and_wait(BACKGROUND_REGISTRY_SHUTDOWN_WAIT)
+                            .await;
+                        // Persist the reconciled terminal state to the old
+                        // session before replacing the registry. Otherwise a
+                        // stopped process is restored forever as `running`.
+                        persist_background_task_projections_if_changed(
+                            &mut background_registry,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_task_projection_cache,
+                        )
+                        .await;
+                        background_registry = super::background_tasks::BackgroundTaskRegistry::new(
+                            background_task_output_dir(state.session_id.as_deref()),
+                        );
+                        restored_local_agent_task_projections = restore_background_task_projections(
+                            &mut background_registry,
+                            state.session_id.as_deref(),
+                        )
+                        .await;
+                        background_task_projection_cache =
+                            background_registry.export_shell_task_projections();
+                        background_local_agent_projection_cache =
+                            restored_local_agent_task_projections.clone();
+                        background_registry_session_id = state.session_id.clone();
                     }
-                    background_registry.kill_all();
-                    background_registry = super::background_tasks::BackgroundTaskRegistry::new(
-                        background_task_output_dir(state.session_id.as_deref()),
-                    );
-                    restored_local_agent_task_projections = restore_background_task_projections(
-                        &mut background_registry,
-                        state.session_id.as_deref(),
-                    )
-                    .await;
-                    background_task_projection_cache =
-                        background_registry.export_shell_task_projections();
-                    background_local_agent_projection_cache =
-                        restored_local_agent_task_projections.clone();
-                    background_registry_session_id = state.session_id.clone();
                     if first_session_binding
                         && let Some(session_id) = state.session_id.as_deref()
                     {
@@ -8118,8 +8168,19 @@ pub(crate) async fn run_tui_session(
         task.abort();
         let _ = task.await;
     }
-    // Clean up background shells on exit.
-    background_registry.kill_all();
+    // Clean up background shells on exit and persist their reconciled terminal
+    // state. A fire-and-forget cancellation request followed by registry drop
+    // leaves durable projections falsely marked as running.
+    background_registry
+        .kill_all_and_wait(BACKGROUND_REGISTRY_SHUTDOWN_WAIT)
+        .await;
+    persist_background_task_projections_if_changed(
+        &mut background_registry,
+        state.session_id.as_deref(),
+        state.model.as_deref(),
+        &mut background_task_projection_cache,
+    )
+    .await;
     if let Err(error) = file_writer_runtime.shutdown().await {
         tracing::warn!(%error, "TUI file writer did not shut down cleanly");
     }
@@ -9177,6 +9238,21 @@ mod tests {
             Some("session-b")
         ));
         assert!(should_reset_agent_scope(Some("session-a"), None));
+    }
+
+    #[test]
+    fn initial_session_binding_is_identity_discovery_not_a_session_switch() {
+        assert!(is_initial_session_binding(None, Some("session-a")));
+        assert!(is_initial_session_binding(Some(""), Some("session-a")));
+        assert!(!is_initial_session_binding(None, None));
+        assert!(!is_initial_session_binding(
+            Some("session-a"),
+            Some("session-a")
+        ));
+        assert!(!is_initial_session_binding(
+            Some("session-a"),
+            Some("session-b")
+        ));
     }
 
     #[tokio::test]

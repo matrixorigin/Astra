@@ -353,6 +353,17 @@ impl BackgroundTaskRegistry {
         }
     }
 
+    /// Re-scope output created by tasks spawned after the initial server
+    /// session id becomes available. Existing handles keep their original
+    /// paths because their live writers may already have those files open.
+    ///
+    /// This is intentionally not a registry reset: the first `None -> Some`
+    /// session binding is identity discovery for the current conversation,
+    /// not a user-requested session switch, so running work must survive it.
+    pub fn rebind_output_dir_for_new_tasks(&mut self, output_dir: PathBuf) {
+        self.output_dir = output_dir;
+    }
+
     /// Spawn a shell command in the background. Returns the task ID.
     pub fn try_spawn_shell(&mut self, command: &str, description: &str) -> Result<String, String> {
         if self.running_count() >= MAX_CONCURRENT_TASKS {
@@ -529,6 +540,13 @@ impl BackgroundTaskRegistry {
         if id.is_empty() {
             return Err("background shell projection id is required".to_string());
         }
+        if let Some(sequence) = id
+            .strip_prefix("bg-shell-")
+            .and_then(|value| value.parse::<u32>().ok())
+            .and_then(|sequence| sequence.checked_add(1))
+        {
+            NEXT_BG_ID.fetch_max(sequence, Ordering::Relaxed);
+        }
         let status = BgTaskStatus::from_str(projection.status.as_str()).ok_or_else(|| {
             format!(
                 "invalid background shell status '{}' for {}",
@@ -589,10 +607,17 @@ impl BackgroundTaskRegistry {
                 task_id: id.to_string(),
             });
         }
-        if handle.status().is_terminal() {
+        let status = handle.status();
+        if status.is_terminal() {
             return Err(BackgroundTaskError::AlreadyTerminated {
                 task_id: id.to_string(),
             });
+        }
+        if status == BgTaskStatus::Stopping {
+            // Cancellation is an idempotent desired-state command. A retry
+            // while the process is converging must not turn an already-
+            // accepted stop into a false failure.
+            return Ok(());
         }
         if !handle.request_stop() {
             return Err(BackgroundTaskError::CannotStop {
@@ -623,62 +648,62 @@ impl BackgroundTaskRegistry {
     /// completions are collected.
     pub fn drain_join_set(&mut self) {
         while let Some(result) = self.join_set.try_join_next() {
-            match result {
-                Ok(completion) => {
-                    let mut title = completion.id.clone();
-                    if let Some(handle) = self.tasks.get_mut(&completion.id) {
-                        title = handle.description.clone();
-                        if !handle.set_status_if_non_terminal(completion.status) {
-                            continue;
-                        }
-                        handle.ended_at_ms = Some(unix_epoch_millis());
-                        handle.exit_code = completion.exit_code;
-                        // Force one final asynchronous preview after process exit
-                        // so fast commands and trailing buffered output reach the
-                        // detail view without synchronous reads during rendering.
-                        handle.output_sampled_at = None;
-                        handle.terminal_reason =
-                            completion
-                                .error
-                                .clone()
-                                .or_else(|| match completion.status {
-                                    BgTaskStatus::Completed => {
-                                        completion.exit_code.map(|code| format!("exit code {code}"))
-                                    }
-                                    BgTaskStatus::Killed => Some("stopped by user".to_string()),
-                                    _ => None,
-                                });
-                    }
-                    let event = match completion.status {
-                        BgTaskStatus::Completed => BgTaskEvent::Completed {
-                            id: completion.id,
-                            title,
-                            exit_code: completion.exit_code,
-                            summary: completion.summary,
-                        },
-                        BgTaskStatus::Failed => BgTaskEvent::Failed {
-                            id: completion.id,
-                            title,
-                            error: completion.error.unwrap_or_default(),
-                        },
-                        BgTaskStatus::Killed => BgTaskEvent::Killed {
-                            id: completion.id,
-                            title,
-                        },
-                        _ => continue,
-                    };
-                    self.pending_completions.push(event);
-                }
-                Err(e) => {
-                    // Every runner is wrapped by `completion_from_runner`, so a
-                    // panic becomes a normal Failed completion with task
-                    // identity. A remaining JoinError can only come from
-                    // registry shutdown/cancellation, when no live UI owner
-                    // remains to reconcile.
-                    tracing::warn!("background shell join error: {e}");
-                }
-            }
+            self.record_join_result(result);
         }
+    }
+
+    fn record_join_result(&mut self, result: Result<TaskCompletion, tokio::task::JoinError>) {
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) => {
+                // Every runner is wrapped by `completion_from_runner`, so a
+                // panic becomes a normal Failed completion. A remaining join
+                // error is only expected after a bounded registry shutdown.
+                tracing::warn!("background shell join error: {error}");
+                return;
+            }
+        };
+        let mut title = completion.id.clone();
+        if let Some(handle) = self.tasks.get_mut(&completion.id) {
+            title = handle.description.clone();
+            if !handle.set_status_if_non_terminal(completion.status) {
+                return;
+            }
+            handle.ended_at_ms = Some(unix_epoch_millis());
+            handle.exit_code = completion.exit_code;
+            // Force one final asynchronous preview after process exit so fast
+            // commands and trailing buffered output reach the detail view.
+            handle.output_sampled_at = None;
+            handle.terminal_reason = completion
+                .error
+                .clone()
+                .or_else(|| match completion.status {
+                    BgTaskStatus::Completed => {
+                        completion.exit_code.map(|code| format!("exit code {code}"))
+                    }
+                    BgTaskStatus::Killed => Some("stopped by user".to_string()),
+                    _ => None,
+                });
+        }
+        let event = match completion.status {
+            BgTaskStatus::Completed => BgTaskEvent::Completed {
+                id: completion.id,
+                title,
+                exit_code: completion.exit_code,
+                summary: completion.summary,
+            },
+            BgTaskStatus::Failed => BgTaskEvent::Failed {
+                id: completion.id,
+                title,
+                error: completion.error.unwrap_or_default(),
+            },
+            BgTaskStatus::Killed => BgTaskEvent::Killed {
+                id: completion.id,
+                title,
+            },
+            _ => return,
+        };
+        self.pending_completions.push(event);
     }
 
     /// Bound retained terminal shell handles without hiding recent results.
@@ -737,6 +762,63 @@ impl BackgroundTaskRegistry {
             let _ = self.kill(id);
         }
         ids
+    }
+
+    /// Cancel every live shell and reconcile its terminal state before the
+    /// registry is replaced or persisted. `kill_all()` alone only requests
+    /// cancellation; dropping the registry immediately afterwards used to
+    /// lose the Killed event and persist a permanently-running stale handle.
+    pub async fn kill_all_and_wait(&mut self, timeout: Duration) -> Vec<String> {
+        let live_ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, handle)| {
+                handle.live_control.is_available() && !handle.status().is_terminal()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let requested = self.kill_all();
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.join_set.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.join_set.join_next()).await {
+                Ok(Some(result)) => self.record_join_result(result),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        if !self.join_set.is_empty() {
+            self.join_set.abort_all();
+            while let Some(result) = self.join_set.join_next().await {
+                self.record_join_result(result);
+            }
+        }
+
+        // A cancelled JoinSet future cannot return its typed completion. The
+        // child runner is kill-on-drop, so close any remaining live projection
+        // as killed instead of leaking an impossible `running`/`stopping`
+        // state into the durable workspace.
+        for id in live_ids {
+            let title = {
+                let Some(handle) = self.tasks.get_mut(&id) else {
+                    continue;
+                };
+                if handle.status().is_terminal() {
+                    continue;
+                }
+                handle.set_status(BgTaskStatus::Killed);
+                handle.ended_at_ms = Some(unix_epoch_millis());
+                handle.terminal_reason = Some("stopped during registry shutdown".to_string());
+                handle.description.clone()
+            };
+            self.pending_completions
+                .push(BgTaskEvent::Killed { id, title });
+        }
+        requested
     }
 
     /// Read output from a task's stdout file. Returns (content, total_bytes).
@@ -2460,11 +2542,9 @@ mod tests {
         assert_eq!(reg.get(&id).unwrap().status(), BgTaskStatus::Stopping);
         assert_eq!(reg.get(&id).unwrap().projected_status(), "stopping");
         assert_eq!(reg.running_count(), 1, "capacity remains owned until exit");
-        assert_eq!(
-            reg.kill(&id).unwrap_err(),
-            BackgroundTaskError::CannotStop {
-                task_id: id.clone(),
-            }
+        assert!(
+            reg.kill(&id).is_ok(),
+            "repeating an accepted cancellation should be idempotent"
         );
 
         let events =
@@ -2473,6 +2553,54 @@ mod tests {
             .iter()
             .any(|e| matches!(e, BgTaskEvent::Killed { .. }));
         assert!(has_killed);
+    }
+
+    #[tokio::test]
+    async fn initial_session_binding_preserves_live_task_and_rebinds_future_output() {
+        let original = crate::tests::test_temp_dir();
+        let rebound = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(original.path().to_path_buf());
+        let live_id = reg.spawn_shell("sleep 60", "live before session id");
+
+        reg.rebind_output_dir_for_new_tasks(rebound.path().to_path_buf());
+
+        let live = reg.get(&live_id).expect("live task survives rebind");
+        assert_eq!(live.status(), BgTaskStatus::Running);
+        assert_eq!(live.stdout_path.parent(), Some(original.path()));
+
+        let later_id = reg.spawn_shell("printf done", "started after session id");
+        assert_eq!(
+            reg.get(&later_id)
+                .and_then(|handle| handle.stdout_path.parent()),
+            Some(rebound.path())
+        );
+        wait_for_task_terminal(&mut reg, &later_id).await;
+        reg.kill_all_and_wait(Duration::from_secs(2)).await;
+        assert_eq!(
+            reg.get(&live_id).map(BackgroundTaskHandle::status),
+            Some(BgTaskStatus::Killed)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_reconciles_an_already_stopping_task() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("sleep 60", "stopping at shutdown");
+
+        reg.kill(&id).expect("initial stop request");
+        assert_eq!(reg.get(&id).unwrap().status(), BgTaskStatus::Stopping);
+        assert!(
+            reg.kill_all_and_wait(Duration::from_secs(2))
+                .await
+                .is_empty(),
+            "a stopping task should not be reported as a new stop request"
+        );
+
+        let handle = reg.get(&id).expect("terminal handle retained");
+        assert_eq!(handle.status(), BgTaskStatus::Killed);
+        assert!(handle.ended_at_ms.is_some());
+        assert_eq!(reg.export_shell_task_projections()[0].status, "killed");
     }
 
     #[tokio::test]
@@ -2635,6 +2763,38 @@ mod tests {
         assert!(xml.contains("ended_at_ms=\"1766000005000\""), "{xml}");
         let exported = reg.export_shell_task_projections();
         assert_eq!(exported[0].ended_at_ms, Some(1_766_000_005_000));
+    }
+
+    #[tokio::test]
+    async fn restored_numeric_id_advances_future_task_ids_without_overwrite() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("restored.stdout");
+        let stderr = tmp.path().join("restored.stderr");
+        std::fs::write(&stdout, "done\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().join("new-output"));
+        reg.restore_shell_task_projection(BackgroundShellTaskProjection {
+            id: "bg-shell-1000000".into(),
+            status: "completed".into(),
+            title: "restored".into(),
+            started_at_ms: unix_epoch_millis(),
+            ended_at_ms: Some(unix_epoch_millis()),
+            stdout_path: stdout.display().to_string(),
+            stderr_path: stderr.display().to_string(),
+            exit_code: Some(0),
+            terminal_reason: Some("exit code 0".into()),
+        })
+        .expect("restore projection");
+
+        let spawned_id = reg.spawn_shell("printf new", "new task");
+        let sequence = spawned_id
+            .strip_prefix("bg-shell-")
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("numeric task id");
+        assert!(sequence > 1_000_000, "spawned id: {spawned_id}");
+        assert!(reg.get("bg-shell-1000000").is_some());
+        assert!(reg.get(&spawned_id).is_some());
+        wait_for_task_terminal(&mut reg, &spawned_id).await;
     }
 
     #[test]

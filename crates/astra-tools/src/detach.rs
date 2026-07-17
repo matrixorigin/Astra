@@ -53,7 +53,7 @@ pub fn render_bash_detached_marker(task_id: &str) -> String {
         "<bash_detached>The bash command was promoted to background task {task_id}. \
          The runtime will deliver a <task_notification> when the task terminates — \
          continue with independent work or briefly tell the user it is still running. \
-         Do NOT poll this task in the same turn: do not call `task_output`, do not rerun the bash command, \
+         Do NOT poll this task in the same turn: do not call `task_output` or `task_list`, do not rerun the bash command, \
          and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
          On a later turn, if the user explicitly asks for partial progress, call `task_output` ONCE with \
          block=false; if they ask you to wait, use `task_output` with block=true. \

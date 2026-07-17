@@ -1152,7 +1152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and a next_call cursor when more observation is possible. Reuse next_offset; omitting offset restarts at byte 0 and is not a progress check. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1163,12 +1163,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for new output or terminal status before returning. Default false; set true only when the user explicitly asks to wait."
+                            "description": "Wait for output after the supplied offset or terminal status before returning. Default false; set true only when the user explicitly asks to wait, and pass the previous next_offset so already-read output does not return immediately."
                         },
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Resume reading from this byte offset. Default 0."
+                            "description": "Resume reading from this byte offset. Use the prior response's next_offset for progress. Default 0 means read from the beginning."
                         },
                         "max_bytes": {
                             "type": "integer",
@@ -1188,7 +1188,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_stop",
-                "description": "Stop a running typed background task by id. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
+                "description": "Request cancellation of a running typed background task by id. Returns structured ok/status/terminal fields; stop_requested is an accepted request and a later terminal notification closes the lifecycle. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1540,8 +1540,10 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            output_desc.contains("background task") && !output_desc.contains("job(action"),
-            "task_output description must teach typed background task vocabulary"
+            output_desc.contains("background task")
+                && output_desc.contains("next_offset")
+                && !output_desc.contains("job(action"),
+            "task_output description must teach typed background task vocabulary and incremental cursors"
         );
         let output_block_desc = find_schema(&schemas, "task_output")
             .and_then(|schema| {
@@ -1555,8 +1557,16 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            output_block_desc.contains("Default false"),
-            "task_output must default to snapshot reads unless the user asks to wait"
+            output_block_desc.contains("Default false")
+                && output_block_desc.contains("previous next_offset"),
+            "task_output must default to snapshot reads and wait after the prior cursor"
+        );
+        let stop_desc = find_schema(&schemas, "task_stop")
+            .and_then(|schema| schema["function"]["description"].as_str())
+            .unwrap_or_default();
+        assert!(
+            stop_desc.contains("ok/status/terminal") && stop_desc.contains("stop_requested"),
+            "task_stop must distinguish accepted cancellation from terminal completion"
         );
     }
 
