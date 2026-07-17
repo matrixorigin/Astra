@@ -1152,7 +1152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and a next_call cursor when more observation is possible. Reuse next_offset; omitting offset restarts at byte 0 and is not a progress check. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1163,12 +1163,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for output after the supplied offset or terminal status before returning. Default false; set true only when the user explicitly asks to wait, and pass the previous next_offset so already-read output does not return immediately."
+                            "description": "Wait inside the runtime for terminal task status, required input, or timeout. Default false. Set true once only when the user explicitly asks to wait; ordinary output growth does not wake the model."
                         },
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Resume reading from this byte offset. Use the prior response's next_offset for progress. Default 0 means read from the beginning."
+                            "description": "Explicit output cursor. For shell tasks, omit it for one current latest-tail status snapshot and set it only when the user asked to page historical output. For bounded agent results, reuse the returned next_offset to continue the semantic result."
                         },
                         "max_bytes": {
                             "type": "integer",
@@ -1558,8 +1558,9 @@ mod tests {
             .unwrap_or_default();
         assert!(
             output_block_desc.contains("Default false")
-                && output_block_desc.contains("previous next_offset"),
-            "task_output must default to snapshot reads and wait after the prior cursor"
+                && output_block_desc.contains("terminal task status")
+                && output_block_desc.contains("ordinary output growth does not wake the model"),
+            "task_output must keep terminal waiting inside the runtime"
         );
         let stop_desc = find_schema(&schemas, "task_stop")
             .and_then(|schema| schema["function"]["description"].as_str())

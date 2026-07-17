@@ -981,6 +981,8 @@ fn append_interruption_detail(
 fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     state.stall.same_turn_detached_task_ids.clear();
     state.stall.same_turn_detached_poll_attempts = 0;
+    state.stall.observed_background_task_snapshots.clear();
+    state.stall.repeated_background_task_snapshot_attempts = 0;
     state.stall.execution_escalation_advisory_emitted = false;
     state.stall.parallel_batching_advisory_emitted = false;
     state.stall.repetition_advisory_emitted = false;

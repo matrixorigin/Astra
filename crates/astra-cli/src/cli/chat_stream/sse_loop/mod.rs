@@ -818,6 +818,8 @@ pub(crate) async fn stream_chat_sse(
         stall: StallTrackingState {
             same_turn_detached_task_ids: Default::default(),
             same_turn_detached_poll_attempts: 0,
+            observed_background_task_snapshots: Default::default(),
+            repeated_background_task_snapshot_attempts: 0,
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),

@@ -1080,6 +1080,14 @@ pub struct StallTrackingState {
     /// short running acknowledgement; a second attempt closes the loop with
     /// a runtime-owned acknowledgement instead of burning dozens of rounds.
     pub same_turn_detached_poll_attempts: u32,
+    /// Shell background tasks already observed through a current `task_output`
+    /// snapshot or runtime-owned wait in this turn. These are status
+    /// observations, not requests to page through the task's full log.
+    pub observed_background_task_snapshots: BTreeSet<String>,
+    /// Repeated attempts to page a task after a current snapshot was already
+    /// returned. The first attempt is corrected; the second closes the
+    /// wasteful model loop while leaving the task itself running.
+    pub repeated_background_task_snapshot_attempts: u32,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<String>>,
     /// Per-turn tool name sets.
@@ -3916,6 +3924,31 @@ pub(crate) mod tests {
         }
     }
 
+    fn make_shell_task_output_observation(
+        task_id: &str,
+        mode: &str,
+        output: &str,
+    ) -> EdgeToolExecResult {
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert(
+            "background_task_observation".to_string(),
+            json!({
+                "task_id": task_id,
+                "task_kind": "shell",
+                "status": "running",
+                "terminal": false,
+                "mode": mode,
+            }),
+        );
+        let mut result = make_edge_tool_with_args(
+            "task_output",
+            json!({"task_id": task_id, "block": mode == "wait"}),
+            output,
+        );
+        result.tool_result_fields = Some(fields);
+        result
+    }
+
     // ── State builder ───────────────────────────────────────────────────────
 
     pub(crate) fn make_state() -> AgenticLoopState {
@@ -5554,6 +5587,117 @@ pub(crate) mod tests {
         );
         assert!(
             state.final_text.contains("surfaced automatically"),
+            "{}",
+            state.final_text
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn current_background_snapshot_blocks_same_turn_log_chasing() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "opaque current shell snapshot",
+                )],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({"task_id": "bg-shell-1", "offset": 4096, "block": false}),
+                    "should not run",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("The task is still running.", 10, 5, None),
+        ])
+        .with_valid_tools(&["task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(host.turn_count(), 3);
+        assert_eq!(state.total_tool_calls, 2);
+        assert!(
+            state.messages.iter().any(|message| {
+                let message = message.to_string();
+                message.contains("already has a current status snapshot")
+                    && message.contains("Do not page historical output")
+            }),
+            "a cursor follow-up after a current snapshot must be intercepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_background_snapshot_pagination_is_runtime_bounded() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "opaque current shell snapshot",
+                )],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({"task_id": "bg-shell-1", "offset": 4096}),
+                    "should not run",
+                )],
+                10,
+                5,
+                None,
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "task_output",
+                    json!({"task_id": "bg-shell-1", "offset": 8192}),
+                    "should not run",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("unreachable model response", 10, 5, None),
+        ])
+        .with_valid_tools(&["task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "a second attempt to chase a running snapshot must close the loop"
+        );
+        assert_eq!(state.total_tool_calls, 3);
+        assert!(
+            state.final_text.contains("bg-shell-1"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("already has a current status snapshot"),
             "{}",
             state.final_text
         );

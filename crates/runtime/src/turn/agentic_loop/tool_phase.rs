@@ -125,6 +125,32 @@ fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<S
         .map(ToString::to_string)
 }
 
+fn current_shell_background_task_observation_id(
+    result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
+) -> Option<String> {
+    let tool_name = astra_turn_core::tool_allowlist::normalize_tool_name(&result.tool)?;
+    if tool_name != "task_output" {
+        return None;
+    }
+    let observation = result
+        .tool_result_fields
+        .as_ref()?
+        .get("background_task_observation")?
+        .as_object()?;
+    let mode = observation.get("mode").and_then(Value::as_str)?;
+    if observation.get("task_kind").and_then(Value::as_str)? != "shell"
+        || !matches!(mode, "current" | "wait")
+    {
+        return None;
+    }
+    observation
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())
+        .map(ToString::to_string)
+}
+
 fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
     matches!(tool_name, "agent" | "agent_fanout")
 }
@@ -1600,6 +1626,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     if let Some(task_id) = detached_background_task_id(&edge_tool_round, &new_tool_results) {
         state.stall.same_turn_detached_task_ids.insert(task_id);
     }
+    for result in &edge_tool_round {
+        if let Some(task_id) = current_shell_background_task_observation_id(result) {
+            state
+                .stall
+                .observed_background_task_snapshots
+                .insert(task_id);
+        }
+    }
 
     let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
 
@@ -1701,6 +1735,28 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             task_ids,
             attempts = state.stall.same_turn_detached_poll_attempts,
             "closing repeated same-turn background polling with a runtime acknowledgement"
+        );
+        state.step_recorder.end_turn(false);
+        finalize_and_render(host, state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
+
+    if state.stall.repeated_background_task_snapshot_attempts >= 2 {
+        let task_ids = state
+            .stall
+            .observed_background_task_snapshots
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.final_text = format!(
+            "Background task {task_ids} already has a current status snapshot in this turn. No further live-log polling will run; answer from the observed status and output."
+        );
+        tracing::info!(
+            target: "astra::loop_guard",
+            task_ids,
+            attempts = state.stall.repeated_background_task_snapshot_attempts,
+            "closing repeated background snapshot pagination with a runtime acknowledgement"
         );
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;

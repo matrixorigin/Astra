@@ -195,6 +195,29 @@ fn intercept_disallowed_tool_calls(
     (blocked, remaining)
 }
 
+fn task_output_target(tool_call: &Value) -> Option<String> {
+    let tool_name = tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .and_then(astra_turn_core::tool_allowlist::normalize_tool_name)?;
+    if tool_name != "task_output" {
+        return None;
+    }
+    let arguments = tool_call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())?;
+    let task_id = arguments
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())?
+        .to_string();
+    Some(task_id)
+}
+
 fn intercept_same_turn_detached_task_poll(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
@@ -215,18 +238,7 @@ fn intercept_same_turn_detached_task_poll(
             .and_then(Value::as_str);
         let tool_name =
             raw_tool_name.and_then(astra_turn_core::tool_allowlist::normalize_tool_name);
-        let target_task_id = tool_call
-            .get("function")
-            .and_then(|function| function.get("arguments"))
-            .and_then(Value::as_str)
-            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-            .and_then(|arguments| {
-                arguments
-                    .get("task_id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .map(ToString::to_string)
-            });
+        let target_task_id = task_output_target(tool_call);
         let targets_detached_task = match tool_name.as_deref() {
             Some("task_output") => target_task_id
                 .as_ref()
@@ -278,6 +290,59 @@ fn intercept_same_turn_detached_task_poll(
     (blocked, remaining)
 }
 
+fn intercept_repeated_background_task_snapshot(
+    state: &mut AgenticLoopState,
+    tool_calls: &[Value],
+) -> (
+    Vec<crate::turn::skill_tool::InterceptedToolResult>,
+    Vec<Value>,
+) {
+    if state.stall.observed_background_task_snapshots.is_empty() {
+        return (Vec::new(), tool_calls.to_vec());
+    }
+
+    let mut blocked = Vec::new();
+    let mut remaining = Vec::new();
+    for tool_call in tool_calls {
+        let Some(task_id) = task_output_target(tool_call) else {
+            remaining.push(tool_call.clone());
+            continue;
+        };
+        if !state
+            .stall
+            .observed_background_task_snapshots
+            .contains(&task_id)
+        {
+            remaining.push(tool_call.clone());
+            continue;
+        }
+
+        let tool_call_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        state.stall.repeated_background_task_snapshot_attempts = state
+            .stall
+            .repeated_background_task_snapshot_attempts
+            .saturating_add(1);
+        blocked.push(crate::turn::skill_tool::InterceptedToolResult {
+            tool_call_id,
+            tool_name: "task_output".to_string(),
+            ok: false,
+            result_class: Some(
+                astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+            ),
+            result: format!(
+                "OBSERVED: Background task {task_id} already has a current status snapshot in this turn. Do not page historical output to chase live progress. Answer from the status and output already returned. If the task is non-terminal, completion will be delivered automatically. On a later user turn, omit offset for one fresh tail snapshot; use block=true once when the user explicitly asks to wait for terminal completion."
+            ),
+        });
+    }
+
+    (blocked, remaining)
+}
+
 pub(crate) async fn prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
@@ -290,8 +355,11 @@ pub(crate) async fn prepare_intercepted_tool_round(
             .into_owned();
     let (mut blocked_tool_results, post_detach_tool_calls) =
         intercept_same_turn_detached_task_poll(state, &tool_calls);
+    let (repeated_snapshot_results, post_snapshot_tool_calls) =
+        intercept_repeated_background_task_snapshot(state, &post_detach_tool_calls);
+    blocked_tool_results.extend(repeated_snapshot_results);
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
-        intercept_disallowed_tool_calls(state, &post_detach_tool_calls);
+        intercept_disallowed_tool_calls(state, &post_snapshot_tool_calls);
     blocked_tool_results.extend(allowlist_blocked_tool_results);
     let (mut pre_resolved_results, post_send_tool_calls, communication_events) =
         intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;

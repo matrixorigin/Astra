@@ -56,7 +56,9 @@ pub fn render_bash_detached_marker(task_id: &str) -> String {
          Do NOT poll this task in the same turn: do not call `task_output` or `task_list`, do not rerun the bash command, \
          and do not read the on-disk output files via bash (tail/cat/head/less are denied). \
          On a later turn, if the user explicitly asks for partial progress, call `task_output` ONCE with \
-         block=false; if they ask you to wait, use `task_output` with block=true. \
+         block=false and omit offset for the latest tail; do not follow its cursor in the same turn. \
+         If they ask you to wait, call `task_output` ONCE with block=true and omit offset so the runtime \
+         owns the wait until terminal status, required input, or timeout. \
          Use `task_stop` only when the user wants the task cancelled.\
          </bash_detached>"
     )
