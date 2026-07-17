@@ -1118,10 +1118,10 @@ fn write_diff_artifact(
     let stem = format!("cache-break-{:010}-{:04}", curr.timestamp_secs, seq);
     let path = dir.join(format!("{stem}.json"));
     let patch_path = dir.join(format!("{stem}.patch"));
-    let _ = std::fs::write(
+    write_diff_artifact_file(
         &patch_path,
-        render_unified_snapshot_patch(prev, curr, event).into_bytes(),
-    );
+        render_unified_snapshot_patch(prev, curr, event).as_bytes(),
+    )?;
     let snapshot_summary = |s: Option<&PromptStateSnapshot>| {
         s.map(|s| {
             serde_json::json!({
@@ -1145,11 +1145,25 @@ fn write_diff_artifact(
         "event": event,
         "patch_path": patch_path,
     });
-    std::fs::write(
+    write_diff_artifact_file(
         &path,
-        serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
+        &serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
     )?;
     Ok(path)
+}
+
+fn write_diff_artifact_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("artifact");
+    let temporary_path = path.with_extension(format!("{extension}.tmp"));
+    std::fs::write(&temporary_path, bytes)?;
+    if let Err(error) = std::fs::rename(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn spawn_diff_artifact_write(
@@ -1852,22 +1866,25 @@ mod tests {
     }
 
     fn wait_for_artifacts(dir: &std::path::Path, expected: usize) -> Vec<std::path::PathBuf> {
-        for _ in 0..50 {
-            let files: Vec<_> = std::fs::read_dir(dir)
+        let completed_artifacts = || {
+            std::fs::read_dir(dir)
                 .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .collect();
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.extension()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .is_some_and(|extension| matches!(extension, "json" | "patch"))
+                })
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..50 {
+            let files = completed_artifacts();
             if files.len() >= expected {
                 return files;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect()
+        completed_artifacts()
     }
 
     #[test]
