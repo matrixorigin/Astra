@@ -324,20 +324,22 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     Ok(affected)
 }
 
-/// Clean up stale idempotency rows where task creation succeeded but
-/// `complete_todo_create_idempotency` never ran (e.g. DB connection dropped
-/// mid-response).  Instead of deleting rows (which would allow a retry to
-/// create a duplicate task), we set `output` to a clear error message so
-/// the client receives an explicit failure on replay and the poisoned key
-/// cannot create a duplicate.
+/// Close stale idempotency admissions whose commit outcome cannot be proven.
+/// Instead of deleting rows (which could allow a duplicate create) or writing
+/// presentation text (which would become a hidden protocol), persist a typed
+/// `indeterminate` outcome. The client can then reconcile from the task board
+/// without mistaking uncertainty for a confirmed failure.
 ///
 /// This is defense-in-depth.  The primary fix makes idempotency completion
 /// non-blocking in the HTTP handler (see session_todo_handlers.rs); this
 /// sweeper handles the rare case where the response never reached the
 /// client AND the idempotency row was left behind.
 pub(crate) async fn run_stale_idempotency_sweep(pool: SharedPool) -> Result<u64, String> {
-    const ERROR_MSG: &str = "Error: task creation was interrupted — idempotency record expired without completion. \
-         Please retry with a new idempotency key.";
+    let outcome = astra_tools::task_mgmt::TaskMutationOutcome::indeterminate(
+        "task creation was interrupted and its commit outcome could not be confirmed; inspect the task board before deciding whether to retry",
+    );
+    let encoded_outcome = serde_json::to_string(&outcome)
+        .map_err(|e| format!("encode stale idempotency outcome: {e}"))?;
 
     let mut affected: u64 = 0;
     loop {
@@ -348,7 +350,7 @@ pub(crate) async fn run_stale_idempotency_sweep(pool: SharedPool) -> Result<u64,
                AND updated_at < NOW(6) - INTERVAL ? MINUTE \
              LIMIT ?",
         )
-        .bind(ERROR_MSG)
+        .bind(&encoded_outcome)
         .bind(IDEMPOTENCY_STALE_MINUTES as i64)
         .bind(IDEMPOTENCY_BATCH_LIMIT)
         .execute(pool.get())

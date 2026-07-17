@@ -9,6 +9,27 @@ use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::session::session_projection::history_as_messages;
 use crate::cli::session::session_state::SessionState;
 
+#[derive(Debug)]
+pub(crate) struct RecoverySnapshotSyncError {
+    pub(crate) message: String,
+    pub(crate) rollback_failed: bool,
+}
+
+impl std::fmt::Display for RecoverySnapshotSyncError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<String> for RecoverySnapshotSyncError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            rollback_failed: false,
+        }
+    }
+}
+
 fn recovery_user_id(state: &SessionState) -> String {
     state
         .ingestion_user_id
@@ -322,7 +343,7 @@ pub(crate) fn rollback_recovery_checkpoint(
 /// continuation sees the same context the user just saw.
 pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     state: &mut SessionState,
-) -> Result<(), String> {
+) -> Result<(), RecoverySnapshotSyncError> {
     let Some(sid) = state.session_id.clone().filter(|sid| !sid.is_empty()) else {
         return Ok(());
     };
@@ -348,31 +369,40 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     )?;
     if let Err(error) = persist_recovery_workspace_snapshot(state, &sid) {
         let mut error_message = error;
-        append_rollback_error(
-            &mut error_message,
-            "workspace",
-            restore_optional_file_bytes(&workspace_path, workspace_backup.clone()),
-        );
+        let workspace_rollback =
+            restore_optional_file_bytes(&workspace_path, workspace_backup.clone());
+        let workspace_rollback_failed = workspace_rollback.is_err();
+        append_rollback_error(&mut error_message, "workspace", workspace_rollback);
+        let checkpoint_rollback =
+            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback);
+        let checkpoint_rollback_failed = checkpoint_rollback.is_err();
         append_rollback_error(
             &mut error_message,
             "recovery checkpoint",
-            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback),
+            checkpoint_rollback,
         );
-        return Err(error_message);
+        return Err(RecoverySnapshotSyncError {
+            message: error_message,
+            rollback_failed: workspace_rollback_failed || checkpoint_rollback_failed,
+        });
     }
     if let Err(error) = rebuild_csl_from_history(state, &sid, &messages, &session_state).await {
         let mut error_message = error;
-        append_rollback_error(
-            &mut error_message,
-            "workspace",
-            restore_optional_file_bytes(&workspace_path, workspace_backup),
-        );
+        let workspace_rollback = restore_optional_file_bytes(&workspace_path, workspace_backup);
+        let workspace_rollback_failed = workspace_rollback.is_err();
+        append_rollback_error(&mut error_message, "workspace", workspace_rollback);
+        let checkpoint_rollback =
+            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback);
+        let checkpoint_rollback_failed = checkpoint_rollback.is_err();
         append_rollback_error(
             &mut error_message,
             "recovery checkpoint",
-            rollback_recovery_checkpoint(&user_id, &sid, &checkpoint_rollback),
+            checkpoint_rollback,
         );
-        return Err(error_message);
+        return Err(RecoverySnapshotSyncError {
+            message: error_message,
+            rollback_failed: workspace_rollback_failed || checkpoint_rollback_failed,
+        });
     }
 
     Ok(())

@@ -205,7 +205,7 @@ mod tests {
             &self,
             session_id: &str,
             _mutation: TaskMutation,
-        ) -> Result<String, String> {
+        ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
             Err(format!("forced task mutate failure for {session_id}"))
         }
 

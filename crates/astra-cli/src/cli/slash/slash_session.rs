@@ -5365,10 +5365,17 @@ pub(crate) async fn fork_session_into_state(
         cloud_task_board_copy,
     )
     .await?;
-    crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
-        fork_guard.state(),
-    )
-    .await?;
+    if let Err(error) =
+        crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
+            fork_guard.state(),
+        )
+        .await
+    {
+        if error.rollback_failed {
+            fork_guard.state().session_persistence_error = Some(error.message.clone());
+        }
+        return Err(error.message);
+    }
     persist_profile_last_session_or_warn(
         profile,
         &new_session_id,
@@ -6280,7 +6287,7 @@ mod resume_tests {
             &self,
             session_id: &str,
             _mutation: TaskMutation,
-        ) -> Result<String, String> {
+        ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
             Err(format!("forced mutate failure for {session_id}"))
         }
 

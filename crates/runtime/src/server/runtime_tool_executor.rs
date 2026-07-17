@@ -6590,11 +6590,11 @@ esac
                 &self,
                 _session_id: &str,
                 mutation: astra_tools::task_mgmt::TaskMutation,
-            ) -> Result<String, String> {
+            ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
                 self.mutate_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let result = mutation(Vec::new(), 1)?;
-                Ok(result.response)
+                Ok(result.outcome)
             }
 
             async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
@@ -11261,11 +11261,11 @@ esac
                 &self,
                 _session_id: &str,
                 mutation: astra_tools::task_mgmt::TaskMutation,
-            ) -> Result<String, String> {
+            ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
                 self.mutate_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let result = mutation(Vec::new(), 1)?;
-                Ok(result.response)
+                Ok(result.outcome)
             }
 
             async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {

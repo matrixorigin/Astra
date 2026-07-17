@@ -9,27 +9,6 @@ use super::tool_execution_result::tool_result_from_output;
 use crate::server::runtime_tool_executor::RuntimeToolExecutor;
 use crate::server::tool_session_state_rollback::{self, SessionStateRollbackAction};
 
-fn find_json_body_start(output: &str) -> Option<usize> {
-    if output.starts_with('{') {
-        return Some(0);
-    }
-    output.find("\n{").map(|pos| pos + 1)
-}
-
-pub(crate) fn task_output_success(output: &str) -> bool {
-    if output.starts_with("Error:") {
-        return false;
-    }
-    if let Some(pos) = find_json_body_start(output) {
-        if let Ok(value) = serde_json::from_str::<Value>(&output[pos..]) {
-            if let Some(false) = value.get("success").and_then(Value::as_bool) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 pub(crate) fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
     task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
 }
@@ -99,19 +78,22 @@ impl TaskMutationKind {
 pub(crate) struct TaskMutationRollback {
     pub(crate) snapshot: TaskManagerSnapshot,
     pub(crate) label: String,
-    pub(crate) event_reason: &'static str,
 }
 
 #[derive(Debug)]
-pub(crate) struct TaskMutationOutcome {
+pub(crate) struct TaskMutationExecution {
     pub(crate) output: String,
     pub(crate) rollback: Option<TaskMutationRollback>,
+    /// Present exactly when the mutation durably changed the board. This is
+    /// independent of whether an optional rollback snapshot could be sealed.
+    pub(crate) event_reason: Option<&'static str>,
 }
 
 #[derive(Debug)]
 pub(crate) struct TaskToolOutcome {
     pub(crate) result: astra_tools::ToolResult,
     pub(crate) rollback: Option<TaskMutationRollback>,
+    pub(crate) event_reason: Option<&'static str>,
 }
 
 pub(crate) fn public_task_arguments(args: &Value) -> Value {
@@ -177,27 +159,29 @@ pub(crate) async fn execute_task_mutation(
     task_manager: &TaskManager,
     args: &Value,
     kind: TaskMutationKind,
-) -> TaskMutationOutcome {
+) -> TaskMutationExecution {
     let mut snapshot = match task_manager.try_snapshot_state().await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return TaskMutationOutcome {
+            return TaskMutationExecution {
                 output: format!("Error: failed to capture task rollback snapshot: {error}"),
                 rollback: None,
+                event_reason: None,
             };
         }
     };
     let task_args = public_task_arguments(args);
-    let output = match kind {
-        TaskMutationKind::Create => task_manager.create(&task_args).await,
-        TaskMutationKind::Update => task_manager.update(&task_args).await,
-        TaskMutationKind::Stop => task_manager.stop(&task_args).await,
-        TaskMutationKind::Archive => task_manager.archive(&task_args).await,
+    let mutation = match kind {
+        TaskMutationKind::Create => task_manager.create_outcome(&task_args).await,
+        TaskMutationKind::Update => task_manager.update_outcome(&task_args).await,
+        TaskMutationKind::Stop => task_manager.stop_outcome(&task_args).await,
+        TaskMutationKind::Archive => task_manager.archive_outcome(&task_args).await,
     };
-    if !task_output_success(&output) {
-        return TaskMutationOutcome {
-            output,
+    if !mutation.status.changed() {
+        return TaskMutationExecution {
+            output: mutation.output,
             rollback: None,
+            event_reason: None,
         };
     }
     if let Err(error) = task_manager.seal_snapshot_for_restore(&mut snapshot).await {
@@ -210,25 +194,26 @@ pub(crate) async fn execute_task_mutation(
             mutation = ?kind,
             "task mutation succeeded but rollback snapshot seal failed — skipping rollback"
         );
-        return TaskMutationOutcome {
-            output,
+        return TaskMutationExecution {
+            output: mutation.output,
             rollback: None,
+            event_reason: Some(kind.event_reason()),
         };
     }
-    TaskMutationOutcome {
+    TaskMutationExecution {
         rollback: Some(TaskMutationRollback {
             snapshot,
             label: kind.rollback_label(&task_args),
-            event_reason: kind.event_reason(),
         }),
-        output,
+        output: mutation.output,
+        event_reason: Some(kind.event_reason()),
     }
 }
 
 pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) -> TaskToolOutcome {
     let action = match task_tool_contract::task_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return task_tool_result(format!("Error: {error}"), None),
+        Err(error) => return task_tool_result(format!("Error: {error}"), None, None),
     };
 
     match action {
@@ -243,8 +228,8 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         "stop" => execute_validated_task_mutation(task_manager, args, TaskMutationKind::Stop).await,
         "list_user" => execute_validated_task_read(task_manager, args, "list_user").await,
         "adopt" => match validate_task_tool_args_for_action("adopt", args) {
-            Ok(()) => task_tool_result(task_adopt_requires_http_endpoint_result(), None),
-            Err(error) => task_tool_result(format!("Error: {error}"), None),
+            Ok(()) => task_tool_result(task_adopt_requires_http_endpoint_result(), None, None),
+            Err(error) => task_tool_result(format!("Error: {error}"), None, None),
         },
         "archive" => {
             execute_validated_task_mutation(task_manager, args, TaskMutationKind::Archive).await
@@ -254,6 +239,7 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
                 "Error: {}",
                 task_tool_contract::task_unknown_action_message(other)
             ),
+            None,
             None,
         ),
     }
@@ -273,9 +259,9 @@ async fn execute_validated_task_mutation(
     match validate_task_tool_args_for_action(action, args) {
         Ok(()) => {
             let outcome = execute_task_mutation(task_manager, args, kind).await;
-            task_tool_result(outcome.output, outcome.rollback)
+            task_tool_result(outcome.output, outcome.rollback, outcome.event_reason)
         }
-        Err(error) => task_tool_result(format!("Error: {error}"), None),
+        Err(error) => task_tool_result(format!("Error: {error}"), None, None),
     }
 }
 
@@ -292,16 +278,21 @@ async fn execute_validated_task_read(
                 "list_user" => task_list_user(task_manager, args).await,
                 _ => unreachable!("validated task read action must be known"),
             };
-            task_tool_result(output, None)
+            task_tool_result(output, None, None)
         }
-        Err(error) => task_tool_result(format!("Error: {error}"), None),
+        Err(error) => task_tool_result(format!("Error: {error}"), None, None),
     }
 }
 
-fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> TaskToolOutcome {
+fn task_tool_result(
+    output: String,
+    rollback: Option<TaskMutationRollback>,
+    event_reason: Option<&'static str>,
+) -> TaskToolOutcome {
     TaskToolOutcome {
         result: tool_result_from_output(output),
         rollback,
+        event_reason,
     }
 }
 
@@ -323,8 +314,10 @@ pub(super) async fn execute_with_executor(
                 snapshot: rollback.snapshot,
             },
         );
+    }
+    if let Some(event_reason) = outcome.event_reason {
         executor
-            .emit_task_board_snapshot(rollback.event_reason, run_id, args)
+            .emit_task_board_snapshot(event_reason, run_id, args)
             .await;
     }
     outcome.result
@@ -332,39 +325,62 @@ pub(super) async fn execute_with_executor(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager};
+    use astra_tools::task_mgmt::{
+        InMemoryTaskStore, SessionTask, TaskManager, TaskMutation, TaskMutationOutcome, TaskStore,
+    };
     use serde_json::json;
 
     use super::*;
 
-    #[test]
-    fn task_output_success_treats_plain_summary_as_success() {
-        assert!(task_output_success("Created task #5: build PR"));
+    struct SealConflictStore {
+        inner: InMemoryTaskStore,
+        version_reads: AtomicUsize,
     }
 
-    #[test]
-    fn task_output_success_accepts_summary_plus_json_body() {
-        let out = "Created task #5\n{\"success\": true, \"id\": 5}";
-        assert!(task_output_success(out));
+    impl SealConflictStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryTaskStore::new(),
+                version_reads: AtomicUsize::new(0),
+            }
+        }
     }
 
-    #[test]
-    fn task_output_success_rejects_error_prefix() {
-        assert!(!task_output_success("Error: title is required"));
-    }
+    #[async_trait::async_trait]
+    impl TaskStore for SealConflictStore {
+        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+            self.inner.load(session_id).await
+        }
 
-    #[test]
-    fn task_output_success_rejects_explicit_success_false() {
-        let out = "Failed to create\n{\"success\": false, \"reason\": \"dup\"}";
-        assert!(!task_output_success(out));
-    }
+        async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
+            self.inner.save(session_id, tasks).await
+        }
 
-    #[test]
-    fn task_output_success_accepts_unparseable_json_body() {
-        let out = "Created task #5\n{not actually json";
-        assert!(task_output_success(out));
+        async fn mutate(
+            &self,
+            session_id: &str,
+            mutation: TaskMutation,
+        ) -> Result<TaskMutationOutcome, String> {
+            self.inner.mutate(session_id, mutation).await
+        }
+
+        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            self.inner.next_task_id(session_id).await
+        }
+
+        async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
+            self.inner.peek_next_task_id(session_id).await
+        }
+
+        async fn get_session_version(&self, _session_id: &str) -> Result<u64, String> {
+            let read = self.version_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(if read < 2 { 0 } else { 2 })
+        }
     }
 
     #[test]
@@ -486,11 +502,11 @@ mod tests {
 
         assert!(outcome.output.contains("created"), "{outcome:?}");
         assert!(outcome.output.contains("\"success\":true"), "{outcome:?}");
+        assert_eq!(outcome.event_reason, Some("task_board.create"));
         let rollback = outcome
             .rollback
             .expect("successful mutation should produce rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task_board.create");
     }
 
     #[tokio::test]
@@ -508,6 +524,31 @@ mod tests {
         assert!(
             outcome.rollback.is_none(),
             "failed mutation output must not snapshot rollback"
+        );
+        assert_eq!(outcome.event_reason, None);
+    }
+
+    #[tokio::test]
+    async fn successful_mutation_remains_observable_when_rollback_seal_conflicts() {
+        let store = Arc::new(SealConflictStore::new());
+        let manager = TaskManager::new("task-mutation-seal-conflict", store.clone());
+
+        let outcome = execute_task_mutation(
+            &manager,
+            &json!({"action": "create", "title": "ship"}),
+            TaskMutationKind::Create,
+        )
+        .await;
+
+        assert!(outcome.rollback.is_none(), "{outcome:?}");
+        assert_eq!(outcome.event_reason, Some("task_board.create"));
+        assert_eq!(
+            store
+                .load("task-mutation-seal-conflict")
+                .await
+                .expect("persisted task")
+                .len(),
+            1
         );
     }
 
@@ -567,8 +608,8 @@ mod tests {
 
         assert!(!outcome.result.is_error, "{outcome:?}");
         assert!(outcome.result.output.contains("\"success\":true"));
+        assert_eq!(outcome.event_reason, Some("task_board.create"));
         let rollback = outcome.rollback.expect("successful create rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task_board.create");
     }
 }

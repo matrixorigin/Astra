@@ -1244,6 +1244,11 @@ fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> 
     Ok(Some(id.to_string()))
 }
 
+struct RoutedTaskAction {
+    output: String,
+    mutation: Option<crate::cli::session::session_todo_client::TodoMutationResult>,
+}
+
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -2761,29 +2766,6 @@ impl ToolExecutor {
         astra_tools::task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
     }
 
-    fn task_output_json(output: &str) -> Option<Value> {
-        if output.starts_with("Error:") {
-            return None;
-        }
-        // task_mgmt now prefixes success responses with a human-readable
-        // summary line followed by the JSON body (see `prefix_summary`).
-        // Strip up to the first `{` so JSON parsing still works for
-        // the old-format (pure JSON) and new-format (summary + JSON)
-        // responses. Pre-prefix responses still work — `find('{')` on
-        // a pure-JSON string returns 0 and we parse the whole string.
-        let json_body = {
-            let pos = output.find('{')?;
-            &output[pos..]
-        };
-        serde_json::from_str::<Value>(json_body).ok()
-    }
-
-    fn task_output_success(output: &str) -> bool {
-        Self::task_output_json(output)
-            .and_then(|value| value.get("success").and_then(Value::as_bool))
-            .unwrap_or(false)
-    }
-
     fn task_action_mutates_board(action: &str) -> bool {
         matches!(action, "create" | "update" | "stop" | "adopt" | "archive")
     }
@@ -2794,6 +2776,7 @@ impl ToolExecutor {
         }
         match action {
             "create" => "task_created",
+            "adopt" => "task_adopted",
             "stop" => "task_cancelled",
             "archive" => "task_archived",
             "update" => match payload.get("status").and_then(Value::as_str) {
@@ -2831,7 +2814,7 @@ impl ToolExecutor {
             detail.insert("previous_status".to_string(), value);
         }
         let final_status = payload.get("status").cloned().or_else(|| match action {
-            "create" => Some(json!("pending")),
+            "create" | "adopt" => Some(json!("pending")),
             "stop" => Some(json!("cancelled")),
             _ => None,
         });
@@ -2854,19 +2837,13 @@ impl ToolExecutor {
         Value::Object(detail)
     }
 
-    fn record_task_lifecycle_event(&self, action: &str, args: &Value, output: &str) {
+    fn record_task_lifecycle_event(&self, action: &str, args: &Value, payload: &Value) {
         let Some(session_id) = self
             .active_session_id()
             .filter(|sid| !sid.trim().is_empty())
         else {
             return;
         };
-        let Some(payload) = Self::task_output_json(output) else {
-            return;
-        };
-        if payload.get("success").and_then(Value::as_bool) != Some(true) {
-            return;
-        }
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2875,8 +2852,8 @@ impl ToolExecutor {
             &astra_services::session_journal::JournalEvent::task_lifecycle(
                 Some(&session_id),
                 turn,
-                Self::task_lifecycle_summary(action, &payload),
-                Some(Self::task_lifecycle_detail(action, args, &payload)),
+                Self::task_lifecycle_summary(action, payload),
+                Some(Self::task_lifecycle_detail(action, args, payload)),
             ),
             "edge_tools:record_task_lifecycle_event",
         );
@@ -2889,14 +2866,14 @@ impl ToolExecutor {
     /// so the server is the single source of truth — CLI never
     /// touches MO directly. Falls back to the in-memory manager only
     /// when no cloud is wired (one-shot CLI, headless tests).
-    async fn route_task_action(&self, action: &str, args: &Value) -> Option<String> {
+    async fn route_task_action(&self, action: &str, args: &Value) -> Option<RoutedTaskAction> {
         let cloud_base = self.cloud_base.clone()?;
         let session_id = self.active_session_id()?;
         if session_id.is_empty() {
             return None;
         }
         let token = self.cloud_token();
-        match crate::cli::session::session_todo_client::execute_todo_action(
+        match crate::cli::session::session_todo_client::execute_todo_action_typed(
             &cloud_base,
             token.as_deref(),
             &session_id,
@@ -2905,16 +2882,25 @@ impl ToolExecutor {
         )
         .await
         {
-            Ok(output) => {
+            Ok(response) => {
                 if Self::task_action_mutates_board(action)
-                    && Self::task_output_success(&output)
+                    && response
+                        .mutation
+                        .as_ref()
+                        .is_some_and(|mutation| mutation.status.changed())
                     && let Some(tx) = &self.task_notify_tx
                 {
                     let _ = tx.send(session_id);
                 }
-                Some(output)
+                Some(RoutedTaskAction {
+                    output: response.output,
+                    mutation: response.mutation,
+                })
             }
-            Err(err) => Some(format!("Error: cloud todo {action} failed: {err}")),
+            Err(err) => Some(RoutedTaskAction {
+                output: format!("Error: cloud todo {action} failed: {err}"),
+                mutation: None,
+            }),
         }
     }
 
@@ -3284,9 +3270,15 @@ impl ToolExecutor {
     }
 
     async fn task_action_create(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("create", args).await {
-            self.record_task_lifecycle_event("create", args, &output);
-            return output;
+        if let Some(routed) = self.route_task_action("create", args).await {
+            if let Some(mutation) = routed
+                .mutation
+                .as_ref()
+                .filter(|mutation| mutation.status.changed())
+            {
+                self.record_task_lifecycle_event("create", args, &mutation.data);
+            }
+            return routed.output;
         }
         let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
@@ -3295,14 +3287,20 @@ impl ToolExecutor {
             }
         };
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let output = self.task_manager.create(&public_args).await;
-        if Self::task_output_success(&output) {
+        let outcome = self.task_manager.create_outcome(&public_args).await;
+        if outcome.status.changed() {
+            self.record_task_lifecycle_event("create", &public_args, &outcome.data);
             if let Err(error) = self
                 .task_manager
                 .seal_snapshot_for_restore(&mut snapshot)
                 .await
             {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
+                tracing::warn!(
+                    target: "astra_cli::task",
+                    %error,
+                    "task create succeeded but rollback snapshot seal failed"
+                );
+                return outcome.output;
             }
             self.record_task_state_rollback(
                 snapshot,
@@ -3314,9 +3312,8 @@ impl ToolExecutor {
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("create", &public_args, &output);
         }
-        output
+        outcome.output
     }
 
     async fn execute_task_tool_args(&self, args: &Value) -> String {
@@ -3368,23 +3365,29 @@ impl ToolExecutor {
     }
 
     async fn task_list(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("list", args).await {
-            return output;
+        if let Some(routed) = self.route_task_action("list", args).await {
+            return routed.output;
         }
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
         self.task_manager.list(&public_args).await
     }
     async fn task_get(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("get", args).await {
-            return output;
+        if let Some(routed) = self.route_task_action("get", args).await {
+            return routed.output;
         }
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
         self.task_manager.get(&public_args).await
     }
     async fn task_action_update(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("update", args).await {
-            self.record_task_lifecycle_event("update", args, &output);
-            return output;
+        if let Some(routed) = self.route_task_action("update", args).await {
+            if let Some(mutation) = routed
+                .mutation
+                .as_ref()
+                .filter(|mutation| mutation.status.changed())
+            {
+                self.record_task_lifecycle_event("update", args, &mutation.data);
+            }
+            return routed.output;
         }
         let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
@@ -3393,14 +3396,20 @@ impl ToolExecutor {
             }
         };
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let output = self.task_manager.update(&public_args).await;
-        if Self::task_output_success(&output) {
+        let outcome = self.task_manager.update_outcome(&public_args).await;
+        if outcome.status.changed() {
+            self.record_task_lifecycle_event("update", &public_args, &outcome.data);
             if let Err(error) = self
                 .task_manager
                 .seal_snapshot_for_restore(&mut snapshot)
                 .await
             {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
+                tracing::warn!(
+                    target: "astra_cli::task",
+                    %error,
+                    "task update succeeded but rollback snapshot seal failed"
+                );
+                return outcome.output;
             }
             self.record_task_state_rollback(
                 snapshot,
@@ -3412,14 +3421,19 @@ impl ToolExecutor {
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("update", &public_args, &output);
         }
-        output
+        outcome.output
     }
     async fn task_action_stop(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("stop", args).await {
-            self.record_task_lifecycle_event("stop", args, &output);
-            return output;
+        if let Some(routed) = self.route_task_action("stop", args).await {
+            if let Some(mutation) = routed
+                .mutation
+                .as_ref()
+                .filter(|mutation| mutation.status.changed())
+            {
+                self.record_task_lifecycle_event("stop", args, &mutation.data);
+            }
+            return routed.output;
         }
         let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
@@ -3428,14 +3442,20 @@ impl ToolExecutor {
             }
         };
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let output = self.task_manager.stop(&public_args).await;
-        if Self::task_output_success(&output) {
+        let outcome = self.task_manager.stop_outcome(&public_args).await;
+        if outcome.status.changed() {
+            self.record_task_lifecycle_event("stop", &public_args, &outcome.data);
             if let Err(error) = self
                 .task_manager
                 .seal_snapshot_for_restore(&mut snapshot)
                 .await
             {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
+                tracing::warn!(
+                    target: "astra_cli::task",
+                    %error,
+                    "task stop succeeded but rollback snapshot seal failed"
+                );
+                return outcome.output;
             }
             self.record_task_state_rollback(
                 snapshot,
@@ -3447,9 +3467,8 @@ impl ToolExecutor {
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("stop", &public_args, &output);
         }
-        output
+        outcome.output
     }
 
     /// `task_board(action='list_user')` — cross-session active list. Cloud
@@ -3511,7 +3530,16 @@ impl ToolExecutor {
         // Server-side dispatch will reject if source isn't owned by
         // the same user (auth check via SessionService).
         match self.route_task_action("adopt", args).await {
-            Some(output) => output,
+            Some(routed) => {
+                if let Some(mutation) = routed
+                    .mutation
+                    .as_ref()
+                    .filter(|mutation| mutation.status.changed())
+                {
+                    self.record_task_lifecycle_event("adopt", args, &mutation.data);
+                }
+                routed.output
+            }
             None => "Error: cannot adopt task without an active session id".to_string(),
         }
     }
@@ -3520,9 +3548,15 @@ impl ToolExecutor {
     /// current-session task immediately, or bulk-archive stale
     /// completed history in the current session.
     async fn task_action_archive(&self, args: &Value) -> String {
-        if let Some(output) = self.route_task_action("archive", args).await {
-            self.record_task_lifecycle_event("archive", args, &output);
-            return output;
+        if let Some(routed) = self.route_task_action("archive", args).await {
+            if let Some(mutation) = routed
+                .mutation
+                .as_ref()
+                .filter(|mutation| mutation.status.changed())
+            {
+                self.record_task_lifecycle_event("archive", args, &mutation.data);
+            }
+            return routed.output;
         }
         let mut snapshot = match self.task_manager.try_snapshot_state().await {
             Ok(snapshot) => snapshot,
@@ -3531,14 +3565,20 @@ impl ToolExecutor {
             }
         };
         let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let output = self.task_manager.archive(&public_args).await;
-        if Self::task_output_success(&output) {
+        let outcome = self.task_manager.archive_outcome(&public_args).await;
+        if outcome.status.changed() {
+            self.record_task_lifecycle_event("archive", &public_args, &outcome.data);
             if let Err(error) = self
                 .task_manager
                 .seal_snapshot_for_restore(&mut snapshot)
                 .await
             {
-                return format!("Error: failed to seal task rollback snapshot: {error}");
+                tracing::warn!(
+                    target: "astra_cli::task",
+                    %error,
+                    "task archive succeeded but rollback snapshot seal failed"
+                );
+                return outcome.output;
             }
             self.record_task_state_rollback(
                 snapshot,
@@ -3550,9 +3590,8 @@ impl ToolExecutor {
                         .unwrap_or("bulk")
                 ),
             );
-            self.record_task_lifecycle_event("archive", &public_args, &output);
         }
-        output
+        outcome.output
     }
 
     async fn task_list_bg(&self) -> String {

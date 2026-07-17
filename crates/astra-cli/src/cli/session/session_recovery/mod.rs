@@ -8,7 +8,7 @@ pub(crate) mod workspace;
 
 // Re-export public items from sub-modules
 pub(crate) use checkpoint::{
-    build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
+    RecoverySnapshotSyncError, build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
     persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
     sync_recovery_snapshot_after_history_edit,
 };
@@ -1211,7 +1211,7 @@ mod tests {
             .await
             .expect_err("temporary CSL path conflict should fail");
 
-        assert!(error.contains("replace CSL snapshot"), "{error}");
+        assert!(error.message.contains("replace CSL snapshot"), "{error}");
 
         let checkpoints =
             astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();

@@ -685,10 +685,140 @@ pub fn prepare_task_snapshot_for_fork(mut snapshot: TaskManagerSnapshot) -> Task
     snapshot
 }
 
+/// Machine-readable result of one atomic task-board mutation.
+///
+/// `output` is presentation for the model/UI. Callers must use `status` and
+/// `data` for control flow instead of parsing that text. `success` and
+/// `changed` remain denormalized wire-compatibility fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMutationStatus {
+    Applied,
+    Unchanged,
+    Refused,
+    Failed,
+    /// The durable admission record exists, but the system cannot prove
+    /// whether the mutation committed. Callers must reconcile from the task
+    /// board instead of treating this as either success or a safe retry.
+    Indeterminate,
+}
+
+impl TaskMutationStatus {
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Applied | Self::Unchanged)
+    }
+
+    pub fn changed(self) -> bool {
+        self == Self::Applied
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskMutationOutcome {
+    pub output: String,
+    /// Canonical control-flow evidence. The booleans below remain on the wire
+    /// for compatibility, but internal callers must branch on this enum.
+    pub status: TaskMutationStatus,
+    pub success: bool,
+    pub changed: bool,
+    pub data: Value,
+}
+
+impl TaskMutationOutcome {
+    fn from_parts(summary: impl Into<String>, mut data: Value, status: TaskMutationStatus) -> Self {
+        let success = status.is_success();
+        let changed = status.changed();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("success".to_string(), Value::Bool(success));
+            object.insert("mutation_status".to_string(), json!(status));
+        }
+        Self {
+            output: prefix_summary(summary.into(), data.to_string()),
+            status,
+            success,
+            changed,
+            data,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            output: format!("Error: {message}"),
+            status: TaskMutationStatus::Failed,
+            success: false,
+            changed: false,
+            data: json!({
+                "success": false,
+                "mutation_status": TaskMutationStatus::Failed,
+                "message": message,
+            }),
+        }
+    }
+
+    pub fn applied(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Applied)
+    }
+
+    pub fn unchanged(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Unchanged)
+    }
+
+    pub fn refused(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Refused)
+    }
+
+    pub fn indeterminate(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            output: format!("Indeterminate: {message}"),
+            status: TaskMutationStatus::Indeterminate,
+            success: false,
+            changed: false,
+            data: json!({
+                "success": false,
+                "mutation_status": TaskMutationStatus::Indeterminate,
+                "message": message,
+            }),
+        }
+    }
+}
+
 pub struct TaskMutationResult {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: Option<u32>,
-    pub response: String,
+    pub outcome: TaskMutationOutcome,
+}
+
+impl TaskMutationResult {
+    fn applied(
+        tasks: Vec<SessionTask>,
+        next_task_id: Option<u32>,
+        summary: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            tasks,
+            next_task_id,
+            outcome: TaskMutationOutcome::applied(summary, data),
+        }
+    }
+
+    fn unchanged(tasks: Vec<SessionTask>, summary: impl Into<String>, data: Value) -> Self {
+        Self {
+            tasks,
+            next_task_id: None,
+            outcome: TaskMutationOutcome::unchanged(summary, data),
+        }
+    }
+
+    fn refused(tasks: Vec<SessionTask>, summary: impl Into<String>, data: Value) -> Self {
+        Self {
+            tasks,
+            next_task_id: None,
+            outcome: TaskMutationOutcome::refused(summary, data),
+        }
+    }
 }
 
 pub type TaskMutation =
@@ -761,7 +891,7 @@ pub trait TaskStore: Send + Sync {
     /// still have coherent semantics. SQL-backed stores should keep the same
     /// session-local default; cross-session cleanup belongs behind an explicit
     /// user-level action, not a model-triggered current-session archive.
-    async fn archive(&self, session_id: &str, args: &Value) -> Result<String, String> {
+    async fn archive(&self, session_id: &str, args: &Value) -> Result<TaskMutationOutcome, String> {
         let parsed = parse_archive_args(args)?;
         let task_id = parsed.task_id;
         let days = parsed.older_than_days;
@@ -776,63 +906,48 @@ pub trait TaskStore: Send + Sync {
             Box::new(move |mut tasks, _next| {
                 if let Some(task_id) = task_id {
                     let Some(task_index) = tasks.iter().position(|t| t.id == task_id) else {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} not found in session {session_label}"
-                                ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "message": format!(
-                                        "Task '{}' was not found in session '{}'",
-                                        task_id, session_label
-                                    ),
-                                })
-                                .to_string(),
+                            format!(
+                                "Refused: task #{task_id} not found in session {session_label}"
                             ),
-                        });
+                            json!({
+                                "task_id": task_id,
+                                "message": format!(
+                                    "Task '{}' was not found in session '{}'",
+                                    task_id, session_label
+                                ),
+                            }),
+                        ));
                     };
                     let previous_status = tasks[task_index].status;
                     if previous_status == SessionTaskStatusKind::Archived
                     {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!("Refused: task #{task_id} is already archived"),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "previous_status": previous_status,
-                                    "message": format!("Task '{}' is already archived", task_id),
-                                })
-                                .to_string(),
-                            ),
-                        });
+                            format!("Refused: task #{task_id} is already archived"),
+                            json!({
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "message": format!("Task '{}' is already archived", task_id),
+                            }),
+                        ));
                     }
                     if !previous_status.can_be_archived() {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} is '{previous_status}' — only completed, failed, or cancelled tasks can be archived"
-                                ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "previous_status": previous_status,
-                                    "message": format!(
-                                        "Task '{}' must be completed, failed, or cancelled before it can be archived",
-                                        task_id
-                                    ),
-                                })
-                                .to_string(),
+                            format!(
+                                "Refused: task #{task_id} is '{previous_status}' — only completed, failed, or cancelled tasks can be archived"
                             ),
-                        });
+                            json!({
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "message": format!(
+                                    "Task '{}' must be completed, failed, or cancelled before it can be archived",
+                                    task_id
+                                ),
+                            }),
+                        ));
                     }
 
                     tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
@@ -847,21 +962,17 @@ pub trait TaskStore: Send + Sync {
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
                     reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
-                    return Ok(TaskMutationResult {
+                    return Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: None,
-                        response: prefix_summary(
-                            format!("Archived task #{task_id} (was {previous_status})"),
-                            json!({
-                                "success": true,
-                                "task_id": task_id,
-                                "previous_status": previous_status,
-                                "status": SESSION_TASK_STATUS_ARCHIVED,
-                                "message": format!("Task '{}' archived", task_id),
-                            })
-                            .to_string(),
-                        ),
-                    });
+                        None,
+                        format!("Archived task #{task_id} (was {previous_status})"),
+                        json!({
+                            "task_id": task_id,
+                            "previous_status": previous_status,
+                            "status": SESSION_TASK_STATUS_ARCHIVED,
+                            "message": format!("Task '{}' archived", task_id),
+                        }),
+                    ));
                 }
 
                 let mut archived_ids: HashSet<String> = HashSet::new();
@@ -891,27 +1002,24 @@ pub trait TaskStore: Send + Sync {
                 let archived = archived_ids.len() as u64;
                 detach_task_dependency_edges(&mut tasks, &archived_ids);
                 reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
-                Ok(TaskMutationResult {
-                    tasks,
-                    next_task_id: None,
-                    response: prefix_summary(
-                        format!(
-                            "Archived {archived} terminal task(s) older than {days} days in session {session_label}"
-                        ),
-                        json!({
-                            "success": true,
-                            "archived": archived,
-                            "older_than_days": days,
-                            "scope": "session",
-                            "session_id": session_label,
-                            "message": format!(
-                                "Archived {} terminal task(s) older than {} days in session '{}'",
-                                archived, days, session_label
-                            ),
-                        })
-                        .to_string(),
+                let summary = format!(
+                    "Archived {archived} terminal task(s) older than {days} days in session {session_label}"
+                );
+                let data = json!({
+                    "archived": archived,
+                    "older_than_days": days,
+                    "scope": "session",
+                    "session_id": session_label,
+                    "message": format!(
+                        "Archived {} terminal task(s) older than {} days in session '{}'",
+                        archived, days, session_label
                     ),
-                })
+                });
+                if archived == 0 {
+                    Ok(TaskMutationResult::unchanged(tasks, summary, data))
+                } else {
+                    Ok(TaskMutationResult::applied(tasks, None, summary, data))
+                }
             }),
         )
         .await
@@ -924,15 +1032,22 @@ pub trait TaskStore: Send + Sync {
     /// Implementations that can be shared across processes must serialize this
     /// method per `session_id` so concurrent create/update/stop calls cannot
     /// overwrite each other with stale full-list saves.
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
         let tasks = self.load(session_id).await?;
         let next = self.peek_next_task_id(session_id).await?;
         let result = mutation(tasks, next)?;
+        if !result.outcome.status.changed() {
+            return Ok(result.outcome);
+        }
         if let Some(next) = result.next_task_id {
             self.set_next_task_id(session_id, next).await?;
         }
         self.save(session_id, result.tasks).await?;
-        Ok(result.response)
+        Ok(result.outcome)
     }
     /// Return and consume the next integer to use when forming `task-<n>` ids.
     /// Must be monotonic per session_id.
@@ -1259,8 +1374,12 @@ impl TaskStore for InMemoryTaskStore {
         Ok(())
     }
 
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
-        let response = {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
+        let outcome = {
             let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
             let next = if entry.next_id == 0 { 1 } else { entry.next_id };
@@ -1278,19 +1397,23 @@ impl TaskStore for InMemoryTaskStore {
                      task board unchanged"
                 )
             })??;
-            if self.validate_on_save {
+            if self.validate_on_save && result.outcome.status.changed() {
                 Self::validate_tasks(&result.tasks)?;
             }
-            let entry = sessions.entry(session_id.to_string()).or_default();
-            entry.tasks = result.tasks;
-            if let Some(next_task_id) = result.next_task_id {
-                entry.next_id = u64::from(next_task_id);
+            if result.outcome.status.changed() {
+                let entry = sessions.entry(session_id.to_string()).or_default();
+                entry.tasks = result.tasks;
+                if let Some(next_task_id) = result.next_task_id {
+                    entry.next_id = u64::from(next_task_id);
+                }
+                entry.version = entry.version.wrapping_add(1);
             }
-            entry.version = entry.version.wrapping_add(1);
-            result.response
+            result.outcome
         };
-        let _ = self.changed_tx.send(session_id.to_string());
-        Ok(response)
+        if outcome.status.changed() {
+            let _ = self.changed_tx.send(session_id.to_string());
+        }
+        Ok(outcome)
     }
 
     async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
@@ -2460,8 +2583,8 @@ impl TaskManager {
             .await
     }
 
-    /// Create a new task in the session-local task list.
-    pub async fn create(&self, args: &Value) -> String {
+    /// Create a new task and preserve its machine-readable mutation outcome.
+    pub async fn create_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(
             args,
             "create",
@@ -2477,46 +2600,46 @@ impl TaskManager {
                 "add_blocked_by",
             ],
         ) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let title = match required_non_empty_string_field(args, "title") {
             Ok(title) => title,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_string_chars(&title, "title", MAX_TASK_TITLE_CHARS) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let description = match optional_string_field(args, "description") {
             Ok(description) => description,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(description) = description.as_deref()
             && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let now = chrono::Utc::now().to_rfc3339();
 
         let active_form = match optional_non_empty_string_field(args, "active_form") {
             Ok(active_form) => active_form,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(active_form) = active_form.as_deref()
             && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let owner = match optional_non_empty_string_field(args, "owner") {
             Ok(owner) => owner,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(owner) = owner.as_deref()
             && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         // U-7: subtasks inherit parent's `owner` when they don't
         // declare one explicitly. Without inheritance a sub-agent
@@ -2527,27 +2650,27 @@ impl TaskManager {
         let parent_owner_for_subtasks = owner.clone();
         let subtasks = match parse_create_subtasks(args, parent_owner_for_subtasks.as_deref()) {
             Ok(subtasks) => subtasks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let metadata = match args.get("metadata") {
             Some(value) => match value.as_object() {
                 Some(metadata) => {
                     if let Err(error) = validate_metadata_size(metadata, "metadata") {
-                        return format!("Error: {error}");
+                        return TaskMutationOutcome::error(error);
                     }
                     Some(metadata.clone())
                 }
-                None => return "Error: field 'metadata' must be an object".to_string(),
+                None => return TaskMutationOutcome::error("field 'metadata' must be an object"),
             },
             None => None,
         };
         let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
             Ok(proposed_blocks) => proposed_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let proposed_blocked_by = match optional_string_array_field(args, "add_blocked_by") {
             Ok(proposed_blocked_by) => proposed_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         for (field, ids) in [
             ("add_blocks", &proposed_blocks),
@@ -2555,7 +2678,7 @@ impl TaskManager {
         ] {
             for id in ids {
                 if let Err(error) = validate_task_id_chars(id, field) {
-                    return format!("Error: {error}");
+                    return TaskMutationOutcome::error(error);
                 }
             }
         }
@@ -2578,28 +2701,20 @@ impl TaskManager {
                         t.status.blocks_duplicate_create()
                             && normalize_title(&t.title) == normalized_new
                     }) {
-                        let response = prefix_summary(
-                            format!(
-                                "Refused: open task #{} already has this title — use update / get instead",
+                        let summary = format!(
+                            "Refused: open task #{} already has this title — use update / get instead",
+                            dup.id
+                        );
+                        let data = json!({
+                            "duplicate_of": dup.id,
+                            "duplicate_title": dup.title,
+                            "duplicate_status": dup.status,
+                            "message": format!(
+                                "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
                                 dup.id
                             ),
-                            json!({
-                                "success": false,
-                                "duplicate_of": dup.id,
-                                "duplicate_title": dup.title,
-                                "duplicate_status": dup.status,
-                                "message": format!(
-                                    "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
-                                    dup.id
-                                ),
-                            })
-                            .to_string(),
-                        );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
                         });
+                        return Ok(TaskMutationResult::refused(tasks, summary, data));
                     }
 
                     let task_id = format!("task-{next}");
@@ -2610,29 +2725,21 @@ impl TaskManager {
                     // silently producing an invisible duplicate or
                     // hitting a raw "Duplicate entry" DB error.
                     if tasks.iter().any(|t| t.id == task_id) {
-                        let response = prefix_summary(
-                            format!(
-                                "Error: task counter desync — id '{task_id}' already exists. \
-                                 The session's counter may need to be reset. \
-                                 Contact support or use `task_board(action='list')` to see the \
-                                 current task list and manually continue from the last id."
-                            ),
-                            json!({
-                                "success": false,
-                                "error": "counter_desync",
-                                "conflicting_id": task_id,
-                                "message": format!(
-                                    "Task id '{task_id}' already exists in this session; \
-                                     counter is out of sync with the task list."
-                                ),
-                            })
-                            .to_string(),
+                        let summary = format!(
+                            "Error: task counter desync — id '{task_id}' already exists. \
+                             The session's counter may need to be reset. \
+                             Contact support or use `task_board(action='list')` to see the \
+                             current task list and manually continue from the last id."
                         );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
+                        let data = json!({
+                            "error": "counter_desync",
+                            "conflicting_id": task_id,
+                            "message": format!(
+                                "Task id '{task_id}' already exists in this session; \
+                                 counter is out of sync with the task list."
+                            ),
                         });
+                        return Ok(TaskMutationResult::refused(tasks, summary, data));
                     }
                     let task = SessionTask {
                         id: task_id.clone(),
@@ -2656,32 +2763,34 @@ impl TaskManager {
                     for id in &proposed_blocked_by {
                         add_dependency_edge(&mut tasks, id, &task_id, &now)?;
                     }
-                    let response = prefix_summary(
-                        format!("Task #{task_id} created: {mutation_title}"),
-                        json!({
-                            "success": true,
-                            "task_id": task_id,
-                            "blocks": proposed_blocks,
-                            "blocked_by": proposed_blocked_by,
-                            "message": format!("Task '{}' created successfully", mutation_title)
-                        })
-                        .to_string(),
-                    );
+                    let summary = format!("Task #{task_id} created: {mutation_title}");
+                    let data = json!({
+                        "task_id": task_id,
+                        "blocks": proposed_blocks,
+                        "blocked_by": proposed_blocked_by,
+                        "message": format!("Task '{}' created successfully", mutation_title)
+                    });
                     let next_task_id = next.checked_add(1).ok_or_else(|| {
                         "task id counter overflow for session during create".to_string()
                     })?;
-                    Ok(TaskMutationResult {
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: Some(next_task_id),
-                        response,
-                    })
+                        Some(next_task_id),
+                        summary,
+                        data,
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn create(&self, args: &Value) -> String {
+        self.create_outcome(args).await.output
     }
 
     /// List tasks in the session, optionally filtered by status.
@@ -2812,8 +2921,8 @@ impl TaskManager {
         }
     }
 
-    /// Update a task's status, metadata, or dependency edges.
-    pub async fn update(&self, args: &Value) -> String {
+    /// Update a task while preserving the typed mutation outcome.
+    pub async fn update_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(
             args,
             "update",
@@ -2835,42 +2944,42 @@ impl TaskManager {
                 "error_message",
             ],
         ) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let task_id = match required_non_empty_string_field(args, "task_id") {
             Ok(task_id) => task_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let new_status = match normalize_update_status(args) {
             Ok(status) => status,
-            Err(e) => return format!("Error: {e}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let subtask_id = match optional_non_empty_string_field(args, "subtask_id") {
             Ok(subtask_id) => subtask_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let mut error_message = match optional_non_empty_string_field(args, "error_message") {
             Ok(error_message) => error_message,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let reason = match optional_non_empty_string_field(args, "reason") {
             Ok(reason) => reason,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(error_message) = error_message.as_deref()
             && let Err(error) =
                 validate_string_chars(error_message, "error_message", MAX_TASK_ERROR_MESSAGE_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         if let Some(reason) = reason.as_deref()
             && let Err(error) = validate_string_chars(reason, "reason", MAX_TASK_STOP_REASON_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         if subtask_id.is_none()
             && error_message.is_none()
@@ -2880,79 +2989,83 @@ impl TaskManager {
         }
         if error_message.is_some() {
             if subtask_id.is_some() {
-                return "Error: field 'error_message' is only supported for parent task failure updates; subtask failures cannot store an error_message".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'error_message' is only supported for parent task failure updates; subtask failures cannot store an error_message",
+                );
             }
             if !matches!(
                 new_status,
                 Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
             ) {
-                return "Error: field 'error_message' requires new_status='failed' or new_status='cancelled'".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'error_message' requires new_status='failed' or new_status='cancelled'",
+                );
             }
         }
         let now = chrono::Utc::now().to_rfc3339();
 
         let title_update = match optional_non_empty_string_field(args, "title") {
             Ok(title_update) => title_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(title) = title_update.as_deref()
             && let Err(error) = validate_string_chars(title, "title", MAX_TASK_TITLE_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let desc_update = match optional_string_field(args, "description") {
             Ok(desc_update) => desc_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(description) = desc_update.as_deref()
             && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let active_form_update = match optional_non_empty_string_field(args, "active_form") {
             Ok(active_form_update) => active_form_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(active_form) = active_form_update.as_deref()
             && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let owner_update = match optional_non_empty_string_field(args, "owner") {
             Ok(owner_update) => owner_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(owner) = owner_update.as_deref()
             && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let metadata_update = match optional_object_field(args, "metadata") {
             Ok(metadata_update) => metadata_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(metadata_update) = metadata_update.as_ref()
             && let Err(error) = validate_metadata_size(metadata_update, "metadata")
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
             Ok(proposed_blocks) => proposed_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let proposed_blocked_by = match optional_string_array_field(args, "add_blocked_by") {
             Ok(proposed_blocked_by) => proposed_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let remove_blocks = match optional_string_array_field(args, "remove_blocks") {
             Ok(remove_blocks) => remove_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let remove_blocked_by = match optional_string_array_field(args, "remove_blocked_by") {
             Ok(remove_blocked_by) => remove_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if subtask_id.is_some() {
             let unsupported = [
@@ -2970,13 +3083,15 @@ impl TaskManager {
             .filter_map(|(field, present)| present.then_some(field))
             .collect::<Vec<_>>();
             if !unsupported.is_empty() {
-                return format!(
-                    "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: {}",
+                return TaskMutationOutcome::error(format!(
+                    "field 'subtask_id' only supports new_status updates; unsupported with subtask_id: {}",
                     unsupported.join(", ")
-                );
+                ));
             }
             if new_status.is_none() {
-                return "Error: field 'new_status' is required when updating a subtask".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'new_status' is required when updating a subtask",
+                );
             }
         } else {
             let has_parent_update = new_status.is_some()
@@ -2994,7 +3109,9 @@ impl TaskManager {
                 || error_message.is_some()
                 || reason.is_some();
             if !has_parent_update {
-                return "Error: task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
+                return TaskMutationOutcome::error(
+                    "task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message",
+                );
             }
         }
         let sid = self.sid();
@@ -3078,30 +3195,22 @@ impl TaskManager {
                         task.metadata = projected_task.metadata;
                         let final_subtask_status = subtask.status;
                         task.updated_at = now.clone();
-                        let response = prefix_summary(
-                            format!(
-                                "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
-                            ),
-                            json!({
-                                "success": true,
-                                "task_id": task_id,
-                                "subtask_id": st_id,
-                                "previous_status": previous_status,
-                                "status": final_subtask_status,
-                                "reason": reason,
-                                "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
-                            })
-                            .to_string(),
+                        let summary = format!(
+                            "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
                         );
+                        let data = json!({
+                            "task_id": task_id,
+                            "subtask_id": st_id,
+                            "previous_status": previous_status,
+                            "status": final_subtask_status,
+                            "reason": reason,
+                            "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
+                        });
                         // Parent auto-completion is dependency-driven. If this
                         // task just completed, reconcile any all-done parents
                         // that it unblocked in the same atomic mutation.
                         reconcile_all_subtask_completion(&mut tasks, &now);
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
-                        });
+                        return Ok(TaskMutationResult::applied(tasks, None, summary, data));
                     }
 
                     if new_status == Some(SessionTaskStatusKind::Deleted) {
@@ -3128,23 +3237,18 @@ impl TaskManager {
                         let deleted_ids = HashSet::from([task_id.clone()]);
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
                         reconcile_all_subtask_completion(&mut tasks, &now);
-                        let response = prefix_summary(
+                        return Ok(TaskMutationResult::applied(
+                            tasks,
+                            None,
                             format!("Task #{task_id} deleted (was: {previous_status})"),
                             json!({
-                                "success": true,
                                 "task_id": task_id,
                                 "previous_status": previous_status.to_string(),
                                 "status": "deleted",
                                 "deleted_subtasks": deleted_subtasks,
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
-                            })
-                            .to_string(),
-                        );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
-                        });
+                            }),
+                        ));
                     }
 
                     let previous_status = match tasks.iter().find(|t| t.id == task_id) {
@@ -3162,31 +3266,23 @@ impl TaskManager {
                                 && t.status.blocks_duplicate_create()
                                 && normalize_title(&t.title) == normalized_new
                         }) {
-                            let response = prefix_summary(
-                                format!(
-                                    "Refused: open task #{} already has this title — keep task titles distinct or update the existing task",
+                            let summary = format!(
+                                "Refused: open task #{} already has this title — keep task titles distinct or update the existing task",
+                                dup.id
+                            );
+                            let data = json!({
+                                "duplicate_of": dup.id,
+                                "duplicate_title": dup.title,
+                                "duplicate_status": dup.status,
+                                "task_id": task_id,
+                                "message": format!(
+                                    "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
+                                    task_id,
+                                    dup.title,
                                     dup.id
                                 ),
-                                json!({
-                                    "success": false,
-                                    "duplicate_of": dup.id,
-                                    "duplicate_title": dup.title,
-                                    "duplicate_status": dup.status,
-                                    "task_id": task_id,
-                                    "message": format!(
-                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
-                                        task_id,
-                                        dup.title,
-                                        dup.id
-                                    ),
-                                })
-                                .to_string(),
-                            );
-                            return Ok(TaskMutationResult {
-                                tasks,
-                                next_task_id: None,
-                                response,
                             });
+                            return Ok(TaskMutationResult::refused(tasks, summary, data));
                         }
                     }
 
@@ -3439,45 +3535,47 @@ impl TaskManager {
                     ) {
                         response_body["cancelled_subtasks"] = json!(cancelled_subtasks);
                     }
-                    let response = prefix_summary(
-                        format!("Task #{task_id}: {previous_status} → {final_status}"),
-                        response_body.to_string(),
-                    );
-                    Ok(TaskMutationResult {
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: None,
-                        response,
-                    })
+                        None,
+                        format!("Task #{task_id}: {previous_status} → {final_status}"),
+                        response_body,
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
     }
 
-    /// Stop/cancel a running task.
-    pub async fn stop(&self, args: &Value) -> String {
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn update(&self, args: &Value) -> String {
+        self.update_outcome(args).await.output
+    }
+
+    /// Stop/cancel a running task while preserving the typed outcome.
+    pub async fn stop_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(args, "stop", &["action", "task_id", "reason"])
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let task_id = match required_non_empty_string_field(args, "task_id") {
             Ok(task_id) => task_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let reason = match optional_non_empty_string_field(args, "reason") {
             Ok(Some(reason)) => reason,
             Ok(None) => "user requested".to_string(),
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_string_chars(&reason, "reason", MAX_TASK_STOP_REASON_CHARS) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -3502,41 +3600,33 @@ impl TaskManager {
                         if open_subtasks > 0 {
                             cancel_task_and_open_subtasks(task, Some(&reason), &now);
                         }
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!("Task #{task_id} is already cancelled"),
-                                json!({
-                                    "success": true,
-                                    "task_id": task_id,
-                                    "status": "cancelled",
-                                    "already_cancelled": true,
-                                    "cancelled_subtasks": open_subtasks,
-                                    "message": format!("Task '{}' was already cancelled", task_id)
-                                })
-                                .to_string(),
-                            ),
+                        let summary = format!("Task #{task_id} is already cancelled");
+                        let data = json!({
+                            "task_id": task_id,
+                            "status": "cancelled",
+                            "already_cancelled": true,
+                            "cancelled_subtasks": open_subtasks,
+                            "message": format!("Task '{}' was already cancelled", task_id)
                         });
+                        return if open_subtasks == 0 {
+                            Ok(TaskMutationResult::unchanged(tasks, summary, data))
+                        } else {
+                            Ok(TaskMutationResult::applied(tasks, None, summary, data))
+                        };
                     }
 
                     if !task_status.can_be_stopped() {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
-                                ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "status": task_status,
-                                    "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
-                                })
-                                .to_string(),
+                            format!(
+                                "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
                             ),
-                        });
+                            json!({
+                                "task_id": task_id,
+                                "status": task_status,
+                                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
+                            }),
+                        ));
                     }
 
                     let task = &mut tasks[task_idx];
@@ -3551,42 +3641,47 @@ impl TaskManager {
                     } else {
                         format!("Task #{task_id} cancelled (was {previous_status}): {reason}")
                     };
-                    let response = prefix_summary(
+                    Ok(TaskMutationResult::applied(
+                        tasks,
+                        None,
                         summary,
                         json!({
-                            "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "status": "cancelled",
                             "reason": reason,
                             "cancelled_subtasks": cancelled_subtasks,
                             "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
-                        })
-                        .to_string(),
-                    );
-                    Ok(TaskMutationResult {
-                        tasks,
-                        next_task_id: None,
-                        response,
-                    })
+                        }),
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn stop(&self, args: &Value) -> String {
+        self.stop_outcome(args).await.output
     }
 
     /// Archive historical work. Single-task and bulk archive are both
     /// session-scoped; cross-session cleanup must use an explicit user-level
     /// surface so automatic task cleanup cannot unexpectedly mutate other
     /// sessions.
-    pub async fn archive(&self, args: &Value) -> String {
+    pub async fn archive_outcome(&self, args: &Value) -> TaskMutationOutcome {
         match self.store.archive(&self.sid(), args).await {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn archive(&self, args: &Value) -> String {
+        self.archive_outcome(args).await.output
     }
 }
 
@@ -4887,6 +4982,95 @@ mod tests {
         assert_eq!(
             list["count"], 1,
             "duplicate must not be persisted; got {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_mutation_does_not_advance_board_version_or_broadcast() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let manager = TaskManager::new("typed-refusal", store.clone());
+        manager
+            .create(&json!({"title": "Implement dark mode toggle"}))
+            .await;
+        let version = store
+            .get_session_version("typed-refusal")
+            .await
+            .expect("version after create");
+        let mut changes = store.subscribe().expect("in-memory change stream");
+
+        let outcome = manager
+            .create_outcome(&json!({"title": "IMPLEMENT DARK MODE TOGGLE."}))
+            .await;
+
+        assert!(!outcome.success);
+        assert!(!outcome.changed);
+        assert_eq!(outcome.data["duplicate_of"], "task-1");
+        assert_eq!(
+            store
+                .get_session_version("typed-refusal")
+                .await
+                .expect("version after refusal"),
+            version,
+            "a business refusal must not create a phantom board revision"
+        );
+        assert!(
+            changes.try_recv().is_err(),
+            "a business refusal must not wake task-board observers"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_control_flow_uses_typed_outcome_not_rendered_summary() {
+        let store = InMemoryTaskStore::new();
+        let before = store
+            .get_session_version("typed-protocol")
+            .await
+            .expect("initial version");
+
+        let applied = store
+            .mutate(
+                "typed-protocol",
+                Box::new(|tasks, _| {
+                    Ok(TaskMutationResult::applied(
+                        tasks,
+                        None,
+                        "Error: deliberately misleading presentation",
+                        json!({"message": "typed applied"}),
+                    ))
+                }),
+            )
+            .await
+            .expect("typed applied outcome");
+        assert!(applied.success && applied.changed);
+        assert_eq!(
+            store
+                .get_session_version("typed-protocol")
+                .await
+                .expect("version after applied outcome"),
+            before + 1
+        );
+
+        let refused = store
+            .mutate(
+                "typed-protocol",
+                Box::new(|tasks, _| {
+                    Ok(TaskMutationResult::refused(
+                        tasks,
+                        "Created successfully (presentation only)",
+                        json!({"message": "typed refusal"}),
+                    ))
+                }),
+            )
+            .await
+            .expect("typed refused outcome");
+        assert!(!refused.success && !refused.changed);
+        assert_eq!(
+            store
+                .get_session_version("typed-protocol")
+                .await
+                .expect("version after refused outcome"),
+            before + 1,
+            "rendered success-like text must not turn a refusal into a write"
         );
     }
 
@@ -6975,11 +7159,12 @@ mod tests {
                         blocks: Vec::new(),
                         blocked_by: Vec::new(),
                     });
-                    Ok(TaskMutationResult {
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: Some(next_id + 1),
-                        response: "should fail".to_string(),
-                    })
+                        Some(next_id + 1),
+                        "should fail",
+                        json!({"message": "should fail"}),
+                    ))
                 }),
             )
             .await

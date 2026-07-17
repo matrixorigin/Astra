@@ -43,6 +43,18 @@ pub enum EditType {
     Delete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEditTransactionError {
+    pub message: String,
+    pub rollback_failed: bool,
+}
+
+impl std::fmt::Display for FileEditTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// A single file edit recorded by the journal.
 ///
 /// Serializable so the journal can survive a CLI restart: entries are
@@ -252,6 +264,26 @@ impl FileEditJournal {
     /// original post-turn contents.
     pub fn undo_turn_transactional(&self, turn_index: u32) -> Result<Vec<PathBuf>, String> {
         self.undo_turn_since_transactional(turn_index, 0)
+    }
+
+    /// Typed variant for callers whose recovery policy depends on whether the
+    /// journal's own rollback succeeded.
+    pub fn undo_turn_transactional_detailed(
+        &self,
+        turn_index: u32,
+    ) -> Result<Vec<PathBuf>, FileEditTransactionError> {
+        let turn_entries: Vec<&FileEditEntry> = self
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.turn_index == turn_index)
+            .collect();
+        Self::apply_entries_transactionally_detailed(
+            turn_entries,
+            Self::apply_revert,
+            Self::apply_forward,
+            "undo",
+        )
     }
 
     /// Revert file edits from a specific turn recorded at or after a
@@ -713,6 +745,16 @@ impl FileEditJournal {
         rollback: fn(&FileEditEntry) -> io::Result<()>,
         action: &str,
     ) -> Result<Vec<PathBuf>, String> {
+        Self::apply_entries_transactionally_detailed(entries, apply, rollback, action)
+            .map_err(|error| error.message)
+    }
+
+    fn apply_entries_transactionally_detailed(
+        entries: Vec<&FileEditEntry>,
+        apply: fn(&FileEditEntry) -> io::Result<()>,
+        rollback: fn(&FileEditEntry) -> io::Result<()>,
+        action: &str,
+    ) -> Result<Vec<PathBuf>, FileEditTransactionError> {
         let mut applied: Vec<&FileEditEntry> = Vec::new();
         let mut paths = Vec::new();
 
@@ -725,15 +767,20 @@ impl FileEditJournal {
                 Err(error) => {
                     let mut error_message =
                         format!("{action} file {}: {error}", entry.path.display());
+                    let mut rollback_failed = false;
                     for reverted in applied.iter().rev() {
                         if let Err(rollback_error) = rollback(reverted) {
+                            rollback_failed = true;
                             error_message.push_str(&format!(
                                 "; rollback file {}: {rollback_error}",
                                 reverted.path.display()
                             ));
                         }
                     }
-                    return Err(error_message);
+                    return Err(FileEditTransactionError {
+                        message: error_message,
+                        rollback_failed,
+                    });
                 }
             }
         }

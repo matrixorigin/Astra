@@ -17,10 +17,18 @@ use serde_json::{Value, json};
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Deserialize)]
-struct ExecuteTodoResponse {
-    output: String,
+pub(crate) struct ExecuteTodoResponse {
+    pub(crate) output: String,
+    #[serde(default)]
+    pub(crate) mutation: Option<TodoMutationResult>,
     #[serde(default)]
     fork_copy: Option<ForkTaskBoardCopyResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TodoMutationResult {
+    pub(crate) status: astra_tools::task_mgmt::TaskMutationStatus,
+    pub(crate) data: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -159,6 +167,18 @@ pub async fn execute_todo_action(
     execute_todo_request(cloud_base, token, session_id, action, args)
         .await
         .map(|response| response.output)
+}
+
+/// Typed variant for callers that make lifecycle, rollback, or refresh
+/// decisions. Rendered `output` is never parsed as a protocol.
+pub(crate) async fn execute_todo_action_typed(
+    cloud_base: &str,
+    token: Option<&str>,
+    session_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<ExecuteTodoResponse, String> {
+    execute_todo_request(cloud_base, token, session_id, action, args).await
 }
 
 async fn execute_todo_request(
@@ -568,7 +588,11 @@ impl TaskStore for HttpTaskStore {
         Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
     }
 
-    async fn mutate(&self, _session_id: &str, _mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        _session_id: &str,
+        _mutation: TaskMutation,
+    ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
         Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
     }
 
@@ -667,7 +691,7 @@ mod wiring_e2e {
                 let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 let args = body.get("args").cloned().unwrap_or(Value::Null);
                 let mut tasks = state_exec.lock_recover();
-                let output = match action {
+                let (output, mutation) = match action {
                     "create" => {
                         let next = counter_exec.fetch_add(1, Ordering::SeqCst) + 1;
                         let id = format!("task-{next}");
@@ -691,7 +715,14 @@ mod wiring_e2e {
                             blocks: vec![],
                             blocked_by: vec![],
                         });
-                        format!("Task #{id} created: {title}")
+                        (
+                            format!("Task #{id} created: {title}"),
+                            Some(json!({
+                                "success": true,
+                                "changed": true,
+                                "data": {"success": true, "task_id": id}
+                            })),
+                        )
                     }
                     "update" => {
                         let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -703,11 +734,19 @@ mod wiring_e2e {
                             task.status =
                                 astra_tools::task_mgmt::SessionTaskStatusKind::from(new_status);
                         }
-                        format!("Task #{id} updated to {new_status}")
+                        (
+                            format!("Task #{id} updated to {new_status}"),
+                            Some(json!({
+                                "success": true,
+                                "changed": true,
+                                "data": {"success": true, "task_id": id, "status": new_status}
+                            })),
+                        )
                     }
-                    other => format!("Error: unsupported action {other}"),
+                    other => (format!("Error: unsupported action {other}"), None),
                 };
-                ResponseTemplate::new(200).set_body_json(json!({ "output": output }))
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "output": output, "mutation": mutation }))
             })
             .mount(&server)
             .await;

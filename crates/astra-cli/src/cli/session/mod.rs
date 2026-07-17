@@ -5,7 +5,6 @@ pub mod session_compaction;
 pub mod session_continuation;
 pub mod session_diagnosis;
 pub mod session_guard;
-pub mod session_improvement;
 pub mod session_input;
 pub mod session_lessons;
 pub mod session_projection;

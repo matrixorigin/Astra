@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::task_mgmt::{
     InMemoryTaskStore, SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_PAUSED,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskStore,
+    TaskMutationOutcome, TaskStore,
 };
 
 const INSERT_BATCH_ROWS: usize = 100;
@@ -549,7 +549,11 @@ impl TaskStore for MatrixOneTaskStore {
         Ok(())
     }
 
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
@@ -657,6 +661,11 @@ impl TaskStore for MatrixOneTaskStore {
             }
         };
 
+        if !result.outcome.status.changed() {
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(result.outcome);
+        }
+
         if let Some(next_task_id) = result.next_task_id
             && let Err(e) = sqlx::query(
                 "UPDATE session_todo_counters SET next_id = ? WHERE session_id = ? AND user_id = ?",
@@ -714,7 +723,7 @@ impl TaskStore for MatrixOneTaskStore {
 
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
-        Ok(result.response)
+        Ok(result.outcome)
     }
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {

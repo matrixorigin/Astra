@@ -340,14 +340,21 @@ fn plan_manual_compaction(
     }
 }
 
-async fn persist_history_edit_state(state: &mut SessionState, action: &str) -> Result<(), String> {
+async fn persist_history_edit_state(
+    state: &mut SessionState,
+    action: &str,
+) -> Result<(), crate::cli::session::session_recovery::RecoverySnapshotSyncError> {
     crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(state)
         .await
-        .map_err(|error| {
-            format!(
-                "{action} updated live context but failed to refresh resume/fork state: {error}"
-            )
-        })?;
+        .map_err(
+            |error| crate::cli::session::session_recovery::RecoverySnapshotSyncError {
+                message: format!(
+                    "{action} updated live context but failed to refresh resume/fork state: {}",
+                    error.message
+                ),
+                rollback_failed: error.rollback_failed,
+            },
+        )?;
 
     // Session memory is a projection of canonical history. Any successful
     // undo/redo/compact invalidates that projection just as surely as a new
@@ -442,15 +449,17 @@ fn apply_undo_file_reverts(
     let mut reverted_turns = Vec::new();
 
     for &turn_index in undone_turns {
-        match journal.undo_turn_transactional(turn_index) {
+        match journal.undo_turn_transactional_detailed(turn_index) {
             Ok(paths) => {
                 reverted_paths.extend(paths.into_iter().map(|path| path.display().to_string()));
                 reverted_turns.push(turn_index);
             }
             Err(error) => {
-                let mut error_message =
-                    format!("revert workspace files for turn {turn_index}: {error}");
-                let mut rollback_failed = error.contains("; rollback file ");
+                let mut error_message = format!(
+                    "revert workspace files for turn {turn_index}: {}",
+                    error.message
+                );
+                let mut rollback_failed = error.rollback_failed;
                 for reverted_turn in reverted_turns.iter().rev() {
                     let rollback_result = journal
                         .restore_turn_transactional(*reverted_turn)
@@ -501,10 +510,10 @@ fn handle_undo_persist_failure(
     state: &mut SessionState,
     snapshot: HistoryEditSnapshot,
     undone_turns: &[u32],
-    error_message: String,
+    error: crate::cli::session::session_recovery::RecoverySnapshotSyncError,
 ) -> String {
-    let mut error_message = error_message;
-    let persist_rollback_failed = error_message.contains("rollback failed");
+    let mut error_message = error.message;
+    let persist_rollback_failed = error.rollback_failed;
     let rollback_result = rollback_undo_file_reverts(state, undone_turns);
     let file_rollback_failed = rollback_result.is_err();
     append_history_edit_rollback_error(
@@ -524,6 +533,18 @@ fn handle_undo_persist_failure(
         }
     }
     error_message
+}
+
+fn handle_history_edit_persist_failure(
+    state: &mut SessionState,
+    snapshot: HistoryEditSnapshot,
+    error: crate::cli::session::session_recovery::RecoverySnapshotSyncError,
+) -> String {
+    snapshot.restore(state);
+    if error.rollback_failed {
+        state.session_persistence_error = Some(error.message.clone());
+    }
+    error.message
 }
 
 pub(crate) async fn handle_state_command(
@@ -726,8 +747,7 @@ pub(crate) async fn handle_state_command(
             }
             state.continuation_anchor = None;
             if let Err(error) = persist_history_edit_state(state, "/redo").await {
-                snapshot.restore(state);
-                return Err(error);
+                return Err(handle_history_edit_persist_failure(state, snapshot, error));
             }
             append_state_journal_event_or_warn(
                 state,
@@ -1044,8 +1064,7 @@ pub(crate) async fn handle_state_command(
                 compact_args.quick,
             );
             if let Err(error) = persist_history_edit_state(state, "/compact").await {
-                snapshot.restore(state);
-                return Err(error);
+                return Err(handle_history_edit_persist_failure(state, snapshot, error));
             }
             // Journal: log compact event (include summary for knowledge backflow)
             append_state_journal_event_or_warn(
@@ -1602,7 +1621,8 @@ fn compact_refs(refs: &[String]) -> String {
 #[cfg(test)]
 mod state_command_tests {
     use super::{
-        HistoryEditSnapshot, StateCommandContext, handle_state_command, handle_undo_persist_failure,
+        HistoryEditSnapshot, StateCommandContext, handle_history_edit_persist_failure,
+        handle_state_command, handle_undo_persist_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::lock_recovery::LockRecovery;
@@ -1881,7 +1901,10 @@ mod state_command_tests {
             &mut state,
             snapshot,
             &[],
-            "/undo updated live context but failed to refresh resume/fork state: recovery checkpoint rollback failed: stale heavy checkpoint".into(),
+            crate::cli::session::session_recovery::RecoverySnapshotSyncError {
+                message: "/undo updated live context but failed to refresh resume/fork state: recovery checkpoint rollback failed: stale heavy checkpoint".into(),
+                rollback_failed: true,
+            },
         );
 
         assert!(error.contains("rollback failed"), "{error}");
@@ -1892,6 +1915,34 @@ mod state_command_tests {
         assert_eq!(
             state.session_persistence_error.as_deref(),
             Some(error.as_str())
+        );
+    }
+
+    #[test]
+    fn non_undo_history_edit_preserves_typed_recovery_rollback_failure() {
+        let snapshot_source = SessionState {
+            turn: 2,
+            history: vec![("q1".into(), "a1".into()), ("q2".into(), "a2".into())],
+            ..Default::default()
+        };
+        let snapshot = HistoryEditSnapshot::capture(&snapshot_source);
+        let mut state = SessionState {
+            turn: 1,
+            history: vec![("compacted".into(), "summary".into())],
+            ..Default::default()
+        };
+        let error = crate::cli::session::session_recovery::RecoverySnapshotSyncError {
+            message: "checkpoint rollback could not be confirmed".into(),
+            rollback_failed: true,
+        };
+
+        let message = handle_history_edit_persist_failure(&mut state, snapshot, error);
+
+        assert_eq!(state.history, snapshot_source.history);
+        assert_eq!(state.turn, snapshot_source.turn);
+        assert_eq!(
+            state.session_persistence_error.as_deref(),
+            Some(message.as_str())
         );
     }
 

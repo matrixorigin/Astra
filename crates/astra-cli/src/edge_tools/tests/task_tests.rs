@@ -111,7 +111,13 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
             "args": {"action": "update", "task_id": "task-2", "title": "duplicate"}
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "output": "Refused: open task #task-1 already has this title\n{\"success\":false,\"duplicate_of\":\"task-1\"}"
+            "output": "Refused: open task #task-1 already has this title\n{\"success\":false,\"duplicate_of\":\"task-1\"}",
+            "mutation": {
+                "status": "refused",
+                "success": false,
+                "changed": false,
+                "data": {"success": false, "duplicate_of": "task-1"}
+            }
         })))
         .mount(&server)
         .await;
@@ -122,7 +128,13 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
             "args": {"action": "update", "task_id": "task-2", "new_status": "completed"}
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "output": "Task #task-2: in_progress -> completed\n{\"success\":true,\"task_id\":\"task-2\",\"status\":\"completed\"}"
+            "output": "Task #task-2: in_progress -> completed\n{\"success\":true,\"task_id\":\"task-2\",\"status\":\"completed\"}",
+            "mutation": {
+                "status": "applied",
+                "success": true,
+                "changed": true,
+                "data": {"success": true, "task_id": "task-2", "status": "completed"}
+            }
         })))
         .mount(&server)
         .await;
@@ -201,10 +213,10 @@ async fn task_mutation_refuses_when_rollback_snapshot_load_fails() {
             &self,
             _session_id: &str,
             mutation: TaskMutation,
-        ) -> Result<String, String> {
+        ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
             self.mutate_calls.fetch_add(1, Ordering::SeqCst);
             let result = mutation(Vec::new(), 1)?;
-            Ok(result.response)
+            Ok(result.outcome)
         }
 
         async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {

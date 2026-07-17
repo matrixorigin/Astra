@@ -397,14 +397,14 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
             {
                 context_lines.push(format!("  request_id: {rid}"));
             }
-            if let Some(code) = json
+            let error_code = json
                 .get("error_code")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
+                .filter(|s| !s.is_empty());
+            if let Some(code) = error_code {
                 context_lines.push(format!("  error_code: {code}"));
             }
-            if let Some(hint) = status_hint_for(status, msg) {
+            if let Some(hint) = status_hint_for(status, error_code) {
                 context_lines.push(format!("  Hint: {hint}"));
             }
             if context_lines.is_empty() {
@@ -419,14 +419,25 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
 
 /// Get a helpful hint for an HTTP status code.
 pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
-    status_hint_for(status, "")
+    status_hint_for(status, None)
 }
 
-/// Message-aware hint: checks error body for known patterns before falling back to status-only hints.
-pub(crate) fn status_hint_for(status: u16, message: &str) -> Option<&'static str> {
-    if (status == 500 || status == 503) && message.to_ascii_lowercase().contains("pool timed out") {
+/// Error-code-aware hint. Human-readable detail is presentation and must not
+/// be parsed to recover a failure category.
+pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    if (status == 500 || status == 503)
+        && matches!(
+            error_code,
+            Some("database_pool_timeout" | "database_pool_exhausted")
+        )
+    {
         return Some(
             "Database pool timeout — the API could not obtain a free DB connection in time (other requests may be holding connections or the DB is slow). Retry; on the server enable RUST_LOG=astra_services::auth=warn to log pool_size, pool_idle, and the auth operation name.",
+        );
+    }
+    if (status == 500 || status == 503) && error_code == Some("database_error") {
+        return Some(
+            "Database operation failed — retry; if it persists, use the request_id and error_code when reporting the incident.",
         );
     }
     match status {
@@ -444,7 +455,7 @@ pub(crate) fn status_hint_for(status: u16, message: &str) -> Option<&'static str
 
 /// Format error with helpful context based on status code
 pub(crate) fn format_error_with_context(status: u16, message: &str) -> String {
-    match status_hint_for(status, message) {
+    match status_hint_for(status, None) {
         Some(hint) => format!("request failed ({status}): {message}\n  Hint: {hint}"),
         None => format!("request failed ({status}): {message}"),
     }
@@ -984,14 +995,17 @@ mod tests {
         let body = serde_json::json!({
             "detail": "pool timed out while waiting for an open connection",
             "request_id": "req-test-123",
-            "error_code": "internal"
+            "error_code": "database_pool_timeout"
         })
         .to_string();
         let err = read_api_error(503, &body);
         assert!(err.contains("pool timed out"), "got: {err}");
         assert!(err.contains("Database pool timeout"), "got: {err}");
         assert!(err.contains("request_id: req-test-123"), "got: {err}");
-        assert!(err.contains("error_code: internal"), "got: {err}");
+        assert!(
+            err.contains("error_code: database_pool_timeout"),
+            "got: {err}"
+        );
         // Verify ordering: request_id and error_code appear before Hint
         let rid_pos = err.find("request_id:").unwrap();
         let code_pos = err.find("error_code:").unwrap();
@@ -1003,7 +1017,8 @@ mod tests {
     #[test]
     fn read_api_error_pool_timeout_also_matches_legacy_500() {
         let body = serde_json::json!({
-            "detail": "pool timed out while waiting for an open connection"
+            "detail": "pool timed out while waiting for an open connection",
+            "error_code": "database_pool_timeout"
         })
         .to_string();
         let err = read_api_error(500, &body);
@@ -1043,16 +1058,16 @@ mod tests {
 
     #[test]
     fn status_hint_for_pool_timeout_overrides_generic_500() {
-        let hint = status_hint_for(500, "pool timed out while waiting");
+        let hint = status_hint_for(500, Some("database_pool_timeout"));
         assert!(hint.unwrap().contains("Database pool timeout"));
         // Also works with 503
-        let hint = status_hint_for(503, "pool timed out while waiting");
+        let hint = status_hint_for(503, Some("database_pool_timeout"));
         assert!(hint.unwrap().contains("Database pool timeout"));
     }
 
     #[test]
     fn status_hint_for_normal_500_gives_generic() {
-        let hint = status_hint_for(500, "unexpected error");
+        let hint = status_hint_for(500, None);
         assert!(hint.unwrap().contains("Server error"));
     }
 
