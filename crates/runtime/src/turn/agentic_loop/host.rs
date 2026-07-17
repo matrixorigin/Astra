@@ -1466,10 +1466,20 @@ pub struct TaskBoardSnapshot {
     pub active_tasks: Vec<String>,
 }
 
+fn compact_task_blocker_ids(blockers: &[String]) -> String {
+    const MAX_IDS: usize = 3;
+    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
+    if blockers.len() > MAX_IDS {
+        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
+    }
+    ids.join(", ")
+}
+
 impl TaskBoardSnapshot {
     #[must_use]
     pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
         let mut snapshot = Self::default();
+        let mut active_candidates = Vec::new();
         for task in tasks {
             if matches!(
                 task.status,
@@ -1509,12 +1519,29 @@ impl TaskBoardSnapshot {
             if task.status.is_open_work() && !unresolved_blockers.is_empty() {
                 snapshot.blocked_count += 1;
             }
-            if task.status.is_open_work() && snapshot.active_tasks.len() < 3 {
-                snapshot
-                    .active_tasks
-                    .push(format!("{} {} [{}]", task.id, task.title, task.status));
+            if task.status.is_open_work() {
+                let blocked = !unresolved_blockers.is_empty();
+                let suffix = if blocked {
+                    format!(
+                        " (waiting on {})",
+                        compact_task_blocker_ids(&unresolved_blockers)
+                    )
+                } else {
+                    String::new()
+                };
+                active_candidates.push((
+                    task.status.active_priority(),
+                    blocked,
+                    format!("{} {} [{}]{}", task.id, task.title, task.status, suffix),
+                ));
             }
         }
+        active_candidates.sort_by_key(|(priority, blocked, _)| (*priority, *blocked));
+        snapshot.active_tasks = active_candidates
+            .into_iter()
+            .take(3)
+            .map(|(_, _, summary)| summary)
+            .collect();
         snapshot
     }
 
@@ -4186,8 +4213,8 @@ pub(crate) mod tests {
         assert_eq!(
             snapshot.active_tasks,
             vec![
-                "task-2 add runtime tests [pending]".to_string(),
                 "task-1 wire completion guard [in_progress]".to_string(),
+                "task-2 add runtime tests [pending] (waiting on task-1)".to_string(),
             ]
         );
         assert!(snapshot.has_unfinished_tasks());
@@ -4245,6 +4272,14 @@ pub(crate) mod tests {
         assert_eq!(
             snapshot.blocked_count, 1,
             "missing dependency references must remain visibly unresolved"
+        );
+        assert_eq!(
+            snapshot.active_tasks,
+            vec![
+                "task-2 running after prerequisite [in_progress]".to_string(),
+                "task-3 waiting on missing prerequisite [pending] (waiting on task-missing)"
+                    .to_string(),
+            ]
         );
     }
 

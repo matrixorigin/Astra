@@ -5426,7 +5426,7 @@ impl AgenticRunLifecycleService {
                 }
             };
         let manager = TaskManager::new(session_id.to_string(), store);
-        match manager.load_active_tasks().await {
+        match manager.load_tasks().await {
             Ok(tasks) => format_task_board_resume_hint(&tasks),
             Err(error) => {
                 tracing::warn!(

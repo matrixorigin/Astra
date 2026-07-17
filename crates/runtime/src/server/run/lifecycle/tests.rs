@@ -1160,6 +1160,39 @@ fn task_board_resume_hint_is_absent_without_open_work() {
 }
 
 #[test]
+fn task_board_resume_hint_distinguishes_resolved_and_unresolved_dependencies() {
+    use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+    let completed = test_session_task(
+        "task-1",
+        "finished prerequisite",
+        SessionTaskStatusKind::Completed,
+    );
+    let mut ready = test_session_task("task-2", "ready dependent", SessionTaskStatusKind::Pending);
+    ready.blocked_by = vec!["task-1".into()];
+    let resolved = format_task_board_resume_hint(&[completed, ready]).expect("resolved hint");
+    assert!(resolved.contains("next=[pending] task-2"), "{resolved}");
+    assert!(!resolved.contains("blocked_by"), "{resolved}");
+
+    let mut blocked = test_session_task(
+        "task-3",
+        "waiting dependent",
+        SessionTaskStatusKind::Pending,
+    );
+    blocked.blocked_by = vec!["task-missing".into()];
+    let unresolved = format_task_board_resume_hint(&[blocked]).expect("unresolved hint");
+    assert!(
+        unresolved.contains("waiting=[pending] task-3"),
+        "{unresolved}"
+    );
+    assert!(
+        unresolved.contains("blocked_by=task-missing"),
+        "{unresolved}"
+    );
+    assert!(!unresolved.contains("next="), "{unresolved}");
+}
+
+#[test]
 fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
     let redacted = redact_trace_value(&json!({
         "Authorization": "Bearer secret",

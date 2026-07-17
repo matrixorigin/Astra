@@ -1213,6 +1213,9 @@ pub fn render_collapsed_active_summary(
         .cloned()
         .collect::<Vec<_>>();
     active.sort_by_key(|task| !unresolved_task_blocker_ids(tasks, task).is_empty());
+    if active.is_empty() {
+        return None;
+    }
     let selected = active
         .iter()
         .find(|task| task.status.is_in_progress())
@@ -1244,7 +1247,18 @@ pub fn render_collapsed_active_summary(
     let summary_width = blocker_suffix.as_ref().map_or(columns, |suffix| {
         columns.saturating_sub(suffix.width() as u16)
     });
-    let mut line = render_collapsed_summary(&active, summary_width)?;
+    // Preserve lifecycle progress in a mixed board while keeping terminal
+    // rows ineligible for current/next selection. Putting the ordered open
+    // rows first lets `render_collapsed_summary` select the same ready task;
+    // appending terminal history keeps done/failed/cancelled counts truthful.
+    let mut lifecycle = active;
+    lifecycle.extend(
+        tasks
+            .iter()
+            .filter(|task| task_is_renderable(task) && !task.status.is_open_work())
+            .cloned(),
+    );
+    let mut line = render_collapsed_summary(&lifecycle, summary_width)?;
     if let Some(suffix) = blocker_suffix {
         line.spans.push(Span::styled(
             suffix,
@@ -1344,17 +1358,26 @@ pub fn render_collapsed_multi_summary(
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
 pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
-    // Pick the first in-progress task, else first pending.
-    let candidate = tasks
+    let mut active = tasks
         .iter()
-        .find(|t| t.status.is_in_progress())
-        .or_else(|| tasks.iter().find(|t| t.status.is_pending()))?;
+        .filter(|task| task.status.is_open_work())
+        .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
+        .collect::<Vec<_>>();
+    active.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
+    let (candidate, blockers) = active.first()?;
+    let label = if !blockers.is_empty() {
+        "Waiting · "
+    } else if candidate.status == SessionTaskStatusKind::Paused {
+        "Resume · "
+    } else {
+        "Focus · "
+    };
     let subject = truncate_to_width(
         &candidate.title,
-        max_subject_width(columns).saturating_sub(9), // "Focus · "
+        max_subject_width(columns).saturating_sub(label.width()),
     );
     Some(Line::from(Span::styled(
-        format!("Focus · {}", subject),
+        format!("{label}{subject}"),
         Style::default().add_modifier(Modifier::DIM),
     )))
 }
@@ -1657,6 +1680,24 @@ mod tests {
     }
 
     #[test]
+    fn next_hint_does_not_present_blocked_work_as_focus() {
+        let blocker = mk_task("task-1", "prerequisite", "pending");
+        let mut blocked = mk_task("task-2", "dependent", "pending");
+        blocked.blocked_by = vec!["task-1".into()];
+        let hint = render_next_hint(&[blocker, blocked], 80).expect("ready blocker hint");
+        assert_eq!(spans_text(&hint), "Focus · prerequisite");
+
+        let mut missing = mk_task("task-3", "needs missing input", "pending");
+        missing.blocked_by = vec!["task-missing".into()];
+        let waiting = render_next_hint(&[missing], 80).expect("blocked hint");
+        assert_eq!(spans_text(&waiting), "Waiting · needs missing input");
+
+        let paused = mk_task("task-4", "paused for review", "paused");
+        let resume = render_next_hint(&[paused], 80).expect("paused hint");
+        assert_eq!(spans_text(&resume), "Resume · paused for review");
+    }
+
+    #[test]
     fn collapsed_summary_shows_counts_and_current_task() {
         let tasks = vec![
             mk_task("task-1", "alpha-done", "completed"),
@@ -1717,6 +1758,10 @@ mod tests {
                 .expect("resolved active summary"),
         );
         assert!(resolved_summary.contains("dependent"), "{resolved_summary}");
+        assert!(
+            resolved_summary.contains("1 done"),
+            "mixed compact boards must retain terminal lifecycle progress: {resolved_summary}"
+        );
         assert!(
             !resolved_summary.contains("waiting on"),
             "{resolved_summary}"

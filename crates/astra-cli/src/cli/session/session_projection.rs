@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use astra_text_utils::str_preview::truncate_str;
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
 
 use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 use crate::cli::stream::streaming_types::StreamResult;
@@ -108,9 +108,32 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
     lines
 }
 
-fn prioritize_active_tasks_for_anchor(mut tasks: Vec<SessionTask>) -> Vec<SessionTask> {
-    tasks.sort_by_key(|task| session_task_active_priority(task.status));
-    tasks
+fn prioritize_active_tasks_for_anchor(tasks: Vec<SessionTask>) -> Vec<SessionTask> {
+    let mut active = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .map(|task| {
+            let mut projected = task.clone();
+            projected.blocked_by = unresolved_task_blocker_ids(&tasks, task);
+            projected
+        })
+        .collect::<Vec<_>>();
+    active.sort_by_key(|task| {
+        (
+            session_task_active_priority(task.status),
+            !task.blocked_by.is_empty(),
+        )
+    });
+    active
+}
+
+fn compact_blocker_ids(blockers: &[String]) -> String {
+    const MAX_IDS: usize = 3;
+    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
+    if blockers.len() > MAX_IDS {
+        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
+    }
+    ids.join(", ")
 }
 
 fn active_task_anchor_items(active_tasks: &[SessionTask]) -> Vec<String> {
@@ -121,7 +144,7 @@ fn active_task_anchor_items(active_tasks: &[SessionTask]) -> Vec<String> {
             let blocked = if task.blocked_by.is_empty() {
                 String::new()
             } else {
-                format!(" [blocked by: {}]", task.blocked_by.join(", "))
+                format!(" [blocked by: {}]", compact_blocker_ids(&task.blocked_by))
             };
             format!(
                 "[{}] {}: {}{}",
@@ -251,7 +274,7 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Result<Vec<SessionTask>, String> {
     state
         .task_manager
-        .load_active_tasks()
+        .load_tasks()
         .await
         .map(prioritize_active_tasks_for_anchor)
 }
@@ -619,6 +642,42 @@ mod tests {
         assert!(anchor.contains("Active task board:"), "{anchor}");
         assert!(anchor.contains("Finish slash command repair"), "{anchor}");
         assert!(anchor.contains("[in_progress]"), "{anchor}");
+    }
+
+    #[tokio::test]
+    async fn continuation_anchor_does_not_call_completed_dependency_blocked() {
+        let mut state = SessionState::default();
+        state.task_manager.rebind("sess-anchor-resolved");
+        state
+            .history
+            .push(("继续".into(), "Finished the prerequisite.".into()));
+        state
+            .task_manager
+            .create(&serde_json::json!({"title": "prerequisite"}))
+            .await;
+        state
+            .task_manager
+            .update(&serde_json::json!({
+                "task_id": "task-1",
+                "new_status": "completed"
+            }))
+            .await;
+        state
+            .task_manager
+            .create(&serde_json::json!({
+                "title": "ready dependent",
+                "add_blocked_by": ["task-1"]
+            }))
+            .await;
+
+        rebuild_continuation_anchor_from_live_state(&mut state).await;
+
+        let anchor = state.continuation_anchor.expect("anchor");
+        assert!(anchor.contains("ready dependent"), "{anchor}");
+        assert!(
+            !anchor.contains("blocked by"),
+            "completed edges are history, not active blockers: {anchor}"
+        );
     }
 
     #[tokio::test]

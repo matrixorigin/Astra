@@ -552,7 +552,6 @@ pub(crate) fn active_viewport(
     // separately could pair a pre-refresh cache with post-refresh confidence.
     let projection = board.map(TaskBoardObserver::active_projection);
     let truth_state = projection.as_ref().map(TaskBoardProjection::truth_state);
-    let has_confirmed_truth = truth_state.is_some_and(TaskBoardTruthState::has_confirmed_truth);
     let has_tasks = projection
         .as_ref()
         .is_some_and(TaskBoardProjection::has_tasks);
@@ -593,7 +592,7 @@ pub(crate) fn active_viewport(
     // there is any displayable work, show its independently attributable
     // health without hiding the canonical task projection.
     let checklist_lane_is_relevant =
-        has_confirmed_truth || has_tasks || board_expanded || board_user_pin.is_some();
+        has_open_work || resolved_expanded || board_user_pin == Some(true);
     if checklist_lane_is_relevant
         && let Some(line) =
             truth_state.and_then(|state| task_board_truth_line(state, store_health, width))
@@ -1622,14 +1621,12 @@ mod task_board_draw_tests {
             || obs.maybe_refresh(),
         )
         .await;
-        obs.hide_completed_after_review();
-
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
             &status_indicator::StatusIndicator::new(),
             Some(&obs),
             false,
-            None,
+            Some(false),
             80,
             24,
         );
@@ -1644,6 +1641,23 @@ mod task_board_draw_tests {
         assert_eq!(
             footer.task_counts, None,
             "terminal history remains available through Ctrl+T without a sticky footer chip"
+        );
+
+        assert!(obs.request_refresh());
+        let refreshing_frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&obs),
+            false,
+            Some(false),
+            80,
+            24,
+        );
+        assert_eq!(obs.truth_state(), TaskBoardTruthState::Refreshing);
+        assert!(
+            refreshing_frame.task_board.is_none(),
+            "quiet reconciliation of explicitly collapsed terminal history must not flash a foreground loading row: {:?}",
+            refreshing_frame.task_board
         );
     }
 

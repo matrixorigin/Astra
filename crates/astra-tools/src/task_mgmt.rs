@@ -322,22 +322,23 @@ fn projected_blockers_for_task(
     blockers
 }
 
-fn blocker_is_resolved(tasks: &[SessionTask], blocker_id: &str) -> bool {
-    tasks
-        .iter()
-        .find(|task| task.id == blocker_id)
-        .is_some_and(|task| task.status.is_completed())
-}
-
 fn unresolved_blocker_ids(
     tasks: &[SessionTask],
     blocker_ids: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
+    let task_statuses = tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.status))
+        .collect::<HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut unresolved = blocker_ids
         .into_iter()
         .filter(|blocker_id| seen.insert(blocker_id.clone()))
-        .filter(|blocker_id| !blocker_is_resolved(tasks, blocker_id))
+        .filter(|blocker_id| {
+            !task_statuses
+                .get(blocker_id.as_str())
+                .is_some_and(SessionTaskStatusKind::is_completed)
+        })
         .collect::<Vec<_>>();
     unresolved.sort();
     unresolved
@@ -372,7 +373,7 @@ fn projected_unresolved_task_blocker_ids(
     )
 }
 
-fn validate_task_can_start_after_projected_edges(
+fn validate_task_blockers_resolved_after_projected_edges(
     tasks: &[SessionTask],
     task_id: &str,
     add_blocked_by: &[String],
@@ -394,7 +395,7 @@ fn validate_task_can_start_after_projected_edges(
     }
 
     Err(format!(
-        "task '{}' cannot start while blocked_by is unresolved: {}. Complete the blocker(s), or remove the dependency if it no longer applies",
+        "task '{}' cannot start or complete while blocked_by is unresolved: {}. Complete the blocker(s), or remove the dependency if it no longer applies",
         task_id,
         unresolved.join(", ")
     ))
@@ -845,6 +846,7 @@ pub trait TaskStore: Send + Sync {
                     }
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
+                    reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
                     return Ok(TaskMutationResult {
                         tasks,
                         next_task_id: None,
@@ -888,6 +890,7 @@ pub trait TaskStore: Send + Sync {
                 }
                 let archived = archived_ids.len() as u64;
                 detach_task_dependency_edges(&mut tasks, &archived_ids);
+                reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
                 Ok(TaskMutationResult {
                     tasks,
                     next_task_id: None,
@@ -1937,6 +1940,15 @@ pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
 /// only fires when this function itself auto-completed the parent earlier.
 /// Explicit parent completion is terminal history and must not be resurrected
 /// by a later subtask edit.
+fn clear_auto_completed_marker(task: &mut SessionTask) {
+    if let Some(meta) = task.metadata.as_mut() {
+        meta.remove("auto_completed_by_subtasks");
+        if meta.is_empty() {
+            task.metadata = None;
+        }
+    }
+}
+
 fn reconcile_subtask_completion(task: &mut SessionTask, blockers_resolved: bool) {
     if task.subtasks.is_empty() {
         return;
@@ -1948,6 +1960,13 @@ fn reconcile_subtask_completion(task: &mut SessionTask, blockers_resolved: bool)
             task.status = SessionTaskStatusKind::Completed;
             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
             meta.insert("auto_completed_by_subtasks".to_string(), json!(true));
+        } else if !blockers_resolved && is_reversible_auto_completed_parent(task) {
+            // Completion derived from children is valid only while the task's
+            // own prerequisites remain resolved. If an upstream auto-complete
+            // is reversed, reopen this derived completion as waiting work so
+            // downstream projections never report success through a blocker.
+            task.status = SessionTaskStatusKind::Pending;
+            clear_auto_completed_marker(task);
         }
         return;
     }
@@ -1960,18 +1979,66 @@ fn reconcile_subtask_completion(task: &mut SessionTask, blockers_resolved: bool)
         .unwrap_or(false);
     if task.status.is_completed() && was_auto_completed {
         task.status = SessionTaskStatusKind::InProgress;
-        if let Some(meta) = task.metadata.as_mut() {
-            meta.remove("auto_completed_by_subtasks");
-            if meta.is_empty() {
-                task.metadata = None;
-            }
-        }
+        clear_auto_completed_marker(task);
         return;
     }
 
     let any_started = task.subtasks.iter().any(|st| st.status.is_started());
-    if any_started && task.status.is_pending() {
+    if any_started && task.status.is_pending() && blockers_resolved {
         task.status = SessionTaskStatusKind::InProgress;
+    }
+}
+
+/// Reconcile every derived parent status until dependency-driven completion
+/// reaches a fixed point. A task completion can unblock another all-done
+/// parent, which can in turn unblock a third; one local callback is therefore
+/// not a complete trigger model.
+fn reconcile_all_subtask_completion(tasks: &mut [SessionTask], now: &str) {
+    for _ in 0..tasks.len() {
+        let task_statuses = tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status))
+            .collect::<HashMap<_, _>>();
+        let mut blocker_ids = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    task.blocked_by.iter().cloned().collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for blocker in tasks.iter() {
+            for blocked_id in &blocker.blocks {
+                if let Some(ids) = blocker_ids.get_mut(blocked_id.as_str()) {
+                    ids.insert(blocker.id.clone());
+                }
+            }
+        }
+        let blockers_resolved = tasks
+            .iter()
+            .map(|task| {
+                blocker_ids.get(task.id.as_str()).is_none_or(|ids| {
+                    ids.iter().all(|id| {
+                        task_statuses
+                            .get(id)
+                            .is_some_and(SessionTaskStatusKind::is_completed)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (task, blockers_resolved) in tasks.iter_mut().zip(blockers_resolved) {
+            let previous_status = task.status;
+            reconcile_subtask_completion(task, blockers_resolved);
+            if task.status != previous_status {
+                task.updated_at = now.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -2091,14 +2158,36 @@ impl TaskManager {
     /// reads from the durable store, and flows through the context pipeline's
     /// proper token accounting.
     pub async fn build_active_task_context(&self) -> Option<String> {
-        fn compact_title(title: &str) -> String {
-            const MAX_CHARS: usize = 120;
-            if title.chars().count() <= MAX_CHARS {
-                return title.to_string();
+        fn compact_text(text: &str, max_chars: usize) -> String {
+            if max_chars == 0 {
+                return String::new();
             }
-            let mut out: String = title.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+            if text.chars().count() <= max_chars {
+                return text.to_string();
+            }
+            let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
             out.push('…');
             out
+        }
+
+        fn compact_title(title: &str) -> String {
+            compact_text(title, 120)
+        }
+
+        fn compact_blocked_task(task: &SessionTask, blockers: &[String]) -> String {
+            const MAX_CHARS: usize = 120;
+            const MAX_BLOCKERS: usize = 2;
+            let mut blocker_summary = blockers
+                .iter()
+                .take(MAX_BLOCKERS)
+                .map(|id| compact_text(id, 32))
+                .collect::<Vec<_>>();
+            if blockers.len() > MAX_BLOCKERS {
+                blocker_summary.push(format!("+{} more", blockers.len() - MAX_BLOCKERS));
+            }
+            let suffix = format!(" (waiting on {})", blocker_summary.join(", "));
+            let title_budget = MAX_CHARS.saturating_sub(suffix.chars().count());
+            format!("{}{}", compact_text(&task.title, title_budget), suffix)
         }
 
         fn compact_titles(titles: &[&str]) -> String {
@@ -2147,7 +2236,7 @@ impl TaskManager {
         let blocked = open_tasks
             .iter()
             .filter(|(_, blockers)| !blockers.is_empty())
-            .map(|(task, blockers)| format!("{} (waiting on {})", task.title, blockers.join(", ")))
+            .map(|(task, blockers)| compact_blocked_task(task, blockers))
             .collect::<Vec<_>>();
         let blocked_titles = blocked.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -2889,13 +2978,8 @@ impl TaskManager {
                             return Err(format!("task '{}' not found", task_id));
                         };
                         let mut projected_task = tasks[task_index].clone();
-                        if matches!(
-                            projected_task.status,
-                            SessionTaskStatusKind::Completed
-                                | SessionTaskStatusKind::Failed
-                                | SessionTaskStatusKind::Cancelled
-                                | SessionTaskStatusKind::Archived
-                        ) && !is_reversible_auto_completed_parent(&projected_task)
+                        if !projected_task.status.is_open_work()
+                            && !is_reversible_auto_completed_parent(&projected_task)
                         {
                             return Err(format!(
                                 "task '{}' is already terminal ({}); create a new task for follow-up work instead of editing its subtasks",
@@ -2928,6 +3012,12 @@ impl TaskManager {
                             Some(SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed)
                         ) {
                             validate_subtask_dependencies_resolved(&projected_task, st_id)?;
+                            validate_task_blockers_resolved_after_projected_edges(
+                                &tasks,
+                                &task_id,
+                                &[],
+                                &[],
+                            )?;
                         }
                         let blockers_resolved =
                             unresolved_task_blocker_ids(&tasks, &projected_task).is_empty();
@@ -2955,7 +3045,7 @@ impl TaskManager {
                         task.status = projected_task.status;
                         task.metadata = projected_task.metadata;
                         let final_subtask_status = subtask.status;
-                        task.updated_at = now;
+                        task.updated_at = now.clone();
                         let response = prefix_summary(
                             format!(
                                 "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
@@ -2971,6 +3061,10 @@ impl TaskManager {
                             })
                             .to_string(),
                         );
+                        // Parent auto-completion is dependency-driven. If this
+                        // task just completed, reconcile any all-done parents
+                        // that it unblocked in the same atomic mutation.
+                        reconcile_all_subtask_completion(&mut tasks, &now);
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
@@ -3001,6 +3095,7 @@ impl TaskManager {
                         };
                         let deleted_ids = HashSet::from([task_id.clone()]);
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
+                        reconcile_all_subtask_completion(&mut tasks, &now);
                         let response = prefix_summary(
                             format!("Task #{task_id} deleted (was: {previous_status})"),
                             json!({
@@ -3091,18 +3186,45 @@ impl TaskManager {
                             return Err(format!("task '{}' cannot be blocked by itself", task_id));
                         }
                     }
-                    if projected_status.is_in_progress() {
-                        let starting_now = new_status == Some(SessionTaskStatusKind::InProgress)
-                            && previous_status != SessionTaskStatusKind::InProgress;
+                    if projected_status.is_in_progress() || projected_status.is_completed()
+                    {
+                        let advancing_now = matches!(
+                            new_status,
+                            Some(
+                                SessionTaskStatusKind::InProgress
+                                    | SessionTaskStatusKind::Completed
+                            )
+                        ) && previous_status != projected_status;
                         let incoming_dependency_changed = !proposed_blocked_by.is_empty()
                             || !remove_blocked_by.is_empty();
-                        if starting_now || incoming_dependency_changed {
-                            validate_task_can_start_after_projected_edges(
+                        if advancing_now || incoming_dependency_changed {
+                            validate_task_blockers_resolved_after_projected_edges(
                                 &tasks,
                                 &task_id,
                                 &proposed_blocked_by,
                                 &remove_blocked_by,
                             )?;
+                        }
+                    }
+
+                    // `add_blocks` is the reverse spelling of adding an
+                    // incoming blocker to the target. Validate the affected
+                    // running task too; otherwise callers can bypass the same
+                    // invariant simply by mutating the other endpoint.
+                    if !projected_status.is_completed() {
+                        for blocked_id in &proposed_blocks {
+                            if let Some(blocked_task) = tasks
+                                .iter()
+                                .find(|task| task.id == *blocked_id)
+                                .filter(|task| {
+                                    task.status.is_in_progress() || task.status.is_completed()
+                                })
+                            {
+                                return Err(format!(
+                                    "task '{}' cannot become blocked by unresolved task '{}' while {}. Complete the blocker first, or move open work to a non-advancing state before adding the dependency",
+                                    blocked_id, task_id, blocked_task.status
+                                ));
+                            }
                         }
                     }
 
@@ -3168,14 +3290,7 @@ impl TaskManager {
                         }
                     }
 
-                    let blockers_resolved = projected_unresolved_task_blocker_ids(
-                        &tasks,
-                        &task_id,
-                        &proposed_blocked_by,
-                        &remove_blocked_by,
-                    )
-                    .is_empty();
-                    let (final_status, cancelled_subtasks) = {
+                    let cancelled_subtasks = {
                         let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
                             return Err(format!("task '{}' not found", task_id));
                         };
@@ -3256,8 +3371,7 @@ impl TaskManager {
 
                         task.updated_at = now.clone();
 
-                        reconcile_subtask_completion(task, blockers_resolved);
-                        (task.status, cancelled_subtasks)
+                        cancelled_subtasks
                     };
 
                     for id in &remove_blocks {
@@ -3272,6 +3386,13 @@ impl TaskManager {
                     for id in &proposed_blocked_by {
                         add_dependency_edge(&mut tasks, id, &task_id, &now)?;
                     }
+
+                    reconcile_all_subtask_completion(&mut tasks, &now);
+                    let final_status = tasks
+                        .iter()
+                        .find(|task| task.id == task_id)
+                        .map(|task| task.status)
+                        .ok_or_else(|| format!("task '{}' not found after update", task_id))?;
 
                     let mut response_body = json!({
                             "success": true,
@@ -5515,6 +5636,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_add_blocks_cannot_bypass_running_task_dependency_validation() {
+        let m = mgr();
+        m.create(&json!({"title": "late prerequisite"})).await;
+        m.create(&json!({"title": "already running"})).await;
+        let started = m
+            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
+
+        let rejected = m
+            .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(
+            rejected.contains("task-2")
+                && rejected.contains("task-1")
+                && rejected.contains("in_progress"),
+            "the reverse edge spelling should explain the same invariant: {rejected}"
+        );
+        let tasks = m.snapshot().await.expect("unchanged task graph");
+        assert!(tasks[0].blocks.is_empty(), "{tasks:?}");
+        assert!(tasks[1].blocked_by.is_empty(), "{tasks:?}");
+    }
+
+    #[tokio::test]
+    async fn completed_status_rejects_unresolved_parent_dependencies() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        m.create(&json!({
+            "title": "blocked work",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let rejected = m
+            .update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(
+            rejected.contains("cannot start or complete")
+                && rejected.contains("task-1")
+                && rejected.contains("pending"),
+            "completion must not turn blocked work into a downstream success signal: {rejected}"
+        );
+        let blocked: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(blocked.status, SessionTaskStatusKind::Pending);
+    }
+
+    #[tokio::test]
+    async fn subtask_cannot_start_through_an_unresolved_parent_dependency() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        m.create(&json!({
+            "title": "blocked parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "child", "title": "must wait too"}]
+        }))
+        .await;
+
+        let rejected = m
+            .update(&json!({
+                "task_id": "task-2",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(rejected.contains("task-1"), "{rejected}");
+        let parent: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(parent.status, SessionTaskStatusKind::Pending);
+        assert_eq!(parent.subtasks[0].status, SessionTaskStatusKind::Pending);
+    }
+
+    #[tokio::test]
     async fn in_progress_allows_same_update_to_remove_stale_dependency() {
         let m = mgr();
         m.create(&json!({"title": "old blocker"})).await;
@@ -5603,6 +5800,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_blocker_completion_reconciles_all_done_parent_chain() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "prerequisite",
+            "subtasks": [{"id": "prereq-child", "title": "finish prerequisite"}]
+        }))
+        .await;
+        m.create(&json!({
+            "title": "dependent parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "dependent-child", "title": "already done"}]
+        }))
+        .await;
+        m.create(&json!({
+            "title": "transitive parent",
+            "add_blocked_by": ["task-2"],
+            "subtasks": [{"id": "transitive-child", "title": "already done too"}]
+        }))
+        .await;
+
+        // Simulate durable state written by an older client before parent
+        // dependency validation was enforced. A subsequent canonical
+        // mutation must reconcile it instead of leaving the board stuck.
+        let mut snapshot = m.try_snapshot_state().await.expect("legacy snapshot");
+        for task_id in ["task-2", "task-3"] {
+            let task = snapshot
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+                .expect("dependent fixture task");
+            task.subtasks[0].status = SessionTaskStatusKind::Completed;
+        }
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy all-done parents");
+        for task_id in ["task-2", "task-3"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await).unwrap();
+            assert_eq!(task.status, SessionTaskStatusKind::Pending, "{task:?}");
+        }
+
+        let completed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "prereq-child",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+        for task_id in ["task-1", "task-2", "task-3"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await).unwrap();
+            assert_eq!(
+                task.status,
+                SessionTaskStatusKind::Completed,
+                "completion should propagate through the dependency chain: {task:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reopened_prerequisite_reopens_derived_completion_chain() {
+        let m = mgr();
+        for (title, blocker) in [
+            ("root", None),
+            ("dependent", Some("task-1")),
+            ("transitive", Some("task-2")),
+        ] {
+            let mut create = json!({
+                "title": title,
+                "subtasks": [{"id": "only", "title": format!("{title} child")}]
+            });
+            if let Some(blocker) = blocker {
+                create["add_blocked_by"] = json!([blocker]);
+            }
+            let created = m.create(&create).await;
+            assert!(!created.starts_with("Error:"), "{created}");
+        }
+        for task_id in ["task-1", "task-2", "task-3"] {
+            let completed = m
+                .update(&json!({
+                    "task_id": task_id,
+                    "subtask_id": "only",
+                    "new_status": "completed"
+                }))
+                .await;
+            assert!(!completed.starts_with("Error:"), "{completed}");
+        }
+
+        let reopened = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "pending"
+            }))
+            .await;
+        assert!(!reopened.starts_with("Error:"), "{reopened}");
+        let tasks = m.try_snapshot_state().await.expect("reopened chain").tasks;
+        assert_eq!(tasks[0].status, SessionTaskStatusKind::InProgress);
+        assert_eq!(tasks[1].status, SessionTaskStatusKind::Pending);
+        assert_eq!(tasks[2].status, SessionTaskStatusKind::Pending);
+        assert_eq!(unresolved_task_blocker_ids(&tasks, &tasks[1]), ["task-1"]);
+        assert_eq!(unresolved_task_blocker_ids(&tasks, &tasks[2]), ["task-2"]);
+
+        let recompleted = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!recompleted.starts_with("Error:"), "{recompleted}");
+        assert!(
+            m.try_snapshot_state()
+                .await
+                .expect("recompleted chain")
+                .tasks
+                .iter()
+                .all(|task| task.status.is_completed())
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_task_rejects_new_unresolved_dependency_from_either_endpoint() {
+        let m = mgr();
+        m.create(&json!({"title": "unfinished prerequisite"})).await;
+        m.create(&json!({"title": "finished work"})).await;
+        let completed = m
+            .update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+
+        let direct = m
+            .update(&json!({
+                "task_id": "task-2",
+                "add_blocked_by": ["task-1"]
+            }))
+            .await;
+        assert!(direct.starts_with("Error:"), "{direct}");
+        assert!(direct.contains("cannot start or complete"), "{direct}");
+
+        let reverse = m
+            .update(&json!({
+                "task_id": "task-1",
+                "add_blocks": ["task-2"]
+            }))
+            .await;
+        assert!(reverse.starts_with("Error:"), "{reverse}");
+        assert!(reverse.contains("while completed"), "{reverse}");
+
+        let tasks = m.try_snapshot_state().await.expect("unchanged graph").tasks;
+        assert!(tasks.iter().all(|task| task.blocks.is_empty()));
+        assert!(tasks.iter().all(|task| task.blocked_by.is_empty()));
+    }
+
+    #[tokio::test]
     async fn completing_all_children_finishes_a_paused_parent() {
         let m = mgr();
         m.create(&json!({
@@ -5657,6 +6010,32 @@ mod tests {
             !task_b.blocked_by.contains(&"task-1".to_string()),
             "b still references a: {task_b:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_last_blocker_reconciles_legacy_all_done_parent() {
+        let m = mgr();
+        m.create(&json!({"title": "obsolete blocker"})).await;
+        m.create(&json!({
+            "title": "dependent parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "done", "title": "legacy completed child"}]
+        }))
+        .await;
+        let mut snapshot = m.try_snapshot_state().await.expect("delete fixture");
+        snapshot.tasks[1].subtasks[0].status = SessionTaskStatusKind::Completed;
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy delete fixture");
+
+        let deleted = m
+            .update(&json!({"task_id": "task-1", "new_status": "deleted"}))
+            .await;
+        assert!(!deleted.starts_with("Error:"), "{deleted}");
+        let dependent: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(dependent.status, SessionTaskStatusKind::Completed);
+        assert!(dependent.blocked_by.is_empty(), "{dependent:?}");
     }
 
     #[tokio::test]
@@ -6888,12 +7267,21 @@ mod tests {
     async fn archive_single_task_detaches_dependency_edges() {
         let m = mgr();
         m.create(&json!({"title": "producer"})).await;
-        m.create(&json!({"title": "consumer"})).await;
+        m.create(&json!({
+            "title": "consumer",
+            "subtasks": [{"id": "done", "title": "legacy completed child"}]
+        }))
+        .await;
         let linked = m
             .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
             .await;
         assert!(!linked.starts_with("Error:"), "{linked}");
-        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
+        let mut snapshot = m.try_snapshot_state().await.expect("archive fixture");
+        snapshot.tasks[0].status = SessionTaskStatusKind::Completed;
+        snapshot.tasks[1].subtasks[0].status = SessionTaskStatusKind::Completed;
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy archive fixture");
 
         let archived = m.archive(&json!({"task_id": "task-1"})).await;
         assert!(!archived.starts_with("Error:"), "{archived}");
@@ -6910,6 +7298,11 @@ mod tests {
         assert!(
             consumer.blocked_by.is_empty(),
             "open tasks should not remain blocked by archived history: {consumer:?}"
+        );
+        assert_eq!(
+            consumer.status,
+            SessionTaskStatusKind::Completed,
+            "detaching the last blocker must reconcile an all-done parent atomically"
         );
     }
 
@@ -7222,6 +7615,31 @@ mod tests {
             "{ctx}"
         );
         assert!(!ctx.contains("Focus on the first pending"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_bounds_blocker_details_without_hiding_them() {
+        let m = mgr();
+        for index in 1..=4 {
+            m.create(&json!({"title": format!("prerequisite {index}")}))
+                .await;
+        }
+        m.create(&json!({
+            "title": "x".repeat(200),
+            "add_blocked_by": ["task-1", "task-2", "task-3", "task-4"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        let blocked_line = ctx
+            .lines()
+            .find(|line| line.starts_with("- ⛔ Blocked"))
+            .expect("bounded blocked summary");
+        assert!(blocked_line.contains("waiting on task-1, task-2, +2 more"));
+        assert!(
+            blocked_line.chars().count() <= 140,
+            "prompt projection must stay bounded: {blocked_line}"
+        );
     }
 
     #[tokio::test]

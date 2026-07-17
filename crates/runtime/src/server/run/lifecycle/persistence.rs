@@ -24,7 +24,7 @@ use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
 use astra_turn_core::contracts::{
     TurnDecisionAuditRecord, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
     TurnObserverWorker, TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord,
@@ -894,21 +894,27 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     }
 }
 
+fn compact_task_blocker_ids(blockers: &[String]) -> String {
+    const MAX_IDS: usize = 3;
+    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
+    if blockers.len() > MAX_IDS {
+        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
+    }
+    ids.join(",")
+}
+
 pub(crate) fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<String> {
-    let open: Vec<&SessionTask> = tasks
+    let mut open = tasks
         .iter()
         .filter(|task| task.status.is_open_work())
-        .collect();
+        .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
+        .collect::<Vec<_>>();
     if open.is_empty() {
         return None;
     }
+    open.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
 
-    let next = open
-        .iter()
-        .copied()
-        .find(|task| task.status.is_in_progress())
-        .or_else(|| open.iter().copied().find(|task| task.status.is_pending()))
-        .or_else(|| open.first().copied())?;
+    let (next, blockers) = open.first()?;
     let title = next.title.chars().take(120).collect::<String>();
     let more = open.len().saturating_sub(1);
     let more_suffix = if more > 0 {
@@ -916,14 +922,18 @@ pub(crate) fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<Str
     } else {
         String::new()
     };
-    Some(format!(
-        "open={} · next=[{}] {}: {}{}",
-        open.len(),
-        next.status,
-        next.id,
-        title,
-        more_suffix
-    ))
+    let focus = if blockers.is_empty() {
+        format!("next=[{}] {}: {}", next.status, next.id, title)
+    } else {
+        format!(
+            "waiting=[{}] {}: {} · blocked_by={}",
+            next.status,
+            next.id,
+            title,
+            compact_task_blocker_ids(blockers)
+        )
+    };
+    Some(format!("open={} · {focus}{more_suffix}", open.len()))
 }
 
 pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {

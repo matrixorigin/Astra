@@ -1,7 +1,7 @@
 use crate::cli::project_instructions::format_project_instructions;
 use crate::cli::session::session_state::SessionState;
 use astra_runtime::prompts;
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
 use astra_turn_core::input_classifier;
 
 /// Detect if a user message appears to be a correction/redirection.
@@ -58,7 +58,7 @@ pub(crate) async fn finalize_effective_line(
     if state.turns_since_task_use >= TURNS_SINCE_TASK_USE_THRESHOLD
         && state.turns_since_task_reminder >= TURNS_BETWEEN_REMINDERS
     {
-        let snapshot = match state.task_manager.load_active_tasks().await {
+        let snapshot = match state.task_manager.load_tasks().await {
             Ok(tasks) => format_open_task_snapshot(&tasks)
                 .map(|task_list| format!("External task board snapshot:\n{task_list}")),
             Err(error) => Some(format!("External task board snapshot unavailable: {error}")),
@@ -83,20 +83,36 @@ pub(crate) async fn finalize_effective_line(
     }
 }
 
+fn compact_blocker_ids(blockers: &[String]) -> String {
+    const MAX_IDS: usize = 3;
+    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
+    if blockers.len() > MAX_IDS {
+        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
+    }
+    ids.join(", ")
+}
+
 fn format_open_task_snapshot(tasks: &[SessionTask]) -> Option<String> {
-    let mut lines: Vec<String> = tasks
+    let mut open = tasks
         .iter()
         .filter(|task| task.status.is_open_work())
+        .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
+        .collect::<Vec<_>>();
+    open.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
+    let mut lines: Vec<String> = open
+        .iter()
         .take(10)
-        .map(|task| {
+        .map(|(task, blockers)| {
             let title = task.title.chars().take(120).collect::<String>();
-            format!("- [{}] {}: {}", task.status, task.id, title)
+            let blocked = if blockers.is_empty() {
+                String::new()
+            } else {
+                format!(" [blocked by: {}]", compact_blocker_ids(blockers))
+            };
+            format!("- [{}] {}: {}{}", task.status, task.id, title, blocked)
         })
         .collect();
-    let open_total = tasks
-        .iter()
-        .filter(|task| task.status.is_open_work())
-        .count();
+    let open_total = open.len();
     if open_total > lines.len() {
         lines.push(format!(
             "- ... {} more open task(s)",
@@ -555,6 +571,14 @@ mod tests {
             .update(&serde_json::json!({"task_id": "task-3", "new_status": "completed"}))
             .await;
         assert!(!done_update.starts_with("Error:"), "{done_update}");
+        let dependent = state
+            .task_manager
+            .create(&serde_json::json!({
+                "title": "Ready after finished work",
+                "add_blocked_by": ["task-3"]
+            }))
+            .await;
+        assert!(!dependent.starts_with("Error:"), "{dependent}");
 
         let finalized =
             finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
@@ -565,6 +589,8 @@ mod tests {
         assert!(snapshot.contains("External task board snapshot:"));
         assert!(snapshot.contains("Track the recovery cleanup"));
         assert!(snapshot.contains("[paused] task-2: Wait for operator input"));
+        assert!(snapshot.contains("Ready after finished work"), "{snapshot}");
+        assert!(!snapshot.contains("blocked by: task-3"), "{snapshot}");
         assert!(
             !snapshot.contains("Already finished"),
             "terminal completed history should not clutter the open-work snapshot: {snapshot}"
