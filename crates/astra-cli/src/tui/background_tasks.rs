@@ -683,7 +683,7 @@ impl BackgroundTaskRegistry {
 
     /// Bound retained terminal shell handles without hiding recent results.
     ///
-    /// Recent terminal tasks stay visible after their notification so Ctrl+T
+    /// Recent terminal tasks stay visible after their notification so Ctrl+B
     /// and task_output can inspect them. Failed tasks get a separate retention
     /// cap because they drive footer attention and usually need diagnosis.
     /// Output files remain on disk either way.

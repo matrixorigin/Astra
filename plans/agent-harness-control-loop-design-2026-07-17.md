@@ -534,6 +534,57 @@ agent tool 和 standalone messaging 中。每一块单独看都有合理实现�
   计费和用户意图优先级共同落地，不能用后台 `tokio::spawn` 伪造。
 - `message_type=result` 只表示模型的语义报告，不再伪造 runtime `Completed`；真实终态始终由 runtime 自动发送。
 
+### 10.2 Session `5ab1d01f-b933-4258-ba85-8536d9b35bd4` 复盘
+
+这次真实使用暴露出“局部闭环已经存在，但闭环之间会重复、误判”的问题。该 session 只有 4 条顶层
+turn 记录，却产生了 119 个 LLM round；其中 root agent 占 94 round、约 114.7 万输入 token，并调用
+`task_board` 52 次。两个修复回合分别持续约 12 分钟和 36 分钟。高消耗不是任务本身必需，而是以下
+反馈失真级联造成的：
+
+1. `agent_fanout.start` 实际返回 3 个 `launched` child 和稳定 `group_id`，顶层状态却是 `started`；通用
+   tool-result classifier 不认识 `started`，把成功回执记为 `ok=false` 和 unclassified tool error。
+2. Parent 随后用 `get_results` 收齐了 3 个结果并输出汇总，但 child attention hint 在结果收集前一瞬间
+   已进入 local run-control 队列。结算时系统没有用 `result_collected` 再确认，因而 200ms 后创建了一个
+   空 logical-user notification turn，重复汇报同一结果并再次询问是否修复。
+3. 三个 reviewer 的 finding 被直接提升为 P0 / Critical，没有先核对当前锁、容量和投递不变量。后续 root
+   先把 router race、队列 eviction、promotion rollback 判为 false positive 并取消 task-1/2/3，又创建
+   等价的 task-14/15/16、修改代码并标记 completed，最后再次撤销。Task Board 一度把“不存在于最终代码的
+   修复”显示为 completed，说明任务状态和代码事实没有完成闭环。
+4. `Ctrl+T` handler 的注释声明 Ctrl+B 是后台任务入口，代码却在普通 Task Board 路径优先调用
+   `open_background_task_view`。旧测试使用空 registry，错误分支恰好返回 false，因此形成假绿；真实 session
+   有后台任务时就稳定打开错误面板。
+5. Runtime notification 的顶层 `turn.user_input` 虽为空，但 provider 使用的非空 internal envelope 仍以
+   `role=user` 出现在 durable transcript。它没有冒充用户的 turn record，却仍污染了逐条 transcript 语义；
+   后续需要 typed internal input / persistence filter，而不是依靠固定自然语言识别。
+6. 三个 reviewer 实际分别运行 10 / 5 / 10 个 round、产生 32 / 11 / 27 次 tool call，但
+   `agent_terminated.turns_completed` 全部为 0。CLI executor 已持有准确的 session turn number，返回给 spawner
+   的结果契约却遗漏该字段，导致终态 journal 和历史面板丢失真实成本。
+
+本次按最小改动修复可由 runtime 确定保证的契约：
+
+- 通用 tool-result 语义接受 `started` 为非失败 domain status，并用 fanout 回执回归测试锁定；
+- active→idle 交接时，只对结构化 `agent_attention_hint.v1` 做确认去重：若相同 agent/run 的 fanout result
+  已被本 turn 收集，则不再启动 idle LLM turn；未收集、非 fanout 和未知通知全部保留；
+- `Ctrl+T` handler 删除 background registry / spawner 依赖，始终只操作 canonical Task Board；测试使用
+  真实运行中的后台任务验证它不会再打开 Background Tasks；所有后台 shell 回执统一提示 `Ctrl+B`；
+- CLI child result 显式携带 `turns_completed`，spawner 在 archive / journal 前写入统一 metrics。Server delegation
+  的共享结果尚未暴露 round 数时明确记 0，不使用 tool count 或 token count 猜测，避免伪造观测数据；
+- Waiting 与 Stalled 分离，系统 deadline cancellation 与用户主动取消分离，避免父 agent 基于错误生命周期
+  语义做升级或归因。
+
+对多-agent review 采用以下最小 guardrail，不建设新的 verifier 框架：
+
+- 子 agent finding 是**待验证证据**，不是 task fact。父 agent 只有在读到当前代码不变量，并得到最小复现、
+  现有测试缺口或明确反例之一后，才能把 finding 建成修复任务。
+- 容量策略必须先声明交付语义：已经返回 accepted 的消息不能为接收新消息而静默驱逐；bounded queue 满时
+  明确拒绝新消息是 backpressure，不是资源泄漏。
+- 同一 finding 被取消为 false positive 后，不因 compaction / continuation anchor 再创建等价任务；若新证据
+  要求 reopen，应恢复原 task 并记录 invalidation evidence。
+- `completed` 表示代码事实与验证事实都成立。若后续撤销对应 diff，Task Board 必须同步 reopen/cancel，不能
+  保留与工作区相反的 completed 投影。
+- 内部 notification turn 在 observability 中必须有独立 kind 和稳定 id，不能与真实用户 turn 复用编号或只靠
+  空字符串区分；这属于后续 telemetry/persistence 修复，不阻塞本轮 runtime 控制闭环。
+
 本轮没有扩展到以下能力，因为它们需要新的跨执行面契约，不能用局部开关安全完成：
 
 - Bash 按等待预算自动 yield，以及模型显式 background 的 CLI / Server 一致实现；

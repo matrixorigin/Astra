@@ -34,6 +34,7 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
                 | "still_running"
                 | "processing"
                 | "starting"
+                | "started"
                 | "waiting"
                 | "waiting_for_input"
                 | "interrupted"
@@ -876,6 +877,7 @@ mod tests {
     #[test]
     fn agent_runtime_domain_statuses_are_not_tool_execution_failures() {
         for status in [
+            "started",
             "launched",
             "still_running",
             "waiting",

@@ -137,8 +137,10 @@ pub enum AgentSignal {
     Heartbeat,
     /// Agent is idle / waiting for work.
     Idle,
-    /// Agent detected a stall condition.
+    /// Agent detected a stall condition (likely permanent without intervention).
     Stalled { reason: String },
+    /// Agent is waiting on an external dependency (may resolve without intervention).
+    Waiting { reason: String },
     /// Agent completed successfully.
     Completed { output: String },
     /// Agent failed.
@@ -512,6 +514,23 @@ mod tests {
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["type"], "progress");
         assert_eq!(json["turn_index"], 3);
+    }
+
+    #[test]
+    fn waiting_signal_roundtrip_preserves_recoverable_state() {
+        let payload = MessagePayload::Signal(AgentSignal::Waiting {
+            reason: "executor_offline".into(),
+        });
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "signal");
+        assert_eq!(json["waiting"]["reason"], "executor_offline");
+
+        let restored: MessagePayload = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            restored,
+            MessagePayload::Signal(AgentSignal::Waiting { reason })
+                if reason == "executor_offline"
+        ));
     }
 
     #[test]

@@ -5764,6 +5764,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,

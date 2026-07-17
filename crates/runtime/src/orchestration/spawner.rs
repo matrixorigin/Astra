@@ -818,6 +818,8 @@ pub struct SpawnRunResult {
     pub completion_tokens: u64,
     /// Total tool calls.
     pub tool_calls: u32,
+    /// Number of agentic-loop rounds completed by this child run.
+    pub turns_completed: u32,
     /// Final permission summary for UI/status surfaces.
     pub permission_summary: Option<PermissionSummary>,
     /// Number of permission requests sent to parent.
@@ -858,6 +860,12 @@ pub trait DurableAgentReconciler: Send + Sync {
 }
 
 // ─── Dynamic Agent Spawner ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelOrigin {
+    User,
+    System,
+}
 
 /// Handles dynamic agent creation at runtime.
 ///
@@ -2807,10 +2815,16 @@ impl DynamicAgentSpawner {
     /// Cancel a single background agent by id. Returns true only when this call
     /// actually owned the cancellation and archived the agent as cancelled.
     pub async fn cancel_agent(&self, agent_id: &str, reason: &str) -> bool {
-        self.cancel_agent_with_origin(agent_id, reason, true).await
+        self.cancel_agent_with_origin(agent_id, reason, CancelOrigin::User)
+            .await
     }
 
-    async fn cancel_agent_with_origin(&self, agent_id: &str, reason: &str, by_user: bool) -> bool {
+    async fn cancel_agent_with_origin(
+        &self,
+        agent_id: &str,
+        reason: &str,
+        origin: CancelOrigin,
+    ) -> bool {
         // Single write-lock scope that *atomically* removes both the abort
         // handle and the agent state.  This prevents a TOCTOU race where the
         // monitor finalises the agent between handle removal and state
@@ -2840,7 +2854,7 @@ impl DynamicAgentSpawner {
         // Public `cancel_agent` is user-driven (Ctrl+G x, /agent cancel,
         // etc.); bounded one-shot shutdown uses the same atomic finalization
         // without mislabeling the deadline as user intent.
-        self.finalize_cancelled_agent(&mut state, agent_id, reason, by_user)
+        self.finalize_cancelled_agent(&mut state, agent_id, reason, origin)
             .await
     }
 
@@ -2853,7 +2867,7 @@ impl DynamicAgentSpawner {
         state: &mut SpawnedAgentState,
         agent_id: &str,
         reason: &str,
-        by_user: bool,
+        origin: CancelOrigin,
     ) -> bool {
         self.foreground_promotion_requests
             .write()
@@ -2861,13 +2875,12 @@ impl DynamicAgentSpawner {
             .remove(agent_id);
         self.remove_background_agent_id(agent_id);
 
-        let status = if by_user {
-            AgentStatus::cancelled_by_user(reason)
-        } else {
-            AgentStatus::Cancelled {
+        let status = match origin {
+            CancelOrigin::User => AgentStatus::cancelled_by_user(reason),
+            CancelOrigin::System => AgentStatus::Cancelled {
                 by_user: false,
                 reason: reason.to_string(),
-            }
+            },
         };
         state.status = status;
         state.ended_at = Some(SystemTime::now());
@@ -2932,6 +2945,7 @@ impl DynamicAgentSpawner {
                 return false;
             };
             if let Some(run_result) = run_result {
+                state.metrics.turns_completed = run_result.turns_completed;
                 state.metrics.tool_calls = run_result.tool_calls;
                 state.metrics.prompt_tokens = run_result.prompt_tokens;
                 state.metrics.completion_tokens = run_result.completion_tokens;
@@ -3017,7 +3031,7 @@ impl DynamicAgentSpawner {
                 })
             }
             AgentStatus::Waiting { reason } => {
-                MessagePayload::Signal(astra_messaging::AgentSignal::Stalled {
+                MessagePayload::Signal(astra_messaging::AgentSignal::Waiting {
                     reason: reason.clone(),
                 })
             }
@@ -3325,7 +3339,7 @@ impl DynamicAgentSpawner {
                         .cancel_agent_with_origin(
                             &agent_id,
                             "one-shot caller deadline elapsed while waiting for background agent",
-                            false,
+                            CancelOrigin::System,
                         )
                         .await;
                 }
@@ -4516,6 +4530,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -4540,6 +4555,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -4562,6 +4578,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 tool_calls: 0,
+                turns_completed: 3,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -4584,6 +4601,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -4607,6 +4625,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -4638,6 +4657,7 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             tool_calls: 0,
+            turns_completed: 0,
             permission_summary: None,
             permission_requests: 0,
             permission_requests_approved: 0,
@@ -4790,6 +4810,7 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             tool_calls: 0,
+            turns_completed: 0,
             permission_summary: None,
             permission_requests: 0,
             permission_requests_approved: 0,
@@ -4896,7 +4917,7 @@ mod tests {
 
         // Background spawn returns Launched immediately; the completion
         // path unregisters the mailbox asynchronously.
-        let _agent_id = match spawner.spawn(input, &context).await.unwrap() {
+        let agent_id = match spawner.spawn(input, &context).await.unwrap() {
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
             other => panic!("expected Launched, got {other:?}"),
         };
@@ -4919,6 +4940,14 @@ mod tests {
                 .await
                 .is_ok_and(|agents| agents.is_empty()),
             "background completion should unregister mailbox"
+        );
+        let completed = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("completed child should remain inspectable");
+        assert_eq!(
+            completed.metrics.turns_completed, 3,
+            "executor-reported loop rounds must survive archival and journaling"
         );
     }
 
@@ -5319,6 +5348,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,

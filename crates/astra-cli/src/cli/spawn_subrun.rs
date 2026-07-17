@@ -1024,6 +1024,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         }
 
         let tool_calls = state.total_tool_calls as u32;
+        let turns_completed = state.current_session_turn_number();
         let agent_id = config.agent_id.clone();
         let run_id = config.run_id;
         let prompt_tokens = state.total_prompt;
@@ -1111,6 +1112,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,
@@ -1137,6 +1139,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,
@@ -1179,6 +1182,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,
@@ -1215,6 +1219,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,
@@ -1245,6 +1250,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,
@@ -1274,6 +1280,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    turns_completed,
                     permission_summary,
                     permission_requests,
                     permission_requests_approved,

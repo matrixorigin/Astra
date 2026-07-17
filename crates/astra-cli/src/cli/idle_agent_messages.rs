@@ -62,6 +62,7 @@ fn format_idle_agent_message_payload(payload: &astra_messaging::MessagePayload) 
             AgentSignal::Heartbeat => "heartbeat".to_string(),
             AgentSignal::Idle => "idle".to_string(),
             AgentSignal::Stalled { reason } => format!("stalled: {reason}"),
+            AgentSignal::Waiting { reason } => format!("waiting: {reason}"),
             AgentSignal::Completed { output } => format!("completed: {output}"),
             AgentSignal::Failed { error } => format!("failed: {error}"),
         },
@@ -90,6 +91,24 @@ pub(crate) fn flush_idle_agent_messages_between_prompts(state: &mut SessionState
             "mail".magenta(),
             format!("{} -> main", message.from.agent_id).bold(),
             payload
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_idle_agent_message_payload;
+    use astra_messaging::{AgentSignal, MessagePayload};
+
+    #[test]
+    fn waiting_signal_is_not_rendered_as_a_stall() {
+        let payload = MessagePayload::Signal(AgentSignal::Waiting {
+            reason: "executor_offline".into(),
+        });
+
+        assert_eq!(
+            format_idle_agent_message_payload(&payload),
+            "waiting: executor_offline"
         );
     }
 }

@@ -10332,6 +10332,10 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,
             tool_calls: result.tool_calls,
+            // The shared delegation result does not currently expose loop
+            // rounds. Keep this explicit instead of inventing a proxy from
+            // tool or token counts.
+            turns_completed: 0,
             permission_summary: None,
             permission_requests: 0,
             permission_requests_approved: 0,

@@ -46,6 +46,40 @@ impl LocalAgentSnapshot {
             .collect()
     }
 
+    /// Return false only for a machine-owned child attention hint whose
+    /// result was already collected by the active parent turn. The hint may
+    /// have been queued just before `agent_fanout.get_results` returned; in
+    /// that case replaying it after settlement would create a redundant idle
+    /// model turn for a fact the parent has already consumed.
+    pub(crate) fn notification_still_requires_reconciliation(&self, notification: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(notification) else {
+            return true;
+        };
+        if value.get("schema").and_then(serde_json::Value::as_str)
+            != Some("agent_attention_hint.v1")
+            || value.get("event").and_then(serde_json::Value::as_str)
+                != Some("agent_status_changed")
+        {
+            return true;
+        }
+        let Some(agent_id) = value.get("agent_id").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        let Some(run_id) = value.get("run_id").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+
+        !self
+            .fanout_groups
+            .iter()
+            .flat_map(|group| &group.slots)
+            .any(|slot| {
+                slot.result_collected
+                    && slot.agent_id.as_deref() == Some(agent_id)
+                    && slot.run_id.as_deref() == Some(run_id)
+            })
+    }
+
     /// Return only newly attention-worthy child transitions. Ordinary running
     /// progress stays in the task UI; terminal/waiting facts wake the parent
     /// exactly once when the snapshot crosses that lifecycle boundary.
@@ -108,5 +142,56 @@ impl LocalAgentSnapshot {
                 .to_string()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalAgentSnapshot;
+    use astra_turn_core::orchestration_fanout_group::{
+        AgentFanoutGroupProjection, AgentFanoutSlotStatus,
+    };
+
+    #[test]
+    fn collected_fanout_result_suppresses_only_its_stale_attention_hint() {
+        let mut group = AgentFanoutGroupProjection::new("review", "Review", 1);
+        group
+            .record_spawn_accepted_with_run(0, "reviewer@run-review", Some("run-review".into()))
+            .unwrap();
+        group
+            .record_terminal_by_agent(
+                "reviewer@run-review",
+                AgentFanoutSlotStatus::Completed,
+                None,
+            )
+            .unwrap();
+        let notification = serde_json::json!({
+            "schema": "agent_attention_hint.v1",
+            "event": "agent_status_changed",
+            "agent_id": "reviewer@run-review",
+            "run_id": "run-review",
+        })
+        .to_string();
+
+        let uncollected = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![group.clone()],
+            ..LocalAgentSnapshot::default()
+        };
+        assert!(uncollected.notification_still_requires_reconciliation(&notification));
+
+        assert!(group.mark_result_collected("reviewer@run-review"));
+        let collected = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![group],
+            ..LocalAgentSnapshot::default()
+        };
+        assert!(!collected.notification_still_requires_reconciliation(&notification));
+        assert!(collected.notification_still_requires_reconciliation(
+            r#"{"schema":"agent_attention_hint.v1","agent_id":"other","run_id":"other"}"#,
+        ));
+        assert!(collected.notification_still_requires_reconciliation(
+            "<task_notification>done</task_notification>"
+        ));
     }
 }

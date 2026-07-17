@@ -1791,15 +1791,11 @@ fn drain_plan_updates_into_workbench(
     changed
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_task_surface_shortcut(
+fn handle_task_surface_shortcut(
     key: &crossterm::event::KeyEvent,
     task_board: &task_board_observer::TaskBoardObserver,
     board_expanded: &mut bool,
     board_user_pin: &mut Option<bool>,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> bool {
@@ -1844,18 +1840,6 @@ async fn handle_task_surface_shortcut(
         *board_expanded = true;
         *board_user_pin = Some(true);
         frame_requester.schedule_frame();
-        return true;
-    }
-
-    if open_background_task_view(
-        background_registry,
-        agent_spawner,
-        restored_local_agents,
-        bottom_pane,
-        frame_requester,
-    )
-    .await
-    {
         return true;
     }
 
@@ -4070,7 +4054,10 @@ fn start_local_background_shell(
 }
 
 fn local_background_shell_started_message(task_id: &str, command: &str) -> String {
-    format!("Shell {task_id} started: {command}\nCtrl+T to inspect output or stop it.")
+    format!(
+        "Shell {task_id} started: {command}\n{} to inspect output or stop it.",
+        super::background_shortcut::ctrl_b_background_shortcut()
+    )
 }
 
 async fn run_interactive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
@@ -4806,13 +4793,9 @@ pub(crate) async fn run_tui_session(
                             &task_board,
                             &mut board_expanded,
                             &mut board_user_pin,
-                            &mut background_registry,
-                            state.agent_spawner.as_ref(),
-                            &restored_local_agent_task_projections,
                             &mut bottom_pane,
                             &frame_requester,
                         )
-                        .await
                         {
                             continue;
                         }
@@ -5790,13 +5773,9 @@ pub(crate) async fn run_tui_session(
                                                                 &task_board,
                                                                 &mut board_expanded,
                                                                 &mut board_user_pin,
-                                                                &mut background_registry,
-                                                                agent_spawner_for_cancel.as_ref(),
-                                                                &restored_local_agent_task_projections,
                                                                 &mut bottom_pane,
                                                                 &frame_requester,
                                                             )
-                                                            .await
                                                             {
                                                                 continue;
                                                             }
@@ -6737,10 +6716,24 @@ pub(crate) async fn run_tui_session(
                                                 }
                                             }
                                         };
-                                        deferred_active_bg_notifications.extend(
+                                        let mut pending_runtime_notifications =
                                             preinstalled_run_control
-                                                .take_pending_runtime_notifications(),
-                                        );
+                                                .take_pending_runtime_notifications();
+                                        if !pending_runtime_notifications.is_empty() {
+                                            let settled_agent_snapshot =
+                                                super::local_agent_snapshot::LocalAgentSnapshot::capture(
+                                                    agent_spawner_for_cancel.as_ref(),
+                                                )
+                                                .await;
+                                            pending_runtime_notifications.retain(|notification| {
+                                                settled_agent_snapshot
+                                                    .notification_still_requires_reconciliation(
+                                                        notification,
+                                                    )
+                                            });
+                                        }
+                                        deferred_active_bg_notifications
+                                            .extend(pending_runtime_notifications);
                                         // Turn fully settled: blit any images display_sixel
                                         // queued this turn on a paused screen (see fn docs).
                                         render_pending_sixel_images(&mut guard).await;
@@ -10219,23 +10212,23 @@ mod tests {
         let mut expanded = false;
         let mut pin = None;
         let mut bottom_pane = BottomPane::new();
+        let background_task_id = registry.spawn_shell("sleep 60", "unrelated background work");
 
-        assert!(
-            handle_task_surface_shortcut(
-                &key,
-                &task_board,
-                &mut expanded,
-                &mut pin,
-                &mut registry,
-                None,
-                &[],
-                &mut bottom_pane,
-                &frame_requester,
-            )
-            .await
-        );
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
         assert!(expanded);
         assert_eq!(pin, Some(true));
+        assert!(
+            !bottom_pane.has_active_view(),
+            "Ctrl+T must not open the background-task panel even when background work exists"
+        );
+        registry.kill(&background_task_id).unwrap();
 
         bottom_pane.push_view(Box::new(
             crate::tui::bottom_pane::info_view::InfoView::from_plain(
@@ -10243,30 +10236,20 @@ mod tests {
                 vec!["Keep focus here".to_string()],
             ),
         ));
-        assert!(
-            !handle_task_surface_shortcut(
-                &key,
-                &task_board,
-                &mut expanded,
-                &mut pin,
-                &mut registry,
-                None,
-                &[],
-                &mut bottom_pane,
-                &frame_requester,
-            )
-            .await
-        );
+        assert!(!handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
         assert!(expanded);
         assert_eq!(pin, Some(true));
     }
 
-    #[tokio::test]
-    async fn ctrl_t_opens_canonical_task_board_over_a_conversation_tab() {
-        let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
-            temp.path().join("task-shortcut-conversation"),
-        );
+    #[test]
+    fn ctrl_t_opens_canonical_task_board_over_a_conversation_tab() {
         let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
         let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
         let frame_requester = FrameRequester::test_dummy();
@@ -10285,20 +10268,14 @@ mod tests {
             ),
         ));
 
-        assert!(
-            handle_task_surface_shortcut(
-                &key,
-                &task_board,
-                &mut expanded,
-                &mut pin,
-                &mut registry,
-                None,
-                &[],
-                &mut bottom_pane,
-                &frame_requester,
-            )
-            .await
-        );
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
         assert!(bottom_pane.primary_workspace_is_open());
         assert!(render_bottom_pane_text(&bottom_pane, 80, 16).contains("Task board"));
 
@@ -10407,12 +10384,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ctrl_shift_t_opens_the_cross_session_board_even_before_it_has_rows() {
-        let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
-            temp.path().join("task-shortcut-all-sessions"),
-        );
+    #[test]
+    fn ctrl_shift_t_opens_the_cross_session_board_even_before_it_has_rows() {
         let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
         let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
         let frame_requester = FrameRequester::test_dummy();
@@ -10424,20 +10397,14 @@ mod tests {
         let mut pin = None;
         let mut bottom_pane = BottomPane::new();
 
-        assert!(
-            handle_task_surface_shortcut(
-                &key,
-                &task_board,
-                &mut expanded,
-                &mut pin,
-                &mut registry,
-                None,
-                &[],
-                &mut bottom_pane,
-                &frame_requester,
-            )
-            .await
-        );
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
         assert_eq!(
             task_board.view_mode(),
             task_board_observer::ViewMode::AllSessions
@@ -10947,7 +10914,7 @@ mod tests {
                 &FrameRequester::test_dummy(),
             )
             .await,
-            "completed-only background tasks should not steal Ctrl+T from the task board"
+            "completed-only background tasks should not trigger an attention-only background view"
         );
         assert!(!bottom_pane.has_active_view());
 
@@ -10973,7 +10940,7 @@ mod tests {
                 &FrameRequester::test_dummy(),
             )
             .await,
-            "failed background tasks must remain reachable from Ctrl+T"
+            "failed background tasks must remain reachable from the background-task surface"
         );
         assert!(bottom_pane.has_active_view());
     }
@@ -11758,7 +11725,7 @@ mod tests {
             .expect("captured local shell output");
         assert!(output.contains("local shell ready"), "{output:?}");
         assert!(
-            local_background_shell_started_message(&id, "printf ready").contains("Ctrl+T"),
+            local_background_shell_started_message(&id, "printf ready").contains("Ctrl+B"),
             "the immediate receipt must expose the observation/control path"
         );
     }
