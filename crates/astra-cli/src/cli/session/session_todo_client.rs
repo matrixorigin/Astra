@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -193,14 +194,22 @@ async fn execute_todo_request(
         cloud_base.trim_end_matches('/'),
         session_id
     );
+    // Runtime-only fields carry execution identity and observability context;
+    // they are not part of the public task-board contract and must never cross
+    // the REST boundary as task data.  The call id still gives create a stable
+    // idempotency identity, so a lost response followed by replay cannot create
+    // a duplicate task.  Direct callers without a runtime identity retain the
+    // old per-invocation UUID behavior, which deliberately does not collapse
+    // two legitimate tasks merely because their public fields are identical.
+    let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
     let body = if action == "create" {
         json!({
             "action": action,
-            "args": args,
-            "idempotency_key": format!("todo-create:{}", uuid::Uuid::new_v4()),
+            "args": public_args,
+            "idempotency_key": todo_create_idempotency_key(session_id, args),
         })
     } else {
-        json!({ "action": action, "args": args })
+        json!({ "action": action, "args": public_args })
     };
 
     for attempt in 0..2 {
@@ -240,6 +249,24 @@ async fn execute_todo_request(
     // Loop always returns inside; this branch is unreachable but the
     // compiler can't prove it without a labeled break.
     Err("execute_todo_action: retry loop exhausted".to_string())
+}
+
+fn todo_create_idempotency_key(session_id: &str, args: &Value) -> String {
+    let Some(tool_call_id) = args
+        .get("_tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return format!("todo-create:{}", uuid::Uuid::new_v4());
+    };
+
+    let mut digest = Sha256::new();
+    digest.update(b"astra:todo-create:v1\0");
+    digest.update(session_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(tool_call_id.as_bytes());
+    format!("todo-create:{:x}", digest.finalize())
 }
 
 /// Internal fork support: copy the parent session task board into an
@@ -613,6 +640,41 @@ impl TaskStore for HttpTaskStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::todo_create_idempotency_key;
+    use serde_json::json;
+
+    #[test]
+    fn create_idempotency_uses_stable_runtime_execution_identity() {
+        let args = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-1"
+        });
+        let first = todo_create_idempotency_key("session-1", &args);
+        let replay = todo_create_idempotency_key("session-1", &args);
+        assert_eq!(first, replay);
+        assert_ne!(first, todo_create_idempotency_key("session-2", &args));
+
+        let other_call = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-2"
+        });
+        assert_ne!(first, todo_create_idempotency_key("session-1", &other_call));
+    }
+
+    #[test]
+    fn equal_public_creates_without_execution_identity_remain_distinct() {
+        let args = json!({"action": "create", "title": "ship"});
+        assert_ne!(
+            todo_create_idempotency_key("session-1", &args),
+            todo_create_idempotency_key("session-1", &args)
+        );
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // Wiring E2E tests
 //
@@ -718,8 +780,7 @@ mod wiring_e2e {
                         (
                             format!("Task #{id} created: {title}"),
                             Some(json!({
-                                "success": true,
-                                "changed": true,
+                                "status": "applied",
                                 "data": {"success": true, "task_id": id}
                             })),
                         )
@@ -737,8 +798,7 @@ mod wiring_e2e {
                         (
                             format!("Task #{id} updated to {new_status}"),
                             Some(json!({
-                                "success": true,
-                                "changed": true,
+                                "status": "applied",
                                 "data": {"success": true, "task_id": id, "status": new_status}
                             })),
                         )
@@ -1092,6 +1152,41 @@ mod wiring_e2e {
             .await
             .expect("mock fork copy");
         assert_eq!(status, ForkTaskBoardCopyStatus::Copied);
+    }
+
+    #[tokio::test]
+    async fn create_uses_call_identity_but_does_not_leak_private_args() {
+        let server = MockServer::start().await;
+        let args = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-create-1",
+            "_run_id": "run-1"
+        });
+        let expected_key = super::todo_create_idempotency_key("session-1", &args);
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/todos:execute"))
+            .respond_with(move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("json body");
+                assert_eq!(body["idempotency_key"], expected_key, "{body}");
+                assert_eq!(body["args"]["title"], "ship", "{body}");
+                assert!(body["args"].get("_tool_call_id").is_none(), "{body}");
+                assert!(body["args"].get("_run_id").is_none(), "{body}");
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "output": "created",
+                    "mutation": {
+                        "status": "applied",
+                        "data": {"task_id": "task-1"}
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let output = execute_todo_action(&server.uri(), None, "session-1", "create", &args)
+            .await
+            .expect("create request");
+        assert_eq!(output, "created");
     }
 
     #[tokio::test]

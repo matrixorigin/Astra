@@ -14,6 +14,11 @@ pub(crate) enum TuiEvent {
     Paste(String),
     Resize,
     Draw,
+    /// Internal wake that asks the idle loop to reconcile queued runtime
+    /// facts at a model boundary. This must stay typed: injecting magic text
+    /// into the composer would turn presentation bytes into a control
+    /// protocol and could collide with real user input.
+    RuntimeNotificationTurn,
 }
 
 pub(crate) struct TuiEventStream {

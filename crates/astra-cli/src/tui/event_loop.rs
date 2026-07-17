@@ -54,9 +54,28 @@ const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 const BACKGROUND_REGISTRY_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
-const RUNTIME_NOTIFICATION_TURN_SENTINEL: &str = "\u{2063}astra-runtime-notification-turn\u{2063}";
+const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
+
+fn schedule_runtime_notification_wake(
+    wake_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) {
+    wake_at.get_or_insert(now + RUNTIME_NOTIFICATION_SETTLE_DELAY);
+}
+
+fn release_runtime_notification_turn(
+    turn_pending: &mut bool,
+    wake_at: &mut Option<std::time::Instant>,
+    retry_needed: bool,
+    now: std::time::Instant,
+) {
+    *turn_pending = false;
+    if retry_needed {
+        schedule_runtime_notification_wake(wake_at, now);
+    }
+}
 
 /// A one-shot startup observation. These are deliberately presentation-only:
 /// the TUI can accept input before they arrive, and no effect changes the
@@ -4837,8 +4856,25 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
+                let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
+                let ev = match ev {
+                    TuiEvent::RuntimeNotificationTurn => TuiEvent::Key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    ),
+                    event => event,
+                };
                 match ev {
                     TuiEvent::Key(key) => {
+                        let runtime_notification_submission =
+                            runtime_notification_event && runtime_notification_turn_pending;
+                        if runtime_notification_event && !runtime_notification_submission {
+                            // A real user submission may have consumed and re-armed the
+                            // scheduled wake before this queued event was observed.
+                            continue;
+                        }
                         match handle_global_key_action(
                             key,
                             &mut guard,
@@ -4987,7 +5023,12 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        match bottom_pane.handle_key(key) {
+                        let bottom_pane_action = if runtime_notification_submission {
+                            BottomPaneAction::SubmitInput(String::new())
+                        } else {
+                            bottom_pane.handle_key(key)
+                        };
+                        match bottom_pane_action {
                             BottomPaneAction::OpenPermissionModePicker => {
                                 bottom_pane.push_view(Box::new(
                                     slash_dispatch::build_permission_mode_picker(
@@ -4997,24 +5038,20 @@ pub(crate) async fn run_tui_session(
                                 frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
-                                let runtime_notification_submission =
-                                    runtime_notification_turn_pending
-                                        && text == RUNTIME_NOTIFICATION_TURN_SENTINEL;
                                 if runtime_notification_turn_pending {
                                     // The scheduled wake is consumed either by its
-                                    // sentinel or by a real user submission that won
-                                    // the race. In the latter case ordinary input
+                                    // typed event or by a real user submission that
+                                    // won the race. In the latter case ordinary input
                                     // finalization normally carries the pending runtime
                                     // facts. Re-arm as a fallback because the real input
                                     // may instead be a local slash/shell action that does
                                     // not enter a model boundary.
-                                    runtime_notification_turn_pending = false;
-                                    if !runtime_notification_submission {
-                                        runtime_notification_wake_at.get_or_insert_with(|| {
-                                            std::time::Instant::now()
-                                                + Duration::from_millis(200)
-                                        });
-                                    }
+                                    release_runtime_notification_turn(
+                                        &mut runtime_notification_turn_pending,
+                                        &mut runtime_notification_wake_at,
+                                        !runtime_notification_submission,
+                                        std::time::Instant::now(),
+                                    );
                                 }
                                 let text = if runtime_notification_submission {
                                     String::new()
@@ -6269,8 +6306,22 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                            let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
+                                                        }
+                                                        TuiEvent::RuntimeNotificationTurn => {
+                                                            // Runtime-notification wakes are only scheduled by
+                                                            // the idle loop. If one was already queued when a
+                                                            // foreground turn began, leave the durable facts in
+                                                            // SessionState and release the one-wake latch. Keeping
+                                                            // the latch set here would permanently suppress the
+                                                            // replacement wake after this turn settles.
+                                                            release_runtime_notification_turn(
+                                                                &mut runtime_notification_turn_pending,
+                                                                &mut runtime_notification_wake_at,
+                                                                true,
+                                                                std::time::Instant::now(),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -6903,10 +6954,10 @@ pub(crate) async fn run_tui_session(
                                         state
                                             .pending_bg_notifications
                                             .extend(deferred_active_bg_notifications);
-                                        runtime_notification_wake_at.get_or_insert_with(|| {
-                                            std::time::Instant::now()
-                                                + Duration::from_millis(200)
-                                        });
+                                        schedule_runtime_notification_wake(
+                                            &mut runtime_notification_wake_at,
+                                            std::time::Instant::now(),
+                                        );
                                     }
 
                                     if let Some(mode) = bottom_pane.take_staged_permission_mode() {
@@ -7705,6 +7756,9 @@ pub(crate) async fn run_tui_session(
                         bottom_pane.handle_paste(&text);
                         frame_requester.schedule_frame();
                     }
+                    TuiEvent::RuntimeNotificationTurn => unreachable!(
+                        "runtime notification events are normalized before dispatch"
+                    ),
                 }
             }
             Some(ae) = tui_rx.recv() => {
@@ -8053,9 +8107,10 @@ pub(crate) async fn run_tui_session(
                         .attention_notifications_since(&local_agent_snapshot);
                     if !agent_notifications.is_empty() {
                         state.pending_bg_notifications.extend(agent_notifications);
-                        runtime_notification_wake_at.get_or_insert_with(|| {
-                            std::time::Instant::now() + Duration::from_millis(200)
-                        });
+                        schedule_runtime_notification_wake(
+                            &mut runtime_notification_wake_at,
+                            std::time::Instant::now(),
+                        );
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
@@ -8087,9 +8142,10 @@ pub(crate) async fn run_tui_session(
                     let notification = super::background_tasks::format_notification_xml(ev);
                     if !notification.is_empty() {
                         state.pending_bg_notifications.push(notification);
-                        runtime_notification_wake_at.get_or_insert_with(|| {
-                            std::time::Instant::now() + Duration::from_millis(200)
-                        });
+                        schedule_runtime_notification_wake(
+                            &mut runtime_notification_wake_at,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
                 for msg in background_task_event_system_messages(&bg_events) {
@@ -8110,15 +8166,7 @@ pub(crate) async fn run_tui_session(
                 {
                     runtime_notification_wake_at = None;
                     runtime_notification_turn_pending = true;
-                    bottom_pane
-                        .composer
-                        .set_text(RUNTIME_NOTIFICATION_TURN_SENTINEL);
-                    event_stream.push_front(TuiEvent::Key(
-                        crossterm::event::KeyEvent::new(
-                            crossterm::event::KeyCode::Enter,
-                            crossterm::event::KeyModifiers::NONE,
-                        ),
-                    ));
+                    event_stream.push_front(TuiEvent::RuntimeNotificationTurn);
                 }
                 persist_background_task_projections_if_changed(
                     &mut background_registry,
@@ -8394,6 +8442,25 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut buffer);
         crate::tui::testing::render::buffer_to_string(&buffer)
+    }
+
+    #[test]
+    fn deferred_runtime_notification_releases_latch_and_rearms_once() {
+        let now = std::time::Instant::now();
+        let mut pending = true;
+        let mut wake_at = None;
+
+        release_runtime_notification_turn(&mut pending, &mut wake_at, true, now);
+
+        assert!(!pending);
+        assert_eq!(wake_at, Some(now + RUNTIME_NOTIFICATION_SETTLE_DELAY));
+
+        let existing = wake_at;
+        release_runtime_notification_turn(&mut pending, &mut wake_at, true, now);
+        assert_eq!(
+            wake_at, existing,
+            "releasing twice must not postpone the wake"
+        );
     }
 
     #[test]
@@ -10215,8 +10282,8 @@ mod tests {
         .expect("restored projection should be readable");
 
         assert_eq!(snapshot.kind, "local agent");
-        assert_eq!(snapshot.status.as_str(), "running");
-        assert!(!snapshot.status.is_terminal());
+        assert_eq!(snapshot.status.as_str(), "unavailable");
+        assert!(snapshot.status.is_terminal());
         assert_eq!(snapshot.output, "reviewing auth middleware");
         assert_eq!(snapshot.output_ref, "workspace_projection: agent-restored");
     }

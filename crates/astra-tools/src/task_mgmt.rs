@@ -38,7 +38,7 @@ pub const MAX_SUBTASK_TITLE_CHARS: usize = 512;
 pub const MAX_SUBTASK_DESCRIPTION_CHARS: usize = 10_000;
 
 /// A durable checklist task tracked within the current CLI session.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTask {
     pub id: String,
@@ -212,28 +212,36 @@ fn add_dependency_edge(
         return Err(format!("task '{}' not found", blocked_id));
     };
 
-    // Idempotent: already exists, skip
-    if tasks[blocker_index]
+    let blocker_has_edge = tasks[blocker_index]
         .blocks
         .iter()
-        .any(|id| id == blocked_id)
-    {
+        .any(|id| id == blocked_id);
+    let blocked_has_reverse = tasks[blocked_index]
+        .blocked_by
+        .iter()
+        .any(|id| id == blocker_id);
+    if blocker_has_edge && blocked_has_reverse {
         return Ok(());
     }
 
     // Cycle detection: adding blocker_id → blocked_id must not create a path
     // from blocked_id back to blocker_id.
-    if would_create_cycle(tasks, blocker_id, blocked_id) {
+    if !blocker_has_edge && would_create_cycle(tasks, blocker_id, blocked_id) {
         return Err(format!(
             "adding dependency '{}' → '{}' would create a cycle. Review the dependency graph",
             blocker_id, blocked_id
         ));
     }
 
-    push_unique_string(&mut tasks[blocker_index].blocks, blocked_id);
-    push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id);
-    tasks[blocker_index].updated_at = now.to_string();
-    tasks[blocked_index].updated_at = now.to_string();
+    // Repair either half of a legacy/asymmetric edge independently. Treating
+    // the forward half as proof that the whole relation exists would preserve
+    // corrupt graph state forever on an otherwise idempotent add.
+    if push_unique_string(&mut tasks[blocker_index].blocks, blocked_id) {
+        tasks[blocker_index].updated_at = now.to_string();
+    }
+    if push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id) {
+        tasks[blocked_index].updated_at = now.to_string();
+    }
     Ok(())
 }
 
@@ -446,7 +454,7 @@ fn validate_subtask_dependencies_resolved(
 }
 
 /// A subtask within a SessionTask.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSubtask {
     pub id: String,
@@ -465,6 +473,27 @@ pub struct SessionSubtask {
     /// accept explanatory reasons without pretending they are parent failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Compare semantic board state while deliberately excluding `updated_at`.
+/// Mutation code may stage timestamps before it knows whether an idempotent
+/// request changed anything; timestamp-only churn is not a task mutation.
+fn same_task_board_state(left: &[SessionTask], right: &[SessionTask]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left.title == right.title
+                && left.description == right.description
+                && left.status == right.status
+                && left.subtasks == right.subtasks
+                && left.created_at == right.created_at
+                && left.active_form == right.active_form
+                && left.owner == right.owner
+                && left.metadata == right.metadata
+                && left.blocks == right.blocks
+                && left.blocked_by == right.blocked_by
+                && left.archived_at == right.archived_at
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -900,6 +929,7 @@ pub trait TaskStore: Send + Sync {
         self.mutate(
             session_id,
             Box::new(move |mut tasks, _next| {
+                let original_tasks = tasks.clone();
                 if let Some(task_id) = task_id {
                     let Some(task_index) = tasks.iter().position(|t| t.id == task_id) else {
                         return Ok(TaskMutationResult::refused(
@@ -917,19 +947,9 @@ pub trait TaskStore: Send + Sync {
                         ));
                     };
                     let previous_status = tasks[task_index].status;
-                    if previous_status == SessionTaskStatusKind::Archived
+                    if previous_status != SessionTaskStatusKind::Archived
+                        && !previous_status.can_be_archived()
                     {
-                        return Ok(TaskMutationResult::refused(
-                            tasks,
-                            format!("Refused: task #{task_id} is already archived"),
-                            json!({
-                                "task_id": task_id,
-                                "previous_status": previous_status,
-                                "message": format!("Task '{}' is already archived", task_id),
-                            }),
-                        ));
-                    }
-                    if !previous_status.can_be_archived() {
                         return Ok(TaskMutationResult::refused(
                             tasks,
                             format!(
@@ -946,33 +966,92 @@ pub trait TaskStore: Send + Sync {
                         ));
                     }
 
-                    tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
-                    tasks[task_index].updated_at = now_rfc3339.clone();
-                    tasks[task_index].archived_at = Some(now_rfc3339.clone());
-                    if let Some(reason) = reason.as_deref() {
-                        let meta = tasks[task_index]
-                            .metadata
-                            .get_or_insert_with(Default::default);
-                        meta.insert("archive_reason".to_string(), json!(reason));
+                    if previous_status != SessionTaskStatusKind::Archived {
+                        tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
+                        tasks[task_index].updated_at = now_rfc3339.clone();
+                        tasks[task_index].archived_at = Some(now_rfc3339.clone());
+                        if let Some(reason) = reason.as_deref() {
+                            let meta = tasks[task_index]
+                                .metadata
+                                .get_or_insert_with(Default::default);
+                            meta.insert("archive_reason".to_string(), json!(reason));
+                        }
+                    } else if tasks[task_index].archived_at.is_none() {
+                        // Legacy rows may predate archived_at. Preserve their
+                        // last known mutation time instead of inventing a new
+                        // archive time during replay.
+                        tasks[task_index].archived_at = Some(tasks[task_index].updated_at.clone());
                     }
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
                     reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
+                    if same_task_board_state(&original_tasks, &tasks) {
+                        return Ok(TaskMutationResult::unchanged(
+                            original_tasks,
+                            format!("Task #{task_id} is already archived"),
+                            json!({
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "status": SESSION_TASK_STATUS_ARCHIVED,
+                                "already_current": true,
+                                "message": format!("Task '{}' is already archived", task_id),
+                            }),
+                        ));
+                    }
+                    let repaired_existing = previous_status == SessionTaskStatusKind::Archived;
                     return Ok(TaskMutationResult::applied(
                         tasks,
                         None,
-                        format!("Archived task #{task_id} (was {previous_status})"),
+                        if repaired_existing {
+                            format!("Reconciled archived task #{task_id}")
+                        } else {
+                            format!("Archived task #{task_id} (was {previous_status})")
+                        },
                         json!({
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "status": SESSION_TASK_STATUS_ARCHIVED,
-                            "message": format!("Task '{}' archived", task_id),
+                            "reconciled_existing_archive": repaired_existing,
+                            "message": if repaired_existing {
+                                format!("Task '{}' archive invariants reconciled", task_id)
+                            } else {
+                                format!("Task '{}' archived", task_id)
+                            },
                         }),
                     ));
                 }
 
+                let existing_archived_ids: HashSet<&str> = original_tasks
+                    .iter()
+                    .filter(|task| task.status == SessionTaskStatusKind::Archived)
+                    .map(|task| task.id.as_str())
+                    .collect();
+                let repaired_existing_archives = existing_archived_ids
+                    .iter()
+                    .filter(|archived_id| {
+                        original_tasks.iter().any(|task| {
+                            (task.id.as_str() == **archived_id
+                                && (task.archived_at.is_none()
+                                    || !task.blocks.is_empty()
+                                    || !task.blocked_by.is_empty()))
+                                || task.blocks.iter().any(|id| id.as_str() == **archived_id)
+                                || task
+                                    .blocked_by
+                                    .iter()
+                                    .any(|id| id.as_str() == **archived_id)
+                        })
+                    })
+                    .count() as u64;
                 let mut archived_ids: HashSet<String> = HashSet::new();
+                let mut newly_archived = 0_u64;
                 for task in &mut tasks {
+                    if task.status == SessionTaskStatusKind::Archived {
+                        if task.archived_at.is_none() {
+                            task.archived_at = Some(task.updated_at.clone());
+                        }
+                        archived_ids.insert(task.id.clone());
+                        continue;
+                    }
                     if !task.status.can_be_archived() {
                         continue;
                     }
@@ -993,27 +1072,34 @@ pub trait TaskStore: Send + Sync {
                             meta.insert("archive_reason".to_string(), json!(reason));
                         }
                         archived_ids.insert(task.id.clone());
+                        newly_archived = newly_archived.saturating_add(1);
                     }
                 }
-                let archived = archived_ids.len() as u64;
                 detach_task_dependency_edges(&mut tasks, &archived_ids);
                 reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
-                let summary = format!(
-                    "Archived {archived} terminal task(s) older than {days} days in session {session_label}"
+                let mut summary = format!(
+                    "Archived {newly_archived} terminal task(s) older than {days} days in session {session_label}"
                 );
-                let data = json!({
-                    "archived": archived,
+                let mut data = json!({
+                    "archived": newly_archived,
                     "older_than_days": days,
                     "scope": "session",
                     "session_id": session_label,
+                    "reconciled_existing_archives": repaired_existing_archives,
                     "message": format!(
-                        "Archived {} terminal task(s) older than {} days in session '{}'",
-                        archived, days, session_label
+                        "Archived {} terminal task(s) older than {} days in session '{}'; reconciled {} existing archive(s)",
+                        newly_archived, days, session_label, repaired_existing_archives
                     ),
                 });
-                if archived == 0 {
-                    Ok(TaskMutationResult::unchanged(tasks, summary, data))
+                if same_task_board_state(&original_tasks, &tasks) {
+                    Ok(TaskMutationResult::unchanged(original_tasks, summary, data))
                 } else {
+                    if newly_archived == 0 {
+                        summary = format!(
+                            "Reconciled existing archive invariants in session {session_label}"
+                        );
+                        data["archive_invariants_reconciled"] = json!(true);
+                    }
                     Ok(TaskMutationResult::applied(tasks, None, summary, data))
                 }
             }),
@@ -1994,6 +2080,35 @@ fn optional_non_empty_string_field(args: &Value, field: &str) -> Result<Option<S
     }
 }
 
+/// Parse an update-only optional string where JSON `null` explicitly clears
+/// persisted state. Outer `None` means the field was absent; inner `None`
+/// means the caller requested a clear.
+fn optional_nullable_string_field(
+    args: &Value,
+    field: &str,
+) -> Result<Option<Option<String>>, String> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => value
+            .as_str()
+            .map(|text| Some(Some(text.to_string())))
+            .ok_or_else(|| format!("field '{field}' must be a string or null")),
+    }
+}
+
+fn optional_nullable_non_empty_string_field(
+    args: &Value,
+    field: &str,
+) -> Result<Option<Option<String>>, String> {
+    match optional_nullable_string_field(args, field)? {
+        Some(Some(text)) if text.trim().is_empty() => {
+            Err(format!("field '{field}' must be non-empty or null"))
+        }
+        value => Ok(value),
+    }
+}
+
 fn optional_object_field(
     args: &Value,
     field: &str,
@@ -2949,31 +3064,32 @@ impl TaskManager {
         {
             return TaskMutationOutcome::error(error);
         }
-        let desc_update = match optional_string_field(args, "description") {
+        let desc_update = match optional_nullable_string_field(args, "description") {
             Ok(desc_update) => desc_update,
             Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(description) = desc_update.as_deref()
+        if let Some(Some(description)) = desc_update.as_ref()
             && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
         {
             return TaskMutationOutcome::error(error);
         }
-        let active_form_update = match optional_non_empty_string_field(args, "active_form") {
+        let active_form_update = match optional_nullable_non_empty_string_field(args, "active_form")
+        {
             Ok(active_form_update) => active_form_update,
             Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(active_form) = active_form_update.as_deref()
+        if let Some(Some(active_form)) = active_form_update.as_ref()
             && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
         {
             return TaskMutationOutcome::error(error);
         }
-        let owner_update = match optional_non_empty_string_field(args, "owner") {
+        let owner_update = match optional_nullable_non_empty_string_field(args, "owner") {
             Ok(owner_update) => owner_update,
             Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(owner) = owner_update.as_deref()
+        if let Some(Some(owner)) = owner_update.as_ref()
             && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
         {
             return TaskMutationOutcome::error(error);
@@ -3030,6 +3146,28 @@ impl TaskManager {
                 );
             }
         } else {
+            if new_status == Some(SessionTaskStatusKind::Deleted) {
+                let unsupported = [
+                    ("title", title_update.is_some()),
+                    ("description", desc_update.is_some()),
+                    ("active_form", active_form_update.is_some()),
+                    ("owner", owner_update.is_some()),
+                    ("metadata", metadata_update.is_some()),
+                    ("add_blocks", !proposed_blocks.is_empty()),
+                    ("add_blocked_by", !proposed_blocked_by.is_empty()),
+                    ("remove_blocks", !remove_blocks.is_empty()),
+                    ("remove_blocked_by", !remove_blocked_by.is_empty()),
+                ]
+                .into_iter()
+                .filter_map(|(field, present)| present.then_some(field))
+                .collect::<Vec<_>>();
+                if !unsupported.is_empty() {
+                    return TaskMutationOutcome::error(format!(
+                        "new_status='deleted' only supports an optional reason; delete already detaches every dependency edge. Unsupported fields: {}",
+                        unsupported.join(", ")
+                    ));
+                }
+            }
             let has_parent_update = new_status.is_some()
                 || title_update.is_some()
                 || desc_update.is_some()
@@ -3057,6 +3195,7 @@ impl TaskManager {
             .mutate(
                 &sid,
                 Box::new(move |mut tasks, _next| {
+                    let original_tasks = tasks.clone();
                     // Subtask path short-circuits: all logic stays local to one SessionTask.
                     if let Some(st_id) = subtask_id.as_deref() {
                         let Some(task_index) = tasks.iter().position(|t| t.id == task_id) else {
@@ -3134,7 +3273,7 @@ impl TaskManager {
                         let summary = format!(
                             "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
                         );
-                        let data = json!({
+                        let mut data = json!({
                             "task_id": task_id,
                             "subtask_id": st_id,
                             "previous_status": previous_status,
@@ -3146,6 +3285,16 @@ impl TaskManager {
                         // task just completed, reconcile any all-done parents
                         // that it unblocked in the same atomic mutation.
                         reconcile_all_subtask_completion(&mut tasks, &now);
+                        if same_task_board_state(&original_tasks, &tasks) {
+                            data["already_current"] = json!(true);
+                            return Ok(TaskMutationResult::unchanged(
+                                original_tasks,
+                                format!(
+                                    "Subtask {st_id} of #{task_id} is already {final_subtask_status}"
+                                ),
+                                data,
+                            ));
+                        }
                         return Ok(TaskMutationResult::applied(tasks, None, summary, data));
                     }
 
@@ -3173,17 +3322,26 @@ impl TaskManager {
                         let deleted_ids = HashSet::from([task_id.clone()]);
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
                         reconcile_all_subtask_completion(&mut tasks, &now);
-                        return Ok(TaskMutationResult::applied(
-                            tasks,
-                            None,
-                            format!("Task #{task_id} deleted (was: {previous_status})"),
-                            json!({
+                        let mut data = json!({
                                 "task_id": task_id,
                                 "previous_status": previous_status.to_string(),
                                 "status": "deleted",
                                 "deleted_subtasks": deleted_subtasks,
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
-                            }),
+                            });
+                        if same_task_board_state(&original_tasks, &tasks) {
+                            data["already_current"] = json!(true);
+                            return Ok(TaskMutationResult::unchanged(
+                                original_tasks,
+                                format!("Task #{task_id} is already deleted"),
+                                data,
+                            ));
+                        }
+                        return Ok(TaskMutationResult::applied(
+                            tasks,
+                            None,
+                            format!("Task #{task_id} deleted (was: {previous_status})"),
+                            data,
                         ));
                     }
 
@@ -3192,6 +3350,9 @@ impl TaskManager {
                         None => return Err(format!("task '{}' not found", task_id)),
                     };
                     validate_parent_status_transition(previous_status, new_status)?;
+                    let transitioning_to_failure =
+                        previous_status != SessionTaskStatusKind::Failed
+                            && new_status == Some(SessionTaskStatusKind::Failed);
                     let projected_status = new_status.unwrap_or(previous_status);
                     // Collect proposed edge changes before mutating so cycle detection
                     // sees a consistent view.
@@ -3350,14 +3511,14 @@ impl TaskManager {
                         if let Some(title) = title_update.as_deref() {
                             task.title = title.to_string();
                         }
-                        if let Some(desc) = desc_update.as_deref() {
-                            task.description = Some(desc.to_string());
+                        if let Some(desc) = desc_update.as_ref() {
+                            task.description = desc.clone();
                         }
-                        if let Some(af) = active_form_update.as_deref() {
-                            task.active_form = Some(af.to_string());
+                        if let Some(active_form) = active_form_update.as_ref() {
+                            task.active_form = active_form.clone();
                         }
-                        if let Some(owner) = owner_update.as_deref() {
-                            task.owner = Some(owner.to_string());
+                        if let Some(owner) = owner_update.as_ref() {
+                            task.owner = owner.clone();
                         }
                         if let Some(meta_update) = metadata_update.as_ref() {
                             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
@@ -3387,16 +3548,20 @@ impl TaskManager {
                             if let Some(err) = error_message.as_deref() {
                                 let meta = task.metadata.get_or_insert_with(Default::default);
                                 // Stash structured error in metadata so `list`
-                                // can surface a preview without parsing description
-                                // prose. Keep a human-readable copy after any
-                                // description update.
-                                let note = format!("Error: {err}");
-                                task.description = Some(
-                                    match task.description.as_deref().filter(|s| !s.is_empty()) {
-                                        Some(description) => format!("{description}\n\n{note}"),
-                                        None => note,
-                                    },
-                                );
+                                // can surface a preview without parsing description prose.
+                                // Persist a human-readable copy only on the typed transition
+                                // into failure, or when this request explicitly replaces the
+                                // definition-of-done text. Same-state retries must not append
+                                // another copy of the error.
+                                if transitioning_to_failure || desc_update.is_some() {
+                                    let note = format!("Error: {err}");
+                                    task.description = Some(
+                                        match task.description.as_deref().filter(|s| !s.is_empty()) {
+                                            Some(description) => format!("{description}\n\n{note}"),
+                                            None => note,
+                                        },
+                                    );
+                                }
                                 meta.insert("error_message".to_string(), json!(err));
                             } else if let Some(note) = reason.as_deref() {
                                 let meta = task.metadata.get_or_insert_with(Default::default);
@@ -3441,6 +3606,14 @@ impl TaskManager {
                         Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
                     ) {
                         response_body["cancelled_subtasks"] = json!(cancelled_subtasks);
+                    }
+                    if same_task_board_state(&original_tasks, &tasks) {
+                        response_body["already_current"] = json!(true);
+                        return Ok(TaskMutationResult::unchanged(
+                            original_tasks,
+                            format!("Task #{task_id} is already {final_status}"),
+                            response_body,
+                        ));
                     }
                     Ok(TaskMutationResult::applied(
                         tasks,
@@ -5272,20 +5445,184 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_progress_is_idempotent_for_the_same_task() {
-        let m = mgr();
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-parent-update", store.clone());
         m.create(&json!({"title": "already running"})).await;
         let first = m
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .update_outcome(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
-        assert!(!first.starts_with("Error:"), "{first}");
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-parent-update")
+            .await
+            .unwrap();
+        let mut changes = store.subscribe().expect("in-memory change stream");
 
         let repeat = m
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .update_outcome(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
-        assert!(
-            repeat.contains("\"success\":true") && repeat.contains("\"status\":\"in_progress\""),
-            "same-task in_progress repeat should be treated as idempotent success: {repeat}"
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(repeat.data["already_current"], true, "{repeat:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-parent-update")
+                .await
+                .unwrap(),
+            version,
+            "an idempotent update must not advance durable board state"
         );
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_subtask_status_is_unchanged_without_a_board_write() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-subtask-update", store.clone());
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{"id": "child", "title": "child"}]
+        }))
+        .await;
+        let first = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-subtask-update")
+            .await
+            .unwrap();
+
+        let repeat = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-subtask-update")
+                .await
+                .unwrap(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_existing_dependency_repairs_missing_reverse_edge() {
+        let m = mgr();
+        m.create(&json!({"title": "producer"})).await;
+        m.create(&json!({"title": "consumer"})).await;
+
+        let mut snapshot = m.try_snapshot_state().await.unwrap();
+        snapshot.tasks[0].blocks.push("task-2".to_string());
+        assert!(snapshot.tasks[1].blocked_by.is_empty());
+        m.restore_snapshot(&snapshot).await.unwrap();
+
+        let repaired = m
+            .update_outcome(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
+            .await;
+
+        assert_eq!(repaired.status, TaskMutationStatus::Applied, "{repaired:?}");
+        let tasks = m.snapshot().await.unwrap();
+        assert_eq!(tasks[0].blocks, ["task-2"]);
+        assert_eq!(tasks[1].blocked_by, ["task-1"]);
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_evidence_is_unchanged_without_duplicate_prose() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-failure", store.clone());
+        m.create(&json!({"title": "compile", "description": "Build succeeds"}))
+            .await;
+        let args = json!({
+            "task_id": "task-1",
+            "new_status": "failed",
+            "error_message": "missing type Foo"
+        });
+        let first = m.update_outcome(&args).await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let before = m.get(&json!({"task_id": "task-1"})).await;
+        let version = store
+            .get_session_version("idempotent-failure")
+            .await
+            .unwrap();
+
+        let repeat = m.update_outcome(&args).await;
+
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(repeat.data["already_current"], true, "{repeat:?}");
+        assert_eq!(m.get(&json!({"task_id": "task-1"})).await, before);
+        assert_eq!(
+            store
+                .get_session_version("idempotent-failure")
+                .await
+                .unwrap(),
+            version
+        );
+        assert_eq!(
+            before.matches("Error: missing type Foo").count(),
+            1,
+            "{before}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_null_clears_optional_task_fields() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "reassignable work",
+            "description": "old definition",
+            "active_form": "working",
+            "owner": "agent-1"
+        }))
+        .await;
+
+        let cleared = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "description": null,
+                "active_form": null,
+                "owner": null
+            }))
+            .await;
+
+        assert_eq!(cleared.status, TaskMutationStatus::Applied, "{cleared:?}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.description, None);
+        assert_eq!(task.active_form, None);
+        assert_eq!(task.owner, None);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_fields_it_would_otherwise_ignore() {
+        let m = mgr();
+        m.create(&json!({"title": "keep identity"})).await;
+
+        let outcome = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "new_status": "deleted",
+                "title": "silently discarded"
+            }))
+            .await;
+
+        assert_eq!(outcome.status, TaskMutationStatus::Failed, "{outcome:?}");
+        assert!(outcome.output.contains("Unsupported fields: title"));
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.title, "keep identity");
+        assert_eq!(task.status, SessionTaskStatusKind::Pending);
     }
 
     #[tokio::test]
@@ -7453,6 +7790,80 @@ mod tests {
             active_out["count"], 0,
             "no active tasks should remain after archive; got: {active_out}"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_replay_is_a_successful_unchanged_mutation() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-archive", store.clone());
+        m.create(&json!({"title": "historical work"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        let first = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-archive")
+            .await
+            .unwrap();
+
+        let replay = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Unchanged, "{replay:?}");
+        assert_eq!(replay.data["already_current"], true, "{replay:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-archive")
+                .await
+                .unwrap(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_replay_repairs_legacy_dependency_edges() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("archive-repair", store.clone());
+        m.create(&json!({"title": "historical"})).await;
+        m.create(&json!({"title": "dependent"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        // Simulate an old/corrupt row written before archive detached both
+        // sides of the dependency graph.
+        let mut snapshot = m.try_snapshot_state().await.unwrap();
+        snapshot.tasks[0].archived_at = None;
+        snapshot.tasks[0].blocks.push("task-2".to_string());
+        snapshot.tasks[1].blocked_by.push("task-1".to_string());
+        m.restore_snapshot(&snapshot).await.unwrap();
+        let version = store.get_session_version("archive-repair").await.unwrap();
+
+        let replay = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Applied, "{replay:?}");
+        assert_eq!(
+            store.get_session_version("archive-repair").await.unwrap(),
+            version + 1
+        );
+        let tasks = m.snapshot().await.unwrap();
+        assert!(tasks.iter().all(|task| task.blocks.is_empty()));
+        assert!(tasks.iter().all(|task| task.blocked_by.is_empty()));
+        assert!(tasks[0].archived_at.is_some());
+        assert_eq!(replay.data["reconciled_existing_archive"], true);
+    }
+
+    #[tokio::test]
+    async fn bulk_archive_reports_only_new_transitions() {
+        let m = mgr();
+        m.create(&json!({"title": "historical"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        let replay = m.archive_outcome(&json!({"older_than_days": 0})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Unchanged, "{replay:?}");
+        assert_eq!(replay.data["archived"], 0, "{replay:?}");
     }
 
     #[tokio::test]

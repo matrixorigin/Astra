@@ -560,11 +560,9 @@ impl TaskBoardObserver {
                     && state.single_binding_generation == generation =>
                 {
                     state.single_lane.request_failed(Instant::now(), health);
-                    inner.single_dirty.store(true, Ordering::Release);
                 }
                 FetchIdentity::All => {
                     state.all_lane.request_failed(Instant::now(), health);
-                    inner.all_dirty.store(true, Ordering::Release);
                 }
                 FetchIdentity::Single { .. } => {}
             }
@@ -1055,16 +1053,12 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
     (POLL_INTERVAL * multiplier).min(MAX_FAILURE_BACKOFF)
 }
 
-/// Cheap equality check for Tier 1 boards (dozens of rows): compare
-/// `(id, status, title, updated_at)` tuples. Avoids forcing PartialEq
-/// on the public SessionTask struct in astra-tools.
+/// Equality for the complete renderer-facing task projection. Tier 1 boards
+/// contain only dozens of rows, so suppressing a repaint is not worth hiding
+/// an owner, dependency, subtask, metadata, or description update merely
+/// because a producer preserved the same `updated_at` value.
 fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        x.id == y.id && x.status == y.status && x.title == y.title && x.updated_at == y.updated_at
-    })
+    a == b
 }
 
 /// Compose the task-board read model without assigning ownership of either
@@ -2172,6 +2166,10 @@ mod tests {
         }
 
         let observer = TaskBoardObserver::new(Arc::new(StalledStore), "sess-stalled");
+        // Mirror the production fetch path: maybe_refresh consumes the dirty
+        // signal before marking a request in flight.  The supervisor must not
+        // manufacture a new dirty signal when that request later times out.
+        observer.inner.single_dirty.store(false, Ordering::Relaxed);
         {
             let (mut state, _) = lock_state(&observer.inner, "test_stalled_fetch");
             state.single_lane.request_started();
@@ -2190,6 +2188,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(observer.truth_state(), TaskBoardTruthState::Unavailable);
+        assert!(
+            !observer.inner.single_dirty.load(Ordering::Relaxed),
+            "a timeout is failure evidence, not a new store-change signal; automatic retries must honor backoff"
+        );
         assert!(observer.request_refresh());
     }
 

@@ -53,7 +53,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "description".to_string(),
-        json!({"type": "string", "description": "(create/update) Definition of done."}),
+        json!({"type": ["string", "null"], "description": "(create/update) Definition of done; update may pass null to clear it."}),
     );
     props.insert(
         "task_id".to_string(),
@@ -73,11 +73,11 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "active_form".to_string(),
-        json!({"type": "string", "description": "(create/update) Spinner text while in_progress."}),
+        json!({"type": ["string", "null"], "description": "(create/update) Spinner text while in_progress; update may pass null to clear it."}),
     );
     props.insert(
         "owner".to_string(),
-        json!({"type": "string", "description": "(create/update) Owner."}),
+        json!({"type": ["string", "null"], "description": "(create/update) Owner; update may pass null to unassign."}),
     );
     props.insert(
         "metadata".to_string(),
@@ -1715,6 +1715,13 @@ mod tests {
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
             "update schema should let the model intentionally pause/resume stale work"
         );
+        for field in ["description", "active_form", "owner"] {
+            assert_eq!(
+                properties[field]["type"],
+                json!(["string", "null"]),
+                "update must be able to clear optional task field {field}"
+            );
+        }
         assert!(
             properties["status_filter"]["enum"]
                 .as_array()

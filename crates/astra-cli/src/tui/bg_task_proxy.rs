@@ -622,15 +622,26 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
-    let status = crate::edge_tools::BgTaskOutputStatus::from_protocol(&projection.status)
-        .unwrap_or_else(|| {
+    let status = match crate::edge_tools::BgTaskOutputStatus::from_protocol(&projection.status) {
+        Some(status) if status.is_terminal() => status,
+        Some(_) => {
+            // A workspace projection is last-observed evidence, not a live
+            // executor. If no current local-agent snapshot matched this id,
+            // reporting a restored `running`/`waiting` row as non-terminal
+            // makes task_output wait or poll forever for a process this
+            // runtime cannot observe. Keep the captured output but fail
+            // closed on lifecycle truth.
+            crate::edge_tools::BgTaskOutputStatus::Unavailable
+        }
+        None => {
             tracing::warn!(
                 task_id = projection.id,
                 status = projection.status,
                 "restored local agent has unknown status; marking output unavailable"
             );
             crate::edge_tools::BgTaskOutputStatus::Unavailable
-        });
+        }
+    };
 
     crate::edge_tools::BgTaskOutputSnapshot {
         kind: "local agent".to_string(),
