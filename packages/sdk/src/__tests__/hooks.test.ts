@@ -113,6 +113,7 @@ describe("useAstraChat", () => {
         model: "test-model",
         allowSkills: ["s1"],
         allowTools: ["bash"],
+        enabledTools: ["web_search", "web_fetch"],
         skillSearch,
         agentBinding: {
           id: "binding-1",
@@ -142,6 +143,7 @@ describe("useAstraChat", () => {
     const req = streamChatMock.mock.calls[0][0] as {
       allowSkills?: string[];
       allowTools?: string[];
+      enabledTools?: string[];
       skillSearch?: typeof skillSearch;
       selectedModel?: { model: string };
       agentBinding?: {
@@ -159,6 +161,7 @@ describe("useAstraChat", () => {
     expect(req.selectedModel).toEqual({ model: "test-model" });
     expect(req.allowSkills).toEqual(["s1"]);
     expect(req.allowTools).toEqual(["bash"]);
+    expect(req.enabledTools).toEqual(["web_search", "web_fetch"]);
     expect(req.skillSearch).toEqual(skillSearch);
     expect(req.agentBinding).toEqual({
       id: "binding-1",

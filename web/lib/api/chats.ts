@@ -21,6 +21,7 @@ import type {
   WorkSurfaceRunResponse,
   ChatInsightsResponse,
   EdgeStatusResponse,
+  RuntimeCapabilitiesResponse,
   WorkspaceSelection,
 } from "@/lib/api/types";
 
@@ -67,6 +68,10 @@ export function getChatInsights(chatId: string) {
 
 export function getEdgeStatus() {
   return requestJson<EdgeStatusResponse>("/api/edges/status");
+}
+
+export function getRuntimeCapabilities() {
+  return requestJson<RuntimeCapabilitiesResponse>("/api/runtime/capabilities");
 }
 
 export function archiveChat(chatId: string, archived: boolean) {

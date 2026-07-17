@@ -31,6 +31,7 @@ export const PATH_RUNS = "/runs";
 export const PATH_EVENTS = "/events";
 
 export const PATH_EDGES_STATUS = "/edges/status";
+export const PATH_RUNTIME_CAPABILITIES = "/runtime/capabilities";
 
 export const PATH_TOOLS_RESULT = "/tools/result";
 export const PATH_APPROVAL_RESPOND = "/approval/respond";

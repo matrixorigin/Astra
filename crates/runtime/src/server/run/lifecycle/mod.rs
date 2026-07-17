@@ -2796,8 +2796,12 @@ impl AgenticRunLifecycleService {
     /// previous `.expect("validated before state build")` ladder is gone
     /// because validation and construction now happen together.
     fn try_request_constraints(request: &ChatRequestData) -> Result<RequestConstraints, String> {
+        let enabled_tools =
+            normalize_request_allowlist(request.enabled_tools.as_deref(), "enabled_tools")?
+                .or_else(|| Some(HashSet::new()));
         Ok(RequestConstraints::new(
             normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")?,
+            enabled_tools,
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")?,
             normalize_request_skill_sources(
                 request.allow_skill_sources.as_deref(),
@@ -3746,12 +3750,79 @@ impl AgenticRunLifecycleService {
         }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if let Some(enabled_tools) = request_constraints.enabled_tools.as_ref() {
+            let fallback_registry = astra_runtime_env::ToolRegistry::builtins();
+            let registry = self
+                .tool_execution_service
+                .as_ref()
+                .map(ToolExecutionService::tool_registry)
+                .unwrap_or(&fallback_registry);
+            for tool_name in enabled_tools {
+                let Some(spec) = registry.get(tool_name) else {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        format!("enabled_tools contains unknown tool '{tool_name}'"),
+                        "enabled_tools_invalid",
+                    ));
+                };
+                if !spec.requires_explicit_user_enablement() {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "enabled_tools may contain only product-optional external tools; '{tool_name}' is a core runtime tool"
+                        ),
+                        "enabled_tools_invalid",
+                    ));
+                }
+            }
+        }
         if request.agent_binding.is_none() && request.runtime_skill_binding.is_none() {
             let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
             apply_normalized_skill_allowlist(resolver, &request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
         Ok(request_constraints)
+    }
+
+    async fn validate_optional_tool_availability(
+        &self,
+        user_id: &str,
+        constraints: &RequestConstraints,
+        execution_bindings: Option<&ExecutionBindingSnapshot>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let Some(enabled_tools) = constraints
+            .enabled_tools
+            .as_ref()
+            .filter(|tools| !tools.is_empty())
+        else {
+            return Ok(());
+        };
+        let Some(service) = self.tool_execution_service.as_ref() else {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "optional tools were enabled, but this runtime has no tool execution provider"
+                    .to_string(),
+                "optional_tool_provider_unavailable",
+            ));
+        };
+        let unavailable = service
+            .unavailable_optional_tools_for_binding(user_id, enabled_tools, execution_bindings)
+            .await;
+        if unavailable.is_empty() {
+            return Ok(());
+        }
+        let selected_provider = execution_bindings
+            .filter(|snapshot| snapshot.executor.kind == ExecutorBindingKind::EdgeAgent)
+            .map(|snapshot| format!("bound edge '{}'", snapshot.executor.executor_id))
+            .unwrap_or_else(|| "server deployment".to_string());
+        Err(error_response_coded(
+            StatusCode::CONFLICT,
+            format!(
+                "{selected_provider} does not currently provide the enabled optional tools: {}",
+                unavailable.join(", ")
+            ),
+            "optional_tool_provider_unavailable",
+        ))
     }
 
     fn prepare_chat_request(
@@ -4994,6 +5065,7 @@ impl AgenticRunLifecycleService {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
+                .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         // Wire test LLM rounds from request context (E2E test hook).
@@ -6810,6 +6882,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Err(error) = self
+            .validate_optional_tool_availability(
+                &user_id,
+                &request_constraints,
+                execution_bindings.as_ref(),
+            )
+            .await
+        {
+            self.runs.write().await.remove(&run_id);
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "enabled optional tools became unavailable before run start".to_string(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
@@ -7775,6 +7868,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Err(error) = self
+            .validate_optional_tool_availability(
+                &user_id,
+                &request_constraints,
+                execution_bindings.as_ref(),
+            )
+            .await
+        {
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "enabled optional tools became unavailable before stream start".to_string(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
@@ -9951,6 +10064,7 @@ fn spawn_child_request_constraints(
 
     RequestConstraints::new(
         allowed_tools,
+        parent.enabled_tools.clone(),
         parent.allowed_skills.clone(),
         parent.allowed_skill_sources.clone(),
     )
@@ -10765,6 +10879,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
+                .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         let mut host = builder.build();

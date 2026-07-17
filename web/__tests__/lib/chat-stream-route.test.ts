@@ -922,7 +922,7 @@ describe("chat stream route proxy cancellation", () => {
         parts: [],
         attachments: [],
         selected_model: { id: "model-backend", model: "backend-model" },
-        allow_tools: ["github", "web_fetch", "web_search"],
+        enabled_tools: ["github", "web_fetch", "web_search"],
         workspace_binding: {
           kind: "edge_workspace",
           display_name: "MacBook Pro",

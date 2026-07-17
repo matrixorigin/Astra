@@ -11,21 +11,21 @@
 //! ```ignore
 //! use astra_runtime::deployment::DeploymentProfile;
 //!
-//! // Full server with all tools
+//! // Server control plane and non-network service tools
 //! let profile = DeploymentProfile::server_default();
 //!
-//! // Server without web_search / web_fetch
-//! let profile = DeploymentProfile::server_without(&["web_search", "web_fetch"]);
+//! // Narrow the baseline server surface
+//! let profile = DeploymentProfile::server_without(&["memory"]);
 //!
 //! // Server with only explicit tools
-//! let profile = DeploymentProfile::server_with_only(&["bash", "read_file"]);
+//! let profile = DeploymentProfile::server_with_only(&["memory", "agent"]);
 //!
 //! // Build the CapabilityRegistry
 //! let registry = profile.build_registry(server_runtime).await?;
 //! service.set_capability_registry(registry);
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -170,19 +170,35 @@ pub struct DeploymentProfile {
 
 /// All server-service/control-plane tool names that a server deployment can
 /// provide without an explicit workspace/runtime execution provider.
-pub fn server_all_tools() -> &'static [String] {
-    server_builtin_tool_names()
+pub fn server_default_tool_names() -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        server_builtin_tool_names()
+            .iter()
+            .filter(|name| {
+                registry.get(name).is_some_and(|spec| {
+                    matches!(
+                        spec.required.network,
+                        astra_runtime_env::RequiredNetwork::None
+                    )
+                })
+            })
+            .cloned()
+            .collect()
+    })
 }
 
 impl DeploymentProfile {
-    /// Standard server deployment with all server-service/control-plane
-    /// built-in tools.
+    /// Standard server deployment with control-plane and non-network service
+    /// tools. Network capacity is declared separately at the concrete provider
+    /// boundary; a default topology must not imply server egress.
     pub fn server_default() -> Self {
         Self {
             profile_name: "server-default".into(),
             providers: vec![ProviderConfig {
                 kind: ProviderKind::ServerBuiltin,
-                capabilities: server_all_tools()
+                capabilities: server_default_tool_names()
                     .iter()
                     .map(|t| ToolCapability::Named(t.clone()))
                     .collect(),
@@ -196,7 +212,7 @@ impl DeploymentProfile {
     /// Server deployment with the given tools **disabled**.
     ///
     /// ```ignore
-    /// let profile = DeploymentProfile::server_without(&["web_search", "web_fetch"]);
+    /// let profile = DeploymentProfile::server_without(&["memory"]);
     /// ```
     pub fn server_without(disabled: &[&str]) -> Self {
         let mut profile = Self::server_default();
@@ -212,7 +228,7 @@ impl DeploymentProfile {
     /// Server deployment with **only** the given tools enabled.
     ///
     /// ```ignore
-    /// let profile = DeploymentProfile::server_with_only(&["memory", "web_search", "agent"]);
+    /// let profile = DeploymentProfile::server_with_only(&["memory", "agent"]);
     /// ```
     pub fn server_with_only(enabled: &[&str]) -> Self {
         let mut profile = Self::server_default();
@@ -336,32 +352,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_default_has_all_server_builtin_tools() {
+    fn server_default_excludes_undeclared_network_capacity() {
         let profile = DeploymentProfile::server_default();
         assert_eq!(profile.providers.len(), 1);
         let caps = &profile.providers[0].capabilities;
-        assert_eq!(caps.len(), server_all_tools().len());
-        let names: Vec<&str> = caps
-            .iter()
-            .filter_map(|c| match c {
-                ToolCapability::Named(n) => Some(n.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(names.contains(&"web_search"));
-        assert!(names.contains(&"memory"));
-        assert!(names.contains(&"agent"));
-        assert!(names.contains(&"reflect"));
-        assert!(!names.contains(&"bash"));
-        assert!(!names.contains(&"read_file"));
-        assert!(!names.contains(&"write_file"));
-        assert!(!names.contains(&"git"));
-    }
-
-    #[test]
-    fn server_without_removes_tools() {
-        let profile = DeploymentProfile::server_without(&["web_search", "web_fetch"]);
-        let caps = &profile.providers[0].capabilities;
+        assert_eq!(caps.len(), server_default_tool_names().len());
         let names: Vec<&str> = caps
             .iter()
             .filter_map(|c| match c {
@@ -373,12 +368,32 @@ mod tests {
         assert!(!names.contains(&"web_fetch"));
         assert!(names.contains(&"memory"));
         assert!(names.contains(&"agent"));
-        assert_eq!(names.len(), server_all_tools().len() - 2);
+        assert!(names.contains(&"reflect"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"read_file"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"git"));
+    }
+
+    #[test]
+    fn server_without_removes_tools() {
+        let profile = DeploymentProfile::server_without(&["memory", "agent"]);
+        let caps = &profile.providers[0].capabilities;
+        let names: Vec<&str> = caps
+            .iter()
+            .filter_map(|c| match c {
+                ToolCapability::Named(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!names.contains(&"memory"));
+        assert!(!names.contains(&"agent"));
+        assert_eq!(names.len(), server_default_tool_names().len() - 2);
     }
 
     #[test]
     fn server_with_only_keeps_specified() {
-        let profile = DeploymentProfile::server_with_only(&["memory", "web_search", "agent"]);
+        let profile = DeploymentProfile::server_with_only(&["memory", "agent", "reflect"]);
         let caps = &profile.providers[0].capabilities;
         let names: Vec<&str> = caps
             .iter()

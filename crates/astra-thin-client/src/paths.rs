@@ -18,6 +18,9 @@ pub const USER_PROMPT_RESPOND: &str = "/user-prompts/respond";
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 
+/// `GET` — optional tool capacity from server and connected edge providers.
+pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
+
 /// `POST` — edge registry (`edge_agent_registry` + JWT); body: [`crate::protocol::EdgeRegisterRequest`].
 pub const AGENTS_EDGE: &str = "/agents/edge";
 

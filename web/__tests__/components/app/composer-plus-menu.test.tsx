@@ -41,6 +41,26 @@ function renderMenu(
     <ComposerPlusMenu
       webSearch={false}
       onWebSearchChange={vi.fn()}
+      webAccess={{
+        available: true,
+        description: "Run via Server",
+        provider: {
+          provider_id: "server-builtin",
+          kind: "server",
+          display_name: "Server",
+          status: "ready",
+        },
+      }}
+      githubAccess={{
+        available: true,
+        description: "Run via Server",
+        provider: {
+          provider_id: "server-builtin",
+          kind: "server",
+          display_name: "Server",
+          status: "ready",
+        },
+      }}
       activeSkills={[]}
       onActiveSkillsChange={vi.fn()}
       {...props}

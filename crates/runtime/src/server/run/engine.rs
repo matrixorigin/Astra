@@ -3009,6 +3009,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),

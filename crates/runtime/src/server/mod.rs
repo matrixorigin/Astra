@@ -26,6 +26,7 @@ pub mod artifact_retention_sweeper;
 mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
+mod capability_handlers;
 mod chat_handlers;
 mod cleanup_retry;
 pub mod conflict_resolver;

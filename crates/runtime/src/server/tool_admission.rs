@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use astra_core::{PROVIDER_CAPABILITY_CREDENTIAL_BROKER, PROVIDER_CAPABILITY_PUBLIC_NETWORK};
 use astra_runtime_env::{
     CapacityProvider, CapacityProviderDeclaration, CapacityProviderStatus, CapacityProviderType,
 };
@@ -79,6 +80,7 @@ pub(crate) struct ToolAdmissionContext {
     pub request_scoped_mcp_provider_ready: bool,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub runtime_declared_tool_names: Option<HashSet<String>>,
+    pub provider_capabilities: HashMap<String, HashSet<String>>,
     pub disabled_tool_offers: HashSet<String>,
     pub provider_allowed_tools: HashMap<String, HashSet<String>>,
 }
@@ -91,6 +93,7 @@ impl Default for ToolAdmissionContext {
             request_scoped_mcp_provider_ready: false,
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             runtime_declared_tool_names: None,
+            provider_capabilities: HashMap::new(),
             disabled_tool_offers: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
         }
@@ -393,10 +396,14 @@ pub(crate) fn active_provider_declarations_for_binding(
 ) -> Vec<CapacityProviderDeclaration> {
     let mut providers = Vec::new();
     if context.server_service_provider_ready {
-        providers.push(astra_runtime_env::server_service_provider(
-            "server-builtin",
-            registry,
-        ));
+        let mut provider = astra_runtime_env::server_service_provider("server-builtin", registry);
+        provider.tool_names.retain(|tool_name| {
+            provider_capabilities_allow_tool(context, &provider.provider_id, tool_name, registry)
+        });
+        provider
+            .tool_schema_digests
+            .retain(|tool_name, _| provider.tool_names.contains(tool_name));
+        providers.push(provider);
     }
     if context.control_plane_provider_ready {
         providers.push(astra_runtime_env::control_plane_provider(
@@ -436,6 +443,29 @@ pub(crate) fn active_provider_declarations_for_binding(
     }
 
     providers
+}
+
+fn provider_capabilities_allow_tool(
+    context: &ToolAdmissionContext,
+    provider_id: &str,
+    tool_name: &str,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> bool {
+    let Some(spec) = registry.get(tool_name) else {
+        return false;
+    };
+    if matches!(
+        spec.required.network,
+        astra_runtime_env::RequiredNetwork::None
+    ) {
+        return true;
+    }
+    let capabilities = context.provider_capabilities.get(provider_id);
+    capabilities.is_some_and(|capabilities| {
+        capabilities.contains(PROVIDER_CAPABILITY_PUBLIC_NETWORK)
+            && (!spec.required.credentials
+                || capabilities.contains(PROVIDER_CAPABILITY_CREDENTIAL_BROKER))
+    })
 }
 
 pub(crate) fn has_explicit_runtime_executor_provider(
@@ -829,8 +859,18 @@ mod tests {
         astra_runtime_env::ToolRegistry::builtins()
     }
 
+    fn server_network_context() -> ToolAdmissionContext {
+        ToolAdmissionContext {
+            provider_capabilities: HashMap::from([(
+                "server-builtin".to_string(),
+                HashSet::from([PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+            )]),
+            ..ToolAdmissionContext::default()
+        }
+    }
+
     #[test]
-    fn shared_network_tool_selects_server_offer_without_workspace() {
+    fn shared_network_tool_is_hidden_without_declared_server_capacity() {
         let decision = resolve_tool_admission_for_binding(
             "web_fetch",
             &[],
@@ -838,6 +878,23 @@ mod tests {
             &ExecutorBinding::server_local(),
             None,
             &registry(),
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::NoProvider));
+        assert!(decision.candidates.is_empty());
+    }
+
+    #[test]
+    fn shared_network_tool_selects_server_offer_without_workspace() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_local(),
+            None,
+            &registry(),
+            server_network_context(),
         );
 
         assert!(decision.visible);
@@ -863,7 +920,7 @@ mod tests {
 
     #[test]
     fn shared_network_tool_selects_edge_offer_for_edge_binding() {
-        let decision = resolve_tool_admission_for_binding(
+        let decision = resolve_tool_admission_for_binding_with_context(
             "web_fetch",
             &[],
             &WorkspaceBinding::edge_workspace(
@@ -879,6 +936,7 @@ mod tests {
             ),
             None,
             &registry(),
+            server_network_context(),
         );
 
         assert!(decision.visible);
@@ -949,13 +1007,14 @@ mod tests {
             transport: ToolTransportKind::McpHttp,
             status: ExecutorStatus::Online,
         };
-        let decision = resolve_tool_admission_for_binding(
+        let decision = resolve_tool_admission_for_binding_with_context(
             "mcp__github__search",
             &schemas,
             &WorkspaceBinding::none(),
             &executor,
             None,
             &registry(),
+            ToolAdmissionContext::default(),
         );
 
         assert!(decision.visible);
@@ -983,13 +1042,14 @@ mod tests {
             "type": "function",
             "function": { "name": "mcp__github__search" }
         })];
-        let decision = resolve_tool_admission_for_binding(
+        let decision = resolve_tool_admission_for_binding_with_context(
             "mcp__github__search",
             &schemas,
             &WorkspaceBinding::none(),
             &ExecutorBinding::server_local(),
             None,
             &registry(),
+            server_network_context(),
         );
 
         assert!(!decision.visible);
@@ -1017,7 +1077,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 request_scoped_mcp_provider_ready: true,
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1056,7 +1116,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 request_scoped_mcp_provider_ready: true,
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1125,7 +1185,7 @@ mod tests {
                     "cli-local".to_string(),
                     HashSet::from(["bash".to_string()]),
                 )]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1186,7 +1246,7 @@ mod tests {
 
     #[test]
     fn shared_network_tool_does_not_implicitly_fallback_when_selected_executor_offline() {
-        let decision = resolve_tool_admission_for_binding(
+        let decision = resolve_tool_admission_for_binding_with_context(
             "web_fetch",
             &[],
             &WorkspaceBinding::edge_workspace(
@@ -1202,6 +1262,7 @@ mod tests {
             ),
             None,
             &registry(),
+            server_network_context(),
         );
 
         assert!(!decision.visible);
@@ -1286,7 +1347,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 disabled_tool_offers: HashSet::from(["web_fetch@server-builtin".to_string()]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1327,7 +1388,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 disabled_tool_offers: HashSet::from(["web_fetch@server-builtin".to_string()]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1363,7 +1424,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 disabled_tool_offers: HashSet::from(["web_fetch@edge-macpro".to_string()]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1404,7 +1465,7 @@ mod tests {
                     "edge-macpro".to_string(),
                     HashSet::from(["bash".to_string()]),
                 )]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 
@@ -1455,7 +1516,7 @@ mod tests {
                     "server-builtin".to_string(),
                     HashSet::from(["memory".to_string()]),
                 )]),
-                ..ToolAdmissionContext::default()
+                ..server_network_context()
             },
         );
 

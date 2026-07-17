@@ -18,21 +18,19 @@ fn tool_names(profile: &DeploymentProfile) -> Vec<String> {
 /// covered in unit tests inside the astra-runtime crate
 /// (tool_execution_service and server_loop_host).
 #[tokio::test]
-async fn server_default_includes_web_tools() {
+async fn server_default_does_not_imply_network_capacity() {
     let profile = DeploymentProfile::server_default();
     let names = tool_names(&profile);
-    assert!(names.iter().any(|n| n == "web_search"));
-    assert!(names.iter().any(|n| n == "web_fetch"));
+    assert!(!names.iter().any(|n| n == "web_search"));
+    assert!(!names.iter().any(|n| n == "web_fetch"));
 }
 
 #[tokio::test]
 async fn server_without_excludes_tools() {
-    let profile = DeploymentProfile::server_without(&["web_search", "web_fetch"]);
+    let profile = DeploymentProfile::server_without(&["memory", "agent"]);
     let names = tool_names(&profile);
-    assert!(!names.iter().any(|n| n == "web_search"));
-    assert!(!names.iter().any(|n| n == "web_fetch"));
-    assert!(names.iter().any(|n| n == "memory"));
-    assert!(names.iter().any(|n| n == "agent"));
+    assert!(!names.iter().any(|n| n == "memory"));
+    assert!(!names.iter().any(|n| n == "agent"));
     assert!(!names.iter().any(|n| n == "bash"));
 }
 
@@ -51,7 +49,7 @@ async fn server_with_only_keeps_server_service_tools() {
     let profile = DeploymentProfile::server_with_only(&["memory", "web_fetch"]);
     let names = tool_names(&profile);
     assert!(names.iter().any(|n| n == "memory"));
-    assert!(names.iter().any(|n| n == "web_fetch"));
+    assert!(!names.iter().any(|n| n == "web_fetch"));
     assert!(!names.iter().any(|n| n == "web_search"));
     assert!(!names.iter().any(|n| n == "bash"));
     assert!(!names.iter().any(|n| n == "read_file"));

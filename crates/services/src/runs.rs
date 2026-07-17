@@ -578,6 +578,7 @@ pub struct ChatRequestData {
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
+    pub enabled_tools: Option<Vec<String>>,
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,

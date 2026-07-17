@@ -883,6 +883,11 @@ pub struct RequestConstraints {
     /// This does not restrict the `skill` or `discover_skills` tool schemas;
     /// skill access is controlled by `allowed_skills`.
     pub allowed_tools: Option<HashSet<String>>,
+    /// User-enabled optional external tools. When present, optional tools not
+    /// in this set are unavailable; core tools are unaffected. `None` means
+    /// the embedding host does not manage product enablement (for example the
+    /// local CLI); Server request boundaries normalize omission to an empty set.
+    pub enabled_tools: Option<HashSet<String>>,
     /// When set, only this subset of skills may be visible/executable via
     /// the `skill` / `discover_skills` tool schemas.
     pub allowed_skills: Option<HashSet<String>>,
@@ -899,11 +904,13 @@ impl RequestConstraints {
     /// don't have a specific lane should pass `None`.
     pub fn new(
         allowed_tools: Option<HashSet<String>>,
+        enabled_tools: Option<HashSet<String>>,
         allowed_skills: Option<HashSet<String>>,
         allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
     ) -> Self {
         Self {
             allowed_tools,
+            enabled_tools,
             allowed_skills,
             allowed_skill_sources,
         }

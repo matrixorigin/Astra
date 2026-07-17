@@ -103,6 +103,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
         .route(
+            "/runtime/capabilities",
+            get(capability_handlers::runtime_capabilities_handler),
+        )
+        .route(
             "/agent-bindings",
             post(agent_binding_handlers::create_agent_binding_handler),
         )

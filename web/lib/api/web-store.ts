@@ -2400,7 +2400,7 @@ async function callBackendAgent(params: {
         sessionId: params.sessionId,
         selectedModel,
         allowSkills: activeSkills.length ? activeSkills : undefined,
-        allowTools: activeTools.length ? activeTools : undefined,
+        enabledTools: activeTools,
         context: {
           source: "web_v1",
           edge_profile: activeSkills.length || activeTools.length

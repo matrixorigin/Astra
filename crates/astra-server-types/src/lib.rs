@@ -122,6 +122,10 @@ pub struct ChatRequest {
     pub allow_skill_sources: Option<Vec<String>>,
     #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
+    /// Optional external tools explicitly enabled by the embedding product.
+    /// Unlike `allow_tools`, this does not restrict core tools.
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub workspace_binding: Option<astra_services::runs::WorkspaceBindingRequest>,
     #[serde(default)]
@@ -1233,6 +1237,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
+        enabled_tools: request.enabled_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
         runtime_mcp_bindings: request.runtime_mcp_bindings,

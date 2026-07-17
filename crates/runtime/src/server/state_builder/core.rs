@@ -238,6 +238,9 @@ fn build_shared_tool_execution_service(
         .edge_connection_pool(edge_connection_pool)
         .edge_dispatch_service(edge_dispatch_service)
         .edge_registry_service(edge_registry_service);
+    if !policy.provider_capabilities.is_empty() {
+        builder = builder.initial_provider_capabilities(policy.provider_capabilities.clone());
+    }
     if !policy.disabled_tool_offers.is_empty() {
         builder = builder.initial_disabled_tool_offers(&policy.disabled_tool_offers);
     }

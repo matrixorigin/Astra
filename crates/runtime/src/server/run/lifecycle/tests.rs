@@ -1514,6 +1514,7 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         Some(["read_file".to_string()].into_iter().collect()),
         None,
         None,
+        None,
     );
     root_context.spawner = Arc::downgrade(&spawner);
     executor.set_runtime_context(root_context).await;
@@ -1988,6 +1989,7 @@ fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
                 .map(String::from)
                 .collect(),
         ),
+        None,
         Some(["review"].into_iter().map(String::from).collect()),
         Some(
             [
@@ -2033,6 +2035,7 @@ fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
                 .map(String::from)
                 .collect(),
         ),
+        None,
         None,
         None,
     );
@@ -3051,6 +3054,7 @@ fn test_request(message: &str) -> ChatRequestData {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
@@ -4455,6 +4459,77 @@ async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
             .detail
             .contains("mcp_binding_ids is no longer supported")
     );
+}
+
+#[tokio::test]
+async fn validate_request_constraints_rejects_core_or_unknown_enabled_tools() {
+    let service = test_service();
+    for tool_name in ["read_file", "not_a_tool"] {
+        let mut request = test_request("hello");
+        request.enabled_tools = Some(vec![tool_name.to_string()]);
+
+        let error = service
+            .validate_request_constraints("u1", &request)
+            .await
+            .expect_err("enabled_tools is only for known product-optional tools");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("enabled_tools_invalid")
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_request_omission_explicitly_disables_optional_tools() {
+    let service = test_service();
+    let request = test_request("hello");
+
+    let constraints = service
+        .validate_request_constraints("u1", &request)
+        .await
+        .expect("ordinary server request should validate");
+
+    assert_eq!(constraints.enabled_tools, Some(HashSet::new()));
+    assert!(constraints.allowed_tools.is_none());
+}
+
+#[tokio::test]
+async fn optional_tool_availability_is_checked_against_selected_provider() {
+    let request_constraints = RequestConstraints::new(
+        None,
+        Some(HashSet::from([
+            "web_search".to_string(),
+            "web_fetch".to_string(),
+        ])),
+        None,
+        None,
+    );
+    let unavailable_service =
+        test_service().with_tool_execution_service(ToolExecutionService::builder().build());
+    let error = unavailable_service
+        .validate_optional_tool_availability("u1", &request_constraints, None)
+        .await
+        .expect_err("server network capability is opt-in");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("optional_tool_provider_unavailable")
+    );
+
+    let available_service = test_service().with_tool_execution_service(
+        ToolExecutionService::builder()
+            .initial_provider_capabilities(std::collections::HashMap::from([(
+                crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+            )]))
+            .build(),
+    );
+    available_service
+        .validate_optional_tool_availability("u1", &request_constraints, None)
+        .await
+        .expect("declared server network capacity should satisfy the web bundle");
 }
 
 #[test]
@@ -7321,6 +7396,7 @@ fn extract_edge_tools_from_context() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
@@ -7492,6 +7568,7 @@ fn extract_edge_profile_from_context() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),

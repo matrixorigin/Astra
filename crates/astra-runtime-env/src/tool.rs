@@ -224,6 +224,16 @@ pub struct ToolSpec {
     pub required: ToolRequirements,
 }
 
+impl ToolSpec {
+    /// Whether this is an optional external capability that an embedding
+    /// product must explicitly enable. This is derived from semantic
+    /// requirements, not from a parallel hand-maintained tool-name list.
+    pub fn requires_explicit_user_enablement(&self) -> bool {
+        self.load_policy == ToolLoadPolicy::Deferred
+            && !matches!(self.required.network, RequiredNetwork::None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolSpec>,

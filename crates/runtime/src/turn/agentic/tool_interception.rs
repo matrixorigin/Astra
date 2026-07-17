@@ -35,6 +35,20 @@ pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name
         .is_none_or(|allowed| allowed.contains(tool_name))
 }
 
+fn optional_tool_is_enabled(state: &AgenticLoopState, tool_name: &str) -> bool {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let requires_enablement = registry
+        .get(tool_name)
+        .is_some_and(astra_runtime_env::ToolSpec::requires_explicit_user_enablement);
+    !requires_enablement
+        || state
+            .skills
+            .request_constraints
+            .enabled_tools
+            .as_ref()
+            .is_none_or(|enabled| enabled.contains(tool_name))
+}
+
 pub(crate) fn exempt_from_request_allowlist(tool_name: &str) -> bool {
     tool_name == crate::turn::skill_tool::SKILL_TOOL_NAME
         || tool_name == crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
@@ -74,6 +88,9 @@ pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Optio
 }
 
 pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
+    if !optional_tool_is_enabled(state, tool_name) {
+        return false;
+    }
     if blocked_by_request_allowlist(state, tool_name) {
         return false;
     }
@@ -1273,6 +1290,30 @@ mod tests {
         );
 
         assert!(runtime_tool_allowlist_notice(&state).is_none());
+    }
+
+    #[test]
+    fn optional_network_tools_require_product_enablement_without_restricting_core_tools() {
+        let mut state = make_state();
+        assert!(runtime_allows_tool(&state, "web_search"));
+        assert!(runtime_allows_tool(&state, "memory"));
+
+        state.skills.request_constraints.enabled_tools = Some(HashSet::new());
+
+        assert!(!runtime_allows_tool(&state, "web_search"));
+        assert!(!runtime_allows_tool(&state, "web_fetch"));
+        assert!(runtime_allows_tool(&state, "memory"));
+        assert!(runtime_allows_tool(&state, "task_board"));
+
+        state
+            .skills
+            .request_constraints
+            .enabled_tools
+            .as_mut()
+            .unwrap()
+            .extend(["web_search".to_string(), "web_fetch".to_string()]);
+        assert!(runtime_allows_tool(&state, "web_search"));
+        assert!(runtime_allows_tool(&state, "web_fetch"));
     }
 
     #[tokio::test]

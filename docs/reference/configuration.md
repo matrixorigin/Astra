@@ -35,6 +35,29 @@ Use these files as the canonical configuration references:
 stack modes. In the all-in-one compose stack, this value controls the
 host-facing published port; the API container listens on port `17001`.
 
+Server-hosted optional capacity is declared structurally in `server.toml`, not
+with one environment variable per tool. Public-network tools are unavailable
+on the server unless its provider explicitly declares outbound network capacity:
+
+```toml
+[deployment.provider_capabilities]
+server-builtin = ["public_network"]
+```
+
+Credential-backed connectors additionally require the generic
+`credential_broker` provider capability. This declares a usable credential
+resolution boundary; it still does not enable any connector for a user turn:
+
+```toml
+[deployment.provider_capabilities]
+server-builtin = ["public_network", "credential_broker"]
+```
+
+Without this declaration, `web_search` and `web_fetch` can still become
+available through a ready bound Edge provider. Capability availability does
+not enable either tool for a user turn; Web and SDK clients must explicitly
+select optional tools separately.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`

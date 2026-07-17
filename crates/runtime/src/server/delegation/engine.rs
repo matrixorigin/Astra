@@ -2571,11 +2571,17 @@ impl DelegationEngine {
             .context
             .remove(crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
         Self::ensure_source_in_delegation_chain(&mut request, source_agent_id);
+        let enabled_tools = parse_request_allowlist_from_context(
+            &mut request.context,
+            crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY,
+        )?
+        .or_else(|| Some(HashSet::new()));
         let request_constraints = RequestConstraints::new(
             parse_request_allowlist_from_context(
                 &mut request.context,
                 crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
             )?,
+            enabled_tools,
             parse_request_allowlist_from_context(
                 &mut request.context,
                 crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,

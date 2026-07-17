@@ -313,6 +313,7 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   if (req.capabilities?.length) body.capabilities = req.capabilities;
   if (req.allowSkills?.length) body.allow_skills = req.allowSkills;
   if (req.allowTools?.length) body.allow_tools = req.allowTools;
+  if (req.enabledTools !== undefined) body.enabled_tools = req.enabledTools;
   if (req.workspaceBinding) body.workspace_binding = req.workspaceBinding;
   if (req.executorBinding) body.executor_binding = req.executorBinding;
   if (req.skillSearch) {

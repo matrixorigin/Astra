@@ -82,9 +82,17 @@ pub struct ServerConfig {
 }
 
 /// Deployment-level tool capability controls.
+pub const PROVIDER_CAPABILITY_PUBLIC_NETWORK: &str = "public_network";
+pub const PROVIDER_CAPABILITY_CREDENTIAL_BROKER: &str = "credential_broker";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeploymentConfig {
+    /// Provider capability declarations: provider id -> capability labels.
+    /// These describe actual deployment capacity, not user enablement. For
+    /// example, `server-builtin = ["public_network"]` declares intentional
+    /// outbound network capacity for server-hosted web tools.
+    pub provider_capabilities: HashMap<String, Vec<String>>,
     /// Tool offers disabled at deployment time (checked before dispatch).
     pub disabled_tool_offers: Vec<String>,
     /// Exact provider allowlist: provider id -> canonical tool names enabled
@@ -94,6 +102,9 @@ pub struct DeploymentConfig {
 
 impl DeploymentConfig {
     fn merge_from(&mut self, other: &Self) {
+        if !other.provider_capabilities.is_empty() {
+            self.provider_capabilities = other.provider_capabilities.clone();
+        }
         if !other.disabled_tool_offers.is_empty() {
             self.disabled_tool_offers = other.disabled_tool_offers.clone();
         }
@@ -117,9 +128,33 @@ impl DeploymentConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        validate_provider_capabilities(&self.provider_capabilities)?;
         validate_tool_offer_ids(&self.disabled_tool_offers)?;
         validate_provider_allowed_tools(&self.provider_allowed_tools)
     }
+}
+
+fn validate_provider_capabilities(
+    provider_capabilities: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    for (provider_id, capabilities) in provider_capabilities {
+        if !crate::tool_offer::is_valid_provider_id(provider_id) {
+            return Err(format!(
+                "provider_capabilities keys must be concrete provider ids (got '{provider_id}')"
+            ));
+        }
+        for capability in capabilities {
+            if !matches!(
+                capability.as_str(),
+                PROVIDER_CAPABILITY_PUBLIC_NETWORK | PROVIDER_CAPABILITY_CREDENTIAL_BROKER
+            ) {
+                return Err(format!(
+                    "unsupported provider capability '{capability}' for provider '{provider_id}'; supported capabilities: {PROVIDER_CAPABILITY_PUBLIC_NETWORK}, {PROVIDER_CAPABILITY_CREDENTIAL_BROKER}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_tool_offer_ids(offer_ids: &[String]) -> Result<(), String> {
@@ -776,6 +811,8 @@ pub struct AppSettings {
     pub token_encryption_key: Option<String>,
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
     pub database_bootstrap_catalog: String,
+    /// Deployment-declared provider capabilities.
+    pub provider_capabilities: HashMap<String, Vec<String>>,
     /// Tool offers disabled at deployment time (deployment.toml -> server.toml -> env).
     pub disabled_tool_offers: Vec<String>,
     /// Exact provider allowlist: provider id -> canonical tool names enabled
@@ -844,9 +881,14 @@ impl AppSettings {
         };
         let mut settings = Self::from_lookup(lookup)?;
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
+        settings.provider_capabilities = sc.deployment.provider_capabilities.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
         settings.provider_request_auth = sc.auth.provider_request_auth.clone();
+        validate_provider_capabilities(&settings.provider_capabilities)
+            .map_err(ConfigError::Validation)?;
         validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
+        validate_provider_allowed_tools(&settings.provider_allowed_tools)
+            .map_err(ConfigError::Validation)?;
         Ok(settings)
     }
 
@@ -930,6 +972,7 @@ impl AppSettings {
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             provider_request_auth: Vec::new(),
             disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
+            provider_capabilities: HashMap::new(),
             provider_allowed_tools: HashMap::new(),
         };
         validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
@@ -2136,11 +2179,22 @@ auth_mode = "legacy"
             [deployment]
             disabled_tool_offers = ["tool_a@server", "tool_b@edge:macpro.local"]
 
+            [deployment.provider_capabilities]
+            server-builtin = ["public_network"]
+
             [deployment.provider_allowed_tools]
             server-builtin = ["web_fetch", "memory"]
             edge-macpro = ["bash", "read_file"]
             "#;
         let config = ServerConfig::parse(toml_str).unwrap();
+        assert_eq!(
+            config
+                .deployment
+                .provider_capabilities
+                .get("server-builtin")
+                .unwrap(),
+            &vec!["public_network".to_string()]
+        );
         assert_eq!(
             config.deployment.disabled_tool_offers,
             vec![
@@ -2176,12 +2230,22 @@ auth_mode = "legacy"
             [deployment]
             disabled_tool_offers = ["web_fetch@server-builtin"]
 
+            [deployment.provider_capabilities]
+            server-builtin = ["public_network"]
+
             [deployment.provider_allowed_tools]
             server-builtin = ["web_fetch"]
             "#;
         let config = ServerConfig::parse(toml_str).unwrap();
         temp_env::with_var("MATRIXONE_PASSWORD", Some("test-password"), || {
             let settings = AppSettings::from_server_config(&config).unwrap();
+            assert_eq!(
+                settings
+                    .provider_capabilities
+                    .get("server-builtin")
+                    .unwrap(),
+                &vec!["public_network".to_string()]
+            );
             assert_eq!(
                 settings.disabled_tool_offers,
                 vec!["web_fetch@server-builtin".to_string()]
@@ -2208,6 +2272,23 @@ auth_mode = "legacy"
                 .to_string()
                 .contains("unknown field `disabled_tool_names`"),
             "legacy global disabled tool names must fail fast: {error}"
+        );
+    }
+
+    #[test]
+    fn deployment_rejects_unknown_provider_capability() {
+        let error = ServerConfig::parse(
+            r#"
+            [deployment.provider_capabilities]
+            server-builtin = ["public_netwrok"]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported provider capability")
         );
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Map;
@@ -10,8 +10,9 @@ use super::tool_admission::{
 };
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
+    ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
     ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
@@ -28,6 +29,30 @@ use super::tool_transport_metadata::{
     cancelled_runtime_tool_result, cancelled_runtime_tool_result_for_binding,
 };
 
+pub(crate) const SERVER_OPTIONAL_TOOL_PROVIDER_ID: &str = "server-builtin";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OptionalToolProviderKind {
+    Server,
+    Edge,
+}
+
+impl OptionalToolProviderKind {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OptionalToolProvider {
+    pub provider_id: String,
+    pub kind: OptionalToolProviderKind,
+    pub display_name: String,
+}
+
 /// Builder for constructing a fully-configured [`ToolExecutionService`].
 ///
 /// Eliminates semi-constructed state by requiring all dependencies to be
@@ -40,6 +65,7 @@ pub struct ToolExecutionServiceBuilder {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
+    provider_capabilities: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
     provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
@@ -53,6 +79,7 @@ impl Default for ToolExecutionServiceBuilder {
             gateway_relay_transport: None,
             sandbox_resident_agent_transport: None,
             tool_registry: astra_runtime_env::ToolRegistry::builtins(),
+            provider_capabilities: Arc::new(RwLock::new(HashMap::new())),
             disabled_tool_offers: Arc::new(RwLock::new(HashSet::new())),
             provider_allowed_tools: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -118,6 +145,14 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
+    pub fn initial_provider_capabilities(
+        mut self,
+        capabilities: HashMap<String, HashSet<String>>,
+    ) -> Self {
+        self.provider_capabilities = Arc::new(RwLock::new(capabilities));
+        self
+    }
+
     pub fn initial_provider_allowed_tools(
         mut self,
         tools: HashMap<String, HashSet<String>>,
@@ -138,6 +173,7 @@ impl ToolExecutionServiceBuilder {
             gateway_relay_transport: self.gateway_relay_transport,
             sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
+            provider_capabilities: self.provider_capabilities,
             disabled_tool_offers: self.disabled_tool_offers,
             provider_allowed_tools: self.provider_allowed_tools,
         }
@@ -152,6 +188,9 @@ pub struct ToolExecutionService {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
+    /// Deployment-declared provider capacity. This is distinct from the user
+    /// selecting an optional tool and from administrator offer policy.
+    provider_capabilities: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Runtime-disabled tool offers (admin API/config). Checked before dispatch.
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
     /// Optional exact allowlist per provider id. Missing provider id means
@@ -220,6 +259,10 @@ impl ToolExecutionService {
         Arc::clone(&self.provider_allowed_tools)
     }
 
+    pub fn provider_capabilities_handle(&self) -> Arc<RwLock<HashMap<String, HashSet<String>>>> {
+        Arc::clone(&self.provider_capabilities)
+    }
+
     pub(crate) async fn invocation_admission_snapshot(
         &self,
         request: &ToolExecutionRequest,
@@ -249,6 +292,11 @@ impl ToolExecutionService {
 
     pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
         ToolAdmissionContext {
+            provider_capabilities: self
+                .provider_capabilities
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
             disabled_tool_offers: self
                 .disabled_tool_offers
                 .try_read()
@@ -271,6 +319,133 @@ impl ToolExecutionService {
 
     pub fn tool_registry(&self) -> &astra_runtime_env::ToolRegistry {
         &self.tool_registry
+    }
+
+    /// Resolve the currently usable providers for every product-optional
+    /// tool. Deployment capacity, live Edge advertisements, and administrator
+    /// offer policy meet here so UI discovery and submit-time validation use
+    /// the same facts as execution admission.
+    pub(crate) async fn optional_tool_providers_for_user(
+        &self,
+        user_id: &str,
+    ) -> BTreeMap<String, Vec<OptionalToolProvider>> {
+        let provider_capabilities = self.provider_capabilities.read().await.clone();
+        let disabled_tool_offers = self.disabled_tool_offers.read().await.clone();
+        let provider_allowed_tools = self.provider_allowed_tools.read().await.clone();
+        let mut providers_by_tool = self
+            .tool_registry
+            .iter()
+            .filter(|spec| spec.requires_explicit_user_enablement())
+            .map(|spec| (spec.name.clone(), BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+
+        let server_capabilities = provider_capabilities.get(SERVER_OPTIONAL_TOOL_PROVIDER_ID);
+        if server_capabilities.is_some_and(|capabilities| {
+            capabilities.contains(astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK)
+        }) {
+            for (tool_name, providers) in &mut providers_by_tool {
+                let requirements_satisfied =
+                    self.tool_registry.get(tool_name).is_some_and(|spec| {
+                        !spec.required.credentials
+                            || server_capabilities.is_some_and(|capabilities| {
+                                capabilities
+                                    .contains(astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER)
+                            })
+                    });
+                if requirements_satisfied
+                    && provider_offer_is_enabled(
+                        &disabled_tool_offers,
+                        &provider_allowed_tools,
+                        SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+                        tool_name,
+                    )
+                {
+                    providers.insert(OptionalToolProvider {
+                        provider_id: SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                        kind: OptionalToolProviderKind::Server,
+                        display_name: "Server".to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Some(pool) = self.edge_connection_pool.as_ref() {
+            for edge in pool.get_user_edges(user_id) {
+                let advertised_tools = edge
+                    .capabilities
+                    .and_then(|value| {
+                        serde_json::from_value::<
+                            astra_runtime_env::RuntimeEnvironmentAdvertisement,
+                        >(value)
+                        .ok()
+                    })
+                    .map(|advertisement| {
+                        advertisement
+                            .binding
+                            .tool_surface
+                            .tool_names
+                            .into_iter()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                for (tool_name, providers) in &mut providers_by_tool {
+                    if advertised_tools.contains(tool_name)
+                        && provider_offer_is_enabled(
+                            &disabled_tool_offers,
+                            &provider_allowed_tools,
+                            &edge.edge_agent_id,
+                            tool_name,
+                        )
+                    {
+                        providers.insert(OptionalToolProvider {
+                            provider_id: edge.edge_agent_id.clone(),
+                            kind: OptionalToolProviderKind::Edge,
+                            display_name: edge
+                                .hostname
+                                .clone()
+                                .unwrap_or_else(|| edge.edge_agent_id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
+        providers_by_tool
+            .into_iter()
+            .map(|(name, providers)| (name, providers.into_iter().collect()))
+            .collect()
+    }
+
+    pub(crate) async fn unavailable_optional_tools_for_binding(
+        &self,
+        user_id: &str,
+        enabled_tools: &HashSet<String>,
+        binding: Option<&ExecutionBindingSnapshot>,
+    ) -> Vec<String> {
+        let providers = self.optional_tool_providers_for_user(user_id).await;
+        let selected_edge = binding
+            .filter(|snapshot| snapshot.executor.kind == ExecutorBindingKind::EdgeAgent)
+            .map(|snapshot| snapshot.executor.executor_id.as_str());
+        let mut unavailable = enabled_tools
+            .iter()
+            .filter(|tool_name| {
+                !providers.get(tool_name.as_str()).is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| match selected_edge {
+                        Some(edge_id) => {
+                            candidate.kind == OptionalToolProviderKind::Edge
+                                && candidate.provider_id == edge_id
+                        }
+                        None => {
+                            candidate.kind == OptionalToolProviderKind::Server
+                                && candidate.provider_id == SERVER_OPTIONAL_TOOL_PROVIDER_ID
+                        }
+                    })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        unavailable.sort();
+        unavailable
     }
 
     #[cfg(test)]
@@ -652,6 +827,19 @@ impl ToolExecutionService {
     }
 }
 
+fn provider_offer_is_enabled(
+    disabled_tool_offers: &HashSet<String>,
+    provider_allowed_tools: &HashMap<String, HashSet<String>>,
+    provider_id: &str,
+    tool_name: &str,
+) -> bool {
+    let offer_id = astra_runtime_env::tool_offer_id(tool_name, provider_id);
+    !disabled_tool_offers.contains(&offer_id)
+        && provider_allowed_tools
+            .get(provider_id)
+            .is_none_or(|allowed| allowed.contains(tool_name))
+}
+
 fn selected_offer_route_mismatch(
     request: &ToolExecutionRequest,
     route: ToolExecutionRouteKind,
@@ -926,6 +1114,122 @@ mod tests {
 
         assert!(service.tool_registry().get("task_board").is_some());
         assert!(service.tool_registry().get("read_file").is_some());
+    }
+
+    #[tokio::test]
+    async fn optional_provider_snapshot_requires_declared_server_capacity() {
+        let service = ToolExecutionService::new_for_test();
+        let unavailable = service.optional_tool_providers_for_user("user-1").await;
+        assert!(unavailable["web_search"].is_empty());
+        assert!(unavailable["web_fetch"].is_empty());
+
+        let service = ToolExecutionService::builder()
+            .initial_provider_capabilities(HashMap::from([(
+                SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+            )]))
+            .initial_disabled_tool_offers(&["web_fetch@server-builtin".to_string()])
+            .build();
+        let available = service.optional_tool_providers_for_user("user-1").await;
+        assert_eq!(
+            available["web_search"],
+            vec![OptionalToolProvider {
+                provider_id: SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                kind: OptionalToolProviderKind::Server,
+                display_name: "Server".to_string(),
+            }]
+        );
+        assert!(available["web_fetch"].is_empty());
+        assert!(
+            available["github"].is_empty(),
+            "network egress alone must not claim credential-backed tools"
+        );
+
+        let credential_service = ToolExecutionService::builder()
+            .initial_provider_capabilities(HashMap::from([(
+                SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                HashSet::from([
+                    astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string(),
+                    astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER.to_string(),
+                ]),
+            )]))
+            .build();
+        let credential_tools = credential_service
+            .optional_tool_providers_for_user("user-1")
+            .await;
+        assert_eq!(credential_tools["github"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_edge_optional_tools_never_fall_back_to_server() {
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut advertisement =
+            serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                astra_runtime_env::RunBinding::edge_developer(
+                    "/workspace",
+                    &astra_runtime_env::ToolRegistry::builtins(),
+                ),
+            ))
+            .unwrap();
+        advertisement["binding"]["tool_surface"]["tool_names"] =
+            serde_json::json!(["web_search", "web_fetch"]);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-1",
+            Some("Developer Mac".to_string()),
+            Some("/workspace".to_string()),
+            Some(advertisement),
+            None,
+            tx,
+        );
+        let service = ToolExecutionService::builder()
+            .edge_connection_pool(pool)
+            .initial_provider_capabilities(HashMap::from([(
+                SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+            )]))
+            .build();
+        let enabled = HashSet::from(["web_search".to_string(), "web_fetch".to_string()]);
+        let edge_binding = ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::edge_workspace(
+                "Developer Mac",
+                "/workspace",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "Developer Mac",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        assert!(
+            service
+                .unavailable_optional_tools_for_binding("user-1", &enabled, Some(&edge_binding),)
+                .await
+                .is_empty()
+        );
+
+        let missing_edge_binding = ExecutionBindingSnapshot::inferred(
+            edge_binding.workspace,
+            ExecutorBinding::edge_agent(
+                "edge-2",
+                "Offline edge",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
+        );
+        assert_eq!(
+            service
+                .unavailable_optional_tools_for_binding(
+                    "user-1",
+                    &enabled,
+                    Some(&missing_edge_binding),
+                )
+                .await,
+            vec!["web_fetch".to_string(), "web_search".to_string()]
+        );
     }
 
     #[tokio::test]

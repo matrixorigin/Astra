@@ -23,6 +23,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { SkillPickerPanel } from '@/components/app/skill-picker-panel';
 import type { EdgeStatusResponse, WorkspaceSelection } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
+import type { WebAccessAvailability } from '@/lib/runtime-capabilities';
 
 type EdgeWorkspace = EdgeStatusResponse['edges'][number];
 type EdgeWorkspaceSelection = Extract<
@@ -372,6 +373,8 @@ export function ComposerEnvironmentChip({
 export function ComposerPlusMenu({
   inProject,
   webSearch,
+  webAccess,
+  githubAccess,
   onWebSearchChange,
   activeSkills,
   onActiveSkillsChange,
@@ -386,6 +389,8 @@ export function ComposerPlusMenu({
 }: {
   inProject?: boolean;
   webSearch: boolean;
+  webAccess: WebAccessAvailability;
+  githubAccess: WebAccessAvailability;
   onWebSearchChange: (value: boolean) => void;
   activeSkills: string[];
   onActiveSkillsChange: (skills: string[]) => void;
@@ -424,6 +429,7 @@ export function ComposerPlusMenu({
       ) : panel === 'connectors' ? (
         <ConnectorPanel
           activeTools={activeTools}
+          githubAccess={githubAccess}
           onActiveToolsChange={onActiveToolsChange}
           onBack={() => setPanel('main')}
         />
@@ -478,6 +484,8 @@ export function ComposerPlusMenu({
           <Row
             icon={Globe}
             label="Web search"
+            description={webAccess.description}
+            disabled={!webAccess.available}
             onClick={() => onWebSearchChange(!webSearch)}
             trailing={webSearch ? <Check className="size-4 text-accent" /> : null}
           />
@@ -490,10 +498,12 @@ export function ComposerPlusMenu({
 
 function ConnectorPanel({
   activeTools,
+  githubAccess,
   onActiveToolsChange,
   onBack,
 }: {
   activeTools: string[];
+  githubAccess: WebAccessAvailability;
   onActiveToolsChange: (tools: string[]) => void;
   onBack: () => void;
 }) {
@@ -523,7 +533,8 @@ function ConnectorPanel({
       <Row
         icon={GitPullRequest}
         label="GitHub"
-        description="Repositories, issues, pull requests, reviews, and CI"
+        description={githubAccess.description}
+        disabled={!githubAccess.available}
         selected={githubSelected}
         onClick={() => toggleTool('github')}
       />

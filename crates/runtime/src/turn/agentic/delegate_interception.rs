@@ -13,6 +13,7 @@ use super::super::agentic_loop::host::{
 pub(crate) const DELEGATE_TOOL_NAME: &str = "delegate";
 pub(crate) const FORWARD_HEADERS_CONTEXT_KEY: &str = "__astra_forward_headers";
 pub(crate) const REQUEST_ALLOWED_TOOLS_CONTEXT_KEY: &str = "__astra_request_allowed_tools";
+pub(crate) const REQUEST_ENABLED_TOOLS_CONTEXT_KEY: &str = "__astra_request_enabled_tools";
 pub(crate) const REQUEST_ALLOWED_SKILLS_CONTEXT_KEY: &str = "__astra_request_allowed_skills";
 pub(crate) const REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY: &str =
     "__astra_request_allowed_skill_sources";
@@ -814,6 +815,11 @@ pub(crate) async fn partition_and_execute_delegations(
                         &mut request,
                         REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
                         request_constraints.allowed_tools.as_ref(),
+                    );
+                    merge_request_allowlist_into_delegation_request(
+                        &mut request,
+                        REQUEST_ENABLED_TOOLS_CONTEXT_KEY,
+                        request_constraints.enabled_tools.as_ref(),
                     );
                     merge_request_allowlist_into_delegation_request(
                         &mut request,

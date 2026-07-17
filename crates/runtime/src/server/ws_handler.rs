@@ -153,6 +153,8 @@ pub(super) struct WsChatMessage {
     #[serde(default)]
     allow_tools: Option<Vec<String>>,
     #[serde(default)]
+    enabled_tools: Option<Vec<String>>,
+    #[serde(default)]
     context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
@@ -592,6 +594,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     allow_skills,
                                     allow_skill_sources,
                                     allow_tools,
+                                    enabled_tools,
                                     context,
                                     execution_budget,
                                     explain,
@@ -612,6 +615,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     allow_skills,
                                     allow_skill_sources,
                                     allow_tools,
+                                    enabled_tools,
                                     context,
                                     execution_budget,
                                     explain,
@@ -727,6 +731,7 @@ async fn handle_chat_message(
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
+    enabled_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
@@ -752,6 +757,7 @@ async fn handle_chat_message(
         allow_skills,
         allow_skill_sources,
         allow_tools,
+        enabled_tools,
         context,
         execution_budget,
         explain,
@@ -1212,6 +1218,7 @@ fn build_ws_chat_request(
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
+    enabled_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
@@ -1242,6 +1249,7 @@ fn build_ws_chat_request(
         allow_skills,
         allow_skill_sources,
         allow_tools,
+        enabled_tools,
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
@@ -2512,7 +2520,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "user_intent": "pure hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "user_intent": "pure hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "enabled_tools": ["web_search", "web_fetch"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
@@ -2526,6 +2534,7 @@ mod tests {
                     allow_skills,
                     allow_skill_sources,
                     allow_tools,
+                    enabled_tools,
                     context,
                     execution_budget,
                     explain,
@@ -2549,6 +2558,10 @@ mod tests {
                 assert_eq!(allow_skills, Some(vec!["plan".into()]));
                 assert_eq!(allow_skill_sources, Some(vec!["database".into()]));
                 assert_eq!(allow_tools, Some(vec!["bash".into()]));
+                assert_eq!(
+                    enabled_tools,
+                    Some(vec!["web_search".into(), "web_fetch".into()])
+                );
                 assert!(context.is_none());
                 assert_eq!(
                     execution_budget,
@@ -2716,6 +2729,7 @@ mod tests {
             Some(vec!["plan".into()]),
             Some(vec!["database".into()]),
             Some(vec!["bash".into(), "read_file".into()]),
+            Some(vec!["web_search".into(), "web_fetch".into()]),
             Some(serde_json::Map::from_iter([(
                 "cwd".to_string(),
                 serde_json::Value::String("/tmp".into()),
@@ -2762,6 +2776,10 @@ mod tests {
         assert_eq!(
             request.allow_tools,
             Some(vec!["bash".into(), "read_file".into()])
+        );
+        assert_eq!(
+            request.enabled_tools,
+            Some(vec!["web_search".into(), "web_fetch".into()])
         );
         assert_eq!(request.context.as_ref().unwrap()["cwd"], "/tmp");
         assert_eq!(

@@ -639,7 +639,7 @@ export async function POST(
           session_id: runtimeSessionId,
           selected_model: selectedModel,
           allow_skills: activeSkills.length ? activeSkills : undefined,
-          allow_tools: activeTools.length ? activeTools : undefined,
+          enabled_tools: activeTools,
           workspace_binding: workspaceBindings.workspaceBinding,
           executor_binding: workspaceBindings.executorBinding,
           context: {

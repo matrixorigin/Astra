@@ -13,8 +13,14 @@ import type {
   AttachmentRef,
   ComposerOptions,
   EdgeStatusResponse,
+  RuntimeCapabilitiesResponse,
   WorkspaceSelection,
 } from '@/lib/api/types';
+import { getRuntimeCapabilities } from '@/lib/api/chats';
+import {
+  resolveGitHubAccessAvailability,
+  resolveWebAccessAvailability,
+} from '@/lib/runtime-capabilities';
 import { filterSlashCommands, skillToSlashCommand, type SlashCommandItem } from '@/lib/composer/slash-commands';
 import { useSkillCatalog } from '@/hooks/use-skill-catalog';
 import { cn } from '@/lib/utils/cn';
@@ -228,6 +234,8 @@ export function Composer({
 }: ComposerProps) {
   const [text, setText] = useState(initialValue);
   const [webSearch, setWebSearch] = useState(false);
+  const [runtimeCapabilities, setRuntimeCapabilities] =
+    useState<RuntimeCapabilitiesResponse | null>(null);
   const [thinking, setThinking] = useState(true);
   const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
   const [modelAvailable, setModelAvailable] = useState(false);
@@ -261,6 +269,44 @@ export function Composer({
     return filterSlashCommands(commands, slashQuery);
   }, [activeSkills, skillCatalogItems, slashQuery]);
   const showSlashPanel = slashQuery !== null && !disabled && !submitting;
+  const edgeCapabilityRevision = (edgeWorkspaces ?? [])
+    .map(
+      (edge) =>
+        `${edge.edge_agent_id}:${JSON.stringify(edge.capabilities ?? null)}`,
+    )
+    .join('|');
+  const webAccess = useMemo(
+    () => resolveWebAccessAvailability(runtimeCapabilities, workspaceSelection),
+    [runtimeCapabilities, workspaceSelection],
+  );
+  const githubAccess = useMemo(
+    () => resolveGitHubAccessAvailability(runtimeCapabilities, workspaceSelection),
+    [runtimeCapabilities, workspaceSelection],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void getRuntimeCapabilities()
+      .then((snapshot) => {
+        if (!cancelled) setRuntimeCapabilities(snapshot);
+      })
+      .catch(() => {
+        if (!cancelled) setRuntimeCapabilities({ tools: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [edgeCapabilityRevision]);
+
+  useEffect(() => {
+    if (!webAccess.available) setWebSearch(false);
+  }, [webAccess.available]);
+
+  useEffect(() => {
+    if (!githubAccess.available) {
+      setActiveTools((tools) => tools.filter((tool) => tool !== 'github'));
+    }
+  }, [githubAccess.available]);
 
   useEffect(() => {
     const storedThinking = window.localStorage.getItem('astra.composer.thinking');
@@ -589,6 +635,8 @@ export function Composer({
         <ComposerPlusMenu
           inProject={Boolean(projectContext)}
           webSearch={webSearch}
+          webAccess={webAccess}
+          githubAccess={githubAccess}
           onWebSearchChange={setWebSearch}
           activeSkills={activeSkills}
           onActiveSkillsChange={handleActiveSkillsChange}

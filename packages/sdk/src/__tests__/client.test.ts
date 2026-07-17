@@ -1209,12 +1209,13 @@ describe("AstraClient — Errors", () => {
 // ─── chatRequestToWire ─────────────────────────────────────────────
 
 describe("chatRequestToWire", () => {
-  test("maps allow_skills, allow_tools, and skill_search", () => {
+  test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",
       selectedModel: { model: "test-model" },
       allowSkills: ["a", "b"],
       allowTools: ["t1"],
+      enabledTools: ["web_search", "web_fetch"],
       skillSearch: {
         dynamicSurface: false,
         minCatalogSize: 10,
@@ -1223,6 +1224,7 @@ describe("chatRequestToWire", () => {
     });
     expect(body.allow_skills).toEqual(["a", "b"]);
     expect(body.allow_tools).toEqual(["t1"]);
+    expect(body.enabled_tools).toEqual(["web_search", "web_fetch"]);
     expect(body.skill_search).toEqual({
       dynamic_surface: false,
       min_catalog_size: 10,
@@ -1239,6 +1241,15 @@ describe("chatRequestToWire", () => {
     });
     expect(body.allow_skills).toBeUndefined();
     expect(body.allow_tools).toBeUndefined();
+  });
+
+  test("preserves an empty optional-tool set as an explicit disablement", () => {
+    const body = chatRequestToWire({
+      message: "x",
+      selectedModel: { model: "test-model" },
+      enabledTools: [],
+    });
+    expect(body.enabled_tools).toEqual([]);
   });
 
   test("default request omits execution_budget", () => {

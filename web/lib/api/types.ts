@@ -98,7 +98,22 @@ export type EdgeStatusResponse = {
     edge_agent_id: string;
     hostname?: string | null;
     workspace_dir?: string | null;
+    capabilities?: unknown;
     connected_secs: number;
+  }>;
+};
+
+export type RuntimeCapabilityProvider = {
+  provider_id: string;
+  kind: 'server' | 'edge';
+  display_name: string;
+  status: 'ready';
+};
+
+export type RuntimeCapabilitiesResponse = {
+  tools: Array<{
+    name: string;
+    providers: RuntimeCapabilityProvider[];
   }>;
 };
 

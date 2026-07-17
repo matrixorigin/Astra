@@ -749,6 +749,8 @@ export type ChatConfig = {
   allowSkills?: string[];
   /** When set and non-empty, sent as `allow_tools` on chat requests. */
   allowTools?: string[];
+  /** Optional external tools explicitly enabled by the embedding product. */
+  enabledTools?: string[];
   /** Catalog surfacing — sent as `skill_search` (snake_case fields on the wire). */
   skillSearch?: SkillSearchSettings;
   /** Optional explicit workspace boundary for direct SDK integrations. */
@@ -824,6 +826,9 @@ export type ChatRequest = {
   allowSkills?: string[];
   /** When set and non-empty, sent as `allow_tools`. */
   allowTools?: string[];
+  /** Optional external tools explicitly enabled for this request. An empty
+   * array intentionally disables all user-selectable optional tools. */
+  enabledTools?: string[];
   skillSearch?: SkillSearchSettings;
   workspaceBinding?: WorkspaceBinding;
   executorBinding?: ExecutorBinding;
