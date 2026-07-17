@@ -587,6 +587,10 @@ pub(crate) async fn handle_slash_command(
             diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
         }
 
+        "/stop" => {
+            eprintln!("{}", "  No active run to stop.".dim());
+        }
+
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
             return Ok(true);

@@ -472,6 +472,13 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new("/exit", "Exit astra", CommandGroup::Core)
         .with_tui_route(TuiCommandRoute::Native),
+    CommandMeta::new(
+        "/stop",
+        "Stop the active run (same control as Ctrl+C)",
+        CommandGroup::Core,
+    )
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     // ── Workspace ─────────────────────────────────────────────────────────
     CommandMeta::new(
         "/grep",
@@ -1185,7 +1192,7 @@ mod tests {
     #[test]
     fn native_routes_cover_inline_panels_and_selectors_without_decorative_subtypes() {
         for command in [
-            "/help", "/model", "/clear", "/context", "/mcp", "/task", "/agent", "/reflect",
+            "/help", "/model", "/clear", "/stop", "/context", "/mcp", "/task", "/agent", "/reflect",
         ] {
             let meta = resolve_command_meta(command).unwrap_or_else(|| panic!("missing {command}"));
             assert_eq!(meta.tui_route, TuiCommandRoute::Native, "{command}");
@@ -1234,8 +1241,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "/help", "/model", "/plan", "/memory", "/task", "/inspect", "/context", "/agent",
-                "/allow",
+                "/help", "/model", "/stop", "/plan", "/memory", "/task", "/inspect", "/context",
+                "/agent", "/allow",
             ]
         );
         assert!(

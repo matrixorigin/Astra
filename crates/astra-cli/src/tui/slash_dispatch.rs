@@ -36,12 +36,14 @@ pub(crate) enum SlashResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImmediateControl {
     Exit,
+    StopCurrentRun,
 }
 
 pub(crate) fn immediate_control(text: &str) -> Option<ImmediateControl> {
     let (command, _args) = parse_slash(text);
     match command_registry::resolve_command(command).ok()? {
         "/exit" => Some(ImmediateControl::Exit),
+        "/stop" => Some(ImmediateControl::StopCurrentRun),
         _ => None,
     }
 }
@@ -228,6 +230,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     match resolved {
         // ── Exit ────────────────────────────────────────────────────
         "/exit" => SlashResult::Exit,
+        "/stop" => {
+            ctx.show_info("No active run to stop.".to_string());
+            SlashResult::Handled
+        }
 
         // ── Help ────────────────────────────────────────────────────
         "/help" => match help_command_route(args) {
@@ -3656,6 +3662,7 @@ mod view_result_tests {
     #[test]
     fn bypass_selection_requires_a_separate_typed_confirmation() {
         let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Prompt);
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
@@ -3701,6 +3708,7 @@ mod view_result_tests {
     #[test]
     fn confirmed_bypass_changes_policy_but_cancel_keeps_it_unchanged() {
         let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Prompt);
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
@@ -3944,8 +3952,25 @@ mod immediate_control_tests {
     }
 
     #[test]
+    fn stop_is_a_typed_phase_independent_control() {
+        for input in ["/stop", "  /stop  ", "/stop now"] {
+            assert_eq!(
+                immediate_control(input),
+                Some(ImmediateControl::StopCurrentRun)
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_slash_and_conversation_inputs_are_not_immediate_controls() {
-        for input in ["/agent", "/help", "please /exit later", ""] {
+        for input in [
+            "/agent",
+            "/help",
+            "please /exit later",
+            "停！",
+            "stop the server",
+            "",
+        ] {
             assert_eq!(immediate_control(input), None, "input: {input}");
         }
     }

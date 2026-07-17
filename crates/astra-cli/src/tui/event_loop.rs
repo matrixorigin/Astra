@@ -1147,6 +1147,50 @@ fn user_intent_preview(text: &str) -> String {
     preview
 }
 
+/// One cancellation choke point for keyboard and composer-driven stop
+/// requests. Local cancellation is visible to the run before any durable
+/// child-task RPCs are attempted, so a service round trip cannot allow another
+/// model round to start before cancellation is visible locally.
+async fn request_active_run_cancel(
+    chat_widget: &mut chat_widget::ChatWidget,
+    task_service: Option<&Arc<dyn astra_services::TaskService>>,
+    run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+    tui_cancel_token: &tokio_util::sync::CancellationToken,
+) {
+    run_control.request_cancel();
+    tui_cancel_token.cancel();
+
+    let ids = chat_widget.in_flight_task_ids().to_vec();
+    chat_widget.mark_control_tasks_cancelling(&ids);
+    let cancelled_count = ids.len();
+    chat_widget.commit_cancel_banner(cancelled_count);
+
+    if !ids.is_empty()
+        && let Some(service) = task_service
+    {
+        let service = service.clone();
+        let user_id = Arc::new(crate::cli::cli_config::cli_utils::cli_user_id());
+        let errors = super::cancel_fanout::fanout(&ids, move |id| {
+            let service = service.clone();
+            let user_id = user_id.clone();
+            async move {
+                service
+                    .update_status(user_id.as_str(), &id, astra_services::TaskStatus::Cancelled)
+                    .await
+            }
+        })
+        .await;
+        for (id, error) in errors {
+            tracing::warn!(
+                target: "astra_cli::tui",
+                task_id = %id,
+                error = %error,
+                "active-run cancel fan-out: cancel rpc failed"
+            );
+        }
+    }
+}
+
 /// Resolve submissions that were accepted while a turn still owned the
 /// composer. A normal turn gives them a deterministic next-turn route; an
 /// interrupted or failed turn returns every queued byte to the caller for
@@ -1206,6 +1250,65 @@ fn background_task_event_requires_model_attention(
             | super::background_tasks::BgTaskEvent::Failed { .. }
             | super::background_tasks::BgTaskEvent::Killed { .. }
     )
+}
+
+/// Service tool-to-workbench background commands in every event-loop phase.
+/// The foreground turn owns `&mut SessionState`, so the shared queue and
+/// backends are snapshotted before that borrow and drained from its 80ms tick.
+/// Without this, `task_output` waits for the event loop that is itself waiting
+/// for the active agent, producing a deterministic registry timeout.
+async fn drain_background_task_commands(
+    commands: &Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    list_cache: &Arc<tokio::sync::RwLock<String>>,
+) {
+    let commands: Vec<_> = commands.lock_recover().drain(..).collect();
+    for command in commands {
+        match command {
+            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
+                let _ = reply.send(
+                    stop_background_task_with_agents(
+                        background_registry,
+                        agent_spawner,
+                        restored_local_agents,
+                        &task_id,
+                    )
+                    .await
+                    .map(|_| ()),
+                );
+            }
+            crate::edge_tools::BgTaskCommand::GetOutputSince {
+                task_id,
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(
+                    background_task_output_snapshot_with_agents(
+                        background_registry,
+                        agent_spawner,
+                        restored_local_agents,
+                        &task_id,
+                        offset,
+                        max_bytes,
+                    )
+                    .await,
+                );
+            }
+            crate::edge_tools::BgTaskCommand::List { reply } => {
+                let rendered = render_background_task_list_xml_with_agents(
+                    background_registry,
+                    agent_spawner,
+                    restored_local_agents,
+                )
+                .await;
+                *list_cache.write().await = rendered.clone();
+                let _ = reply.send(rendered);
+            }
+        }
+    }
 }
 
 fn transcript_snapshot(
@@ -5564,6 +5667,10 @@ pub(crate) async fn run_tui_session(
                                         let background_registry_turn_session_id =
                                             state.session_id.clone();
                                         let background_registry_turn_model = state.model.clone();
+                                        let bg_task_commands_for_turn =
+                                            state.bg_task_commands.clone();
+                                        let bg_task_list_cache_for_turn =
+                                            state.bg_task_list_cache.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
                                             api,
                                             profile,
@@ -5785,16 +5892,47 @@ pub(crate) async fn run_tui_session(
                                                             bottom_pane.pre_draw_tick(std::time::Instant::now());
                                                             match bottom_pane.handle_key(k) {
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
-                                                                        if matches!(
-                                                                            slash_dispatch::immediate_control(&queued_text),
-                                                                            Some(slash_dispatch::ImmediateControl::Exit)
-                                                                        ) {
-                                                                            // `/exit` is a workbench lifecycle command in every
-                                                                            // turn phase. Cancel the in-flight local boundary and
-                                                                            // leave through the regular shutdown path; never queue
-                                                                            // it as model guidance or a follow-up user message.
-                                                                            tui_cancel_token.cancel();
-                                                                            break 'main Ok(());
+                                                                        match slash_dispatch::immediate_control(&queued_text) {
+                                                                            Some(slash_dispatch::ImmediateControl::Exit) => {
+                                                                                // `/exit` is a workbench lifecycle command in every
+                                                                                // turn phase. Cancel the in-flight local boundary and
+                                                                                // leave through the regular shutdown path; never queue
+                                                                                // it as model guidance or a follow-up user message.
+                                                                                tui_cancel_token.cancel();
+                                                                                break 'main Ok(());
+                                                                            }
+                                                                            Some(slash_dispatch::ImmediateControl::StopCurrentRun) => {
+                                                                                if output_settled_at.is_some() {
+                                                                                    chat_widget.commit_system(
+                                                                                        history_cell::system::SystemCell::info(
+                                                                                            "The current run has already finished its response and is settling.",
+                                                                                        ),
+                                                                                    );
+                                                                                } else {
+                                                                                    chat_widget.commit_system(
+                                                                                        history_cell::system::SystemCell::info(
+                                                                                            "Stopping the current run…",
+                                                                                        ),
+                                                                                    );
+                                                                                    request_active_run_cancel(
+                                                                                        &mut chat_widget,
+                                                                                        task_service_for_cancel.as_ref(),
+                                                                                        &preinstalled_run_control,
+                                                                                        &tui_cancel_token,
+                                                                                    )
+                                                                                    .await;
+                                                                                    interrupt_pending = true;
+                                                                                    bottom_pane.interrupt_pending = true;
+                                                                                }
+                                                                                flush_chat_widget(
+                                                                                    &mut guard,
+                                                                                    &mut chat_widget,
+                                                                                    w,
+                                                                                );
+                                                                                frame_requester.schedule_frame();
+                                                                                continue;
+                                                                            }
+                                                                            None => {}
                                                                         }
                                                                         match classify_local_shell_submission(&queued_text) {
                                                                             LocalShellSubmission::NotShell => {}
@@ -5993,63 +6131,13 @@ pub(crate) async fn run_tui_session(
                                                                         continue;
                                                                     }
                                                                     BottomPaneAction::Interrupt | BottomPaneAction::Quit => {
-                                                                        // Fan out cancel to every in-flight
-                                                                        // sub-agent TaskCell so Ctrl+C
-                                                                        // doesn't just kill the parent turn
-                                                                        // while children keep running in
-                                                                        // the durable worker.
-                                                                        let ids: Vec<String> = chat_widget
-                                                                            .in_flight_task_ids()
-                                                                            .to_vec();
-                                                                        chat_widget.mark_control_tasks_cancelling(&ids);
-                                                                        // Report the count of tasks the user
-                                                                        // *targeted* with Ctrl+C, not just the
-                                                                        // ones the durable-task service acked.
-                                                                        // Service errors are logged separately;
-                                                                        // a non-acked task is usually a
-                                                                        // synchronous-spawn child the worker
-                                                                        // never persisted, but the user's
-                                                                        // intent was to interrupt all six
-                                                                        // running children, so the banner
-                                                                        // should say "Cancelled 6", not "1".
-                                                                        let cancelled_count = ids.len();
-                                                                        if !ids.is_empty()
-                                                                            && let Some(ref svc) = task_service_for_cancel
-                                                                        {
-                                                                            let svc = svc.clone();
-                                                                            let user_id = std::sync::Arc::new(
-                                                                                crate::cli::cli_config::cli_utils::cli_user_id(),
-                                                                            );
-                                                                            let errs = super::cancel_fanout::fanout(
-                                                                                &ids,
-                                                                                move |id| {
-                                                                                    let svc = svc.clone();
-                                                                                    let user_id = user_id.clone();
-                                                                                    async move {
-                                                                                        svc.update_status(
-                                                                                            user_id.as_str(),
-                                                                                            &id,
-                                                                                            astra_services::TaskStatus::Cancelled,
-                                                                                        )
-                                                                                        .await
-                                                                                    }
-                                                                                },
-                                                                            )
-                                                                            .await;
-                                                                            for (id, e) in &errs {
-                                                                                tracing::warn!(
-                                                                                    target: "astra_cli::tui",
-                                                                                    task_id = %id,
-                                                                                    error = %e,
-                                                                                    "ctrl+c cancel fan-out: cancel rpc failed"
-                                                                                );
-                                                                            }
-                                                                        }
-                                                                        // Scrollback banner so the user sees
-                                                                        // the cascade — silent on zero-task
-                                                                        // Ctrl+C so routine interrupts stay
-                                                                        // noise-free.
-                                                                        chat_widget.commit_cancel_banner(cancelled_count);
+                                                                        request_active_run_cancel(
+                                                                            &mut chat_widget,
+                                                                            task_service_for_cancel.as_ref(),
+                                                                            &preinstalled_run_control,
+                                                                            &tui_cancel_token,
+                                                                        )
+                                                                        .await;
                                                                         // Don't drain the queue here. The run is
                                                                         // being cancelled but may still emit
                                                                         // typed run-input applied events
@@ -6062,7 +6150,6 @@ pub(crate) async fn run_tui_session(
                                                                         // stop" can never drop user input.
                                                                         interrupt_pending = true;
                                                                         bottom_pane.interrupt_pending = true;
-                                                                        tui_cancel_token.cancel();
                                                                     }
                                                                     _ => {}
                                                                 }
@@ -6553,6 +6640,14 @@ pub(crate) async fn run_tui_session(
                                                     frame_requester.schedule_frame();
                                                 }
                                                 _ = &mut itick => {
+                                                    drain_background_task_commands(
+                                                        &bg_task_commands_for_turn,
+                                                        &mut background_registry,
+                                                        agent_spawner_for_cancel.as_ref(),
+                                                        &restored_local_agent_task_projections,
+                                                        &bg_task_list_cache_for_turn,
+                                                    )
+                                                    .await;
                                                     drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
                                                         background_registry_session_id.as_deref(),
@@ -6676,18 +6771,24 @@ pub(crate) async fn run_tui_session(
                                                             &mut background_task_projection_cache,
                                                         )
                                                         .await;
-                                                        let rows = background_task_rows_with_agent_snapshot(
-                                                            &mut background_registry,
-                                                            &local_agent_snapshot,
-                                                            &restored_local_agent_task_projections,
-                                                        );
-                                                        if bottom_pane.accepts_background_task_rows() {
-                                                            bottom_pane.refresh_background_task_rows(rows.clone());
-                                                        }
-                                                        let counts =
-                                                            status_line::BackgroundTaskCounts::from_rows(&rows);
-                                                        bottom_pane.footer.bg_task_counts =
-                                                            (!counts.is_empty()).then_some(counts);
+                                                    }
+                                                    // The tool executor reads this cache directly.
+                                                    // Refresh it during active turns too, including
+                                                    // immediately after a shell handoff or local `&`
+                                                    // launch, rather than exposing the last idle tick.
+                                                    let rows = background_task_rows_with_agent_snapshot(
+                                                        &mut background_registry,
+                                                        &local_agent_snapshot,
+                                                        &restored_local_agent_task_projections,
+                                                    );
+                                                    *bg_task_list_cache_for_turn.write().await =
+                                                        render_background_task_rows_xml(&rows);
+                                                    sync_background_task_footer_from_rows(
+                                                        &mut bottom_pane,
+                                                        &rows,
+                                                    );
+                                                    if bottom_pane.accepts_background_task_rows() {
+                                                        bottom_pane.refresh_background_task_rows(rows);
                                                     }
                                                     // Refresh the permission-mode chip via the
                                                     // lock-free mirror — the agentic loop holds
@@ -7868,58 +7969,14 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                 }
-                // Drain background shell commands from the tool executor.
-                {
-                    let cmds: Vec<_> = {
-                        state.bg_task_commands.lock_recover().drain(..).collect()
-                    };
-                    for cmd in cmds {
-                        match cmd {
-                            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                                let _ = reply.send(
-                                    stop_background_task_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                        &task_id,
-                                    )
-                                    .await
-                                    .map(|_| ()),
-                                );
-                            }
-                            crate::edge_tools::BgTaskCommand::GetOutputSince {
-                                task_id,
-                                offset,
-                                max_bytes,
-                                reply,
-                            } => {
-                                let _ = reply.send(
-                                    background_task_output_snapshot_with_agents(
-                                        &mut background_registry,
-                                        state.agent_spawner.as_ref(),
-                                        &restored_local_agent_task_projections,
-                                        &task_id,
-                                        offset,
-                                        max_bytes,
-                                    )
-                                    .await,
-                                );
-                            }
-                            crate::edge_tools::BgTaskCommand::List { reply } => {
-                                let rendered = render_background_task_list_xml_with_agents(
-                                    &mut background_registry,
-                                    state.agent_spawner.as_ref(),
-                                    &restored_local_agent_task_projections,
-                                )
-                                .await;
-                                // Populate shared cache so task_list_bg can read
-                                // directly without queue latency.
-                                *state.bg_task_list_cache.write().await = rendered.clone();
-                                let _ = reply.send(rendered);
-                            }
-                        }
-                    }
-                }
+                drain_background_task_commands(
+                    &state.bg_task_commands,
+                    &mut background_registry,
+                    state.agent_spawner.as_ref(),
+                    &restored_local_agent_task_projections,
+                    &state.bg_task_list_cache,
+                )
+                .await;
 
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
@@ -8212,7 +8269,9 @@ mod tests {
     use crate::cli::turn::local_run_control::LocalRunControl;
     use crate::tui::background_tasks::BgTaskEvent;
     use crate::tui::status_line::{StatusContext, StatusLine};
-    use astra_runtime::turn::run_control::UserIntentProvider;
+    use astra_runtime::turn::run_control::{
+        RunControlStatus, RunStatusProvider, UserIntentProvider,
+    };
     use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
     use astra_turn_core::orchestration_types::{
         AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
@@ -8338,7 +8397,10 @@ mod tests {
 
     #[test]
     fn active_turn_permission_selection_is_staged_without_rewriting_current_policy() {
-        let state = crate::cli::session::session_state::SessionState::default();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = chat_widget::ChatWidget::new("");
 
@@ -9887,6 +9949,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreground_tick_services_background_output_commands() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let task_id = registry.spawn_shell("printf 'progress\\n'", "long test");
+        for _ in 0..100 {
+            registry.poll_completions();
+            if registry
+                .get(&task_id)
+                .is_some_and(|task| task.status().as_str() != "running")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let commands = Arc::new(std::sync::Mutex::new(vec![
+            crate::edge_tools::BgTaskCommand::GetOutputSince {
+                task_id: task_id.clone(),
+                offset: 0,
+                max_bytes: 8192,
+                reply: reply_tx,
+            },
+        ]));
+        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
+
+        drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await;
+
+        let snapshot = reply_rx
+            .await
+            .expect("foreground tick must answer command")
+            .expect("background output must be readable");
+        assert_eq!(snapshot.output, "progress\n");
+        assert!(snapshot.terminal);
+        assert!(commands.lock_recover().is_empty());
+    }
+
+    #[tokio::test]
     async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
         let temp = crate::tests::test_temp_dir();
         let mut registry =
@@ -10962,6 +11063,24 @@ mod tests {
         assert_eq!(polled.inputs.len(), 1, "one user intent should be queued");
         assert_eq!(polled.inputs[0].intent_id, receipt.intent_id);
         assert_eq!(polled.inputs[0].input["content"], "先停下来吧");
+    }
+
+    #[tokio::test]
+    async fn active_run_cancel_updates_control_plane_before_returning() {
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let run_control = LocalRunControl::default();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        request_active_run_cancel(&mut chat_widget, None, &run_control, &cancel_token).await;
+
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(
+            run_control
+                .control_status("local-user", "run-local")
+                .await
+                .expect("local control status"),
+            Some(RunControlStatus::Cancelled)
+        );
     }
 
     #[tokio::test]

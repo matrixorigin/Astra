@@ -299,7 +299,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_session_messages_uses_csl_when_checkpoint_errors() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-cont-corrupt-{}", uuid::Uuid::new_v4());
         let mut checkpoint = StepCheckpoint::heavy(
             "s1".to_string(),
@@ -357,7 +359,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_session_messages_prefers_csl_over_valid_checkpoint() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-priority-{}", uuid::Uuid::new_v4());
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         let checkpoint = StepCheckpoint::heavy(

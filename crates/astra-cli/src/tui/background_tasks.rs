@@ -1152,6 +1152,22 @@ impl BackgroundTaskRegistry {
 
 // ── Shell task runner ───────────────────────────────────────────────
 
+/// A background command is terminally successful when its process completed
+/// and the command's domain result is usable. Keep this separate from
+/// `ExitSemantics::is_tool_error`: a failed build/test is a valid tool
+/// response, but it is still a failed background task and must wake the
+/// harness through `BgTaskEvent::Failed`.
+fn background_task_exit_succeeded(command: &str, exit_code: Option<i32>) -> bool {
+    use astra_tools::exit_semantics::{CommandResultClass, classify_command_result};
+
+    matches!(
+        classify_command_result(command, "", "", exit_code),
+        CommandResultClass::Success
+            | CommandResultClass::EmptyResult
+            | CommandResultClass::DomainNegative
+    )
+}
+
 async fn run_shell_task(
     cmd: &str,
     stdout_path: &Path,
@@ -1242,13 +1258,7 @@ async fn run_shell_task(
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
-                    let success = exit_status.success()
-                        || code
-                            .map(|code| {
-                                !astra_tools::exit_semantics::classify_exit(cmd, code)
-                                    .is_tool_error()
-                            })
-                            .unwrap_or(false);
+                    let success = background_task_exit_succeeded(cmd, code);
                     let summary = make_summary(stdout_path, code).await;
                     if success {
                         TaskCompletion {
@@ -1437,13 +1447,7 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
             match exit {
                 Ok(exit_status) => {
                     let code = exit_status.code();
-                    let success = exit_status.success()
-                        || code
-                            .map(|code| {
-                                !astra_tools::exit_semantics::classify_exit(&command_label, code)
-                                    .is_tool_error()
-                            })
-                            .unwrap_or(false);
+                    let success = background_task_exit_succeeded(&command_label, code);
                     let summary = make_summary(&stdout_path, code).await;
                     if success {
                         TaskCompletion {
@@ -3272,6 +3276,36 @@ mod tests {
         assert!(
             !has_killed,
             "should NOT see Killed for fast-completed: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_build_is_not_reported_as_completed_background_work() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        // The trailing arguments make the command recognizable as build/test
+        // work while `sh -c` deterministically returns the representative
+        // `make` failure status from the reported session.
+        let id = registry.spawn_shell("sh -c 'exit 2' make test", "offline tests");
+
+        let events = wait_for_task_terminal(&mut registry, &id).await;
+
+        assert_eq!(
+            registry.get(&id).map(BackgroundTaskHandle::status),
+            Some(BgTaskStatus::Failed)
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BgTaskEvent::Failed { id: event_id, error, .. }
+                    if event_id == &id && error.contains("exit code 2")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BgTaskEvent::Completed { id: event_id, .. } if event_id == &id)),
+            "failed test work must not emit Completed: {events:?}"
         );
     }
 }
