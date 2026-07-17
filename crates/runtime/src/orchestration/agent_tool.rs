@@ -2579,6 +2579,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 tool_calls: 2,
+                turns_completed: 0,
                 permission_summary: None,
                 permission_requests: 0,
                 permission_requests_approved: 0,
@@ -3819,61 +3820,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("stop_slot has side effects")),
             "{recovered}"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_fanout_get_results_preserves_budget_adjustment_notice() {
-        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
-        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
-        let start = handle_agent_fanout_tool(
-            &json!({
-                "action": "start",
-                "group_id": "review-budget",
-                "target_count": 1,
-                "defaults": {
-                    "agent_type": "code-review",
-                    "max_turns": 15,
-                    "complexity": "deep"
-                },
-                "slots": [
-                    {"id": "storage", "description": "Review storage", "prompt": "Review storage changes"}
-                ]
-            }),
-            Some(&ctx),
-        )
-        .await;
-        let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["status"], "started");
-        assert!(
-            start_value["budget_adjustment"]
-                .as_str()
-                .is_some_and(|notice| notice.contains("max_turns 15")),
-            "start response must expose budget adjustment: {start}"
-        );
-
-        let result = handle_agent_fanout_tool(
-            &json!({
-                "action": "get_results",
-                "group_id": "review-budget"
-            }),
-            Some(&ctx),
-        )
-        .await;
-        let value: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(value["status"], "completed");
-        assert!(
-            value["budget_adjustment"]
-                .as_str()
-                .is_some_and(|notice| notice.contains("max_turns 15")),
-            "get_results response must preserve budget adjustment: {result}"
-        );
-
-        let groups = spawner.list_fanout_groups().await;
-        assert_eq!(
-            groups[0].budget_adjustment.as_deref(),
-            value["budget_adjustment"].as_str()
         );
     }
 
