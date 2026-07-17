@@ -869,8 +869,15 @@ STALE_HOURS ?= 12
 clean-stale:
 	@echo "Current target/ size:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
 	@echo ""
-	@echo "Removing artifacts not accessed in $(STALE_HOURS)h..."
-	@STALE_MIN=$$(( $(STALE_HOURS) * 60 )); \
+	@mkdir -p $(RUST_TARGET_DIR)/debug $(RUST_TARGET_DIR)/release
+	@exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
+	exec 9>$(RUST_TARGET_DIR)/release/.cargo-lock; \
+	if ! flock -n 8 || ! flock -n 9; then \
+		echo "Skipping stale cleanup: Cargo is using the target directory"; \
+		exit 0; \
+	fi; \
+	echo "Removing artifacts not accessed in $(STALE_HOURS)h..."; \
+	STALE_MIN=$$(( $(STALE_HOURS) * 60 )); \
 	for PROFILE in debug release; do \
 		DIR=$(RUST_TARGET_DIR)/$$PROFILE; \
 		[ -d "$$DIR" ] || continue; \
@@ -879,10 +886,10 @@ clean-stale:
 		find $$DIR/.fingerprint -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 		find $$DIR/build -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 		find $$DIR/examples -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
-	done
-	@echo ""
-	@echo "After cleanup:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
-	@echo "✅ Stale artifacts (>$(STALE_HOURS)h) removed"
+	done; \
+	echo ""; \
+	echo "After cleanup:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true; \
+	echo "✅ Stale artifacts (>$(STALE_HOURS)h) removed"
 
 # Maximum age (in hours) for build artifacts before sweep removes them.
 # Override: make sweep SWEEP_MAX_AGE_H=2
@@ -892,16 +899,23 @@ SWEEP_MAX_AGE_H ?= 4
 # Runs automatically before build-release and test-offline to keep disk usage bounded.
 .PHONY: sweep
 sweep:
-	@AGE_MIN=$$(( $(SWEEP_MAX_AGE_H) * 60 )); \
+	@mkdir -p $(RUST_TARGET_DIR)/debug $(RUST_TARGET_DIR)/release
+	@exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
+	exec 9>$(RUST_TARGET_DIR)/release/.cargo-lock; \
+	if ! flock -n 8 || ! flock -n 9; then \
+		echo "Skipping artifact sweep: Cargo is using the target directory"; \
+		exit 0; \
+	fi; \
+	AGE_MIN=$$(( $(SWEEP_MAX_AGE_H) * 60 )); \
 	echo "Sweeping artifacts older than $(SWEEP_MAX_AGE_H)h..."; \
 	find $(RUST_TARGET_DIR)/debug/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/debug/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/debug/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/release/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/release/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
-	find $(RUST_TARGET_DIR)/release/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true
-	@echo "✅ Stale artifacts removed"
-	@du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
+	find $(RUST_TARGET_DIR)/release/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+	echo "✅ Stale artifacts removed"; \
+	du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
 
 # ============================================================================
 # Testing
