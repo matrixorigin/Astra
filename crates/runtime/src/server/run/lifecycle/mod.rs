@@ -121,7 +121,7 @@ use astra_runtime_env::{
 };
 
 use crate::orchestration::spawner::{
-    agent_status_to_progress_event, project_subrun_status_to_spawn,
+    DescendantCancellationReason, agent_status_to_progress_event, project_subrun_status_to_spawn,
 };
 use crate::server::agent_binding_skill_runtime;
 use crate::server::deployment_tool_policy::{
@@ -2825,7 +2825,7 @@ impl AgenticRunLifecycleService {
             let cancelled_children = spawner
                 .cancel_descendants_of_parent_run(
                     run_id,
-                    "ancestor run cancelled before child completion",
+                    DescendantCancellationReason::AncestorCancelled,
                 )
                 .await;
             if cancelled_children > 0 {
@@ -2842,7 +2842,7 @@ impl AgenticRunLifecycleService {
             user_id,
             session_id,
             run_id,
-            "ancestor run cancelled before child completion",
+            DescendantCancellationReason::AncestorCancelled.as_str(),
         )
         .await
         {
@@ -8761,7 +8761,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let cancelled_children = missing_lifecycle_spawner
                         .cancel_descendants_of_parent_run(
                             &bg_run_id,
-                            "ancestor run cancelled before child completion",
+                            DescendantCancellationReason::AncestorCancelled,
                         )
                         .await;
                     if cancelled_children > 0 {
@@ -8777,7 +8777,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_user_id,
                         &bg_session_id,
                         &bg_run_id,
-                        "ancestor run cancelled before child completion",
+                        DescendantCancellationReason::AncestorCancelled.as_str(),
                     )
                     .await
                     {

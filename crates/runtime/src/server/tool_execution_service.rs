@@ -53,6 +53,11 @@ pub(crate) struct OptionalToolProvider {
     pub display_name: String,
 }
 
+struct OfferPolicySnapshot {
+    disabled_tool_offers: HashSet<String>,
+    provider_allowed_tools: HashMap<String, HashSet<String>>,
+}
+
 /// Builder for constructing a fully-configured [`ToolExecutionService`].
 ///
 /// Eliminates semi-constructed state by requiring all dependencies to be
@@ -65,7 +70,7 @@ pub struct ToolExecutionServiceBuilder {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
-    provider_capabilities: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
     provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
@@ -79,7 +84,7 @@ impl Default for ToolExecutionServiceBuilder {
             gateway_relay_transport: None,
             sandbox_resident_agent_transport: None,
             tool_registry: astra_runtime_env::ToolRegistry::builtins(),
-            provider_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            provider_capabilities: Arc::new(HashMap::new()),
             disabled_tool_offers: Arc::new(RwLock::new(HashSet::new())),
             provider_allowed_tools: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -149,7 +154,7 @@ impl ToolExecutionServiceBuilder {
         mut self,
         capabilities: HashMap<String, HashSet<String>>,
     ) -> Self {
-        self.provider_capabilities = Arc::new(RwLock::new(capabilities));
+        self.provider_capabilities = Arc::new(capabilities);
         self
     }
 
@@ -190,7 +195,7 @@ pub struct ToolExecutionService {
     tool_registry: astra_runtime_env::ToolRegistry,
     /// Deployment-declared provider capacity. This is distinct from the user
     /// selecting an optional tool and from administrator offer policy.
-    provider_capabilities: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     /// Runtime-disabled tool offers (admin API/config). Checked before dispatch.
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
     /// Optional exact allowlist per provider id. Missing provider id means
@@ -259,7 +264,7 @@ impl ToolExecutionService {
         Arc::clone(&self.provider_allowed_tools)
     }
 
-    pub fn provider_capabilities_handle(&self) -> Arc<RwLock<HashMap<String, HashSet<String>>>> {
+    pub fn provider_capabilities_handle(&self) -> Arc<HashMap<String, HashSet<String>>> {
         Arc::clone(&self.provider_capabilities)
     }
 
@@ -292,11 +297,7 @@ impl ToolExecutionService {
 
     pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
         ToolAdmissionContext {
-            provider_capabilities: self
-                .provider_capabilities
-                .try_read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default(),
+            provider_capabilities: self.provider_capabilities.as_ref().clone(),
             disabled_tool_offers: self
                 .disabled_tool_offers
                 .try_read()
@@ -329,91 +330,115 @@ impl ToolExecutionService {
         &self,
         user_id: &str,
     ) -> BTreeMap<String, Vec<OptionalToolProvider>> {
-        let provider_capabilities = self.provider_capabilities.read().await.clone();
-        let disabled_tool_offers = self.disabled_tool_offers.read().await.clone();
-        let provider_allowed_tools = self.provider_allowed_tools.read().await.clone();
-        let mut providers_by_tool = self
-            .tool_registry
-            .iter()
-            .filter(|spec| spec.requires_explicit_user_enablement())
-            .map(|spec| (spec.name.clone(), BTreeSet::new()))
-            .collect::<BTreeMap<_, _>>();
-
-        let server_capabilities = provider_capabilities.get(SERVER_OPTIONAL_TOOL_PROVIDER_ID);
-        if server_capabilities.is_some_and(|capabilities| {
-            capabilities.contains(astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK)
-        }) {
-            for (tool_name, providers) in &mut providers_by_tool {
-                let requirements_satisfied =
-                    self.tool_registry.get(tool_name).is_some_and(|spec| {
-                        !spec.required.credentials
-                            || server_capabilities.is_some_and(|capabilities| {
-                                capabilities
-                                    .contains(astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER)
-                            })
-                    });
-                if requirements_satisfied
-                    && provider_offer_is_enabled(
-                        &disabled_tool_offers,
-                        &provider_allowed_tools,
-                        SERVER_OPTIONAL_TOOL_PROVIDER_ID,
-                        tool_name,
-                    )
-                {
-                    providers.insert(OptionalToolProvider {
-                        provider_id: SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
-                        kind: OptionalToolProviderKind::Server,
-                        display_name: "Server".to_string(),
-                    });
-                }
-            }
-        }
-
-        if let Some(pool) = self.edge_connection_pool.as_ref() {
-            for edge in pool.get_user_edges(user_id) {
-                let advertised_tools = edge
-                    .capabilities
-                    .and_then(|value| {
-                        serde_json::from_value::<
-                            astra_runtime_env::RuntimeEnvironmentAdvertisement,
-                        >(value)
-                        .ok()
-                    })
-                    .map(|advertisement| {
-                        advertisement
-                            .binding
-                            .tool_surface
-                            .tool_names
-                            .into_iter()
-                            .collect::<BTreeSet<_>>()
-                    })
-                    .unwrap_or_default();
-                for (tool_name, providers) in &mut providers_by_tool {
-                    if advertised_tools.contains(tool_name)
-                        && provider_offer_is_enabled(
-                            &disabled_tool_offers,
-                            &provider_allowed_tools,
-                            &edge.edge_agent_id,
-                            tool_name,
-                        )
-                    {
-                        providers.insert(OptionalToolProvider {
-                            provider_id: edge.edge_agent_id.clone(),
-                            kind: OptionalToolProviderKind::Edge,
-                            display_name: edge
-                                .hostname
-                                .clone()
-                                .unwrap_or_else(|| edge.edge_agent_id.clone()),
-                        });
-                    }
-                }
-            }
-        }
-
+        let policy_snapshot = self.snapshot_offer_policy().await;
+        let mut providers_by_tool = self.collect_optional_tool_candidates();
+        self.collect_server_providers(&mut providers_by_tool, &policy_snapshot);
+        self.collect_edge_providers(&mut providers_by_tool, user_id, &policy_snapshot);
         providers_by_tool
             .into_iter()
             .map(|(name, providers)| (name, providers.into_iter().collect()))
             .collect()
+    }
+
+    async fn snapshot_offer_policy(&self) -> OfferPolicySnapshot {
+        OfferPolicySnapshot {
+            disabled_tool_offers: self.disabled_tool_offers.read().await.clone(),
+            provider_allowed_tools: self.provider_allowed_tools.read().await.clone(),
+        }
+    }
+
+    fn collect_optional_tool_candidates(&self) -> BTreeMap<String, BTreeSet<OptionalToolProvider>> {
+        self.tool_registry
+            .iter()
+            .filter(|spec| spec.requires_explicit_user_enablement())
+            .map(|spec| (spec.name.clone(), BTreeSet::new()))
+            .collect()
+    }
+
+    fn collect_server_providers(
+        &self,
+        providers_by_tool: &mut BTreeMap<String, BTreeSet<OptionalToolProvider>>,
+        policy: &OfferPolicySnapshot,
+    ) {
+        let server_capabilities = self
+            .provider_capabilities
+            .get(SERVER_OPTIONAL_TOOL_PROVIDER_ID);
+        let has_public_network = server_capabilities
+            .is_some_and(|caps| caps.contains(astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK));
+        if !has_public_network {
+            return;
+        }
+        let has_credential_broker = server_capabilities
+            .is_some_and(|caps| caps.contains(astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER));
+        for (tool_name, providers) in providers_by_tool {
+            let requirements_satisfied = self
+                .tool_registry
+                .get(tool_name)
+                .is_some_and(|spec| !spec.required.credentials || has_credential_broker);
+            if requirements_satisfied
+                && provider_offer_is_enabled(
+                    &policy.disabled_tool_offers,
+                    &policy.provider_allowed_tools,
+                    SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+                    tool_name,
+                )
+            {
+                providers.insert(OptionalToolProvider {
+                    provider_id: SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+                    kind: OptionalToolProviderKind::Server,
+                    display_name: "Server".to_string(),
+                });
+            }
+        }
+    }
+
+    fn collect_edge_providers(
+        &self,
+        providers_by_tool: &mut BTreeMap<String, BTreeSet<OptionalToolProvider>>,
+        user_id: &str,
+        policy: &OfferPolicySnapshot,
+    ) {
+        let Some(pool) = self.edge_connection_pool.as_ref() else {
+            return;
+        };
+        for edge in pool.get_user_edges(user_id) {
+            let advertised_tools = edge
+                .capabilities
+                .and_then(|value| {
+                    serde_json::from_value::<astra_runtime_env::RuntimeEnvironmentAdvertisement>(
+                        value,
+                    )
+                    .ok()
+                })
+                .map(|advertisement| {
+                    advertisement
+                        .binding
+                        .tool_surface
+                        .tool_names
+                        .into_iter()
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            for (tool_name, providers) in &mut *providers_by_tool {
+                if advertised_tools.contains(tool_name)
+                    && provider_offer_is_enabled(
+                        &policy.disabled_tool_offers,
+                        &policy.provider_allowed_tools,
+                        &edge.edge_agent_id,
+                        tool_name,
+                    )
+                {
+                    providers.insert(OptionalToolProvider {
+                        provider_id: edge.edge_agent_id.clone(),
+                        kind: OptionalToolProviderKind::Edge,
+                        display_name: edge
+                            .hostname
+                            .clone()
+                            .unwrap_or_else(|| edge.edge_agent_id.clone()),
+                    });
+                }
+            }
+        }
     }
 
     pub(crate) async fn unavailable_optional_tools_for_binding(

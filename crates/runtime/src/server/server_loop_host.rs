@@ -1234,7 +1234,8 @@ pub struct ServerAgenticLoopHost {
     disabled_tool_offers: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Deployment-declared provider capacity used by both prompt admission and
     /// dispatch. User selection is tracked separately in request constraints.
-    provider_capabilities: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
+    /// Frozen at startup — no runtime writes, so we use a plain Arc (no lock).
+    provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
@@ -1308,8 +1309,8 @@ pub struct ServerAgenticLoopHostBuilder {
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Shared handle to the runtime-disabled tool offers (admin API).
     disabled_tool_offers: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
-    /// Deployment-declared provider capacity.
-    provider_capabilities: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
+    /// Deployment-declared provider capacity. Frozen at startup (no runtime writes).
+    provider_capabilities: Option<Arc<HashMap<String, HashSet<String>>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
 }
@@ -1610,7 +1611,11 @@ impl ServerAgenticLoopHostBuilder {
             control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
             runtime_declared_tool_names: (!runtime_declared_tool_names.is_empty())
                 .then(|| runtime_declared_tool_names.clone()),
-            provider_capabilities: snapshot_builder_policy_handle(&self.provider_capabilities),
+            provider_capabilities: self
+                .provider_capabilities
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
             disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
@@ -1782,7 +1787,7 @@ impl ServerAgenticLoopHostBuilder {
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
             provider_capabilities: self
                 .provider_capabilities
-                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
+                .unwrap_or_else(|| Arc::new(HashMap::new())),
             provider_allowed_tools: self
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
@@ -1819,7 +1824,7 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_provider_capabilities(
         mut self,
-        handle: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
+        handle: Arc<HashMap<String, HashSet<String>>>,
     ) -> Self {
         self.provider_capabilities = Some(handle);
         self
@@ -3938,10 +3943,7 @@ impl ServerAgenticLoopHost {
     }
 
     fn provider_capabilities_snapshot(&self) -> HashMap<String, HashSet<String>> {
-        self.provider_capabilities
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        self.provider_capabilities.as_ref().clone()
     }
 
     fn tool_admission_context(&self) -> ToolAdmissionContext {
@@ -6874,12 +6876,11 @@ mod tests {
         ]
     }
 
-    fn server_public_network_capabilities()
-    -> Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>> {
-        Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+    fn server_public_network_capabilities() -> Arc<HashMap<String, HashSet<String>>> {
+        Arc::new(HashMap::from([(
             "server-builtin".to_string(),
             HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
-        )])))
+        )]))
     }
 
     fn sample_edge_tools_with_ask_user() -> Vec<Value> {
@@ -10526,10 +10527,10 @@ mod tests {
 
     #[test]
     fn tool_admission_snapshot_reports_selected_offer_candidates() {
-        let provider_capabilities = Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+        let provider_capabilities = Arc::new(HashMap::from([(
             "server-builtin".to_string(),
             HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
-        )])));
+        )]));
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),

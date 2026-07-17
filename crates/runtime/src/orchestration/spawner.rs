@@ -46,6 +46,20 @@ pub const SPAWN_STATUS_CANCELLED: &str = "cancelled";
 pub const SPAWN_STATUS_FAILED: &str = "failed";
 pub const SPAWN_STATUS_WAITING: &str = "waiting";
 
+/// Stable causes shared by descendant cancellation and durable run cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DescendantCancellationReason {
+    AncestorCancelled,
+}
+
+impl DescendantCancellationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AncestorCancelled => "ancestor run cancelled before child completion",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnRunStatusKind {
     Completed,
@@ -2844,11 +2858,12 @@ impl DynamicAgentSpawner {
     /// parent loop's `JoinHandle`, so dropping/cancelling the parent future is
     /// not sufficient. Snapshot the run tree first, then cancel deepest-first
     /// without holding an agent-map lock across persistence or mailbox I/O.
-    pub async fn cancel_descendants_of_parent_run(
+    pub(crate) async fn cancel_descendants_of_parent_run(
         &self,
         parent_run_id: &str,
-        reason: &str,
+        reason: DescendantCancellationReason,
     ) -> usize {
+        let reason = reason.as_str();
         let mut children_by_parent: HashMap<String, Vec<(String, String)>> = HashMap::new();
         {
             let active = self.active_agents.read().await;
@@ -6811,7 +6826,10 @@ mod tests {
 
         assert_eq!(
             spawner
-                .cancel_descendants_of_parent_run("root", "ancestor run cancelled")
+                .cancel_descendants_of_parent_run(
+                    "root",
+                    DescendantCancellationReason::AncestorCancelled,
+                )
                 .await,
             2
         );
@@ -6826,7 +6844,7 @@ mod tests {
                 AgentStatus::Cancelled {
                     by_user: false,
                     ref reason,
-                } if reason == "ancestor run cancelled"
+                } if reason == DescendantCancellationReason::AncestorCancelled.as_str()
             ));
         }
     }
