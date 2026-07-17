@@ -84,8 +84,11 @@ pub async fn push_tasks_pack_held_mysql(
     holder_agent_id: &str,
     pack_json: &str,
 ) -> Result<TasksPackPushResult, String> {
-    let tasks: Vec<TaskRecord> =
+    let mut tasks: Vec<TaskRecord> =
         serde_json::from_str(pack_json).map_err(|e| format!("push_tasks_pack parse: {e}"))?;
+    // The transaction can lock more than one task. A canonical order keeps
+    // concurrent pack pushes from constructing opposite task-row lock graphs.
+    tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     let mut applied = 0u32;
     let mut rejected = 0u32;
     let mut tx = pool
@@ -111,8 +114,23 @@ pub async fn push_tasks_pack_held_mysql(
             .transpose()
             .map_err(|e| format!("push_tasks_pack checkpoint_json: {e}"))?;
 
-        // Lock task_leases before agent_tasks to match claim/release ordering
-        // and prevent a stale holder from updating after lease transfer.
+        // `agent_tasks` is the stable identity row and therefore the global
+        // serialization point for claim/release/held-push. Lock it before the
+        // optional lease row so a missing lease cannot turn concurrent gap
+        // locks into a cycle with the task-row lock.
+        let task_exists = sqlx::query_scalar::<_, String>(
+            "SELECT task_id FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(&t.task_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("push_tasks_pack task lock: {e}"))?;
+        if task_exists.is_none() {
+            rejected += 1;
+            continue;
+        }
+
         let holder: Option<String> = sqlx::query_scalar(
             "SELECT holder_agent_id FROM task_leases \
              WHERE user_id = ? AND task_id = ? AND expires_at >= NOW(6) \
@@ -130,13 +148,6 @@ pub async fn push_tasks_pack_held_mysql(
                 continue;
             }
         }
-
-        sqlx::query("SELECT task_id FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE")
-            .bind(user_id)
-            .bind(&t.task_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("push_tasks_pack task lock: {e}"))?;
 
         let n = sqlx::query(
             "UPDATE agent_tasks SET \
@@ -660,20 +671,11 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             .await
             .map_err(|e| format!("lease tx begin: {e}"))?;
 
-        // Lock task_leases FIRST — ensures release_lease (which locks
-        // task_leases) wins the race: if release has the lock, claim
-        // blocks until after the lease is deleted, then sees None → Granted.
-        let mut lease_row = sqlx::query(
-            "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
-             CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
-             FROM task_leases WHERE user_id = ? AND task_id = ? FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("lease select: {e}"))?;
-
+        // `agent_tasks` always exists for a valid claim, while `task_leases`
+        // may not. It is the stable serialization point for every operation
+        // that touches both tables. Locking it first prevents multiple
+        // claimants from holding compatible missing-row gap locks and then
+        // deadlocking while they converge on this task row.
         let task_row = sqlx::query(
             "SELECT user_id, status FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE",
         )
@@ -699,18 +701,16 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             return Err(format!("task is not claimable from status '{task_status}'"));
         }
 
-        if lease_row.is_none() {
-            lease_row = sqlx::query(
-                "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
-                 CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
-                 FROM task_leases WHERE user_id = ? AND task_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("lease reselect after task lock: {e}"))?;
-        }
+        let lease_row = sqlx::query(
+            "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
+             CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
+             FROM task_leases WHERE user_id = ? AND task_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lease select: {e}"))?;
 
         let has_existing_lease_row = lease_row.is_some();
 
@@ -778,9 +778,22 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
             .await
             .map_err(|e| format!("lease release tx begin: {e}"))?;
 
-        // Lock the lease row first to prevent concurrent acquire/release races.
-        // SELECT FOR UPDATE ensures no other transaction can claim or release
-        // this lease until we commit.
+        // Use the same stable task -> optional lease lock order as claim and
+        // held-push. The task row serializes a concurrent claim even after the
+        // lease row is deleted later in this transaction.
+        let task_exists: Option<String> = sqlx::query_scalar(
+            "SELECT task_id FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lease release task lock: {e}"))?;
+        if task_exists.is_none() {
+            rollback_task_lease_tx(tx, "release missing task").await;
+            return Ok(false);
+        }
+
         let existing = sqlx::query(
             "SELECT holder_agent_id FROM task_leases \
              WHERE user_id = ? AND task_id = ? AND holder_agent_id = ? \

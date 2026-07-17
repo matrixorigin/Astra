@@ -239,46 +239,60 @@ async fn task_lease_parallel_claims_single_winner() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
-    let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &user, &task_id).await;
+    const ROUNDS: usize = 8;
+    const CLAIMANTS: usize = 5;
 
-    sqlx::query(
-        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
-    )
-    .bind(&task_id)
-    .bind(&user)
-    .bind("parallel-lease")
-    .execute(&pool)
-    .await
-    .expect("insert task");
+    for round in 0..ROUNDS {
+        let task_id = Uuid::new_v4().to_string();
+        cleanup_task(&pool, &user, &task_id).await;
 
-    let n = 5usize;
-    let barrier = Arc::new(Barrier::new(n));
-    let mut join = tokio::task::JoinSet::new();
-    for i in 0..n {
-        let pool = pool.clone();
-        let user = user.clone();
-        let task_id = task_id.clone();
-        let barrier = barrier.clone();
-        join.spawn(async move {
-            barrier.wait().await;
-            let svc = DatabaseTaskLeaseService::new(pool, Arc::new(TaskLeaseHoldCache::default()));
-            svc.try_claim_lease(&user, &task_id, &format!("agent-{i}"), "edge", 120)
+        sqlx::query(
+            "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+        )
+        .bind(&task_id)
+        .bind(&user)
+        .bind(format!("parallel-lease-{round}"))
+        .execute(&pool)
+        .await
+        .expect("insert task");
+
+        let barrier = Arc::new(Barrier::new(CLAIMANTS));
+        let mut join = tokio::task::JoinSet::new();
+        for claimant in 0..CLAIMANTS {
+            let pool = pool.clone();
+            let user = user.clone();
+            let task_id = task_id.clone();
+            let barrier = barrier.clone();
+            join.spawn(async move {
+                barrier.wait().await;
+                let svc =
+                    DatabaseTaskLeaseService::new(pool, Arc::new(TaskLeaseHoldCache::default()));
+                svc.try_claim_lease(
+                    &user,
+                    &task_id,
+                    &format!("agent-{round}-{claimant}"),
+                    "edge",
+                    120,
+                )
                 .await
-        });
-    }
-
-    let mut granted = 0u32;
-    while let Some(res) = join.join_next().await {
-        let out = res.expect("join");
-        let claim = out.expect("try_claim");
-        if matches!(claim, LeaseClaimResult::Granted { .. }) {
-            granted += 1;
+            });
         }
-    }
-    assert_eq!(granted, 1, "exactly one parallel claim should win");
 
-    cleanup_task(&pool, &user, &task_id).await;
+        let mut granted = 0u32;
+        while let Some(res) = join.join_next().await {
+            let out = res.expect("join");
+            let claim = out.unwrap_or_else(|error| panic!("round {round} try_claim: {error}"));
+            if matches!(claim, LeaseClaimResult::Granted { .. }) {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, 1,
+            "exactly one parallel claim should win in round {round}"
+        );
+
+        cleanup_task(&pool, &user, &task_id).await;
+    }
 }
 
 fn sample_task_record(task_id: &str, user_id: &str) -> TaskRecord {
@@ -685,6 +699,83 @@ async fn task_lease_concurrent_release_and_claim() {
         .expect("get lease")
         .expect("lease exists");
     assert_eq!(view.holder_agent_id, "agent-b", "agent-b should be holder");
+
+    cleanup_task(&pool, &user, &task_id).await;
+}
+
+/// A release and a competing claim may linearize in either order, but both
+/// operations must complete without a database deadlock and the durable state
+/// must match the observed claim result.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn task_lease_simultaneous_release_and_claim_linearize_consistently() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let task_id = Uuid::new_v4().to_string();
+    cleanup_task(&pool, &user, &task_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(&task_id)
+    .bind(&user)
+    .bind("simultaneous-release-claim")
+    .execute(&pool)
+    .await
+    .expect("insert task");
+
+    DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+        .try_claim_lease(&user, &task_id, "agent-a", "edge-a", 60)
+        .await
+        .expect("initial claim");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let release_barrier = barrier.clone();
+    let claim_barrier = barrier.clone();
+    let release_pool = pool.clone();
+    let claim_pool = pool.clone();
+    let release_user = user.clone();
+    let claim_user = user.clone();
+    let release_task = task_id.clone();
+    let claim_task = task_id.clone();
+
+    let (released, claimed) = tokio::join!(
+        async move {
+            release_barrier.wait().await;
+            DatabaseTaskLeaseService::new(release_pool, Arc::new(TaskLeaseHoldCache::default()))
+                .release_lease(&release_user, &release_task, "agent-a")
+                .await
+        },
+        async move {
+            claim_barrier.wait().await;
+            DatabaseTaskLeaseService::new(claim_pool, Arc::new(TaskLeaseHoldCache::default()))
+                .try_claim_lease(&claim_user, &claim_task, "agent-b", "edge-b", 60)
+                .await
+        }
+    );
+
+    assert!(released.expect("release must not deadlock"));
+    let claimed = claimed.expect("claim must not deadlock");
+    let durable =
+        DatabaseTaskLeaseService::new(pool.clone(), Arc::new(TaskLeaseHoldCache::default()))
+            .get_lease(&user, &task_id)
+            .await
+            .expect("load final lease");
+    match claimed {
+        LeaseClaimResult::Granted { .. } => {
+            assert_eq!(
+                durable.as_ref().map(|lease| lease.holder_agent_id.as_str()),
+                Some("agent-b")
+            );
+        }
+        LeaseClaimResult::Contested {
+            holder_agent_id, ..
+        } => {
+            assert_eq!(holder_agent_id, "agent-a");
+            assert!(durable.is_none(), "release linearized after contention");
+        }
+    }
 
     cleanup_task(&pool, &user, &task_id).await;
 }
