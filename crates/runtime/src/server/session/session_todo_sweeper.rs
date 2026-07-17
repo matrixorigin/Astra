@@ -22,12 +22,10 @@
 //!    default of 90 days — adjust via
 //!    `ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS` when needed.
 //!
-//! 4. **Stale idempotency** (NEW): every 5 minutes UPDATE rows where
+//! 4. **Stale idempotency**: every 5 minutes closes admissions where
 //!    `output IS NULL` AND `updated_at < now - IDEMPOTENCY_STALE_MINUTES`
-//!    to set `output` to an error message. Cleans up orphaned idempotency
-//!    rows where task creation succeeded but the idempotency completion
-//!    update failed. UPDATE (not DELETE) prevents duplicate task creation
-//!    on retry — the client receives an explicit error on replay.
+//!    with a typed `indeterminate` outcome. UPDATE (not DELETE) prevents a
+//!    retry from duplicating a create whose original commit is unknown.
 //!
 //! Both sweepers log a one-line summary per run (rows affected) so
 //! operators can spot anomalies (millions of in_progress → maybe
@@ -174,37 +172,29 @@ fn archive_retention_days() -> i64 {
     )
 }
 
-fn auto_pause_metadata_json(existing: Option<&str>, paused_at: &str) -> String {
-    let parsed = existing.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    let needs_repair_marker = match (&parsed, existing) {
-        (Some(Value::Object(_)), _) => false,
-        (Some(_), _) => true,
-        (None, Some(raw)) => !raw.trim().is_empty(),
-        (None, None) => false,
+#[derive(Debug, PartialEq)]
+enum StaleSweepMetadata {
+    Eligible(Map<String, Value>),
+    PlanDerived,
+}
+
+fn classify_stale_sweep_metadata(existing: Option<&str>) -> Result<StaleSweepMetadata, String> {
+    let Some(raw) = existing.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(StaleSweepMetadata::Eligible(Map::new()));
     };
-    let metadata_before_auto_pause = if needs_repair_marker {
-        Some(match (&parsed, existing) {
-            (Some(value), _) => value.clone(),
-            (None, Some(raw)) => Value::String(raw.to_string()),
-            (None, None) => Value::Null,
-        })
+    let Value::Object(metadata) = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("invalid metadata JSON: {error}"))?
+    else {
+        return Err("metadata must be a JSON object".to_string());
+    };
+    if metadata.contains_key("plan_subtask_id") {
+        Ok(StaleSweepMetadata::PlanDerived)
     } else {
-        None
-    };
-    let mut metadata = match parsed {
-        Some(Value::Object(map)) => map,
-        Some(_) | None => Map::new(),
-    };
-    if needs_repair_marker {
-        metadata.insert(
-            "metadata_before_auto_pause".to_string(),
-            metadata_before_auto_pause.unwrap_or(Value::Null),
-        );
-        metadata.insert(
-            "metadata_repair_reason".to_string(),
-            Value::String("invalid_or_non_object_metadata_before_auto_pause".to_string()),
-        );
+        Ok(StaleSweepMetadata::Eligible(metadata))
     }
+}
+
+fn auto_pause_metadata_json(mut metadata: Map<String, Value>, paused_at: &str) -> String {
     metadata.insert(
         "auto_paused_reason".to_string(),
         Value::String("stale_in_progress > 24h".to_string()),
@@ -277,25 +267,37 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
             let Some((metadata,)) = current else {
                 continue;
             };
-            // Defense-in-depth: plan-derived tasks are controlled by the plan
-            // orchestrator, not generic inactivity maintenance.
-            if metadata
-                .as_deref()
-                .is_some_and(|meta| meta.contains("\"plan_subtask_id\""))
-            {
-                tracing::warn!(
-                    target: "astra_runtime::session_todo_sweeper",
-                    user_id = %user_id,
-                    session_id = %session_id,
-                    todo_id = %todo_id,
-                    "Stale-sweep: plan-derived task passed SQL filter — \
-                     skipping to preserve plan consistency"
-                );
-                continue;
-            }
+            let metadata = match classify_stale_sweep_metadata(metadata.as_deref()) {
+                Ok(StaleSweepMetadata::Eligible(metadata)) => metadata,
+                Ok(StaleSweepMetadata::PlanDerived) => {
+                    tracing::warn!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        todo_id = %todo_id,
+                        "Stale-sweep: plan-derived task passed SQL filter — \
+                         skipping to preserve plan consistency"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    // Corrupt metadata may hide orchestration ownership. A
+                    // generic lifecycle worker must fail closed instead of
+                    // changing state it cannot safely classify.
+                    tracing::warn!(
+                        target: "astra_runtime::session_todo_sweeper",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        todo_id = %todo_id,
+                        %error,
+                        "Stale-sweep: invalid task metadata; leaving task unchanged"
+                    );
+                    continue;
+                }
+            };
 
             let paused_at = chrono::Utc::now().to_rfc3339();
-            let metadata_json = auto_pause_metadata_json(metadata.as_deref(), &paused_at);
+            let metadata_json = auto_pause_metadata_json(metadata, &paused_at);
             let result = sqlx::query(
                 "UPDATE session_todos \
                  SET status = 'paused', metadata = ?, updated_at = NOW(6) \
@@ -876,35 +878,38 @@ mod tests {
 
     #[test]
     fn auto_pause_metadata_preserves_existing_object_keys() {
-        let metadata =
-            auto_pause_metadata_json(Some(r#"{"owner_note":"keep","count":2}"#), "paused-at");
+        let metadata = match classify_stale_sweep_metadata(Some(
+            r#"{"owner_note":"keep","count":2}"#,
+        ))
+        .unwrap()
+        {
+            StaleSweepMetadata::Eligible(metadata) => {
+                auto_pause_metadata_json(metadata, "paused-at")
+            }
+            StaleSweepMetadata::PlanDerived => panic!("ordinary metadata classified as plan"),
+        };
         let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
         assert_eq!(parsed["owner_note"], "keep");
         assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["auto_paused_reason"], "stale_in_progress > 24h");
         assert_eq!(parsed["auto_paused_at"], "paused-at");
-        assert!(parsed.get("metadata_repair_reason").is_none(), "{parsed}");
     }
 
     #[test]
-    fn auto_pause_metadata_repairs_invalid_or_non_object_metadata() {
-        for (existing, expected_original) in [
-            (Some("not-json"), Value::String("not-json".to_string())),
-            (Some("[1,2]"), serde_json::json!([1, 2])),
-        ] {
-            let metadata = auto_pause_metadata_json(existing, "paused-at");
-            let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
-            assert_eq!(parsed["auto_paused_reason"], "stale_in_progress > 24h");
-            assert_eq!(parsed["auto_paused_at"], "paused-at");
-            assert_eq!(
-                parsed["metadata_before_auto_pause"], expected_original,
-                "{parsed}"
-            );
-            assert_eq!(
-                parsed["metadata_repair_reason"],
-                "invalid_or_non_object_metadata_before_auto_pause"
-            );
-        }
+    fn stale_sweep_metadata_uses_typed_plan_ownership_and_fails_closed() {
+        assert_eq!(
+            classify_stale_sweep_metadata(Some(r#"{"plan_subtask_id":"step-1"}"#)).unwrap(),
+            StaleSweepMetadata::PlanDerived
+        );
+        assert!(matches!(
+            classify_stale_sweep_metadata(Some(
+                r#"{"note":"text containing \"plan_subtask_id\" is not a protocol field"}"#
+            ))
+            .unwrap(),
+            StaleSweepMetadata::Eligible(_)
+        ));
+        assert!(classify_stale_sweep_metadata(Some("not-json")).is_err());
+        assert!(classify_stale_sweep_metadata(Some("[1,2]")).is_err());
     }
 
     #[test]
@@ -1557,7 +1562,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
     #[serial_test::serial(session_todo_sweeper_db)]
-    async fn stale_in_progress_sweep_repairs_invalid_metadata_in_matrixone() {
+    async fn stale_in_progress_sweep_leaves_invalid_metadata_unchanged_in_matrixone() {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -1592,13 +1597,9 @@ mod tests {
         .await
         .expect("seed invalid metadata row");
 
-        let paused = run_stale_in_progress_sweep(shared)
+        run_stale_in_progress_sweep(shared)
             .await
-            .expect("stale sweep should repair invalid metadata instead of failing batch");
-        assert!(
-            paused >= 1,
-            "global sweeper may also pause unrelated stale rows; got {paused}"
-        );
+            .expect("one corrupt row must not fail the whole stale sweep");
 
         let row: (String, String) = sqlx::query_as(
             "SELECT status, metadata FROM session_todos \
@@ -1609,14 +1610,9 @@ mod tests {
         .bind("task-1")
         .fetch_one(&pool)
         .await
-        .expect("load repaired row");
-        assert_eq!(row.0, "paused");
-        let metadata: serde_json::Value = serde_json::from_str(&row.1).expect("metadata json");
-        assert_eq!(metadata["auto_paused_reason"], "stale_in_progress > 24h");
-        assert_eq!(
-            metadata["metadata_repair_reason"],
-            "invalid_or_non_object_metadata_before_auto_pause"
-        );
+        .expect("load unchanged row");
+        assert_eq!(row.0, "in_progress");
+        assert_eq!(row.1, "not-json");
 
         cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }

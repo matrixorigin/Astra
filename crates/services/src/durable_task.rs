@@ -1407,24 +1407,11 @@ impl VerificationRunner {
                                 format!("LLM evaluation: {}", truncate(prompt, 200)),
                             ))
                         }
-                        Err(e) => {
-                            // call_cloud_llm already maps 401/403 to a
-                            // redacted "LLM judge unavailable (auth error)"
-                            // message; pass it through cleanly. Other errors
-                            // get the legacy 'LLM judge error:' prefix.
-                            let reason = if e.contains("auth error")
-                                || e.starts_with("LLM judge unavailable")
-                            {
-                                e.clone()
-                            } else {
-                                format!("LLM judge error: {e}")
-                            };
-                            Ok((
-                                false,
-                                reason,
-                                format!("LLM evaluation: {}", truncate(prompt, 200)),
-                            ))
-                        }
+                        Err(e) => Ok((
+                            false,
+                            llm_judge_failure_reason(&e),
+                            format!("LLM evaluation: {}", truncate(prompt, 200)),
+                        )),
                     }
                 } else {
                     // No LLM judge available — skip with informative message
@@ -1710,6 +1697,13 @@ fn truncate(s: &str, max: usize) -> String {
 /// Shared secret-pattern redaction used for judge/provider error strings.
 fn redact_judge_secrets(s: &str) -> String {
     redact_known_secret_patterns(s)
+}
+
+fn llm_judge_failure_reason(error: &str) -> String {
+    // Provider implementations already classify availability internally. The
+    // verifier only needs safe presentation text; it must not infer protocol
+    // state by matching an arbitrary error sentence.
+    format!("LLM judge error: {}", redact_judge_secrets(error))
 }
 
 /// Search for a file by its basename (or path suffix) under `root`.
@@ -2848,7 +2842,7 @@ impl MatrixOneDurableTaskLifecycle {
 
             match insert_result {
                 Ok(_) => {}
-                Err(e) if e.to_string().contains("Duplicate") => {
+                Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
                     return Err(crate::service_error::ServiceError::conflict_transient(
                         format!(
                             "persist_contract: version conflict for {} (expected version {})",
@@ -5017,34 +5011,20 @@ mod tests {
     }
 
     #[test]
-    fn judge_error_reason_drops_auth_prefix_and_secret() {
-        // Simulate the mapping at the judge call site: call_cloud_llm
-        // returns "LLM judge unavailable (auth error)" for 401/403.
-        let upstream_err = "LLM judge unavailable (auth error)".to_string();
-        let reason = if upstream_err.contains("auth error")
-            || upstream_err.starts_with("LLM judge unavailable")
-        {
-            upstream_err.clone()
-        } else {
-            format!("LLM judge error: {upstream_err}")
-        };
-        assert!(!reason.contains("sk-"));
-        assert!(reason.contains("LLM judge unavailable"));
-        assert!(!reason.starts_with("LLM judge error:"));
+    fn judge_error_reason_is_stable_presentation_not_string_protocol() {
+        let reason = llm_judge_failure_reason("LLM judge unavailable (auth error)");
+        assert_eq!(
+            reason,
+            "LLM judge error: LLM judge unavailable (auth error)"
+        );
     }
 
     #[test]
-    fn judge_error_reason_keeps_prefix_for_non_auth_errors() {
-        let upstream_err = "Cloud LLM API error 503: backend down".to_string();
-        let reason = if upstream_err.contains("auth error")
-            || upstream_err.starts_with("LLM judge unavailable")
-        {
-            upstream_err.clone()
-        } else {
-            format!("LLM judge error: {upstream_err}")
-        };
+    fn judge_error_reason_redacts_provider_secrets() {
+        let reason = llm_judge_failure_reason("Cloud LLM API error: Bearer tok_secret");
         assert!(reason.starts_with("LLM judge error:"));
-        assert!(reason.contains("503"));
+        assert!(!reason.contains("tok_secret"));
+        assert!(reason.contains("[REDACTED]"));
     }
 
     #[test]

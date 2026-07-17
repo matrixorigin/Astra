@@ -43,11 +43,39 @@ pub const AGENT_RESULT_STATUS_PAUSED: &str = "paused";
 pub const AGENT_RESULT_STATUS_CANCELLED: &str = "cancelled";
 pub const AGENT_RESULT_STATUS_PARTIAL: &str = "partial";
 pub const AGENT_RESULT_STATUS_VERIFICATION_FAILED: &str = "verification_failed";
-/// Durable run rows have no `partial` lifecycle state. Server sub-runs store a
-/// terminal failed row with this prefix so recovery and run-tree projection
-/// can reconstruct the richer interrupted/partial child result without
-/// mistaking it for an ordinary failure.
-pub const AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX: &str = "partial:";
+/// Typed durable error code used when a terminal failed run represents an
+/// interrupted child with a usable partial result.
+pub const AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE: &str = "agent_result_partial";
+/// Compatibility boundary for durable rows written before partial outcomes
+/// had a typed `error_code`. New writers must never encode control state in
+/// `error_message` with this prefix.
+const LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX: &str = "partial:";
+
+pub fn durable_agent_result_is_partial(
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> bool {
+    match error_code {
+        Some(code) => code == AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE,
+        None => error_message.is_some_and(|message| {
+            message.starts_with(LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX)
+        }),
+    }
+}
+
+pub fn durable_agent_partial_reason<'a>(
+    error_code: Option<&str>,
+    error_message: Option<&'a str>,
+) -> Option<&'a str> {
+    if error_code == Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE) {
+        return error_message;
+    }
+    if error_code.is_some() {
+        return None;
+    }
+    error_message
+        .and_then(|message| message.strip_prefix(LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX))
+}
 
 pub const DELEGATION_RESULT_STATUS_COMPLETED: &str = "completed";
 pub const DELEGATION_RESULT_STATUS_UNFINISHED: &str = "unfinished";
@@ -736,8 +764,6 @@ pub fn aggregate_results(
 pub struct CoordinationHints {
     /// Agent IDs available for this delegation.
     pub agent_ids: Vec<String>,
-    /// Task description (used for keyword heuristics).
-    pub task: String,
     /// Whether the task involves review/verification.
     pub needs_review: bool,
     /// Whether sub-tasks have ordering dependencies.
@@ -746,14 +772,18 @@ pub struct CoordinationHints {
     pub timeout_sec: u64,
 }
 
-/// Suggest a coordination pattern based on heuristics.
+/// Suggest a coordination pattern from typed orchestration facts.
 ///
 /// Rules (in priority order):
 /// 1. `needs_review` + exactly 2 agents → AdversarialReview
 /// 2. `has_dependencies` → Sequential (ordered)
-/// 3. 1 agent + multi-task keywords → Fork (single agent, multiple tasks)
-/// 4. 2+ independent agents → FanOut
-/// 5. Fallback → Sequential { stop_on_success: true }
+/// 3. 2+ independent agents → FanOut
+/// 4. Fallback → Sequential { stop_on_success: true }
+///
+/// Task prose is deliberately not accepted here. Natural-language keyword
+/// matching is not a reliable semantic classifier and must never silently
+/// change execution topology. Callers that need a `Fork` must provide that
+/// pattern and its typed task list explicitly.
 pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
     let n = hints.agent_ids.len();
     let timeout = hints.timeout_sec;
@@ -767,14 +797,8 @@ pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
         };
     }
 
-    // Check for review keywords in task
-    let review_keywords = ["review", "审查", "check", "verify", "验证", "critique"];
-    let task_lower = hints.task.to_lowercase();
-    let task_needs_review =
-        hints.needs_review || review_keywords.iter().any(|kw| task_lower.contains(kw));
-
     // Rule 1: Review pattern
-    if task_needs_review && n == 2 {
+    if hints.needs_review && n == 2 {
         return CoordinationPattern::AdversarialReview {
             producer_id: hints.agent_ids[0].clone(),
             reviewer_id: hints.agent_ids[1].clone(),
@@ -793,32 +817,7 @@ pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
         };
     }
 
-    // Rule 3: Single agent with "and" / multiple sub-tasks → Fork
-    let fork_keywords = [" and ", "并且", "同时", "然后", "以及"];
-    let task_is_compound = fork_keywords.iter().any(|kw| task_lower.contains(kw));
-    if n == 1 && task_is_compound {
-        // Split task into sub-tasks (simple heuristic: split on conjunctions)
-        let tasks: Vec<String> = hints
-            .task
-            .split(&[',', '，'][..])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let tasks = if tasks.len() < 2 {
-            vec![hints.task.clone()]
-        } else {
-            tasks
-        };
-        return CoordinationPattern::Fork {
-            tasks,
-            agent_id: hints.agent_ids[0].clone(),
-            max_turns: 10,
-            aggregation: AggregationStrategy::AllResults,
-            timeout_sec: timeout,
-        };
-    }
-
-    // Rule 4: Multiple independent agents → FanOut
+    // Rule 3: Multiple independent agents → FanOut
     if n >= 2 {
         return CoordinationPattern::FanOut {
             agent_ids: hints.agent_ids.clone(),
@@ -851,6 +850,42 @@ mod tests {
 
     fn user_agent(id: &str) -> AgentProfile {
         AgentProfile::new(id, &format!("User-{id}"), AgentTier::User)
+    }
+
+    #[test]
+    fn durable_partial_result_uses_typed_error_code() {
+        let reason = "budget_exhausted: adaptive hard turn limit reached";
+        assert!(durable_agent_result_is_partial(
+            Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
+            Some(reason),
+        ));
+        assert_eq!(
+            durable_agent_partial_reason(
+                Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
+                Some(reason),
+            ),
+            Some(reason)
+        );
+        assert!(!durable_agent_result_is_partial(
+            None,
+            Some("partial result could not be verified"),
+        ));
+        assert!(!durable_agent_result_is_partial(
+            Some("ordinary_failure"),
+            Some("partial:still not an interrupted result"),
+        ));
+    }
+
+    #[test]
+    fn durable_partial_result_reads_legacy_prefix_at_compatibility_boundary() {
+        assert!(durable_agent_result_is_partial(
+            None,
+            Some("partial:budget_exhausted"),
+        ));
+        assert_eq!(
+            durable_agent_partial_reason(None, Some("partial:budget_exhausted")),
+            Some("budget_exhausted")
+        );
     }
 
     // ── AgentTier ───
@@ -1662,7 +1697,7 @@ mod tests {
     fn suggest_review_with_two_agents() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into(), "a2".into()],
-            task: "review the code changes".into(),
+            needs_review: true,
             timeout_sec: 60,
             ..Default::default()
         };
@@ -1677,7 +1712,6 @@ mod tests {
     fn suggest_sequential_with_dependencies() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into(), "a2".into(), "a3".into()],
-            task: "build then deploy".into(),
             has_dependencies: true,
             timeout_sec: 30,
             ..Default::default()
@@ -1693,7 +1727,6 @@ mod tests {
     fn suggest_fanout_for_independent_agents() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into(), "a2".into()],
-            task: "search for information".into(),
             timeout_sec: 60,
             ..Default::default()
         };
@@ -1705,17 +1738,16 @@ mod tests {
     }
 
     #[test]
-    fn suggest_fork_for_compound_single_agent() {
+    fn suggest_single_agent_never_invents_fork_tasks() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into()],
-            task: "fix the bug, and update the docs".into(),
             timeout_sec: 60,
             ..Default::default()
         };
         let pattern = suggest_pattern(&hints);
         assert!(
-            matches!(pattern, CoordinationPattern::Fork { .. }),
-            "single agent + compound task should yield Fork"
+            matches!(pattern, CoordinationPattern::Sequential { .. }),
+            "typed hints cannot manufacture a Fork without an explicit task list"
         );
     }
 
@@ -1723,7 +1755,6 @@ mod tests {
     fn suggest_fallback_sequential_for_single_agent() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into()],
-            task: "do something simple".into(),
             timeout_sec: 0,
             ..Default::default()
         };
@@ -1735,17 +1766,16 @@ mod tests {
     }
 
     #[test]
-    fn suggest_review_via_chinese_keyword() {
+    fn suggest_does_not_infer_review_without_typed_hint() {
         let hints = CoordinationHints {
             agent_ids: vec!["a1".into(), "a2".into()],
-            task: "审查这段代码".into(),
             timeout_sec: 30,
             ..Default::default()
         };
         let pattern = suggest_pattern(&hints);
         assert!(
-            matches!(pattern, CoordinationPattern::AdversarialReview { .. }),
-            "Chinese review keyword should yield AdversarialReview"
+            matches!(pattern, CoordinationPattern::FanOut { .. }),
+            "untyped prose cannot silently select an adversarial topology"
         );
     }
 
@@ -1753,7 +1783,6 @@ mod tests {
     fn suggest_empty_agents_returns_sequential() {
         let hints = CoordinationHints {
             agent_ids: vec![],
-            task: "do something".into(),
             timeout_sec: 30,
             ..Default::default()
         };

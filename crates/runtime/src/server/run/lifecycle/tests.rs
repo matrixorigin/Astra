@@ -1954,7 +1954,11 @@ fn server_subrun_budget_exhaustion_preserves_reason_without_leaving_child_paused
             server_subrun_interruption_reason(&state).as_deref(),
         )
         .as_deref(),
-        Some("partial:budget_exhausted: adaptive hard turn limit reached")
+        Some("budget_exhausted: adaptive hard turn limit reached")
+    );
+    assert_eq!(
+        server_subrun_durable_error_code(server_subrun_outcome_status(&outcome, &state)),
+        Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
     );
 }
 
@@ -3522,6 +3526,53 @@ fn server_subrun_executor_reuses_the_lifecycle_run_engine() {
         Arc::ptr_eq(run_engine.store(), wired.store()),
         "subruns must retain the lifecycle store identity rather than reconstructing a new owner"
     );
+}
+
+#[tokio::test]
+async fn server_subrun_partial_status_persists_typed_error_code() {
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    run_engine
+        .start_run("child-run", "user-1", "session-1")
+        .await
+        .unwrap();
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    executor
+        .persist_durable_subrun_status(
+            "user-1",
+            "session-1",
+            "child-run",
+            STATUS_FAILED,
+            None,
+            Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
+            Some("budget_exhausted: adaptive hard turn limit reached"),
+        )
+        .await;
+
+    let run = run_engine
+        .load_run("user-1", "child-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, STATUS_FAILED);
+    assert_eq!(
+        run.error_code.as_deref(),
+        Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
+    );
+    assert_eq!(
+        run.error_message.as_deref(),
+        Some("budget_exhausted: adaptive hard turn limit reached")
+    );
+    assert!(run.events.iter().any(|event| {
+        event["event_type"] == "run_finished"
+            && event["data"]["error_code"]
+                == astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE
+    }));
 }
 
 #[test]

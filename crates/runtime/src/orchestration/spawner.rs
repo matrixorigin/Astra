@@ -417,24 +417,19 @@ fn durable_agent_status(run: &astra_services::runs::DurableRunRecord) -> AgentSt
             finish_reason: "durable_result_unavailable".into(),
         },
         astra_core::STATUS_FAILED
-            if run.error_message.as_deref().is_some_and(|message| {
-                message.starts_with(
-                    astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-                )
-            }) =>
+            if astra_services::coordination::durable_agent_result_is_partial(
+                run.error_code.as_deref(),
+                run.error_message.as_deref(),
+            ) =>
         {
             AgentStatus::Interrupted {
                 partial_result: output,
-                finish_reason: run
-                    .error_message
-                    .as_deref()
-                    .and_then(|message| {
-                        message.strip_prefix(
-                            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-                        )
-                    })
-                    .unwrap_or("partial")
-                    .to_string(),
+                finish_reason: astra_services::coordination::durable_agent_partial_reason(
+                    run.error_code.as_deref(),
+                    run.error_message.as_deref(),
+                )
+                .unwrap_or("partial")
+                .to_string(),
             }
         }
         astra_core::STATUS_FAILED => AgentStatus::Failed {
@@ -3977,10 +3972,9 @@ mod tests {
     #[test]
     fn durable_partial_child_restores_as_interrupted_with_exact_reason() {
         let mut run = durable_run("partial-child", 1, astra_core::STATUS_FAILED);
-        run.error_message = Some(format!(
-            "{}budget_exhausted: adaptive hard turn limit reached",
-            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
-        ));
+        run.error_code =
+            Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE.to_string());
+        run.error_message = Some("budget_exhausted: adaptive hard turn limit reached".to_string());
         run.events.push(json!({
             "event_type": "text_done",
             "data": {"full_text": "Partial architecture findings."}

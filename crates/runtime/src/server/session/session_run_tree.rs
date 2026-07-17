@@ -158,11 +158,10 @@ fn project_run_node_with_status(
     inherited_control: bool,
 ) -> SessionRunNode {
     let partial_interruption = lifecycle_status == RunStatus::Failed
-        && run.error_message.as_deref().is_some_and(|message| {
-            message.starts_with(
-                astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-            )
-        });
+        && astra_services::coordination::durable_agent_result_is_partial(
+            run.error_code.as_deref(),
+            run.error_message.as_deref(),
+        );
     let status = match lifecycle_status {
         RunStatus::Running => SessionRunLifecycleStatus::Running,
         RunStatus::Waiting => SessionRunLifecycleStatus::Waiting,
@@ -221,14 +220,11 @@ fn project_run_node_with_status(
             .or_else(|| run.waiting_for.clone()),
         error_code: run.error_code.clone(),
         error_message: if partial_interruption {
-            run.error_message.as_deref().map(|message| {
-                message
-                    .strip_prefix(
-                        astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-                    )
-                    .unwrap_or(message)
-                    .to_string()
-            })
+            astra_services::coordination::durable_agent_partial_reason(
+                run.error_code.as_deref(),
+                run.error_message.as_deref(),
+            )
+            .map(ToString::to_string)
         } else {
             run.error_message.clone()
         },
@@ -555,10 +551,10 @@ mod tests {
     #[test]
     fn projection_recovers_terminal_partial_child_as_interrupted() {
         let mut child = run("child", STATUS_FAILED, 1);
-        child.error_message = Some(format!(
-            "{}budget_exhausted: adaptive hard turn limit reached",
-            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
-        ));
+        child.error_code =
+            Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE.to_string());
+        child.error_message =
+            Some("budget_exhausted: adaptive hard turn limit reached".to_string());
         let page = astra_services::runs::DurableSessionRunPage {
             runs: vec![child],
             limit: 200,

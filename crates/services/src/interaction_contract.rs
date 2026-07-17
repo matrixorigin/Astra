@@ -161,34 +161,17 @@ pub fn ask_user_response_status(status: &str) -> InteractionStatus {
     }
 }
 
-pub fn edge_dispatch_status(status: &str, result_json: Option<&str>) -> InteractionStatus {
+pub fn edge_dispatch_status(status: &str, _result_json: Option<&str>) -> InteractionStatus {
     match normalize_status(status).as_str() {
         "pending" | "dispatched" => InteractionStatus::Pending,
         "completed" => InteractionStatus::Resolved,
         "cancelled" | "canceled" => InteractionStatus::Cancelled,
         "expired" => InteractionStatus::Expired,
-        "failed" => edge_failed_status(result_json),
+        // A failed tool execution still delivered a terminal result. Timeout
+        // and cancellation are distinct typed dispatch states; presentation
+        // text inside the result must not redefine the lifecycle.
+        "failed" => InteractionStatus::Resolved,
         _ => InteractionStatus::Pending,
-    }
-}
-
-fn edge_failed_status(result_json: Option<&str>) -> InteractionStatus {
-    let Some(result_json) = result_json else {
-        return InteractionStatus::Resolved;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(result_json) else {
-        return InteractionStatus::Resolved;
-    };
-    let output = value
-        .get("output")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    match normalize_status(output).as_str() {
-        text if text.contains("cancelled") || text.contains("canceled") => {
-            InteractionStatus::Cancelled
-        }
-        text if text.contains("expired") || text.contains("timeout") => InteractionStatus::Expired,
-        _ => InteractionStatus::Resolved,
     }
 }
 
@@ -283,14 +266,14 @@ mod tests {
                 "failed",
                 Some(r#"{"status":"error","output":"edge dispatch expired"}"#)
             ),
-            InteractionStatus::Expired
+            InteractionStatus::Resolved
         );
         assert_eq!(
             edge_dispatch_status(
                 "failed",
                 Some(r#"{"status":"error","output":"edge dispatch cancelled"}"#)
             ),
-            InteractionStatus::Cancelled
+            InteractionStatus::Resolved
         );
         assert_eq!(
             edge_dispatch_status(

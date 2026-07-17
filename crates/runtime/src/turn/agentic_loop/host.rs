@@ -2817,8 +2817,8 @@ pub(crate) use super::super::agentic::delegate_interception::{
     delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
     is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
-    pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name,
+    pattern_from_name, select_default_coordination_pattern, tool_call_arguments_value,
+    tool_call_name,
 };
 
 use super::super::harness_adapter::harness_at;

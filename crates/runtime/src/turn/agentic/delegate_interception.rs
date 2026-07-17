@@ -43,7 +43,7 @@ fn source_agent_alias_candidates(source_agent_id: &str) -> impl Iterator<Item = 
     })
 }
 
-async fn execute_delegation_with_source_agent_fallback(
+async fn execute_delegation_with_source_agent_alias(
     engine: &crate::server::delegation::engine::DelegationEngine,
     request: astra_services::coordination::DelegationRequest,
     source_agent_id: &str,
@@ -51,32 +51,26 @@ async fn execute_delegation_with_source_agent_fallback(
     llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
-    let candidates: Vec<&str> = source_agent_alias_candidates(source_agent_id).collect();
-    let mut last_err = None;
-    for (index, candidate) in candidates.iter().enumerate() {
-        match engine
-            .execute_with_forward_headers_and_live_events(
-                request.clone(),
-                candidate,
-                None,
-                forward_headers.clone(),
-                llm_token_service.cloned(),
-                live_event_sink.clone(),
-            )
-            .await
-        {
-            Ok(result) => return Ok(result),
-            Err(err)
-                if err.contains("source agent")
-                    && err.contains("not registered")
-                    && index + 1 < candidates.len() =>
-            {
-                last_err = Some(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| format!("source agent '{source_agent_id}' not registered")))
+    // `main` and `orchestrator` are identity aliases at the runtime boundary.
+    // Resolve them from the typed registry before execution; never retry based
+    // on presentation text from a validation error.
+    let source_agent_id = {
+        let registry = engine.registry().read().await;
+        source_agent_alias_candidates(source_agent_id)
+            .find(|candidate| registry.get(candidate).is_some())
+            .unwrap_or(source_agent_id)
+            .to_string()
+    };
+    engine
+        .execute_with_forward_headers_and_live_events(
+            request,
+            &source_agent_id,
+            None,
+            forward_headers.clone(),
+            llm_token_service.cloned(),
+            live_event_sink,
+        )
+        .await
 }
 
 pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
@@ -374,20 +368,23 @@ pub(crate) fn parse_delegation_request(
     let task = args
         .get("task")
         .and_then(Value::as_str)
-        .unwrap_or("delegated task")
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .ok_or("delegate call requires a non-empty string field 'task'")?
         .to_string();
 
-    let explicit_pattern = args.get("pattern").and_then(Value::as_str);
-    let (pattern, adaptive_policy) = if explicit_pattern.is_some() {
+    let (pattern, adaptive_policy) = if args.get("pattern").is_some() {
         (parse_coordination_pattern(&args)?, None)
     } else {
-        let (pattern, policy) =
-            select_default_coordination_pattern(&args, &task, adaptive_context)?;
+        let (pattern, policy) = select_default_coordination_pattern(&args, adaptive_context)?;
         (pattern, Some(policy))
     };
 
     let mut context = std::collections::HashMap::new();
-    if let Some(ctx) = args.get("context").and_then(Value::as_object) {
+    if let Some(ctx) = args.get("context") {
+        let ctx = ctx
+            .as_object()
+            .ok_or("delegate field 'context' must be an object")?;
         for (k, v) in ctx {
             context.insert(k.clone(), v.clone());
         }
@@ -450,27 +447,29 @@ pub(crate) fn delegation_adaptive_context(
 
 pub(crate) fn select_default_coordination_pattern(
     args: &Value,
-    task: &str,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
-    let agents = parse_delegate_agents(args);
+    let agents = parse_delegate_agents(args)?;
     let scenario = adaptive_context.and_then(|ctx| ctx.scenario);
     let preferred = adaptive_context.and_then(|ctx| ctx.preferred_pattern.as_deref());
-    let task_requests_review = task_needs_review(task);
+    let explicit_needs_review = optional_bool_arg(args, "needs_review")?.unwrap_or(false);
+    let explicit_has_dependencies = optional_bool_arg(args, "has_dependencies")?.unwrap_or(false);
+    let timeout = optional_u64_arg(args, "timeout")?.unwrap_or(0);
 
-    if let Some(pref) = preferred {
-        if let Some(pattern) = pattern_from_name(pref, &agents, args) {
-            return Ok((
-                pattern,
-                serde_json::json!({
-                    "selected_pattern": pref,
-                    "selection_source": "outcome_history",
-                    "reason": "historically preferred pattern for this scenario",
-                    "scenario": scenario,
-                }),
-            ));
-        }
+    if let Some((pref, pattern)) = preferred
+        .and_then(|pref| pattern_from_name(pref, &agents, args).map(|pattern| (pref, pattern)))
+    {
+        return Ok((
+            pattern,
+            serde_json::json!({
+                "selected_pattern": pref,
+                "selection_source": "outcome_history",
+                "reason": "historically preferred pattern compatible with the current typed request",
+                "scenario": scenario,
+            }),
+        ));
     }
+    let ignored_preferred_pattern = preferred;
 
     let should_adapt = matches!(
         scenario,
@@ -480,7 +479,8 @@ pub(crate) fn select_default_coordination_pattern(
                 | astra_config::user_profile::Scenario::Debugging
                 | astra_config::user_profile::Scenario::Testing
         )
-    ) || task_requests_review;
+    ) || explicit_needs_review
+        || explicit_has_dependencies;
 
     if !should_adapt {
         let pattern = astra_services::coordination::CoordinationPattern::Sequential {
@@ -492,54 +492,60 @@ pub(crate) fn select_default_coordination_pattern(
             pattern,
             serde_json::json!({
                 "selected_pattern": "sequential",
-                "selection_source": "legacy_default",
-                "reason": "no explicit pattern and no adaptive delegation signal",
+                "selection_source": "deterministic_default",
+                "reason": "no explicit pattern or typed adaptive delegation signal",
                 "scenario": scenario,
+                "ignored_preferred_pattern": ignored_preferred_pattern,
             }),
         ));
     }
 
     let hints = astra_services::coordination::CoordinationHints {
         agent_ids: agents,
-        task: task.to_string(),
-        needs_review: matches!(
-            scenario,
-            Some(astra_config::user_profile::Scenario::CodeReview)
-        ),
-        has_dependencies: !matches!(
-            scenario,
-            Some(
-                astra_config::user_profile::Scenario::Exploration
-                    | astra_config::user_profile::Scenario::CodeReview
-                    | astra_config::user_profile::Scenario::Testing
-            )
-        ),
-        timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
+        needs_review: explicit_needs_review
+            || matches!(
+                scenario,
+                Some(astra_config::user_profile::Scenario::CodeReview)
+            ),
+        has_dependencies: explicit_has_dependencies
+            || matches!(
+                scenario,
+                Some(astra_config::user_profile::Scenario::Debugging)
+            ),
+        timeout_sec: timeout,
     };
     let pattern = astra_services::coordination::suggest_pattern(&hints);
     let selected_pattern = coordination_pattern_name(&pattern);
-    let reason = if matches!(
+    let reason = if explicit_needs_review && selected_pattern == "adversarial" {
+        "typed_request_requires_review"
+    } else if explicit_has_dependencies && selected_pattern == "sequential" {
+        "typed_request_has_dependencies"
+    } else if matches!(
         scenario,
         Some(astra_config::user_profile::Scenario::CodeReview)
-    ) {
+    ) && selected_pattern == "adversarial"
+    {
         "code_review_scenario_prefers_review_loop"
     } else if matches!(
         scenario,
         Some(astra_config::user_profile::Scenario::Exploration)
-    ) {
+    ) && selected_pattern == "fan_out"
+    {
         "exploration_scenario_prefers_parallel_scouting"
     } else if matches!(
         scenario,
         Some(astra_config::user_profile::Scenario::Debugging)
-    ) {
+    ) && selected_pattern == "sequential"
+    {
         "debugging_scenario_prefers_sequential_with_stop"
     } else if matches!(
         scenario,
         Some(astra_config::user_profile::Scenario::Testing)
-    ) {
+    ) && selected_pattern == "fan_out"
+    {
         "testing_scenario_prefers_parallel_execution"
-    } else if task_requests_review {
-        "task_keywords_request_review"
+    } else if scenario.is_some() {
+        "typed_scenario_fallback_for_available_agents"
     } else {
         "adaptive_default"
     };
@@ -551,6 +557,7 @@ pub(crate) fn select_default_coordination_pattern(
             "selection_source": "adaptive_default",
             "reason": reason,
             "scenario": scenario,
+            "ignored_preferred_pattern": ignored_preferred_pattern,
         }),
     ))
 }
@@ -560,21 +567,26 @@ pub(crate) fn pattern_from_name(
     agents: &[String],
     args: &Value,
 ) -> Option<astra_services::coordination::CoordinationPattern> {
-    let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(0);
+    let timeout = match optional_u64_arg(args, "timeout") {
+        Ok(timeout) => timeout.unwrap_or(0),
+        Err(_) => return None,
+    };
     match name {
-        "fan_out" => Some(astra_services::coordination::CoordinationPattern::FanOut {
-            agent_ids: agents.to_vec(),
-            aggregation: astra_services::coordination::AggregationStrategy::AllResults,
-            timeout_sec: timeout,
-        }),
-        "sequential" => Some(
+        "fan_out" if agents.len() >= 2 => {
+            Some(astra_services::coordination::CoordinationPattern::FanOut {
+                agent_ids: agents.to_vec(),
+                aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+                timeout_sec: timeout,
+            })
+        }
+        "sequential" if !agents.is_empty() => Some(
             astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids: agents.to_vec(),
                 stop_on_success: false,
                 timeout_sec: timeout,
             },
         ),
-        "pipeline" => Some(
+        "pipeline" if agents.len() >= 2 => Some(
             astra_services::coordination::CoordinationPattern::Pipeline {
                 stages: agents
                     .iter()
@@ -596,39 +608,69 @@ pub(crate) fn pattern_from_name(
                 timeout_sec: timeout,
             },
         ),
-        "fork" => {
-            agents.first().map(
-                |agent| astra_services::coordination::CoordinationPattern::Fork {
+        "fork" if agents.len() == 1 => agents.first().and_then(|agent| {
+            let tasks = args
+                .get("tasks")?
+                .as_array()?
+                .iter()
+                .map(|task| task.as_str().map(str::trim))
+                .collect::<Option<Vec<_>>>()?;
+            (tasks.len() >= 2 && tasks.iter().all(|task| !task.is_empty())).then(|| {
+                astra_services::coordination::CoordinationPattern::Fork {
                     agent_id: agent.clone(),
-                    tasks: vec!["delegated task".to_string()],
+                    tasks: tasks.into_iter().map(ToString::to_string).collect(),
                     max_turns: 10,
                     aggregation: astra_services::coordination::AggregationStrategy::AllResults,
                     timeout_sec: timeout,
-                },
-            )
-        }
+                }
+            })
+        }),
         _ => None,
     }
 }
 
-pub(crate) fn parse_delegate_agents(args: &Value) -> Vec<String> {
-    args.get("agents")
+pub(crate) fn parse_delegate_agents(args: &Value) -> Result<Vec<String>, String> {
+    let agents = args
+        .get("agents")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["coder".to_string()])
+        .ok_or("delegate call requires a non-empty string array field 'agents'")?;
+    if agents.is_empty() {
+        return Err("delegate call requires at least one agent".to_string());
+    }
+    let mut seen = HashSet::with_capacity(agents.len());
+    let mut parsed = Vec::with_capacity(agents.len());
+    for (index, value) in agents.iter().enumerate() {
+        let agent = value
+            .as_str()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+            .ok_or_else(|| format!("delegate agents[{index}] must be a non-empty string"))?;
+        if !seen.insert(agent.to_string()) {
+            return Err(format!(
+                "delegate agents contains duplicate agent_id '{agent}'"
+            ));
+        }
+        parsed.push(agent.to_string());
+    }
+    Ok(parsed)
 }
 
-pub(crate) fn task_needs_review(task: &str) -> bool {
-    let review_keywords = ["review", "审查", "check", "verify", "验证", "critique"];
-    let task_lower = task.to_lowercase();
-    review_keywords
-        .iter()
-        .any(|keyword| task_lower.contains(keyword))
+fn optional_bool_arg(args: &Value, field: &str) -> Result<Option<bool>, String> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("delegate field '{field}' must be a boolean")),
+    }
+}
+
+fn optional_u64_arg(args: &Value, field: &str) -> Result<Option<u64>, String> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("delegate field '{field}' must be a non-negative integer")),
+    }
 }
 
 pub(crate) fn coordination_pattern_name(
@@ -648,25 +690,24 @@ pub(crate) fn coordination_pattern_name(
 pub(crate) fn parse_coordination_pattern(
     args: &Value,
 ) -> Result<astra_services::coordination::CoordinationPattern, String> {
-    let pattern_type = args
-        .get("pattern")
-        .and_then(Value::as_str)
-        .unwrap_or("sequential");
+    let pattern_type = match args.get("pattern") {
+        None => "sequential",
+        Some(Value::String(pattern)) if !pattern.trim().is_empty() => pattern.as_str(),
+        Some(_) => return Err("delegate field 'pattern' must be a non-empty string".to_string()),
+    };
 
-    let agents = parse_delegate_agents(args);
-    let task = args
-        .get("task")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
+    let agents = parse_delegate_agents(args)?;
+    let timeout = optional_u64_arg(args, "timeout")?.unwrap_or(0);
     match pattern_type {
-        "fan_out" => Ok(astra_services::coordination::CoordinationPattern::FanOut {
-            agent_ids: agents,
-            aggregation: astra_services::coordination::AggregationStrategy::AllResults,
-            timeout_sec: 300,
-        }),
-        "pipeline" => {
+        "fan_out" if agents.len() >= 2 => {
+            Ok(astra_services::coordination::CoordinationPattern::FanOut {
+                agent_ids: agents,
+                aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+                timeout_sec: timeout,
+            })
+        }
+        "fan_out" => Err("delegate pattern 'fan_out' requires at least two agents".to_string()),
+        "pipeline" if agents.len() >= 2 => {
             let stages = agents
                 .into_iter()
                 .map(|id| astra_services::coordination::PipelineStage {
@@ -677,50 +718,88 @@ pub(crate) fn parse_coordination_pattern(
             Ok(
                 astra_services::coordination::CoordinationPattern::Pipeline {
                     stages,
-                    timeout_sec: 0,
+                    timeout_sec: timeout,
                 },
             )
         }
-        "adversarial" => {
-            let producer = agents
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "coder".to_string());
-            let reviewer = agents
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "reviewer".to_string());
-            let max_rounds = args.get("max_rounds").and_then(Value::as_u64).unwrap_or(2) as u32;
+        "pipeline" => Err("delegate pattern 'pipeline' requires at least two agents".to_string()),
+        "adversarial" if agents.len() == 2 => {
+            let producer = agents[0].clone();
+            let reviewer = agents[1].clone();
+            let max_rounds = optional_u64_arg(args, "max_rounds")?.unwrap_or(2);
+            if max_rounds == 0 {
+                return Err("delegate max_rounds must be greater than zero".to_string());
+            }
+            let max_rounds = u32::try_from(max_rounds)
+                .map_err(|_| "delegate max_rounds exceeds the supported range".to_string())?;
             Ok(
                 astra_services::coordination::CoordinationPattern::AdversarialReview {
                     producer_id: producer,
                     reviewer_id: reviewer,
                     max_rounds,
                     acceptance_threshold: 0.8,
-                    timeout_sec: 0,
+                    timeout_sec: timeout,
                 },
             )
         }
+        "adversarial" => {
+            Err("delegate pattern 'adversarial' requires exactly two agents".to_string())
+        }
+        "fork" if agents.len() == 1 => {
+            let tasks = args
+                .get("tasks")
+                .and_then(Value::as_array)
+                .ok_or("delegate pattern 'fork' requires a 'tasks' array")?;
+            if tasks.len() < 2 {
+                return Err("delegate pattern 'fork' requires at least two tasks".to_string());
+            }
+            let tasks = tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| {
+                    task.as_str()
+                        .map(str::trim)
+                        .filter(|task| !task.is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            format!("delegate fork tasks[{index}] must be a non-empty string")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let max_turns = optional_u64_arg(args, "max_turns")?.unwrap_or(10);
+            if max_turns == 0 {
+                return Err("delegate max_turns must be greater than zero".to_string());
+            }
+            let max_turns = u32::try_from(max_turns)
+                .map_err(|_| "delegate max_turns exceeds the supported range".to_string())?;
+            Ok(astra_services::coordination::CoordinationPattern::Fork {
+                tasks,
+                agent_id: agents[0].clone(),
+                max_turns,
+                aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+                timeout_sec: timeout,
+            })
+        }
+        "fork" => Err("delegate pattern 'fork' requires exactly one agent".to_string()),
         "auto" => {
             let hints = astra_services::coordination::CoordinationHints {
                 agent_ids: agents,
-                task,
-                needs_review: false,
-                has_dependencies: args
-                    .get("has_dependencies")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
+                needs_review: optional_bool_arg(args, "needs_review")?.unwrap_or(false),
+                has_dependencies: optional_bool_arg(args, "has_dependencies")?.unwrap_or(false),
+                timeout_sec: timeout,
             };
             Ok(astra_services::coordination::suggest_pattern(&hints))
         }
-        _ => Ok(
+        "sequential" => Ok(
             astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids: agents,
                 stop_on_success: false,
-                timeout_sec: 0,
+                timeout_sec: timeout,
             },
         ),
+        unknown => Err(format!(
+            "unknown delegate pattern '{unknown}'; expected sequential, fan_out, pipeline, adversarial, fork, or auto"
+        )),
     }
 }
 
@@ -841,7 +920,7 @@ pub(crate) async fn partition_and_execute_delegations(
                                     .and_then(|v| v.as_str().map(String::from))
                                     .unwrap_or_else(|| format!("{s:?}").to_lowercase())
                             });
-                    match execute_delegation_with_source_agent_fallback(
+                    match execute_delegation_with_source_agent_alias(
                         engine,
                         request,
                         source_agent_id,
@@ -1150,7 +1229,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(agent_ids, vec!["coder", "writer"]);
-                assert_eq!(timeout_sec, 300);
+                assert_eq!(timeout_sec, 0);
             }
             _ => panic!("expected FanOut"),
         }
@@ -1187,6 +1266,65 @@ mod tests {
                 assert_eq!(max_rounds, 3);
             }
             _ => panic!("expected AdversarialReview"),
+        }
+    }
+
+    #[test]
+    fn parse_coordination_pattern_rejects_invalid_or_incompatible_topology() {
+        for (args, expected) in [
+            (
+                json!({"pattern": "adversarial", "agents": ["coder"]}),
+                "requires exactly two agents",
+            ),
+            (
+                json!({"pattern": "fan_out", "agents": ["coder"]}),
+                "requires at least two agents",
+            ),
+            (
+                json!({"pattern": "pipline", "agents": ["coder", "reviewer"]}),
+                "unknown delegate pattern",
+            ),
+            (
+                json!({"pattern": "fork", "agents": ["coder"], "tasks": ["only one"]}),
+                "requires at least two tasks",
+            ),
+        ] {
+            let error = parse_coordination_pattern(&args).unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn parse_coordination_pattern_accepts_explicit_fork_tasks() {
+        let pattern = parse_coordination_pattern(&json!({
+            "pattern": "fork",
+            "agents": ["coder"],
+            "tasks": ["inspect storage", "inspect TUI"],
+            "max_turns": 4,
+            "timeout": 30
+        }))
+        .unwrap();
+        assert!(matches!(
+            pattern,
+            astra_services::coordination::CoordinationPattern::Fork {
+                tasks,
+                agent_id,
+                max_turns: 4,
+                timeout_sec: 30,
+                ..
+            } if tasks == ["inspect storage", "inspect TUI"] && agent_id == "coder"
+        ));
+    }
+
+    #[test]
+    fn parse_delegate_agents_rejects_missing_malformed_and_duplicate_identity() {
+        for args in [
+            json!({}),
+            json!({"agents": []}),
+            json!({"agents": ["coder", 7]}),
+            json!({"agents": ["coder", " coder "]}),
+        ] {
+            assert!(parse_delegate_agents(&args).is_err(), "{args}");
         }
     }
 
@@ -1275,6 +1413,34 @@ mod tests {
         let result = parse_delegation_request(&tool_call, "run-1", "sess-1", 0, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing arguments"));
+    }
+
+    #[test]
+    fn parse_delegation_request_rejects_missing_or_malformed_typed_fields() {
+        for (arguments, expected) in [
+            (r#"{"agents":["coder"]}"#, "non-empty string field 'task'"),
+            (r#"{"task":"work"}"#, "string array field 'agents'"),
+            (
+                r#"{"task":"work","agents":["coder"],"pattern":7}"#,
+                "field 'pattern' must be a non-empty string",
+            ),
+            (
+                r#"{"task":"work","agents":["coder"],"context":"repo"}"#,
+                "field 'context' must be an object",
+            ),
+            (
+                r#"{"task":"work","agents":["coder"],"needs_review":"yes"}"#,
+                "field 'needs_review' must be a boolean",
+            ),
+        ] {
+            let tool_call = json!({
+                "type": "function",
+                "function": {"name": "delegate", "arguments": arguments}
+            });
+            let error =
+                parse_delegation_request(&tool_call, "run-1", "sess-1", 0, None).unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]
@@ -1369,6 +1535,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_delegation_request_does_not_infer_topology_from_task_prose() {
+        let tool_call = json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"review and verify this patch\", \"agents\": [\"coder\", \"reviewer\"]}"
+            }
+        });
+
+        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 0, None).unwrap();
+
+        assert!(matches!(
+            req.pattern,
+            astra_services::coordination::CoordinationPattern::Sequential { .. }
+        ));
+        assert_eq!(
+            req.context["adaptive_coordination"]["selection_source"],
+            json!("deterministic_default")
+        );
+    }
+
+    #[test]
+    fn parse_delegation_request_accepts_typed_review_signal() {
+        let tool_call = json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"inspect this patch\", \"agents\": [\"coder\", \"reviewer\"], \"needs_review\": true}"
+            }
+        });
+
+        let req = parse_delegation_request(&tool_call, "run-123", "session-456", 0, None).unwrap();
+
+        assert!(matches!(
+            req.pattern,
+            astra_services::coordination::CoordinationPattern::AdversarialReview { .. }
+        ));
+        assert_eq!(
+            req.context["adaptive_coordination"]["reason"],
+            json!("typed_request_requires_review")
+        );
+    }
+
+    #[test]
     fn pattern_from_name_fan_out() {
         let agents = vec!["a".to_string(), "b".to_string()];
         let args = json!({"timeout": 60});
@@ -1431,8 +1641,7 @@ mod tests {
             preferred_pattern: Some("fan_out".to_string()),
         };
         let (pattern, policy) =
-            select_default_coordination_pattern(&args, "review code", Some(&adaptive_context))
-                .unwrap();
+            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
         assert!(
             matches!(
                 pattern,
@@ -1450,12 +1659,8 @@ mod tests {
             scenario: Some(astra_config::user_profile::Scenario::Testing),
             preferred_pattern: Some("pipeline".to_string()),
         };
-        let (pattern, policy) = select_default_coordination_pattern(
-            &args,
-            "run staged verification",
-            Some(&adaptive_context),
-        )
-        .unwrap();
+        let (pattern, policy) =
+            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
         assert!(
             matches!(
                 pattern,
@@ -1475,8 +1680,7 @@ mod tests {
             preferred_pattern: None,
         };
         let (_pattern, policy) =
-            select_default_coordination_pattern(&args, "find the bug", Some(&adaptive_context))
-                .unwrap();
+            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
         assert_eq!(policy["selection_source"], "adaptive_default");
         assert_eq!(
             policy["reason"],
@@ -1492,13 +1696,32 @@ mod tests {
             preferred_pattern: None,
         };
         let (_pattern, policy) =
-            select_default_coordination_pattern(&args, "run tests", Some(&adaptive_context))
-                .unwrap();
+            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
         assert_eq!(policy["selection_source"], "adaptive_default");
         assert_eq!(
             policy["reason"],
             "testing_scenario_prefers_parallel_execution"
         );
+    }
+
+    #[test]
+    fn select_default_explains_single_agent_scenario_fallback() {
+        let args = json!({"agents": ["tester"]});
+        let adaptive_context = DelegationAdaptiveContext {
+            scenario: Some(astra_config::user_profile::Scenario::Testing),
+            preferred_pattern: Some("adversarial".to_string()),
+        };
+        let (pattern, policy) =
+            select_default_coordination_pattern(&args, Some(&adaptive_context)).unwrap();
+        assert!(matches!(
+            pattern,
+            astra_services::coordination::CoordinationPattern::Sequential { .. }
+        ));
+        assert_eq!(
+            policy["reason"],
+            "typed_scenario_fallback_for_available_agents"
+        );
+        assert_eq!(policy["ignored_preferred_pattern"], "adversarial");
     }
 
     #[test]
@@ -1829,7 +2052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_preserves_target_not_registered_error_after_source_alias_retry() {
+    async fn partition_preserves_target_error_after_typed_source_alias_resolution() {
         let engine = make_partition_engine("main", &[]);
         let tool_calls = vec![json!({
             "id": "missing_target",
@@ -1908,7 +2131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intercept_delegations_retries_root_agent_aliases() {
+    async fn intercept_delegations_resolves_root_agent_alias_from_registry() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));

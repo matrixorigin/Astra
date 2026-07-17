@@ -46,7 +46,27 @@ pub struct TeamExecutionReport {
     pub delegation_result: Option<DelegationResult>,
     pub merge_result: Option<MergeResult>,
     pub status: TeamExecutionStatus,
+    pub error_kind: Option<TeamExecutionErrorKind>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamExecutionErrorKind {
+    TeamNotFound,
+    InvalidTeam,
+    Persistence,
+    Execution,
+}
+
+impl TeamExecutionErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TeamNotFound => "team_not_found",
+            Self::InvalidTeam => "team_invalid",
+            Self::Persistence => "team_persistence_error",
+            Self::Execution => "team_execution_failed",
+        }
+    }
 }
 
 fn durable_status_for_team_outcome(status: &TeamExecutionStatus) -> &'static str {
@@ -162,11 +182,18 @@ impl TeamExecutionOrchestrator {
                     team_name,
                     "",
                     "",
+                    TeamExecutionErrorKind::TeamNotFound,
                     format!("team '{team_name}' not found"),
                 );
             }
             Err(e) => {
-                return self.fail_report(team_name, "", "", format!("failed to load team: {e}"));
+                return self.fail_report(
+                    team_name,
+                    "",
+                    "",
+                    TeamExecutionErrorKind::Persistence,
+                    format!("failed to load team: {e}"),
+                );
             }
         };
 
@@ -189,6 +216,7 @@ impl TeamExecutionOrchestrator {
                 team_name,
                 "",
                 &parent_run_id,
+                TeamExecutionErrorKind::Persistence,
                 format!("failed to start run: {e}"),
             );
         }
@@ -229,6 +257,7 @@ impl TeamExecutionOrchestrator {
                     team_name,
                     "",
                     &parent_run_id,
+                    TeamExecutionErrorKind::InvalidTeam,
                     format!("team validation failed: {e}"),
                 );
             }
@@ -320,6 +349,7 @@ impl TeamExecutionOrchestrator {
                             team_name,
                             &delegation_id,
                             &parent_run_id,
+                            TeamExecutionErrorKind::Execution,
                             format!("failed to create worktrees: {e}"),
                         );
                     }
@@ -475,7 +505,13 @@ impl TeamExecutionOrchestrator {
                         format!("delegation failed: {e}; cleanup skipped: {cleanup_err}")
                     }
                 };
-                return self.fail_report(team_name, &delegation_id, &parent_run_id, failure);
+                return self.fail_report(
+                    team_name,
+                    &delegation_id,
+                    &parent_run_id,
+                    TeamExecutionErrorKind::Execution,
+                    failure,
+                );
             }
         };
 
@@ -674,6 +710,7 @@ impl TeamExecutionOrchestrator {
             delegation_result: Some(delegation_result),
             merge_result,
             status,
+            error_kind: error.as_ref().map(|_| TeamExecutionErrorKind::Execution),
             error,
         }
     }
@@ -710,6 +747,7 @@ impl TeamExecutionOrchestrator {
         team_name: &str,
         delegation_id: &str,
         parent_run_id: &str,
+        error_kind: TeamExecutionErrorKind,
         error: String,
     ) -> TeamExecutionReport {
         TeamExecutionReport {
@@ -719,6 +757,7 @@ impl TeamExecutionOrchestrator {
             delegation_result: None,
             merge_result: None,
             status: TeamExecutionStatus::Failed,
+            error_kind: Some(error_kind),
             error: Some(error),
         }
     }
@@ -809,6 +848,10 @@ mod tests {
 
         let report = orch.execute_team("nonexistent", "do something", None).await;
         assert_eq!(report.status, TeamExecutionStatus::Failed);
+        assert_eq!(
+            report.error_kind,
+            Some(TeamExecutionErrorKind::TeamNotFound)
+        );
         assert!(report.error.as_ref().unwrap().contains("not found"));
     }
 
@@ -1229,6 +1272,7 @@ mod tests {
 
         let report = orch.execute_team("bad", "task", None).await;
         assert_eq!(report.status, TeamExecutionStatus::Failed);
+        assert_eq!(report.error_kind, Some(TeamExecutionErrorKind::InvalidTeam));
         assert!(report.error.as_ref().unwrap().contains("validation failed"));
     }
 
@@ -1300,12 +1344,19 @@ mod tests {
             conflict_resolver: None,
         };
 
-        let report = orch.fail_report("team", "deleg", "run", "boom".to_string());
+        let report = orch.fail_report(
+            "team",
+            "deleg",
+            "run",
+            TeamExecutionErrorKind::Execution,
+            "boom".to_string(),
+        );
         assert_eq!(report.status, TeamExecutionStatus::Failed);
         assert_eq!(report.team_name, "team");
         assert_eq!(report.delegation_id, "deleg");
         assert_eq!(report.parent_run_id, "run");
         assert_eq!(report.error, Some("boom".to_string()));
+        assert_eq!(report.error_kind, Some(TeamExecutionErrorKind::Execution));
     }
 
     #[tokio::test]

@@ -16,7 +16,9 @@ use astra_server_types::team_orchestrator_traits::{
 use astra_server_types::team_orchestrator_types::{OrchestratorConfig, sum_usage};
 
 use super::super::*;
-use crate::server::team::orchestrator::{TeamExecutionOrchestrator, TeamExecutionReport};
+use crate::server::team::orchestrator::{
+    TeamExecutionErrorKind, TeamExecutionOrchestrator, TeamExecutionReport,
+};
 use astra_services::team_persistence::{
     TeamDefinition, TeamExecutionListCursor, TeamExecutionRecord, TeamPersistenceService,
     TeamSnapshotListCursor, team_execution_cursor_db_started_at,
@@ -362,25 +364,24 @@ pub(crate) async fn execute_team_handler(
 fn map_team_execution_report_to_http(
     report: TeamExecutionReport,
 ) -> Result<Json<TeamExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(ref err) = report.error {
-        if err.contains("not found") && err.contains("team") {
-            return Err(astra_core::error_response(
-                StatusCode::NOT_FOUND,
-                err.clone(),
-            ));
-        }
-        if err.contains("team validation failed") {
-            return Err(astra_core::error_response(
-                StatusCode::BAD_REQUEST,
-                err.clone(),
-            ));
-        }
-        if err.contains("failed to load team") {
-            return Err(astra_core::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                err.clone(),
-            ));
-        }
+    let error_status = match report.error_kind {
+        Some(TeamExecutionErrorKind::TeamNotFound) => Some(StatusCode::NOT_FOUND),
+        Some(TeamExecutionErrorKind::InvalidTeam) => Some(StatusCode::BAD_REQUEST),
+        Some(TeamExecutionErrorKind::Persistence) => Some(StatusCode::INTERNAL_SERVER_ERROR),
+        Some(TeamExecutionErrorKind::Execution) | None => None,
+    };
+    if let Some(status) = error_status {
+        return Err(astra_core::error_response_coded(
+            status,
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "team execution failed without error detail".to_string()),
+            report
+                .error_kind
+                .map(TeamExecutionErrorKind::as_str)
+                .unwrap_or("team_execution_failed"),
+        ));
     }
 
     Ok(Json(TeamExecuteResponse::from(report)))
@@ -404,6 +405,8 @@ pub(crate) struct TeamExecuteResponse {
     pub delegation_id: String,
     pub parent_run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub agent_count: usize,
     pub total_prompt_tokens: u64,
@@ -423,6 +426,7 @@ impl From<TeamExecutionReport> for TeamExecuteResponse {
             status: r.status.to_string(),
             delegation_id: r.delegation_id,
             parent_run_id: r.parent_run_id,
+            error_code: r.error_kind.map(|kind| kind.as_str().to_string()),
             error: r.error,
             agent_count: r
                 .delegation_result
@@ -631,6 +635,54 @@ impl From<astra_services::team_persistence::TeamSnapshotRecord> for SnapshotEntr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_report(kind: TeamExecutionErrorKind, message: &str) -> TeamExecutionReport {
+        TeamExecutionReport {
+            team_name: "reviewers".to_string(),
+            delegation_id: String::new(),
+            parent_run_id: String::new(),
+            delegation_result: None,
+            merge_result: None,
+            status: astra_server_types::team_orchestrator_types::TeamExecutionStatus::Failed,
+            error_kind: Some(kind),
+            error: Some(message.to_string()),
+        }
+    }
+
+    #[test]
+    fn team_execution_http_mapping_uses_typed_failure_kind() {
+        let not_found = map_team_execution_report_to_http(failed_report(
+            TeamExecutionErrorKind::TeamNotFound,
+            "arbitrary detail",
+        ))
+        .unwrap_err();
+        assert_eq!(not_found.0, StatusCode::NOT_FOUND);
+        assert_eq!(not_found.1.0.error_code.as_deref(), Some("team_not_found"));
+
+        let persistence = map_team_execution_report_to_http(failed_report(
+            TeamExecutionErrorKind::Persistence,
+            "database unavailable",
+        ))
+        .unwrap_err();
+        assert_eq!(persistence.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            persistence.1.0.error_code.as_deref(),
+            Some("team_persistence_error")
+        );
+    }
+
+    #[test]
+    fn execution_error_text_cannot_impersonate_http_protocol() {
+        let Json(response) = map_team_execution_report_to_http(failed_report(
+            TeamExecutionErrorKind::Execution,
+            "team not found while rendering an agent quote",
+        ))
+        .unwrap();
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("team_execution_failed")
+        );
+    }
 
     #[test]
     fn team_execution_query_cursor_requires_complete_seek_key() {

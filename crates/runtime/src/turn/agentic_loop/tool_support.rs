@@ -103,12 +103,37 @@ pub(crate) fn delegate_tool_schema() -> Value {
                     },
                     "pattern": {
                         "type": "string",
-                        "enum": ["sequential", "fan_out", "pipeline", "adversarial"],
-                        "description": "Coordination pattern: sequential, fan_out, pipeline, or adversarial."
+                        "enum": ["sequential", "fan_out", "pipeline", "adversarial", "fork", "auto"],
+                        "description": "Explicit coordination topology. Omit it to use typed runtime scenario/history signals; task prose is never keyword-classified."
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 2,
+                        "description": "Explicit sub-task list required by the fork pattern."
+                    },
+                    "needs_review": {
+                        "type": "boolean",
+                        "description": "Typed hint for auto/default selection; true may choose adversarial review when exactly two agents are supplied."
+                    },
+                    "has_dependencies": {
+                        "type": "boolean",
+                        "description": "Typed hint for auto/default selection; true keeps agents ordered."
                     },
                     "max_rounds": {
                         "type": "integer",
+                        "minimum": 1,
                         "description": "Maximum rounds for adversarial pattern (default: 2)."
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum turns for each explicit fork task (default: 10)."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-agent timeout in seconds; zero disables the timeout."
                     },
                     "context": {
                         "type": "object",
@@ -211,7 +236,12 @@ mod tests {
         assert!(props["task"].is_object());
         assert!(props["agents"].is_object());
         assert!(props["pattern"].is_object());
+        assert!(props["tasks"].is_object());
+        assert!(props["needs_review"].is_object());
+        assert!(props["has_dependencies"].is_object());
         assert!(props["max_rounds"].is_object());
+        assert!(props["max_turns"].is_object());
+        assert!(props["timeout"].is_object());
         assert!(props["context"].is_object());
     }
 
@@ -230,7 +260,12 @@ mod tests {
         assert!(props.get("task").is_some());
         assert!(props.get("agents").is_some());
         assert!(props.get("pattern").is_some());
+        assert!(props.get("tasks").is_some());
+        assert!(props.get("needs_review").is_some());
+        assert!(props.get("has_dependencies").is_some());
         assert!(props.get("max_rounds").is_some());
+        assert!(props.get("max_turns").is_some());
+        assert!(props.get("timeout").is_some());
         assert!(props.get("context").is_some());
     }
 
