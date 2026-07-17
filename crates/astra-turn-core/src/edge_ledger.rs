@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use astra_services::multi_agent::EdgeDispatchIdentity;
@@ -93,11 +93,44 @@ impl LedgerEntryMeta {
     }
 }
 
-/// Parallel side-channel of per-entry metadata (created_at, retry count, poll timestamps).
+/// Parallel side-channel of expected-or-present entry metadata for retry and
+/// expiry observability. Authorization is scoped separately by
+/// [`ledger_expectations`] so independent ledgers cannot trust each other.
 fn ledger_meta() -> &'static StdMutex<HashMap<String, LedgerEntryMeta>> {
     static META: std::sync::OnceLock<StdMutex<HashMap<String, LedgerEntryMeta>>> =
         std::sync::OnceLock::new();
     META.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+type CallbackLedger = tokio::sync::Mutex<HashMap<String, Value>>;
+
+struct LedgerExpectation {
+    ledger: Weak<CallbackLedger>,
+    registered_at: Instant,
+}
+
+/// Process-local callback expectations, scoped to the exact ledger instance.
+/// A key alone is insufficient: tests and embedded servers may host multiple
+/// independent AppStates in one process. Weak references prevent a discarded
+/// state from authorizing a later ledger that happens to reuse its identity.
+fn ledger_expectations() -> &'static StdMutex<HashMap<String, Vec<LedgerExpectation>>> {
+    static EXPECTATIONS: std::sync::OnceLock<StdMutex<HashMap<String, Vec<LedgerExpectation>>>> =
+        std::sync::OnceLock::new();
+    EXPECTATIONS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn clear_ledger_expectation(ledger: &Arc<CallbackLedger>, key: &str) {
+    let ledger = Arc::downgrade(ledger);
+    if let Ok(mut expectations) = ledger_expectations().lock() {
+        if let Some(ledgers) = expectations.get_mut(key) {
+            ledgers.retain(|candidate| {
+                candidate.ledger.upgrade().is_some() && !Weak::ptr_eq(&candidate.ledger, &ledger)
+            });
+            if ledgers.is_empty() {
+                expectations.remove(key);
+            }
+        }
+    }
 }
 
 fn prune_ledger_meta(meta: &mut HashMap<String, LedgerEntryMeta>) {
@@ -239,6 +272,63 @@ pub fn on_ledger_insert(key: &str) {
     if let Some(p) = ledger_persistence() {
         let _ = p.write_op("insert", key);
     }
+}
+
+/// Mark a callback key as expected before its request is exposed to a client.
+///
+/// This is deliberately separate from event construction: formatting an SSE
+/// map must not authorize a callback unless the caller will also consume it.
+pub fn expect_ledger_entry(ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>, key: &str) {
+    let ledger = Arc::downgrade(ledger);
+    if let Ok(mut expectations) = ledger_expectations().lock() {
+        let ledgers = expectations.entry(key.to_string()).or_default();
+        let now = Instant::now();
+        ledgers.retain(|candidate| {
+            candidate.ledger.upgrade().is_some()
+                && now.saturating_duration_since(candidate.registered_at) <= MAX_LEDGER_ENTRY_AGE
+        });
+        if let Some(candidate) = ledgers
+            .iter_mut()
+            .find(|candidate| Weak::ptr_eq(&candidate.ledger, &ledger))
+        {
+            candidate.registered_at = now;
+        } else {
+            ledgers.push(LedgerExpectation {
+                ledger,
+                registered_at: now,
+            });
+        }
+    }
+    if let Ok(mut meta) = ledger_meta().lock() {
+        meta.entry(key.to_string())
+            .or_insert_with(LedgerEntryMeta::now);
+        prune_ledger_meta(&mut meta);
+    }
+}
+
+/// Whether this process has an active waiter or an unconsumed entry for `key`.
+pub fn ledger_entry_is_expected(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    key: &str,
+) -> bool {
+    let ledger = Arc::downgrade(ledger);
+    ledger_expectations()
+        .lock()
+        .map(|mut expectations| {
+            let Some(ledgers) = expectations.get_mut(key) else {
+                return false;
+            };
+            let now = Instant::now();
+            ledgers.retain(|candidate| {
+                candidate.ledger.upgrade().is_some()
+                    && now.saturating_duration_since(candidate.registered_at)
+                        <= MAX_LEDGER_ENTRY_AGE
+            });
+            ledgers
+                .iter()
+                .any(|candidate| Weak::ptr_eq(&candidate.ledger, &ledger))
+        })
+        .unwrap_or(false)
 }
 
 /// ── File-based persistence ──────────────────────────────────────────
@@ -447,6 +537,7 @@ pub async fn take_ledger_entry(
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
                 // Clean up metadata and timestamps.
+                clear_ledger_expectation(ledger, key);
                 if let Ok(mut ts) = ledger_timestamps().lock() {
                     ts.remove(key);
                 }
@@ -459,9 +550,20 @@ pub async fn take_ledger_entry(
                 }
                 return Some(v);
             }
-        }
-        if started.elapsed() >= timeout {
-            return None;
+            if started.elapsed() >= timeout {
+                // Clear the authorization boundary while holding the ledger
+                // lock. A callback handler takes the same lock before checking
+                // the expectation, so it cannot enqueue an orphan in the
+                // timeout check/return race window.
+                clear_ledger_expectation(ledger, key);
+                if let Ok(mut ts) = ledger_timestamps().lock() {
+                    ts.remove(key);
+                }
+                if let Ok(mut meta) = ledger_meta().lock() {
+                    meta.remove(key);
+                }
+                return None;
+            }
         }
         let delay = backoff_delay(retries);
         retries += 1;
@@ -1000,6 +1102,31 @@ mod tests {
         let got = take_ledger_entry(&ledger, &key, Duration::from_millis(60)).await;
         assert!(got.is_none());
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn callback_expectation_is_cleared_at_timeout_boundary() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let independent_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", &Uuid::now_v7().to_string());
+
+        assert!(!ledger_entry_is_expected(&ledger, &key));
+        expect_ledger_entry(&ledger, &key);
+        assert!(ledger_entry_is_expected(&ledger, &key));
+        assert!(
+            !ledger_entry_is_expected(&independent_ledger, &key),
+            "the same callback key must not cross independent server states"
+        );
+
+        assert!(
+            take_ledger_entry(&ledger, &key, Duration::ZERO)
+                .await
+                .is_none()
+        );
+        assert!(
+            !ledger_entry_is_expected(&ledger, &key),
+            "a timed-out waiter must stop authorizing future callbacks"
+        );
     }
 
     #[test]

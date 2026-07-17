@@ -19,7 +19,9 @@ use astra_thin_client::{
 use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use serde_json::Value;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{
+    LEDGER_MAX_ENTRIES, approval_callback_key, ledger_entry_is_expected, tool_callback_key,
+};
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
@@ -253,20 +255,26 @@ pub(crate) async fn post_tool_result_handler(
             )
         })?,
     });
+    // The ledger lock and expectation check form one boundary with waiter
+    // timeout cleanup. Session ownership authenticates the caller, but only a
+    // request this process emitted may enter its process-local delivery lane.
     let ledger_insert_result = {
         let mut lock = state.edge_callback_ledger.lock().await;
-        insert_ledger_entry(&mut lock, key.clone(), ledger_value)
+        ledger_entry_is_expected(&state.edge_callback_ledger, &key)
+            .then(|| insert_ledger_entry(&mut lock, key.clone(), ledger_value))
     };
-    let (ledger_enqueued, ledger_capacity_exceeded) = match ledger_insert_result {
-        Ok(enqueued) => (enqueued, false),
-        Err(LedgerInsertError::DuplicateKey) => {
-            return Err(ledger_insert_error_response(
-                &key,
-                LedgerInsertError::DuplicateKey,
-            ));
-        }
-        Err(LedgerInsertError::CapacityExceeded) => (false, true),
-    };
+    let (local_callback_accepted, ledger_enqueued, ledger_capacity_exceeded) =
+        match ledger_insert_result {
+            Some(Ok(enqueued)) => (true, enqueued, false),
+            Some(Err(LedgerInsertError::DuplicateKey)) => {
+                return Err(ledger_insert_error_response(
+                    &key,
+                    LedgerInsertError::DuplicateKey,
+                ));
+            }
+            Some(Err(LedgerInsertError::CapacityExceeded)) => (false, false, true),
+            None => (false, false, false),
+        };
 
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
@@ -299,7 +307,7 @@ pub(crate) async fn post_tool_result_handler(
 
     let delivery_route = if dispatch_delivered {
         "durable_dispatch"
-    } else if ledger_enqueued {
+    } else if local_callback_accepted {
         "same_pod_ledger"
     } else {
         "none"
@@ -319,6 +327,22 @@ pub(crate) async fn post_tool_result_handler(
         return Err(ledger_insert_error_response(
             &key,
             LedgerInsertError::CapacityExceeded,
+        ));
+    }
+    if !local_callback_accepted && !dispatch_delivered {
+        tracing::warn!(
+            target: "astra_runtime::edge_callback",
+            user_id = %user.user_id,
+            session_id = %body.session_id,
+            run_id = %body.run_id,
+            turn_chain_id = %body.turn_chain_id,
+            request_id = %body.request_id,
+            edge_agent_id = %edge_agent_id,
+            "Edge: rejected tool result without a matching local waiter or durable dispatch"
+        );
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Tool result request not found or no longer awaiting a result",
         ));
     }
 
@@ -1847,6 +1871,42 @@ mod edge_callback_insert_tests {
             state.edge_callback_ledger.lock().await.is_empty(),
             "a terminal run has no consumer, so its callback must not enter the ledger"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_run_does_not_authorize_an_unrequested_tool_result() {
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new("run-active", "sess-active").with_running_edge_wait(),
+        );
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(lifecycle);
+
+        let error = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-unrequested-tool-result".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: "sess-active".into(),
+                    run_id: "run-active".into(),
+                    turn_chain_id: "chain-active".into(),
+                    request_id: "req-never-emitted".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output: "forged result".into(),
+                    duration_ms: 12,
+                    tool_result_fields: None,
+                },
+            )),
+        )
+        .await
+        .expect_err("an active run alone must not authorize arbitrary callback identities");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -21,7 +21,7 @@ use futures_util::stream::StreamExt;
 use crate::action_compensation::explicit_approval_reason;
 use crate::cloud::approval_policy::edge_tool_requires_cloud_approval_with_args;
 use crate::edge_ledger::{
-    DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key,
+    DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, expect_ledger_entry,
     persist_value_for_ledger_tool_result, take_ledger_entry, tool_callback_key,
     tool_content_from_ledger_entry,
 };
@@ -648,6 +648,10 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
         );
     }
     let t_key = tool_callback_key(identity);
+    // The emitter should register before exposing `tool_request` to close the
+    // pre-wait race. Registering again here is idempotent and guarantees that
+    // direct callers still authorize callbacks while an exact waiter exists.
+    expect_ledger_entry(ledger, &t_key);
     let mut cancelled = false;
     let tr_entry = if let Some(cancel_token) = cancel_token {
         tokio::select! {
@@ -863,6 +867,13 @@ fn tool_identity_for_call(scope: &EdgeDispatchIdentity, tc: &Value) -> EdgeDispa
     scope.for_request_id(request_id)
 }
 
+fn expect_tool_result_callback(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    identity: &EdgeDispatchIdentity,
+) {
+    expect_ledger_entry(ledger, &tool_callback_key(identity));
+}
+
 async fn deliver_read_only_block(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     scope: &EdgeDispatchIdentity,
@@ -872,6 +883,7 @@ async fn deliver_read_only_block(
     let mut out = EdgeToolRoundDelivery::default();
     for tc in tool_calls {
         let identity = tool_identity_for_call(scope, tc);
+        expect_tool_result_callback(ledger, &identity);
         out.sse_maps
             .extend(sse_maps_through_tool_request(tc, &identity));
         extend_delivery(
@@ -903,6 +915,7 @@ async fn deliver_approval_block(
 
     for tc in &approved_calls {
         let identity = tool_identity_for_call(scope, tc);
+        expect_tool_result_callback(ledger, &identity);
         out.sse_maps
             .extend(sse_maps_through_tool_request(tc, &identity));
     }
@@ -927,6 +940,7 @@ async fn deliver_read_only_block_concurrent(
     let mut out = EdgeToolRoundDelivery::default();
     for tc in tool_calls {
         let identity = tool_identity_for_call(scope, tc);
+        expect_tool_result_callback(ledger, &identity);
         out.sse_maps
             .extend(sse_maps_through_tool_request(tc, &identity));
     }
@@ -975,6 +989,7 @@ async fn deliver_approval_block_concurrent(
 
     for tc in &approved_calls {
         let identity = tool_identity_for_call(scope, tc);
+        expect_tool_result_callback(ledger, &identity);
         out.sse_maps
             .extend(sse_maps_through_tool_request(tc, &identity));
     }
