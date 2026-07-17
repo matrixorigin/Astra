@@ -66,7 +66,7 @@ use astra_config::user_profile::TurnIntent;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
-use astra_tools::task_mgmt::{SessionTask, TaskManager};
+use astra_tools::task_mgmt::{SessionTask, TaskManager, unresolved_task_blocker_ids};
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
@@ -1458,10 +1458,10 @@ pub struct TaskBoardSnapshot {
     pub paused_count: usize,
     pub completed_count: usize,
     pub terminal_non_success_count: usize,
-    /// Count of active (pending/in_progress) tasks that have at least one
-    /// blocker in their `blocked_by` list.  This counts tasks waiting on
-    /// dependencies, *not* tasks whose status is literally "blocked"
-    /// (there is no such status — the field reflects dependency edges).
+    /// Count of open tasks that have at least one unresolved dependency.
+    /// Completed blocker edges are history, while missing blocker references
+    /// fail closed. This counts tasks waiting on dependencies, *not* tasks
+    /// whose status is literally "blocked" (there is no such status).
     pub blocked_count: usize,
     pub active_tasks: Vec<String>,
 }
@@ -1479,11 +1479,12 @@ impl TaskBoardSnapshot {
             ) {
                 continue;
             }
+            let unresolved_blockers = unresolved_task_blocker_ids(tasks, task);
             snapshot.tracked_count += 1;
             match task.status {
                 astra_tools::task_mgmt::SessionTaskStatusKind::InProgress => {
                     snapshot.in_progress_count += 1;
-                    if task.blocked_by.is_empty() {
+                    if unresolved_blockers.is_empty() {
                         snapshot.reconcilable_in_progress_count += 1;
                     }
                 }
@@ -1505,7 +1506,7 @@ impl TaskBoardSnapshot {
                 | astra_tools::task_mgmt::SessionTaskStatusKind::Deleted
                 | astra_tools::task_mgmt::SessionTaskStatusKind::Migrated => {}
             }
-            if !task.blocked_by.is_empty() {
+            if task.status.is_open_work() && !unresolved_blockers.is_empty() {
                 snapshot.blocked_count += 1;
             }
             if task.status.is_open_work() && snapshot.active_tasks.len() < 3 {
@@ -4198,6 +4199,53 @@ pub(crate) mod tests {
             "1 in_progress, 1 pending task(s) remain"
         );
         assert!(VolatileKind::TaskBoardAdvisory.is_singleton());
+    }
+
+    #[test]
+    fn task_board_snapshot_resolves_dependencies_by_blocker_state() {
+        use astra_tools::task_mgmt::SessionTaskStatusKind::{Completed, InProgress, Pending};
+        let task = |id: &str,
+                    title: &str,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind,
+                    blocked_by: &[&str]| SessionTask {
+            archived_at: None,
+            id: id.to_string(),
+            title: title.to_string(),
+            description: None,
+            status,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: blocked_by.iter().map(|id| (*id).to_string()).collect(),
+        };
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[
+            task("task-1", "finished prerequisite", Completed, &[]),
+            task(
+                "task-2",
+                "running after prerequisite",
+                InProgress,
+                &["task-1"],
+            ),
+            task(
+                "task-3",
+                "waiting on missing prerequisite",
+                Pending,
+                &["task-missing"],
+            ),
+        ]);
+
+        assert_eq!(
+            snapshot.reconcilable_in_progress_count, 1,
+            "a retained edge to completed work must not suppress reconciliation"
+        );
+        assert_eq!(
+            snapshot.blocked_count, 1,
+            "missing dependency references must remain visibly unresolved"
+        );
     }
 
     #[test]

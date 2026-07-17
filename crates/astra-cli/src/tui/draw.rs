@@ -333,7 +333,7 @@ pub(crate) struct ViewportFrame {
     /// other. `None` when no parallel agents are live.
     pub multi_agent: Option<Vec<MultiAgentEntry>>,
     /// Pre-rendered task board. `None` when the board should not
-    /// draw (collapsed, hidden by idle timer, empty, etc.).
+    /// draw (terminal-history only, explicitly hidden, empty, etc.).
     pub task_board: Option<Vec<Line<'static>>>,
     /// The resolved board visibility state after evaluating the
     /// snapshot. Callers MUST write this back to their local
@@ -556,6 +556,9 @@ pub(crate) fn active_viewport(
     let has_tasks = projection
         .as_ref()
         .is_some_and(TaskBoardProjection::has_tasks);
+    let has_open_work = projection
+        .as_ref()
+        .is_some_and(TaskBoardProjection::has_open_work);
     // `hidden` only records an explicit compact-board collapse. It is never
     // derived from a terminal-task timeout, so completed work remains
     // reachable through Ctrl+T and the primary Taskboard.
@@ -621,12 +624,12 @@ pub(crate) fn active_viewport(
             Some(TaskBoardProjection::All { snapshot, .. }) if resolved_expanded => {
                 task_list::render_multi(&snapshot.per_session, width, row_budget)
             }
-            Some(TaskBoardProjection::Single { snapshot, .. }) => {
-                task_list::render_collapsed_summary(&snapshot.tasks, width)
+            Some(TaskBoardProjection::Single { snapshot, .. }) if has_open_work => {
+                task_list::render_collapsed_active_summary(&snapshot.tasks, width)
                     .into_iter()
                     .collect()
             }
-            Some(TaskBoardProjection::All { snapshot, .. }) => {
+            Some(TaskBoardProjection::All { snapshot, .. }) if has_open_work => {
                 let tasks = snapshot
                     .per_session
                     .iter()
@@ -636,7 +639,7 @@ pub(crate) fn active_viewport(
                     .into_iter()
                     .collect()
             }
-            None => Vec::new(),
+            Some(_) | None => Vec::new(),
         }
     } else {
         Vec::new()
@@ -1601,7 +1604,7 @@ mod task_board_draw_tests {
     }
 
     #[tokio::test]
-    async fn footer_keeps_completed_count_when_board_hidden() {
+    async fn terminal_history_does_not_keep_compact_surface_alive() {
         let store = Arc::new(InMemoryTaskStore::new());
         let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
             store.clone() as Arc<dyn TaskStore>,
@@ -1621,12 +1624,55 @@ mod task_board_draw_tests {
         .await;
         obs.hide_completed_after_review();
 
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&obs),
+            false,
+            None,
+            80,
+            24,
+        );
+        assert!(
+            frame.task_board.is_none(),
+            "collapsed terminal history should not occupy the active viewport: {:?}",
+            frame.task_board
+        );
+
+        let mut footer = Footer::new();
+        sync_task_footer(&mut footer, &obs, false);
+        assert_eq!(
+            footer.task_counts, None,
+            "terminal history remains available through Ctrl+T without a sticky footer chip"
+        );
+    }
+
+    #[tokio::test]
+    async fn footer_retains_lifecycle_progress_while_open_work_remains() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
+            store.clone() as Arc<dyn TaskStore>,
+            "draw-mixed-progress",
+        );
+        let mgr = TaskManager::new("draw-mixed-progress", store as Arc<dyn TaskStore>);
+        mgr.create(&serde_json::json!({"title": "done"})).await;
+        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        mgr.create(&serde_json::json!({"title": "still open"}))
+            .await;
+        wait_until(
+            || obs.snapshot().tasks.len() == 2,
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
         let mut footer = Footer::new();
         sync_task_footer(&mut footer, &obs, false);
         assert_eq!(
             footer.task_counts,
-            Some((0, 1)),
-            "completed hidden boards should still advertise a Ctrl+T-visible task chip"
+            Some((1, 2)),
+            "active progress should retain completed lifecycle context"
         );
     }
 

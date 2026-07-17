@@ -1920,6 +1920,12 @@ fn drain_plan_updates_into_workbench(
     changed
 }
 
+fn reconcile_task_board_on_open(task_board: &task_board_observer::TaskBoardObserver) {
+    if task_board.request_refresh() && tokio::runtime::Handle::try_current().is_ok() {
+        task_board.maybe_refresh();
+    }
+}
+
 fn handle_task_surface_shortcut(
     key: &crossterm::event::KeyEvent,
     task_board: &task_board_observer::TaskBoardObserver,
@@ -1950,6 +1956,7 @@ fn handle_task_surface_shortcut(
             task_board.toggle_view_mode();
         }
         task_board.reveal_completed_for_review();
+        reconcile_task_board_on_open(task_board);
         bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
             task_board.active_projection(),
         )));
@@ -1968,6 +1975,7 @@ fn handle_task_surface_shortcut(
         // from an unavailable checklist service.
         *board_expanded = true;
         *board_user_pin = Some(true);
+        reconcile_task_board_on_open(task_board);
         frame_requester.schedule_frame();
         return true;
     }
@@ -1977,6 +1985,9 @@ fn handle_task_surface_shortcut(
     *board_expanded = new_pin;
     if new_pin {
         task_board.reveal_completed_for_review();
+        // Ctrl+T is an explicit inspection request. Reconcile immediately so
+        // an idle/terminal board does not first show a quiet-poll-old snapshot.
+        reconcile_task_board_on_open(task_board);
     } else {
         task_board.hide_completed_after_review();
     }

@@ -474,9 +474,9 @@ impl StatusLine {
                 .push(Segment::styled(text, Style::default().fg(theme.warn)));
         }
 
-        // Task-board chip. `▶` = collapsed (Ctrl+T to expand),
-        // `▼` = expanded. Count is `open/total` for mixed boards and
-        // `total done` when nothing is open.
+        // Task-board chip. `▶` = collapsed (Ctrl+T to expand), `▼` =
+        // expanded. The observer reports lifecycle progress while work is
+        // open and removes the chip once only terminal history remains.
         if let Some((open, total)) = ctx.task_counts {
             if total > 0 {
                 let glyph = if ctx.task_board_expanded {

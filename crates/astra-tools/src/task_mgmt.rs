@@ -302,9 +302,7 @@ fn projected_blockers_for_task(
     tasks: &[SessionTask],
     task_id: &str,
     add_blocked_by: &[String],
-    add_blocks: &[String],
     remove_blocked_by: &[String],
-    remove_blocks: &[String],
 ) -> HashSet<String> {
     let mut blockers: HashSet<String> = HashSet::new();
     if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
@@ -318,50 +316,77 @@ fn projected_blockers_for_task(
     for blocker_id in remove_blocked_by {
         blockers.remove(blocker_id);
     }
-    for blocked_id in remove_blocks {
-        if blocked_id == task_id {
-            blockers.remove(task_id);
-        }
-    }
     for blocker_id in add_blocked_by {
         blockers.insert(blocker_id.clone());
     }
-    for blocked_id in add_blocks {
-        if blocked_id == task_id {
-            blockers.insert(task_id.to_string());
-        }
-    }
     blockers
+}
+
+fn blocker_is_resolved(tasks: &[SessionTask], blocker_id: &str) -> bool {
+    tasks
+        .iter()
+        .find(|task| task.id == blocker_id)
+        .is_some_and(|task| task.status.is_completed())
+}
+
+fn unresolved_blocker_ids(
+    tasks: &[SessionTask],
+    blocker_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unresolved = blocker_ids
+        .into_iter()
+        .filter(|blocker_id| seen.insert(blocker_id.clone()))
+        .filter(|blocker_id| !blocker_is_resolved(tasks, blocker_id))
+        .collect::<Vec<_>>();
+    unresolved.sort();
+    unresolved
+}
+
+/// Return the task's unresolved dependency IDs from the canonical graph.
+///
+/// A dependency is resolved only when the referenced task exists and is
+/// completed. Missing references deliberately remain unresolved so a corrupt
+/// or partially-loaded graph cannot silently authorize work. Both edge
+/// directions are considered to keep projections truthful while legacy data
+/// with only one side of an edge is repaired.
+pub fn unresolved_task_blocker_ids(tasks: &[SessionTask], task: &SessionTask) -> Vec<String> {
+    let blockers = task.blocked_by.iter().cloned().chain(
+        tasks
+            .iter()
+            .filter(|candidate| candidate.blocks.iter().any(|id| id == &task.id))
+            .map(|candidate| candidate.id.clone()),
+    );
+    unresolved_blocker_ids(tasks, blockers)
+}
+
+fn projected_unresolved_task_blocker_ids(
+    tasks: &[SessionTask],
+    task_id: &str,
+    add_blocked_by: &[String],
+    remove_blocked_by: &[String],
+) -> Vec<String> {
+    unresolved_blocker_ids(
+        tasks,
+        projected_blockers_for_task(tasks, task_id, add_blocked_by, remove_blocked_by),
+    )
 }
 
 fn validate_task_can_start_after_projected_edges(
     tasks: &[SessionTask],
     task_id: &str,
     add_blocked_by: &[String],
-    add_blocks: &[String],
     remove_blocked_by: &[String],
-    remove_blocks: &[String],
 ) -> Result<(), String> {
-    let blockers = projected_blockers_for_task(
-        tasks,
-        task_id,
-        add_blocked_by,
-        add_blocks,
-        remove_blocked_by,
-        remove_blocks,
-    );
-    if blockers.is_empty() {
-        return Ok(());
-    }
-
+    let unresolved_ids =
+        projected_unresolved_task_blocker_ids(tasks, task_id, add_blocked_by, remove_blocked_by);
     let tasks_by_id: HashMap<&str, &SessionTask> =
         tasks.iter().map(|task| (task.id.as_str(), task)).collect();
-    let unresolved: Vec<String> = blockers
+    let unresolved: Vec<String> = unresolved_ids
         .into_iter()
-        .filter_map(|blocker_id| match tasks_by_id.get(blocker_id.as_str()) {
-            Some(task) if task.status.is_completed() => None,
-            Some(task) => Some(format!("{blocker_id} ({})", task.status)),
-            None => Some(format!("{blocker_id} (missing)")),
+        .map(|blocker_id| match tasks_by_id.get(blocker_id.as_str()) {
+            Some(task) => format!("{blocker_id} ({})", task.status),
+            None => format!("{blocker_id} (missing)"),
         })
         .collect();
     if unresolved.is_empty() {
@@ -1903,23 +1928,23 @@ pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
 /// - any started subtask (`in_progress` / `completed`) promotes a still-pending
 ///   parent to `in_progress`, so the task board stops reading the parent as
 ///   untouched work once execution has clearly begun.
-/// - all subtasks completed → parent completed, but only when the parent is in
-///   an *active* state (pending / in_progress). Terminal non-success states
-///   (failed / cancelled) stay as-is, since promoting them to completed would
+/// - all subtasks completed → parent completed, but only when the parent still
+///   represents open work (pending / in_progress / paused). Terminal
+///   non-success states stay as-is, since promoting them to completed would
 ///   silently erase a failure signal.
 ///
 /// Reverse arm (a subtask flipped back from completed → parent reopens):
 /// only fires when this function itself auto-completed the parent earlier.
 /// Explicit parent completion is terminal history and must not be resurrected
 /// by a later subtask edit.
-fn reconcile_subtask_completion(task: &mut SessionTask) {
+fn reconcile_subtask_completion(task: &mut SessionTask, blockers_resolved: bool) {
     if task.subtasks.is_empty() {
         return;
     }
 
     let all_completed = task.subtasks.iter().all(|st| st.status.is_completed());
     if all_completed {
-        if task.status.is_active() && task.blocked_by.is_empty() {
+        if task.status.is_open_work() && blockers_resolved {
             task.status = SessionTaskStatusKind::Completed;
             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
             meta.insert("auto_completed_by_subtasks".to_string(), json!(true));
@@ -1948,6 +1973,51 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
     if any_started && task.status.is_pending() {
         task.status = SessionTaskStatusKind::InProgress;
     }
+}
+
+/// Transition child work that cannot outlive a terminal parent while
+/// preserving already-terminal success/failure facts.
+fn transition_open_subtasks(task: &mut SessionTask, status: SessionTaskStatusKind) -> usize {
+    debug_assert!(!status.is_open_work());
+    let mut transitioned = 0;
+    for subtask in &mut task.subtasks {
+        if subtask.status.can_be_stopped() {
+            subtask.status = status;
+            transitioned += 1;
+        }
+    }
+    transitioned
+}
+
+fn cancel_open_subtasks(task: &mut SessionTask) -> usize {
+    transition_open_subtasks(task, SessionTaskStatusKind::Cancelled)
+}
+
+/// Apply the single cancellation invariant used by both `update(cancelled)`
+/// and `stop`: the parent and every still-open child become cancelled in the
+/// same atomic store mutation. Returns the number of child transitions.
+fn cancel_task_and_open_subtasks(task: &mut SessionTask, reason: Option<&str>, now: &str) -> usize {
+    let previous_status = task.status;
+    let transitioning = previous_status != SessionTaskStatusKind::Cancelled;
+    task.status = SessionTaskStatusKind::Cancelled;
+
+    let cancelled_subtasks = cancel_open_subtasks(task);
+
+    if let Some(reason) = reason {
+        let metadata = task.metadata.get_or_insert_with(Default::default);
+        metadata.insert("reason".to_string(), json!(reason));
+        if transitioning {
+            let note = format!("Cancelled: {reason} (was: {previous_status})");
+            task.description = Some(
+                match task.description.as_deref().filter(|s| !s.is_empty()) {
+                    Some(description) => format!("{description}\n\n{note}"),
+                    None => note,
+                },
+            );
+        }
+    }
+    task.updated_at = now.to_string();
+    cancelled_subtasks
 }
 
 impl TaskManager {
@@ -2059,23 +2129,29 @@ impl TaskManager {
             return None;
         }
 
-        let in_progress: Vec<&str> = tasks
+        let open_tasks = tasks
             .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::InProgress)
-            .map(|t| t.title.as_str())
-            .collect();
-        let pending: Vec<&str> = tasks
+            .filter(|task| task.status.is_open_work())
+            .map(|task| (task, unresolved_task_blocker_ids(&tasks, task)))
+            .collect::<Vec<_>>();
+        let ready_titles = |status| {
+            open_tasks
+                .iter()
+                .filter(|(task, blockers)| task.status == status && blockers.is_empty())
+                .map(|(task, _)| task.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        let in_progress = ready_titles(SessionTaskStatusKind::InProgress);
+        let pending = ready_titles(SessionTaskStatusKind::Pending);
+        let paused = ready_titles(SessionTaskStatusKind::Paused);
+        let blocked = open_tasks
             .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::Pending)
-            .map(|t| t.title.as_str())
-            .collect();
-        let paused: Vec<&str> = tasks
-            .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::Paused)
-            .map(|t| t.title.as_str())
-            .collect();
+            .filter(|(_, blockers)| !blockers.is_empty())
+            .map(|(task, blockers)| format!("{} (waiting on {})", task.title, blockers.join(", ")))
+            .collect::<Vec<_>>();
+        let blocked_titles = blocked.iter().map(String::as_str).collect::<Vec<_>>();
 
-        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() {
+        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() && blocked.is_empty() {
             return None;
         }
 
@@ -2104,6 +2180,13 @@ impl TaskManager {
                 compact_titles(&paused)
             ));
         }
+        if !blocked.is_empty() {
+            hint.push_str(&format!(
+                "- ⛔ Blocked ({}): {}\n",
+                blocked.len(),
+                compact_titles(&blocked_titles)
+            ));
+        }
         if in_progress.is_empty() && !pending.is_empty() {
             hint.push_str(&format!(
                 "Focus on the first pending task: {}\n",
@@ -2116,6 +2199,8 @@ impl TaskManager {
             ));
         } else if !in_progress.is_empty() {
             hint.push_str("Focus on completing the in-progress task before starting new work.\n");
+        } else if !blocked.is_empty() {
+            hint.push_str("Resolve the listed blockers before starting blocked work.\n");
         }
 
         Some(hint)
@@ -2844,7 +2929,9 @@ impl TaskManager {
                         ) {
                             validate_subtask_dependencies_resolved(&projected_task, st_id)?;
                         }
-                        reconcile_subtask_completion(&mut projected_task);
+                        let blockers_resolved =
+                            unresolved_task_blocker_ids(&tasks, &projected_task).is_empty();
+                        reconcile_subtask_completion(&mut projected_task, blockers_resolved);
 
                         let task = &mut tasks[task_index];
                         let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id)
@@ -2892,18 +2979,22 @@ impl TaskManager {
                     }
 
                     if new_status == Some(SessionTaskStatusKind::Deleted) {
-                        let Some(previous_status) = tasks
+                        let Some((previous_status, deleted_subtasks)) = tasks
                             .iter_mut()
                             .find(|t| t.id == task_id)
                             .map(|task| {
                                 let previous_status = task.status;
                                 task.status = SessionTaskStatusKind::Deleted;
+                                let deleted_subtasks = transition_open_subtasks(
+                                    task,
+                                    SessionTaskStatusKind::Deleted,
+                                );
                                 task.updated_at = now.clone();
                                 if let Some(note) = reason.as_deref() {
                                     let meta = task.metadata.get_or_insert_with(Default::default);
                                     meta.insert("reason".to_string(), json!(note));
                                 }
-                                previous_status
+                                (previous_status, deleted_subtasks)
                             })
                         else {
                             return Err(format!("task '{}' not found", task_id));
@@ -2917,6 +3008,7 @@ impl TaskManager {
                                 "task_id": task_id,
                                 "previous_status": previous_status.to_string(),
                                 "status": "deleted",
+                                "deleted_subtasks": deleted_subtasks,
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
                             })
                             .to_string(),
@@ -3002,18 +3094,14 @@ impl TaskManager {
                     if projected_status.is_in_progress() {
                         let starting_now = new_status == Some(SessionTaskStatusKind::InProgress)
                             && previous_status != SessionTaskStatusKind::InProgress;
-                        let dependency_edges_changed = !proposed_blocked_by.is_empty()
-                            || !proposed_blocks.is_empty()
-                            || !remove_blocked_by.is_empty()
-                            || !remove_blocks.is_empty();
-                        if starting_now || dependency_edges_changed {
+                        let incoming_dependency_changed = !proposed_blocked_by.is_empty()
+                            || !remove_blocked_by.is_empty();
+                        if starting_now || incoming_dependency_changed {
                             validate_task_can_start_after_projected_edges(
                                 &tasks,
                                 &task_id,
                                 &proposed_blocked_by,
-                                &proposed_blocks,
                                 &remove_blocked_by,
-                                &remove_blocks,
                             )?;
                         }
                     }
@@ -3080,13 +3168,22 @@ impl TaskManager {
                         }
                     }
 
-                    let final_status = {
+                    let blockers_resolved = projected_unresolved_task_blocker_ids(
+                        &tasks,
+                        &task_id,
+                        &proposed_blocked_by,
+                        &remove_blocked_by,
+                    )
+                    .is_empty();
+                    let (final_status, cancelled_subtasks) = {
                         let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
                             return Err(format!("task '{}' not found", task_id));
                         };
 
                         if let Some(ref status) = new_status {
-                            task.status = *status;
+                            if *status != SessionTaskStatusKind::Cancelled {
+                                task.status = *status;
+                            }
                             if *status == SessionTaskStatusKind::Completed {
                                 // Cascade parent→subtask completion, but preserve any
                                 // subtask already in a terminal non-success state.
@@ -3125,36 +3222,42 @@ impl TaskManager {
                                 task.metadata = None;
                             }
                         }
-                        if let Some(err) = error_message.as_deref() {
-                            let meta = task.metadata.get_or_insert_with(Default::default);
-                            if new_status == Some(SessionTaskStatusKind::Cancelled) {
-                                task.description = Some(format!(
-                                    "{}\n\nCancelled: {}",
-                                    task.description.as_deref().unwrap_or(""),
-                                    err
-                                ));
-                                meta.insert("reason".to_string(), json!(err));
-                            } else {
-                                // Stash structured error in metadata so `list`
-                                // can surface a preview without parsing
-                                // description prose. Keep a human-readable copy in
-                                // description as well, after any description update.
-                                task.description = Some(format!(
-                                    "{}\n\nError: {}",
-                                    task.description.as_deref().unwrap_or(""),
-                                    err
-                                ));
-                                meta.insert("error_message".to_string(), json!(err));
+                        let cancelled_subtasks = match new_status {
+                            Some(SessionTaskStatusKind::Cancelled) => {
+                                cancel_task_and_open_subtasks(
+                                    task,
+                                    error_message.as_deref().or(reason.as_deref()),
+                                    &now,
+                                )
                             }
-                        } else if let Some(note) = reason.as_deref() {
-                            let meta = task.metadata.get_or_insert_with(Default::default);
-                            meta.insert("reason".to_string(), json!(note));
+                            Some(SessionTaskStatusKind::Failed) => cancel_open_subtasks(task),
+                            _ => 0,
+                        };
+                        if new_status != Some(SessionTaskStatusKind::Cancelled) {
+                            if let Some(err) = error_message.as_deref() {
+                                let meta = task.metadata.get_or_insert_with(Default::default);
+                                // Stash structured error in metadata so `list`
+                                // can surface a preview without parsing description
+                                // prose. Keep a human-readable copy after any
+                                // description update.
+                                let note = format!("Error: {err}");
+                                task.description = Some(
+                                    match task.description.as_deref().filter(|s| !s.is_empty()) {
+                                        Some(description) => format!("{description}\n\n{note}"),
+                                        None => note,
+                                    },
+                                );
+                                meta.insert("error_message".to_string(), json!(err));
+                            } else if let Some(note) = reason.as_deref() {
+                                let meta = task.metadata.get_or_insert_with(Default::default);
+                                meta.insert("reason".to_string(), json!(note));
+                            }
                         }
 
                         task.updated_at = now.clone();
 
-                        reconcile_subtask_completion(task);
-                        task.status
+                        reconcile_subtask_completion(task, blockers_resolved);
+                        (task.status, cancelled_subtasks)
                     };
 
                     for id in &remove_blocks {
@@ -3170,16 +3273,22 @@ impl TaskManager {
                         add_dependency_edge(&mut tasks, id, &task_id, &now)?;
                     }
 
-                    let response = prefix_summary(
-                        format!("Task #{task_id}: {previous_status} → {final_status}"),
-                        json!({
+                    let mut response_body = json!({
                             "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "status": final_status,
                             "message": format!("Task '{}' updated to '{}'", task_id, final_status)
-                        })
-                        .to_string(),
+                        });
+                    if matches!(
+                        new_status,
+                        Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
+                    ) {
+                        response_body["cancelled_subtasks"] = json!(cancelled_subtasks);
+                    }
+                    let response = prefix_summary(
+                        format!("Task #{task_id}: {previous_status} → {final_status}"),
+                        response_body.to_string(),
                     );
                     Ok(TaskMutationResult {
                         tasks,
@@ -3230,6 +3339,34 @@ impl TaskManager {
                     };
                     let task_status = tasks[task_idx].status;
 
+                    if task_status == SessionTaskStatusKind::Cancelled {
+                        let task = &mut tasks[task_idx];
+                        let open_subtasks = task
+                            .subtasks
+                            .iter()
+                            .filter(|subtask| subtask.status.can_be_stopped())
+                            .count();
+                        if open_subtasks > 0 {
+                            cancel_task_and_open_subtasks(task, Some(&reason), &now);
+                        }
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: prefix_summary(
+                                format!("Task #{task_id} is already cancelled"),
+                                json!({
+                                    "success": true,
+                                    "task_id": task_id,
+                                    "status": "cancelled",
+                                    "already_cancelled": true,
+                                    "cancelled_subtasks": open_subtasks,
+                                    "message": format!("Task '{}' was already cancelled", task_id)
+                                })
+                                .to_string(),
+                            ),
+                        });
+                    }
+
                     if !task_status.can_be_stopped() {
                         return Ok(TaskMutationResult {
                             tasks,
@@ -3251,22 +3388,8 @@ impl TaskManager {
 
                     let task = &mut tasks[task_idx];
                     let previous_status = task.status;
-                    task.status = SessionTaskStatusKind::Cancelled;
-                    task.description = Some(format!(
-                        "{}\n\nCancelled: {} (was: {})",
-                        task.description.as_deref().unwrap_or(""),
-                        reason,
-                        previous_status
-                    ));
-                    task.updated_at = now;
-
-                    let mut cancelled_subtasks = 0;
-                    for subtask in &mut task.subtasks {
-                        if subtask.status.can_be_stopped() {
-                            subtask.status = SessionTaskStatusKind::Cancelled;
-                            cancelled_subtasks += 1;
-                        }
-                    }
+                    let cancelled_subtasks =
+                        cancel_task_and_open_subtasks(task, Some(&reason), &now);
 
                     let summary = if cancelled_subtasks > 0 {
                         format!(
@@ -3281,6 +3404,7 @@ impl TaskManager {
                             "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
+                            "status": "cancelled",
                             "reason": reason,
                             "cancelled_subtasks": cancelled_subtasks,
                             "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
@@ -4409,6 +4533,178 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_cancelled_and_stop_enforce_the_same_parent_child_invariant() {
+        let m = mgr();
+        for title in ["cancel through update", "cancel through stop"] {
+            let created = m
+                .create(&json!({
+                    "title": title,
+                    "subtasks": [
+                        {"id": "running", "title": "running child"},
+                        {"id": "done", "title": "completed child"},
+                        {"id": "failed", "title": "failed child"}
+                    ]
+                }))
+                .await;
+            assert!(!created.starts_with("Error:"), "{created}");
+        }
+        for task_id in ["task-1", "task-2"] {
+            for (subtask_id, status) in [
+                ("running", "in_progress"),
+                ("done", "completed"),
+                ("failed", "failed"),
+            ] {
+                let updated = m
+                    .update(&json!({
+                        "task_id": task_id,
+                        "subtask_id": subtask_id,
+                        "new_status": status
+                    }))
+                    .await;
+                assert!(!updated.starts_with("Error:"), "{updated}");
+            }
+        }
+
+        let through_update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "cancelled",
+                "reason": "superseded"
+            }))
+            .await;
+        let through_stop = m
+            .stop(&json!({"task_id": "task-2", "reason": "superseded"}))
+            .await;
+        for response in [&through_update, &through_stop] {
+            assert!(!response.starts_with("Error:"), "{response}");
+            let body: Value = serde_json::from_str(
+                response
+                    .split_once('\n')
+                    .expect("summary and structured body")
+                    .1,
+            )
+            .expect("structured cancellation response");
+            assert_eq!(body["success"], true, "{response}");
+            assert_eq!(body["status"], "cancelled", "{response}");
+            assert_eq!(body["cancelled_subtasks"], 1, "{response}");
+        }
+
+        for task_id in ["task-1", "task-2"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await)
+                    .expect("cancelled task");
+            assert_eq!(task.status, SessionTaskStatusKind::Cancelled);
+            let statuses = task
+                .subtasks
+                .iter()
+                .map(|subtask| (subtask.id.as_str(), subtask.status))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(statuses["running"], SessionTaskStatusKind::Cancelled);
+            assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+            assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
+            assert_eq!(
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("reason"))
+                    .and_then(Value::as_str),
+                Some("superseded")
+            );
+            assert_eq!(
+                task.description.as_deref(),
+                Some("Cancelled: superseded (was: in_progress)"),
+                "cancellation should store one clean human-readable note: {task:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_an_already_cancelled_task_is_idempotent() {
+        let m = mgr();
+        m.create(&json!({"title": "cancel once"})).await;
+        let first = m
+            .stop(&json!({"task_id": "task-1", "reason": "no longer needed"}))
+            .await;
+        assert!(!first.starts_with("Error:"), "{first}");
+        let before = m.get(&json!({"task_id": "task-1"})).await;
+
+        let second = m
+            .stop(&json!({"task_id": "task-1", "reason": "no longer needed"}))
+            .await;
+        let body: Value = serde_json::from_str(
+            second
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("idempotent stop body");
+        assert_eq!(body["success"], true, "{second}");
+        assert_eq!(body["already_cancelled"], true, "{second}");
+        assert_eq!(body["cancelled_subtasks"], 0, "{second}");
+        assert_eq!(
+            m.get(&json!({"task_id": "task-1"})).await,
+            before,
+            "repeating stop must not append prose or advance task state"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_a_parent_closes_only_its_open_children() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent that fails",
+            "subtasks": [
+                {"id": "running", "title": "running child"},
+                {"id": "done", "title": "completed child"},
+                {"id": "failed", "title": "failed child"}
+            ]
+        }))
+        .await;
+        for (subtask_id, status) in [
+            ("running", "in_progress"),
+            ("done", "completed"),
+            ("failed", "failed"),
+        ] {
+            let updated = m
+                .update(&json!({
+                    "task_id": "task-1",
+                    "subtask_id": subtask_id,
+                    "new_status": status
+                }))
+                .await;
+            assert!(!updated.starts_with("Error:"), "{updated}");
+        }
+
+        let failed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "failed",
+                "error_message": "parent execution failed"
+            }))
+            .await;
+        let body: Value = serde_json::from_str(
+            failed
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("structured failure response");
+        assert_eq!(body["success"], true, "{failed}");
+        assert_eq!(body["cancelled_subtasks"], 1, "{failed}");
+
+        let task: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("failed parent");
+        assert_eq!(task.status, SessionTaskStatusKind::Failed);
+        let statuses = task
+            .subtasks
+            .iter()
+            .map(|subtask| (subtask.id.as_str(), subtask.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["running"], SessionTaskStatusKind::Cancelled);
+        assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+        assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
+    }
+
     /// U-4 (unhappy path): refuse to create an exact-normalized
     /// duplicate of an active task. The model after a session
     /// restore frequently re-creates work it already has open;
@@ -5268,6 +5564,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_dependency_edge_does_not_block_parent_autocomplete() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        let created = m
+            .create(&json!({
+                "title": "dependent parent",
+                "add_blocked_by": ["task-1"],
+                "subtasks": [{"id": "only", "title": "only child"}]
+            }))
+            .await;
+        assert!(!created.starts_with("Error:"), "{created}");
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+
+        let child = m
+            .update(&json!({
+                "task_id": "task-2",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!child.starts_with("Error:"), "{child}");
+        let parent: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await)
+            .expect("dependent parent");
+        assert_eq!(
+            parent.status,
+            SessionTaskStatusKind::Completed,
+            "a retained dependency edge is historical after its blocker completes: {parent:?}"
+        );
+        assert_eq!(parent.blocked_by, ["task-1"]);
+        assert!(
+            unresolved_task_blocker_ids(&m.try_snapshot_state().await.unwrap().tasks, &parent)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_all_children_finishes_a_paused_parent() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "paused parent",
+            "subtasks": [{"id": "only", "title": "only child"}]
+        }))
+        .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+
+        let completed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+        let parent: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("paused parent");
+        assert_eq!(parent.status, SessionTaskStatusKind::Completed);
+    }
+
+    #[tokio::test]
     async fn delete_cleans_symmetric_edges() {
         let m = mgr();
         m.create(&json!({"title": "a"})).await;
@@ -5298,6 +5657,58 @@ mod tests {
             !task_b.blocked_by.contains(&"task-1".to_string()),
             "b still references a: {task_b:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_parent_deletes_only_its_open_children() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent to delete",
+            "subtasks": [
+                {"id": "running", "title": "running child"},
+                {"id": "done", "title": "completed child"},
+                {"id": "failed", "title": "failed child"}
+            ]
+        }))
+        .await;
+        for (subtask_id, status) in [
+            ("running", "in_progress"),
+            ("done", "completed"),
+            ("failed", "failed"),
+        ] {
+            let updated = m
+                .update(&json!({
+                    "task_id": "task-1",
+                    "subtask_id": subtask_id,
+                    "new_status": status
+                }))
+                .await;
+            assert!(!updated.starts_with("Error:"), "{updated}");
+        }
+
+        let deleted = m
+            .update(&json!({"task_id": "task-1", "new_status": "deleted"}))
+            .await;
+        let body: Value = serde_json::from_str(
+            deleted
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("structured delete response");
+        assert_eq!(body["success"], true, "{deleted}");
+        assert_eq!(body["deleted_subtasks"], 1, "{deleted}");
+
+        let task: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("deleted parent");
+        let statuses = task
+            .subtasks
+            .iter()
+            .map(|subtask| (subtask.id.as_str(), subtask.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["running"], SessionTaskStatusKind::Deleted);
+        assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+        assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
     }
 
     #[tokio::test]
@@ -5428,59 +5839,6 @@ mod tests {
             after.status,
             SessionTaskStatusKind::InProgress,
             "an active subtask should make the parent read as in-progress so the task board doesn't show it as merely open"
-        );
-    }
-
-    #[tokio::test]
-    async fn subtask_autocomplete_preserves_terminal_parent_status() {
-        let m = mgr();
-        m.create(&json!({
-            "title": "parent",
-            "subtasks": [
-                {"id": "s1", "title": "first"},
-                {"id": "s2", "title": "second"}
-            ]
-        }))
-        .await;
-
-        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "new_status": "failed"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "new_status": "completed"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "subtask_id": "s2", "new_status": "completed"}))
-            .await;
-        let after_failed = m.get(&json!({"task_id": "task-1"})).await;
-        let after_failed: SessionTask =
-            serde_json::from_str(&after_failed).expect("task json after failed parent");
-        assert_eq!(
-            after_failed.status,
-            SessionTaskStatusKind::Failed,
-            "subtask auto-complete must not overwrite explicit failed status"
-        );
-
-        m.create(&json!({
-            "title": "cancelled parent",
-            "subtasks": [
-                {"id": "s1", "title": "first"},
-                {"id": "s2", "title": "second"}
-            ]
-        }))
-        .await;
-        m.stop(&json!({"task_id": "task-2", "reason": "no longer needed"}))
-            .await;
-        m.update(&json!({"task_id": "task-2", "subtask_id": "s1", "new_status": "completed"}))
-            .await;
-        m.update(&json!({"task_id": "task-2", "subtask_id": "s2", "new_status": "completed"}))
-            .await;
-        let after_cancelled = m.get(&json!({"task_id": "task-2"})).await;
-        let after_cancelled: SessionTask =
-            serde_json::from_str(&after_cancelled).expect("task json after cancelled parent");
-        assert_eq!(
-            after_cancelled.status,
-            SessionTaskStatusKind::Cancelled,
-            "subtask auto-complete must not overwrite explicit cancelled status"
         );
     }
 
@@ -6838,6 +7196,53 @@ mod tests {
         assert!(ctx.contains("⏳ Pending (1): Add feature"), "{ctx}");
         // in_progress takes priority for focus message
         assert!(ctx.contains("Focus on completing the in-progress"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_does_not_focus_blocked_pending_work() {
+        let m = mgr();
+        m.create(&json!({"title": "Paused prerequisite"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+        m.create(&json!({
+            "title": "Dependent work",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("⏸ Paused (1): Paused prerequisite"), "{ctx}");
+        assert!(
+            ctx.contains("⛔ Blocked (1): Dependent work (waiting on task-1)"),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("⏳ Pending"), "{ctx}");
+        assert!(
+            ctx.contains("Resume or reprioritize the first paused task"),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("Focus on the first pending"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_treats_completed_blockers_as_resolved() {
+        let m = mgr();
+        m.create(&json!({"title": "Finished prerequisite"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.create(&json!({
+            "title": "Ready dependent",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("⏳ Pending (1): Ready dependent"), "{ctx}");
+        assert!(!ctx.contains("⛔ Blocked"), "{ctx}");
+        assert!(
+            ctx.contains("Focus on the first pending task: Ready dependent"),
+            "{ctx}"
+        );
     }
 
     #[tokio::test]
