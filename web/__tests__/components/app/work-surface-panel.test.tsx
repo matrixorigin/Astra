@@ -121,7 +121,9 @@ describe("WorkSurfacePanel", () => {
 
     expect(await screen.findByText("Reflect")).toBeInTheDocument();
     expect(
-      screen.getByText("No recommendations were produced for the current evidence."),
+      screen.getByText(
+        "No recommendations were produced for the current evidence.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -180,7 +182,9 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    await waitFor(() => expect(onLoadAgentRun).toHaveBeenCalledWith("child-run-1"));
+    await waitFor(() =>
+      expect(onLoadAgentRun).toHaveBeenCalledWith("child-run-1"),
+    );
     await user.click(
       await screen.findByRole("button", { name: /Open transcript/i }),
     );
@@ -192,7 +196,86 @@ describe("WorkSurfacePanel", () => {
       screen.getByText("Review the concurrency boundary."),
     ).toBeInTheDocument();
     expect(screen.getByText("The boundary is race-safe.")).toBeInTheDocument();
-    expect(screen.getByText("Checked the durable CAS path.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Checked the durable CAS path."),
+    ).toBeInTheDocument();
+  });
+
+  it("switches between durable parent and child agent transcripts without closing the workspace", async () => {
+    const user = userEvent.setup();
+    const onLoadAgentRun = vi.fn(async (runId: string) => ({
+      runId,
+      sessionId: "session-1",
+      status: "completed",
+      events: [],
+      transcript: [
+        {
+          session_id: "session-1",
+          item_seq: 1,
+          run_id: runId,
+          role: "assistant",
+          content:
+            runId === "run-review"
+              ? "Review coordinator result"
+              : "Nested security finding",
+          created_at: "2026-07-16T10:00:02.000Z",
+        },
+      ],
+      transcriptComplete: true,
+      transcriptWarning: null,
+      generatedAt: "2026-07-16T10:00:03.000Z",
+    }));
+
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "root-run"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-review",
+              runId: "run-review",
+              parentRunId: "root-run",
+              description: "Review coordinator",
+              status: "completed",
+              updatedAt: 2_000,
+            },
+            {
+              agentId: "agent-security",
+              runId: "run-security",
+              parentRunId: "run-review",
+              description: "Security review",
+              status: "completed",
+              updatedAt: 3_000,
+            },
+          ],
+        }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={onLoadAgentRun}
+      />,
+    );
+
+    expect(screen.getByText("Child of Main conversation")).toBeInTheDocument();
+    expect(screen.getByText("Child of Review coordinator")).toBeInTheDocument();
+    await user.click(
+      await screen.findByRole("button", { name: /Open transcript/i }),
+    );
+    expect(
+      await screen.findByText("Review coordinator result"),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: /Security review, Completed/i }),
+    );
+    expect(
+      await screen.findByText("Nested security finding"),
+    ).toBeInTheDocument();
+    expect(onLoadAgentRun).toHaveBeenCalledWith("run-security");
+
+    await user.click(screen.getByRole("button", { name: "Main conversation" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("renders concise run status text in the panel header", () => {
@@ -278,9 +361,49 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(screen.getByText("Investigate the production failure")).toBeInTheDocument();
+    expect(
+      screen.getByText("Investigate the production failure"),
+    ).toBeInTheDocument();
     expect(screen.queryByText("45%")).not.toBeInTheDocument();
     expect(screen.getByText(/Updated/)).toBeInTheDocument();
+  });
+
+  it("names the actual tasks that block downstream work", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "schema",
+              title: "Apply schema migration",
+              status: "in_progress",
+              blocks: ["api"],
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+            {
+              id: "api",
+              title: "Start API rollout",
+              status: "pending",
+              blocked_by: ["schema"],
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Blocked by")).toBeInTheDocument();
+    expect(screen.getAllByText("Apply schema migration")).toHaveLength(2);
+    expect(screen.getByText("Unblocks 1")).toBeInTheDocument();
   });
 
   it("labels measured subtask completion as evidence-backed progress", () => {
@@ -801,7 +924,7 @@ describe("WorkSurfacePanel", () => {
 
     expect(screen.getAllByText("Needs final answer").length).toBeGreaterThan(0);
     expect(screen.queryByText("Interrupted")).toBeNull();
-    expect(screen.queryByText("Needs attention")).toBeNull();
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
     expect(await screen.findByText("No final answer")).toBeInTheDocument();
     expect(
       screen.getAllByText("上海今日小雨，33°C / 25°C。").length,

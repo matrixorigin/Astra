@@ -154,6 +154,7 @@ export function WorkSurfacePanel({
   const transcriptAgent = transcriptAgentId
     ? state.agents.find((agent) => agent.agentId === transcriptAgentId)
     : undefined;
+  const projectedAgent = transcriptAgent ?? selectedAgent;
 
   const toggleWorkSurface = useCallback(() => {
     if (window.innerWidth < 1024) {
@@ -198,13 +199,13 @@ export function WorkSurfacePanel({
   }, [selectedAgentId, visibleAgents, tab]);
 
   useEffect(() => {
-    if (!selectedAgent?.runId) {
+    if (!projectedAgent?.runId) {
       return;
     }
     let cancelled = false;
     let timeout: number | undefined;
     let intervalMs = 2_500;
-    const runId = selectedAgent.runId;
+    const runId = projectedAgent.runId;
     const load = async (quiet = false) => {
       if (!quiet) {
         setAgentRunDetails((current) => ({
@@ -256,7 +257,7 @@ export function WorkSurfacePanel({
     };
 
     void load();
-    if (isAgentActive(selectedAgent.status)) {
+    if (isAgentActive(projectedAgent.status)) {
       timeout = window.setTimeout(scheduleNext, intervalMs);
     }
 
@@ -266,7 +267,7 @@ export function WorkSurfacePanel({
         window.clearTimeout(timeout);
       }
     };
-  }, [onLoadAgentRun, selectedAgent?.runId, selectedAgent?.status]);
+  }, [onLoadAgentRun, projectedAgent?.runId, projectedAgent?.status]);
 
   const loadInsights = useCallback(async () => {
     setInsightsState((current) => ({
@@ -439,6 +440,7 @@ export function WorkSurfacePanel({
         {tab === "tasks" ? (
           <TaskBoard
             tasks={visibleTasks}
+            allTasks={state.tasks}
             loading={state.loading}
             counts={visibleTaskCounts}
           />
@@ -448,13 +450,17 @@ export function WorkSurfacePanel({
             agents={visibleAgents}
             loading={state.loading}
             selectedAgentId={selectedAgentId}
+            rootRunId={state.runId}
             agentRunDetails={agentRunDetails}
             onSelectAgent={(agentId) =>
               setSelectedAgentId((current) =>
                 current === agentId ? null : agentId,
               )
             }
-            onOpenTranscript={setTranscriptAgentId}
+            onOpenTranscript={(agentId) => {
+              setSelectedAgentId(agentId);
+              setTranscriptAgentId(agentId);
+            }}
           />
         ) : null}
         {tab === "tools" ? (
@@ -548,11 +554,17 @@ export function WorkSurfacePanel({
       {transcriptAgent ? (
         <AgentTranscriptWorkspace
           agent={transcriptAgent}
+          agents={state.agents}
+          rootRunId={state.runId}
           details={
             transcriptAgent.runId
               ? agentRunDetails[transcriptAgent.runId]
               : undefined
           }
+          onSelectAgent={(agentId) => {
+            setSelectedAgentId(agentId);
+            setTranscriptAgentId(agentId);
+          }}
           onClose={() => setTranscriptAgentId(null)}
         />
       ) : null}
@@ -765,17 +777,12 @@ function InsightsBoard({
             <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-text-muted">
               Audit
             </h3>
-            <span className="text-[11px] text-text-muted">
-              {audit.status}
-            </span>
+            <span className="text-[11px] text-text-muted">{audit.status}</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Metric label="Turns" value={audit.turn_count} />
             <Metric label="Tool calls" value={audit.tool_calls_total} />
-            <Metric
-              label="Tool failures"
-              value={audit.tool_calls_failed}
-            />
+            <Metric label="Tool failures" value={audit.tool_calls_failed} />
             <Metric label="Compactions" value={audit.compact_count} />
           </div>
         </section>
@@ -907,10 +914,12 @@ function formatInsightTime(value: string) {
 
 function TaskBoard({
   tasks,
+  allTasks,
   loading,
   counts,
 }: {
   tasks: SessionTask[];
+  allTasks: SessionTask[];
   loading: boolean;
   counts: ReturnType<typeof taskCounts>;
 }) {
@@ -918,6 +927,7 @@ function TaskBoard({
     return <EmptySurface loading={loading} label="No tasks yet" />;
   }
   const sorted = [...tasks].sort(taskSort);
+  const tasksById = new Map(allTasks.map((task) => [task.id, task]));
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-3 divide-x divide-border/70 rounded-card border border-border/70 bg-bg p-1 text-center shadow-sm">
@@ -927,14 +937,20 @@ function TaskBoard({
       </div>
       <div className="space-y-2.5">
         {sorted.map((task) => (
-          <TaskCard key={task.id} task={task} />
+          <TaskCard key={task.id} task={task} tasksById={tasksById} />
         ))}
       </div>
     </div>
   );
 }
 
-function TaskCard({ task }: { task: SessionTask }) {
+function TaskCard({
+  task,
+  tasksById,
+}: {
+  task: SessionTask;
+  tasksById: Map<string, SessionTask>;
+}) {
   const subtasks = task.subtasks ?? [];
   const done = subtasks.filter((item) => isDone(item.status)).length;
   const progress = taskObservedProgress(task, done);
@@ -996,12 +1012,13 @@ function TaskCard({ task }: { task: SessionTask }) {
               <span>Updated {formatTaskUpdatedAt(task.updated_at)}</span>
             )}
             {task.owner ? <span>Owner {task.owner}</span> : null}
-            {task.blocked_by?.length ? (
-              <span className="rounded-full bg-warning/10 px-2 py-0.5 font-medium text-warning">
-                {task.blocked_by.length} blockers
-              </span>
+            {task.blocks?.length ? (
+              <span>Unblocks {task.blocks.length}</span>
             ) : null}
           </div>
+          {task.blocked_by?.length ? (
+            <TaskDependencyStrip task={task} tasksById={tasksById} />
+          ) : null}
           {subtasks.length ? (
             <div className="space-y-1">
               {subtasks.slice(0, 4).map((subtask) => (
@@ -1036,10 +1053,39 @@ function TaskCard({ task }: { task: SessionTask }) {
   );
 }
 
+function TaskDependencyStrip({
+  task,
+  tasksById,
+}: {
+  task: SessionTask;
+  tasksById: Map<string, SessionTask>;
+}) {
+  const blockers = (task.blocked_by ?? []).map((id) => ({
+    id,
+    title: tasksById.get(id)?.title ?? id,
+  }));
+  return (
+    <div className="rounded-[7px] border border-warning/20 bg-warning/[0.055] px-2.5 py-2">
+      <div className="flex items-start gap-2">
+        <Pause className="mt-0.5 size-3.5 shrink-0 text-warning" />
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-warning">
+            Blocked by
+          </p>
+          <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-secondary">
+            {blockers.map((blocker) => blocker.title).join(" · ")}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AgentBoard({
   agents,
   loading,
   selectedAgentId,
+  rootRunId,
   agentRunDetails,
   onSelectAgent,
   onOpenTranscript,
@@ -1047,6 +1093,7 @@ function AgentBoard({
   agents: AgentSurfaceItem[];
   loading: boolean;
   selectedAgentId: string | null;
+  rootRunId: string | null;
   agentRunDetails: Record<string, AgentRunProjectionState>;
   onSelectAgent: (agentId: string) => void;
   onOpenTranscript: (agentId: string) => void;
@@ -1054,33 +1101,172 @@ function AgentBoard({
   if (!agents.length) {
     return <EmptySurface loading={loading} label="No subagent activity yet" />;
   }
-  // Preserve projection order while live events stream in. Sorting by
-  // updatedAt makes concurrently running agent cards jump on every event.
-  const sorted = agents;
+  const hierarchy = agentHierarchyRows(agents, rootRunId);
+  const summary = agentRunSummary(agents);
   return (
-    <div className="space-y-2.5">
-      {sorted.map((agent) => (
-        <AgentCard
-          key={agent.agentId}
-          agent={agent}
-          selected={selectedAgentId === agent.agentId}
-          runDetails={agent.runId ? agentRunDetails[agent.runId] : undefined}
-          onSelect={() => onSelectAgent(agent.agentId)}
-          onOpenTranscript={() => onOpenTranscript(agent.agentId)}
-        />
-      ))}
+    <div className="space-y-3">
+      <AgentRunSummary summary={summary} />
+      <div className="space-y-2.5">
+        {hierarchy.map((row) => (
+          <div
+            key={row.agent.agentId}
+            className={cn(
+              row.depth > 0 && "relative border-l border-border/80 pl-2",
+            )}
+            style={{ marginLeft: `${Math.min(row.depth, 3) * 10}px` }}
+          >
+            {row.depth > 0 ? (
+              <span className="absolute -left-px top-5 h-px w-2 bg-border" />
+            ) : null}
+            <AgentCard
+              agent={row.agent}
+              parentLabel={row.parentLabel}
+              childCount={row.childCount}
+              selected={selectedAgentId === row.agent.agentId}
+              runDetails={
+                row.agent.runId ? agentRunDetails[row.agent.runId] : undefined
+              }
+              onSelect={() => onSelectAgent(row.agent.agentId)}
+              onOpenTranscript={() => onOpenTranscript(row.agent.agentId)}
+            />
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
+function AgentRunSummary({
+  summary,
+}: {
+  summary: ReturnType<typeof agentRunSummary>;
+}) {
+  return (
+    <div className="flex items-center gap-3 rounded-[8px] border border-border/70 bg-bg px-3 py-2 shadow-sm">
+      <span className="relative flex size-7 shrink-0 items-center justify-center rounded-full bg-accent/10 text-accent">
+        <Bot className="size-3.5" />
+        {summary.active ? (
+          <span className="absolute -right-0.5 -top-0.5 size-2 animate-pulse rounded-full bg-accent ring-2 ring-bg" />
+        ) : null}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold text-text">Run map</p>
+        <p className="mt-0.5 truncate text-[11px] text-text-muted">
+          {agentRunSummaryText(summary)}
+        </p>
+      </div>
+      <span className="text-xs font-semibold tabular-nums text-text-secondary">
+        {summary.total}
+      </span>
+    </div>
+  );
+}
+
+type AgentHierarchyRow = {
+  agent: AgentSurfaceItem;
+  depth: number;
+  parentLabel: string;
+  childCount: number;
+};
+
+function agentHierarchyRows(
+  agents: AgentSurfaceItem[],
+  rootRunId: string | null,
+): AgentHierarchyRow[] {
+  const byRunId = new Map(
+    agents
+      .filter((agent): agent is AgentSurfaceItem & { runId: string } =>
+        Boolean(agent.runId),
+      )
+      .map((agent) => [agent.runId, agent]),
+  );
+  const childrenByParent = new Map<string, AgentSurfaceItem[]>();
+  for (const agent of agents) {
+    if (!agent.parentRunId) continue;
+    const children = childrenByParent.get(agent.parentRunId) ?? [];
+    children.push(agent);
+    childrenByParent.set(agent.parentRunId, children);
+  }
+
+  const roots = agents.filter(
+    (agent) =>
+      !agent.parentRunId ||
+      agent.parentRunId === rootRunId ||
+      !byRunId.has(agent.parentRunId),
+  );
+  const rows: AgentHierarchyRow[] = [];
+  const visited = new Set<string>();
+  const visit = (agent: AgentSurfaceItem, depth: number) => {
+    if (visited.has(agent.agentId)) return;
+    visited.add(agent.agentId);
+    const children = agent.runId
+      ? (childrenByParent.get(agent.runId) ?? [])
+      : [];
+    rows.push({
+      agent,
+      depth,
+      parentLabel: agentParentLabel(agent, agents, rootRunId),
+      childCount: children.length,
+    });
+    children.forEach((child) => visit(child, depth + 1));
+  };
+  roots.forEach((agent) => visit(agent, 0));
+  // Corrupt or cyclic ancestry must remain observable instead of disappearing.
+  agents.forEach((agent) => visit(agent, 0));
+  return rows;
+}
+
+function agentParentLabel(
+  agent: AgentSurfaceItem,
+  agents: AgentSurfaceItem[],
+  rootRunId: string | null,
+) {
+  if (!agent.parentRunId || agent.parentRunId === rootRunId) {
+    return "Main conversation";
+  }
+  const parent = agents.find(
+    (candidate) => candidate.runId === agent.parentRunId,
+  );
+  return (
+    parent?.description || parent?.agentType || shortRunId(agent.parentRunId)
+  );
+}
+
+function agentRunSummary(agents: AgentSurfaceItem[]) {
+  return {
+    total: agents.length,
+    active: agents.filter((agent) => isAgentActive(agent.status)).length,
+    completed: agents.filter(
+      (agent) => agent.status.trim().toLowerCase() === "completed",
+    ).length,
+    attention: agents.filter(agentNeedsAttention).length,
+  };
+}
+
+function agentRunSummaryText(summary: ReturnType<typeof agentRunSummary>) {
+  const parts: string[] = [];
+  if (summary.active) parts.push(`${summary.active} working`);
+  if (summary.attention) parts.push(`${summary.attention} need attention`);
+  if (summary.completed) parts.push(`${summary.completed} complete`);
+  return parts.length ? parts.join(" · ") : `${summary.total} observed`;
+}
+
+function shortRunId(value: string) {
+  return value.length > 12 ? `${value.slice(0, 8)}…` : value;
+}
+
 function AgentCard({
   agent,
+  parentLabel,
+  childCount,
   selected,
   runDetails,
   onSelect,
   onOpenTranscript,
 }: {
   agent: AgentSurfaceItem;
+  parentLabel: string;
+  childCount: number;
   selected: boolean;
   runDetails?: AgentRunProjectionState;
   onSelect: () => void;
@@ -1107,9 +1293,9 @@ function AgentCard({
           ? "border-accent/30"
           : waiting
             ? "border-warning/25"
-          : failed
-            ? "border-danger/25"
-            : "border-border/70",
+            : failed
+              ? "border-danger/25"
+              : "border-border/70",
       )}
     >
       <button
@@ -1125,9 +1311,9 @@ function AgentCard({
               ? "border-accent/25 bg-accent/10 text-accent"
               : waiting
                 ? "border-warning/25 bg-warning/10 text-warning"
-              : failed
-                ? "border-danger/20 bg-danger/10 text-danger"
-                : "border-border bg-surface-muted text-text-muted",
+                : failed
+                  ? "border-danger/20 bg-danger/10 text-danger"
+                  : "border-border bg-surface-muted text-text-muted",
           )}
         >
           {active ? (
@@ -1145,8 +1331,14 @@ function AgentCard({
                 {title}
               </h3>
               <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-text-muted">
+                <span className="truncate">Child of {parentLabel}</span>
                 {agent.agentType ? (
                   <span>{statusLabel(agent.agentType)}</span>
+                ) : null}
+                {childCount ? (
+                  <span>
+                    {childCount} child run{childCount === 1 ? "" : "s"}
+                  </span>
                 ) : null}
                 {metaItems.map((item) => (
                   <span key={item} className="min-w-0 max-w-full truncate">
@@ -1180,9 +1372,9 @@ function AgentCard({
                     ? "text-danger"
                     : waiting
                       ? "text-warning"
-                    : active
-                      ? "text-accent"
-                      : "text-text-muted",
+                      : active
+                        ? "text-accent"
+                        : "text-text-muted",
                 )}
               >
                 {latestEvent.tone === "danger" ? "Issue" : "Latest"}
@@ -1213,11 +1405,7 @@ function AgentCard({
                 <div
                   className={cn(
                     "h-full rounded-full transition-all duration-500",
-                    failed
-                      ? "bg-danger"
-                      : waiting
-                        ? "bg-warning"
-                        : "bg-accent",
+                    failed ? "bg-danger" : waiting ? "bg-warning" : "bg-accent",
                   )}
                   style={{ width: `${turnBudgetUsed}%` }}
                 />
@@ -1253,7 +1441,8 @@ function AgentCard({
   );
 }
 
-type AgentDisplayTone = "neutral" | "running" | "success" | "warning" | "danger";
+type AgentDisplayTone =
+  "neutral" | "running" | "success" | "warning" | "danger";
 
 function agentDisplayState(agent: AgentSurfaceItem): {
   label: string;
@@ -1624,11 +1813,17 @@ function AgentRunProjection({
 
 function AgentTranscriptWorkspace({
   agent,
+  agents,
+  rootRunId,
   details,
+  onSelectAgent,
   onClose,
 }: {
   agent: AgentSurfaceItem;
+  agents: AgentSurfaceItem[];
+  rootRunId: string | null;
   details?: AgentRunProjectionState;
+  onSelectAgent: (agentId: string) => void;
   onClose: () => void;
 }) {
   const projection = details?.projection;
@@ -1636,6 +1831,7 @@ function AgentTranscriptWorkspace({
   const events = projection?.events ?? [];
   const display = agentDisplayState(agent);
   const title = agent.description || agent.agentType || "Subagent";
+  const awaitingProjection = Boolean(agent.runId && !details);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1648,23 +1844,26 @@ function AgentTranscriptWorkspace({
   }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
-      <button
-        type="button"
-        aria-label="Close agent transcript"
-        onClick={onClose}
-        className="absolute inset-0 bg-slate-950/35 backdrop-blur-[2px]"
-      />
+    <div className="fixed inset-0 z-50 bg-bg">
       <section
         role="dialog"
         aria-modal="true"
         aria-label={`${title} transcript`}
-        className="relative flex h-[min(92vh,920px)] w-full max-w-[1180px] flex-col overflow-hidden rounded-[14px] border border-border bg-bg shadow-[0_30px_90px_rgba(15,23,42,0.28)]"
+        className="relative flex h-full w-full flex-col overflow-hidden bg-bg"
       >
-        <header className="flex min-h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-5">
+        <header className="flex min-h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-4 sm:px-5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex size-9 shrink-0 items-center justify-center rounded-control border border-border bg-bg text-text-muted transition hover:bg-surface-muted hover:text-text"
+            aria-label="Back to main conversation"
+            title="Back to main conversation"
+          >
+            <ChevronRight className="size-4 rotate-180" />
+          </button>
           <span
             className={cn(
-              "flex size-9 shrink-0 items-center justify-center rounded-control border",
+              "hidden size-9 shrink-0 items-center justify-center rounded-control border sm:flex",
               isAgentActive(agent.status)
                 ? "border-accent/25 bg-accent/10 text-accent"
                 : display.tone === "danger"
@@ -1675,7 +1874,14 @@ function AgentTranscriptWorkspace({
             <Bot className="size-4" />
           </span>
           <div className="min-w-0 flex-1">
-            <div className="flex min-w-0 items-center gap-2">
+            <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-text-muted">
+              <span className="shrink-0">Main conversation</span>
+              <ChevronRight className="size-3 shrink-0" />
+              <span className="truncate">
+                {agentParentLabel(agent, agents, rootRunId)}
+              </span>
+            </div>
+            <div className="mt-0.5 flex min-w-0 items-center gap-2">
               <h2 className="truncate text-sm font-semibold text-text">
                 {title}
               </h2>
@@ -1686,84 +1892,178 @@ function AgentTranscriptWorkspace({
                 tone={display.tone}
               />
             </div>
-            <p className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
-              {agent.runId ?? agent.agentId}
-            </p>
           </div>
           <div className="hidden items-center gap-2 text-xs text-text-muted md:flex">
-            <span>Agent transcript</span>
-            <span>·</span>
             <span>{transcript.length} messages</span>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono">
+              {shortRunId(agent.runId ?? agent.agentId)}
+            </span>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="inline-flex size-9 items-center justify-center rounded-control text-text-muted hover:bg-surface-muted hover:text-text"
-            aria-label="Close transcript"
+            aria-label="Close agent transcript"
           >
             <X className="size-4" />
           </button>
         </header>
 
-        <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1fr)_300px]">
-          <main className="min-h-0 overflow-y-auto px-5 py-6 sm:px-8">
-            {details?.loading && !projection ? (
-              <div className="flex h-full min-h-56 items-center justify-center gap-2 text-sm text-text-muted">
-                <Loader2 className="size-4 animate-spin" />
-                Loading canonical run view
-              </div>
-            ) : details?.error && !projection ? (
-              <div className="rounded-card border border-danger/20 bg-danger/5 p-4 text-sm text-danger">
-                {details.error}
-              </div>
-            ) : transcript.length ? (
-              <div className="mx-auto max-w-3xl space-y-5">
-                {transcript.map((item) => (
-                  <TranscriptMessage
-                    key={`${item.item_seq}:${item.role}`}
-                    item={item}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div className="mx-auto max-w-3xl">
-                <div className="rounded-card border border-warning/20 bg-warning/5 p-4">
-                  <p className="text-sm font-medium text-text">
-                    Canonical conversation is not available yet
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-text-muted">
-                    Live run evidence is shown below. Activity events are not
-                    presented as a substitute for missing conversation history.
-                  </p>
+        <div className="grid min-h-0 flex-1 md:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[268px_minmax(0,1fr)]">
+          <AgentRunNavigator
+            agents={agents}
+            selectedAgentId={agent.agentId}
+            rootRunId={rootRunId}
+            onSelectAgent={onSelectAgent}
+            onClose={onClose}
+          />
+          <div className="grid min-h-0 min-w-0 flex-1 lg:grid-cols-[minmax(0,1fr)_300px]">
+            <main className="min-h-0 overflow-y-auto px-5 py-6 sm:px-8">
+              {(awaitingProjection || details?.loading) && !projection ? (
+                <div className="flex h-full min-h-56 items-center justify-center gap-2 text-sm text-text-muted">
+                  <Loader2 className="size-4 animate-spin" />
+                  Loading canonical run view
                 </div>
-                <div className="mt-5 space-y-2">
-                  {events.length ? (
-                    events.map((event, index) => (
-                      <RunProjectionEventRow
-                        key={`${eventType(event)}:${index}`}
-                        event={event}
-                      />
-                    ))
-                  ) : (
-                    <p className="text-sm text-text-muted">
-                      No run evidence has arrived.
+              ) : details?.error && !projection ? (
+                <div className="rounded-card border border-danger/20 bg-danger/5 p-4 text-sm text-danger">
+                  {details.error}
+                </div>
+              ) : transcript.length ? (
+                <div className="mx-auto max-w-3xl space-y-5">
+                  {transcript.map((item) => (
+                    <TranscriptMessage
+                      key={`${item.item_seq}:${item.role}`}
+                      item={item}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="mx-auto max-w-3xl">
+                  <div className="rounded-card border border-warning/20 bg-warning/5 p-4">
+                    <p className="text-sm font-medium text-text">
+                      Canonical conversation is not available yet
                     </p>
-                  )}
+                    <p className="mt-1 text-xs leading-5 text-text-muted">
+                      Live run evidence is shown below. Activity events are not
+                      presented as a substitute for missing conversation
+                      history.
+                    </p>
+                  </div>
+                  <div className="mt-5 space-y-2">
+                    {events.length ? (
+                      events.map((event, index) => (
+                        <RunProjectionEventRow
+                          key={`${eventType(event)}:${index}`}
+                          event={event}
+                        />
+                      ))
+                    ) : (
+                      <p className="text-sm text-text-muted">
+                        No run evidence has arrived.
+                      </p>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
-          </main>
+              )}
+            </main>
 
-          <aside className="min-h-0 overflow-y-auto border-t border-border bg-surface/70 p-4 lg:border-l lg:border-t-0">
-            <AgentTranscriptSummary
-              agent={agent}
-              projection={projection}
-              transcriptCount={transcript.length}
-            />
-          </aside>
+            <aside className="min-h-0 overflow-y-auto border-t border-border bg-surface/70 p-4 lg:border-l lg:border-t-0">
+              <AgentTranscriptSummary
+                agent={agent}
+                projection={projection}
+                transcriptCount={transcript.length}
+              />
+            </aside>
+          </div>
         </div>
       </section>
     </div>
+  );
+}
+
+function AgentRunNavigator({
+  agents,
+  selectedAgentId,
+  rootRunId,
+  onSelectAgent,
+  onClose,
+}: {
+  agents: AgentSurfaceItem[];
+  selectedAgentId: string;
+  rootRunId: string | null;
+  onSelectAgent: (agentId: string) => void;
+  onClose: () => void;
+}) {
+  const rows = agentHierarchyRows(agents, rootRunId);
+  return (
+    <aside className="min-h-0 overflow-y-auto border-b border-border bg-surface/65 p-3 md:border-b-0 md:border-r">
+      <div className="mb-2 px-2 pt-1">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-text-muted">
+          Run navigator
+        </p>
+        <p className="mt-1 text-xs leading-5 text-text-secondary">
+          Switch conversations without losing run context.
+        </p>
+      </div>
+      <nav aria-label="Agent run transcripts" className="space-y-1">
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex w-full items-center gap-2 rounded-[8px] px-2.5 py-2 text-left text-xs font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text"
+        >
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-bg text-text-muted">
+            <Activity className="size-3" />
+          </span>
+          <span className="min-w-0 flex-1 truncate">Main conversation</span>
+        </button>
+        <div className="my-2 h-px bg-border/70" />
+        {rows.map((row) => {
+          const display = agentDisplayState(row.agent);
+          const active = row.agent.agentId === selectedAgentId;
+          return (
+            <button
+              key={row.agent.agentId}
+              type="button"
+              onClick={() => onSelectAgent(row.agent.agentId)}
+              aria-label={`${row.agent.description || row.agent.agentType || "Subagent"}, ${display.label}`}
+              aria-current={active ? "page" : undefined}
+              className={cn(
+                "flex w-full items-start gap-2 rounded-[8px] px-2.5 py-2 text-left transition",
+                active
+                  ? "bg-accent/10 text-text ring-1 ring-accent/20"
+                  : "text-text-secondary hover:bg-surface-muted hover:text-text",
+              )}
+              style={{ paddingLeft: `${10 + Math.min(row.depth, 3) * 12}px` }}
+            >
+              <span
+                className={cn(
+                  "mt-1 size-2 shrink-0 rounded-full",
+                  isAgentActive(row.agent.status)
+                    ? "animate-pulse bg-accent"
+                    : display.tone === "success"
+                      ? "bg-success"
+                      : display.tone === "warning"
+                        ? "bg-warning"
+                        : display.tone === "danger"
+                          ? "bg-danger"
+                          : "bg-border-strong",
+                )}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-xs font-medium">
+                  {row.agent.description || row.agent.agentType || "Subagent"}
+                </span>
+                <span className="mt-0.5 block truncate text-[10px] text-text-muted">
+                  {display.label}
+                  {row.childCount ? ` · ${row.childCount} child` : ""}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </nav>
+    </aside>
   );
 }
 
@@ -2023,9 +2323,9 @@ function AgentEventRow({
               ? "bg-danger"
               : event.tone === "warning"
                 ? "bg-warning"
-              : event.tone === "running"
-                ? "animate-pulse bg-accent"
-                : "bg-border-strong",
+                : event.tone === "running"
+                  ? "animate-pulse bg-accent"
+                  : "bg-border-strong",
         )}
       />
       <div className="min-w-0">
@@ -2545,7 +2845,9 @@ function StructuredValue({
 function Metric({ label, value }: { label: string; value: number }) {
   return (
     <div className="px-2 py-1.5">
-      <div className="text-sm font-semibold tabular-nums text-text">{value}</div>
+      <div className="text-sm font-semibold tabular-nums text-text">
+        {value}
+      </div>
       <div className="text-[10px] font-medium uppercase tracking-[0.06em] text-text-muted">
         {label}
       </div>
@@ -2639,11 +2941,11 @@ function StatusIcon({
         ? "text-accent"
         : waiting
           ? "text-warning"
-        : cancelled
-          ? "text-text-muted"
-          : failed
-            ? "text-danger"
-            : "text-text-muted",
+          : cancelled
+            ? "text-text-muted"
+            : failed
+              ? "text-danger"
+              : "text-text-muted",
   );
   if (done) return <CheckCircle2 className={className} />;
   if (waiting) return <Pause className={className} />;
@@ -2697,7 +2999,8 @@ function workbenchActivitySummary(state: WorkSurfaceState) {
   const activeTools = state.tools.filter(
     (tool) => tool.status === "running" && !tool.finishedAt,
   ).length;
-  if (openTasks) parts.push(`${openTasks} open task${openTasks === 1 ? "" : "s"}`);
+  if (openTasks)
+    parts.push(`${openTasks} open task${openTasks === 1 ? "" : "s"}`);
   if (activeAgents) {
     parts.push(`${activeAgents} active agent${activeAgents === 1 ? "" : "s"}`);
   }
@@ -2727,6 +3030,9 @@ function agentNeedsAttention(agent: AgentSurfaceItem) {
   if (agent.error) return true;
   const display = agentDisplayState(agent);
   if (display.tone === "danger") return true;
+  if (agent.status === "interrupted" && display.tone === "warning") {
+    return true;
+  }
   if (agent.status === "waiting") {
     const reason = (agent.reason ?? "").trim().toLowerCase();
     return (
@@ -2785,7 +3091,7 @@ function insightRecommendationCount(payload: ChatInsightsResponse | null) {
 }
 
 function isAgentActive(status: string) {
-  return ACTIVE_AGENT_SURFACE_STATUSES.has(status);
+  return ACTIVE_AGENT_SURFACE_STATUSES.has(status.trim().toLowerCase());
 }
 
 function statusLabel(status: string) {
