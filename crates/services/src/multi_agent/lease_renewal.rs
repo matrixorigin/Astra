@@ -93,12 +93,13 @@ impl LeaseRenewalTask {
     }
 
     /// Stops the renewal loop cooperatively and waits for it to exit.
-    pub async fn cancel_and_wait(&mut self) {
+    pub async fn cancel_and_wait(&mut self) -> Result<(), tokio::task::JoinError> {
         self.cancel.store(true, Ordering::Release);
         self.cancel_notify.notify_waiters();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+            handle.await?;
         }
+        Ok(())
     }
 }
 
@@ -256,7 +257,9 @@ mod tests {
             .await
             .expect("test scaffolding: renewal should fire at least once");
 
-        task.cancel_and_wait().await;
+        task.cancel_and_wait()
+            .await
+            .expect("lease renewal task should stop cleanly");
         let after_cancel = renew_count.load(Ordering::SeqCst);
         let after_wait = timeout(Duration::from_millis(150), renew_fired.notified()).await;
         assert!(

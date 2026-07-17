@@ -28,14 +28,14 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
 fastrand = "2"
-fs2 = "0.4"
+fs2.workspace = true
 reqwest = { workspace = true }
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
-astra-tools = { path = "../astra-tools" }
+astra-tools.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

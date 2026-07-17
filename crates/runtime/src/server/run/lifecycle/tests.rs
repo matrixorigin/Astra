@@ -9020,8 +9020,20 @@ async fn db_cross_pod_parent_control_reaches_remote_child() {
         .load_run(&user_id, &child_id)
         .await
         .unwrap()
-        .expect("child remains independently durable");
-    assert_eq!(child.status, STATUS_RUNNING);
+        .expect("child remains durably queryable after cascading cancellation");
+    assert_eq!(child.status, STATUS_CANCELLED);
+    let terminal = child.events.last().expect("child cancellation event");
+    assert_eq!(
+        terminal.get("event_type").and_then(Value::as_str),
+        Some("run_finished")
+    );
+    assert_eq!(
+        terminal
+            .get("data")
+            .and_then(|data| data.get("ancestor_run_id"))
+            .and_then(Value::as_str),
+        Some(root_id.as_str())
+    );
 
     for run_id in [&child_id, &root_id] {
         cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;

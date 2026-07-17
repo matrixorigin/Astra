@@ -6,7 +6,7 @@ description = "Plan decomposition engine — breaks complex goals into subtasks"
 license = "MIT"
 
 [dependencies]
-astra-core = { workspace = true, features = ["dev-defaults"] }
+astra-core.workspace = true
 astra-services.workspace = true
 astra-tools.workspace = true
 astra-turn-types.workspace = true

@@ -2773,7 +2773,7 @@ impl AgenticRunLifecycleService {
             if descendants.is_empty() {
                 return Ok(cancelled);
             }
-            descendants.sort_by(|left, right| right.depth.cmp(&left.depth));
+            descendants.sort_by_key(|run| std::cmp::Reverse(run.depth));
 
             let mut page_updates = 0;
             for descendant in descendants {

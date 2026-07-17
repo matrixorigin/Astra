@@ -1,7 +1,7 @@
 [package]
 name = "astra-sandbox"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Security boundary enforcement for Astra agent tool execution"
 
 [dependencies]
@@ -33,5 +33,5 @@ astra-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
-temp-env = "0.3"
+tempfile.workspace = true
+temp-env.workspace = true

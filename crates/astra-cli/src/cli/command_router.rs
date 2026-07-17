@@ -1030,7 +1030,13 @@ async fn execute_task_worker_once(
         }
     };
 
-    renewal_task.cancel_and_wait().await;
+    if let Err(error) = renewal_task.cancel_and_wait().await {
+        tracing::error!(
+            task_id = %task_id,
+            %error,
+            "lease renewal task failed while stopping"
+        );
+    }
 
     if interrupted {
         use std::time::Duration;

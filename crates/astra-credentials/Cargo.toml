@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-dirs = "6"
-fs2 = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
+dirs.workspace = true
+fs2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-temp-env = "0.3"
-tempfile = "3"
+temp-env.workspace = true
+tempfile.workspace = true

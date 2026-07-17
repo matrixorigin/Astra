@@ -64,8 +64,10 @@ base64 = "0.22.1"
 bcrypt = "0.17.1"
 chrono = { version = "0.4.42", features = ["clock"] }
 dotenvy = "0.15.7"
+dirs = "6"
 fernet = "0.2.2"
 flate2 = "1.1.2"
+fs2 = "0.4"
 tar = "0.4"
 futures-util = "0.3.31"
 hmac = "0.12.1"
@@ -118,6 +120,9 @@ webpki-roots = "0.26"
 clap = { version = "4", features = ["derive", "env"] }
 hostname = "0.4"
 insta = { version = "1.41", features = ["yaml"] }
+temp-env = "0.3"
+tempfile = "3"
+toml = "1.1.2"
 
 [profile.dev]
 debug = "line-tables-only"

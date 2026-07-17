@@ -176,21 +176,42 @@ pub(crate) async fn post_tool_result_handler(
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     // A bearer token authenticates the caller, but does not make the
     // session/run identity in an arbitrary callback body trustworthy. Resolve
-    // the durable run before touching either delivery lane. Late callbacks for
-    // terminal runs are acknowledged and discarded: retrying cannot make them
-    // consumable, while enqueueing them would create a five-minute orphan.
-    let target = state
+    // the strongest durable ownership root available before touching either
+    // delivery lane. Late callbacks for terminal runs are acknowledged and
+    // discarded: retrying cannot make them consumable, while enqueueing them
+    // would create a five-minute orphan.
+    let durable_target = match state
         .execution
         .run_lifecycle_service
         .get_run_status(body.run_id.clone(), user.user_id.clone())
-        .await?;
-    if target.session_id != body.session_id {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "Tool result request not found in this session",
-        ));
-    }
-    if astra_services::runs::durable_run_status_is_terminal(&target.status) {
+        .await
+    {
+        Ok(target) => {
+            if target.session_id != body.session_id {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    "Tool result request not found in this session",
+                ));
+            }
+            Some(target)
+        }
+        // `/chat/turn` uses a turn-scoped run identity that is not inserted
+        // into `agent_runs`. Its durable authorization root is the cloud
+        // session created or resolved before the bridge starts. Keep the
+        // stronger run check whenever a durable run exists, and otherwise
+        // require the callback session to belong to the authenticated user.
+        Err((StatusCode::NOT_FOUND, _)) => {
+            state
+                .session_service
+                .get_session(body.session_id.clone(), user.user_id.clone())
+                .await?;
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(target) = durable_target
+        && astra_services::runs::durable_run_status_is_terminal(&target.status)
+    {
         tracing::info!(
             target: "astra_runtime::edge_callback",
             request_id = %trace.request_id,

@@ -11,10 +11,10 @@ default = []
 [dependencies]
 astra-core.workspace = true
 astra-services.workspace = true
-astra-text-utils = { path = "../astra-text-utils" }
-astra-turn-types = { path = "../astra-turn-types" }
-async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
+astra-text-utils.workspace = true
+astra-turn-types.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
@@ -25,4 +25,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
-tempfile = "3"
+tempfile.workspace = true

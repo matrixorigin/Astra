@@ -7566,11 +7566,16 @@ mod tests {
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
-            let _ = sqlx::query(sql)
+            sqlx::query(sql)
                 .bind(user_id)
                 .bind(run_id)
                 .execute(pool.get())
-                .await;
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "database run fixture cleanup failed for user={user_id} run={run_id} sql={sql}: {error}"
+                    )
+                });
         }
     }
 

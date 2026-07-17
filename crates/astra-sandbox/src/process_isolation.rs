@@ -709,8 +709,21 @@ pub async fn execute_isolated(
     // the child will be frozen immediately upon entering the cgroup
     // and won't execute user code until limits are applied + unfreeze.
     #[cfg(unix)]
-    if let Some(ref cg) = cg_path {
-        let _ = std::fs::write(cg.join("cgroup.freeze"), "1");
+    if let Some(ref cg) = cg_path
+        && let Err(error) = std::fs::write(cg.join("cgroup.freeze"), "1")
+    {
+        tracing::error!(%error, "cgroup.freeze setup failed before child spawn");
+        cleanup_cgroup(cg);
+        return IsolatedOutput {
+            stdout: String::new(),
+            stderr: format!("cgroup freeze setup failed: {error}"),
+            exit_code: None,
+            timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+        };
     }
 
     let mut cmd = tokio::process::Command::new(&program);

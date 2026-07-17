@@ -160,7 +160,7 @@ dependencies = [
  "clap_complete",
  "crossterm 0.29.0",
  "derive_more 1.0.0",
- "dirs 6.0.0",
+ "dirs",
  "dotenvy",
  "fs2",
  "futures-util",
@@ -225,7 +225,7 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "chrono",
- "dirs 6.0.0",
+ "dirs",
  "fs2",
  "serde",
  "serde_json",
@@ -259,13 +259,13 @@ dependencies = [
 name = "astra-credentials"
 version = "0.1.0"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "fs2",
  "serde",
  "serde_json",
  "temp-env",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -453,7 +453,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "dashmap",
- "dirs 6.0.0",
+ "dirs",
  "dotenvy",
  "fastrand",
  "flate2",
@@ -554,7 +554,7 @@ dependencies = [
  "base64",
  "bcrypt",
  "chrono",
- "dirs 6.0.0",
+ "dirs",
  "dotenvy",
  "fastrand",
  "fernet",
@@ -590,7 +590,7 @@ dependencies = [
  "astra-services",
  "async-trait",
  "axum",
- "dirs 5.0.1",
+ "dirs",
  "flate2",
  "regex",
  "serde",
@@ -645,7 +645,7 @@ dependencies = [
 name = "astra-text-utils"
 version = "0.1.0"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "serde",
  "serde_json",
 ]
@@ -685,7 +685,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
- "dirs 6.0.0",
+ "dirs",
  "futures",
  "gix",
  "libc",
@@ -738,7 +738,7 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
- "dirs 6.0.0",
+ "dirs",
  "fastrand",
  "filetime",
  "fnv",
@@ -1735,32 +1735,11 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -1771,7 +1750,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.60.2",
 ]
 
@@ -5285,17 +5264,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
 dependencies = [
  "bitflags 2.13.0",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
 ]
 
 [[package]]

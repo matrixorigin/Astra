@@ -1,7 +1,7 @@
 [package]
 name = "astra-skills"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Skill framework types and providers for Astra"
 
 [dependencies]
@@ -23,14 +23,14 @@ sha2 = { workspace = true }
 
 # Filesystem
 walkdir = "2.5"
-dirs = "5"
+dirs = { workspace = true }
 
 # YAML for manifest parsing
 serde_yaml_ng.workspace = true
 
 
 # TOML for manifest parsing
-toml = "1.1.2"
+toml = { workspace = true }
 
 # Tar/gzip for packing
 flate2 = { workspace = true }
@@ -40,16 +40,16 @@ tar = { workspace = true }
 axum = { workspace = true }
 
 # Service integration
-astra-services = { path = "../services" }
-astra-core = { path = "../core" }
+astra-services.workspace = true
+astra-core.workspace = true
 
 # Crash recovery (optional)
-astra-pipeline = { path = "../astra-pipeline", optional = true }
+astra-pipeline = { workspace = true, optional = true }
 
 [features]
 crash-recovery = ["astra-pipeline"]
 
 [dev-dependencies]
-astra-core = { path = "../core", features = ["dev-defaults"] }
+astra-core = { workspace = true, features = ["dev-defaults"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
+tempfile.workspace = true

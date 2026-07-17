@@ -174,13 +174,13 @@ impl CoreSchemaDatabaseLease {
             .bind(&holder_id)
             .execute(pool)
             .await?;
-            let current_holder: String = sqlx::query_scalar(
+            let current_holder: Option<String> = sqlx::query_scalar(
                 "SELECT holder_id FROM astra_schema_bootstrap_leases WHERE component = ?",
             )
             .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-            .fetch_one(pool)
+            .fetch_optional(pool)
             .await?;
-            if current_holder == holder_id {
+            if current_holder.as_deref() == Some(holder_id.as_str()) {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {

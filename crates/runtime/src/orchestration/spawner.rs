@@ -1664,7 +1664,12 @@ impl DynamicAgentSpawner {
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
         }
-        let group = groups.get_mut(&identity.group_id).unwrap();
+        let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
+            SpawnError::Race(format!(
+                "fanout group '{}' disappeared while its write guard was held",
+                identity.group_id
+            ))
+        })?;
         let active_before = group.summary().active;
         group
             .set_slot_request(
@@ -1712,7 +1717,12 @@ impl DynamicAgentSpawner {
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
         }
-        let group = groups.get_mut(&identity.group_id).unwrap();
+        let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
+            SpawnError::Race(format!(
+                "fanout group '{}' disappeared while its write guard was held",
+                identity.group_id
+            ))
+        })?;
         let active_before = group.summary().active;
         group
             .set_slot_request(
