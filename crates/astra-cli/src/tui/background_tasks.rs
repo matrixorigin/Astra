@@ -10,7 +10,7 @@
 //!   per occurrence
 //! - Factual no-recent-output advisory without guessing process intent
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -2079,49 +2079,126 @@ fn search_combined_output(
         if !path.exists() || file_len(path) == 0 {
             continue;
         }
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let hits: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| line.contains(pattern).then_some(index))
-            .collect();
-        matching_lines = matching_lines.saturating_add(hits.len() as u64);
+        search_output_source(
+            label,
+            path,
+            pattern,
+            context_lines,
+            max_bytes,
+            &mut output,
+            &mut matching_lines,
+            &mut truncated,
+        )?;
+    }
 
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for hit in hits {
-            let start = hit.saturating_sub(context_lines);
-            let end = hit
-                .saturating_add(context_lines)
-                .saturating_add(1)
-                .min(lines.len());
-            if let Some((_, previous_end)) = ranges.last_mut()
-                && start <= *previous_end
-            {
-                *previous_end = (*previous_end).max(end);
-            } else {
-                ranges.push((start, end));
-            }
+    Ok((output, matching_lines, truncated))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_output_source(
+    label: &str,
+    path: &Path,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+    output: &mut String,
+    matching_lines: &mut u64,
+    truncated: &mut bool,
+) -> Result<(), String> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut prior_lines = VecDeque::<(u64, String)>::with_capacity(context_lines);
+    let mut following_context = 0_usize;
+    let mut line_number = 0_u64;
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+        let is_match = line.contains(pattern);
+        if is_match {
+            *matching_lines = matching_lines.saturating_add(1);
         }
 
-        for (start, end) in ranges {
-            if output.len() >= max_bytes {
-                truncated = true;
+        // Once the bounded response is full, keep scanning only to return an
+        // accurate match count. In particular, do not retain per-line state:
+        // captured shell output can contain millions of very short lines.
+        if *truncated {
+            continue;
+        }
+
+        if is_match {
+            if following_context == 0 {
+                if !output.is_empty() && append_utf8_bounded(output, "\n", max_bytes) {
+                    *truncated = true;
+                    continue;
+                }
+                let header = format!("[{label} context near line {line_number}]\n");
+                if append_utf8_bounded(output, &header, max_bytes) {
+                    *truncated = true;
+                    continue;
+                }
+                for (number, prior) in prior_lines.drain(..) {
+                    if append_numbered_search_line(output, number, &prior, max_bytes) {
+                        *truncated = true;
+                        break;
+                    }
+                }
+                if *truncated {
+                    continue;
+                }
+            } else {
+                prior_lines.clear();
+            }
+            if append_numbered_search_line(output, line_number, line, max_bytes) {
+                *truncated = true;
                 continue;
             }
-            let mut block = format!("[{label} lines {}-{}]\n", start + 1, end);
-            for (index, line) in lines[start..end].iter().enumerate() {
-                block.push_str(&format!("{}: {line}\n", start + index + 1));
+            following_context = context_lines;
+        } else if following_context > 0 {
+            if append_numbered_search_line(output, line_number, line, max_bytes) {
+                *truncated = true;
+                continue;
             }
-            if append_utf8_bounded(&mut output, &block, max_bytes) {
-                truncated = true;
+            following_context -= 1;
+        } else if context_lines > 0 {
+            // A retained context line can never contribute more than the
+            // response byte budget, so cap it before storing it in the ring.
+            let mut end = line.len().min(max_bytes);
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            prior_lines.push_back((line_number, line[..end].to_string()));
+            if prior_lines.len() > context_lines {
+                prior_lines.pop_front();
             }
         }
     }
 
-    Ok((output, matching_lines, truncated))
+    Ok(())
+}
+
+fn append_numbered_search_line(
+    output: &mut String,
+    line_number: u64,
+    line: &str,
+    max_bytes: usize,
+) -> bool {
+    let prefix = format!("{line_number}: ");
+    append_utf8_bounded(output, &prefix, max_bytes)
+        || append_utf8_bounded(output, line, max_bytes)
+        || append_utf8_bounded(output, "\n", max_bytes)
 }
 
 /// Append as much UTF-8 text as fits and report whether any bytes were omitted.
@@ -3015,10 +3092,10 @@ mod tests {
 
         assert_eq!(matching_lines, 3, "{output}");
         assert!(!truncated, "{output}");
-        assert!(output.contains("[stdout lines 1-6]"), "{output}");
+        assert!(output.contains("[stdout context near line 2]"), "{output}");
         assert!(output.contains("1: before one"), "{output}");
         assert!(output.contains("5: failing_test_name again"), "{output}");
-        assert!(output.contains("[stderr lines 1-1]"), "{output}");
+        assert!(output.contains("[stderr context near line 1]"), "{output}");
     }
 
     #[test]
@@ -3030,12 +3107,34 @@ mod tests {
         std::fs::write(&stderr, "").unwrap();
 
         let (output, matching_lines, truncated) =
-            search_combined_output(&stdout, &stderr, "needle", 0, 24)
+            search_combined_output(&stdout, &stderr, "needle", 0, 43)
                 .expect("bounded search captured output");
 
         assert_eq!(matching_lines, 1);
         assert!(truncated, "{output}");
-        assert!(output.len() <= 24, "{} bytes: {output}", output.len());
+        assert!(output.len() <= 43, "{} bytes: {output}", output.len());
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok(), "{output:?}");
+    }
+
+    #[test]
+    fn output_search_counts_late_matches_after_result_is_full() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(
+            &stdout,
+            "needle one\nignored\nneedle two\nignored\nneedle three\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr, "needle four\n").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "needle", 0, 16)
+                .expect("bounded search captured output");
+
+        assert_eq!(matching_lines, 4, "{output}");
+        assert!(truncated, "{output}");
+        assert!(output.len() <= 16, "{} bytes: {output}", output.len());
     }
 
     #[test]

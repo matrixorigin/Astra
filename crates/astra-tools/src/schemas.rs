@@ -1152,7 +1152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. For a terminal shell failure, set pattern to search the captured output with bounded context instead of reading its files through Bash; terminal diagnostics remain available after a status snapshot. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
+                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. For a terminal shell task, especially a failure, set pattern to search the captured output with bounded context instead of reading its files through Bash; terminal diagnostics remain available after a status snapshot. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1172,7 +1172,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Literal text to find in a terminal shell task's captured stdout/stderr. Returns bounded matching lines with context. Use an exact failing test, error, or panic fragment from the terminal summary. Cannot be combined with block or offset. A failed status alone is not evidence that a test is flaky."
+                            "minLength": 1,
+                            "maxLength": 512,
+                            "description": "Single-line literal text to find in a terminal shell task's captured stdout/stderr. Returns bounded matching lines with context. Use an exact failing test, error, or panic fragment from the terminal summary. Cannot be combined with block or offset. A failed status alone is not evidence that a test is flaky."
                         },
                         "context_lines": {
                             "type": "integer",
@@ -1183,10 +1185,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "max_bytes": {
                             "type": "integer",
                             "minimum": 1,
+                            "maximum": 65536,
                             "description": "Maximum bytes to return from the current offset. Default 8192, max 65536."
                         },
                         "timeout_ms": {
                             "type": "integer",
+                            "minimum": 1,
+                            "maximum": 300000,
                             "description": "Max ms to wait when block=true, and max registry response wait when block=false. Default 30000, max 300000."
                         }
                     },

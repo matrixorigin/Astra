@@ -513,6 +513,14 @@ pub(crate) async fn background_task_output_search_snapshot(
         )
     };
     let terminal = background_task_status_is_terminal(&status);
+    if !terminal {
+        return Err(BackgroundTaskError::output_unavailable(
+            task_id,
+            format!(
+                "diagnostic search requires a terminal shell task; current status is {status}. Use one current task_output snapshot and wait for the automatic completion notification."
+            ),
+        ));
+    }
     let (output, matching_lines, truncated) = background_registry
         .search_combined_output_async(task_id, pattern, context_lines, max_bytes)
         .await?;
@@ -790,7 +798,34 @@ pub(crate) fn background_task_event_system_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::{background_task_output_dir, background_task_status_is_terminal};
+    use super::{
+        background_task_output_dir, background_task_output_search_snapshot,
+        background_task_status_is_terminal,
+    };
+
+    #[tokio::test]
+    async fn diagnostic_search_rejects_live_shell_output() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            super::super::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let task_id = registry.spawn_shell("sleep 5", "long test");
+
+        let error =
+            background_task_output_search_snapshot(&mut registry, &task_id, "failure", 3, 8192)
+                .await
+                .expect_err("live output must not be treated as stable diagnostic evidence");
+
+        assert!(
+            matches!(
+                error,
+                crate::background_task_error::BackgroundTaskError::OutputUnavailable {
+                    ref detail,
+                    ..
+                } if detail.contains("requires a terminal shell task")
+            ),
+            "{error}"
+        );
+    }
 
     #[test]
     fn unbound_background_output_scope_is_process_owned_not_shared_default() {

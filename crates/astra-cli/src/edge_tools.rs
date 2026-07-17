@@ -3729,6 +3729,9 @@ impl ToolExecutor {
                         "pattern must be at most 512 characters",
                     );
                 }
+                if pattern.contains(['\r', '\n']) {
+                    return format_background_task_argument_error("pattern must be a single line");
+                }
                 Some(pattern.to_string())
             }
             Some(_) => {
@@ -7122,6 +7125,20 @@ mod tests {
                 "{output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn task_output_pattern_rejects_multiline_literal() {
+        let executor = test_executor();
+        let output = executor
+            .task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "pattern": "failure\npanic"
+            }))
+            .await;
+        let result = parse_control_result(&output);
+        assert_eq!(result["status"], "invalid_argument", "{output}");
+        assert_eq!(result["error"], "pattern must be a single line", "{output}");
     }
 
     #[tokio::test]
