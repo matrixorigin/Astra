@@ -19,6 +19,25 @@ const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 #[derive(Deserialize)]
 struct ExecuteTodoResponse {
     output: String,
+    #[serde(default)]
+    fork_copy: Option<ForkTaskBoardCopyResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForkTaskBoardCopyStatus {
+    Copied,
+    PreservedExistingChild,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkTaskBoardCopyResult {
+    status: ForkTaskBoardCopyStatus,
+    source_session_id: String,
+    target_session_id: String,
+    #[serde(rename = "count")]
+    _count: usize,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +156,18 @@ pub async fn execute_todo_action(
     action: &str,
     args: &Value,
 ) -> Result<String, String> {
+    execute_todo_request(cloud_base, token, session_id, action, args)
+        .await
+        .map(|response| response.output)
+}
+
+async fn execute_todo_request(
+    cloud_base: &str,
+    token: Option<&str>,
+    session_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<ExecuteTodoResponse, String> {
     let url = format!(
         "{}/sessions/{}/todos:execute",
         cloud_base.trim_end_matches('/'),
@@ -165,7 +196,7 @@ pub async fn execute_todo_action(
                         .json()
                         .await
                         .map_err(|e| format!("decode response: {e}"))?;
-                    return Ok(parsed.output);
+                    return Ok(parsed);
                 }
                 // Retry once on 5xx; 4xx surfaces immediately.
                 if status.is_server_error() && attempt == 0 {
@@ -196,13 +227,13 @@ pub async fn execute_todo_action(
 /// same server-side TaskManager/MatrixOne write surface as model-facing
 /// task actions, but `fork_copy` is intentionally not exposed in the
 /// tool schema.
-pub async fn copy_todos_for_fork(
+pub(crate) async fn copy_todos_for_fork(
     cloud_base: &str,
     token: Option<&str>,
     source_session_id: &str,
     target_session_id: &str,
-) -> Result<String, String> {
-    execute_todo_action(
+) -> Result<ForkTaskBoardCopyStatus, String> {
+    let response = execute_todo_request(
         cloud_base,
         token,
         target_session_id,
@@ -211,7 +242,23 @@ pub async fn copy_todos_for_fork(
             "source_session_id": source_session_id,
         }),
     )
-    .await
+    .await?;
+    let result = response.fork_copy.ok_or_else(|| {
+        format!(
+            "cloud fork task-board response omitted typed fork_copy result: {}",
+            response.output
+        )
+    })?;
+    if result.source_session_id != source_session_id
+        || result.target_session_id != target_session_id
+    {
+        return Err(format!(
+            "cloud fork task-board response identity mismatch: expected {source_session_id} -> \
+             {target_session_id}, got {} -> {}",
+            result.source_session_id, result.target_session_id
+        ));
+    }
+    Ok(result.status)
 }
 
 /// `GET /users/me/todos?status=...` — cross-session active list for
@@ -570,8 +617,8 @@ impl TaskStore for HttpTaskStore {
 #[cfg(test)]
 mod wiring_e2e {
     use super::{
-        HttpTaskStore, copy_todos_for_fork, execute_todo_action, health_for_http_status,
-        list_user_todos,
+        ForkTaskBoardCopyStatus, HttpTaskStore, copy_todos_for_fork, execute_todo_action,
+        health_for_http_status, list_user_todos,
     };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::lock_recovery::LockRecovery;
@@ -985,18 +1032,27 @@ mod wiring_e2e {
             .respond_with(|req: &Request| {
                 let body: Value = serde_json::from_slice(&req.body).expect("json body");
                 assert_eq!(body["action"], "fork_copy", "{body}");
-                assert_eq!(body["args"]["source_session_id"], "parent-session", "{body}");
+                assert_eq!(
+                    body["args"]["source_session_id"], "parent-session",
+                    "{body}"
+                );
                 ResponseTemplate::new(200).set_body_json(json!({
-                    "output": "Fork task board copied: 1 task(s)\n{\"success\":true,\"status\":\"copied\",\"count\":1}"
+                    "output": "Human-facing wording may change without breaking fork state",
+                    "fork_copy": {
+                        "status": "copied",
+                        "source_session_id": "parent-session",
+                        "target_session_id": "child-session",
+                        "count": 1
+                    }
                 }))
             })
             .mount(&server)
             .await;
 
-        let output = copy_todos_for_fork(&server.uri(), None, "parent-session", "child-session")
+        let status = copy_todos_for_fork(&server.uri(), None, "parent-session", "child-session")
             .await
             .expect("mock fork copy");
-        assert!(output.contains("\"status\":\"copied\""), "{output}");
+        assert_eq!(status, ForkTaskBoardCopyStatus::Copied);
     }
 
     #[tokio::test]

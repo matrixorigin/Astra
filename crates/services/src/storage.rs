@@ -4892,7 +4892,9 @@ async fn ensure_core_schema_while_leased(
             PRIMARY KEY (user_id, session_id, todo_id),
             INDEX idx_session_todos_owner_session_ordinal (user_id, session_id, ordinal),
             INDEX idx_session_todos_owner_session_status_updated (user_id, session_id, status, updated_at),
-            INDEX idx_session_todos_user_status_updated (user_id, status, updated_at)
+            INDEX idx_session_todos_user_status_updated (user_id, status, updated_at),
+            INDEX idx_session_todos_status_updated_owner (status, updated_at, user_id, session_id, todo_id),
+            INDEX idx_session_todos_archived_gc_owner (status, archived_at, user_id, session_id, todo_id)
         )",
     )
     .execute(&pool)
@@ -4905,11 +4907,7 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_todos ADD PRIMARY KEY (user_id, session_id, todo_id)",
     )
     .await?;
-    for removed_index in [
-        "idx_session_todos_session_status_updated",
-        "idx_session_todos_status_updated_owner",
-        "idx_session_todos_archived_gc_owner",
-    ] {
+    for removed_index in ["idx_session_todos_session_status_updated"] {
         drop_index_if_present(&pool, &settings.database, "session_todos", removed_index).await?;
     }
     for (index, expected_columns, ddl) in [
@@ -4927,6 +4925,16 @@ async fn ensure_core_schema_while_leased(
             "idx_session_todos_user_status_updated",
             &["user_id", "status", "updated_at"][..],
             "ALTER TABLE session_todos ADD INDEX idx_session_todos_user_status_updated (user_id, status, updated_at)",
+        ),
+        (
+            "idx_session_todos_status_updated_owner",
+            &["status", "updated_at", "user_id", "session_id", "todo_id"][..],
+            "ALTER TABLE session_todos ADD INDEX idx_session_todos_status_updated_owner (status, updated_at, user_id, session_id, todo_id)",
+        ),
+        (
+            "idx_session_todos_archived_gc_owner",
+            &["status", "archived_at", "user_id", "session_id", "todo_id"][..],
+            "ALTER TABLE session_todos ADD INDEX idx_session_todos_archived_gc_owner (status, archived_at, user_id, session_id, todo_id)",
         ),
     ] {
         ensure_index_shape(

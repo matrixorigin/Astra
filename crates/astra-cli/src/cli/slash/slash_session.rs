@@ -5237,34 +5237,21 @@ async fn apply_prepared_fork_restore(
 ) -> Result<ForkTaskBoardRestore, String> {
     let task_restore_plan = if state.task_notify_tx.is_none() {
         let store = state.task_manager.store();
-        let child_tasks = store.load(new_sid).await.map_err(|error| {
+        let child_snapshot = store.load_snapshot_state(new_sid).await.map_err(|error| {
             format!("load existing task board for forked child {new_sid}: {error}")
         })?;
-        if child_tasks.is_empty() {
-            let parent_tasks = store.load(parent_id).await.map_err(|error| {
-                format!("load parent task board for forked child {new_sid}: {error}")
-            })?;
-            let fallback_next_id = parent_tasks
-                .iter()
-                .filter_map(|task| {
-                    task.id
-                        .strip_prefix("task-")
-                        .and_then(|suffix| suffix.parse::<u32>().ok())
-                })
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(1);
-            let next_task_id = store
-                .peek_next_task_id(parent_id)
+        if child_snapshot.tasks.is_empty() {
+            let parent_snapshot = store
+                .load_snapshot_state(parent_id)
                 .await
-                .unwrap_or(fallback_next_id);
-            let child_version = store.get_session_version(new_sid).await.unwrap_or(0);
+                .map_err(|error| {
+                    format!("load parent task board for forked child {new_sid}: {error}")
+                })?;
             let mut snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
-                tasks: parent_tasks,
-                next_task_id,
-                version: child_version,
-                restore_version: Some(child_version),
+                tasks: parent_snapshot.tasks,
+                next_task_id: parent_snapshot.next_task_id,
+                version: child_snapshot.version,
+                restore_version: Some(child_snapshot.version),
             };
             snapshot = astra_tools::task_mgmt::prepare_task_snapshot_for_fork(snapshot);
             Some(snapshot)
@@ -5280,29 +5267,19 @@ async fn apply_prepared_fork_restore(
             "cloud task board fork copy is unavailable: missing cloud endpoint configuration"
                 .to_string()
         })?;
-        let output = crate::cli::session::session_todo_client::copy_todos_for_fork(
+        let status = crate::cli::session::session_todo_client::copy_todos_for_fork(
             &copy.cloud_base,
             copy.token.as_deref(),
             parent_id,
             new_sid,
         )
         .await?;
-        let status = output
-            .find('{')
-            .and_then(|pos| serde_json::from_str::<serde_json::Value>(&output[pos..]).ok())
-            .and_then(|value| {
-                value
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
-        match status.as_deref() {
-            Some("copied") => Some(ForkTaskBoardRestore::Copied),
-            Some("preserved_existing_child") => Some(ForkTaskBoardRestore::PreservedExistingChild),
-            _ => {
-                return Err(format!(
-                    "cloud task board fork copy returned an invalid response: {output}"
-                ));
+        match status {
+            crate::cli::session::session_todo_client::ForkTaskBoardCopyStatus::Copied => {
+                Some(ForkTaskBoardRestore::Copied)
+            }
+            crate::cli::session::session_todo_client::ForkTaskBoardCopyStatus::PreservedExistingChild => {
+                Some(ForkTaskBoardRestore::PreservedExistingChild)
             }
         }
     } else {

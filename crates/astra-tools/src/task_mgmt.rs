@@ -964,6 +964,49 @@ pub trait TaskStore: Send + Sync {
         let _ = (session_id, tasks, next_task_id, expected_version);
         Err("restore_snapshot_state is not supported for this store".to_string())
     }
+    /// Capture tasks, id allocator state, and the board version from one
+    /// logical point in time.
+    ///
+    /// The default uses an optimistic version fence so stores do not return a
+    /// torn snapshot when a writer commits between the individual reads.
+    /// Durable stores must increment the same version for every task-board
+    /// write path, including background lifecycle maintenance.
+    async fn load_snapshot_state(&self, session_id: &str) -> Result<TaskManagerSnapshot, String> {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let version_before = self
+                .get_session_version(session_id)
+                .await
+                .map_err(|e| format!("get_session_version before snapshot failed: {e}"))?;
+            let tasks = self
+                .load(session_id)
+                .await
+                .map_err(|e| format!("task load during snapshot failed: {e}"))?;
+            let next_task_id = self
+                .peek_next_task_id(session_id)
+                .await
+                .map_err(|e| format!("peek_next_task_id failed: {e}"))?;
+            let version_after = self
+                .get_session_version(session_id)
+                .await
+                .map_err(|e| format!("get_session_version after snapshot failed: {e}"))?;
+            if version_before == version_after {
+                return Ok(TaskManagerSnapshot {
+                    tasks,
+                    next_task_id,
+                    version: version_after,
+                    restore_version: None,
+                });
+            }
+            if attempt == MAX_ATTEMPTS {
+                return Err(format!(
+                    "task board changed while capturing snapshot \
+                     (version {version_before} -> {version_after}); retry"
+                ));
+            }
+        }
+        unreachable!("snapshot attempt loop always returns")
+    }
     /// Read the next id WITHOUT consuming or mutating the counter.
     /// Used by `try_snapshot_state` to capture the counter for rollback
     /// without leaving a hole in the id sequence.
@@ -982,8 +1025,9 @@ pub trait TaskStore: Send + Sync {
     /// `restore_snapshot` checks the snapshot version against the store
     /// to detect concurrent-mutation conflicts.
     ///
-    /// Default returns 0 — stores that do not support version tracking
-    /// disable the conflict check (restore_snapshot always succeeds).
+    /// Versions start at 0. Stores that support snapshot restore must
+    /// increment the version for every write so 0 remains a valid CAS value,
+    /// not a sentinel for disabling conflict detection.
     async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
         let _ = session_id;
         Ok(0)
@@ -1296,7 +1340,7 @@ impl TaskStore for InMemoryTaskStore {
         {
             let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
-            if expected_version > 0 && entry.version != expected_version {
+            if entry.version != expected_version {
                 return Err(format!(
                     "restore_snapshot_state: version conflict (expected={}, current={}) — \
                      task board changed after rollback snapshot was sealed; retry with fresh state",
@@ -1309,6 +1353,21 @@ impl TaskStore for InMemoryTaskStore {
         }
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(())
+    }
+
+    async fn load_snapshot_state(&self, session_id: &str) -> Result<TaskManagerSnapshot, String> {
+        let sessions = self.sessions.lock().await;
+        let entry = sessions.get(session_id);
+        let next_task_id = entry
+            .map(|state| if state.next_id == 0 { 1 } else { state.next_id })
+            .unwrap_or(1);
+        Ok(TaskManagerSnapshot {
+            tasks: entry.map(|state| state.tasks.clone()).unwrap_or_default(),
+            next_task_id: u32::try_from(next_task_id)
+                .map_err(|_| format!("task id counter exhausted for session {session_id}"))?,
+            version: entry.map(|state| state.version).unwrap_or(0),
+            restore_version: None,
+        })
     }
 
     async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
@@ -2306,35 +2365,10 @@ impl TaskManager {
     /// for an unreadable task board.
     pub async fn try_snapshot_state(&self) -> Result<TaskManagerSnapshot, String> {
         let sid = self.sid();
-        let tasks = self.store.load(&sid).await?;
-        // Read the counter without consuming or mutating it so concurrent
-        // allocators can't race us into duplicate ids (the old
-        // alloc-then-rewind dance clobbered concurrent increments).
-        //
-        // **Fail-closed on peek errors.** The old fallback to
-        // `max(existing task ids) + 1` looked safe but isn't: concurrent
-        // allocators may have already consumed ids beyond the snapshot's
-        // max, and `restore_snapshot` would rewind the counter to the
-        // stale value — guaranteeing duplicate id allocation on the
-        // next `next_task_id` call. Propagating the error forces the
-        // caller to abort the mutation instead of capturing a snapshot
-        // that could corrupt the id space on rollback.
-        let peeked = self
-            .store
-            .peek_next_task_id(&sid)
+        self.store
+            .load_snapshot_state(&sid)
             .await
-            .map_err(|e| format!("snapshot peek_next_task_id failed: {e}"))?;
-        let version = self
-            .store
-            .get_session_version(&sid)
-            .await
-            .map_err(|e| format!("snapshot get_session_version failed: {e}"))?;
-        Ok(TaskManagerSnapshot {
-            tasks,
-            next_task_id: peeked,
-            version,
-            restore_version: None,
-        })
+            .map_err(|e| format!("snapshot read failed: {e}"))
     }
 
     /// Seal a snapshot after this caller's own mutations have completed.
@@ -2391,19 +2425,17 @@ impl TaskManager {
         // snapshot was sealed for. If the snapshot was never sealed, it may
         // only restore over its original captured version.
         let expected_version = snapshot.restore_version.unwrap_or(snapshot.version);
-        if expected_version > 0 {
-            let current_version = self
-                .store
-                .get_session_version(&sid)
-                .await
-                .map_err(|e| format!("restore_snapshot: failed to read version: {e}"))?;
-            if current_version != expected_version {
-                return Err(format!(
-                    "restore_snapshot: version conflict (expected={}, current={}) — \
-                     task board changed after rollback snapshot was sealed; retry with fresh state",
-                    expected_version, current_version
-                ));
-            }
+        let current_version = self
+            .store
+            .get_session_version(&sid)
+            .await
+            .map_err(|e| format!("restore_snapshot: failed to read version: {e}"))?;
+        if current_version != expected_version {
+            return Err(format!(
+                "restore_snapshot: version conflict (expected={}, current={}) — \
+                 task board changed after rollback snapshot was sealed; retry with fresh state",
+                expected_version, current_version
+            ));
         }
 
         let current_next = self
@@ -6541,6 +6573,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn optimistic_snapshot_rejects_a_board_that_never_stabilizes() {
+        struct MovingVersionStore {
+            version_reads: std::sync::atomic::AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl TaskStore for MovingVersionStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Ok(Vec::new())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn get_session_version(&self, _session_id: &str) -> Result<u64, String> {
+                Ok(self
+                    .version_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            }
+        }
+
+        let store = MovingVersionStore {
+            version_reads: std::sync::atomic::AtomicU64::new(0),
+        };
+        let error = store
+            .load_snapshot_state("sess-moving")
+            .await
+            .expect_err("a torn task/counter/version view must never be returned as a snapshot");
+        assert!(
+            error.contains("changed while capturing snapshot"),
+            "{error}"
+        );
+        assert_eq!(
+            store
+                .version_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "snapshot capture should retry a bounded number of times"
+        );
+    }
+
     #[test]
     fn prepare_task_snapshot_for_fork_pauses_live_parent_work() {
         let snapshot = TaskManagerSnapshot {
@@ -6690,10 +6777,14 @@ mod tests {
         for _ in 0..5 {
             let _ = store.next_task_id("sess-order").await.unwrap();
         }
+        let version = store
+            .get_session_version("sess-order")
+            .await
+            .expect("current board version");
         let snap = TaskManagerSnapshot {
             tasks: vec![],
             next_task_id: 1,
-            version: 0,
+            version,
             restore_version: None,
         };
         let mut rx = store.subscribe().expect("inmemory supports subscribe");
@@ -6792,6 +6883,51 @@ mod tests {
             .await
             .expect_err("stale restore must be rejected");
         assert!(err.contains("version conflict"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn in_memory_restore_treats_zero_as_a_real_cas_version() {
+        let store = InMemoryTaskStore::new();
+        let empty_snapshot = store
+            .load_snapshot_state("sess-first-write")
+            .await
+            .expect("capture new board");
+        assert_eq!(empty_snapshot.version, 0);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .save(
+                "sess-first-write",
+                vec![SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "concurrent first write".to_string(),
+                    description: None,
+                    status: SessionTaskStatusKind::Pending,
+                    subtasks: Vec::new(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                }],
+            )
+            .await
+            .expect("concurrent first write");
+
+        let error = store
+            .restore_snapshot_state(
+                "sess-first-write",
+                empty_snapshot.tasks,
+                empty_snapshot.next_task_id,
+                empty_snapshot.version,
+            )
+            .await
+            .expect_err("version-0 snapshot must not erase the first concurrent write");
+        assert!(error.contains("version conflict"), "{error}");
+        assert_eq!(store.load("sess-first-write").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

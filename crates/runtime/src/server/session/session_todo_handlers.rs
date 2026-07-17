@@ -55,6 +55,58 @@ pub(crate) struct ExecuteTodoResponse {
     /// `Error: ...` prefix on failure). Mirrors what the local
     /// TaskManager returns.
     pub output: String,
+    /// Machine-readable result for the internal fork operation. The rendered
+    /// output is presentation, not a protocol for session state transitions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fork_copy: Option<ForkTaskBoardCopyResult>,
+}
+
+impl ExecuteTodoResponse {
+    fn output(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            fork_copy: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ForkTaskBoardCopyStatus {
+    Copied,
+    PreservedExistingChild,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ForkTaskBoardCopyResult {
+    status: ForkTaskBoardCopyStatus,
+    source_session_id: String,
+    target_session_id: String,
+    count: usize,
+}
+
+impl ForkTaskBoardCopyResult {
+    fn render(&self) -> String {
+        let summary = match self.status {
+            ForkTaskBoardCopyStatus::Copied => {
+                format!("Fork task board copied: {} task(s)", self.count)
+            }
+            ForkTaskBoardCopyStatus::PreservedExistingChild => format!(
+                "Fork task board preserved: target already has {} task(s)",
+                self.count
+            ),
+        };
+        format!(
+            "{summary}\n{}",
+            serde_json::json!({
+                "success": true,
+                "status": self.status,
+                "source_session_id": self.source_session_id,
+                "target_session_id": self.target_session_id,
+                "count": self.count,
+            })
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -416,14 +468,6 @@ async fn ensure_session_todo_session_owner(
     }
 }
 
-async fn ensure_session_todo_counter_owner_available(
-    executor: &mut sqlx::MySqlConnection,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    ensure_session_todo_session_owner(executor, session_id, user_id).await
-}
-
 async fn adopt_task_into_session_atomic(
     shared: &astra_core::SharedPool,
     user_id: &str,
@@ -433,9 +477,44 @@ async fn adopt_task_into_session_atomic(
 ) -> Result<String, String> {
     let mut tx = shared.get().begin().await.map_err(|e| e.to_string())?;
 
-    ensure_session_todo_session_owner(&mut tx, source_session, user_id)
+    // A cross-session mutation must acquire both boards in one canonical
+    // order. Locking the source todo before the target root lets reciprocal
+    // adopts (A -> B and B -> A) deadlock under load.
+    let mut board_ids = [source_session, target_session];
+    board_ids.sort_unstable();
+    for session_id in board_ids {
+        ensure_session_todo_session_owner(&mut tx, session_id, user_id)
+            .await
+            .map_err(|e| format!("task board owner check failed for {session_id}: {e}"))?;
+    }
+    for session_id in board_ids {
+        sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
+             ON DUPLICATE KEY UPDATE next_id = next_id",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| format!("source task owner check failed: {e}"))?;
+        .map_err(|e| format!("initialize task counter for {session_id}: {e}"))?;
+    }
+
+    let mut target_raw_next = None;
+    for session_id in board_ids {
+        let raw_next: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT next_id FROM session_todo_counters \
+             WHERE session_id = ? AND user_id = ? FOR UPDATE",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map(|(next,)| next)
+        .map_err(|e| format!("lock task counter for {session_id}: {e}"))?;
+        if session_id == target_session {
+            target_raw_next = Some(raw_next);
+        }
+    }
 
     let source_row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
         "SELECT title, description, subtasks, status FROM session_todos \
@@ -469,29 +548,8 @@ async fn adopt_task_into_session_atomic(
         None => None,
     };
 
-    ensure_session_todo_counter_owner_available(&mut tx, target_session, user_id)
-        .await
-        .map_err(|e| format!("initialize target task counter failed: {e}"))?;
-
-    sqlx::query(
-        "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
-         ON DUPLICATE KEY UPDATE next_id = next_id",
-    )
-    .bind(target_session)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| format!("initialize target task counter failed: {e}"))?;
-
-    let raw_next: i64 = sqlx::query_as::<_, (i64,)>(
-        "SELECT next_id FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
-    )
-    .bind(target_session)
-    .bind(user_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map(|(next,)| next)
-    .map_err(|e| format!("lock target task counter failed: {e}"))?;
+    let raw_next = target_raw_next
+        .ok_or_else(|| format!("target task counter lock missing for session {target_session}"))?;
     let (allocated, next_stored) = parse_next_task_counter(raw_next, target_session)?;
     let target_task_id = format!("task-{allocated}");
 
@@ -588,6 +646,16 @@ async fn adopt_task_into_session_atomic(
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("advance target task counter failed: {e}"))?;
+
+    sqlx::query(
+        "UPDATE session_todo_counters SET version = version + 1 \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(source_session)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("advance source task board version failed: {e}"))?;
 
     tx.commit()
         .await
@@ -782,23 +850,19 @@ pub(crate) async fn execute_todo_handler(
 
     let action = req.action.trim();
     if action.is_empty() {
-        return Ok(Json(ExecuteTodoResponse {
-            output: "Error: field 'action' must be non-empty".to_string(),
-        }));
+        return Ok(Json(ExecuteTodoResponse::output(
+            "Error: field 'action' must be non-empty",
+        )));
     }
 
     if let Err(error) = validate_execute_todo_args_action(action, &req.args) {
-        return Ok(Json(ExecuteTodoResponse {
-            output: format!("Error: {error}"),
-        }));
+        return Ok(Json(ExecuteTodoResponse::output(format!("Error: {error}"))));
     }
     let create_idempotency_key = if action == "create" {
         match validate_create_idempotency_key(req.idempotency_key.as_deref()) {
             Ok(key) => Some(key.to_string()),
             Err(error) => {
-                return Ok(Json(ExecuteTodoResponse {
-                    output: format!("Error: {error}"),
-                }));
+                return Ok(Json(ExecuteTodoResponse::output(format!("Error: {error}"))));
             }
         }
     } else {
@@ -810,9 +874,9 @@ pub(crate) async fn execute_todo_handler(
             .as_deref()
             .is_some_and(|key| !key.trim().is_empty())
     {
-        return Ok(Json(ExecuteTodoResponse {
-            output: "Error: idempotency_key is only valid for todo action 'create'".to_string(),
-        }));
+        return Ok(Json(ExecuteTodoResponse::output(
+            "Error: idempotency_key is only valid for todo action 'create'",
+        )));
     }
 
     let manager = build_task_manager(&state, &session_id, &user.user_id)
@@ -824,6 +888,7 @@ pub(crate) async fn execute_todo_handler(
             )
         })?;
 
+    let mut fork_copy = None;
     let output = match action {
         "create" => {
             let key = create_idempotency_key.expect("create idempotency key validated");
@@ -872,14 +937,21 @@ pub(crate) async fn execute_todo_handler(
         "adopt" => adopt_task_into_session(&state, &user.user_id, &session_id, &req.args).await,
         "archive" => manager.archive(&req.args).await,
         "fork_copy" => {
-            copy_task_board_into_fork(&state, &user.user_id, &session_id, &req.args).await
+            match copy_task_board_into_fork(&state, &user.user_id, &session_id, &req.args).await {
+                Ok(result) => {
+                    let output = result.render();
+                    fork_copy = Some(result);
+                    output
+                }
+                Err(error) => format!("Error: {error}"),
+            }
         }
         other => format!(
             "Error: unknown todo action '{other}'. Valid: create, update, list, get, stop, adopt, archive"
         ),
     };
 
-    Ok(Json(ExecuteTodoResponse { output }))
+    Ok(Json(ExecuteTodoResponse { output, fork_copy }))
 }
 
 fn required_fork_copy_source_session(args: &serde_json::Value) -> Result<String, String> {
@@ -926,74 +998,59 @@ async fn copy_task_board_into_fork(
     user_id: &str,
     target_session: &str,
     args: &serde_json::Value,
-) -> String {
-    let source_session = match required_fork_copy_source_session(args) {
-        Ok(source_session) => source_session,
-        Err(error) => return format!("Error: {error}"),
-    };
+) -> Result<ForkTaskBoardCopyResult, String> {
+    let source_session = required_fork_copy_source_session(args)?;
     if source_session == target_session {
-        return "Error: source_session_id matches the fork target session".to_string();
+        return Err("source_session_id matches the fork target session".to_string());
     }
     if let Err((status, body)) = verify_session_owner(state, user_id, &source_session).await {
-        return format!(
-            "Error: source session ownership check failed for task fork_copy: {} {}",
+        return Err(format!(
+            "source session ownership check failed for task fork_copy: {} {}",
             status, body.detail
-        );
+        ));
     }
 
     let source_manager = match build_task_manager(state, &source_session, user_id) {
         Ok(Some(manager)) => manager,
-        Ok(None) => return "Error: session_todos store not configured on this server".to_string(),
-        Err(error) => return format!("Error: {error}"),
+        Ok(None) => return Err("session_todos store not configured on this server".to_string()),
+        Err(error) => return Err(error),
     };
     let target_manager = match build_task_manager(state, target_session, user_id) {
         Ok(Some(manager)) => manager,
-        Ok(None) => return "Error: session_todos store not configured on this server".to_string(),
-        Err(error) => return format!("Error: {error}"),
+        Ok(None) => return Err("session_todos store not configured on this server".to_string()),
+        Err(error) => return Err(error),
     };
 
-    let target_snapshot = match target_manager.try_snapshot_state().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return format!("Error: load fork target task board {target_session}: {error}");
-        }
-    };
+    let target_snapshot = target_manager
+        .try_snapshot_state()
+        .await
+        .map_err(|error| format!("load fork target task board {target_session}: {error}"))?;
     if !target_snapshot.tasks.is_empty() {
-        return format!(
-            "Fork task board preserved: target already has {} task(s)\n{}",
-            target_snapshot.tasks.len(),
-            serde_json::json!({
-                "success": true,
-                "status": "preserved_existing_child",
-                "source_session_id": source_session,
-                "target_session_id": target_session,
-                "count": target_snapshot.tasks.len(),
-            })
-        );
+        return Ok(ForkTaskBoardCopyResult {
+            status: ForkTaskBoardCopyStatus::PreservedExistingChild,
+            source_session_id: source_session,
+            target_session_id: target_session.to_string(),
+            count: target_snapshot.tasks.len(),
+        });
     }
 
-    let snapshot = match source_manager.try_snapshot_state().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return format!("Error: load fork source task board {source_session}: {error}");
-        }
-    };
+    let snapshot = source_manager
+        .try_snapshot_state()
+        .await
+        .map_err(|error| format!("load fork source task board {source_session}: {error}"))?;
     let copied = snapshot.tasks.len();
     let snapshot = prepare_fork_copy_snapshot_for_target(snapshot, target_snapshot.version);
-    if let Err(error) = target_manager.restore_snapshot(&snapshot).await {
-        return format!("Error: copy fork task board into {target_session}: {error}");
-    }
+    target_manager
+        .restore_snapshot(&snapshot)
+        .await
+        .map_err(|error| format!("copy fork task board into {target_session}: {error}"))?;
 
-    format!(
-        "Fork task board copied: {copied} task(s)\n{}",
-        serde_json::json!({
-            "success": true,
-            "status": "copied",
-            "source_session_id": source_session,
-            "target_session_id": target_session,
-            "count": copied,
-        })
-    )
+    Ok(ForkTaskBoardCopyResult {
+        status: ForkTaskBoardCopyStatus::Copied,
+        source_session_id: source_session,
+        target_session_id: target_session.to_string(),
+        count: copied,
+    })
 }
 
 /// `adopt`: copy a task from another of the user's sessions into the
@@ -2009,11 +2066,9 @@ mod tests {
                 "source_session_id": source_session,
             }),
         )
-        .await;
-        assert!(
-            out.contains("\"success\":true") && out.contains("\"status\":\"copied\""),
-            "fork_copy should report copied: {out}"
-        );
+        .await
+        .expect("fork copy");
+        assert!(matches!(out.status, ForkTaskBoardCopyStatus::Copied));
 
         let source_status: String = sqlx::query_scalar(
             "SELECT status FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
@@ -2058,11 +2113,12 @@ mod tests {
                 "source_session_id": source_session,
             }),
         )
-        .await;
-        assert!(
-            preserve.contains("\"status\":\"preserved_existing_child\""),
-            "second fork_copy must preserve existing child board: {preserve}"
-        );
+        .await
+        .expect("preserve existing child task board");
+        assert!(matches!(
+            preserve.status,
+            ForkTaskBoardCopyStatus::PreservedExistingChild
+        ));
 
         cleanup_session_rows(&pool, &source_session, &user_id).await;
         cleanup_session_rows(&pool, &target_session, &user_id).await;
@@ -2252,6 +2308,14 @@ mod tests {
             .create(&serde_json::json!({"title": "Adopt me without description"}))
             .await;
         assert!(created.contains("\"success\":true"), "{created}");
+        let source_version_before: i64 = sqlx::query_scalar(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&source_session)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("source version before adopt");
 
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(shared.clone());
@@ -2302,6 +2366,31 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(target_row.3.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(metadata["forked_from"], format!("{source_session}:task-1"));
+        let source_version_after: i64 = sqlx::query_scalar(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&source_session)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("source version after adopt");
+        let target_version_after: i64 = sqlx::query_scalar(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&target_session)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("target version after adopt");
+        assert_eq!(
+            source_version_after,
+            source_version_before + 1,
+            "migrating the source must invalidate source-board snapshots"
+        );
+        assert_eq!(
+            target_version_after, 1,
+            "creating the target board through adopt is one logical mutation"
+        );
 
         cleanup_session_rows(&pool, &source_session, &user_id).await;
         cleanup_session_rows(&pool, &target_session, &user_id).await;

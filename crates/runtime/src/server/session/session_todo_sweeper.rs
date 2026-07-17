@@ -39,7 +39,7 @@ use astra_tools::task_mgmt::detach_dependency_edges_for_task_ids;
 use futures_util::FutureExt;
 use serde_json::{Map, Value};
 use sqlx::Row;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -58,6 +58,74 @@ const COMPLETED_AUTO_ARCHIVE_DAYS_DEFAULT: i64 = 7;
 const ARCHIVE_RETENTION_DAYS_DEFAULT: i64 = 90;
 const ARCHIVE_BATCH_LIMIT: i64 = 500;
 const ARCHIVE_GC_BATCH_LIMIT: i64 = 500;
+const SESSION_TODO_OWNER_LOCK_SQL: &str =
+    "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE";
+
+/// Acquire the same owner -> counter lock order used by foreground
+/// `MatrixOneTaskStore` mutations. Lifecycle maintenance must participate in
+/// the board version protocol or a sealed rollback/fork snapshot can silently
+/// overwrite a pause/archive/GC commit.
+async fn lock_task_board_for_lifecycle(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let owner_exists: Option<(i32,)> = sqlx::query_as(SESSION_TODO_OWNER_LOCK_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("task lifecycle owner lock: {e}"))?;
+
+    if owner_exists.is_some() {
+        sqlx::query(
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, 1, 0) \
+             ON DUPLICATE KEY UPDATE next_id = next_id",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("task lifecycle counter initialize: {e}"))?;
+    }
+
+    let counter_exists: Option<(i64,)> = sqlx::query_as(
+        "SELECT version FROM session_todo_counters \
+         WHERE session_id = ? AND user_id = ? FOR UPDATE",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("task lifecycle counter lock: {e}"))?;
+
+    if owner_exists.is_none() {
+        tracing::warn!(
+            target: "astra_runtime::session_todo_sweeper",
+            user_id,
+            session_id,
+            "task lifecycle candidate has no owning agent_sessions row"
+        );
+    }
+    Ok(counter_exists.is_some())
+}
+
+async fn bump_task_board_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE session_todo_counters SET version = version + 1 \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| format!("task lifecycle version bump: {e}"))?;
+    Ok(())
+}
 
 fn positive_i64_env_or_default(key: &'static str, default: i64) -> i64 {
     let raw = match std::env::var(key) {
@@ -156,42 +224,65 @@ fn auto_pause_metadata_json(existing: Option<&str>, paused_at: &str) -> String {
 /// Public for runtime tests; production callers go through the
 /// spawned interval task.
 pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64, String> {
-    let mut tx = pool
-        .get()
-        .begin()
-        .await
-        .map_err(|e| format!("stale-sweep tx begin: {e}"))?;
-
-    // Pull the candidate rows so we can write per-row metadata
-    // (auto_paused_reason). A bulk UPDATE without metadata would be
-    // faster but the audit context matters more here than the SQL
-    // round-trips — sweeps are 5min apart and N is small.
-    //
-    // SELECT … FOR UPDATE serialises with mutator transactions (which
-    // also lock all rows for a session via FOR UPDATE). Without this,
-    // a mutator DELETE+INSERT that restores an in_progress row from its
-    // stale in-memory snapshot can silently overwrite a sweeper pause.
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT user_id, session_id, todo_id, metadata FROM session_todos \
+    // Discovery is intentionally read-only. Candidate rows are revalidated
+    // under a per-board transaction below, after acquiring owner and counter
+    // locks in the same order as foreground mutations. A global `FOR UPDATE`
+    // claim would lock todo first and create a counter<->todo deadlock cycle.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id, todo_id FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
          ORDER BY updated_at ASC, user_id ASC, session_id ASC, todo_id ASC \
-         LIMIT ? \
-         FOR UPDATE",
+         LIMIT ?",
     )
     .bind(STALE_THRESHOLD_HOURS as i64)
     .bind(STALE_BATCH_LIMIT)
-    .fetch_all(&mut *tx)
+    .fetch_all(pool.get())
     .await
     .map_err(|e| format!("stale-sweep query/decode: {e}"))?;
 
     let mut affected = 0u64;
-    for (user_id, session_id, todo_id, metadata) in &rows {
-        // Defense-in-depth: skip plan-derived tasks even if the SQL
-        // JSON filter missed them (e.g. due to MatrixOne JSON function
-        // differences). The plan orchestrator owns their lifecycle.
-        if let Some(meta) = metadata {
-            if meta.contains("\"plan_subtask_id\"") {
+    let mut by_board: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for (user_id, session_id, todo_id) in rows {
+        by_board
+            .entry((user_id, session_id))
+            .or_default()
+            .push(todo_id);
+    }
+
+    for ((user_id, session_id), candidates) in by_board {
+        let mut tx = pool
+            .get()
+            .begin()
+            .await
+            .map_err(|e| format!("stale-sweep tx begin: {e}"))?;
+        let has_counter = lock_task_board_for_lifecycle(&mut tx, &user_id, &session_id).await?;
+        let mut board_affected = 0u64;
+
+        for todo_id in candidates {
+            let current: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT metadata FROM session_todos \
+                 WHERE user_id = ? AND session_id = ? AND todo_id = ? \
+                   AND status = 'in_progress' \
+                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
+                 FOR UPDATE",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(&todo_id)
+            .bind(STALE_THRESHOLD_HOURS as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("stale-sweep candidate lock: {e}"))?;
+            let Some((metadata,)) = current else {
+                continue;
+            };
+            // Defense-in-depth: plan-derived tasks are controlled by the plan
+            // orchestrator, not generic inactivity maintenance.
+            if metadata
+                .as_deref()
+                .is_some_and(|meta| meta.contains("\"plan_subtask_id\""))
+            {
                 tracing::warn!(
                     target: "astra_runtime::session_todo_sweeper",
                     user_id = %user_id,
@@ -202,35 +293,34 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
                 );
                 continue;
             }
-        }
-        // CAS on status: re-check inside the UPDATE so a row that
-        // raced to `completed` between our SELECT and now isn't
-        // clobbered back to `paused`. status must STILL be
-        // in_progress at apply time.
-        let paused_at = chrono::Utc::now().to_rfc3339();
-        let metadata_json = auto_pause_metadata_json(metadata.as_deref(), &paused_at);
-        let result = sqlx::query(
-            "UPDATE session_todos \
-             SET status = 'paused', \
-                 metadata = ?, \
-                 updated_at = NOW(6) \
-             WHERE user_id = ? AND session_id = ? AND todo_id = ? AND status = 'in_progress' \
-               AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR)",
-        )
-        .bind(metadata_json)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(todo_id)
-        .bind(STALE_THRESHOLD_HOURS as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("stale-sweep update: {e}"))?;
-        affected = affected.saturating_add(result.rows_affected());
-    }
 
-    tx.commit()
-        .await
-        .map_err(|e| format!("stale-sweep commit: {e}"))?;
+            let paused_at = chrono::Utc::now().to_rfc3339();
+            let metadata_json = auto_pause_metadata_json(metadata.as_deref(), &paused_at);
+            let result = sqlx::query(
+                "UPDATE session_todos \
+                 SET status = 'paused', metadata = ?, updated_at = NOW(6) \
+                 WHERE user_id = ? AND session_id = ? AND todo_id = ? \
+                   AND status = 'in_progress' \
+                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR)",
+            )
+            .bind(metadata_json)
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(&todo_id)
+            .bind(STALE_THRESHOLD_HOURS as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("stale-sweep update: {e}"))?;
+            board_affected = board_affected.saturating_add(result.rows_affected());
+        }
+        if board_affected > 0 && has_counter {
+            bump_task_board_version(&mut tx, &user_id, &session_id).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| format!("stale-sweep commit: {e}"))?;
+        affected = affected.saturating_add(board_affected);
+    }
     Ok(affected)
 }
 
@@ -295,28 +385,19 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
 
     while remaining > 0 {
         let batch_size = remaining.min(SUB_BATCH_SIZE);
-        let mut tx = pool
-            .get()
-            .begin()
-            .await
-            .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
-
-        // The process-level sweeper lease is the ordinary single-owner path,
-        // but candidate claiming must still be correct if a lease handoff,
-        // operator-triggered pass, or test overlaps another worker. Lock the
-        // deterministic oldest-first batch inside the mutation transaction so
-        // two workers cannot both select a row and then report false progress.
+        // Discover globally, then claim per board after taking owner/counter
+        // locks. This keeps transactions small without violating the lock
+        // order shared with foreground full-board replacements.
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status IN ('completed', 'failed', 'cancelled') \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
              ORDER BY updated_at ASC, user_id ASC, session_id ASC, todo_id ASC \
-             LIMIT ? \
-             FOR UPDATE",
+             LIMIT ?",
         )
         .bind(days)
         .bind(batch_size)
-        .fetch_all(&mut *tx)
+        .fetch_all(pool.get())
         .await
         .map_err(|e| format!("completed-auto-archive select/decode: {e}"))?;
 
@@ -324,49 +405,69 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             break;
         }
 
+        let discovered = rows.len() as i64;
+        let mut by_board: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for (user_id, session_id, todo_id) in rows {
+            by_board
+                .entry((user_id, session_id))
+                .or_default()
+                .push(todo_id);
+        }
+
         let mut affected = 0u64;
-        let mut archived_by_owner_session: HashMap<(String, String), HashSet<String>> =
-            HashMap::new();
-        for (user_id, session_id, todo_id) in &rows {
-            let result = sqlx::query(
-                "UPDATE session_todos \
-                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE user_id = ? AND session_id = ? AND todo_id = ? \
-                   AND status IN ('completed', 'failed', 'cancelled') \
-                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(todo_id)
-            .bind(days)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("completed-auto-archive update: {e}"))?;
-            let rows_affected = result.rows_affected();
-            affected = affected.saturating_add(rows_affected);
-            if rows_affected > 0 {
-                archived_by_owner_session
-                    .entry((user_id.clone(), session_id.clone()))
-                    .or_default()
-                    .insert(todo_id.clone());
+        for ((user_id, session_id), todo_ids) in by_board {
+            let mut tx = pool
+                .get()
+                .begin()
+                .await
+                .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
+            let has_counter = lock_task_board_for_lifecycle(&mut tx, &user_id, &session_id).await?;
+            let mut archived_ids = HashSet::new();
+            for todo_id in todo_ids {
+                let result = sqlx::query(
+                    "UPDATE session_todos \
+                     SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                     WHERE user_id = ? AND session_id = ? AND todo_id = ? \
+                       AND status IN ('completed', 'failed', 'cancelled') \
+                       AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+                )
+                .bind(&user_id)
+                .bind(&session_id)
+                .bind(&todo_id)
+                .bind(days)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("completed-auto-archive update: {e}"))?;
+                if result.rows_affected() > 0 {
+                    archived_ids.insert(todo_id);
+                }
             }
-        }
 
-        for ((user_id, session_id), archived_ids) in &archived_by_owner_session {
-            detach_auto_archived_dependency_edges(&mut tx, user_id, session_id, archived_ids)
+            let board_affected = archived_ids.len() as u64;
+            if board_affected > 0 {
+                detach_auto_archived_dependency_edges(
+                    &mut tx,
+                    &user_id,
+                    &session_id,
+                    &archived_ids,
+                )
                 .await?;
+                if has_counter {
+                    bump_task_board_version(&mut tx, &user_id, &session_id).await?;
+                }
+            }
+            tx.commit()
+                .await
+                .map_err(|e| format!("completed-auto-archive commit: {e}"))?;
+            affected = affected.saturating_add(board_affected);
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| format!("completed-auto-archive commit: {e}"))?;
 
         total_affected = total_affected.saturating_add(affected);
         remaining -= batch_size;
 
         // If this sub-batch returned fewer rows than requested, no more
         // candidates exist — stop early.
-        if (rows.len() as i64) < batch_size {
+        if discovered < batch_size {
             break;
         }
     }
@@ -483,27 +584,17 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
 
     while remaining > 0 {
         let batch_size = remaining.min(SUB_BATCH_SIZE);
-        let mut tx = pool
-            .get()
-            .begin()
-            .await
-            .map_err(|e| format!("archive-gc tx begin: {e}"))?;
-
-        // GC uses the same transaction-local claim boundary as auto-archive.
-        // Stable tie-breakers prevent an equal-timestamp backlog from
-        // repeatedly favoring an arbitrary subset.
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status = 'archived' \
                AND archived_at IS NOT NULL \
                AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
              ORDER BY archived_at ASC, user_id ASC, session_id ASC, todo_id ASC \
-             LIMIT ? \
-             FOR UPDATE",
+             LIMIT ?",
         )
         .bind(days)
         .bind(batch_size)
-        .fetch_all(&mut *tx)
+        .fetch_all(pool.get())
         .await
         .map_err(|e| format!("archive-gc select/decode: {e}"))?;
 
@@ -511,34 +602,55 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
             break;
         }
 
-        let mut affected = 0u64;
-        for (user_id, session_id, todo_id) in &rows {
-            let result = sqlx::query(
-                "DELETE FROM session_todos \
-                 WHERE user_id = ? AND session_id = ? AND todo_id = ? AND status = 'archived' \
-                   AND archived_at IS NOT NULL \
-                   AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(todo_id)
-            .bind(days)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("archive-gc delete: {e}"))?;
-            affected = affected.saturating_add(result.rows_affected());
+        let discovered = rows.len() as i64;
+        let mut by_board: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for (user_id, session_id, todo_id) in rows {
+            by_board
+                .entry((user_id, session_id))
+                .or_default()
+                .push(todo_id);
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| format!("archive-gc commit: {e}"))?;
+        let mut affected = 0u64;
+        for ((user_id, session_id), todo_ids) in by_board {
+            let mut tx = pool
+                .get()
+                .begin()
+                .await
+                .map_err(|e| format!("archive-gc tx begin: {e}"))?;
+            let has_counter = lock_task_board_for_lifecycle(&mut tx, &user_id, &session_id).await?;
+            let mut board_affected = 0u64;
+            for todo_id in todo_ids {
+                let result = sqlx::query(
+                    "DELETE FROM session_todos \
+                     WHERE user_id = ? AND session_id = ? AND todo_id = ? \
+                       AND status = 'archived' AND archived_at IS NOT NULL \
+                       AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+                )
+                .bind(&user_id)
+                .bind(&session_id)
+                .bind(&todo_id)
+                .bind(days)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("archive-gc delete: {e}"))?;
+                board_affected = board_affected.saturating_add(result.rows_affected());
+            }
+            if board_affected > 0 && has_counter {
+                bump_task_board_version(&mut tx, &user_id, &session_id).await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| format!("archive-gc commit: {e}"))?;
+            affected = affected.saturating_add(board_affected);
+        }
 
         total_affected = total_affected.saturating_add(affected);
         remaining -= batch_size;
 
         // If this sub-batch returned fewer rows than requested, no more
         // candidates exist — stop early.
-        if (rows.len() as i64) < batch_size {
+        if discovered < batch_size {
             break;
         }
     }
@@ -1387,6 +1499,14 @@ mod tests {
         .execute(&pool)
         .await
         .expect("age in_progress task");
+        let version_before: i64 = sqlx::query_scalar(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("version before stale sweep");
 
         let paused_count = run_stale_in_progress_sweep(shared.clone())
             .await
@@ -1394,6 +1514,19 @@ mod tests {
         assert!(
             paused_count >= 1,
             "global sweeper may also pause unrelated stale rows; got {paused_count}"
+        );
+        let version_after: i64 = sqlx::query_scalar(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("version after stale sweep");
+        assert_eq!(
+            version_after,
+            version_before + 1,
+            "background lifecycle mutation must invalidate sealed board snapshots"
         );
 
         let paused: serde_json::Value = serde_json::from_str(

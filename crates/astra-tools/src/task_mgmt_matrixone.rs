@@ -5,20 +5,14 @@
 //! reads/writes the same `session_todos` rows for a given owner/session pair,
 //! so a task created on the CLI is immediately visible to a cloud-resumed turn.
 //!
-//! # Sizing assumption
-//!
-//! [`TASK_SOFT_CAP`] encodes the Tier 1 "dozens of rows" budget as a concrete
-//! number. Callers should treat a failing `debug_assert!(len < TASK_SOFT_CAP)`
-//! in [`MatrixOneTaskStore::save`] as a signal to revisit the
-//! delete-all / insert-all strategy in favour of incremental upserts.
-//!
 //! This impl uses a simple **load-all / replace-all** strategy that matches
-//! the [`TaskStore`] trait semantics: a session's todo vec is small (dozens
-//! of rows at most), so a full rewrite on every mutation keeps the MO access
-//! pattern and the in-memory logic in perfect sync with no partial-update
-//! complexity. CLAUDE.md §5 compliance: no `WHERE` on JSON columns; every
-//! read is column-scoped; owner-bound session indexes cover load and active
-//! queries, while a separate user/status index powers cross-session views.
+//! the [`TaskStore`] trait semantics. Inserts are batched, and lifecycle
+//! archive/GC keeps ordinary live boards compact. There is deliberately no
+//! debug-only row limit: correctness and accepted inputs must not differ
+//! between development and release builds. CLAUDE.md §5 compliance: no
+//! `WHERE` on JSON columns; every read is column-scoped; owner-bound session
+//! indexes cover load and active queries, while a separate user/status index
+//! powers cross-session views.
 
 use astra_core::sqlx::{self, MySql, MySqlConnection, Pool, QueryBuilder, Row};
 use async_trait::async_trait;
@@ -32,14 +26,6 @@ use crate::task_mgmt::{
     TaskStore,
 };
 
-/// Soft cap on the number of rows a single `session_todos` full-replace
-/// is expected to handle. Above this the delete-all / insert-all strategy
-/// stops being cheap and callers should migrate to incremental upserts.
-///
-/// Tier 1 plan assumption: a session holds "dozens of rows"; 256 leaves
-/// ample headroom before the debug_assert in [`MatrixOneTaskStore::save`]
-/// trips.
-pub const TASK_SOFT_CAP: usize = 256;
 const INSERT_BATCH_ROWS: usize = 100;
 
 const EXHAUSTED_COUNTER_SENTINEL: u64 = u32::MAX as u64 + 1;
@@ -536,16 +522,6 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        // Full-replace is justified only while task counts stay small (per
-        // module docs: "dozens of rows at most"). Break loudly in debug
-        // builds if a session ever pushes past a soft cap so we catch the
-        // design assumption breaking before it becomes a perf problem.
-        debug_assert!(
-            tasks.len() < TASK_SOFT_CAP,
-            "session_todos full-replace exceeded soft cap ({} rows); revisit incremental upserts",
-            tasks.len()
-        );
-
         if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -885,36 +861,34 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if expected_version > 0 {
-            // CAS: atomically verify the session version hasn't changed since
-            // the snapshot was captured.  Without this, a concurrent sweeper
-            // auto-pause or plan-mirror mutation could be silently overwritten.
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
-            )
-            .bind(session_id)
-            .bind(&self.user_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
-            let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
-            if current_version != expected_version {
-                return Err(format!(
-                    "restore_snapshot_state: version conflict (expected={}, current={}) — \
-                     task board changed after rollback snapshot was sealed; retry with fresh state",
-                    expected_version, current_version
-                ));
-            }
+        // CAS even at version 0: an absent/new board is a real state, not a
+        // request to disable conflict detection. The owner row lock prevents
+        // a concurrent first writer from inserting the counter between this
+        // check and the upsert below.
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
+        )
+        .bind(session_id)
+        .bind(&self.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
+        let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
+        if current_version != expected_version {
+            return Err(format!(
+                "restore_snapshot_state: version conflict (expected={}, current={}) — \
+                 task board changed after rollback snapshot was sealed; retry with fresh state",
+                expected_version, current_version
+            ));
         }
 
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, 0) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
         )
         .bind(session_id)
         .bind(&self.user_id)
         .bind(counter_bind_value(next_task_id))
-        .bind(expected_version as i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("restore_snapshot_state: counter upsert failed: {e}"))?;
@@ -932,12 +906,6 @@ impl TaskStore for MatrixOneTaskStore {
             }
             return Err(e);
         }
-
-        debug_assert!(
-            tasks.len() < TASK_SOFT_CAP,
-            "session_todos full-replace exceeded soft cap ({} rows); revisit incremental upserts",
-            tasks.len()
-        );
 
         if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
