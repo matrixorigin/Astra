@@ -1938,17 +1938,36 @@ fn handle_task_surface_shortcut(
         || !key
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL)
-        || (bottom_pane.has_active_view() && !bottom_pane.primary_workspace_is_open())
+        || (bottom_pane.has_active_view()
+            && !bottom_pane.primary_workspace_is_open()
+            && !bottom_pane.agent_monitor_is_open())
     {
         return false;
     }
 
-    // A focused transcript owns the primary canvas, so the compact board
-    // beneath the composer is deliberately not painted. Ctrl+T therefore
-    // opens the same canonical projection as a workspace, preserving the
-    // conversation tab below it instead of silently toggling an invisible
-    // strip. Ctrl+B remains the explicit background-task surface.
-    if bottom_pane.conversation_tab_is_open() {
+    // A primary workspace owns the canvas, so the compact board beneath the
+    // composer is not painted. Ctrl+T therefore switches to the canonical
+    // Task Board workspace instead of toggling invisible state behind a
+    // transcript, agent monitor, or other workbench view. The retained view
+    // is reactivated so its typed focus and scroll state survive navigation.
+    // Ctrl+B remains the explicit background-task surface.
+    if bottom_pane.task_board_is_open() {
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+        {
+            task_board.toggle_view_mode();
+            task_board.reveal_completed_for_review();
+            reconcile_task_board_on_open(task_board);
+            bottom_pane.refresh_task_board(&task_board.active_projection());
+            frame_requester.schedule_frame();
+            return true;
+        }
+        bottom_pane.close_active_view();
+        frame_requester.schedule_frame();
+        return true;
+    }
+    if bottom_pane.primary_workspace_is_open() || bottom_pane.agent_monitor_is_open() {
         if key
             .modifiers
             .contains(crossterm::event::KeyModifiers::SHIFT)
@@ -1957,9 +1976,11 @@ fn handle_task_surface_shortcut(
         }
         task_board.reveal_completed_for_review();
         reconcile_task_board_on_open(task_board);
-        bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
-            task_board.active_projection(),
-        )));
+        if !bottom_pane.activate_task_board() {
+            bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
+                task_board.active_projection(),
+            )));
+        }
         frame_requester.schedule_frame();
         return true;
     }
@@ -9928,8 +9949,8 @@ mod tests {
             background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
                 .expect("snapshot");
         assert_eq!(snapshot.kind, "local agent");
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.terminal);
+        assert_eq!(snapshot.status.as_str(), "failed");
+        assert!(snapshot.status.is_terminal());
         assert_eq!(snapshot.output, "concurren");
         assert_eq!(snapshot.total_bytes, "concurrency cap reached".len() as u64);
     }
@@ -9948,10 +9969,10 @@ mod tests {
 
         assert_eq!(snapshot.kind, "local agent");
         assert_eq!(snapshot.title.as_deref(), Some("review auth flow"));
-        assert_eq!(snapshot.status, "running");
+        assert_eq!(snapshot.status.as_str(), "running");
         assert_eq!(snapshot.output, "reviewing auth middleware");
         assert_eq!(snapshot.output_ref, "agent_state: agent-1");
-        assert!(!snapshot.terminal);
+        assert!(!snapshot.status.is_terminal());
     }
 
     fn restored_local_agent_projection(
@@ -10089,7 +10110,7 @@ mod tests {
             .expect("foreground tick must answer command")
             .expect("background output must be readable");
         assert_eq!(snapshot.output, "progress\n");
-        assert!(snapshot.terminal);
+        assert!(snapshot.status.is_terminal());
         assert!(commands.lock_recover().is_empty());
     }
 
@@ -10137,7 +10158,7 @@ mod tests {
             "{}",
             snapshot.output
         );
-        assert!(snapshot.terminal);
+        assert!(snapshot.status.is_terminal());
         assert!(commands.lock_recover().is_empty());
     }
 
@@ -10194,8 +10215,8 @@ mod tests {
         .expect("restored projection should be readable");
 
         assert_eq!(snapshot.kind, "local agent");
-        assert_eq!(snapshot.status, "running");
-        assert!(!snapshot.terminal);
+        assert_eq!(snapshot.status.as_str(), "running");
+        assert!(!snapshot.status.is_terminal());
         assert_eq!(snapshot.output, "reviewing auth middleware");
         assert_eq!(snapshot.output_ref, "workspace_projection: agent-restored");
     }
@@ -10534,6 +10555,28 @@ mod tests {
         assert!(bottom_pane.primary_workspace_is_open());
         assert!(render_bottom_pane_text(&bottom_pane, 80, 16).contains("Task board"));
 
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(
+            bottom_pane.conversation_tab_is_open(),
+            "a second Ctrl+T should return to the retained conversation"
+        );
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+
         assert!(matches!(
             bottom_pane.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Esc,
@@ -10542,6 +10585,65 @@ mod tests {
             crate::tui::bottom_pane::BottomPaneAction::ViewCompleted { .. }
         ));
         assert!(bottom_pane.conversation_tab_is_open());
+    }
+
+    #[test]
+    fn ctrl_t_switches_between_agent_monitor_and_task_board() {
+        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
+        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+        let frame_requester = FrameRequester::test_dummy();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let mut expanded = false;
+        let mut pin = None;
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            crate::tui::chat_widget::WireEvent::AgentLive(
+                astra_turn_core::agent_live_event::AgentLiveEvent {
+                    run_id: "run-review".into(),
+                    agent_id: "reviewer@run-review".into(),
+                    kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta(
+                        "reviewing".into(),
+                    ),
+                },
+            ),
+        ));
+        assert!(handle_agent_monitor_shortcut(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('g'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            &mut chat_widget,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(bottom_pane.agent_monitor_is_open());
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(bottom_pane.task_board_is_open());
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(
+            bottom_pane.agent_monitor_is_open(),
+            "closing Task Board should restore the retained Agent Monitor"
+        );
     }
 
     #[test]
@@ -11079,8 +11181,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "completed");
-        assert!(snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "completed");
+        assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("done"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
@@ -11099,8 +11201,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "failed");
+        assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("<stderr>"), "{snapshot:?}");
         assert!(snapshot.output.contains("stderr-line"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
@@ -11137,8 +11239,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "running");
-        assert!(!snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "running");
+        assert!(!snapshot.status.is_terminal(), "{snapshot:?}");
         assert_eq!(snapshot.output, "old output\n");
     }
 

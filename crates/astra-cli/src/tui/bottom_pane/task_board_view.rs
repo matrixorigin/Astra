@@ -494,6 +494,10 @@ impl BottomPaneView for TaskBoardView {
     fn owns_primary_canvas(&self) -> bool {
         true
     }
+
+    fn is_task_board_view(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

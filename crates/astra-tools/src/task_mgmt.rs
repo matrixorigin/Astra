@@ -582,10 +582,6 @@ impl SessionTaskStatusKind {
     pub fn can_be_stopped(&self) -> bool {
         matches!(self, Self::Pending | Self::InProgress | Self::Paused)
     }
-
-    pub fn blocks_duplicate_create(&self) -> bool {
-        matches!(self, Self::Pending | Self::InProgress | Self::Paused)
-    }
 }
 
 impl SessionTaskStatusKind {
@@ -1587,38 +1583,6 @@ pub const VALID_LIST_STATUS_FILTERS: &[&str] = &[
     "all",
     "active",
 ];
-
-/// Title normalization for U-4 duplicate detection. Lowercase, drop
-/// ASCII punctuation, collapse whitespace. Conservative on purpose:
-/// we'd rather miss a near-duplicate (model retries with different
-/// wording → 2 tasks, manageable) than false-positive a legitimate
-/// fresh task (refuse with `duplicate_of` → model confused).
-pub fn normalize_title(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
-    let mut prev_was_space = true; // skip leading whitespace
-    for ch in title.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
-            }
-        } else if ch.is_ascii_punctuation() {
-            // Drop punctuation entirely so "fix bug." matches "fix bug".
-            // Don't pretend it's a word boundary either — preserve
-            // adjacency so "auth-flow" matches "auth flow" without the
-            // hyphen merging into the next char.
-        } else {
-            for lc in ch.to_lowercase() {
-                out.push(lc);
-            }
-            prev_was_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
-}
 
 fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>, String> {
     let raw_new_status = args.get("new_status");
@@ -2689,34 +2653,6 @@ impl TaskManager {
             .mutate(
                 &sid,
                 Box::new(move |mut tasks, next| {
-                    // U-4 dedup: refuse exact-normalized title match
-                    // against open (pending/in_progress/paused) tasks.
-                    // Without this, a session restart can lead the
-                    // model to re-create work it already has open.
-                    // Returns the existing id so the model can
-                    // continue with the open task instead of
-                    // duplicating.
-                    let normalized_new = normalize_title(&mutation_title);
-                    if let Some(dup) = tasks.iter().find(|t| {
-                        t.status.blocks_duplicate_create()
-                            && normalize_title(&t.title) == normalized_new
-                    }) {
-                        let summary = format!(
-                            "Refused: open task #{} already has this title — use update / get instead",
-                            dup.id
-                        );
-                        let data = json!({
-                            "duplicate_of": dup.id,
-                            "duplicate_title": dup.title,
-                            "duplicate_status": dup.status,
-                            "message": format!(
-                                "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
-                                dup.id
-                            ),
-                        });
-                        return Ok(TaskMutationResult::refused(tasks, summary, data));
-                    }
-
                     let task_id = format!("task-{next}");
                     // U-10: if the counter is desynced (corruption or
                     // partial init), `next` may point at an id that
@@ -3257,35 +3193,6 @@ impl TaskManager {
                     };
                     validate_parent_status_transition(previous_status, new_status)?;
                     let projected_status = new_status.unwrap_or(previous_status);
-                    if let Some(title) = title_update.as_deref()
-                        && projected_status.blocks_duplicate_create()
-                    {
-                        let normalized_new = normalize_title(title);
-                        if let Some(dup) = tasks.iter().find(|t| {
-                            t.id != task_id
-                                && t.status.blocks_duplicate_create()
-                                && normalize_title(&t.title) == normalized_new
-                        }) {
-                            let summary = format!(
-                                "Refused: open task #{} already has this title — keep task titles distinct or update the existing task",
-                                dup.id
-                            );
-                            let data = json!({
-                                "duplicate_of": dup.id,
-                                "duplicate_title": dup.title,
-                                "duplicate_status": dup.status,
-                                "task_id": task_id,
-                                "message": format!(
-                                    "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
-                                    task_id,
-                                    dup.title,
-                                    dup.id
-                                ),
-                            });
-                            return Ok(TaskMutationResult::refused(tasks, summary, data));
-                        }
-                    }
-
                     // Collect proposed edge changes before mutating so cycle detection
                     // sees a consistent view.
                     let existing_task_ids: HashSet<&str> =
@@ -3848,11 +3755,6 @@ mod tests {
         assert!(SessionTaskStatusKind::InProgress.can_be_stopped());
         assert!(SessionTaskStatusKind::Paused.can_be_stopped());
         assert!(!SessionTaskStatusKind::Cancelled.can_be_stopped());
-        assert!(SessionTaskStatusKind::Pending.blocks_duplicate_create());
-        assert!(SessionTaskStatusKind::InProgress.blocks_duplicate_create());
-        assert!(SessionTaskStatusKind::Paused.blocks_duplicate_create());
-        assert!(!SessionTaskStatusKind::Completed.blocks_duplicate_create());
-        assert!(!SessionTaskStatusKind::Cancelled.blocks_duplicate_create());
         assert!(SessionTaskStatusKind::Failed.is_unsuccessful());
         assert!(SessionTaskStatusKind::Cancelled.is_unsuccessful());
         assert!(!SessionTaskStatusKind::Archived.is_unsuccessful());
@@ -4953,35 +4855,22 @@ mod tests {
         assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
     }
 
-    /// U-4 (unhappy path): refuse to create an exact-normalized
-    /// duplicate of an active task. The model after a session
-    /// restore frequently re-creates work it already has open;
-    /// returning the existing id steers it to update/get instead.
     #[tokio::test]
-    async fn create_refuses_exact_normalized_duplicate_of_active_task() {
+    async fn create_does_not_use_title_similarity_as_an_idempotency_key() {
         let m = mgr();
         m.create(&json!({"title": "Implement dark mode toggle"}))
             .await;
-        // Same intent, different punctuation/spacing.
-        let dup = m
+        let second = m
             .create(&json!({"title": "  Implement DARK mode toggle. "}))
             .await;
-        assert!(
-            dup.contains("Refused"),
-            "second create should be refused with duplicate notice; got {dup}"
-        );
-        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(
-            dup_parsed["duplicate_of"], "task-1",
-            "response must name the existing task id; got {dup}"
-        );
-        // The store should still hold exactly one task (no second
-        // row appended even though the closure ran).
+        let second: Value =
+            serde_json::from_str(second.split_once('\n').unwrap().1).expect("create response");
+        assert_eq!(second["task_id"], "task-2");
         let list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(
-            list["count"], 1,
-            "duplicate must not be persisted; got {list}"
+            list["count"], 2,
+            "titles are presentation, not a semantic uniqueness constraint: {list}"
         );
     }
 
@@ -4989,22 +4878,17 @@ mod tests {
     async fn refused_mutation_does_not_advance_board_version_or_broadcast() {
         let store = Arc::new(InMemoryTaskStore::new());
         let manager = TaskManager::new("typed-refusal", store.clone());
-        manager
-            .create(&json!({"title": "Implement dark mode toggle"}))
-            .await;
+        manager.create(&json!({"title": "pending work"})).await;
         let version = store
             .get_session_version("typed-refusal")
             .await
             .expect("version after create");
         let mut changes = store.subscribe().expect("in-memory change stream");
 
-        let outcome = manager
-            .create_outcome(&json!({"title": "IMPLEMENT DARK MODE TOGGLE."}))
-            .await;
+        let outcome = manager.archive_outcome(&json!({"task_id": "task-1"})).await;
 
-        assert!(!outcome.success);
-        assert!(!outcome.changed);
-        assert_eq!(outcome.data["duplicate_of"], "task-1");
+        assert_eq!(outcome.status, TaskMutationStatus::Refused);
+        assert_eq!(outcome.data["task_id"], "task-1");
         assert_eq!(
             store
                 .get_session_version("typed-refusal")
@@ -5101,9 +4985,6 @@ mod tests {
         );
     }
 
-    /// Dedup must NOT block creating a task whose normalized title
-    /// matches a *completed* (non-active) task — the user is
-    /// resurrecting work intentionally.
     #[tokio::test]
     async fn create_allows_duplicate_of_completed_task() {
         let m = mgr();
@@ -5128,57 +5009,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_refuses_exact_normalized_duplicate_of_paused_task() {
+    async fn create_allows_same_title_as_paused_task() {
         let m = mgr();
         m.create(&json!({"title": "resume this later"})).await;
         m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
             .await;
 
-        let dup = m.create(&json!({"title": "Resume this later."})).await;
-
-        assert!(
-            dup.contains("Refused") && dup.contains("duplicate_of"),
-            "paused work is still open and must not be duplicated: {dup}"
-        );
-        assert!(
-            dup.starts_with("Refused: open task"),
-            "duplicate refusal should name the open task, not call it only active: {dup}"
-        );
+        let second = m.create(&json!({"title": "Resume this later."})).await;
+        let second: Value =
+            serde_json::from_str(second.split_once('\n').unwrap().1).expect("create response");
+        assert_eq!(second["task_id"], "task-2");
         let list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(
-            list["count"], 1,
-            "paused duplicate refusal must not persist a second task: {list}"
+            list["count"], 2,
+            "paused work does not make its title a uniqueness key: {list}"
         );
     }
 
     #[tokio::test]
-    async fn update_title_refuses_exact_normalized_duplicate_of_open_task() {
+    async fn update_title_allows_duplicate_open_task_titles() {
         let m = mgr();
         m.create(&json!({"title": "Implement OAuth callback"}))
             .await;
         m.create(&json!({"title": "Wire billing webhook"})).await;
 
-        let dup = m
+        let updated = m
             .update(&json!({
                 "task_id": "task-2",
                 "title": " implement oauth callback. "
             }))
             .await;
 
-        assert!(
-            dup.starts_with("Refused: open task #task-1"),
-            "renaming an open task to duplicate another open task should be refused: {dup}"
-        );
-        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(dup_parsed["success"], false, "{dup}");
-        assert_eq!(dup_parsed["duplicate_of"], "task-1", "{dup}");
+        let updated: Value =
+            serde_json::from_str(updated.split_once('\n').unwrap().1).expect("update response");
+        assert_eq!(updated["success"], true, "{updated}");
 
         let task_2: Value =
             serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
         assert_eq!(
-            task_2["title"], "Wire billing webhook",
-            "refused duplicate rename must leave the original title unchanged: {task_2}"
+            task_2["title"], " implement oauth callback. ",
+            "title updates are not rejected by semantic string heuristics: {task_2}"
         );
     }
 

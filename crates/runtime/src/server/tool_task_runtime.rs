@@ -33,7 +33,7 @@ pub(crate) fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
 
 pub(crate) fn task_user_status_matches(status_filter: &str, status: SessionTaskStatusKind) -> bool {
     match status_filter {
-        "active" => status.blocks_duplicate_create(),
+        "active" => status.is_open_work(),
         "all" => true,
         status_filter => status == SessionTaskStatusKind::from(status_filter),
     }

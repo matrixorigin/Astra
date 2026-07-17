@@ -760,6 +760,26 @@ impl BottomPane {
             .is_some_and(|view| view.owns_primary_canvas())
     }
 
+    pub(crate) fn task_board_is_open(&self) -> bool {
+        self.active_view()
+            .is_some_and(BottomPaneView::is_task_board_view)
+    }
+
+    /// Reactivate the retained Task Board workspace instead of stacking a
+    /// duplicate. This preserves the board's stable focus and scroll state.
+    pub(crate) fn activate_task_board(&mut self) -> bool {
+        let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|view| view.is_task_board_view())
+        else {
+            return false;
+        };
+        let view = self.view_stack.remove(index);
+        self.view_stack.push(view);
+        true
+    }
+
     /// A focused root or delegated transcript owns the primary terminal
     /// canvas. This is a conversation switch, not a taller detail pane.
     pub(crate) fn prepare_conversation_workspace(&mut self, terminal_height: u16, width: u16) {

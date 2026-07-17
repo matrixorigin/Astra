@@ -632,6 +632,61 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 }
 
 /// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BgTaskOutputStatus {
+    Pending,
+    Running,
+    WaitingForInput,
+    Stopping,
+    Completed,
+    Failed,
+    Interrupted,
+    Killed,
+    Unavailable,
+}
+
+impl BgTaskOutputStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingForInput => "waiting_for_input",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Killed => "killed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn from_protocol(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "waiting_for_input" => Some(Self::WaitingForInput),
+            "stopping" => Some(Self::Stopping),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            "killed" => Some(Self::Killed),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Killed | Self::Unavailable
+        )
+    }
+
+    fn should_wake_waiter(self) -> bool {
+        self.is_terminal() || self == Self::WaitingForInput
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BgTaskOutputSnapshot {
     pub kind: String,
@@ -640,8 +695,7 @@ pub struct BgTaskOutputSnapshot {
     pub end_offset: u64,
     pub total_bytes: u64,
     pub total_lines: u64,
-    pub status: String,
-    pub terminal: bool,
+    pub status: BgTaskOutputStatus,
     pub output_ref: String,
 }
 
@@ -652,8 +706,7 @@ pub struct BgTaskOutputSearchSnapshot {
     pub output: String,
     pub matching_lines: u64,
     pub truncated: bool,
-    pub status: String,
-    pub terminal: bool,
+    pub status: BgTaskOutputStatus,
     pub output_ref: String,
 }
 
@@ -961,15 +1014,16 @@ fn format_background_task_output(
         "monitor" => format!("Read monitor output {task_id}"),
         other => format!("Read {other} output {task_id}"),
     };
-    let status_label = match snapshot.status.as_str() {
-        "pending" => "pending",
-        "running" => "still running",
-        "waiting_for_input" => "needs input",
-        "completed" => "completed",
-        "failed" => "failed",
-        "killed" => "killed",
-        "unavailable" => "unavailable",
-        other => other,
+    let status_label = match snapshot.status {
+        BgTaskOutputStatus::Pending => "pending",
+        BgTaskOutputStatus::Running => "still running",
+        BgTaskOutputStatus::WaitingForInput => "needs input",
+        BgTaskOutputStatus::Stopping => "stopping",
+        BgTaskOutputStatus::Completed => "completed",
+        BgTaskOutputStatus::Failed => "failed",
+        BgTaskOutputStatus::Interrupted => "interrupted",
+        BgTaskOutputStatus::Killed => "killed",
+        BgTaskOutputStatus::Unavailable => "unavailable",
     };
     let mut metadata_parts = vec![
         format!("offset {offset} -> {}", snapshot.end_offset),
@@ -978,7 +1032,11 @@ fn format_background_task_output(
         format!("{} total lines", snapshot.total_lines),
         format!(
             "terminal {}",
-            if snapshot.terminal { "true" } else { "false" }
+            if snapshot.status.is_terminal() {
+                "true"
+            } else {
+                "false"
+            }
         ),
     ];
     if (read_mode == BgTaskOutputReadMode::Historical || kind != "shell")
@@ -988,18 +1046,20 @@ fn format_background_task_output(
             "next_call task_output(task_id='{task_id}', offset={}, block=false)",
             snapshot.end_offset
         ));
-    } else if !snapshot.terminal && snapshot.status != "waiting_for_input" {
+    } else if !snapshot.status.is_terminal()
+        && snapshot.status != BgTaskOutputStatus::WaitingForInput
+    {
         metadata_parts.push(format!(
             "later_call task_output(task_id='{task_id}', block=false)"
         ));
         metadata_parts.push("do_not_poll_again_this_turn".to_string());
-    } else if snapshot.status == "waiting_for_input" {
+    } else if snapshot.status == BgTaskOutputStatus::WaitingForInput {
         metadata_parts.push("requires_input true".to_string());
     }
     if !snapshot.output_ref.trim().is_empty() {
         metadata_parts.push(format!("output_ref {}", snapshot.output_ref));
     }
-    if kind == "shell" && snapshot.status == "failed" {
+    if kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed {
         metadata_parts.push("failure_cause unverified".to_string());
         metadata_parts.push("diagnostic_search_available true".to_string());
     }
@@ -1012,26 +1072,38 @@ fn format_background_task_output(
     }
     let metadata = metadata_parts.join(" · ");
     if snapshot.output.is_empty() {
-        let state = match (kind, snapshot.status.as_str()) {
-            ("local agent", "pending") => "Pending · local agent has not started",
-            ("local agent", "running") => "No result yet · local agent still running",
-            ("local agent", "waiting_for_input") => "Local agent waiting for input · no result yet",
-            ("local agent", "completed") => "Local agent completed with no result",
-            ("local agent", "failed") => "Local agent failed with no output",
-            ("local agent", "killed") => "Local agent stopped with no result",
-            ("local agent", "unavailable") => {
+        let state = match (kind, snapshot.status) {
+            ("local agent", BgTaskOutputStatus::Pending) => "Pending · local agent has not started",
+            ("local agent", BgTaskOutputStatus::Running) => {
+                "No result yet · local agent still running"
+            }
+            ("local agent", BgTaskOutputStatus::WaitingForInput) => {
+                "Local agent waiting for input · no result yet"
+            }
+            ("local agent", BgTaskOutputStatus::Completed) => {
+                "Local agent completed with no result"
+            }
+            ("local agent", BgTaskOutputStatus::Failed) => "Local agent failed with no output",
+            ("local agent", BgTaskOutputStatus::Interrupted) => {
+                "Local agent interrupted with no result"
+            }
+            ("local agent", BgTaskOutputStatus::Killed) => "Local agent stopped with no result",
+            ("local agent", BgTaskOutputStatus::Unavailable) => {
                 "Local agent unavailable · stale handle or unsupported runner"
             }
-            (_, "pending") => "Pending · no output yet",
-            (_, "running") => "No output yet · still running",
-            (_, "waiting_for_input") => "Waiting for input · no new output",
-            (_, "completed") => "Completed with no output",
-            (_, "failed") => "Failed with no output",
-            (_, "killed") => "Stopped with no output",
-            (_, "unavailable") => "Unavailable · stale handle or unsupported runner",
-            _ => "No output yet",
+            (_, BgTaskOutputStatus::Pending) => "Pending · no output yet",
+            (_, BgTaskOutputStatus::Running) => "No output yet · still running",
+            (_, BgTaskOutputStatus::WaitingForInput) => "Waiting for input · no new output",
+            (_, BgTaskOutputStatus::Stopping) => "Stopping · no new output",
+            (_, BgTaskOutputStatus::Completed) => "Completed with no output",
+            (_, BgTaskOutputStatus::Failed) => "Failed with no output",
+            (_, BgTaskOutputStatus::Interrupted) => "Interrupted with no output",
+            (_, BgTaskOutputStatus::Killed) => "Stopped with no output",
+            (_, BgTaskOutputStatus::Unavailable) => {
+                "Unavailable · stale handle or unsupported runner"
+            }
         };
-        let diagnosis = (kind == "shell" && snapshot.status == "failed").then_some(
+        let diagnosis = (kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed).then_some(
             "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
         );
         return format!("{header}\n{state} · {metadata}{}", diagnosis.unwrap_or(""));
@@ -1039,7 +1111,7 @@ fn format_background_task_output(
 
     let chunk = snapshot.output.trim_end();
     let line_count = chunk.lines().count();
-    let diagnosis = (kind == "shell" && snapshot.status == "failed").then_some(
+    let diagnosis = (kind == "shell" && snapshot.status == BgTaskOutputStatus::Failed).then_some(
         "\nFailure diagnosis is still open. Search this task's captured output with task_output(pattern=...) before assigning a cause; a failed status alone is not evidence that a test is flaky.",
     );
     format!(
@@ -1089,9 +1161,9 @@ fn format_background_task_output_search(
         } else {
             "lines"
         },
-        snapshot.terminal,
+        snapshot.status.is_terminal(),
     );
-    let evidence_contract = if snapshot.status == "failed" {
+    let evidence_contract = if snapshot.status == BgTaskOutputStatus::Failed {
         "\nDiagnostic search returns evidence, not a classification. Call a test flaky only after a controlled rerun succeeds or equivalent repeatability evidence exists."
     } else {
         ""
@@ -1136,8 +1208,8 @@ fn background_task_output_result_fields(
         serde_json::json!({
             "task_id": task_id,
             "task_kind": snapshot.kind,
-            "status": snapshot.status,
-            "terminal": snapshot.terminal,
+            "status": snapshot.status.as_str(),
+            "terminal": snapshot.status.is_terminal(),
             "mode": observation_mode,
         }),
     )])
@@ -1153,8 +1225,8 @@ fn background_task_output_search_result_fields(
         serde_json::json!({
             "task_id": task_id,
             "task_kind": snapshot.kind,
-            "status": snapshot.status,
-            "terminal": snapshot.terminal,
+            "status": snapshot.status.as_str(),
+            "terminal": snapshot.status.is_terminal(),
             "mode": "diagnostic",
             "pattern": pattern,
             "matching_lines": snapshot.matching_lines,
@@ -1220,14 +1292,6 @@ fn format_background_task_unavailable(cloud_session: bool, task_id: Option<&str>
         response["task_id"] = serde_json::Value::String(task_id.to_string());
     }
     response.to_string()
-}
-
-fn background_task_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "killed" | "unavailable")
-}
-
-fn background_task_status_should_wake_waiter(status: &str) -> bool {
-    background_task_status_is_terminal(status) || status == "waiting_for_input"
 }
 
 fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> {
@@ -3884,7 +3948,7 @@ impl ToolExecutor {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            if background_task_status_should_wake_waiter(&latest.status) {
+            if latest.status.should_wake_waiter() {
                 return match background_task_output_view(
                     bg_commands,
                     &task_id,
@@ -3919,7 +3983,7 @@ impl ToolExecutor {
                         *tool_result_fields = Some(background_task_output_result_fields(
                             &task_id, &snapshot, read_mode, true,
                         ));
-                        if background_task_status_should_wake_waiter(&snapshot.status) {
+                        if snapshot.status.should_wake_waiter() {
                             format_background_task_output(&task_id, offset, &snapshot, read_mode)
                         } else {
                             format_background_task_output_wait_timeout(
@@ -4001,14 +4065,14 @@ impl ToolExecutor {
         let terminal = group.is_terminal();
         let status = if terminal {
             if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
-                "failed"
+                BgTaskOutputStatus::Failed
             } else {
-                "completed"
+                BgTaskOutputStatus::Completed
             }
         } else if summary.active > 0 {
-            "running"
+            BgTaskOutputStatus::Running
         } else {
-            "pending"
+            BgTaskOutputStatus::Pending
         };
         // Estimate ~150 bytes per slot JSON entry. Cap serialized slots to avoid
         // allocating hundreds of KB for large fanout groups when the caller only
@@ -4041,7 +4105,7 @@ impl ToolExecutor {
             "type": "agent_fanout_group",
             "group_id": &group.group_id,
             "title": &group.title,
-            "status": status,
+            "status": status.as_str(),
             "summary": group.summary_sentence(),
             "target_count": summary.target_count,
             "accepted": summary.accepted,
@@ -4078,8 +4142,7 @@ impl ToolExecutor {
             end_offset: end as u64,
             total_bytes: output.len() as u64,
             total_lines: output.lines().count() as u64,
-            status: status.to_string(),
-            terminal,
+            status,
             output_ref: format!("agent_fanout:{}", group.group_id),
         })
     }
@@ -6260,11 +6323,12 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 mod tests {
     use super::{
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot,
-        BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor, all_tool_schemas,
-        cli_tool_output_is_error, detect_git_remote_repos, extract_github_owner_repo,
-        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_wait_timeout, format_background_task_stop_error,
-        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
+        BgTaskOutputSnapshot, BgTaskOutputStatus, PERSIST_THRESHOLD, ToolExecutor,
+        all_tool_schemas, cli_tool_output_is_error, detect_git_remote_repos,
+        extract_github_owner_repo, file_checkpoint_dir_for, format_background_task_error,
+        format_background_task_output, format_background_task_output_wait_timeout,
+        format_background_task_stop_error, git_stash_sub_action_args, memoria,
+        parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
@@ -7122,8 +7186,7 @@ mod tests {
                                 output: "[stdout lines 40-42]\n41: panic detail\n".to_string(),
                                 matching_lines: 1,
                                 truncated: false,
-                                status: "failed".to_string(),
-                                terminal: true,
+                                status: BgTaskOutputStatus::Failed,
                                 output_ref: "stdout: /tmp/bg-shell-1.stdout".to_string(),
                             }));
                         }
@@ -7630,11 +7693,22 @@ mod tests {
             end_offset,
             total_bytes,
             total_lines,
-            status: status.to_string(),
-            terminal: matches!(status, "completed" | "failed" | "killed" | "unavailable"),
+            status: BgTaskOutputStatus::from_protocol(status).expect("test status must be known"),
             output_ref: "stdout: /tmp/bg-shell-1.stdout · stderr: /tmp/bg-shell-1.stderr"
                 .to_string(),
         }
+    }
+
+    #[test]
+    fn background_task_output_status_has_one_wait_and_terminal_policy() {
+        assert!(BgTaskOutputStatus::Interrupted.is_terminal());
+        assert!(BgTaskOutputStatus::Interrupted.should_wake_waiter());
+        assert!(BgTaskOutputStatus::Unavailable.is_terminal());
+        assert!(BgTaskOutputStatus::Unavailable.should_wake_waiter());
+        assert!(!BgTaskOutputStatus::WaitingForInput.is_terminal());
+        assert!(BgTaskOutputStatus::WaitingForInput.should_wake_waiter());
+        assert!(!BgTaskOutputStatus::Running.should_wake_waiter());
+        assert_eq!(BgTaskOutputStatus::from_protocol("unexpected"), None);
     }
 
     #[test]
@@ -7676,8 +7750,7 @@ mod tests {
             end_offset: 25,
             total_bytes: 25,
             total_lines: 1,
-            status: "running".to_string(),
-            terminal: false,
+            status: BgTaskOutputStatus::Running,
             output_ref: "agent_state: agent-1".to_string(),
         };
 

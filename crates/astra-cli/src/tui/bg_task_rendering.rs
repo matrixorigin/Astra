@@ -202,8 +202,7 @@ pub(crate) fn background_task_output_snapshot_for_rejected_fanout_slot(
         end_offset: end as u64,
         total_bytes,
         total_lines: full_output.lines().count() as u64,
-        status: "failed".to_string(),
-        terminal: true,
+        status: crate::edge_tools::BgTaskOutputStatus::Failed,
         output_ref: row.output_ref.unwrap_or_else(|| {
             format!(
                 "fanout_spawn_rejected: {}#{}",

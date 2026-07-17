@@ -455,6 +455,12 @@ pub(crate) trait BottomPaneView: Send {
         self.conversation_tab_id().is_some()
     }
 
+    /// Stable workspace identity for global Task Board navigation. This is a
+    /// typed capability: callers never infer the active view from its title.
+    fn is_task_board_view(&self) -> bool {
+        false
+    }
+
     /// Resize a focused conversation to own the terminal's primary canvas.
     /// Root and delegated transcripts are peer conversations; dialogs and
     /// task cards remain bounded overlays.

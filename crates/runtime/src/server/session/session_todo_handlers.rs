@@ -19,9 +19,7 @@
 //! to skip ownership checks.
 
 use super::*;
-use astra_tools::task_mgmt::{
-    TaskManager, TaskStore, normalize_title, prepare_task_snapshot_for_fork,
-};
+use astra_tools::task_mgmt::{TaskManager, TaskStore, prepare_task_snapshot_for_fork};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use sqlx::Row;
 use std::collections::HashSet;
@@ -206,27 +204,57 @@ fn is_known_persisted_todo_status(status: &str) -> bool {
     )
 }
 
-fn adopt_duplicate_refusal(
+fn adopted_task_replay(
     source_session: &str,
     source_task_id: &str,
-    duplicate_id: &str,
-    duplicate_title: &str,
+    target_task_id: &str,
+    target_title: &str,
 ) -> astra_tools::task_mgmt::TaskMutationOutcome {
-    astra_tools::task_mgmt::TaskMutationOutcome::refused(
+    astra_tools::task_mgmt::TaskMutationOutcome::unchanged(
         format!(
-            "Refused: target session already has open task #{duplicate_id} with the same title"
+            "Task #{target_task_id} was already adopted from {source_session}:{source_task_id}"
         ),
         serde_json::json!({
-            "duplicate_of": duplicate_id,
-            "duplicate_title": duplicate_title,
+            "task_id": target_task_id,
+            "title": target_title,
             "source_session_id": source_session,
             "source_task_id": source_task_id,
-            "message": format!(
-                "Target session already has active task '{}' with the same normalized title. Use the existing target task, or archive/rename it before adopting '{}:{}'.",
-                duplicate_id, source_session, source_task_id
-            ),
+            "already_adopted": true,
+            "message": format!("Task '{target_task_id}' already represents the adopted source task"),
         }),
     )
+}
+
+fn metadata_matches_adopted_source(metadata: Option<&str>, source_ref: &str) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata) else {
+        return false;
+    };
+    value
+        .get("adopted_from")
+        .or_else(|| value.get("forked_from"))
+        .and_then(serde_json::Value::as_str)
+        == Some(source_ref)
+}
+
+fn adopted_task_metadata(
+    source_metadata: Option<&str>,
+    source_ref: &str,
+) -> Result<String, String> {
+    let mut metadata = match source_metadata {
+        Some(raw) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+            .map_err(|e| format!("source metadata must be a JSON object: {e}"))?,
+        None => serde_json::Map::new(),
+    };
+    // This is protocol state, not user-authored presentation. Always bind the
+    // new row to its immediate source so retries have an exact idempotency key.
+    metadata.insert(
+        "adopted_from".to_string(),
+        serde_json::Value::String(source_ref.to_string()),
+    );
+    serde_json::to_string(&metadata).map_err(|e| format!("encode adopted metadata failed: {e}"))
 }
 
 fn adoptable_source_status(status: &str) -> bool {
@@ -540,8 +568,55 @@ async fn adopt_task_into_session_atomic(
         }
     }
 
-    let source_row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT title, description, subtasks, status FROM session_todos \
+    let raw_next = target_raw_next
+        .ok_or_else(|| format!("target task counter lock missing for session {target_session}"))?;
+    let (allocated, next_stored) = parse_next_task_counter(raw_next, target_session)?;
+    let target_task_id = format!("task-{allocated}");
+    let source_ref = format!("{source_session}:{source_task_id}");
+
+    // Exact source identity, not title similarity, is the adopt idempotency
+    // key. This also closes the lost-response path: retrying an adopt whose
+    // source is already migrated returns the existing target task.
+    let target_rows = sqlx::query(
+        "SELECT todo_id, title, metadata FROM session_todos \
+         WHERE session_id = ? AND user_id = ? \
+         ORDER BY ordinal ASC FOR UPDATE",
+    )
+    .bind(target_session)
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("target adopt preflight failed: {e}"))?;
+    for row in &target_rows {
+        let todo_id: String = row.try_get("todo_id").map_err(|e| e.to_string())?;
+        let target_title: String = row.try_get("title").map_err(|e| e.to_string())?;
+        let metadata: Option<String> = row.try_get("metadata").map_err(|e| e.to_string())?;
+        if metadata_matches_adopted_source(metadata.as_deref(), &source_ref) {
+            tx.commit()
+                .await
+                .map_err(|e| format!("commit adopt replay: {e}"))?;
+            return Ok(adopted_task_replay(
+                source_session,
+                source_task_id,
+                &todo_id,
+                &target_title,
+            ));
+        }
+        if todo_id == target_task_id {
+            return Err(format!(
+                "task counter desync — id '{target_task_id}' already exists in target session {target_session}"
+            ));
+        }
+    }
+
+    let source_row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT title, description, subtasks, metadata, status FROM session_todos \
              WHERE session_id = ? AND todo_id = ? AND user_id = ? \
                AND status NOT IN ('migrated', 'deleted') \
              LIMIT 1 FOR UPDATE",
@@ -552,7 +627,8 @@ async fn adopt_task_into_session_atomic(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| format!("source lookup failed: {e}"))?;
-    let Some((title, description, subtasks_json, source_status)) = source_row else {
+    let Some((title, description, subtasks_json, source_metadata, source_status)) = source_row
+    else {
         return Err(format!(
             "source task {source_session}:{source_task_id} not found, not owned by you, or already migrated"
         ));
@@ -571,43 +647,10 @@ async fn adopt_task_into_session_atomic(
         }
         None => None,
     };
-
-    let raw_next = target_raw_next
-        .ok_or_else(|| format!("target task counter lock missing for session {target_session}"))?;
-    let (allocated, next_stored) = parse_next_task_counter(raw_next, target_session)?;
-    let target_task_id = format!("task-{allocated}");
-
-    let target_rows = sqlx::query(
-        "SELECT todo_id, title, status, ordinal FROM session_todos \
-         WHERE session_id = ? AND user_id = ? \
-         ORDER BY ordinal ASC FOR UPDATE",
-    )
-    .bind(target_session)
-    .bind(user_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("target duplicate preflight failed: {e}"))?;
-    let normalized_source_title = normalize_title(&title);
-    for row in &target_rows {
-        let todo_id: String = row.try_get("todo_id").map_err(|e| e.to_string())?;
-        let target_title: String = row.try_get("title").map_err(|e| e.to_string())?;
-        let status: String = row.try_get("status").map_err(|e| e.to_string())?;
-        if matches!(status.as_str(), "pending" | "in_progress" | "paused")
-            && normalize_title(&target_title) == normalized_source_title
-        {
-            return Ok(adopt_duplicate_refusal(
-                source_session,
-                source_task_id,
-                &todo_id,
-                &target_title,
-            ));
-        }
-        if todo_id == target_task_id {
-            return Err(format!(
-                "task counter desync — id '{target_task_id}' already exists in target session {target_session}"
-            ));
-        }
-    }
+    let metadata =
+        adopted_task_metadata(source_metadata.as_deref(), &source_ref).map_err(|error| {
+            format!("source task {source_session}:{source_task_id} has invalid metadata: {error}")
+        })?;
 
     let migrate = sqlx::query(
         "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
@@ -626,10 +669,6 @@ async fn adopt_task_into_session_atomic(
         ));
     }
 
-    let metadata = serde_json::to_string(&serde_json::json!({
-        "forked_from": format!("{source_session}:{source_task_id}"),
-    }))
-    .map_err(|e| format!("encode adopted metadata failed: {e}"))?;
     let subtasks = cleaned_subtasks
         .as_ref()
         .map(serde_json::to_string)
@@ -1523,17 +1562,41 @@ mod tests {
     }
 
     #[test]
-    fn adopt_duplicate_refusal_is_structured_and_non_successful() {
-        let outcome = adopt_duplicate_refusal("source-s", "task-7", "task-2", "Ship feature");
-        assert!(!outcome.success && !outcome.changed, "{outcome:?}");
-        assert_eq!(outcome.data["duplicate_of"], "task-2");
-        assert!(
-            outcome.data["message"]
-                .as_str()
-                .unwrap()
-                .contains("archive/rename"),
-            "{outcome:?}"
+    fn adopt_replay_is_keyed_by_typed_source_identity() {
+        assert!(metadata_matches_adopted_source(
+            Some(r#"{"adopted_from":"source-s:task-7"}"#),
+            "source-s:task-7"
+        ));
+        assert!(!metadata_matches_adopted_source(
+            Some(r#"{"adopted_from":"source-s:task-8"}"#),
+            "source-s:task-7"
+        ));
+        let outcome = adopted_task_replay("source-s", "task-7", "task-2", "Ship feature");
+        assert_eq!(
+            outcome.status,
+            astra_tools::task_mgmt::TaskMutationStatus::Unchanged
         );
+        assert_eq!(outcome.data["task_id"], "task-2");
+        assert_eq!(outcome.data["already_adopted"], true);
+    }
+
+    #[test]
+    fn adopted_metadata_preserves_work_definition_and_owns_provenance() {
+        let metadata = adopted_task_metadata(
+            Some(r#"{"priority":"p0","adopted_from":"stale:task-9"}"#),
+            "source-s:task-7",
+        )
+        .expect("valid source metadata");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["priority"], "p0");
+        assert_eq!(metadata["adopted_from"], "source-s:task-7");
+    }
+
+    #[test]
+    fn adopted_metadata_rejects_non_object_source_instead_of_dropping_it() {
+        let error = adopted_task_metadata(Some(r#"["unexpected"]"#), "source-s:task-7")
+            .expect_err("task metadata must retain its object contract");
+        assert!(error.contains("JSON object"), "{error}");
     }
 
     #[tokio::test]
@@ -2096,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn adopt_duplicate_target_does_not_migrate_source_in_matrixone() {
+    async fn adopt_allows_same_title_and_replays_by_source_identity_in_matrixone() {
         let shared = bootstrap_shared_pool().await;
         let pool = shared.get().clone();
         let user_id = format!("u-adopt-{}", uuid::Uuid::new_v4());
@@ -2146,8 +2209,30 @@ mod tests {
             }),
         )
         .await;
-        assert!(!out.success && !out.changed, "{out:?}");
-        assert_eq!(out.data["duplicate_of"], "task-1");
+        assert_eq!(
+            out.status,
+            astra_tools::task_mgmt::TaskMutationStatus::Applied,
+            "{out:?}"
+        );
+        assert_eq!(out.data["task_id"], "task-2");
+
+        let replay = adopt_task_into_session(
+            &state,
+            &user_id,
+            &target_session,
+            &serde_json::json!({
+                "source_session_id": source_session,
+                "task_id": "task-1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            replay.status,
+            astra_tools::task_mgmt::TaskMutationStatus::Unchanged,
+            "{replay:?}"
+        );
+        assert_eq!(replay.data["task_id"], "task-2");
+        assert_eq!(replay.data["already_adopted"], true);
 
         let status: String = sqlx::query_scalar(
             "SELECT status FROM session_todos WHERE session_id = ? AND todo_id = ? AND user_id = ?",
@@ -2158,7 +2243,12 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("source status");
-        assert_eq!(status, "pending", "source must remain adoptable");
+        assert_eq!(status, "migrated", "source must migrate exactly once");
+        assert_eq!(
+            target.load_tasks().await.expect("target task board").len(),
+            2,
+            "same-title tasks are distinct; retry must not create a third row"
+        );
 
         cleanup_session_rows(&pool, &source_session, &user_id).await;
         cleanup_session_rows(&pool, &target_session, &user_id).await;
@@ -2501,7 +2591,7 @@ mod tests {
         assert_eq!(target_row.2, "pending");
         let metadata: serde_json::Value =
             serde_json::from_str(target_row.3.as_deref().unwrap_or("{}")).unwrap();
-        assert_eq!(metadata["forked_from"], format!("{source_session}:task-1"));
+        assert_eq!(metadata["adopted_from"], format!("{source_session}:task-1"));
         let source_version_after: i64 = sqlx::query_scalar(
             "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
         )
