@@ -411,6 +411,7 @@ pub(crate) async fn stream_chat_sse(
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
                 active_skills: Vec::new(), // root agent — no inherited skills
                 live_event_sink: p.agent_live_event_sink.clone(),
+                client_tool_delivery_tx: None,
                 trace_context: None,
                 execution_metadata: None,
                 transcript_location:

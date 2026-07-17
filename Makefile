@@ -882,7 +882,7 @@ clean-stale:
 		DIR=$(RUST_TARGET_DIR)/$$PROFILE; \
 		[ -d "$$DIR" ] || continue; \
 		find $$DIR/incremental -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
-		find $$DIR/deps -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
+		find $$DIR/deps -mindepth 1 -maxdepth 1 -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 		find $$DIR/.fingerprint -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 		find $$DIR/build -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 		find $$DIR/examples -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
@@ -909,10 +909,10 @@ sweep:
 	AGE_MIN=$$(( $(SWEEP_MAX_AGE_H) * 60 )); \
 	echo "Sweeping artifacts older than $(SWEEP_MAX_AGE_H)h..."; \
 	find $(RUST_TARGET_DIR)/debug/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
-	find $(RUST_TARGET_DIR)/debug/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/debug/deps -mindepth 1 -maxdepth 1 -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/debug/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/release/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
-	find $(RUST_TARGET_DIR)/release/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/release/deps -mindepth 1 -maxdepth 1 -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	find $(RUST_TARGET_DIR)/release/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
 	echo "✅ Stale artifacts removed"; \
 	du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
@@ -947,7 +947,7 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_provider_surface_does_not_start_from_workspace_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::mismatched_workspace_executor_does_not_expose_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::explicit_offline_runtime_binding_does_not_expose_runtime_tools
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::visible_turn_tools_excludes_disabled_edge_tools_with_default_server_catalog
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::visible_turn_tools_excludes_only_the_disabled_edge_offer
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::no_workspace_reports_sandbox_unbound
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::mismatched_workspace_executor_reports_unbound_provider
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_workspace_path_guard::tests::workspace_ownership_rejects_symlink_escape_even_when_lexical_path_is_inside
@@ -957,7 +957,7 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::runtime_tool_executor::tests::server_only_reflect_report_includes_runtime_provider_coverage
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::stream_run_cache_miss_replays_durable_text_done
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::subrun_turn_budget
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_completed_status
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_executes_async_dynamic_spawn_with_server_executor
@@ -985,7 +985,7 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_selected_executor_does_not_route_to_other_connected_edge
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_offline_or_unknown_status_blocks_without_dispatch
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
@@ -1002,10 +1002,10 @@ test-managed-runtime:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_sandbox_binding_exposes_project_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_server_sandbox_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_orchestrator_read_only_binding
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::tool_call_start_projects_request_scoped_mcp_metadata
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::tool_call_start_projects_request_scoped_mcp_route_metadata
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::server_sandbox_reports_sandbox_ready
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_executes_through_sandbox_resident_agent_transport
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_without_sandbox_resident_agent_transport_does_not_fallback_to_local
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib request_scoped_mcp_tools_bypass_edge_transport
 
 .PHONY: test-cli-local

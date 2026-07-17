@@ -6308,6 +6308,7 @@ mod tests {
             ),
             active_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
             transcript_location:

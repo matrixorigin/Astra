@@ -5641,7 +5641,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_marks_last_real_message_before_synthetic_tail() {
+    fn bridge_does_not_cache_dynamic_tool_tail_without_a_cacheable_conversation_prefix() {
         let mut llm_messages = vec![
             json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
             json!({"role": "assistant", "content": ""}),
@@ -5670,15 +5670,18 @@ mod tests {
             "sess",
         );
 
-        assert_eq!(bridge_synthetic_tail_prefix_end, Some(3));
+        assert_eq!(bridge_synthetic_tail_prefix_end, Some(2));
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[2]),
-            "bridge should mark the last real tool result before the synthetic suffix",
+            llm_messages.iter().all(|message| {
+                !astra_turn_core::context_serializer::message_has_cache_control(message)
+            }),
+            "an empty assistant is not a cacheable conversation prefix, and the dynamic tool tail must remain unmarked",
         );
         assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[4]),
-            "synthetic tail user must stay unannotated",
+            llm_messages[2].to_string().contains("volatile"),
+            "runtime context should be appended to the existing tool tail",
         );
+        assert_eq!(llm_messages.len(), 3, "bridge must not invent a user turn");
     }
 
     #[test]

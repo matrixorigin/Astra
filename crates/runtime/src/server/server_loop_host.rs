@@ -1163,6 +1163,11 @@ pub struct ServerAgenticLoopHost {
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    /// A server-side child may share its parent's client tool-delivery lane
+    /// while retaining a separate transcript stream. Only edge-bound tool
+    /// requests use that lane; ordinary child output stays on the typed live
+    /// mirror.
+    prefer_client_tool_delivery: bool,
     /// When the SSE channel's receiver is dropped (client disconnected),
     /// this flag is set so the agentic loop cancels at the next turn boundary.
     client_cancel_flag: Option<Arc<AtomicBool>>,
@@ -1741,6 +1746,7 @@ impl ServerAgenticLoopHostBuilder {
             ),
             emitted_events: Vec::new(),
             event_tx: self.event_tx,
+            prefer_client_tool_delivery: false,
             client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
@@ -2678,6 +2684,12 @@ impl ServerAgenticLoopHost {
         self.event_tx = Some(tx);
     }
 
+    /// Use the attached event channel as the executable client lane for
+    /// edge-bound tools owned by a server-side child run.
+    pub fn prefer_client_tool_delivery(&mut self) {
+        self.prefer_client_tool_delivery = true;
+    }
+
     pub fn set_execution_metadata(&mut self, metadata: Value) {
         self.execution_metadata = Some(metadata);
     }
@@ -3352,6 +3364,9 @@ impl ServerAgenticLoopHost {
     }
 
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
+        if self.prefer_client_tool_delivery && self.event_tx.is_some() {
+            return true;
+        }
         should_deliver_edge_bound_tools_via_client_ledger_for_binding(
             self.workspace_binding.kind,
             self.executor_binding.transport,
@@ -6863,6 +6878,14 @@ mod tests {
         ]
     }
 
+    fn server_public_network_capabilities()
+    -> Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>> {
+        Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            "server-builtin".to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )])))
+    }
+
     fn sample_edge_tools_with_ask_user() -> Vec<Value> {
         let mut tools = sample_edge_tools();
         tools.push(json!({
@@ -7318,7 +7341,7 @@ mod tests {
             "u-route".to_string(),
             "s-route".to_string(),
         )
-        .with_edge_tools(sample_edge_tools())
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
@@ -7331,7 +7354,7 @@ mod tests {
             json!({
                 "id": "web-1",
                 "type": "function",
-                "function": {"name": "web_search", "arguments": r#"{"query":"astra"}"#}
+                "function": {"name": "web_fetch", "arguments": r#"{"url":"https://example.com"}"#}
             }),
             json!({
                 "id": "mcp-1",
@@ -7358,7 +7381,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["read_file", "web_search"]);
+        assert_eq!(names, vec!["read_file", "web_fetch"]);
     }
 
     #[test]
@@ -7445,6 +7468,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_child_can_inherit_the_parent_client_tool_delivery_lane() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-child-edge".to_string(),
+            "s-child-edge".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+        host.prefer_client_tool_delivery();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(runtime_executor));
+
+        assert!(
+            host.should_deliver_edge_bound_tools_via_client_ledger(&state),
+            "a child with an inherited executable client lane must not fall through to an unavailable server edge transport"
+        );
+    }
+
     #[tokio::test]
     async fn thin_client_ledger_does_not_emit_server_owned_task_request() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -7492,6 +7541,7 @@ mod tests {
         ))
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .build();
 
         let names = schema_names(&host.tool_schemas);
@@ -7685,6 +7735,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             active_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
             transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
@@ -8058,6 +8109,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .build();
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -8307,8 +8359,9 @@ mod tests {
         let names = schema_names(&host.tool_schemas);
         assert!(names.contains("ask_user"));
         assert!(names.contains("tool_search"));
-        assert!(names.contains("web_search"));
         for hidden in [
+            "web_fetch",
+            "web_search",
             "bash",
             "read_file",
             "write_file",
@@ -8338,6 +8391,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_offers)
         .build();
 
@@ -10423,7 +10477,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_excludes_disabled_edge_offer_with_default_catalog() {
+    fn visible_turn_tools_excludes_only_the_disabled_edge_offer() {
         let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
@@ -10442,10 +10496,6 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let visible_names = schema_names(&visible);
 
-        assert!(
-            visible_names.contains("web_search"),
-            "default server catalog must stay active in this regression guard"
-        );
         assert!(visible_names.contains("read_file"));
         assert!(!visible_names.contains("bash"));
     }
@@ -10463,6 +10513,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
 
@@ -10657,6 +10708,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle.clone())
         .build();
         let mut server_state = create_test_state();
@@ -10678,6 +10730,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
         let mut edge_state = create_test_state();
@@ -10703,6 +10756,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
 

@@ -404,9 +404,9 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&"memory"));
-        assert!(names.contains(&"web_search"));
         assert!(names.contains(&"agent"));
-        assert!(!names.contains(&"reflect"));
+        assert!(!names.contains(&"web_search"));
+        assert!(names.contains(&"reflect"));
         assert!(!names.contains(&"bash"));
     }
 

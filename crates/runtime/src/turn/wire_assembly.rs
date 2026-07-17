@@ -1700,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_tool_tail_marks_last_real_message_before_synthetic_suffix() {
+    fn anthropic_tool_tail_marks_last_nonempty_message_before_runtime_suffix() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble =
             vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
@@ -1725,8 +1725,12 @@ mod tests {
 
         assert_eq!(msgs[3]["role"], "tool");
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&msgs[2]),
-            "stable prefix must end before the tool result containing volatile runtime bytes",
+            astra_turn_core::context_serializer::message_has_cache_control(&msgs[1]),
+            "cache placement must skip the empty assistant and end on real user content",
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&msgs[2]),
+            "empty assistant content must not consume the cache breakpoint",
         );
         assert!(
             !astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),

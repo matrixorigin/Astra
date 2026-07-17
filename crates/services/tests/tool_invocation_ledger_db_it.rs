@@ -115,6 +115,50 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdenti
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn large_terminal_outcome_commits_and_roundtrips_without_a_varchar_projection_limit() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let invocation = identity(&prefix, "large-result");
+    cleanup(&pool, &invocation).await;
+    insert_active_run(&pool, &invocation).await;
+
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let invocation_fingerprint = fingerprint("large-result");
+    let invocation_decision = decision();
+    ledger
+        .prepare(&invocation, &invocation_fingerprint, &invocation_decision)
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&invocation, "large-result-worker", 90_000)
+        .await
+        .unwrap();
+
+    // MatrixOne's CAST(JSON AS CHAR) is bounded to VARCHAR(65535). Real tool
+    // outcomes can exceed that once a truncated command result and its typed
+    // metadata share one envelope; committing the terminal state must not
+    // roll back merely because the same transaction reads that JSON back.
+    let expected = success(&"x".repeat(70_000));
+    let completed = ledger
+        .compare_and_complete(
+            &invocation,
+            ToolInvocationState::Dispatched,
+            Some("large-result-worker"),
+            &expected,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(completed.state, ToolInvocationState::Succeeded);
+    assert_eq!(completed.outcome.as_ref(), Some(&expected));
+    assert_eq!(ledger.get(&invocation).await.unwrap(), Some(completed));
+
+    cleanup(&pool, &invocation).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_dispatch() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();

@@ -3494,12 +3494,7 @@ async fn control_plane_tool_bypasses_edge_transport() {
 async fn server_runtime_tools_bypass_edge_transport() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
-    let server_runtime_tools = [
-        "memory",
-        "mo_query",
-        "rollback_database_snapshots",
-        "github",
-    ];
+    let server_runtime_tools = ["memory", "mo_query", "rollback_database_snapshots"];
 
     for tool in server_runtime_tools {
         let edge_request = request(
@@ -3569,6 +3564,10 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
             agents: vec![edge_agent_record("edge-selected")],
         }))
+        .initial_provider_capabilities(HashMap::from([(
+            crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )]))
         .build();
     let local = CountingLocalTransport::new();
 
@@ -3577,7 +3576,12 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
             tool,
             WorkspaceBinding::none(),
             ExecutorBinding::server_local(),
-        );
+        )
+        .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+            tool,
+            crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+            ToolExecutionRouteKind::ServerRuntime,
+        ));
         assert_eq!(
             service.routing_decision(&server_request),
             ToolExecutionRouteKind::ServerRuntime,
@@ -3640,7 +3644,12 @@ async fn disabled_shared_network_server_offer_does_not_block_explicit_edge_offer
                 "web_fetch",
                 WorkspaceBinding::none(),
                 ExecutorBinding::server_local(),
-            ),
+            )
+            .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+                "web_fetch",
+                crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+                ToolExecutionRouteKind::ServerRuntime,
+            )),
             &local,
         )
         .await;

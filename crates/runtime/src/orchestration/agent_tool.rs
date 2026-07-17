@@ -274,6 +274,9 @@ pub struct AgentToolContext {
     pub active_skills: Vec<String>,
     /// Optional sink for live child token/tool/status events.
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    /// Per-run client lane for executable edge tool requests from spawned
+    /// children. This must never be stored in a session-owned registry.
+    pub client_tool_delivery_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     /// DB trace identity shared with the current Web turn.
     pub trace_context: Option<TraceContext>,
     /// UI/runtime execution binding metadata inherited by child agents.
@@ -2064,6 +2067,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         inherited_permissions,
         inherited_skills: ctx.active_skills.clone(),
         live_event_sink: ctx.live_event_sink.clone(),
+        client_tool_delivery_tx: ctx.client_tool_delivery_tx.clone(),
         trace_context: ctx.trace_context.clone(),
         execution_metadata: ctx.execution_metadata.clone(),
         spawn_tool_call_id: args
@@ -2823,6 +2827,7 @@ mod tests {
             inherited_permissions: InheritedPermissions::auto_approve(),
             active_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
             transcript_location: AgentTranscriptLocation::LocalJournal,

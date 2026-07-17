@@ -918,6 +918,7 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         inherited_skills: vec![],
         working_dir: PathBuf::from("/tmp/astra"),
         live_event_sink: None,
+        client_tool_delivery_tx: None,
         trace_context: None,
         spawn_tool_call_id: Some("call-spawn".to_string()),
         execution_metadata: Some(execution_metadata),
@@ -997,6 +998,7 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
         inherited_skills: vec![],
         working_dir: PathBuf::from("/tmp/astra"),
         live_event_sink: None,
+        client_tool_delivery_tx: None,
         trace_context: None,
         spawn_tool_call_id: Some("call-spawn".to_string()),
         execution_metadata: Some(json!({
@@ -1441,6 +1443,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         permission_context,
         inherited_skills: Vec::new(),
         live_event_sink: None,
+        client_tool_delivery_tx: None,
         inherited_prefix: None,
         execution_metadata: None,
         is_fork_child: false,
@@ -12210,4 +12213,56 @@ fn edge_approval_persistence_rejects_unaddressable_items() {
     assert!(!incrementally_persisted_edge_approval_event(&json!({
         "type": "tool_request"
     })));
+}
+
+#[tokio::test]
+async fn child_client_tool_delivery_forwards_requests_without_leaking_child_transcript() {
+    let (parent_tx, mut parent_rx) = mpsc::channel(8);
+    let (child_tx, child_rx) = mpsc::channel(8);
+    let _bridge = start_child_client_tool_delivery_bridge(
+        parent_tx,
+        "child-run".to_string(),
+        "researcher".to_string(),
+        "session-1".to_string(),
+        child_rx,
+    );
+
+    child_tx
+        .send(json!({"type": "text_delta", "content": "private child output"}))
+        .await
+        .unwrap();
+    child_tx
+        .send(json!({"type": "tool_request", "request_id": "tool-1"}))
+        .await
+        .unwrap();
+    child_tx
+        .send(json!({
+            "type": "approval_required",
+            "request_id": "approval-1",
+            "tool": "bash"
+        }))
+        .await
+        .unwrap();
+
+    let tool_request = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let approval = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tool_request["type"], "tool_request");
+    assert_eq!(approval["type"], "approval_required");
+    for event in [&tool_request, &approval] {
+        assert_eq!(event["run_id"], "child-run");
+        assert_eq!(event["agent_id"], "researcher");
+        assert_eq!(event["session_id"], "session-1");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), parent_rx.recv())
+            .await
+            .is_err(),
+        "child text must remain on the typed agent-live transcript lane"
+    );
 }

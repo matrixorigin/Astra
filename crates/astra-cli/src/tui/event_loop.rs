@@ -9626,6 +9626,7 @@ mod tests {
             ),
             inherited_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,

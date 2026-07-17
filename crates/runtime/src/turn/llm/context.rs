@@ -2849,8 +2849,8 @@ mod context_cache_contract_tests {
 
         assert_eq!(synthetic_tail_prefix_end, Some(3));
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[2]),
-            "live tool-loop shape must mark the stable message before the dynamic tool tail",
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
+            "live tool-loop shape must walk past an empty assistant and mark the stable user message",
         );
         assert!(
             !astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),

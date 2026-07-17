@@ -621,10 +621,10 @@ impl DatabaseToolInvocationLedger {
 
         let rows = sqlx::query(
             "SELECT turn_chain_id, invocation_id, identity_key,
-                    CAST(fingerprint_json AS CHAR) AS fingerprint_json,
-                    CAST(decision_json AS CHAR) AS decision_json,
-                    CAST(outcome_json AS CHAR) AS outcome_json,
-                    CAST(completion_source_json AS CHAR) AS completion_source_json,
+                    JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
+                    JSON_UNQUOTE(decision_json) AS decision_json,
+                    JSON_UNQUOTE(outcome_json) AS outcome_json,
+                    JSON_UNQUOTE(completion_source_json) AS completion_source_json,
                     state, dispatch_certainty, attempt_count, dispatch_owner,
                     CAST(UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000 AS UNSIGNED)
                         AS dispatch_lease_expires_at_epoch_ms
@@ -1321,10 +1321,10 @@ fn select_record_query(
     identity: &ToolInvocationIdentity,
 ) -> sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments> {
     sqlx::query(
-        "SELECT CAST(fingerprint_json AS CHAR) AS fingerprint_json,
-                CAST(decision_json AS CHAR) AS decision_json,
-                CAST(outcome_json AS CHAR) AS outcome_json,
-                CAST(completion_source_json AS CHAR) AS completion_source_json,
+        "SELECT JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
+                JSON_UNQUOTE(decision_json) AS decision_json,
+                JSON_UNQUOTE(outcome_json) AS outcome_json,
+                JSON_UNQUOTE(completion_source_json) AS completion_source_json,
                 state, dispatch_certainty, attempt_count, dispatch_owner,
                 CAST(
                     UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000

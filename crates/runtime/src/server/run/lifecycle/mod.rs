@@ -2927,15 +2927,17 @@ impl AgenticRunLifecycleService {
                 &request_constraints,
             ),
             active_skills: Vec::new(),
-            live_event_sink: work_surface_event_tx.zip(work_surface_gap_tracker).map(
-                |(tx, gap_tracker)| {
+            live_event_sink: work_surface_event_tx
+                .clone()
+                .zip(work_surface_gap_tracker)
+                .map(|(tx, gap_tracker)| {
                     Arc::new(WorkSurfaceAgentLiveEventSink::new(
                         tx,
                         execution_metadata.clone(),
                         gap_tracker,
                     )) as SharedAgentLiveEventSink
-                },
-            ),
+                }),
+            client_tool_delivery_tx: work_surface_event_tx.clone(),
             trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
             execution_metadata,
             transcript_location: AgentTranscriptLocation::DurableServer,
@@ -7931,11 +7933,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 break;
                             };
                             let approval_requests = canonical_edge_approval_requests(&event);
+                            let approval_run_id = event
+                                .get("run_id")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|run_id| !run_id.is_empty())
+                                .unwrap_or(&fanout_run_id)
+                                .to_string();
                             if !approval_requests.is_empty()
                                 && let Err(error) = fanout_run_engine
                                     .append_events_batch(
                                         &fanout_user_id,
-                                        &fanout_run_id,
+                                        &approval_run_id,
                                         &approval_requests,
                                     )
                                     .await
@@ -7957,7 +7966,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 tracing::error!(
                                     target: "astra_runtime::run_lifecycle",
                                     user_id = %fanout_user_id,
-                                    run_id = %fanout_run_id,
+                                    run_id = %approval_run_id,
                                     error = %error,
                                     "edge approval request persistence failed before delivery"
                                 );
@@ -9994,6 +10003,7 @@ impl ServerSpawnAgentExecutor {
         &self,
         inherited_permissions: InheritedPermissions,
         dynamic_agent_spawner: Arc<DynamicAgentSpawner>,
+        client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
     ) -> ServerSubRunExecutor {
         let mut executor = ServerSubRunExecutor::new(
             self.matrixone.clone(),
@@ -10024,7 +10034,8 @@ impl ServerSpawnAgentExecutor {
         }
         executor = executor
             .with_reflect_service(Arc::clone(&self.reflect_service))
-            .with_dynamic_agent_spawner(dynamic_agent_spawner);
+            .with_dynamic_agent_spawner(dynamic_agent_spawner)
+            .with_client_tool_delivery_tx(client_tool_delivery_tx);
         executor
     }
 }
@@ -10418,7 +10429,11 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self.build_subrun_executor(child_permissions, dynamic_agent_spawner);
+        let executor = self.build_subrun_executor(
+            child_permissions,
+            dynamic_agent_spawner,
+            config.client_tool_delivery_tx.clone(),
+        );
         #[cfg(feature = "bridge-e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
@@ -10458,6 +10473,60 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     }
 }
 
+struct ChildClientToolDeliveryBridge {
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ChildClientToolDeliveryBridge {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+fn is_client_tool_delivery_event(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("approval_required" | "approval_batch_required" | "tool_request")
+    )
+}
+
+fn start_child_client_tool_delivery_bridge(
+    parent_tx: mpsc::Sender<Value>,
+    child_run_id: String,
+    child_agent_id: String,
+    session_id: String,
+    mut child_rx: mpsc::Receiver<Value>,
+) -> ChildClientToolDeliveryBridge {
+    let join = tokio::spawn(async move {
+        while let Some(mut event) = child_rx.recv().await {
+            if !is_client_tool_delivery_event(&event) {
+                continue;
+            }
+            let Some(event) = event.as_object_mut() else {
+                continue;
+            };
+            event
+                .entry("run_id".to_string())
+                .or_insert_with(|| Value::String(child_run_id.clone()));
+            event
+                .entry("agent_id".to_string())
+                .or_insert_with(|| Value::String(child_agent_id.clone()));
+            event
+                .entry("session_id".to_string())
+                .or_insert_with(|| Value::String(session_id.clone()));
+            if parent_tx.send(Value::Object(event.clone())).await.is_err() {
+                tracing::debug!(
+                    run_id = %child_run_id,
+                    agent_id = %child_agent_id,
+                    "parent client tool-delivery lane closed"
+                );
+                break;
+            }
+        }
+    });
+    ChildClientToolDeliveryBridge { join }
+}
+
 /// Production sub-run executor backed by [`ServerAgenticLoopHost`].
 ///
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
@@ -10481,6 +10550,8 @@ pub struct ServerSubRunExecutor {
     /// engine sub-runs can omit it; dynamic children must receive the same
     /// session-owned spawner so they can create governed grandchildren.
     dynamic_agent_spawner: Option<Arc<DynamicAgentSpawner>>,
+    /// Parent-owned delivery lane for browser/edge callback tool execution.
+    client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
     /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     pub tool_execution_service: Option<ToolExecutionService>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -10507,6 +10578,7 @@ impl ServerSubRunExecutor {
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             inherited_permissions: InheritedPermissions::auto_approve(),
             dynamic_agent_spawner: None,
+            client_tool_delivery_tx: None,
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
@@ -10541,6 +10613,11 @@ impl ServerSubRunExecutor {
 
     fn with_dynamic_agent_spawner(mut self, spawner: Arc<DynamicAgentSpawner>) -> Self {
         self.dynamic_agent_spawner = Some(spawner);
+        self
+    }
+
+    fn with_client_tool_delivery_tx(mut self, tx: Option<mpsc::Sender<Value>>) -> Self {
+        self.client_tool_delivery_tx = tx;
         self
     }
 
@@ -10841,6 +10918,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
         let execution_bindings =
             execution_bindings_from_metadata(config.execution_metadata.as_ref(), &subrun_workspace);
+        let client_tool_delivery_available = self.client_tool_delivery_tx.is_some()
+            && execution_bindings.as_ref().is_some_and(|snapshot| {
+                matches!(snapshot.workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
+                    || matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
+            });
 
         // Build the host with agent-specific configuration.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -10890,6 +10972,22 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 sink,
             );
         }
+        let _client_tool_delivery_bridge = if client_tool_delivery_available {
+            let (child_tx, child_rx) = mpsc::channel(512);
+            host.set_event_tx(child_tx);
+            host.prefer_client_tool_delivery();
+            Some(start_child_client_tool_delivery_bridge(
+                self.client_tool_delivery_tx
+                    .clone()
+                    .expect("availability checked above"),
+                config.run_id.clone(),
+                config.agent_profile.agent_id.clone(),
+                config.session_id.clone(),
+                child_rx,
+            ))
+        } else {
+            None
+        };
 
         // Build the task prompt, incorporating previous output if pipeline.
         let full_task = if let Some(prev) = &config.previous_output {
@@ -11221,6 +11319,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     inherited_permissions: self.inherited_permissions.clone(),
                     active_skills: Vec::new(),
                     live_event_sink: config.live_event_sink.clone(),
+                    client_tool_delivery_tx: self.client_tool_delivery_tx.clone(),
                     trace_context: trace_context_from_subrun_context(&config.context),
                     execution_metadata: config.execution_metadata.clone(),
                     transcript_location: AgentTranscriptLocation::DurableServer,

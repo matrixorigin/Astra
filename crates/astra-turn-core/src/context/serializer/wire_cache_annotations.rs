@@ -159,7 +159,10 @@ fn is_markable(msg: &Value) -> bool {
         }
         // String form requires a non-empty tool_call_id to synthesize a
         // tool_result block; without one we'd skip annotation.
-        if content.is_some_and(Value::is_string) {
+        if content
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+        {
             return msg
                 .get("tool_call_id")
                 .and_then(Value::as_str)
@@ -170,8 +173,8 @@ fn is_markable(msg: &Value) -> bool {
     }
     // user/assistant: string content always works (we upgrade to a text
     // block); array content is fine if non-empty; anything else no-ops.
-    if content.is_some_and(Value::is_string) {
-        return true;
+    if let Some(text) = content.and_then(Value::as_str) {
+        return !text.trim().is_empty();
     }
     if let Some(arr) = content.and_then(Value::as_array) {
         return !arr.is_empty();
@@ -389,6 +392,19 @@ mod tests {
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[0]["text"], "hi");
         assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn cache_breakpoint_skips_empty_conversation_tail() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "stable question"}),
+            json!({"role": "assistant", "content": ""}),
+        ];
+
+        annotate_last_message_cache_breakpoint(&mut msgs);
+
+        assert!(message_has_cache_control(&msgs[0]));
+        assert!(!message_has_cache_control(&msgs[1]));
     }
 
     #[test]

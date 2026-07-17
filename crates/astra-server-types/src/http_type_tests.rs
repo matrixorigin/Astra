@@ -1196,6 +1196,7 @@ fn chat_request_into_data_maps_all_fields() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        enabled_tools: Some(vec!["github".to_string()]),
         runtime_mcp_bindings: vec![astra_services::runs::RuntimeMcpBindingRequest {
             id: "external_nl2sql".into(),
             transport: "streamable_http".into(),
@@ -1256,6 +1257,7 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(data.context, Some(ctx));
     assert_eq!(data.edge_executor_id.as_deref(), Some("edge-1"));
     assert_eq!(data.capabilities, vec!["bash", "fs"]);
+    assert_eq!(data.enabled_tools, Some(vec!["github".to_string()]));
     assert_eq!(
         data.execution_budget,
         Some(ExecutionBudget {
@@ -1321,6 +1323,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        enabled_tools: None,
         runtime_mcp_bindings: Vec::new(),
         mcp_binding_ids: None,
         context: None,
