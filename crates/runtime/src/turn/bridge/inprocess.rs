@@ -462,10 +462,6 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
         };
     }
     let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
-    if let Ok(session_dir) = astra_services::local_session_artifact_store().session_dir(session_id)
-    {
-        cache_detector.set_diff_dir(session_dir.join("prompt-cache-diffs"));
-    }
     let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
         return BridgePipelineBaseline {
             #[cfg(test)]
@@ -549,6 +545,14 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     } else {
         ratios.iter().sum::<f64>() / ratios.len() as f64
     };
+
+    // Replaying the journal reconstructs detector state; it is not a new live
+    // cache break. Enable artifact emission only after replay so every HTTP turn
+    // does not rewrite historical diagnostics with reset sequence numbers.
+    if let Ok(session_dir) = astra_services::local_session_artifact_store().session_dir(session_id)
+    {
+        cache_detector.set_diff_dir(session_dir.join("prompt-cache-diffs"));
+    }
 
     BridgePipelineBaseline {
         #[cfg(test)]
@@ -7548,10 +7552,39 @@ mod tests {
             )
             .unwrap();
 
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    request_metadata("historical changed prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    response_metadata(0),
+                ),
+            )
+            .unwrap();
+
         let mut baseline = load_bridge_pipeline_baseline(session_id);
+        let diff_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session dir")
+            .join("prompt-cache-diffs");
+        assert!(
+            !diff_dir.exists(),
+            "journal replay must not materialize historical cache-break artifacts"
+        );
         let changed = bridge_prompt_snapshot_from_messages(
             &[
-                json!({"role": "system", "content": "changed prompt"}),
+                json!({"role": "system", "content": "new live prompt"}),
                 json!({"role": "user", "content": "continue"}),
             ],
             &[],
@@ -7568,14 +7601,13 @@ mod tests {
             "changed prompt should trip the bridge cache detector"
         );
 
-        let diff_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
-            .expect("session dir")
-            .join("prompt-cache-diffs");
         let entries = (0..50)
             .find_map(|_| match std::fs::read_dir(&diff_dir) {
                 Ok(read_dir) => {
-                    let count = read_dir.count();
+                    let count = read_dir
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                        .count();
                     if count > 0 {
                         Some(count)
                     } else {
@@ -7591,8 +7623,8 @@ mod tests {
             })
             .unwrap_or(0);
         assert!(
-            entries > 0,
-            "bridge baseline should emit prompt-cache diff artifacts into the session dir"
+            entries == 1,
+            "only the new live cache break should emit a diagnostic artifact"
         );
     }
 

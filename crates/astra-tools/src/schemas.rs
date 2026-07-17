@@ -472,7 +472,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Perform a web search and get results. Returns search URLs for multiple engines that can be fetched with web_fetch. Use for finding current information, documentation, or answers not in local knowledge.",
+                "description": "Perform a web search and return the fetched result page as structured JSON with extracted Markdown and result links. Use for current information, documentation, or answers not in local knowledge; do not call web_fetch on the search page separately.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -483,7 +483,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "engine": {
                             "type": "string",
                             "enum": ["google", "duckduckgo", "bing", "wikipedia", "github"],
-                            "description": "Search engine to use (default: google). Use 'wikipedia' for encyclopedic info, 'github' for code/repos."
+                            "description": "Search engine to use (default: bing). Use 'wikipedia' for encyclopedic info, 'github' for code/repos."
                         },
                         "num_results": {
                             "type": "integer",

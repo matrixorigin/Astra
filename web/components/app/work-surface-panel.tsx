@@ -31,7 +31,6 @@ import type {
   ChatInsightsResponse,
   WorkSurfaceRunResponse,
 } from "@/lib/api/types";
-import { useKeyboardShortcut } from "@/hooks/use-keyboard-shortcut";
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { cn } from "@/lib/utils/cn";
 
@@ -173,21 +172,6 @@ export function WorkSurfacePanel({
       setCollapsed(false);
     },
     [onTabChange],
-  );
-
-  useKeyboardShortcut(
-    useCallback(
-      (event) =>
-        (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "t",
-      [],
-    ),
-    useCallback(
-      (event) => {
-        event.preventDefault();
-        toggleWorkSurface();
-      },
-      [toggleWorkSurface],
-    ),
   );
 
   useEffect(() => {
@@ -340,9 +324,7 @@ export function WorkSurfacePanel({
           className="hidden size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:inline-flex"
           onClick={toggleWorkSurface}
           aria-label={
-            collapsed
-              ? "Expand activity panel (Ctrl+T)"
-              : "Collapse activity panel (Ctrl+T)"
+            collapsed ? "Expand activity panel" : "Collapse activity panel"
           }
         >
           <ChevronRight
@@ -355,9 +337,6 @@ export function WorkSurfacePanel({
             <h2 className="truncate text-sm font-semibold text-text">
               Run workspace
             </h2>
-            <span className="ml-auto hidden rounded-control border border-border/40 px-2 py-0.5 text-[11px] text-text-muted lg:inline-flex">
-              Ctrl+T
-            </span>
           </div>
           <p className="mt-0.5 truncate text-xs text-text-muted">
             {visibleRunStatus
@@ -497,8 +476,8 @@ export function WorkSurfacePanel({
               type="button"
               className="mb-2 inline-flex size-9 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text"
               onClick={toggleWorkSurface}
-              aria-label="Expand run workspace (Ctrl+T)"
-              title="Run workspace · Ctrl+T"
+              aria-label="Expand run workspace"
+              title="Run workspace"
             >
               <Activity className="size-4" />
             </button>

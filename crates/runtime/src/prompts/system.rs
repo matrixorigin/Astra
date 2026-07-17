@@ -740,7 +740,8 @@ fn tool_error_recovery_section() -> &'static str {
      - a memory read returns empty → normal for new users/topics; proceed without memory.\n\
      - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
      ### Unknown tool name\n\
-     If a tool name is rejected, it's not available in this session. Check the tools list; never invent tool names.\n"
+     If a tool name is rejected, it is not available in the current capability binding. Check the tools list; never invent tool names.\n\
+     If it existed on an earlier turn, report only the observed capacity change. Do not claim it was 'reclaimed', 'on-demand', or automatically activatable unless structured runtime evidence explicitly says so.\n"
 }
 
 /// Self-model (tool list). Removed — tool names are already visible in the
@@ -2376,6 +2377,8 @@ mod tests {
         assert!(p.contains("Auth / credential / permission error"));
         assert!(p.contains("Non-errors"));
         assert!(p.contains("Unknown tool name"));
+        assert!(p.contains("current capability binding"));
+        assert!(p.contains("Do not claim it was 'reclaimed', 'on-demand'"));
         assert!(p.contains("Anti-pattern"));
         assert!(p.contains("memory read returns empty"));
     }

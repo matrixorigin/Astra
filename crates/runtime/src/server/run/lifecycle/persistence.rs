@@ -1395,13 +1395,17 @@ fn transcript_items_from_server_loop(
             }),
             source_event_id: trace_event_id("tool_start", &[run_id, &call_id]),
         });
+        let result_content =
+            transcript_tool_text(record.result_full.as_ref(), record.result_preview.as_ref());
+        let result_content = if result_content.is_empty() {
+            transcript_tool_text(record.error.as_ref(), None)
+        } else {
+            result_content
+        };
         core_items.push(TranscriptPersistItem {
             run_id: run_id.to_string(),
             role: "tool",
-            content: transcript_tool_text(
-                record.result_full.as_ref(),
-                record.result_preview.as_ref(),
-            ),
+            content: result_content,
             payload: Some(TranscriptPersistPayload {
                 tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
                     tool_use_id: call_id.clone(),
@@ -3248,6 +3252,46 @@ mod tests {
         assert_eq!(result.tool_use_id, "call-1");
         assert_eq!(result.status.as_deref(), Some("completed"));
         assert_eq!(items[3].content, "implemented the fix");
+    }
+
+    #[test]
+    fn canonical_run_transcript_preserves_rejected_tool_error_evidence() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("call-rejected".to_string()),
+                name: "web_search".to_string(),
+                ok: false,
+                error: Some("Unknown tool 'web_search' for the current capability binding".into()),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                ..Default::default()
+            });
+
+        let items = transcript_items_from_server_loop(
+            "user-1",
+            "session-1",
+            "run-1",
+            None,
+            "try it",
+            &state,
+            false,
+        );
+        let tool_result = items
+            .iter()
+            .find(|item| item.role == "tool")
+            .expect("rejected tool result");
+
+        assert!(tool_result.content.contains("Unknown tool 'web_search'"));
+        assert_eq!(
+            tool_result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.tool_result.as_ref())
+                .and_then(|result| result.status.as_deref()),
+            Some("failed")
+        );
     }
 
     #[test]

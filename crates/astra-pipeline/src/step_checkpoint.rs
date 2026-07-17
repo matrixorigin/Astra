@@ -536,6 +536,26 @@ pub fn list_checkpoints(
     Ok(result)
 }
 
+/// Allocate the next checkpoint number in the session-owned namespace.
+///
+/// Recorder counters are run-scoped and restart for every run, while checkpoint
+/// filenames are session-scoped. Timeline owners must allocate from persisted
+/// session state so a later run cannot overwrite an earlier turn's checkpoint.
+pub fn next_checkpoint_number(user_id: &str, session_id: &str) -> std::io::Result<u32> {
+    list_checkpoints(user_id, session_id)?
+        .into_iter()
+        .map(|(number, _)| number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session checkpoint sequence exhausted u32",
+            )
+        })
+}
+
 /// Remove old light checkpoints, keeping only the most recent MAX_LIGHT_CHECKPOINTS.
 fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     let mut light_files: Vec<_> = std::fs::read_dir(dir)?
@@ -1170,6 +1190,41 @@ mod tests {
             heavy_numbers,
             ((light_total as u32)..(light_total as u32 + 5)).collect::<Vec<_>>(),
             "heavy checkpoints must not be pruned when light checkpoints exceed the limit"
+        );
+    }
+
+    #[test]
+    fn next_checkpoint_number_uses_the_persisted_session_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = unique_session_id("next-session-checkpoint");
+
+        assert_eq!(
+            next_checkpoint_number(TEST_USER_ID, &session_id).unwrap(),
+            1
+        );
+        write_step_checkpoint(
+            TEST_USER_ID,
+            &session_id,
+            7,
+            &StepCheckpoint::Light(make_light("run-local-seven", 0.5)),
+        )
+        .unwrap();
+        write_step_checkpoint(
+            TEST_USER_ID,
+            &session_id,
+            12,
+            &StepCheckpoint::Heavy(Box::new(make_heavy(
+                "later-run",
+                vec![json!({"role": "assistant", "content": "durable"})],
+            ))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            next_checkpoint_number(TEST_USER_ID, &session_id).unwrap(),
+            13,
+            "a new run must continue the session sequence instead of reusing its local counter"
         );
     }
 

@@ -9,7 +9,6 @@ use astra_tools::ToolExecutor;
 use astra_tools::executor::SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES;
 use astra_tools::tool_engine::{
     DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, ToolInvocationMetadata,
-    WebSearchToolHandler,
 };
 
 use super::RuntimeToolExecutor;
@@ -50,7 +49,11 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     let mut engine = ToolEngine::new();
 
     register_handler_or_log!(engine, "notify", NotifyToolHandler);
-    register_handler_or_log!(engine, "web_search", WebSearchToolHandler);
+    register_handler_or_log!(
+        engine,
+        "web_search",
+        DefaultExecutorToolHandler { name: "web_search" }
+    );
 
     for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
         register_handler_or_log!(engine, *name, DefaultExecutorToolHandler { name });

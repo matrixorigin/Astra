@@ -306,28 +306,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WebSearchToolHandler;
-
-#[async_trait]
-impl<C> ToolHandler<C> for WebSearchToolHandler
-where
-    C: Send + Sync,
-{
-    async fn execute(
-        &self,
-        _context: &C,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> ToolResult {
-        // P2-C: 重型 handler 入口处合作式取消检查
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return ToolResult::error("Web search not executed: run was cancelled".to_string());
-        }
-        crate::web_search::web_search_result(args)
-    }
-}
-
 fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
@@ -587,38 +565,6 @@ mod tests {
             .expect("notify handler should execute");
         assert!(err.is_error);
         assert_eq!(err.output, "Error: notify requires a non-empty message");
-    }
-
-    #[tokio::test]
-    async fn web_search_handler_uses_structured_error_semantics() {
-        let mut engine = ToolEngine::new();
-        engine
-            .register_handler("web_search", WebSearchToolHandler)
-            .expect("web_search handler registration should succeed");
-
-        let ok = engine
-            .execute(
-                "web_search",
-                &TestContext { prefix: "unused" },
-                &json!({"query": "astra runtime", "engine": "github"}),
-                None,
-            )
-            .await
-            .expect("web_search handler should execute");
-        assert!(!ok.is_error, "{ok:?}");
-        assert!(ok.output.contains("search_url"));
-
-        let err = engine
-            .execute(
-                "web_search",
-                &TestContext { prefix: "unused" },
-                &json!({"engine": "github"}),
-                None,
-            )
-            .await
-            .expect("web_search handler should execute");
-        assert!(err.is_error, "{err:?}");
-        assert!(err.output.contains("Missing or empty 'query' parameter"));
     }
 
     /// Regression: when a tool handler panics, the engine must catch the

@@ -1,6 +1,6 @@
 'use client';
 
-import { Mic, SendHorizontal, Square } from 'lucide-react';
+import { SendHorizontal, Square } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
 import {
@@ -657,21 +657,15 @@ export function Composer({
           onWorkspaceSelectionChange={onWorkspaceSelectionChange}
           onRefreshEdgeWorkspaces={onRefreshEdgeWorkspaces}
         />
-        <IconButton icon={Mic} label="Voice input" tooltip="Coming soon" disabled />
-        <span
-          className={cn(
-            'ml-auto size-2 rounded-full',
-            submitting ? 'animate-pulse bg-warning' : disabled ? 'bg-border-strong' : 'bg-success',
-          )}
-          aria-label={submitting ? 'Streaming' : 'Ready'}
-        />
-        <ModelSwitcher
-          value={model}
-          onChange={handleModelChange}
-          onModelAvailabilityChange={setModelAvailable}
-          thinking={thinking}
-          onThinkingChange={setThinking}
-        />
+        <div className="ml-auto">
+          <ModelSwitcher
+            value={model}
+            onChange={handleModelChange}
+            onModelAvailabilityChange={setModelAvailable}
+            thinking={thinking}
+            onThinkingChange={setThinking}
+          />
+        </div>
         {showStop ? (
           <IconButton
             icon={Square}

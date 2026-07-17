@@ -549,7 +549,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             no_op: record.is_noop_or_cached_result(),
         })
         .collect::<Vec<_>>();
-    let is_live_query = false;
+    let is_live_query = records_include_live_query(tool_call_records);
     let mut eval = evaluate_turn(
         &tool_calls,
         stall_count,
@@ -1584,25 +1584,57 @@ pub fn build_turn_evaluation_journal_event(
     budget_pressure: f64,
     eval: &TurnEvaluation,
 ) -> JournalEvent {
-    JournalEvent::turn_evaluation(
+    let tool_attempt_count = tool_call_records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .count();
+    let tool_execution_count = tool_call_records
+        .iter()
+        .filter(|record| record_was_executed(record))
+        .count();
+    let tool_rejected_count = tool_call_records
+        .iter()
+        .filter(|record| {
+            !record.is_synthetic_placeholder()
+                && (matches!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                ) || record.was_blocked_by_policy())
+        })
+        .count();
+    let live_query = records_include_live_query(tool_call_records);
+    let mut event = JournalEvent::turn_evaluation(
         session_id,
         turn,
         source,
-        false,
+        live_query,
         eval.success,
         eval.quality,
         eval.confidence,
         budget_pressure,
         stall_count,
         verdict_warning,
-        // Count only calls that reached an executor. Admission/cache/suppression
-        // dimensions are persisted separately in the turn outcome ledger.
-        tool_call_records
-            .iter()
-            .filter(|r| record_was_executed(r))
-            .count(),
+        tool_attempt_count,
         eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
-    )
+    );
+    if let Some(metadata) = event.metadata.as_mut().and_then(Value::as_object_mut) {
+        metadata.insert(
+            "tool_execution_count".to_string(),
+            Value::from(tool_execution_count),
+        );
+        metadata.insert(
+            "tool_rejected_count".to_string(),
+            Value::from(tool_rejected_count),
+        );
+    }
+    event
+}
+
+fn records_include_live_query(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|record| {
+        !record.is_synthetic_placeholder()
+            && matches!(record.name.as_str(), "web_search" | "web_fetch")
+    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1718,7 +1750,9 @@ mod tests {
             &eval,
         );
         let metadata = event.metadata.expect("turn evaluation metadata");
-        assert_eq!(metadata["tool_call_count"], 0);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 0);
+        assert_eq!(metadata["tool_rejected_count"], 1);
         assert!(
             metadata["signals"]
                 .as_array()
@@ -2411,9 +2445,35 @@ mod tests {
         assert_eq!(metadata["source"], "cli_repl");
         assert_eq!(metadata["live_query"], false);
         assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 1);
+        assert_eq!(metadata["tool_rejected_count"], 0);
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn web_tool_records_mark_live_queries_without_parsing_user_text() {
+        let records = vec![journal_ok_call("web_search")];
+        let eval = evaluate_tool_call_records("试一试", &[], &records, 0, false, 0.2);
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-live"),
+            Some(3),
+            "server_runtime",
+            "试一试",
+            &[],
+            &records,
+            0,
+            false,
+            0.2,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+
+        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 1);
+        assert_eq!(metadata["tool_rejected_count"], 0);
     }
 
     #[test]

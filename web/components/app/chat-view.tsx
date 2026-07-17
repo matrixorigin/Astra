@@ -790,13 +790,6 @@ function ConversationWorkCard({
     },
   ];
   const actions = actionCandidates.filter((action) => action.count > 0);
-  const summary = actions
-    .map((action) => {
-      const activeCount = action.activeCount ?? action.count;
-      const count = activeCount > 0 ? activeCount : action.count;
-      return `${count} ${action.label.toLowerCase()}`;
-    })
-    .join(" · ");
   const rows = [
     primaryTask
       ? {
@@ -846,6 +839,17 @@ function ConversationWorkCard({
         }
       : null,
   ].filter((row): row is NonNullable<typeof row> => Boolean(row));
+  const primaryRow =
+    (toolAttentionCount > 0
+      ? rows.find((row) => row.tab === "tools")
+      : undefined) ??
+    (taskBoardIntervention
+      ? rows.find((row) => row.tab === "tasks")
+      : undefined) ??
+    (agentSignalCount > 0
+      ? rows.find((row) => row.tab === "agents")
+      : undefined) ??
+    rows[0];
 
   return (
     <section className="my-3 flex justify-center" aria-label="Background work">
@@ -864,11 +868,6 @@ function ConversationWorkCard({
               }
             />
             <span className="shrink-0">{title}</span>
-            {summary ? (
-              <span className="truncate text-xs font-normal text-text-muted">
-                {summary}
-              </span>
-            ) : null}
           </div>
           {actions.length ? (
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
@@ -882,19 +881,17 @@ function ConversationWorkCard({
             </div>
           ) : null}
         </div>
-        {rows.length ? (
-          <div className="mt-2 divide-y divide-border/60 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
-            {rows.map((row) => (
-              <ConversationWorkRow
-                key={row.key}
-                icon={row.icon}
-                title={row.title}
-                meta={row.meta}
-                status={row.status}
-                tone={row.tone ?? "neutral"}
-                onOpen={() => onOpen(row.tab)}
-              />
-            ))}
+        {primaryRow ? (
+          <div className="mt-2 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
+            <ConversationWorkRow
+              key={primaryRow.key}
+              icon={primaryRow.icon}
+              title={primaryRow.title}
+              meta={primaryRow.meta}
+              status={primaryRow.status}
+              tone={primaryRow.tone ?? "neutral"}
+              onOpen={() => onOpen(primaryRow.tab)}
+            />
           </div>
         ) : null}
       </div>

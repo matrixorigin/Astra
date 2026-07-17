@@ -95,14 +95,8 @@ pub(crate) async fn load_previous_recovery_state(
 
 /// Copy plan / durable-task fields from REPL into workspace before checkpointing.
 pub(crate) fn next_step_checkpoint_number(user_id: &str, sid: &str) -> Result<u32, String> {
-    let existing = astra_pipeline::step_checkpoint::list_checkpoints(user_id, sid)
-        .map_err(|e| format!("list step checkpoints: {e}"))?;
-    Ok(existing
-        .iter()
-        .map(|(n, _)| *n)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1))
+    astra_pipeline::step_checkpoint::next_checkpoint_number(user_id, sid)
+        .map_err(|e| format!("list step checkpoints: {e}"))
 }
 
 /// Build heavy step checkpoint from current REPL history (OpenAI-style messages).

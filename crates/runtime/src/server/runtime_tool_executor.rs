@@ -4863,28 +4863,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_search_executes_from_tool_engine_registry() {
+    async fn web_search_is_registered_as_a_server_tool_engine_handler() {
         let (exec, _dir) = test_executor();
         assert!(
             exec.tool_engine.contains("web_search"),
             "web_search should be registered in ToolEngine for server-local execution"
-        );
-
-        let result = exec
-            .execute_with_metadata(
-                "web_search",
-                &json!({"query": "astra runtime", "engine": "wikipedia"}),
-            )
-            .await;
-
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("search_url"), "{result:?}");
-        let metadata = result
-            .metadata
-            .expect("binding metadata should be attached");
-        assert!(
-            metadata.contains_key("runtime_environment"),
-            "execute_with_metadata should still wrap ToolEngine results with runtime metadata"
         );
     }
 

@@ -441,8 +441,6 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         );
         return;
     };
-    let ckpt_num = state.step_recorder.summary().checkpoints;
-
     // Serialize the interruption record (if any) for checkpoint persistence.
     let interruption_json = state.interruption.as_ref().map(|ir| ir.to_json());
 
@@ -498,6 +496,35 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         };
     }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
+
+    // A delegated run does not own the parent session timeline. Its recorder
+    // counter is run-local, so writing it into the parent checkpoint directory
+    // can overwrite a root checkpoint or a sibling's state. Durable delegated
+    // recovery belongs to the canonical run record/transcript; keep this copy
+    // only for the live loop's local recovery.
+    if !state.owns_session_composite_snapshot() {
+        tracing::debug!(
+            session_id = %sid,
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            recursion_depth = state.recursion_depth,
+            delegation_chain = ?state.delegation_chain,
+            self_agent_id = %state.self_agent_id,
+            "retained delegated heavy checkpoint outside the parent session namespace"
+        );
+        state.stall.last_heavy_checkpoint = Some(cp);
+        return;
+    }
+
+    let ckpt_num = match step_checkpoint::next_checkpoint_number(user_id, sid) {
+        Ok(number) => number,
+        Err(error) => {
+            astra_core::agent_warn!(
+                "checkpoint",
+                "Failed to allocate session checkpoint number for {sid}: {error}"
+            );
+            return;
+        }
+    };
     if let Err(e) = step_checkpoint::write_step_checkpoint(user_id, sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
             "checkpoint",
@@ -507,20 +534,6 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // resume logic would read state pointing at a non-existent checkpoint
         // file. Leave `state.last_composite_snapshot` and the stall heavy
         // checkpoint cache untouched so the next iteration retries cleanly.
-        return;
-    }
-
-    if !state.owns_session_composite_snapshot() {
-        tracing::debug!(
-            session_id = %sid,
-            run_id = state.current_run_id.as_deref().unwrap_or_default(),
-            recursion_depth = state.recursion_depth,
-            delegation_chain = ?state.delegation_chain,
-            self_agent_id = %state.self_agent_id,
-            checkpoint = ckpt_num,
-            "wrote delegated heavy checkpoint without promoting it to the session composite snapshot"
-        );
-        state.stall.last_heavy_checkpoint = Some(cp);
         return;
     }
 
@@ -536,19 +549,6 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             return;
         }
     };
-    if let Some(existing) = index.snapshots.iter().find(|snapshot| {
-        snapshot.session_id == *sid
-            && snapshot.turn == turn
-            && snapshot.session_state() == Some(checkpoint_ref.as_str())
-    }) {
-        // Multiple finalization paths may checkpoint the same logical step. The
-        // heavy file is safe to refresh, but promoting the same state reference
-        // twice creates a false timeline version and makes resume ordering
-        // ambiguous. Promotion is therefore idempotent on its durable identity.
-        state.last_composite_snapshot = Some(existing.clone());
-        state.stall.last_heavy_checkpoint = Some(cp);
-        return;
-    }
     let mut snapshot =
         astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
             .label(format!("checkpoint-t{turn}"))
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(session_journal_dir)]
-    fn root_heavy_checkpoint_promotes_session_composite_snapshot() {
+    fn root_heavy_checkpoints_are_immutable_session_timeline_versions() {
         let user_id = "test-user";
         let session_id = format!("root-composite-{}", uuid::Uuid::new_v4());
         let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
@@ -1677,16 +1677,39 @@ mod tests {
             .last_composite_snapshot
             .clone()
             .expect("first composite snapshot");
+        let first_ref = first_snapshot
+            .session_state()
+            .expect("first session state ref")
+            .to_string();
+        let checkpoint_dir =
+            astra_pipeline::step_checkpoint::owner_session_dir_for(user_id, &session_id)
+                .expect("owner session dir")
+                .join("step_checkpoints");
+        let first_bytes = std::fs::read(checkpoint_dir.join(&first_ref)).expect("first checkpoint");
+        state.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "newer state"
+        }));
         try_write_heavy_checkpoint(&mut state);
 
         let index =
             astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
                 .expect("read composite index");
-        assert_eq!(index.snapshots.len(), 1);
+        assert_eq!(index.snapshots.len(), 2);
         assert_eq!(index.snapshots[0].session_id, session_id);
         assert_eq!(index.snapshots[0].turn, 7);
         assert_eq!(index.snapshots[0].snapshot_id, first_snapshot.snapshot_id);
         assert_eq!(index.snapshots[0].version, first_snapshot.version);
+        assert_ne!(
+            index.snapshots[0].session_state(),
+            index.snapshots[1].session_state(),
+            "each timeline version must own an immutable checkpoint file"
+        );
+        assert_eq!(
+            std::fs::read(checkpoint_dir.join(first_ref)).expect("preserved first checkpoint"),
+            first_bytes,
+            "writing a newer turn state must not mutate the prior snapshot"
+        );
         assert!(
             state.last_composite_snapshot.is_some(),
             "root loop must expose the current session composite snapshot"
@@ -1715,12 +1738,12 @@ mod tests {
 
         try_write_heavy_checkpoint(&mut state);
 
-        let heavy =
+        assert!(
             astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
                 .expect("read checkpoint")
-                .expect("delegated heavy checkpoint");
-        assert_eq!(heavy.budget_remaining_tokens, 76_000);
-        assert_eq!(heavy.budget_remaining_rounds, state.remaining_turns as u32);
+                .is_none(),
+            "delegated state must not be written into the parent session namespace"
+        );
 
         let index =
             astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
@@ -1737,6 +1760,16 @@ mod tests {
             state.stall.last_heavy_checkpoint.is_some(),
             "delegated loop still keeps its own heavy checkpoint for local recovery"
         );
+        let StepCheckpoint::Heavy(heavy) = state
+            .stall
+            .last_heavy_checkpoint
+            .as_ref()
+            .expect("delegated local checkpoint")
+        else {
+            panic!("delegated checkpoint must be heavy");
+        };
+        assert_eq!(heavy.budget_remaining_tokens, 76_000);
+        assert_eq!(heavy.budget_remaining_rounds, state.remaining_turns as u32);
     }
 
     #[tokio::test]

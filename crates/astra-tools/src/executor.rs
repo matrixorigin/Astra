@@ -588,7 +588,15 @@ impl DefaultToolExecutor {
             "symbols" => self.dispatch_symbols(args),
 
             // ── Web search ───────────────────────────────────────────
-            "web_search" => crate::web_search::web_search_result(args),
+            "web_search" => {
+                let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
+                crate::web_search::perform_web_search(
+                    self.ctx.http_client.as_ref(),
+                    args,
+                    &cache_scope,
+                )
+                .await
+            }
 
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {

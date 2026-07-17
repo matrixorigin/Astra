@@ -176,12 +176,20 @@ export const MessageBubble = memo(function MessageBubble({
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
   const hasReasoning = Boolean(reasoning.trim());
   const assistantStillStreaming = message.status === "streaming";
+  const reasoningPending =
+    assistantStillStreaming && message.reasoningStatus === "streaming";
   const reasoningStreaming =
     assistantStillStreaming &&
-    (hasReasoning || splitContent.reasoningOpen || orphanStreamingReasoning);
+    (reasoningPending ||
+      hasReasoning ||
+      splitContent.reasoningOpen ||
+      orphanStreamingReasoning);
   const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
-    message.status === "streaming" && !content.trim() && !hasReasoning;
+    message.status === "streaming" &&
+    !content.trim() &&
+    !hasReasoning &&
+    !showReasoning;
   const artifacts = message.artifacts ?? [];
   const hasArtifacts = artifacts.length > 0;
   const isSettledEmptyAssistant =
@@ -539,7 +547,7 @@ function ReasoningPanel({
   startedAt: string;
   completedAt?: string | null;
 }) {
-  const [open, setOpen] = useState(streaming);
+  const [open, setOpen] = useState(streaming && Boolean(reasoning.trim()));
   const userToggledRef = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const bodyPinnedRef = useRef(true);
@@ -550,6 +558,7 @@ function ReasoningPanel({
   const elapsed = useReasoningElapsed(startedAt, completedAt, displayStreaming);
   const body =
     reasoning.trim() || (displayStreaming ? "Preparing response..." : "Done");
+  const hasReasoningContent = Boolean(reasoning.trim());
   const blocks = splitReasoningBlocks(body);
   const summary = displayStreaming
     ? elapsed
@@ -564,8 +573,8 @@ function ReasoningPanel({
     if (userToggledRef.current) {
       return;
     }
-    setOpen(displayStreaming);
-  }, [displayStreaming]);
+    setOpen(displayStreaming && hasReasoningContent);
+  }, [displayStreaming, hasReasoningContent]);
 
   useEffect(() => {
     if (open && displayStreaming && bodyPinnedRef.current) {
@@ -597,9 +606,11 @@ function ReasoningPanel({
         >
           {summary}
         </span>
-        <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted/90">
-          {preview}
-        </span>
+        {hasReasoningContent ? (
+          <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted/90">
+            {preview}
+          </span>
+        ) : null}
         <ChevronDown
           className={cn(
             "size-3.5 shrink-0 text-text-muted transition-transform duration-200 group-hover:text-text-secondary",

@@ -239,11 +239,9 @@ mod self_mod_tools;
 #[path = "edge_tools/session_state.rs"]
 mod session_state;
 use astra_tools::task_mgmt;
-pub(crate) use task_mgmt::TaskManager;
-#[path = "edge_tools/web_search.rs"]
-mod web_search;
 use file_state::FileState;
 pub(crate) use file_state::{ReadCoverage, ReadDedupKey};
+pub(crate) use task_mgmt::TaskManager;
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
@@ -5408,7 +5406,17 @@ impl ToolExecutor {
                 "task_output" => self.task_output_with_fields(args, tool_result_fields).await,
                 "task_stop" => self.task_kill_bg(args).await,
                 "task_list" => self.task_list_bg().await,
-                "web_search" => self.web_search(args),
+                "web_search" => {
+                    let cache_scope = self
+                        .active_session_id
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
+                    astra_tools::web_search::perform_web_search(None, args, &cache_scope)
+                        .await
+                        .output
+                }
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {
                     const MAX_NOTIFY_MSG: usize = 4096;
@@ -9618,7 +9626,6 @@ mod tests {
     mod task_tests;
     mod tool_search_tests;
     mod utf16_tests;
-    mod web_search_tests;
     mod worktree_tests;
 
     /// Regression test for 3e3d6fa8 proxy policy:

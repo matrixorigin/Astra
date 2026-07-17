@@ -82,6 +82,16 @@ const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
+fn observed_ttft_ms(
+    first_stream_update_ms: Option<u64>,
+    first_visible_text_ms: Option<u64>,
+    completed_ms: u64,
+) -> u64 {
+    first_stream_update_ms
+        .or(first_visible_text_ms)
+        .unwrap_or(completed_ms)
+}
+
 fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
     for (key, value) in fields {
         event.entry(key.clone()).or_insert_with(|| value.clone());
@@ -5282,6 +5292,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                     LlmStreamUpdate::Reasoning(content) => {
+                        if !content.is_empty() {
+                            attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_stream_update_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         attempt_reasoning.push_str(&content);
                         if self.terminal_handoff_window.is_open() {
                             action_window_updates.push(LlmStreamUpdate::Reasoning(content));
@@ -5715,7 +5732,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
 
         // ── 6. Build turn result ────────────────────────────────────────
-        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+        let ttft_ms = Some(observed_ttft_ms(
+            first_stream_update_turn_ms,
+            first_visible_text_turn_ms,
+            turn_started.elapsed().as_millis() as u64,
+        ));
         let mut accum = Self::result_to_accum(&result);
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
@@ -6552,6 +6573,13 @@ mod tests {
     use astra_turn_core::edge_ledger::approval_callback_key;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
+
+    #[test]
+    fn ttft_prefers_the_first_stream_update_including_reasoning() {
+        assert_eq!(observed_ttft_ms(Some(240), Some(900), 1_600), 240);
+        assert_eq!(observed_ttft_ms(None, Some(900), 1_600), 900);
+        assert_eq!(observed_ttft_ms(None, None, 1_600), 1_600);
+    }
 
     struct EnvVarGuard {
         key: &'static str,
