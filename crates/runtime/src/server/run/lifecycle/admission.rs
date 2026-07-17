@@ -49,6 +49,32 @@ pub(super) enum RunAdmissionError {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreSpawnFailureCode {
+    RunAdmissionTimeout,
+    RunAdmissionClosed,
+    PreSpawnFailure,
+}
+
+impl PreSpawnFailureCode {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunAdmissionTimeout => "run_admission_timeout",
+            Self::RunAdmissionClosed => "run_admission_closed",
+            Self::PreSpawnFailure => "pre_spawn_failure",
+        }
+    }
+}
+
+impl From<RunAdmissionError> for PreSpawnFailureCode {
+    fn from(value: RunAdmissionError) -> Self {
+        match value {
+            RunAdmissionError::Timeout => Self::RunAdmissionTimeout,
+            RunAdmissionError::Closed => Self::RunAdmissionClosed,
+        }
+    }
+}
+
 pub(super) struct PostLoopMemoryCleanupPermit;
 
 impl Drop for PostLoopMemoryCleanupPermit {
@@ -99,18 +125,11 @@ pub(super) fn run_admission_capacity_response(
     )
 }
 
-pub(super) fn pre_spawn_failure_error_code(message: &str) -> &'static str {
-    if message.contains("capacity timeout") {
-        "run_admission_timeout"
-    } else if message.contains("capacity admission closed") {
-        "run_admission_closed"
-    } else {
-        "pre_spawn_failure"
-    }
-}
-
-pub(super) fn pre_spawn_failure_terminal_events(message: &str) -> [Value; 2] {
-    let error_code = pre_spawn_failure_error_code(message);
+pub(super) fn pre_spawn_failure_terminal_events(
+    message: &str,
+    failure_code: PreSpawnFailureCode,
+) -> [Value; 2] {
+    let error_code = failure_code.as_str();
     [
         json!({
             "event_type": "run_error",

@@ -3568,8 +3568,14 @@ impl AgenticRunLifecycleService {
             })
     }
 
-    async fn fail_started_run_before_spawn(&self, user_id: &str, run_id: &str, message: &str) {
-        let terminal_events = pre_spawn_failure_terminal_events(message);
+    async fn fail_started_run_before_spawn(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        message: &str,
+        failure_code: PreSpawnFailureCode,
+    ) {
+        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
         astra_core::log_persist!(
             self.run_engine
                 .transition_status_with_events_if_current(
@@ -7230,8 +7236,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Err(error) => {
                     let message =
                         format!("tool executor setup failed after durable run start: {error}");
-                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
-                        .await;
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &run_id,
+                        &message,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -7489,7 +7500,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "server capacity admission closed before agentic loop start"
                     }
                 };
-                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason, error.into())
                     .await;
                 self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
@@ -8321,6 +8332,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &user_id,
                         &run_id,
                         "failed to start streaming run event stream",
+                        PreSpawnFailureCode::PreSpawnFailure,
                     )
                     .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
@@ -8392,8 +8404,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let message = format!(
                         "streaming tool executor setup failed after durable run start: {error}"
                     );
-                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
-                        .await;
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &run_id,
+                        &message,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -8641,7 +8658,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "server capacity admission closed before streaming agentic loop start"
                     }
                 };
-                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason, error.into())
                     .await;
                 self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {

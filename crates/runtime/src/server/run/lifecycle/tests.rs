@@ -11337,6 +11337,7 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         "user-1",
         "run-pre-spawn",
         "server capacity timeout before agentic loop start",
+        PreSpawnFailureCode::RunAdmissionTimeout,
     )
     .await;
 
@@ -11387,6 +11388,7 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
         "user-1",
         "run-pre-spawn-fail",
         "server capacity timeout before agentic loop start",
+        PreSpawnFailureCode::RunAdmissionTimeout,
     )
     .await;
 
