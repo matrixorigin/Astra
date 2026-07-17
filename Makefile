@@ -870,7 +870,11 @@ clean-stale:
 	@echo "Current target/ size:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
 	@echo ""
 	@mkdir -p $(RUST_TARGET_DIR)/debug $(RUST_TARGET_DIR)/release
-	@exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
+	@if ! command -v flock >/dev/null 2>&1; then \
+		echo "Skipping stale cleanup: flock is unavailable on this platform"; \
+		exit 0; \
+	fi; \
+	exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
 	exec 9>$(RUST_TARGET_DIR)/release/.cargo-lock; \
 	if ! flock -n 8 || ! flock -n 9; then \
 		echo "Skipping stale cleanup: Cargo is using the target directory"; \
@@ -900,7 +904,11 @@ SWEEP_MAX_AGE_H ?= 4
 .PHONY: sweep
 sweep:
 	@mkdir -p $(RUST_TARGET_DIR)/debug $(RUST_TARGET_DIR)/release
-	@exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
+	@if ! command -v flock >/dev/null 2>&1; then \
+		echo "Skipping artifact sweep: flock is unavailable on this platform"; \
+		exit 0; \
+	fi; \
+	exec 8>$(RUST_TARGET_DIR)/debug/.cargo-lock; \
 	exec 9>$(RUST_TARGET_DIR)/release/.cargo-lock; \
 	if ! flock -n 8 || ! flock -n 9; then \
 		echo "Skipping artifact sweep: Cargo is using the target directory"; \
