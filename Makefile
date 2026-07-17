@@ -946,7 +946,7 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_completed_status
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_executes_sync_dynamic_spawn_with_server_executor
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_executes_async_dynamic_spawn_with_server_executor
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/chat-input-route.test.ts \

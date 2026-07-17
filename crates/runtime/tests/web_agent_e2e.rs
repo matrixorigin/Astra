@@ -918,7 +918,7 @@ fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> 
 }
 
 #[tokio::test]
-async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
+async fn web_agent_executes_async_dynamic_spawn_with_server_executor() {
     init_env();
     let (app, _ledger) = build_test_app();
 
@@ -932,15 +932,14 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
                         "tool_calls": [
                             tool_call("call-spawn-reviewer", "agent", json!({
                                 "action": "spawn",
-                                "description": "sync child review",
+                                "description": "async child review",
                                 "prompt": "Review src/lib.rs and summarize one issue.",
-                                "agent_type": "code-review",
-                                "run_in_background": false
+                                "agent_type": "code-review"
                             }))
                         ]
                     },
                     {
-                        "full_text": "parent synthesis after child review"
+                        "full_text": "parent continues after launching child review"
                     }
                 ],
                 "test_spawn_child_llm_rounds": [
@@ -956,8 +955,9 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
     assert!(
         find_events(&events, "text_delta")
             .iter()
-            .any(|event| event["content"].as_str() == Some("parent synthesis after child review")),
-        "parent should synthesize after dynamic child spawn: {events:?}"
+            .any(|event| event["content"].as_str()
+                == Some("parent continues after launching child review")),
+        "parent should continue immediately after dynamic child launch: {events:?}"
     );
     let run_id = events[0]
         .get("run_id")
@@ -965,9 +965,22 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
         .expect("session_info should include run_id")
         .to_string();
     let serialized = serde_json::to_string(&events).unwrap();
+    let launch_receipt = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"].as_str() == Some("call-spawn-reviewer"))
+        .and_then(|event| event["result"].as_str())
+        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .unwrap_or_else(|| panic!("spawn should return a structured launch receipt: {serialized}"));
+    assert_eq!(launch_receipt["status"], "launched", "{serialized}");
+    assert_eq!(launch_receipt["delivery"], "asynchronous", "{serialized}");
+    assert!(
+        launch_receipt["agent_id"].as_str().is_some(),
+        "{serialized}"
+    );
+    assert!(launch_receipt["run_id"].as_str().is_some(), "{serialized}");
     assert!(
         serialized.contains("child review result: no critical issues"),
-        "spawn tool output should include child result: {serialized}"
+        "the independent child result should remain visible in the stream: {serialized}"
     );
     let live_events = find_events(&events, "agent_live_event");
     let live_output = live_events
@@ -1060,8 +1073,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                                 "action": "spawn",
                                 "description": "edge child review",
                                 "prompt": "Review src/lib.rs in the inherited edge workspace.",
-                                "agent_type": "code-review",
-                                "run_in_background": false
+                                "agent_type": "code-review"
                             }))
                         ]
                     },
@@ -1088,7 +1100,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     assert!(
         serialized.contains("edge child review result: no critical issues"),
-        "spawn tool output should include edge child result: {serialized}"
+        "the independent edge child result should remain visible in the stream: {serialized}"
     );
 
     let workspace = find_event(&events, "workspace_bound")
@@ -1700,7 +1712,7 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
 }
 
 #[tokio::test]
-async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round() {
+async fn edge_executor_offline_child_waiting_does_not_block_async_parent() {
     init_env();
     let (app, _) = build_test_app();
 
@@ -1729,12 +1741,11 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
                                 "action": "spawn",
                                 "description": "edge child command",
                                 "prompt": "Run a command in the inherited edge workspace.",
-                                "agent_type": "code-review",
-                                "run_in_background": false
+                                "agent_type": "code-review"
                             }))
                         ]
                     },
-                    { "full_text": "Should never run after child waiting." }
+                    { "full_text": "Parent continues while the child waits for its executor." }
                 ],
                 "test_spawn_child_llm_rounds": [
                     {
@@ -1765,40 +1776,72 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
         "child spawn should inherit edge binding metadata: {serialized}"
     );
     assert!(
-        find_events(&events, "tool_transport_failed")
+        find_events(&events, "tool_call_end").iter().any(|event| {
+            event["call_id"].as_str() == Some("call-spawn-offline-child")
+                && event["success"].as_bool() == Some(true)
+                && event["result"]
+                    .as_str()
+                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
+                    .is_some_and(|receipt| {
+                        receipt["status"].as_str() == Some("launched")
+                            && receipt["delivery"].as_str() == Some("asynchronous")
+                            && receipt["agent_id"].as_str().is_some()
+                            && receipt["run_id"].as_str().is_some()
+                    })
+        }),
+        "spawn should succeed once the async child has a stable identity: {serialized}"
+    );
+    assert!(
+        find_events(&events, "agent_live_event")
             .iter()
             .any(|event| {
-                event["tool"].as_str() == Some("agent")
-                    && event["agent_status"].as_str() == Some("waiting")
-                    && event["agent_id"].as_str().is_some()
-                    && event["reason"].as_str() == Some("executor_offline")
+                event["event_kind"].as_str() == Some("signal")
+                    && event["signal"]["signal"].as_str() == Some("execution_waiting")
+                    && event["signal"]["reason"].as_str() == Some("executor_offline")
+            }),
+        "the independently waiting child should remain visible as a live signal: {serialized}"
+    );
+    assert!(
+        find_event_type(&events, "agent_waiting")
+            .iter()
+            .any(|event| {
+                event["reason"].as_str() == Some("executor_offline")
                     && event["workspace"]["kind"].as_str() == Some("edge_workspace")
                     && event["executor"]["kind"].as_str() == Some("edge_agent")
             }),
-        "child waiting state should stream as structured agent tool failure metadata: {serialized}"
+        "the child waiting projection should preserve its execution binding: {serialized}"
     );
     assert!(
-        find_events(&events, "run_blocked").iter().any(|event| {
-            event["call_id"].as_str() == Some("call-spawn-offline-child")
-                && event["tool"].as_str() == Some("agent")
-                && event["reason"].as_str() == Some("executor_offline")
-        }),
-        "parent agent tool should emit an actionable executor-offline blocked event: {serialized}"
-    );
-    assert!(
-        find_events(&events, "run_waiting")
+        find_events(&events, "agent_communication")
             .iter()
-            .any(|event| event["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("executor_offline"))),
-        "parent run should enter waiting after child execution-boundary waiting: {serialized}"
+            .any(|event| {
+                event["direction"].as_str() == Some("received")
+                    && event["payload_kind"].as_str() == Some("signal")
+                    && event["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("executor_offline"))
+            }),
+        "the child should proactively report its waiting state to the parent mailbox: {serialized}"
     );
     assert!(
-        !find_events(&events, "text_delta").iter().any(|event| {
-            event["content"].as_str() == Some("Should never run after child waiting.")
-                || event["content"].as_str() == Some("Child should never synthesize.")
+        find_events(&events, "text_delta").iter().any(|event| {
+            event["content"].as_str()
+                == Some("Parent continues while the child waits for its executor.")
         }),
-        "parent and child must not continue after executor-offline blocking: {serialized}"
+        "child waiting must not block independent parent work: {serialized}"
+    );
+    assert!(
+        find_events(&events, "run_waiting").is_empty()
+            && find_events(&events, "run_finished")
+                .iter()
+                .any(|event| event["status"].as_str() == Some("completed")),
+        "the parent run should complete independently of the waiting child: {serialized}"
+    );
+    assert!(
+        !find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some("Child should never synthesize.")),
+        "the child must not continue past its executor-offline boundary: {serialized}"
     );
 }
 
