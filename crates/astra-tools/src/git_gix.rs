@@ -1324,9 +1324,7 @@ fn validate_diff_path_exists(project_root: &Path, path_filter: &str) -> Result<(
 /// `base_ref` by older callers. A complete range must never have `..HEAD`
 /// appended a second time.
 fn normalized_diff_range(base_ref: &str, tip_ref: Option<&str>) -> Result<String, String> {
-    if let Err(error) = reject_shell_meta(base_ref) {
-        return Err(error);
-    }
+    reject_shell_meta(base_ref)?;
     if base_ref.contains("..") {
         if tip_ref.is_some() {
             return Err(
