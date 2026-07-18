@@ -54,9 +54,29 @@ const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 const BACKGROUND_REGISTRY_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
+const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
+const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
+
+async fn await_shutdown_signal(
+    mut receiver: tokio::sync::watch::Receiver<
+        Option<crate::cli::session::session_guard::ShutdownSignal>,
+    >,
+) -> crate::cli::session::session_guard::ShutdownSignal {
+    loop {
+        if let Some(signal) = *receiver.borrow_and_update() {
+            return signal;
+        }
+        if receiver.changed().await.is_err() {
+            // The process-global sender lives for the process lifetime. Keep
+            // this future inert if that invariant ever changes instead of
+            // turning a closed control channel into a busy shutdown loop.
+            return std::future::pending().await;
+        }
+    }
+}
 
 fn schedule_runtime_notification_wake(
     wake_at: &mut Option<std::time::Instant>,
@@ -899,6 +919,19 @@ async fn rebuild_local_agent_runtime_after_session_rebind(
 async fn retire_local_agent_spawner(
     spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
 ) -> usize {
+    retire_local_agent_spawner_with_reason(
+        spawner,
+        LOCAL_AGENT_SESSION_REBIND_REASON,
+        LOCAL_AGENT_SESSION_REBIND_DRAIN,
+    )
+    .await
+}
+
+async fn retire_local_agent_spawner_with_reason(
+    spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
+    reason: &str,
+    drain: Duration,
+) -> usize {
     let active_agent_ids: Vec<_> = spawner
         .get_agent_history(None)
         .await
@@ -908,15 +941,9 @@ async fn retire_local_agent_spawner(
         .collect();
     let mut cancelled = 0;
     for agent_id in active_agent_ids {
-        cancelled += usize::from(
-            spawner
-                .cancel_agent(&agent_id, LOCAL_AGENT_SESSION_REBIND_REASON)
-                .await,
-        );
+        cancelled += usize::from(spawner.cancel_agent(&agent_id, reason).await);
     }
-    spawner
-        .shutdown_and_wait(LOCAL_AGENT_SESSION_REBIND_DRAIN)
-        .await;
+    spawner.shutdown_and_wait(drain).await;
     cancelled
 }
 
@@ -4399,7 +4426,7 @@ pub(crate) async fn run_tui_session(
         initialize_session_state, install_task_service, install_task_store, resolve_task_service,
         resolve_task_store,
     };
-    use crate::cli::session::session_startup::complete_session_startup;
+    use crate::cli::session::session_startup::{SessionStartupArtifacts, complete_session_startup};
     use crate::cli::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
@@ -4430,7 +4457,7 @@ pub(crate) async fn run_tui_session(
         state.max_budget_limit = max_budget;
     }
     tracer.phase("state_init");
-    let _startup = complete_session_startup(
+    let startup = complete_session_startup(
         &mut state,
         &mut tracer,
         api,
@@ -4440,8 +4467,44 @@ pub(crate) async fn run_tui_session(
         cli_context,
     )
     .await?;
+    let SessionStartupArtifacts {
+        pipeline_modules,
+        mut edge_heartbeat_task,
+        shutdown_signal_rx,
+        ..
+    } = startup;
     tracer.finish(state.session_id.as_deref());
 
+    // Take terminal ownership before spawning any TUI-owned worker. If the
+    // terminal vanished during startup, retire the startup-owned runtime now
+    // instead of detaching heartbeat/agent work from a TUI that never ran.
+    let mut guard = match TerminalGuard::init() {
+        Ok(guard) => guard,
+        Err(error) => {
+            if let Some(spawner) = state.agent_spawner.take() {
+                retire_local_agent_spawner_with_reason(
+                    spawner,
+                    LOCAL_AGENT_SESSION_SHUTDOWN_REASON,
+                    LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN,
+                )
+                .await;
+            }
+            state.unregister_root_mailbox().await;
+            if let Some(task) = edge_heartbeat_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            drop(pipeline_modules);
+            return Err(format!("TUI init failed: {error}"));
+        }
+    };
+    let session_shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_monitor_token = session_shutdown_token.clone();
+    let mut shutdown_monitor = tokio::spawn(async move {
+        let signal = await_shutdown_signal(shutdown_signal_rx).await;
+        shutdown_monitor_token.cancel();
+        signal
+    });
     // Local and bundled skills are already available. External providers
     // converge in a supervised task after startup so DB/MCP latency cannot
     // delay the first interactive frame.
@@ -4461,7 +4524,7 @@ pub(crate) async fn run_tui_session(
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
-    let mut tui_cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
@@ -4489,7 +4552,6 @@ pub(crate) async fn run_tui_session(
     let mut bottom_pane = BottomPane::new();
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
-    let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
     let (draw_tx, draw_rx) = broadcast::channel(16);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
@@ -4769,6 +4831,9 @@ pub(crate) async fn run_tui_session(
         tokio::pin!(tick);
 
         tokio::select! {
+            _ = session_shutdown_token.cancelled() => {
+                break 'main Ok(());
+            }
             Some(completion) = turn_post_commit_completion_rx.recv() => {
                 let completed_session_id = completion.session_id.clone();
                 let errors = crate::cli::turn::turn_post_commit::apply_turn_post_commit_completion(
@@ -5809,6 +5874,9 @@ pub(crate) async fn run_tui_session(
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
                                             tokio::select! {
+                                                _ = session_shutdown_token.cancelled() => {
+                                                    break 'main Ok(());
+                                                }
                                                 // Fair selection keeps key storms from starving a
                                                 // ready Bash handoff or runtime event.
                                                 result = &mut fut, if turn_result_ready.is_none() => {
@@ -7151,7 +7219,9 @@ pub(crate) async fn run_tui_session(
                                     // scrollback in one shot.
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
 
-                                    let new_tok = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+                                    let new_tok = std::sync::Arc::new(
+                                        session_shutdown_token.child_token(),
+                                    );
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
@@ -8242,6 +8312,47 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
+    let shutdown_signal = if session_shutdown_token.is_cancelled() {
+        match (&mut shutdown_monitor).await {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                tracing::warn!(%error, "TUI shutdown monitor failed after requesting shutdown");
+                None
+            }
+        }
+    } else {
+        shutdown_monitor.abort();
+        let _ = shutdown_monitor.await;
+        None
+    };
+    if let Some(signal) = shutdown_signal {
+        tracing::info!(
+            signal = signal.label(),
+            "TUI received process shutdown signal"
+        );
+    }
+
+    // Stop read-side observers first so teardown does not race fresh remote
+    // fetches into state that is already converging toward shutdown.
+    drop(task_board);
+    drop(plan_task_observer);
+    drop(server_agent_observer);
+    state.tui_cancel_token = None;
+    drop(state.plan_handle.take());
+
+    if let Some(spawner) = state.agent_spawner.take() {
+        retire_local_agent_spawner_with_reason(
+            spawner,
+            LOCAL_AGENT_SESSION_SHUTDOWN_REASON,
+            LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN,
+        )
+        .await;
+    }
+    state.unregister_root_mailbox().await;
+    if let Some(task) = edge_heartbeat_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     if external_skill_discovery_pending {
         external_skill_discovery.abort();
         let _ = external_skill_discovery.await;
@@ -8291,6 +8402,17 @@ pub(crate) async fn run_tui_session(
     );
     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
     flush_chat_widget(&mut guard, &mut chat_widget, width);
+    if let Some(journal) = state.journal.as_ref() {
+        crate::cli::session::session_guard::try_write_session_end(
+            journal,
+            state.session_id.as_deref(),
+            state.turn,
+        );
+    }
+    crate::cli::session::session_guard::clear_panic_guard();
+    // The pipeline bundle owns the skill watcher. Drop it only after all
+    // turn/agent work has stopped so no consumer outlives its provider.
+    drop(pipeline_modules);
     drop(guard);
     result
 }
@@ -8442,6 +8564,23 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut buffer);
         crate::tui::testing::render::buffer_to_string(&buffer)
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_waiter_observes_the_typed_signal() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let waiter = tokio::spawn(await_shutdown_signal(receiver));
+
+        sender
+            .send(Some(
+                crate::cli::session::session_guard::ShutdownSignal::Sighup,
+            ))
+            .expect("shutdown receiver remains connected");
+
+        assert_eq!(
+            waiter.await.expect("shutdown waiter task"),
+            crate::cli::session::session_guard::ShutdownSignal::Sighup,
+        );
     }
 
     #[test]

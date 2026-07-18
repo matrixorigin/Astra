@@ -29,7 +29,6 @@ use crossterm::style::Stylize;
 pub(crate) struct SessionStartupArtifacts {
     pub pipeline_modules: PipelineModules,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
-    pub skill_quality_path: std::path::PathBuf,
     pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
 
@@ -855,7 +854,6 @@ pub(crate) async fn complete_session_startup(
     Ok(SessionStartupArtifacts {
         pipeline_modules,
         edge_heartbeat_task,
-        skill_quality_path,
         shutdown_signal_rx,
     })
 }

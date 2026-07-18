@@ -135,6 +135,11 @@ impl PtyAstra {
         self.writer.flush().expect("flush PTY input");
     }
 
+    fn signal(&self, signal: nix::sys::signal::Signal) {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.child.id() as i32), signal)
+            .expect("signal Astra PTY child");
+    }
+
     fn wait_for(&mut self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -278,6 +283,47 @@ fn seed_trusted_workspace(home: &std::path::Path) {
         serde_json::to_vec_pretty(&ledger).expect("serialize workspace trust ledger"),
     )
     .expect("write workspace trust ledger");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sighup_while_idle_converges_through_tui_shutdown() {
+    let _journey = pty_journey_lock().lock().await;
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), "http://127.0.0.1:9");
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "idle SIGHUP must request graceful TUI convergence, got {status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::Slow,
+    )
+    .await
+    .expect("start scripted slow LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"keep_this_turn_active_until_shutdown\r");
+    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
+
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "SIGHUP must request graceful TUI convergence, got {status}"
+    );
 }
 
 fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
