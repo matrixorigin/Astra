@@ -1990,7 +1990,7 @@ impl TaskService for MatrixOneTaskService {
         let sql = format!(
             "SELECT \
              COUNT(*) as total_tasks, \
-             COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as completed_tasks, \
+             CAST(COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) AS SIGNED) as completed_tasks, \
              AVG(user_rating) as avg_rating, \
              AVG(replan_count) as avg_replan_count \
              FROM agent_tasks \

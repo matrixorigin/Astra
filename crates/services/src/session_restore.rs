@@ -850,10 +850,10 @@ impl HybridRestoreService {
               LEFT JOIN ( \
                 SELECT user_id, session_id, \
                        COALESCE(MAX(turn_seq), 0) AS turn_count, \
-                       COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                         THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS total_tokens_in, \
-                       COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                         THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS total_tokens_out \
+                       CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                         THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS total_tokens_in, \
+                       CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                         THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS total_tokens_out \
                 FROM agent_events \
                 GROUP BY user_id, session_id \
               ) event_summary \

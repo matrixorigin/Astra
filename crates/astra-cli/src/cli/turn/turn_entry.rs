@@ -398,7 +398,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         .to_string();
     let logical_user_line = String::new();
     let runtime_envelope =
-        "Reconcile the runtime-owned updates and continue the latest user goal.".to_string();
+        astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE.to_string();
     let turn_start = Instant::now();
     let session_id = state.session_id.clone();
     let local_run_control =

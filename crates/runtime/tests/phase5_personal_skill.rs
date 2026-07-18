@@ -70,6 +70,30 @@ async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> Strin
     text
 }
 
+async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) -> Vec<String> {
+    let schema = sqlx::query("SELECT DATABASE() AS schema_name")
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+        .try_get::<String, _>("schema_name")
+        .unwrap();
+    sqlx::query(
+        "SELECT COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(key)
+    .fetch_all(pool.get())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .collect()
+}
+
 fn test_ids() -> (String, String) {
     let suffix = Uuid::new_v4();
     (suffix.to_string(), format!("skill-{suffix}"))
@@ -264,8 +288,13 @@ async fn l2_47_personal_skill_search_uses_owner_skill_name_index() {
     )
     .await;
     assert!(
-        plan.contains("idx_user_skill_owner_name"),
-        "expected idx_user_skill_owner_name in plan:\n{plan}"
+        plan.contains("user_skill_sources"),
+        "query was not analyzed:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(&pool, "user_skill_sources", "idx_user_skill_owner_name").await,
+        ["owner_user_id", "skill_name"],
+        "personal-skill lookup index must preserve owner/name ordering"
     );
 }
 

@@ -516,6 +516,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         thinking: thinking_config,
     });
 
+    if ctx.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
+        && ctx.semantic_query_override.is_some()
+        && !runtime_required_texts.is_empty()
+        && let Some(edge_profile) = payload
+            .get_mut("edge_profile")
+            .and_then(Value::as_object_mut)
+    {
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN
+                .to_string(),
+            Value::Bool(true),
+        );
+    }
+
     if !runtime_required_texts.is_empty()
         && let Some(root) = payload.as_object_mut()
         && let Some(ep) = root.get_mut("edge_profile")
@@ -1668,6 +1682,8 @@ mod tests {
             vec![json!({"role": "user", "content": "continue"})],
             runtime_required_texts,
             runtime_volatile_texts,
+            "continue",
+            None,
         )
         .await
     }
@@ -1676,6 +1692,8 @@ mod tests {
         messages: Vec<Value>,
         runtime_required_texts: &[String],
         runtime_volatile_texts: &[String],
+        message: &str,
+        semantic_query_override: Option<&str>,
     ) -> Value {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -1719,9 +1737,9 @@ mod tests {
             effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
-            message: "continue",
-            user_intent: "continue",
-            semantic_query_override: None,
+            message,
+            user_intent: semantic_query_override.unwrap_or(message),
+            semantic_query_override,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -1784,11 +1802,44 @@ mod tests {
             payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS],
             json!(volatile)
         );
+        assert!(
+            payload["edge_profile"]
+                .get(
+                    astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN
+                )
+                .is_none(),
+            "ordinary user turns with runtime context must remain user turns"
+        );
         let messages = serde_json::to_string(&payload["messages"]).unwrap();
         assert!(messages.contains("continue"));
         assert!(!messages.contains("Resume the interrupted turn"));
         assert!(!messages.contains("Background task completed"));
         assert!(!messages.contains("<system-reminder>"));
+    }
+
+    #[tokio::test]
+    async fn runtime_reconciliation_payload_marks_non_user_model_boundary() {
+        let required = vec!["Three background agent results are terminal.".to_string()];
+        let envelope =
+            astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE;
+        let payload = prepare_payload_with_messages_for_runtime_lane_test(
+            vec![json!({"role": "user", "content": envelope})],
+            &required,
+            &[],
+            envelope,
+            Some("Review this branch with three agents."),
+        )
+        .await;
+
+        assert_eq!(
+            payload["edge_profile"]
+                [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN],
+            true
+        );
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
+            json!(required)
+        );
     }
 
     #[tokio::test]
@@ -1932,8 +1983,14 @@ mod tests {
         ];
         let structured = vec!["structured resume lane".to_string()];
 
-        let payload =
-            prepare_payload_with_messages_for_runtime_lane_test(messages, &structured, &[]).await;
+        let payload = prepare_payload_with_messages_for_runtime_lane_test(
+            messages,
+            &structured,
+            &[],
+            "continue",
+            None,
+        )
+        .await;
         let payload_messages = serde_json::to_string(&payload["messages"]).unwrap();
 
         assert!(payload_messages.contains("我说过的所有话"));

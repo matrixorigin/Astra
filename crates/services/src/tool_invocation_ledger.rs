@@ -202,13 +202,13 @@ impl DatabaseToolInvocationLedger {
         let hot: (i64, i64, i64, i64, i64, i64, i64, i64) = if let Some(run_id) = run_id {
             sqlx::query_as(
                 "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0)
+                        CAST(COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0) AS SIGNED)
                  FROM tool_invocation_ledger
                  WHERE user_id = ? AND session_id = ? AND run_id = ?",
             )
@@ -220,13 +220,13 @@ impl DatabaseToolInvocationLedger {
         } else {
             sqlx::query_as(
                 "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0)
+                        CAST(COALESCE(SUM(CASE WHEN state = 'prepared' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'dispatched' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'rejected' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                        CAST(COALESCE(SUM(CASE WHEN state = 'rejected' AND dispatch_certainty = 'not_dispatched' THEN 1 ELSE 0 END), 0) AS SIGNED)
                  FROM tool_invocation_ledger
                  WHERE user_id = ? AND session_id = ?",
             )
@@ -291,8 +291,8 @@ impl DatabaseToolInvocationLedger {
         let events: (i64, i64) = if let Some(run_id) = run_id {
             sqlx::query_as(
                 "SELECT
-                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0)
+                    CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                    CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0) AS SIGNED)
                  FROM agent_events
                  WHERE user_id = ? AND session_id = ? AND run_id = ?",
             )
@@ -304,8 +304,8 @@ impl DatabaseToolInvocationLedger {
         } else {
             sqlx::query_as(
                 "SELECT
-                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0)
+                    CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_run_reconciled' THEN 1 ELSE 0 END), 0) AS SIGNED),
+                    CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_invocation_compaction_deferred' THEN 1 ELSE 0 END), 0) AS SIGNED)
                  FROM agent_events
                  WHERE user_id = ? AND session_id = ?",
             )

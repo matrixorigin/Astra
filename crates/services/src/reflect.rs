@@ -992,8 +992,8 @@ impl ReflectService for DatabaseReflectService {
             "SELECT \
                COUNT(*) AS total_events, \
                COUNT(DISTINCT skill_name) AS unique_skills, \
-               COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
-                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END), 0) AS error_count, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
+                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
                CAST(MIN(created_at) AS CHAR) AS first_event, \
                CAST(MAX(created_at) AS CHAR) AS last_event \
              FROM agent_events WHERE session_id = ? AND user_id = ?",

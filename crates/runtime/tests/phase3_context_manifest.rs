@@ -450,7 +450,7 @@ async fn l3_7_s02_ten_gb_retrieval_manifest_records_three_stage_fallbacks() {
     .unwrap();
     assert_eq!(degrade_count, 3);
     let bytes = sqlx::query(
-        "SELECT COALESCE(SUM(LENGTH(chunk_text)), 0) AS bytes
+        "SELECT CAST(COALESCE(SUM(LENGTH(chunk_text)), 0) AS SIGNED) AS bytes
          FROM phase3_history_chunks WHERE session_id = ?",
     )
     .bind(&session_id)

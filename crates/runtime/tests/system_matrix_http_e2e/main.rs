@@ -49,6 +49,10 @@
 //!   `context_trace_signal` event written to `agent_events` with valid causal chain.
 //! - **`e2e_matrix_stream_multi_turn_persistence`** — two sequential `POST /chat/stream` to same
 //!   session → verify event counts increment, distinct causal chains, both runs completed.
+//! - **`e2e_matrix_cli_bridge_session_views_remain_consistent`** — two `POST /chat/turn` model
+//!   boundaries (one human, one runtime reconciliation) with mock LLM → cross-check MatrixOne core
+//!   rows, session/event counts, audit summary/turns, and root transcript; internal runtime text
+//!   must never become user speech.
 //! - **`e2e_matrix_team_crud_and_db`** — `POST/GET/DELETE /teams`, list + detail + empty executions,
 //!   upsert second `POST`, `team_definitions` SQL assertions (`user_id`, `name`, delete removes row).
 //! - **`e2e_matrix_team_snapshots_and_db`** — `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`,
@@ -110,6 +114,7 @@
 mod harness;
 mod journey_admin_smoke_matrix;
 mod journey_branches_matrix;
+mod journey_bridge_session_state;
 mod journey_chat_route_models_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
@@ -276,6 +281,13 @@ async fn e2e_matrix_stream_context_trace_persistence() {
 async fn e2e_matrix_stream_multi_turn_persistence() {
     require_system_e2e_env();
     journey_stream_persistence::run_stream_multi_turn_persistence().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + mock LLM; ASTRA_TEST_DB_IT=1 — CLI bridge session state contract"]
+async fn e2e_matrix_cli_bridge_session_views_remain_consistent() {
+    require_system_e2e_env();
+    journey_bridge_session_state::run_cli_bridge_session_views_remain_consistent().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

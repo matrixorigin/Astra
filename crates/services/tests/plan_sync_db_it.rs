@@ -458,12 +458,13 @@ async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
         "the orphan step run must be skipped"
     );
 
-    // 500ms on loopback for 50 plans + 200 runs is a generous bound. The
-    // N+1 impl against loopback MatrixOne takes ~1.5-2.5s for this workload
-    // (measured); batched SELECTs drop to ~100-250ms. If this ever regresses
-    // above 800ms, someone reintroduced per-row SELECTs.
+    // The N+1 implementation against loopback MatrixOne takes ~1.5-2.5s for
+    // this workload (measured); batched SELECTs normally finish in 100-250ms.
+    // Keep enough headroom for the regular two-way online lane sharing the DB
+    // while retaining a bound below the observed N+1 floor. CI itself runs the
+    // online lane serially.
     assert!(
-        elapsed < std::time::Duration::from_millis(800),
+        elapsed < std::time::Duration::from_millis(1_200),
         "push_plans_pack with {PLAN_COUNT} plans + {} runs took {:?} — \
          this smells like per-row SELECTs returning (N+1 query pattern)",
         PLAN_COUNT * RUNS_PER_PLAN,

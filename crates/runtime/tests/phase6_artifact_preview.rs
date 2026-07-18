@@ -619,21 +619,21 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     let row = sqlx::query(
         "SELECT
            COUNT(*) AS total_artifacts,
-           SUM(CASE
+           CAST(COALESCE(SUM(CASE
                  WHEN retention_policy = 'project_long_term'
                   AND status = 'active'
                   AND retention_until > DATE_ADD(NOW(6), INTERVAL 300 DAY)
                  THEN 1 ELSE 0
-               END) AS long_term_extended,
-           SUM(CASE
+               END), 0) AS SIGNED) AS long_term_extended,
+           CAST(COALESCE(SUM(CASE
                  WHEN retention_policy = 'default'
                   AND (status = 'expired' OR status = 'expiring')
                  THEN 1 ELSE 0
-               END) AS default_processed,
-           SUM(CASE
+               END), 0) AS SIGNED) AS default_processed,
+           CAST(COALESCE(SUM(CASE
                  WHEN retention_policy = 'default' AND status = 'active'
                  THEN 1 ELSE 0
-               END) AS default_still_active
+               END), 0) AS SIGNED) AS default_still_active
          FROM session_artifacts WHERE user_id = ? AND session_id = ?",
     )
     .bind(&user_id)

@@ -48,6 +48,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
+| `e2e_matrix_cli_bridge_session_views_remain_consistent` | `journey_bridge_session_state.rs` | Real MatrixOne + mock LLM: one human `/chat/turn` and one runtime reconciliation; cross-check `agent_events`, `agent_sessions.event_count`, events API, audit summary/turns, and root transcript with exact content/token/role assertions |
 | `e2e_matrix_approval_respond_invalid_session_id` | `journey_extended.rs` | `POST /approval/respond` with an unsafe `session_id`; assert `400` rejects invalid journal path components |
 | `e2e_matrix_edge_callback_http_boundary_failures` | `journey_extended.rs` | `POST /tools/result` and `/approval/respond` without auth or with malformed payloads; assert auth/client errors at the HTTP boundary |
 | `e2e_matrix_duplicate_tool_result_idempotency` | `journey_extended.rs` | Start `POST /chat/turn`, then `POST /tools/result` twice for the same `request_id`; assert the initial SSE handoff still emits one `tool_request` and ends with `has_tool_calls=true` |
@@ -92,7 +93,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*`, `e2e_matrix_meta_health` |
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | Every test uses `bootstrap` (register/login); `product_matrix_*` also hits `/auth/refresh` and `/logout` |
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` + `e2e_matrix_session_http_db` |
-| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*`; `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
+| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | `agent_events` + HTTP cross-check | `product_matrix_*`; `e2e_matrix_cli_bridge_session_views_remain_consistent` (summary/turn counts and token totals); `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_chat_route_models` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
@@ -107,7 +108,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
-| Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events` | `product_matrix_*`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency`, `e2e_matrix_chat_turn_partial_batch_failure`, `e2e_matrix_chat_turn_out_of_order_tool_results`, `e2e_matrix_same_session_concurrent_turns_isolated`, `e2e_matrix_same_session_waiting_turn_overlap_isolated` |
+| Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_cli_bridge_session_views_remain_consistent`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency`, `e2e_matrix_chat_turn_partial_batch_failure`, `e2e_matrix_chat_turn_out_of_order_tool_results`, `e2e_matrix_same_session_concurrent_turns_isolated`, `e2e_matrix_same_session_waiting_turn_overlap_isolated` |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
 | Tasks | P0 | `/tasks`, `GET` list/get/progress, `/tasks/{id}/lease/*`, `.../status` | `agent_tasks`, `task_leases` | `e2e_matrix_tasks_lease_and_db_assertions` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |

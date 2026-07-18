@@ -1293,10 +1293,10 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let agg = query(
             "SELECT \
-               COALESCE(SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END), 0) AS tool_total_calls, \
-               COALESCE(SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END), 0) AS tool_fail_count, \
-               COALESCE(SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS ask_user_total_calls, \
-               COALESCE(SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS ask_user_fail_count \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_total_calls, \
+               CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_fail_count, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS ask_user_total_calls, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS ask_user_fail_count \
               FROM agent_events \
               WHERE user_id = ? \
                 AND (skill_name = ? OR meta_tool_name = ?) \

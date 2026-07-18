@@ -1572,6 +1572,22 @@ impl InProcessChatTurnBridge {
         let tool_results = optional_payload_array(&payload, "tool_results")?;
         let edge_tools = optional_payload_array(&payload, "edge_tools")?;
         let edge_profile = optional_payload_object(&payload, "edge_profile")?;
+        let runtime_reconciliation_turn = edge_profile
+            .get(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN,
+            )
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && latest_user_message_text(&messages)
+                == Some(
+                    astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE,
+                )
+            && edge_profile
+                .get(
+                    astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+                )
+                .and_then(Value::as_array)
+                .is_some_and(|texts| !texts.is_empty());
         let runtime_memory_binding =
             optional_nested_payload_object(&payload, "runtime_bindings", "memory")?;
         let explain = explain_requested(&payload);
@@ -4224,7 +4240,11 @@ impl InProcessChatTurnBridge {
                     session_id: session_id.clone(),
                     run_id: Some(run_id.clone()),
                     agent_id: agent_id.clone(),
-                    event_type: "user_query".to_string(),
+                    event_type: if runtime_reconciliation_turn {
+                        "runtime_reconciliation".to_string()
+                    } else {
+                        "user_query".to_string()
+                    },
                     content: content.clone(),
                     parent_event_id: None,
                     parent_event_ids: Vec::new(),

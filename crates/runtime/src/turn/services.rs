@@ -1,6 +1,9 @@
 use crate::data_layer::storage::{
     bump_agent_session_event_count, insert_trace_event, touch_agent_session_activity,
 };
+use crate::server::run::lifecycle::{
+    TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
+};
 use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
@@ -151,6 +154,35 @@ fn record_session_event_delta(
     }
 }
 
+fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersistItem> {
+    let role = match event.event_type.as_str() {
+        "user_query" => "user",
+        "llm_response" => "assistant",
+        // Runtime reconciliation is durable evidence, not a user utterance.
+        // Its visible assistant result is still materialized by the paired
+        // `llm_response` event below.
+        _ => return None,
+    };
+    let payload = event
+        .reasoning_content
+        .as_ref()
+        .map(|reasoning| TranscriptPersistPayload {
+            reasoning: Some(reasoning.clone()),
+            reasoning_status: Some("completed".to_string()),
+            ..Default::default()
+        });
+    Some(TranscriptPersistItem {
+        // CLI bridge runs are local runtime identities, not durable
+        // `agent_runs` rows. A NULL run_id keeps them visible in both the
+        // session transcript and its root-conversation projection.
+        run_id: None,
+        role,
+        content: event.content.clone(),
+        payload,
+        source_event_id: event.event_id.clone(),
+    })
+}
+
 impl DatabaseTurnReflectionLessonWriter {
     pub fn new(base_url: String, master_key: Option<String>) -> Self {
         Self {
@@ -180,6 +212,24 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         }
         let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let transcript_owner = plan
+            .user_query_event
+            .as_ref()
+            .or(plan.llm_response_event.as_ref())
+            .map(|event| (event.user_id.clone(), event.session_id.clone()));
+        if let (Some(user), Some(assistant)) = (
+            plan.user_query_event.as_ref(),
+            plan.llm_response_event.as_ref(),
+        ) && (user.user_id != assistant.user_id || user.session_id != assistant.session_id)
+        {
+            return Err("core turn events must share one transcript owner/session".to_string());
+        }
+        let transcript_items = plan
+            .user_query_event
+            .iter()
+            .chain(plan.llm_response_event.iter())
+            .filter_map(bridge_transcript_item)
+            .collect::<Vec<_>>();
         let mut deltas =
             std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
         if let Some(event) = plan.user_query_event.as_ref() {
@@ -197,6 +247,18 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
             {
                 record_session_event_delta(&mut deltas, event, Some(&event.event_id));
             }
+        }
+        if let Some((user_id, session_id)) = transcript_owner
+            && !transcript_items.is_empty()
+        {
+            persist_session_transcript_items_inner_in_tx(
+                &mut tx,
+                &user_id,
+                &session_id,
+                &transcript_items,
+            )
+            .await
+            .map_err(|error| format!("persist bridge transcript items: {error}"))?;
         }
         for ((user_id, session_id), (delta, last_event_id)) in deltas {
             bump_agent_session_event_count(
@@ -693,6 +755,47 @@ mod tests {
     fn metadata_tool_name_non_string_value() {
         let v = json!({"tool_name": 42});
         assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn bridge_transcript_projection_excludes_runtime_envelope_but_keeps_reply() {
+        let user = core_event(
+            "user-event",
+            "user-1",
+            "session-1",
+            "chain-1",
+            "user_query",
+            "real user input",
+            None,
+        );
+        let runtime = core_event(
+            "runtime-event",
+            "user-1",
+            "session-1",
+            "chain-2",
+            "runtime_reconciliation",
+            astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE,
+            None,
+        );
+        let response = core_event(
+            "response-event",
+            "user-1",
+            "session-1",
+            "chain-2",
+            "llm_response",
+            "reconciled result",
+            Some("runtime-event"),
+        );
+
+        let user_item = bridge_transcript_item(&user).expect("human input transcript item");
+        assert_eq!(user_item.role, "user");
+        assert_eq!(user_item.content, "real user input");
+        assert!(user_item.run_id.is_none());
+        assert!(bridge_transcript_item(&runtime).is_none());
+        let response_item =
+            bridge_transcript_item(&response).expect("runtime reply transcript item");
+        assert_eq!(response_item.role, "assistant");
+        assert_eq!(response_item.content, "reconciled result");
     }
 
     fn core_event(

@@ -1970,9 +1970,9 @@ pub(crate) use persistence::{
     build_run_turn_complete_event_with_interruption, format_task_board_resume_hint,
     materialize_server_run_transcript_evidence, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_server_loop_transcript_items,
-    persist_session_transcript_items, restore_session_state_compact,
-    restore_step_checkpoint_runtime_state, server_loop_causal_chain_id, server_trace_context,
-    trace_context_from_subrun_context,
+    persist_session_transcript_items, persist_session_transcript_items_inner_in_tx,
+    restore_session_state_compact, restore_step_checkpoint_runtime_state,
+    server_loop_causal_chain_id, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -8356,7 +8356,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
             let user_transcript = TranscriptPersistItem {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 role: "user",
                 content: request.message.clone(),
                 payload: None,

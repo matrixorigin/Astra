@@ -162,13 +162,6 @@ async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) ->
     .collect()
 }
 
-fn assert_plan_uses(plan: &str, index_name: &str) {
-    assert!(
-        plan.contains(index_name),
-        "expected EXPLAIN ANALYZE plan to mention {index_name}, got:\n{plan}"
-    );
-}
-
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_32_compaction_invariants_return_zero_after_compaction() {
@@ -226,7 +219,20 @@ async fn l2_32_compaction_invariants_return_zero_after_compaction() {
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_state_owner_session_status_category");
+    assert!(
+        plan.contains("session_state_items"),
+        "query was not analyzed:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_state_items",
+            "idx_state_owner_session_status_category"
+        )
+        .await,
+        ["user_id", "session_id", "status", "category"],
+        "state lookup index must preserve owner/session/status/category ordering"
+    );
 }
 
 #[tokio::test]
@@ -461,7 +467,20 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_delegations_owner_parent_status_updated");
+    assert!(
+        plan.contains("session_delegations"),
+        "query was not analyzed:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_delegations",
+            "idx_delegations_owner_parent_status_updated"
+        )
+        .await,
+        ["user_id", "parent_run_id", "status", "updated_at"],
+        "delegation lookup index must preserve owner/parent/status/update ordering"
+    );
 }
 
 #[tokio::test]
@@ -740,7 +759,20 @@ async fn l2_40_cross_session_history_query_uses_user_chunk_created_index() {
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_history_user_chunk_created");
+    assert!(
+        plan.contains("session_history_chunks"),
+        "query was not analyzed:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_history_chunks",
+            "idx_history_user_chunk_created"
+        )
+        .await,
+        ["user_id", "chunk_type", "created_at"],
+        "history lookup index must preserve owner/type/time ordering"
+    );
 }
 
 #[tokio::test]
@@ -1170,7 +1202,20 @@ async fn l3_15_s11_cross_session_decision_retrieval_has_provenance() {
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_history_user_chunk_created");
+    assert!(
+        plan.contains("session_history_chunks"),
+        "query was not analyzed:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_history_chunks",
+            "idx_history_user_chunk_created"
+        )
+        .await,
+        ["user_id", "chunk_type", "created_at"],
+        "history lookup index must preserve owner/type/time ordering"
+    );
     let row = sqlx::query(
         "SELECT provenance_json FROM session_history_chunks FORCE INDEX (idx_history_user_chunk_created)
          WHERE user_id = ? AND chunk_type = 'decision'

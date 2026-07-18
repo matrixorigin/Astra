@@ -600,8 +600,8 @@ impl AdminFeedbackStatsReader for DatabaseAdminFeedbackStatsReader {
 
         let mut summary_query = QueryBuilder::<MySql>::new(
             "SELECT COUNT(feedback_id) AS total_feedback, \
-             SUM(IF(rating >= 4, 1, 0)) AS positive_feedback, \
-             SUM(IF(rating <= 2, 1, 0)) AS negative_feedback, \
+             CAST(COALESCE(SUM(IF(rating >= 4, 1, 0)), 0) AS SIGNED) AS positive_feedback, \
+             CAST(COALESCE(SUM(IF(rating <= 2, 1, 0)), 0) AS SIGNED) AS negative_feedback, \
              AVG(rating) AS avg_rating \
              FROM eval_user_feedback",
         );

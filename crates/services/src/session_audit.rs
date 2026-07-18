@@ -896,7 +896,7 @@ mod agent_events_content_cap {
     pub const ERROR_LIST_ENTRY: u32 = 8192;
 }
 
-const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), COUNT(CASE WHEN event_type = 'user_query' THEN 1 END), 0) AS cnt FROM agent_events \
+const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END), COUNT(CASE WHEN event_type = 'user_query' THEN 1 END), 0) AS cnt FROM agent_events \
      WHERE session_id = ? AND user_id = ?";
 
 const TURN_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
@@ -1122,11 +1122,11 @@ fn build_audit_session_list_query(
     let base_sql = format!(
         "SELECT \
            s.session_id, s.status, s.created_at, s.ended_at, \
-           COALESCE(MAX(e.turn_seq), 0) AS turn_count, \
-           COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
-             THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS tokens_in, \
-           COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
-             THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS tokens_out, \
+           COALESCE(MAX(CASE WHEN e.event_type = 'user_query' THEN e.turn_seq END), 0) AS turn_count, \
+           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+             THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
+           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+             THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
            COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
            COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
            MIN(e.created_at) AS first_ts, \
@@ -2241,7 +2241,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
         let metrics_row = query(&format!(
             "SELECT \
-               COALESCE(MAX(turn_seq), 0) AS turn_count, \
+               COALESCE(MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END), 0) AS turn_count, \
                COUNT(CASE WHEN event_type = 'turn_error' THEN 1 END) AS error_count, \
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
@@ -2255,10 +2255,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) \
                  + COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_total, \
                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_failed, \
-               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS tokens_in, \
-               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS tokens_out, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
                CAST(MIN(created_at) AS CHAR) AS first_at, \
                CAST(MAX(created_at) AS CHAR) AS last_at, \
                (SELECT GROUP_CONCAT(m ORDER BY m SEPARATOR '{sep}') \
@@ -2522,7 +2522,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
                  COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
                  COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
-                 COALESCE(SUM(meta_duration_ms), 0) AS total_duration_ms \
+                 CAST(COALESCE(SUM(meta_duration_ms), 0) AS SIGNED) AS total_duration_ms \
                 FROM agent_events \
                 WHERE session_id = ? AND user_id = ? \
                   AND event_type IN ('tool_call', 'tool_error') \
@@ -2718,10 +2718,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                COUNT(DISTINCT e.session_id) as session_count, \
                COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) as total_turns, \
-               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) as tokens_in, \
-               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) as tokens_out, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) as tokens_in, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) as tokens_out, \
                 COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
                 COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
@@ -2769,7 +2769,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                llm_model_used as model, \
                COUNT(DISTINCT session_id) as sess_cnt, \
-               COALESCE(SUM(token_total), 0) as total_tokens \
+               CAST(COALESCE(SUM(token_total), 0) AS SIGNED) as total_tokens \
              FROM agent_events e \
              WHERE {where_clause} AND llm_model_used IS NOT NULL AND llm_model_used != '' \
              GROUP BY model \
@@ -3553,7 +3553,10 @@ mod tests {
 
     #[test]
     fn turn_list_total_query_uses_turn_seq_high_watermark_with_legacy_count_fallback() {
-        assert!(TURN_LIST_TOTAL_SQL.contains("MAX(turn_seq)"));
+        assert!(
+            TURN_LIST_TOTAL_SQL
+                .contains("MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END)")
+        );
         assert!(TURN_LIST_TOTAL_SQL.contains("COUNT(CASE WHEN event_type = 'user_query'"));
     }
 

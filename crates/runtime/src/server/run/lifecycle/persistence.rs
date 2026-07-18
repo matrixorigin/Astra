@@ -1309,7 +1309,11 @@ async fn persist_server_loop_core_events_impl(
 }
 
 pub(crate) struct TranscriptPersistItem {
-    pub(crate) run_id: String,
+    /// Durable run ownership when the producer participates in the server run
+    /// lifecycle. CLI bridge turns deliberately use `None`: their local run
+    /// identity is not an `agent_runs` row, and attaching an orphan id would
+    /// make the root-conversation transcript silently filter the item out.
+    pub(crate) run_id: Option<String>,
     pub(crate) role: &'static str,
     pub(crate) content: String,
     /// Structured transcript-only data. This stays outside prompt-facing
@@ -1357,7 +1361,7 @@ fn transcript_items_from_server_loop(
     let mut core_items = Vec::new();
     if !user_message.is_empty() {
         core_items.push(TranscriptPersistItem {
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             role: "user",
             content: user_message.to_string(),
             payload: None,
@@ -1366,7 +1370,7 @@ fn transcript_items_from_server_loop(
     }
     for intent in state.user_intents.applied_user_intents() {
         core_items.push(TranscriptPersistItem {
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             role: "user",
             content: intent.content.clone(),
             payload: None,
@@ -1389,7 +1393,7 @@ fn transcript_items_from_server_loop(
         let call_id = tool_trace_call_id(run_id, index, record);
         let tool_name = record.name.clone();
         core_items.push(TranscriptPersistItem {
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             role: "assistant",
             content: String::new(),
             payload: Some(TranscriptPersistPayload {
@@ -1413,7 +1417,7 @@ fn transcript_items_from_server_loop(
             result_content
         };
         core_items.push(TranscriptPersistItem {
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             role: "tool",
             content: result_content,
             payload: Some(TranscriptPersistPayload {
@@ -1456,7 +1460,7 @@ fn terminal_assistant_transcript_item(
         .cloned()
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
     Some(TranscriptPersistItem {
-        run_id: run_id.to_string(),
+        run_id: Some(run_id.to_string()),
         role: "assistant",
         content: state.final_text.clone(),
         payload: None,
@@ -1634,7 +1638,7 @@ fn transcript_evidence_items_from_run_event(
         request_id
             .zip(tool)
             .map(|(request_id, tool)| TranscriptPersistItem {
-                run_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
                 role: "event",
                 content: String::new(),
                 payload: Some(TranscriptPersistPayload {
@@ -1683,7 +1687,7 @@ fn transcript_evidence_items_from_run_event(
                 return Vec::new();
             };
             vec![TranscriptPersistItem {
-                run_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
                 role: "event",
                 content: String::new(),
                 payload: Some(TranscriptPersistPayload {
@@ -3887,21 +3891,21 @@ mod tests {
 
         let items = [
             TranscriptPersistItem {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 role: "user",
                 content: "hello".to_string(),
                 payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             },
             TranscriptPersistItem {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 role: "user",
                 content: "second input".to_string(),
                 payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             },
             TranscriptPersistItem {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 role: "assistant",
                 content: "world".to_string(),
                 payload: None,
@@ -3995,7 +3999,7 @@ mod tests {
             &other_user_id,
             &session_id,
             &[TranscriptPersistItem {
-                run_id,
+                run_id: Some(run_id),
                 role: "assistant",
                 content: "wrong owner".to_string(),
                 payload: None,

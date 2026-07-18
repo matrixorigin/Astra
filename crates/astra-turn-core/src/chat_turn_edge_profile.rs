@@ -104,6 +104,18 @@ fn volatile_payload_is_empty(payload: &Value) -> bool {
 /// turn instead of dropping it for cache locality.
 pub const EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS: &str = "runtime_required_texts";
 
+/// Typed marker for a model boundary triggered by runtime-owned background
+/// facts rather than a new human submission. The transport still carries a
+/// non-empty envelope for provider compatibility, but persistence must not
+/// classify that envelope as `user_query`.
+pub const EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN: &str = "runtime_reconciliation_turn";
+
+/// Provider-compatible envelope used only for a runtime reconciliation turn.
+/// Keep this shared with the payload builder so the typed marker cannot drift
+/// from the CLI trigger.
+pub const RUNTIME_RECONCILIATION_USER_ENVELOPE: &str =
+    "Reconcile the runtime-owned updates and continue the latest user goal.";
+
 /// Protocol key for the session-stable deferred-tool manifest routed through
 /// `edge_profile` from the CLI to the runtime bridge.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";

@@ -1824,8 +1824,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let row = query(
             "SELECT COUNT(*) AS total, \
-             COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
-                  THEN 1 ELSE 0 END), 0) AS safe_cnt \
+             CAST(COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END), 0) AS SIGNED) AS safe_cnt \
              FROM agent_events \
              WHERE user_id = ? \
                AND event_type = 'hallucination_check' \
@@ -1865,8 +1865,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let rows = query(
             "SELECT agent_id, COUNT(*) AS total, \
-             SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
-                  THEN 1 ELSE 0 END) AS safe_cnt \
+             CAST(COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END), 0) AS SIGNED) AS safe_cnt \
              FROM agent_events \
              WHERE user_id = ? \
                AND event_type = 'hallucination_check' \
@@ -1904,8 +1904,8 @@ impl EvaluationService for DatabaseEvaluationService {
         let rows = query(
             "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
              COUNT(*) AS total, \
-             SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
-                  THEN 1 ELSE 0 END) AS safe_cnt \
+             CAST(COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END), 0) AS SIGNED) AS safe_cnt \
              FROM agent_events \
              WHERE user_id = ? \
                AND agent_id = ? \
@@ -2004,7 +2004,7 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let skill_row = query(
             "SELECT COUNT(*) AS total, \
-             COALESCE(SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END), 0) AS ok_cnt \
+             CAST(COALESCE(SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END), 0) AS SIGNED) AS ok_cnt \
              FROM skill_selection_events \
              WHERE user_id = ? \
                AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",

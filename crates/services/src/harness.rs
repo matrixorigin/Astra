@@ -2514,8 +2514,8 @@ async fn update_skillify_run_counts(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT
-            COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_count,
-            COALESCE(SUM(CASE WHEN status = 'pending_review' THEN 1 ELSE 0 END), 0) AS pending_count,
+            CAST(COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS SIGNED) AS approved_count,
+            CAST(COALESCE(SUM(CASE WHEN status = 'pending_review' THEN 1 ELSE 0 END), 0) AS SIGNED) AS pending_count,
             COUNT(*) AS candidate_count
          FROM harness_items
          WHERE harness_run_id = ?",
@@ -2556,9 +2556,9 @@ async fn update_skillify_draft_counts(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT
-            COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0) AS published_count,
-            COALESCE(SUM(CASE WHEN status IN ('ready_to_publish', 'approved') THEN 1 ELSE 0 END), 0) AS ready_count,
-            COALESCE(SUM(CASE WHEN status IN ('pending_rule_review', 'pending_skill_review', 'needs_revision') THEN 1 ELSE 0 END), 0) AS pending_count,
+            CAST(COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0) AS SIGNED) AS published_count,
+            CAST(COALESCE(SUM(CASE WHEN status IN ('ready_to_publish', 'approved') THEN 1 ELSE 0 END), 0) AS SIGNED) AS ready_count,
+            CAST(COALESCE(SUM(CASE WHEN status IN ('pending_rule_review', 'pending_skill_review', 'needs_revision') THEN 1 ELSE 0 END), 0) AS SIGNED) AS pending_count,
             COUNT(*) AS skill_draft_count
          FROM harness_skill_drafts
          WHERE harness_run_id = ?",
@@ -2582,7 +2582,7 @@ async fn update_skillify_draft_counts(
     };
     let rule_row = sqlx::query(
         "SELECT
-            COALESCE(SUM(CASE WHEN status IN ('approved', 'edited') THEN 1 ELSE 0 END), 0) AS approved_rule_count,
+            CAST(COALESCE(SUM(CASE WHEN status IN ('approved', 'edited') THEN 1 ELSE 0 END), 0) AS SIGNED) AS approved_rule_count,
             COUNT(*) AS rule_count
          FROM harness_skill_rules
          WHERE harness_run_id = ?",
