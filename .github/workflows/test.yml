@@ -74,7 +74,7 @@ jobs:
         run: >-
           timeout ${{ matrix.command_timeout }} cargo nextest run
           --manifest-path Cargo.toml -p astra-cli
-          --profile ci --bins -E "$NEXTEST_FILTER"
+          --profile ci --lib -E "$NEXTEST_FILTER"
       - name: Test astra-cli runtime profile guardrail
         if: matrix.segment == 'non-edge'
         run: >-
