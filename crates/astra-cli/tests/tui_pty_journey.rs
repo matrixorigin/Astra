@@ -283,6 +283,45 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+fn selected_task_slot(screen: &str) -> Option<String> {
+    screen.lines().find_map(|line| {
+        let numbered = line.trim_start().strip_prefix('›')?.trim_start();
+        let (ordinal, _) = numbered.split_once('.')?;
+        ordinal.parse::<usize>().ok()?;
+        numbered
+            .split_once("slot ")
+            .map(|(_, slot)| slot.trim().to_string())
+    })
+}
+
+fn select_task_slot(astra: &mut PtyAstra, target: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let before = selected_task_slot(&astra.current_screen())
+            .expect("task panel has one selected stable row");
+        if before == target {
+            return;
+        }
+        astra.write(b"\x1b[B");
+        loop {
+            astra.receive(Duration::from_millis(50));
+            if selected_task_slot(&astra.current_screen()).as_deref() != Some(before.as_str()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "task selection did not move toward {target}\n{}",
+                astra.current_screen()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "could not select task slot {target}\n{}",
+            astra.current_screen()
+        );
+    }
+}
+
 fn seed_trusted_workspace(home: &std::path::Path) {
     let workspace = home
         .canonicalize()
@@ -491,24 +530,21 @@ fn is_fanout_reconciliation_request(request: &serde_json::Value) -> bool {
         == Some(astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE)
 }
 
-fn summarize_fanout_reconciliation_request(request: &serde_json::Value) -> String {
-    let tool_results = request
-        .get("tool_results")
+fn is_fanout_status_question(request: &serde_json::Value) -> bool {
+    request
+        .get("messages")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|result| result.get("name").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>();
-    format!(
-        "session_turn={:?} turn_chain_id={:?} reconciliation_flag={:?} messages={} tool_results={tool_results:?}",
-        request.get("session_turn"),
-        request.get("turn_chain_id"),
-        request.pointer("/edge_profile/runtime_reconciliation_turn"),
-        request
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len),
-    )
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        == Some(astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION)
+}
+
+fn is_fanout_root_request(request: &serde_json::Value) -> bool {
+    !is_fanout_journey_child_request(request)
 }
 
 async fn wait_for_three_fanout_children(
@@ -676,10 +712,10 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     // that exact key opens the background-task manager.
     astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b[1;2B"); // xterm Shift+Down
-    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b"); // close the manager before opening Conversations
-    astra.wait_for_absent("Background tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_absent("  Tasks", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x07]); // Ctrl+G while the child response is still pending.
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
@@ -717,7 +753,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fanout_is_one_background_work_unit_with_one_terminal_reconciliation() {
+async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_settlement() {
     let _journey = pty_journey_lock().lock().await;
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
@@ -730,16 +766,303 @@ async fn fanout_is_one_background_work_unit_with_one_terminal_reconciliation() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"launch_three_reviews_as_one_group\r");
-    astra.wait_for(
-        "Three mock reviews are running in the background as one work group.",
-        UI_TRANSITION_TIMEOUT,
-    );
     wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("parent waits for the complete group", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
 
-    // A normal user turn receives the authoritative live snapshot without
-    // first discovering/calling task_list. This is the exact "what is still
-    // running?" product contract from the reported session.
+    // The first two children settle while the third remains deliberately
+    // blocked. Neither completion may advance the parent model; the runtime
+    // projection, not another analysis turn, keeps the user informed.
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_fanout_root_request(request))
+            .count(),
+        2,
+        "tool discovery and fanout launch are the only parent requests before full settlement"
+    );
+
+    astra.write(b"\x1b[1;2B");
+    astra.wait_for("Tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("slot 1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("slot 2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("slot 3: Mock review 3", UI_TRANSITION_TIMEOUT);
+    let selected_before_move = selected_task_slot(&astra.current_screen())
+        .expect("task panel has one selected stable row");
+    astra.write(b"\x1b[B");
+    let selection_deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    let selected_after_move = loop {
+        astra.receive(Duration::from_millis(50));
+        if let Some(selected) = selected_task_slot(&astra.current_screen())
+            && selected != selected_before_move
+        {
+            break selected;
+        }
+        assert!(
+            Instant::now() < selection_deadline,
+            "Down did not move the stable task selection\n{}",
+            astra.current_screen()
+        );
+    };
+
+    let refresh_deadline = Instant::now() + Duration::from_millis(1_700);
+    while Instant::now() < refresh_deadline {
+        astra.receive(Duration::from_millis(50));
+    }
+    let refreshed = astra.current_screen();
+    let first = refreshed
+        .find("slot 1: Mock review 1")
+        .expect("first fanout row");
+    let second = refreshed
+        .find("slot 2: Mock review 2")
+        .expect("second fanout row");
+    let third = refreshed
+        .find("slot 3: Mock review 3")
+        .expect("third fanout row");
+    assert!(
+        first < second && second < third,
+        "rows jumped after refresh:\n{refreshed}"
+    );
+    assert_eq!(
+        selected_task_slot(&refreshed).as_deref(),
+        Some(selected_after_move.as_str()),
+        "selected stable task identity changed during refresh:\n{refreshed}"
+    );
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_fanout_root_request(request))
+            .count(),
+        2,
+        "partial child settlement must not trigger parent analysis"
+    );
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        0,
+        "foreground fan-in must not create a detached reconciliation turn"
+    );
+    astra.write(b"\x1b");
+
+    astra.wait_for(
+        "Parent synthesized one terminal fanout group exactly once.",
+        Duration::from_secs(10),
+    );
+    let received = mock.received_requests();
+    let root_requests = received
+        .iter()
+        .filter(|request| is_fanout_root_request(request))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root_requests.len(),
+        3,
+        "the full fanout result must produce one and only one parent synthesis; root requests: {:#?}",
+        root_requests
+            .iter()
+            .map(|request| summarize_mock_request(request))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        0,
+        "structured foreground completion must stay on the original parent turn"
+    );
+    assert!(
+        !String::from_utf8_lossy(&astra.output)
+            .contains("Fanout did not return a usable launch receipt"),
+        "foreground fan-in must not paint a transient transport failure while the runtime owns live agents\n{}",
+        astra.current_screen()
+    );
+
+    astra.write(b"/exit\r");
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::FanoutPartialThenComplete,
+    )
+    .await
+    .expect("start partial fanout LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"launch_three_reviews_with_one_unhappy_child\r");
+    wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[1;2B");
+    astra.wait_for("slot 2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("failed", UI_TRANSITION_TIMEOUT);
+
+    // Select the failed slot by stable identity and verify that its distinct
+    // cause is inspectable while the final slow slot is still running.
+    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for(
+        "fanout_child_2_failed_with_distinct_cause",
+        UI_TRANSITION_TIMEOUT,
+    );
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_fanout_root_request(request))
+            .count(),
+        2,
+        "one child failure must not trigger partial parent analysis"
+    );
+    astra.write(b"\x1b");
+    astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    astra.wait_for(
+        "Parent synthesized the available 2/3 fanout evidence exactly once.",
+        Duration::from_secs(10),
+    );
+    let received = mock.received_requests();
+    let root_requests = received
+        .iter()
+        .filter(|request| is_fanout_root_request(request))
+        .collect::<Vec<_>>();
+    assert_eq!(root_requests.len(), 3, "partial fan-in gets one synthesis");
+    let final_request = root_requests
+        .last()
+        .expect("final parent request")
+        .to_string();
+    assert!(
+        final_request.contains("\\\"completed\\\":2") || final_request.contains("\"completed\":2"),
+        "canonical partial aggregate must disclose 2 completed slots: {final_request}"
+    );
+    assert!(
+        final_request.contains("\\\"failed\\\":1") || final_request.contains("\"failed\":1"),
+        "canonical partial aggregate must disclose one failed slot: {final_request}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        0,
+        "partial foreground result remains on the original parent"
+    );
+    assert!(
+        !String::from_utf8_lossy(&astra.output)
+            .contains("Fanout did not return a usable launch receipt"),
+        "an unhappy child must not fabricate a launch-transport failure"
+    );
+
+    astra.write(b"/exit\r");
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .expect("start scripted fanout LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"launch_then_explicitly_background_the_group\r");
+    wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
+
+    astra.write(&[0x02]); // Ctrl+B is the only lifecycle handoff.
+    astra.wait_for(
+        "Backgrounded mock-review-group (3 agents)",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.wait_for("one update after the group settles", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Shift+↓ inspect", UI_TRANSITION_TIMEOUT);
+
+    // Backgrounding does not replace the conversation with a panel. The same
+    // advertised Shift+Down route opens the now-detached group on demand.
+    astra.write(b"\x1b[1;2B");
+    astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+
+    astra.wait_for(
+        "Parent reconciled one terminal fanout group exactly once.",
+        Duration::from_secs(12),
+    );
+    let received = mock.received_requests();
+    let reconciliation_requests = received
+        .iter()
+        .filter(|request| is_fanout_reconciliation_request(request))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconciliation_requests.len(),
+        1,
+        "an explicitly backgrounded work group must wake exactly once"
+    );
+    assert_eq!(
+        reconciliation_requests[0]
+            .pointer("/edge_profile/runtime_reconciliation_turn")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "background wake must use the typed runtime reconciliation lane"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_root_request(request))
+            .count(),
+        3,
+        "the cancelled foreground parent must not also synthesize the same group"
+    );
+    assert!(
+        !String::from_utf8_lossy(&astra.output)
+            .contains("Fanout did not return a usable launch receipt"),
+        "Ctrl+B must not paint a transient false failure before the runtime-owned handoff"
+    );
+
+    astra.write(b"/exit\r");
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_group_is_queryable_before_its_single_terminal_wake() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .expect("start scripted fanout LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"launch_then_ask_about_background_state\r");
+    wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x02]);
+    astra.wait_for(
+        "Backgrounded mock-review-group (3 agents)",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
     astra.write(
         format!(
             "{}\r",
@@ -751,44 +1074,38 @@ async fn fanout_is_one_background_work_unit_with_one_terminal_reconciliation() {
         "Astra knows Three mock reviews are running as one background work group.",
         UI_TRANSITION_TIMEOUT,
     );
+    let status_requests = mock
+        .received_requests()
+        .into_iter()
+        .filter(is_fanout_status_question)
+        .collect::<Vec<_>>();
+    assert_eq!(status_requests.len(), 1);
+    let status_request = status_requests[0].to_string();
+    assert!(
+        status_request.contains("Current background work snapshot")
+            && status_request.contains("mock-review-group"),
+        "ordinary user questions must receive the runtime-owned task truth: {status_request}"
+    );
     assert_eq!(
         mock.received_requests()
             .iter()
             .filter(|request| is_fanout_reconciliation_request(request))
             .count(),
         0,
-        "the first or second child completion must not wake a foreground analysis turn"
+        "an active background group must not wake before its terminal boundary"
     );
-
-    astra.write(b"\x1b[1;2B");
-    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Three mock reviews", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b");
 
     astra.wait_for(
         "Parent reconciled one terminal fanout group exactly once.",
-        Duration::from_secs(10),
+        Duration::from_secs(12),
     );
-    let received = mock.received_requests();
-    let reconciliation_requests = received
-        .iter()
-        .filter(|request| is_fanout_reconciliation_request(request))
-        .collect::<Vec<_>>();
     assert_eq!(
-        reconciliation_requests.len(),
-        1,
-        "one fanout group must produce exactly one terminal model reconciliation; reconciliation requests: {:#?}",
-        reconciliation_requests
+        mock.received_requests()
             .iter()
-            .map(|request| summarize_fanout_reconciliation_request(request))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        reconciliation_requests[0]
-            .pointer("/edge_profile/runtime_reconciliation_turn")
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "the one terminal continuation must use the typed reconciliation lane"
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        1,
+        "the same group receives one terminal wake after becoming queryable"
     );
 
     astra.write(b"/exit\r");

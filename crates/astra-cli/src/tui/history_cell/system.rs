@@ -30,6 +30,7 @@ pub(crate) struct SystemCell {
 enum SystemPresentation {
     Standard,
     BackgroundTask,
+    RuntimeWork,
 }
 
 impl SystemCell {
@@ -61,6 +62,19 @@ impl SystemCell {
             message: message.into(),
             level: SystemLevel::Info,
             presentation: SystemPresentation::BackgroundTask,
+            ts: None,
+            durable: true,
+        }
+    }
+
+    /// Runtime-owned launch feedback. This is deliberately not assistant
+    /// prose: users should see accepted work immediately even while the
+    /// parent model is blocked on structured fan-in.
+    pub fn runtime_work(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: SystemLevel::Info,
+            presentation: SystemPresentation::RuntimeWork,
             ts: None,
             durable: true,
         }
@@ -153,6 +167,11 @@ impl HistoryCell for SystemCell {
         let (prefix, label_style, body_style) = match self.presentation {
             SystemPresentation::BackgroundTask => (
                 "↳ Background · ",
+                Style::default().fg(theme.gutter).bold(),
+                Style::default().fg(theme.fg),
+            ),
+            SystemPresentation::RuntimeWork => (
+                "↳ Work · ",
                 Style::default().fg(theme.gutter).bold(),
                 Style::default().fg(theme.fg),
             ),

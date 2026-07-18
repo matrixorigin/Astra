@@ -165,6 +165,24 @@ pub enum SyncOutboxJournalDeltaOutcome {
     },
 }
 
+/// One append-only journal range prepared outside the outbox lock.
+///
+/// Recovery callers submit several of these at once so a large durable
+/// backlog costs one outbox parse/rewrite per batch rather than one full-file
+/// transaction per source session.
+#[derive(Debug, Clone)]
+pub struct SyncOutboxJournalDelta {
+    pub source_session_id: String,
+    pub expected_offset: u64,
+    pub next_offset: u64,
+    pub events: Vec<JournalEvent>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncOutboxJournalBatchOutcome {
+    pub outcomes: BTreeMap<String, SyncOutboxJournalDeltaOutcome>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOutboxAckOutcome {
     Acked { record_id: String, sequence: u64 },
@@ -302,6 +320,30 @@ impl SyncOutboxStore {
         })
     }
 
+    /// Read several durable source cursors from one consistent outbox
+    /// snapshot. This is the recovery counterpart to
+    /// [`Self::append_journal_deltas`].
+    pub fn journal_source_offsets(
+        &self,
+        session_ids: &[String],
+    ) -> std::io::Result<BTreeMap<String, u64>> {
+        self.with_state_readonly(|state| {
+            Ok(session_ids
+                .iter()
+                .map(|session_id| {
+                    (
+                        session_id.clone(),
+                        state
+                            .journal_source_offsets
+                            .get(session_id)
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                })
+                .collect())
+        })
+    }
+
     /// Project a journal byte range into the outbox and advance that journal's
     /// cursor in the exact same durable transaction.
     ///
@@ -316,72 +358,100 @@ impl SyncOutboxStore {
         next_offset: u64,
         events: &[JournalEvent],
     ) -> std::io::Result<SyncOutboxJournalDeltaOutcome> {
-        if next_offset < expected_offset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal source offset cannot move backwards",
-            ));
+        let source_session_id = source_session_id.to_string();
+        let batch = self.append_journal_deltas(&[SyncOutboxJournalDelta {
+            source_session_id: source_session_id.clone(),
+            expected_offset,
+            next_offset,
+            events: events.to_vec(),
+        }])?;
+        batch
+            .outcomes
+            .get(&source_session_id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("single journal delta produced no batch outcome"))
+    }
+
+    /// Project several journal byte ranges in one durable outbox transaction.
+    ///
+    /// Hashing/serialization preparation happens before the file lock. Under
+    /// the lock, every source still gets an independent stale-offset decision,
+    /// but all accepted sources share one parse, rewrite, rename, and fsync.
+    pub fn append_journal_deltas(
+        &self,
+        deltas: &[SyncOutboxJournalDelta],
+    ) -> std::io::Result<SyncOutboxJournalBatchOutcome> {
+        if deltas.is_empty() {
+            return Ok(SyncOutboxJournalBatchOutcome::default());
         }
         let now = unix_ms()?;
-        let candidates = events
-            .iter()
-            .filter(|event| {
-                event
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|session_id| !session_id.trim().is_empty())
-            })
-            .map(|event| build_record(event, 0, now))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        self.with_state(|state| {
-            let actual_offset = state
-                .journal_source_offsets
-                .get(source_session_id)
-                .copied()
-                .unwrap_or(0);
-            if actual_offset != expected_offset {
-                return Ok(SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset });
+        let mut source_ids = HashSet::with_capacity(deltas.len());
+        let mut prepared = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            if delta.next_offset < delta.expected_offset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "journal source offset cannot move backwards: session_id={}",
+                        delta.source_session_id
+                    ),
+                ));
             }
+            if !source_ids.insert(delta.source_session_id.clone()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "journal delta batch contains duplicate source session: {}",
+                        delta.source_session_id
+                    ),
+                ));
+            }
+            prepared.push(prepare_journal_delta(delta, now)?);
+        }
 
-            let mut inserted = 0;
-            let mut duplicates = 0;
-            let mut poisoned = 0;
-            for candidate in candidates {
-                match enqueue_candidate(state, candidate, now)? {
-                    SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
-                    SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
-                    SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
+        self.with_state(|state| {
+            let mut outcomes = BTreeMap::new();
+            for delta in prepared {
+                let actual_offset = state
+                    .journal_source_offsets
+                    .get(&delta.source_session_id)
+                    .copied()
+                    .unwrap_or(0);
+                if actual_offset != delta.expected_offset {
+                    outcomes.insert(
+                        delta.source_session_id,
+                        SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset },
+                    );
+                    continue;
                 }
+
+                let mut inserted = 0;
+                let mut duplicates = 0;
+                let mut poisoned = 0;
+                for candidate in delta.candidates {
+                    match enqueue_candidate(state, candidate, now)? {
+                        SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
+                        SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
+                        SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
+                    }
+                }
+                let skipped = delta.skipped_records.len();
+                state.skipped_records.extend(delta.skipped_records);
+                state
+                    .journal_source_offsets
+                    .insert(delta.source_session_id.clone(), delta.next_offset);
+                outcomes.insert(
+                    delta.source_session_id,
+                    SyncOutboxJournalDeltaOutcome::Appended {
+                        scanned_events: delta.scanned_events,
+                        inserted,
+                        duplicates,
+                        poisoned,
+                        skipped,
+                    },
+                );
             }
-            let skipped = events
-                .len()
-                .saturating_sub(inserted + duplicates + poisoned);
-            for event in events.iter().filter(|event| {
-                event
-                    .session_id
-                    .as_deref()
-                    .is_none_or(|session_id| session_id.trim().is_empty())
-            }) {
-                state.skipped_records.push(SyncOutboxSkippedRecord {
-                    kind: SyncOutboxSkipKind::MissingSessionId,
-                    event_type: event_type_string(&event.event_type),
-                    event_ts: Some(event.ts.clone()).filter(|ts| !ts.trim().is_empty()),
-                    reason: "journal event has no session_id and cannot be delivered to /events"
-                        .to_string(),
-                    observed_at_unix_ms: now,
-                });
-            }
-            state.compact_skipped_records();
-            state
-                .journal_source_offsets
-                .insert(source_session_id.to_string(), next_offset);
-            Ok(SyncOutboxJournalDeltaOutcome::Appended {
-                scanned_events: events.len(),
-                inserted,
-                duplicates,
-                poisoned,
-                skipped,
-            })
+            Ok(SyncOutboxJournalBatchOutcome { outcomes })
         })
     }
 
@@ -915,6 +985,58 @@ impl SyncOutboxFile {
     }
 }
 
+struct PreparedJournalDelta {
+    source_session_id: String,
+    expected_offset: u64,
+    next_offset: u64,
+    scanned_events: usize,
+    candidates: Vec<SyncOutboxRecord>,
+    skipped_records: Vec<SyncOutboxSkippedRecord>,
+}
+
+fn prepare_journal_delta(
+    delta: &SyncOutboxJournalDelta,
+    now: u64,
+) -> std::io::Result<PreparedJournalDelta> {
+    let candidates = delta
+        .events
+        .iter()
+        .filter(|event| {
+            event
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+        })
+        .map(|event| build_record(event, 0, now))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let skipped_records = delta
+        .events
+        .iter()
+        .filter(|event| {
+            event
+                .session_id
+                .as_deref()
+                .is_none_or(|session_id| session_id.trim().is_empty())
+        })
+        .map(|event| SyncOutboxSkippedRecord {
+            kind: SyncOutboxSkipKind::MissingSessionId,
+            event_type: event_type_string(&event.event_type),
+            event_ts: Some(event.ts.clone()).filter(|timestamp| !timestamp.trim().is_empty()),
+            reason: "journal event has no session_id and cannot be delivered to /events"
+                .to_string(),
+            observed_at_unix_ms: now,
+        })
+        .collect();
+    Ok(PreparedJournalDelta {
+        source_session_id: delta.source_session_id.clone(),
+        expected_offset: delta.expected_offset,
+        next_offset: delta.next_offset,
+        scanned_events: delta.events.len(),
+        candidates,
+        skipped_records,
+    })
+}
+
 fn build_record(
     event: &JournalEvent,
     sequence: u64,
@@ -1391,6 +1513,91 @@ mod tests {
             SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset: 256 }
         );
         assert_eq!(store.status().expect("status").pending, 2);
+    }
+
+    #[test]
+    fn journal_delta_batch_isolates_stale_sources_and_commits_fresh_sources() {
+        let (_temp, _guard, store) = test_store();
+        let stale_event = JournalEvent::config_change(Some("session-stale"), "model", "old");
+        store
+            .append_journal_delta("session-stale", 0, 10, &[stale_event])
+            .expect("seed stale source");
+
+        let fresh_a = JournalEvent::config_change(Some("session-a"), "model", "a");
+        let fresh_b = JournalEvent::config_change(Some("session-b"), "model", "b");
+        let outcome = store
+            .append_journal_deltas(&[
+                SyncOutboxJournalDelta {
+                    source_session_id: "session-stale".into(),
+                    expected_offset: 0,
+                    next_offset: 20,
+                    events: vec![JournalEvent::config_change(
+                        Some("session-stale"),
+                        "model",
+                        "must-not-append",
+                    )],
+                },
+                SyncOutboxJournalDelta {
+                    source_session_id: "session-a".into(),
+                    expected_offset: 0,
+                    next_offset: 30,
+                    events: vec![fresh_a],
+                },
+                SyncOutboxJournalDelta {
+                    source_session_id: "session-b".into(),
+                    expected_offset: 0,
+                    next_offset: 40,
+                    events: vec![fresh_b],
+                },
+            ])
+            .expect("append journal batch");
+
+        assert_eq!(
+            outcome.outcomes["session-stale"],
+            SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset: 10 }
+        );
+        assert!(matches!(
+            outcome.outcomes["session-a"],
+            SyncOutboxJournalDeltaOutcome::Appended { inserted: 1, .. }
+        ));
+        assert!(matches!(
+            outcome.outcomes["session-b"],
+            SyncOutboxJournalDeltaOutcome::Appended { inserted: 1, .. }
+        ));
+        assert_eq!(
+            store
+                .journal_source_offsets(&[
+                    "session-stale".into(),
+                    "session-a".into(),
+                    "session-b".into(),
+                ])
+                .expect("batched source offsets"),
+            BTreeMap::from([
+                ("session-a".into(), 30),
+                ("session-b".into(), 40),
+                ("session-stale".into(), 10),
+            ])
+        );
+        assert_eq!(store.status().expect("status").pending, 3);
+    }
+
+    #[test]
+    fn journal_delta_batch_rejects_duplicate_sources_before_mutation() {
+        let (_temp, _guard, store) = test_store();
+        let duplicate = SyncOutboxJournalDelta {
+            source_session_id: "session-a".into(),
+            expected_offset: 0,
+            next_offset: 1,
+            events: Vec::new(),
+        };
+        let error = store
+            .append_journal_deltas(&[duplicate.clone(), duplicate])
+            .expect_err("duplicate source must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !store.path().exists(),
+            "validation must happen before mutation"
+        );
     }
 
     #[test]

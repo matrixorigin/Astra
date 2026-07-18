@@ -853,7 +853,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; asynchronous; no background arg); get_result needs returned agent_id; run_chain needs steps.\n\n\
+                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs steps.\n\n\
          Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
          ## Required fields per action\n\
          - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
@@ -864,14 +864,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
-         `spawn` is asynchronous by contract: it returns after the child has a stable agent_id/run_id and keeps the parent agent free to continue independent work. Terminal child results are delivered to the parent mailbox automatically. Use `send_message` for corrections and `get_result` only for a short non-blocking observation; do not busy-poll or pass a background flag.\n\n\
+         `spawn` is foreground by contract: it waits for the child's terminal result while the runtime streams live progress and keeps client controls responsive. In the terminal, the user may explicitly press Ctrl+B to move the live child to the background; do not pass a background flag. A background handoff returns a stable agent_id/run_id and its terminal result is delivered to the parent mailbox.\n\n\
          ## Parallel sub-agent fan-out\n\
          For a fixed-size parallel group, call `agent_fanout` with its JSON object schema; do not simulate it with an `agents:[...]` payload on `agent`. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## agent vs shell work vs task
-         - `agent(spawn)` + optional `agent(get_result)`: one asynchronous sub-agent; completion also returns through the parent mailbox.
+         - `agent(spawn)` + optional `agent(get_result)`: one foreground sub-agent, or one explicitly backgrounded child the user later inspects.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
@@ -913,9 +913,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
          Actions:\n\
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
-         - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
+         - `get_results`: requires `action` and returned `group_id` for an explicitly backgrounded group. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
-         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start returns stable child identities without waiting for the full group to finish; terminal results flow back through parent mailboxes and get_results remains available for explicit inspection.",
+         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1365,7 +1365,7 @@ mod tests {
     // `execute_code` is NOT in the schema list (so the model doesn't
     // hallucinate it).
 
-    // ── agent tool: asynchronous spawn contract ────────────────────────────
+    // ── agent tool: structured foreground contract ────────────────────────
 
     #[test]
     fn agent_schema_does_not_expose_model_background_parameter() {
@@ -1378,12 +1378,12 @@ mod tests {
             .expect("agent must expose parameters.properties");
         assert!(
             props.get("run_in_background").is_none(),
-            "spawn is asynchronous by contract; the model should not control scheduling policy"
+            "foreground/background is a user control; the model must not choose scheduling policy"
         );
     }
 
     #[test]
-    fn agent_schema_description_documents_async_spawn() {
+    fn agent_schema_description_documents_structured_foreground_spawn() {
         let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
@@ -1392,8 +1392,11 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("asynchronous") && desc.contains("parent mailbox"),
-            "agent description must state that spawn returns before completion"
+            desc.contains("foreground by contract")
+                && desc.contains("waits for the child's terminal result")
+                && desc.contains("keeps client controls responsive")
+                && desc.contains("Ctrl+B"),
+            "agent description must distinguish structured fan-in from a frozen client"
         );
         assert!(
             desc.contains("get_result") && desc.contains("send_message"),
@@ -1445,8 +1448,10 @@ mod tests {
 
         assert!(desc.contains("one complete JSON object"));
         assert!(desc.contains("`id`"));
-        assert!(desc.contains("without waiting for the full group"));
-        assert!(desc.contains("parent mailboxes"));
+        assert!(desc.contains("waits for accepted children concurrently"));
+        assert!(desc.contains("returns one canonical group result"));
+        assert!(desc.contains("Ctrl+B"));
+        assert!(desc.contains("parent mailbox"));
         assert!(desc.contains("non-blocking snapshot"));
         assert!(desc.contains("do not busy-poll"));
         assert!(desc.contains("bounded result window"));

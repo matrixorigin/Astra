@@ -47,6 +47,36 @@ static PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT: AtomicU64 = AtomicU64::new(
 static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<ProcessSessionsDirOverride>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// Cargo places unit-, integration-, and benchmark-test executables under a
+/// `target/{profile}/deps/<name>-<16 hex>` path.  A library dependency is not
+/// compiled with `cfg(test)` for integration tests, so relying on that cfg (or
+/// on every individual test remembering to install a guard) lets test journals
+/// escape into the real `~/.astra` directory.  Resolve one process-scoped
+/// fallback under `target/test-state` instead.  Explicit thread/process guards
+/// still take precedence below.
+static CARGO_TEST_PROCESS_SESSIONS_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    cargo_test_process_sessions_dir_for(&std::env::current_exe().ok()?, std::process::id())
+});
+
+fn cargo_test_process_sessions_dir_for(executable: &Path, process_id: u32) -> Option<PathBuf> {
+    let deps_dir = executable.parent()?;
+    if deps_dir.file_name().and_then(|name| name.to_str()) != Some("deps") {
+        return None;
+    }
+    let executable_name = executable.file_name()?.to_str()?;
+    let (_, hash) = executable_name.rsplit_once('-')?;
+    if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let target_dir = deps_dir.parent()?.parent()?;
+    Some(
+        target_dir
+            .join("test-state")
+            .join(format!("{executable_name}-{process_id}"))
+            .join("sessions"),
+    )
+}
+
 fn merge_execution_boundary_metadata(
     metadata: &mut serde_json::Value,
     execution_metadata: Option<&serde_json::Value>,
@@ -147,6 +177,9 @@ pub fn local_sessions_dir() -> PathBuf {
         };
         if let Some(p) = process_override {
             return p;
+        }
+        if let Some(p) = CARGO_TEST_PROCESS_SESSIONS_DIR.as_ref() {
+            return p.clone();
         }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -6295,6 +6328,33 @@ mod tests {
             assert_eq!(local_sessions_dir(), inner_sessions);
         }
         assert_eq!(local_sessions_dir(), outer_sessions);
+    }
+
+    #[test]
+    fn cargo_test_processes_default_to_target_scoped_state() {
+        let executable =
+            Path::new("/workspace/target/debug/deps/session_journal_tests-0123456789abcdef");
+        assert_eq!(
+            cargo_test_process_sessions_dir_for(executable, 42),
+            Some(PathBuf::from(
+                "/workspace/target/test-state/session_journal_tests-0123456789abcdef-42/sessions"
+            ))
+        );
+    }
+
+    #[test]
+    fn production_and_unhashed_debug_binaries_keep_the_real_state_contract() {
+        assert_eq!(
+            cargo_test_process_sessions_dir_for(Path::new("/workspace/target/debug/astra"), 42),
+            None
+        );
+        assert_eq!(
+            cargo_test_process_sessions_dir_for(
+                Path::new("/workspace/target/debug/deps/astra-integration"),
+                42,
+            ),
+            None
+        );
     }
 
     #[test]

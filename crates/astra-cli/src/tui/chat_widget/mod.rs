@@ -2509,6 +2509,14 @@ impl ChatWidget {
         self.commit_cell(Box::new(cell));
     }
 
+    /// Append a runtime-owned lifecycle projection without claiming that the
+    /// currently executing tool has ended. Use this only for concurrent work
+    /// receipts/handoffs; ordinary conversational system messages retain the
+    /// serial `commit_system` boundary above.
+    pub(crate) fn commit_concurrent_system(&mut self, cell: SystemCell) {
+        self.commit_cell(Box::new(cell));
+    }
+
     /// Show a local warning without mixing a UI-health issue into canonical
     /// conversation history.
     pub(crate) fn commit_ephemeral_warning(&mut self, message: impl Into<String>) {
@@ -3651,6 +3659,21 @@ impl ChatWidget {
                     fanout_rejection_summary(output_summary.as_deref(), output.as_deref())
                 {
                     (status, Some(summary), None)
+                } else if status == "failed" && receipt_missing {
+                    // A transport-side completion without a typed receipt is
+                    // not lifecycle authority.  The local/server task
+                    // registry may already own accepted children (and can
+                    // arrive one observer tick later), so painting a red
+                    // terminal failure here creates a contradictory UI. A
+                    // typed admission rejection above remains a real failure.
+                    (
+                        "uncertain".to_string(),
+                        Some(
+                            "Launch confirmation is delayed · Astra is checking the task registry · Shift+↓ inspect."
+                                .to_string(),
+                        ),
+                        None,
+                    )
                 } else {
                     (status, output_summary, output)
                 }
@@ -3803,8 +3826,20 @@ impl ChatWidget {
     /// claiming that the complete turn (durability, summary, background
     /// settlement) has finished. This keeps a completed answer from retaining
     /// live typing affordances while the turn owner finishes its own work.
+    /// A running tool outlives the model SSE segment that requested it; only
+    /// its typed completion/cancellation or the terminal turn boundary owns
+    /// that lifecycle transition.
     pub(crate) fn finish_stream_projection(&mut self) {
+        if self.has_live_tool_projection() {
+            return;
+        }
         self.commit_active_and_replay_deferred();
+    }
+
+    pub(crate) fn has_live_tool_projection(&self) -> bool {
+        self.active_cell.as_ref().is_some_and(|cell| {
+            matches!(cell_kind(cell.as_ref()), CellKind::Tool) && cell.is_live()
+        }) || !self.live_tasks.is_empty()
     }
 
     fn on_turn_error(&mut self, msg: String) {
@@ -4509,6 +4544,95 @@ mod tests {
             !assistant.is_live(),
             "a closed stream cannot retain typing state"
         );
+    }
+
+    #[test]
+    fn stream_close_does_not_finalize_a_runtime_owned_tool() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "three reviews".into(),
+            tool_use_id: "fanout-call-live".into(),
+            parent_tool_use_id: None,
+        }));
+
+        w.finish_stream_projection();
+
+        assert!(w.has_live_tool_projection());
+        assert!(w.history.is_empty(), "transport close is not tool failure");
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "three reviews".into(),
+            status: "completed".into(),
+            duration_ms: 6_000,
+            output_summary: None,
+            output: Some(
+                serde_json::json!({
+                    "status": "completed",
+                    "group_id": "review-group",
+                    "target_count": 3,
+                })
+                .to_string(),
+            ),
+            tool_use_id: "fanout-call-live".into(),
+            parent_tool_use_id: None,
+        }));
+        assert!(!w.has_live_tool_projection());
+        assert_eq!(w.history.len(), 1, "one tool call has one visible cell");
+        assert!(matches!(
+            w.history[0].to_persist(),
+            Some(TurnEvent::Tool {
+                status: crate::tui::turn_event::ToolStatus::Success,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn concurrent_runtime_receipt_does_not_finalize_a_live_tool() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "three reviews".into(),
+            tool_use_id: "fanout-call-receipt".into(),
+            parent_tool_use_id: None,
+        }));
+
+        w.commit_concurrent_system(SystemCell::runtime_work(
+            "Three reviews · 3 agents started · parent waits",
+        ));
+
+        assert!(w.has_live_tool_projection());
+        assert_eq!(w.history.len(), 1, "only the receipt is committed");
+        assert!(matches!(
+            w.history[0].to_persist(),
+            Some(TurnEvent::System { .. })
+        ));
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "three reviews".into(),
+            status: "completed".into(),
+            duration_ms: 6_000,
+            output_summary: None,
+            output: Some(
+                serde_json::json!({
+                    "status": "completed",
+                    "group_id": "review-group",
+                    "target_count": 3,
+                })
+                .to_string(),
+            ),
+            tool_use_id: "fanout-call-receipt".into(),
+            parent_tool_use_id: None,
+        }));
+        assert_eq!(w.history.len(), 2);
+        assert!(matches!(
+            w.history[1].to_persist(),
+            Some(TurnEvent::Tool {
+                status: crate::tui::turn_event::ToolStatus::Success,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -6743,7 +6867,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_without_live_evidence_keeps_its_failed_status() {
+    fn fanout_without_receipt_is_uncertain_until_the_registry_confirms_it() {
         let mut widget = fresh();
         widget.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent_fanout".into(),
@@ -6770,9 +6894,10 @@ mod tests {
         assert!(matches!(
             persisted,
             TurnEvent::Tool {
-                status: crate::tui::turn_event::ToolStatus::Failed,
+                status: crate::tui::turn_event::ToolStatus::Uncertain,
+                output_summary: Some(ref summary),
                 ..
-            }
+            } if summary.contains("checking the task registry")
         ));
     }
 

@@ -55,8 +55,17 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         tool_already_restricted,
     } = request;
     let mut resource_limit_recorded = false;
+    let is_typed_wait = serde_json::from_str::<Value>(result_str)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| status == "waiting")
+        })
+        .unwrap_or(false);
 
-    if *is_err && !tool_already_restricted {
+    if *is_err && !tool_already_restricted && !is_typed_wait {
         let category = source_error_kind.unwrap_or_else(|| classify_error(result_str.as_str()));
 
         if matches!(category, ErrorCategory::ResourceLimit) {
@@ -369,6 +378,42 @@ mod tests {
             vec![HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
                 tool: "bash".into()
             }]
+        );
+    }
+
+    #[test]
+    fn typed_wait_remains_parseable_without_generic_failure_advice() {
+        let mut turn_guard = TurnGuard::new();
+        let mut output = json!({
+            "status": "waiting",
+            "agent_id": "reviewer-1",
+            "reason": "executor_offline"
+        })
+        .to_string();
+        let expected = output.clone();
+        let mut is_error = true;
+        let mut context = HeadlessOutputEnrichCtx {
+            turn_guard: &mut turn_guard,
+        };
+
+        let resource_limit = enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "agent",
+                result_str: &mut output,
+                is_err: &mut is_error,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
+            &mut context,
+            |_| panic!("typed waiting is not a resource failure"),
+        );
+
+        assert!(!resource_limit);
+        assert_eq!(output, expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["status"],
+            "waiting"
         );
     }
 

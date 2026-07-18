@@ -46,6 +46,101 @@ impl LocalAgentSnapshot {
             .collect()
     }
 
+    /// Describe newly launched user-visible work units without involving the
+    /// model.  A fanout is one receipt even though its slots enter the runtime
+    /// independently; emitting one line per child makes normal concurrency
+    /// look like repeated replanning and leaves the user guessing whether the
+    /// parent is still waiting.
+    pub(crate) fn launch_receipts_since(&self, previous: &Self) -> Vec<String> {
+        let previous_groups = previous
+            .fanout_groups
+            .iter()
+            .filter(|group| {
+                let summary = group.summary();
+                summary.accepted > 0 || summary.spawn_rejected > 0
+            })
+            .map(|group| group.group_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut receipts = self
+            .fanout_groups
+            .iter()
+            .filter(|group| {
+                let summary = group.summary();
+                summary.accepted > 0 || summary.spawn_rejected > 0
+            })
+            .filter(|group| !previous_groups.contains(group.group_id.as_str()))
+            .map(|group| {
+                let title = group.title.trim();
+                let title = if title.is_empty() {
+                    group.group_id.as_str()
+                } else {
+                    title
+                };
+                let member_ids = group
+                    .slots
+                    .iter()
+                    .filter_map(|slot| slot.agent_id.as_deref())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let members = self
+                    .agents
+                    .iter()
+                    .filter(|agent| member_ids.contains(agent.agent_id.as_str()))
+                    .collect::<Vec<_>>();
+                let explicitly_background = !member_ids.is_empty()
+                    && members.len() == member_ids.len()
+                    && members.iter().all(|agent| agent.run_in_background);
+                if explicitly_background {
+                    format!(
+                        "{title} · {} parallel agents started in background · one update after the group settles · Shift+↓ inspect",
+                        group.target_count
+                    )
+                } else {
+                    format!(
+                        "{title} · {} parallel agents started · parent waits for the complete group before synthesizing · Shift+↓ inspect · Ctrl+B move to background",
+                        group.target_count
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let current_fanout_agents = self
+            .fanout_groups
+            .iter()
+            .flat_map(|group| &group.slots)
+            .filter_map(|slot| slot.agent_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let previous_run_ids = previous
+            .agents
+            .iter()
+            .map(|agent| agent.run_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        receipts.extend(
+            self.agents
+                .iter()
+                .filter(|agent| !agent.status.is_terminal())
+                .filter(|agent| !previous_run_ids.contains(agent.run_id.as_str()))
+                .filter(|agent| !current_fanout_agents.contains(agent.agent_id.as_str()))
+                .map(|agent| {
+                    let title = agent.description.trim();
+                    let title = if title.is_empty() {
+                        agent.agent_id.as_str()
+                    } else {
+                        title
+                    };
+                    if agent.run_in_background {
+                        format!(
+                            "{title} started in background · Astra will update once it needs attention or finishes · Shift+↓ inspect"
+                        )
+                    } else {
+                        format!(
+                            "{title} started · parent waits for its result · Shift+↓ inspect · Ctrl+B move to background"
+                        )
+                    }
+                }),
+        );
+        receipts
+    }
+
     /// Return false only for a machine-owned child attention hint whose
     /// result was already collected by the active parent turn. The hint may
     /// have been queued just before `agent_fanout.get_results` returned; in
@@ -111,6 +206,11 @@ impl LocalAgentSnapshot {
         let mut notifications = self
             .agents
             .iter()
+            // Foreground children return through the tool result that is
+            // already blocking their parent.  Waking a second model turn for
+            // the same terminal fact is both wasteful and user-visible as
+            // repeated analysis.
+            .filter(|agent| agent.run_in_background)
             .filter(|agent| {
                 matches!(
                     agent.status,
@@ -420,5 +520,84 @@ mod tests {
         assert_eq!(value["event"], "fanout_group_settled");
         assert_eq!(value["group_id"], "review-group");
         assert_eq!(value["completed"], 3);
+    }
+
+    #[test]
+    fn foreground_child_terminal_result_does_not_schedule_a_second_model_turn() {
+        let mut running = agent(
+            "foreground",
+            "run-foreground",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        );
+        running.run_in_background = false;
+        let before = LocalAgentSnapshot {
+            available: true,
+            agents: vec![running],
+            ..LocalAgentSnapshot::default()
+        };
+        let mut completed = agent(
+            "foreground",
+            "run-foreground",
+            AgentStatus::Completed {
+                result: "done".into(),
+                finish_reason: None,
+            },
+        );
+        completed.run_in_background = false;
+        let after = LocalAgentSnapshot {
+            available: true,
+            agents: vec![completed],
+            ..LocalAgentSnapshot::default()
+        };
+
+        assert!(after.attention_notifications_since(&before).is_empty());
+    }
+
+    #[test]
+    fn fanout_launch_is_one_runtime_receipt_even_as_later_slots_arrive() {
+        let mut group = AgentFanoutGroupProjection::new("review-group", "Three reviews", 3);
+        group
+            .record_spawn_accepted_with_run(0, "reviewer-0", Some("run-0".into()))
+            .unwrap();
+        let mut first_agent = agent(
+            "reviewer-0",
+            "run-0",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        );
+        first_agent.run_in_background = false;
+        let first = LocalAgentSnapshot {
+            available: true,
+            agents: vec![first_agent],
+            fanout_groups: vec![group.clone()],
+        };
+
+        let receipts = first.launch_receipts_since(&LocalAgentSnapshot::default());
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert!(receipts[0].contains("3 parallel agents"), "{receipts:?}");
+        assert!(receipts[0].contains("parent waits"), "{receipts:?}");
+        assert!(receipts[0].contains("Shift+↓ inspect"), "{receipts:?}");
+        assert!(receipts[0].contains("Ctrl+B"), "{receipts:?}");
+
+        group
+            .record_spawn_accepted_with_run(1, "reviewer-1", Some("run-1".into()))
+            .unwrap();
+        let mut second_agent = agent(
+            "reviewer-1",
+            "run-1",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        );
+        second_agent.run_in_background = false;
+        let later = LocalAgentSnapshot {
+            available: true,
+            agents: vec![first.agents[0].clone(), second_agent],
+            fanout_groups: vec![group],
+        };
+        assert!(later.launch_receipts_since(&first).is_empty());
     }
 }

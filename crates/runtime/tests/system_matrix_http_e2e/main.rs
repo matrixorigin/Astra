@@ -49,6 +49,12 @@
 //!   `context_trace_signal` event written to `agent_events` with valid causal chain.
 //! - **`e2e_matrix_stream_multi_turn_persistence`** — two sequential `POST /chat/stream` to same
 //!   session → verify event counts increment, distinct causal chains, both runs completed.
+//! - **`e2e_matrix_stream_structured_fanout_has_one_parent_synthesis_and_durable_tree`** — real
+//!   `/chat/stream` + mock parent/children + MatrixOne: three durable child runs settle before one
+//!   parent synthesis, with no detached reconciliation or orphan transcript run identity.
+//! - **`e2e_matrix_stream_failed_fanout_settles_once_without_orphaning_children`** — the same live
+//!   path with all child providers failing: causes stay inspectable, no replacement runs appear,
+//!   and the parent receives one fixed-size terminal aggregate.
 //! - **`e2e_matrix_cli_bridge_session_views_remain_consistent`** — two `POST /chat/turn` model
 //!   boundaries (one human, one runtime reconciliation) with mock LLM → cross-check MatrixOne core
 //!   rows, session/event counts, audit summary/turns, and root transcript; internal runtime text
@@ -284,6 +290,22 @@ async fn e2e_matrix_stream_context_trace_persistence() {
 async fn e2e_matrix_stream_multi_turn_persistence() {
     require_system_e2e_env();
     journey_stream_persistence::run_stream_multi_turn_persistence().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + mock parent/child LLM; structured fan-in online gate"]
+async fn e2e_matrix_stream_structured_fanout_has_one_parent_synthesis_and_durable_tree() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_structured_fanout_has_one_parent_synthesis_and_durable_tree()
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + failing mock child LLM; structured fan-in unhappy-path gate"]
+async fn e2e_matrix_stream_failed_fanout_settles_once_without_orphaning_children() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_failed_fanout_settles_once_without_orphaning_children()
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

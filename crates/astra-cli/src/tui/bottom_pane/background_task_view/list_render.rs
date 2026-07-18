@@ -114,7 +114,7 @@ pub(crate) fn render_list(
         .filter(|row| row.no_recent_output_ms.is_some())
         .count();
     let header = if rows.is_empty() {
-        "  Background tasks".to_string()
+        "  Tasks".to_string()
     } else {
         let mut parts = vec![format!("{} total", rows.len())];
         if running > 0 {
@@ -135,7 +135,7 @@ pub(crate) fn render_list(
         if quiet > 0 {
             parts.push(format!("{quiet} quiet"));
         }
-        format!("  Background tasks · {}", parts.join(" · "))
+        format!("  Tasks · {}", parts.join(" · "))
     };
     buf.set_line(
         area.x,
@@ -149,7 +149,7 @@ pub(crate) fn render_list(
             buf.set_line(
                 area.x,
                 area.y + 1,
-                &Line::from(Span::styled("  No background tasks.", dim)),
+                &Line::from(Span::styled("  No tasks.", dim)),
                 area.width,
             );
         }
@@ -205,13 +205,21 @@ pub(crate) fn render_list(
                     .list_label()
                     .map(|label| format!("  {label}"))
                     .unwrap_or_default();
+                let ownership = if row.kind == super::types::BackgroundTaskKind::LocalAgent
+                    && !row.run_in_background
+                {
+                    "  foreground"
+                } else {
+                    ""
+                };
                 let meta = format!(
-                    "{}  {}  {}{}{}  ",
+                    "{}  {}  {}{}{}{}  ",
                     row.kind.as_str(),
                     row.status.label(),
                     format_elapsed(row.elapsed_ms),
                     activity,
                     control,
+                    ownership,
                 );
                 let title = if *grouped {
                     fanout_slot_title(row)

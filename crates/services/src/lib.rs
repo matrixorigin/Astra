@@ -343,9 +343,10 @@ pub use sync_outbox::{
     SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_MAX_ATTEMPTS, SYNC_OUTBOX_SCHEMA_VERSION,
     SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
     SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
-    SyncOutboxJournalDeltaOutcome, SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState,
-    SyncOutboxSettlementReport, SyncOutboxSkipKind, SyncOutboxSkippedRecord, SyncOutboxStatus,
-    SyncOutboxStore, sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
+    SyncOutboxJournalBatchOutcome, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
+    SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport,
+    SyncOutboxSkipKind, SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore,
+    sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,

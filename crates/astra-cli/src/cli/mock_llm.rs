@@ -44,9 +44,13 @@ pub enum MockScenario {
     /// Root activates and calls one foreground child agent, then synthesizes
     /// the child's completion.
     AgentThenComplete,
-    /// Root launches one three-slot fanout. Individual slots settle at
-    /// different times; only the terminal group notification is reconciled.
+    /// Root launches one foreground three-slot fanout. Individual slots
+    /// settle at different times; the root remains blocked until the full
+    /// group result is available and then synthesizes exactly once.
     FanoutThenComplete,
+    /// Same structured fan-in, but the second child fails. The parent still
+    /// receives one canonical 2/3 aggregate after the whole group settles.
+    FanoutPartialThenComplete,
     /// Adversarial: a single tool_call_start event's JSON is split across
     /// multiple SSE `data:` chunks (with blank lines in between) so a naive
     /// per-chunk JSON decoder will fail on each half. A correct client must
@@ -76,6 +80,9 @@ impl MockScenario {
             "slow" => Some(Self::Slow),
             "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
             "fanout_then_complete" | "fanout" => Some(Self::FanoutThenComplete),
+            "fanout_partial_then_complete" | "fanout_partial" => {
+                Some(Self::FanoutPartialThenComplete)
+            }
             "sse_chunk_split" | "sse_split" | "chunk_split" => Some(Self::SseChunkSplit),
             "malformed_json" | "malformed" | "bad_json" => Some(Self::MalformedJson),
             "rate_limited" | "rate_limit" | "429" => Some(Self::RateLimited),
@@ -93,7 +100,10 @@ impl MockScenario {
             Self::Slow => "3s delay before response (tests progress display)",
             Self::AgentThenComplete => "one foreground child agent, then parent synthesis",
             Self::FanoutThenComplete => {
-                "three background fanout slots, one terminal group reconciliation"
+                "three foreground fanout slots, one structured parent synthesis"
+            }
+            Self::FanoutPartialThenComplete => {
+                "three foreground fanout slots, one child failure, one parent synthesis"
             }
             Self::SseChunkSplit => "tool_call JSON split across SSE frames (adversarial)",
             Self::MalformedJson => "one SSE event carries malformed JSON (adversarial)",
@@ -118,7 +128,11 @@ impl MockScenario {
             ),
             (
                 "fanout_then_complete",
-                "three background fanout slots, one terminal group reconciliation",
+                "three foreground fanout slots, one structured parent synthesis",
+            ),
+            (
+                "fanout_partial_then_complete",
+                "three foreground fanout slots, one child failure, one parent synthesis",
             ),
             (
                 "sse_chunk_split",
@@ -460,7 +474,7 @@ fn fanout_journey_child_index(body: &Value) -> Option<usize> {
         .position(|candidate| *candidate == prompt)
 }
 
-async fn body_fanout_then_complete(body: &Value) -> String {
+async fn body_fanout_then_complete(body: &Value, failed_child: Option<usize>) -> String {
     if let Some(index) = fanout_journey_child_index(body) {
         tokio::time::sleep(std::time::Duration::from_millis(match index {
             0 => 250,
@@ -468,6 +482,14 @@ async fn body_fanout_then_complete(body: &Value) -> String {
             _ => 6_000,
         }))
         .await;
+        if failed_child == Some(index) {
+            let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
+            stream.push_str(&error_event(&format!(
+                "fanout_child_{}_failed_with_distinct_cause",
+                index + 1
+            )));
+            return stream;
+        }
         let message = format!("fanout_child_{}_evidence_visible", index + 1);
         let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
         stream.push_str(&text_delta(&message));
@@ -544,7 +566,11 @@ async fn body_fanout_then_complete(body: &Value) -> String {
         return stream;
     }
 
-    let message = "Three mock reviews are running in the background as one work group.";
+    let message = if failed_child.is_some() {
+        "Parent synthesized the available 2/3 fanout evidence exactly once."
+    } else {
+        "Parent synthesized one terminal fanout group exactly once."
+    };
     let mut stream = session_info("mock-run-fanout-root");
     stream.push_str(&text_delta(message));
     stream.push_str(&text_done(message));
@@ -687,7 +713,10 @@ async fn handle_chat_turn(
         MockScenario::Fail => body_fail(&agent_id, turn),
         MockScenario::Slow => body_slow(&agent_id, turn).await,
         MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
-        MockScenario::FanoutThenComplete => body_fanout_then_complete(&request_body).await,
+        MockScenario::FanoutThenComplete => body_fanout_then_complete(&request_body, None).await,
+        MockScenario::FanoutPartialThenComplete => {
+            body_fanout_then_complete(&request_body, Some(1)).await
+        }
         MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
         MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
         MockScenario::TextOnly => body_text_only(&agent_id, turn),

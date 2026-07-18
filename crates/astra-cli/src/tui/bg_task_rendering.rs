@@ -221,10 +221,6 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     };
     use astra_turn_core::orchestration_types::AgentStatus;
 
-    if !agent.run_in_background {
-        return None;
-    }
-
     let (status, tail, terminal_reason) = match &agent.status {
         AgentStatus::Initializing => (BackgroundTaskStatus::Pending, None, None),
         AgentStatus::Running { activity } => (
@@ -307,7 +303,8 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, terminal_reason)
-    .with_timing(started_at_ms, ended_at_ms);
+    .with_timing(started_at_ms, ended_at_ms)
+    .with_run_in_background(agent.run_in_background);
 
     Some(if let Some(slot) = agent.fanout_slot.as_ref() {
         row.with_fanout(background_task_fanout_membership(
@@ -549,8 +546,8 @@ pub(crate) async fn reveal_background_task_view_with_extra_rows(
     .await
 }
 
-/// Always open the background task panel, even if the registry is empty.
-/// Used by Ctrl+B so the user always lands in a panel they can navigate or
+/// Always open the task panel, even if the registry is empty.
+/// Used by Ctrl+B/Shift+Down so the user always lands in a panel they can navigate or
 /// dismiss. Empty-state rendering lives in `BackgroundTaskView`.
 pub(crate) async fn force_open_background_task_view(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
@@ -727,9 +724,6 @@ pub(crate) async fn background_task_output_snapshot_with_agents(
         Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
                 if let Some(state) = spawner.get_agent_state_any(task_id).await {
-                    if !state.run_in_background {
-                        return Err(BackgroundTaskError::not_found(task_id));
-                    }
                     let info = astra_turn_core::orchestration_types::SpawnedAgentInfo::from(&state);
                     return Ok(background_task_output_snapshot_for_local_agent(
                         &info, offset, max_bytes,

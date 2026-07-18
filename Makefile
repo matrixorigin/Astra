@@ -968,7 +968,7 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_executes_async_dynamic_spawn_with_server_executor
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/chat-input-route.test.ts \
@@ -995,6 +995,7 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/work-surface.test.ts \

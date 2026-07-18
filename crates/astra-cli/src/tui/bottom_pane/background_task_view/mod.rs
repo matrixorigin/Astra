@@ -69,7 +69,7 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) {
         let current_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
-        let rows = sort_rows(rows);
+        let rows = sort_rows_preserving_work_unit_order(rows, &self.rows);
         let selected_idx = selected_id.and_then(|id| rows.iter().position(|row| row.id == id));
         let fallback_idx = current_selected_id
             .and_then(|id| rows.iter().position(|row| row.id == id))
@@ -173,6 +173,52 @@ impl BackgroundTaskView {
             });
         }
     }
+}
+
+fn work_unit_key(row: &BackgroundTaskRow) -> String {
+    row.fanout.as_ref().map_or_else(
+        || format!("task:{}", row.id),
+        |fanout| format!("fanout:{}", fanout.group_id),
+    )
+}
+
+/// Preserve the first observed position of every work unit across live
+/// refreshes. A fanout's children are discovered independently; recomputing
+/// its anchor from the earliest currently-visible child makes the whole group
+/// jump above and below unrelated rows as slots arrive.
+fn sort_rows_preserving_work_unit_order(
+    rows: Vec<BackgroundTaskRow>,
+    previous: &[BackgroundTaskRow],
+) -> Vec<BackgroundTaskRow> {
+    let mut previous_order = std::collections::HashMap::<String, usize>::new();
+    for row in previous {
+        let next = previous_order.len();
+        previous_order.entry(work_unit_key(row)).or_insert(next);
+    }
+
+    let initially_sorted = sort_rows(rows);
+    let mut next_order = previous_order.len();
+    let mut order = previous_order;
+    for row in &initially_sorted {
+        let key = work_unit_key(row);
+        if !order.contains_key(&key) {
+            order.insert(key, next_order);
+            next_order += 1;
+        }
+    }
+
+    let mut rows = initially_sorted;
+    rows.sort_by_key(|row| {
+        (
+            order
+                .get(&work_unit_key(row))
+                .copied()
+                .unwrap_or(usize::MAX),
+            row.fanout.as_ref().map_or(0, |fanout| fanout.slot_index),
+            row.id.clone(),
+        )
+    });
+    rows
 }
 
 impl BottomPaneView for BackgroundTaskView {
@@ -424,6 +470,46 @@ mod tests {
     }
 
     #[test]
+    fn refresh_keeps_a_partially_discovered_fanout_at_its_first_observed_position() {
+        let mut view = BackgroundTaskView::new(vec![
+            row("unrelated", "running", "unrelated").with_timing(Some(100), None),
+            row("slot-2", "running", "second")
+                .with_timing(Some(200), None)
+                .with_fanout(fanout("review-1", 3, 1)),
+        ]);
+        view.move_down();
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("slot-2")
+        );
+
+        // A later refresh discovers slot 1 with an earlier runtime timestamp.
+        // The group and selected identity must stay where the user first saw
+        // them instead of jumping above the unrelated task.
+        view.replace_rows(vec![
+            row("slot-1", "running", "first")
+                .with_timing(Some(50), None)
+                .with_fanout(fanout("review-1", 3, 0)),
+            row("unrelated", "running", "unrelated").with_timing(Some(100), None),
+            row("slot-2", "completed", "second")
+                .with_timing(Some(200), Some(300))
+                .with_fanout(fanout("review-1", 3, 1)),
+        ]);
+
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unrelated", "slot-1", "slot-2"]
+        );
+        assert_eq!(
+            view.selected_row().map(|row| row.id.as_str()),
+            Some("slot-2")
+        );
+    }
+
+    #[test]
     fn new_with_selected_selects_matching_row_after_sort() {
         let view = BackgroundTaskView::new_with_selected(
             vec![
@@ -473,11 +559,11 @@ mod tests {
         assert!(text.contains("monitor"), "{text}");
         assert!(
             text.find("agent-1").unwrap() < text.find("cloud-1").unwrap(),
-            "attention rows must still sort above plain running rows: {text}"
+            "typed rows must retain deterministic identity order: {text}"
         );
         assert!(
-            text.find("main-1").unwrap() < text.find("cloud-1").unwrap(),
-            "failed rows must still sort above plain running rows: {text}"
+            text.find("cloud-1").unwrap() < text.find("main-1").unwrap(),
+            "a status transition must not promote a row and make the list jump: {text}"
         );
     }
 
@@ -829,7 +915,7 @@ mod tests {
         view.handle_key(key(KeyCode::Esc));
 
         let text = render(&view, 80, 5);
-        assert!(text.contains("Background tasks"));
+        assert!(text.contains("Tasks"));
         assert!(!view.is_complete());
 
         view.handle_key(key(KeyCode::Char('q')));

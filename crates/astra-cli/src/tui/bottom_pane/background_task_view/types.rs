@@ -173,6 +173,10 @@ pub(crate) struct BackgroundTaskRow {
     pub exit_code: Option<i32>,
     pub terminal_reason: Option<String>,
     pub fanout: Option<BackgroundTaskFanoutMembership>,
+    /// Whether the work unit has been explicitly detached from its parent.
+    /// Foreground fan-in remains observable in this view without pretending
+    /// that observation changed lifecycle ownership.
+    pub run_in_background: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +244,7 @@ impl BackgroundTaskRow {
             exit_code: None,
             terminal_reason: None,
             fanout: None,
+            run_in_background: true,
         }
     }
 
@@ -300,6 +305,11 @@ impl BackgroundTaskRow {
 
     pub(crate) fn with_fanout(mut self, fanout: BackgroundTaskFanoutMembership) -> Self {
         self.fanout = Some(fanout);
+        self
+    }
+
+    pub(crate) fn with_run_in_background(mut self, run_in_background: bool) -> Self {
+        self.run_in_background = run_in_background;
         self
     }
 }

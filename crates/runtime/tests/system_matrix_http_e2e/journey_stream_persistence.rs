@@ -61,6 +61,24 @@ async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (St
     collect_full_sse_stream(app, req, 30).await
 }
 
+fn mock_tool_call(id: &str, name: &str, args: Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": args.to_string()
+        }
+    })
+}
+
+fn parse_sse_events(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
 /// Poll until `agent_events` has at least `min_count` rows for the session.
 async fn wait_for_agent_events_count(
     pool: &sqlx::MySqlPool,
@@ -183,6 +201,478 @@ pub async fn run_stream_session_and_run_status() {
     );
 
     // ── Cleanup ──
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
+    ctx.pool.close().await;
+}
+
+/// Online product gate for structured fan-in. This intentionally crosses the
+/// full `/chat/stream` + dynamic child runtime + MatrixOne durability path:
+/// three child runs must exist and settle before the one parent synthesis,
+/// without fabricating a detached reconciliation turn or orphan transcript
+/// ownership.
+pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_tree() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let pool = &ctx.pool;
+    let user_id = &ctx.user_id;
+
+    let (status, session) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({
+            "title": "structured fan-in online gate",
+            "metadata": {"suite": "structured_fanout_online"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create session: {session}");
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let final_reply = "One parent synthesis after all three durable child results.";
+    let fanout_args = json!({
+        "action": "start",
+        "group_id": "online-review-group",
+        "title": "Online three-way review",
+        "target_count": 3,
+        "slots": [
+            {
+                "id": "storage",
+                "description": "Online storage review",
+                "prompt": "Inspect storage behavior and return one finding.",
+                "agent_type": "general-purpose"
+            },
+            {
+                "id": "runtime",
+                "description": "Online runtime review",
+                "prompt": "Inspect runtime behavior and return one finding.",
+                "agent_type": "general-purpose"
+            },
+            {
+                "id": "journey",
+                "description": "Online journey review",
+                "prompt": "Inspect the user journey and return one finding.",
+                "agent_type": "general-purpose"
+            }
+        ]
+    });
+    let payload = json!({
+        "message": "Run three reviews as one structured work group.",
+        "session_id": &session_id,
+        "selected_model": seeded_selected_model(ctx),
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [mock_tool_call(
+                        "online-fanout-start",
+                        "agent_fanout",
+                        fanout_args
+                    )]
+                },
+                {"full_text": final_reply}
+            ],
+            "test_spawn_child_llm_rounds": [
+                {"full_text": "durable child review result"}
+            ]
+        }
+    });
+    let (status, raw_sse) = stream_chat_full(app, auth, payload).await;
+    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    let events = parse_sse_events(&raw_sse);
+    let session_info = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("session_info"))
+        .unwrap_or_else(|| panic!("missing session_info: {raw_sse}"));
+    let root_run_id = session_info["run_id"]
+        .as_str()
+        .expect("root run_id")
+        .to_string();
+    let child_terminal_positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["type"].as_str() == Some("agent_completed")
+                || event["event_type"].as_str() == Some("agent_completed")
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_terminal_positions.len(),
+        3,
+        "each child must have one terminal projection: {raw_sse}"
+    );
+    let final_positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some(final_reply)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_positions.len(),
+        1,
+        "the root must synthesize exactly once: {raw_sse}"
+    );
+    assert!(
+        child_terminal_positions
+            .iter()
+            .all(|position| *position < final_positions[0]),
+        "parent synthesis appeared before the complete fanout: {raw_sse}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"].as_str() == Some("turn_complete"))
+            .count(),
+        1,
+        "one user turn must have one terminal boundary"
+    );
+
+    let durable_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? AND status = 'completed'",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if completed == 4 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < durable_deadline,
+            "expected one root plus three completed durable child runs, got {completed}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let runs = sqlx::query(
+        "SELECT run_id, parent_run_id, root_run_id, depth, status \
+         FROM agent_runs WHERE user_id = ? AND session_id = ? \
+         ORDER BY depth ASC, run_id ASC",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("load durable run tree");
+    assert_eq!(runs.len(), 4, "durable run tree: {runs:?}");
+    let root = runs
+        .iter()
+        .find(|run| run.get::<i32, _>("depth") == 0)
+        .expect("root run row");
+    assert_eq!(root.get::<String, _>("run_id"), root_run_id);
+    assert_eq!(root.get::<String, _>("root_run_id"), root_run_id);
+    assert!(root.get::<Option<String>, _>("parent_run_id").is_none());
+    let children = runs
+        .iter()
+        .filter(|run| run.get::<i32, _>("depth") == 1)
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 3, "durable child runs: {runs:?}");
+    assert!(children.iter().all(|run| {
+        run.get::<Option<String>, _>("parent_run_id").as_deref() == Some(root_run_id.as_str())
+            && run.get::<String, _>("root_run_id") == root_run_id
+            && run.get::<String, _>("status") == "completed"
+    }));
+
+    let runtime_reconciliations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE user_id = ? AND session_id = ? AND event_type = 'runtime_reconciliation'",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count runtime reconciliation events");
+    assert_eq!(
+        runtime_reconciliations, 0,
+        "foreground fan-in must remain on the original root turn"
+    );
+
+    let assistant_rows = sqlx::query(
+        "SELECT content, payload_json FROM session_transcript_items \
+         WHERE user_id = ? AND session_id = ? AND role = 'assistant' \
+         ORDER BY item_seq ASC",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("load assistant transcript rows");
+    let semantically_blank = assistant_rows
+        .iter()
+        .filter(|row| row.get::<String, _>("content").trim().is_empty())
+        .filter(|row| {
+            row.get::<Option<String>, _>("payload_json")
+                .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                .and_then(|payload| payload["tool_calls"].as_array().cloned())
+                .is_none_or(|tool_calls| tool_calls.is_empty())
+        })
+        .count();
+    assert_eq!(
+        semantically_blank, 0,
+        "an assistant transcript row must contain text or structured tool calls"
+    );
+    assert!(
+        assistant_rows.iter().any(|row| {
+            row.get::<String, _>("content").trim().is_empty()
+                && row
+                    .get::<Option<String>, _>("payload_json")
+                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                    .and_then(|payload| payload["tool_calls"].as_array().cloned())
+                    .is_some_and(|tool_calls| {
+                        tool_calls.len() == 1
+                            && tool_calls[0]["name"].as_str() == Some("agent_fanout")
+                    })
+        }),
+        "the tool-only root boundary must retain its typed fanout call instead of a semantically empty row"
+    );
+    let (transcript_status, transcript) = get_json(
+        app,
+        &format!("/sessions/{session_id}/transcript?scope=root_conversation&limit=20"),
+        Some(auth.as_str()),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        transcript_status,
+        StatusCode::OK,
+        "root transcript: {transcript}"
+    );
+    assert!(
+        transcript["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                item["role"].as_str() == Some("assistant")
+                    && item["content"].as_str() == Some("")
+                    && item["tool_calls"].as_array().is_some_and(|calls| {
+                        calls.len() == 1 && calls[0]["name"].as_str() == Some("agent_fanout")
+                    })
+            }),
+        "the downstream transcript API must expose the typed fanout call: {transcript}"
+    );
+    let orphan_transcript_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_transcript_items AS transcript \
+         LEFT JOIN agent_runs AS run \
+           ON run.user_id = transcript.user_id \
+          AND run.session_id = transcript.session_id \
+          AND run.run_id = transcript.run_id \
+         WHERE transcript.user_id = ? AND transcript.session_id = ? \
+           AND transcript.run_id IS NOT NULL AND run.run_id IS NULL",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count orphan transcript run identities");
+    assert_eq!(
+        orphan_transcript_runs, 0,
+        "every non-null transcript run_id must resolve to the same durable run tree"
+    );
+
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
+    ctx.pool.close().await;
+}
+
+/// Unhappy-path companion to the structured fan-in gate. Provider failure in
+/// every child remains one fixed-size terminal group: no replacement agents,
+/// no per-child parent analysis, and one synthesis over the preserved causes.
+pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let pool = &ctx.pool;
+    let user_id = &ctx.user_id;
+
+    let (status, session) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({
+            "title": "failed structured fan-in online gate",
+            "metadata": {"suite": "structured_fanout_failure_online"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create session: {session}");
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let final_reply = "One parent synthesis disclosed all three failed child causes.";
+    let (status, raw_sse) = stream_chat_full(
+        app,
+        auth,
+        json!({
+            "message": "Run three reviews and preserve every failure cause.",
+            "session_id": &session_id,
+            "selected_model": seeded_selected_model(ctx),
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [mock_tool_call(
+                            "online-failed-fanout-start",
+                            "agent_fanout",
+                            json!({
+                                "action": "start",
+                                "group_id": "online-failed-review-group",
+                                "title": "Online failed three-way review",
+                                "target_count": 3,
+                                "slots": [
+                                    {"id": "storage", "description": "Failed storage review", "prompt": "Inspect storage."},
+                                    {"id": "runtime", "description": "Failed runtime review", "prompt": "Inspect runtime."},
+                                    {"id": "journey", "description": "Failed journey review", "prompt": "Inspect journey."}
+                                ],
+                                "defaults": {"agent_type": "general-purpose"}
+                            })
+                        )]
+                    },
+                    {"full_text": final_reply}
+                ],
+                "test_spawn_child_llm_rounds": [{
+                    "error": {
+                        "message": "online child provider failed with preserved cause",
+                        "kind": "server_error"
+                    }
+                }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    let events = parse_sse_events(&raw_sse);
+    let root_run_id = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("session_info"))
+        .and_then(|event| event["run_id"].as_str())
+        .expect("root run id")
+        .to_string();
+    let failed_positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"].as_str() == Some("agent_failed"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_positions.len(),
+        3,
+        "each failed child gets one terminal projection: {raw_sse}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["type"].as_str() == Some("agent_live_event")
+                    && event["event_kind"].as_str() == Some("agent_terminated")
+                    && event["termination"].as_str() == Some("failed")
+            })
+            .count(),
+        3,
+        "the workbench live lane also gets one failed terminal per child"
+    );
+    let final_positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some(final_reply)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_positions.len(),
+        1,
+        "one failed-group synthesis: {raw_sse}"
+    );
+    assert!(
+        failed_positions
+            .iter()
+            .all(|position| *position < final_positions[0]),
+        "parent analyzed before the failed group settled: {raw_sse}"
+    );
+    let aggregate = events
+        .iter()
+        .find(|event| {
+            event["type"].as_str() == Some("tool_call_end")
+                && event["call_id"].as_str() == Some("online-failed-fanout-start")
+        })
+        .and_then(|event| event["result"].as_str())
+        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .unwrap_or_else(|| panic!("missing failed fanout aggregate: {raw_sse}"));
+    assert_eq!(aggregate["target_count"], 3, "{aggregate}");
+    assert_eq!(aggregate["completed"], 0, "{aggregate}");
+    assert_eq!(aggregate["failed"], 3, "{aggregate}");
+    assert!(
+        aggregate
+            .to_string()
+            .contains("online child provider failed with preserved cause"),
+        "failure provenance was lost: {aggregate}"
+    );
+
+    let durable_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let terminal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? \
+             AND status IN ('completed', 'failed')",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if terminal == 4 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < durable_deadline,
+            "failed run tree did not settle: {terminal}/4"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let runs = sqlx::query(
+        "SELECT run_id, parent_run_id, root_run_id, depth, status FROM agent_runs \
+         WHERE user_id = ? AND session_id = ? ORDER BY depth ASC, run_id ASC",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("failed durable run tree");
+    assert_eq!(runs.len(), 4, "{runs:?}");
+    assert!(
+        runs.iter()
+            .filter(|run| run.get::<i32, _>("depth") == 1)
+            .all(|run| {
+                run.get::<String, _>("status") == "failed"
+                    && run.get::<Option<String>, _>("parent_run_id").as_deref()
+                        == Some(root_run_id.as_str())
+                    && run.get::<String, _>("root_run_id") == root_run_id
+            })
+    );
+    let reconciliations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? \
+         AND event_type = 'runtime_reconciliation'",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count failure reconciliations");
+    assert_eq!(reconciliations, 0);
+
     cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.pool.close().await;
 }

@@ -15,8 +15,8 @@ use astra_core::sync_poison::recover_mutex_lock;
 use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_services::{
-    SyncOutboxDeliverySettlement, SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus,
-    SyncOutboxStore,
+    SyncOutboxDeliverySettlement, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
+    SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
@@ -37,10 +37,14 @@ use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
+const SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN: Duration = Duration::from_secs(30);
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
+/// Bound recovery memory while amortizing the monolithic outbox transaction.
+/// A batch pays one parse/rewrite/fsync, never one per source session.
+const SYNC_OUTBOX_JOURNAL_RECOVERY_BATCH_SOURCES: usize = 64;
 const SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY: Duration = Duration::from_millis(250);
 const SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY: Duration = Duration::from_secs(4);
 const SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -367,77 +371,201 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
             }
         }
 
-        let sessions = std::mem::take(&mut pending_sessions);
-        for session_id in sessions {
-            match reconcile_sync_outbox_journal(&session_id).await {
-                Ok(projected) => {
-                    retry_budget.observe_success(&session_id);
-                    if projected {
-                        schedule_sync_outbox_drain();
+        let sessions = std::mem::take(&mut pending_sessions)
+            .into_iter()
+            .collect::<Vec<_>>();
+        for batch in sessions.chunks(SYNC_OUTBOX_JOURNAL_RECOVERY_BATCH_SOURCES) {
+            let mut projected_any = false;
+            for (session_id, outcome) in reconcile_sync_outbox_journals(batch).await {
+                match outcome {
+                    Ok(projected) => {
+                        retry_budget.observe_success(&session_id);
+                        projected_any |= projected;
                     }
+                    Err(error) => match retry_budget.observe_failure(&session_id) {
+                        JournalIngestFailureDisposition::RetryAfter(delay) => {
+                            tracing::warn!(
+                                target: "astra_cli::cloud_sync",
+                                session_id,
+                                ?error,
+                                retry_after_ms = delay.as_millis(),
+                                "journal-to-outbox projection failed; retry remains bounded"
+                            );
+                            delayed_sessions
+                                .insert(session_id, tokio::time::Instant::now() + delay);
+                        }
+                        JournalIngestFailureDisposition::QuarantineUntilNewHint => {
+                            tracing::error!(
+                                target: "astra_cli::cloud_sync",
+                                session_id,
+                                ?error,
+                                "journal-to-outbox projection exhausted its retry budget; canonical journal remains durable and a new journal hint or process recovery will retry"
+                            );
+                        }
+                    },
                 }
-                Err(error) => match retry_budget.observe_failure(&session_id) {
-                    JournalIngestFailureDisposition::RetryAfter(delay) => {
-                        tracing::warn!(
-                            target: "astra_cli::cloud_sync",
-                            session_id,
-                            ?error,
-                            retry_after_ms = delay.as_millis(),
-                            "journal-to-outbox projection failed; retry remains bounded"
-                        );
-                        delayed_sessions.insert(session_id, tokio::time::Instant::now() + delay);
-                    }
-                    JournalIngestFailureDisposition::QuarantineUntilNewHint => {
-                        tracing::error!(
-                            target: "astra_cli::cloud_sync",
-                            session_id,
-                            ?error,
-                            "journal-to-outbox projection exhausted its retry budget; canonical journal remains durable and a new journal hint or process recovery will retry"
-                        );
-                    }
-                },
             }
+            if projected_any {
+                schedule_sync_outbox_drain();
+            }
+            // A startup recovery with hundreds of sources must remain
+            // cooperative with the foreground turn and TUI runtime.
+            tokio::task::yield_now().await;
         }
     }
 }
 
 async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io::Error> {
-    const STALE_OFFSET_RETRIES: usize = 3;
-    let store = SyncOutboxStore::local();
-    for attempt in 0..STALE_OFFSET_RETRIES {
-        let source_session_id = session_id.to_string();
-        let offset = run_sync_outbox_io(store.clone(), move |store| {
-            store.journal_source_offset(&source_session_id)
+    reconcile_sync_outbox_journals(&[session_id.to_string()])
+        .await
+        .into_iter()
+        .next()
+        .map(|(_, outcome)| outcome)
+        .unwrap_or_else(|| {
+            Err(std::io::Error::other(
+                "journal reconciliation produced no outcome",
+            ))
         })
-        .await?;
-        let read_session_id = session_id.to_string();
-        let delta = tokio::task::spawn_blocking(move || {
-            session_journal::read_durable_journal_append_delta(&read_session_id, offset)
+}
+
+async fn reconcile_sync_outbox_journals(
+    session_ids: &[String],
+) -> Vec<(String, Result<bool, std::io::Error>)> {
+    const STALE_OFFSET_RETRIES: usize = 3;
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+    let store = SyncOutboxStore::local();
+    let mut pending = session_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut outcomes = BTreeMap::<String, Result<bool, std::io::Error>>::new();
+    for attempt in 0..STALE_OFFSET_RETRIES {
+        if pending.is_empty() {
+            break;
+        }
+        let current_sessions = pending.iter().cloned().collect::<Vec<_>>();
+        pending.clear();
+        let offset_sessions = current_sessions.clone();
+        let offsets = match run_sync_outbox_io(store.clone(), move |store| {
+            store.journal_source_offsets(&offset_sessions)
         })
         .await
-        .map_err(|error| {
-            std::io::Error::other(format!("journal delta worker failed: {error}"))
-        })??;
-        if delta.next_offset == offset {
-            return Ok(false);
-        }
-        let source_session_id = session_id.to_string();
-        let outcome = run_sync_outbox_io(store.clone(), move |store| {
-            store.append_journal_delta(&source_session_id, offset, delta.next_offset, &delta.events)
+        {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                let message = error.to_string();
+                for session_id in current_sessions {
+                    outcomes.insert(
+                        session_id,
+                        Err(std::io::Error::new(error.kind(), message.clone())),
+                    );
+                }
+                break;
+            }
+        };
+        let read_result = tokio::task::spawn_blocking(move || {
+            current_sessions
+                .into_iter()
+                .map(|session_id| {
+                    let offset = offsets.get(&session_id).copied().unwrap_or(0);
+                    let delta =
+                        session_journal::read_durable_journal_append_delta(&session_id, offset);
+                    (session_id, offset, delta)
+                })
+                .collect::<Vec<_>>()
         })
-        .await?;
-        match outcome {
-            astra_services::SyncOutboxJournalDeltaOutcome::Appended { .. } => return Ok(true),
-            astra_services::SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
-                if attempt + 1 < STALE_OFFSET_RETRIES {
-                    tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+        .await;
+        let reads = match read_result {
+            Ok(reads) => reads,
+            Err(error) => {
+                let message = format!("journal delta worker failed: {error}");
+                for session_id in session_ids {
+                    if !outcomes.contains_key(session_id) {
+                        outcomes.insert(
+                            session_id.clone(),
+                            Err(std::io::Error::other(message.clone())),
+                        );
+                    }
+                }
+                break;
+            }
+        };
+
+        let mut deltas = Vec::new();
+        for (session_id, offset, delta) in reads {
+            match delta {
+                Ok(delta) if delta.next_offset == offset => {
+                    outcomes.insert(session_id, Ok(false));
+                }
+                Ok(delta) => deltas.push(SyncOutboxJournalDelta {
+                    source_session_id: session_id,
+                    expected_offset: offset,
+                    next_offset: delta.next_offset,
+                    events: delta.events,
+                }),
+                Err(error) => {
+                    outcomes.insert(session_id, Err(error));
                 }
             }
         }
+        if deltas.is_empty() {
+            continue;
+        }
+        let delta_session_ids = deltas
+            .iter()
+            .map(|delta| delta.source_session_id.clone())
+            .collect::<Vec<_>>();
+        let batch_outcome = run_sync_outbox_io(store.clone(), move |store| {
+            store.append_journal_deltas(&deltas)
+        })
+        .await;
+        match batch_outcome {
+            Ok(batch_outcome) => {
+                for (session_id, outcome) in batch_outcome.outcomes {
+                    match outcome {
+                        SyncOutboxJournalDeltaOutcome::Appended { .. } => {
+                            outcomes.insert(session_id, Ok(true));
+                        }
+                        SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
+                            if attempt + 1 < STALE_OFFSET_RETRIES {
+                                pending.insert(session_id);
+                            } else {
+                                outcomes.insert(
+                                    session_id,
+                                    Err(std::io::Error::other(
+                                        "sync outbox journal source offset changed repeatedly during projection",
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for session_id in delta_session_ids {
+                    outcomes.insert(
+                        session_id,
+                        Err(std::io::Error::new(error.kind(), message.clone())),
+                    );
+                }
+            }
+        }
+        if !pending.is_empty() && attempt + 1 < STALE_OFFSET_RETRIES {
+            tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+        }
     }
-    Err(std::io::Error::other(
-        "sync outbox journal source offset changed repeatedly during projection",
-    ))
+    session_ids
+        .iter()
+        .cloned()
+        .map(|session_id| {
+            let outcome = outcomes.remove(&session_id).unwrap_or_else(|| {
+                Err(std::io::Error::other(
+                    "journal reconciliation produced no terminal outcome",
+                ))
+            });
+            (session_id, outcome)
+        })
+        .collect()
 }
 
 pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
@@ -471,6 +599,7 @@ pub(crate) struct SyncOutboxDrainReport {
     pub failed: u32,
     pub terminal: u32,
     pub remaining_ready: u32,
+    pub pending_high_watermark_exceeded: bool,
     pub blocker: Option<SyncOutboxDrainBlocker>,
 }
 
@@ -576,6 +705,13 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
             if !report.cloud_configured || report.remaining_ready == 0 || report.attempted == 0 {
                 break;
             }
+            if report.pending_high_watermark_exceeded {
+                // A huge monolithic outbox makes every claim/settlement an
+                // O(backlog) transaction. Preserve forward progress, but cap
+                // this wake to one round so sync recovery cannot monopolize
+                // the foreground CLI runtime.
+                break;
+            }
         }
         if blocked {
             return;
@@ -669,6 +805,9 @@ fn release_sync_outbox_retry_wake_schedule() {
 
 fn next_sync_outbox_drain_delay(status: &SyncOutboxStatus) -> Option<Duration> {
     if status.claimable > 0 {
+        if status.pending_high_watermark_exceeded {
+            return Some(SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN);
+        }
         return Some(Duration::ZERO);
     }
     let retry_at = status.next_retry_after_unix_ms?;
@@ -878,6 +1017,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
     match run_sync_outbox_io(store.clone(), |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+            report.pending_high_watermark_exceeded = status.pending_high_watermark_exceeded;
             if report.remaining_ready == 0 {
                 return report;
             }
@@ -974,6 +1114,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
     match run_sync_outbox_io(store, |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+            report.pending_high_watermark_exceeded = status.pending_high_watermark_exceeded;
         }
         Err(error) => {
             report
@@ -1579,5 +1720,12 @@ mod tests {
         assert!(next_sync_outbox_drain_delay(&status).is_some());
         status.claimable = 1;
         assert_eq!(next_sync_outbox_drain_delay(&status), Some(Duration::ZERO));
+
+        status.pending_high_watermark_exceeded = true;
+        assert_eq!(
+            next_sync_outbox_drain_delay(&status),
+            Some(super::SYNC_OUTBOX_DEGRADED_DRAIN_COOLDOWN),
+            "a huge ready backlog must make progress without a zero-delay CPU/IO loop"
+        );
     }
 }
