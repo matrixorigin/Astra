@@ -17,13 +17,17 @@ import type {
   SendMessageRequest,
   SendMessageResponse,
   ActiveRunMutationResponse,
-  WorkSurfaceResponse,
   WorkSurfaceRunResponse,
   ChatInsightsResponse,
   EdgeStatusResponse,
   RuntimeCapabilitiesResponse,
   WorkspaceSelection,
 } from "@/lib/api/types";
+import {
+  parseWorkSurfaceEvent,
+  type WorkSurfaceEvent,
+  type WorkSurfaceResponse,
+} from "@/lib/work-surface";
 
 export function listChats(params: {
   projectId?: string | null;
@@ -174,7 +178,7 @@ export type ChatStreamHandlers = {
     status: string;
     error?: string | null;
   }) => void;
-  onWorkSurfaceEvent?: (event: Record<string, unknown>) => void;
+  onWorkSurfaceEvent?: (event: WorkSurfaceEvent) => void;
   onCancelled?: (text: string) => void;
   onPaused?: (text: string) => void;
   onDone?: (text: string) => void;
@@ -253,6 +257,7 @@ const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
   "agent_delegated",
   "agent_spawned",
   "agent_live_event",
+  "agent_live_gap",
   "agent_progress",
   "agent_completed",
   "agent_failed",
@@ -265,6 +270,14 @@ const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
 
 function isWorkSurfaceStreamEvent(type: string) {
   return WORK_SURFACE_STREAM_EVENT_TYPES.has(type) || isRunBlockedEvent(type);
+}
+
+function forwardWorkSurfaceEvent(
+  event: Record<string, unknown>,
+  handlers: ChatStreamHandlers,
+) {
+  const parsed = parseWorkSurfaceEvent(event);
+  if (parsed) handlers.onWorkSurfaceEvent?.(parsed);
 }
 
 function applyAssistantText(
@@ -344,7 +357,7 @@ function applyStreamEvent(
 
   if (type === "run_started" && typeof event.run_id === "string") {
     state.runId = event.run_id;
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     handlers.onRunStarted?.(event.run_id);
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -358,7 +371,7 @@ function applyStreamEvent(
 
   if (type === "run_input_queued" && typeof event.run_id === "string") {
     state.runId = event.run_id;
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     handlers.onRunUpdated?.(
       runUpdate(state, {
         runId: event.run_id,
@@ -370,7 +383,7 @@ function applyStreamEvent(
   }
 
   if (isRunBlockedEvent(type)) {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     const runId =
       typeof event.run_id === "string" && event.run_id.trim()
         ? event.run_id
@@ -390,7 +403,7 @@ function applyStreamEvent(
   }
 
   if (type === "run_waiting") {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     const runId =
       typeof event.run_id === "string" && event.run_id.trim()
         ? event.run_id
@@ -413,13 +426,13 @@ function applyStreamEvent(
   }
 
   if (isWorkSurfaceStreamEvent(type)) {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     return;
   }
 
   if (type === "run_paused" && typeof event.run_id === "string") {
     state.runId = event.run_id;
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     state.paused = true;
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -433,7 +446,7 @@ function applyStreamEvent(
 
   if (type === "run_resumed" && typeof event.run_id === "string") {
     state.runId = event.run_id;
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     state.paused = false;
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -446,7 +459,7 @@ function applyStreamEvent(
   }
 
   if (type === "run_error") {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     const message = eventMessage(event, "Astra run failed.");
     state.error = message;
     if (typeof event.run_id === "string") {
@@ -463,7 +476,7 @@ function applyStreamEvent(
   }
 
   if (type === "run_interrupted") {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     state.paused = true;
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
@@ -532,7 +545,7 @@ function applyStreamEvent(
   }
 
   if (type === "run_finished") {
-    handlers.onWorkSurfaceEvent?.(event);
+    forwardWorkSurfaceEvent(event, handlers);
     const status =
       typeof event.status === "string" ? event.status : "completed";
     if (typeof event.run_id === "string") {

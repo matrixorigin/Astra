@@ -6,13 +6,18 @@ import {
   requireRuntimeClient,
   runtimeErrorDetail,
 } from "@/lib/runtime-client";
+import {
+  parseWorkSurfaceEvent,
+  type WorkSurfaceEvent,
+} from "@/lib/work-surface";
+import type { ExecutorBinding, WorkspaceBinding } from "@astra/sdk";
 
 type RuntimeRunProjectionResponse = {
   run_id?: string;
   session_id?: string;
   status?: string;
-  workspace?: Record<string, unknown> | null;
-  executor?: Record<string, unknown> | null;
+  workspace?: WorkspaceBinding | null;
+  executor?: ExecutorBinding | null;
   transport?: string | null;
   fallback_policy?: string | null;
   recent_events?: Array<Record<string, unknown>>;
@@ -20,14 +25,15 @@ type RuntimeRunProjectionResponse = {
 
 const AGENT_RUN_RECENT_EVENT_LIMIT = 120;
 
-function projectionBindingSeedEvent(
+function bindingProjectionEvent(
   projection: RuntimeRunProjectionResponse,
-) {
+): WorkSurfaceEvent | null {
   if (!projection.workspace && !projection.executor) {
     return null;
   }
   return {
-    type: "run_started",
+    type: "binding_projection",
+    source: "durable_run_projection",
     run_id: projection.run_id,
     session_id: projection.session_id,
     status: projection.status,
@@ -86,7 +92,10 @@ export async function GET(
         "Canonical transcript unavailable because the child run did not report a session identity.";
     }
 
-    const bindingSeed = projectionBindingSeedEvent(projection);
+    const bindingProjection = bindingProjectionEvent(projection);
+    const recentEvents = (projection.recent_events ?? [])
+      .map(parseWorkSurfaceEvent)
+      .filter((event): event is WorkSurfaceEvent => event !== null);
     const runTranscript =
       transcript?.items.filter((item) => item.run_id === (projection.run_id ?? runId)) ??
       [];
@@ -103,8 +112,8 @@ export async function GET(
       transport: projection.transport ?? null,
       fallbackPolicy: projection.fallback_policy ?? null,
       events: [
-        ...(bindingSeed ? [bindingSeed] : []),
-        ...(projection.recent_events ?? []),
+        ...(bindingProjection ? [bindingProjection] : []),
+        ...recentEvents,
       ],
       transcript: runTranscript,
       transcriptComplete: Boolean(transcript && !transcript.has_more),

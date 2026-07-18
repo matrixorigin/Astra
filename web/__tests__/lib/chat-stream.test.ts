@@ -72,6 +72,29 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it('forwards live-gap repair evidence to the work-surface consumer', async () => {
+    const onWorkSurfaceEvent = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"agent_live_gap","run_id":"child-run-1","agent_id":"reviewer","dropped_event_count":4,"repair":"refresh_run_snapshot"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, {
+      onWorkSurfaceEvent,
+    });
+
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+      type: 'agent_live_gap',
+      run_id: 'child-run-1',
+      agent_id: 'reviewer',
+      dropped_event_count: 4,
+      repair: 'refresh_run_snapshot',
+    });
+  });
+
   it('treats a cancelled run as a clean stop instead of a failed stream', async () => {
     const onCancelled = vi.fn();
     const onDone = vi.fn();

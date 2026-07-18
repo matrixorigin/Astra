@@ -6,6 +6,11 @@ import {
   requireRuntimeClient,
   runtimeErrorDetail,
 } from "@/lib/runtime-client";
+import {
+  parseWorkSurfaceEvent,
+  type WorkSurfaceEvent,
+} from "@/lib/work-surface";
+import type { ExecutorBinding, WorkspaceBinding } from "@astra/sdk";
 
 type RuntimeTodosResponse = {
   tasks?: Array<Record<string, unknown>>;
@@ -15,8 +20,8 @@ type RuntimeRunProjectionResponse = {
   run_id?: string;
   session_id?: string;
   status?: string | null;
-  workspace?: Record<string, unknown> | null;
-  executor?: Record<string, unknown> | null;
+  workspace?: WorkspaceBinding | null;
+  executor?: ExecutorBinding | null;
   transport?: string | null;
   fallback_policy?: string | null;
   recent_events?: Array<Record<string, unknown>>;
@@ -46,14 +51,15 @@ type RuntimeSessionRunTreeResponse = {
 const WORK_SURFACE_RECENT_EVENT_LIMIT = 400;
 const WORK_SURFACE_RUN_TREE_LIMIT = 400;
 
-function projectionBindingSeedEvent(
+function bindingProjectionEvent(
   projection: RuntimeRunProjectionResponse | null,
-) {
+): WorkSurfaceEvent | null {
   if (!projection?.workspace && !projection?.executor) {
     return null;
   }
   return {
-    type: "run_started",
+    type: "binding_projection",
+    source: "durable_run_projection",
     run_id: projection.run_id,
     session_id: projection.session_id,
     status: projection.status,
@@ -83,10 +89,10 @@ export function selectWorkSurfaceRootRun(
   return roots.sort((left, right) => runTimestamp(right) - runTimestamp(left))[0] ?? null;
 }
 
-export function runTreeAgentEvents(
+export function runTreeAgentProjections(
   tree: RuntimeSessionRunTreeResponse | null,
   rootRunId: string | null,
-) {
+): WorkSurfaceEvent[] {
   if (!rootRunId) return [];
   return (tree?.runs ?? [])
     .filter(
@@ -95,34 +101,21 @@ export function runTreeAgentEvents(
         (node.root_run_id === rootRunId || node.parent_run_id === rootRunId),
     )
     .sort((left, right) => runTimestamp(left) - runTimestamp(right))
-    .map((node) => {
-      const type =
-        node.status === "completed" || node.status === "delegated"
-          ? "agent_completed"
-          : node.status === "failed"
-            ? "agent_failed"
-            : node.status === "cancelled"
-              ? "agent_cancelled"
-              : node.status === "interrupted"
-                ? "agent_interrupted"
-                : node.status === "waiting" || node.status === "paused"
-                  ? "agent_waiting"
-                  : "agent_spawned";
+    .flatMap((node) => {
+      if (!node.agent_id) return [];
       return {
-        type,
+        type: "agent_projection" as const,
+        source: "durable_run_tree",
         agent_id: node.agent_id,
         run_id: node.run_id,
         parent_run_id: node.parent_run_id ?? undefined,
         description: node.agent_name ?? node.agent_id ?? undefined,
         status: node.status,
-        reason:
-          node.waiting_for ??
-          (node.status === "cancelled" ? "ancestor or user cancelled the run" : undefined),
+        reason: node.waiting_for ?? undefined,
         error: node.error_message ?? undefined,
         total_tool_calls: node.total_tool_calls,
         timestamp_epoch_ms: runTimestamp(node),
-        durable: true,
-      };
+      } satisfies WorkSurfaceEvent;
     });
 }
 
@@ -238,11 +231,14 @@ export async function GET(
               return { tasks: [] };
             })
         : { tasks: [] };
-    const bindingSeed = projectionBindingSeedEvent(projection);
+    const bindingProjection = bindingProjectionEvent(projection);
+    const recentEvents = (projection?.recent_events ?? [])
+      .map(parseWorkSurfaceEvent)
+      .filter((event): event is WorkSurfaceEvent => event !== null);
     const events = [
-      ...(bindingSeed ? [bindingSeed] : []),
-      ...(projection?.recent_events ?? []),
-      ...runTreeAgentEvents(runTree, runId),
+      ...(bindingProjection ? [bindingProjection] : []),
+      ...recentEvents,
+      ...runTreeAgentProjections(runTree, runId),
     ];
 
     return NextResponse.json({

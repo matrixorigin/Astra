@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 use crate::detach::DetachShellHandle;
@@ -984,7 +987,17 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 let mut result = ToolResult::text(render_bash_detached_marker(&task_id));
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
-                metadata.insert("background_task_id".to_string(), task_id.into());
+                metadata.insert("background_task_id".to_string(), task_id.clone().into());
+                WorkUnitObservation::new(
+                    task_id,
+                    "shell",
+                    WorkUnitStatus::Running,
+                    "running:0",
+                    WorkUnitObservationMode::Transition,
+                )
+                .expect("detached shell task ids are non-empty")
+                .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+                .insert_into(&mut metadata);
                 result.metadata = Some(metadata);
                 return result;
             }
@@ -5920,6 +5933,15 @@ printf 'probe.txt:1:needle\n'
                 .and_then(|v| v.as_str()),
             Some("bg-shell-test")
         );
+        let work = result
+            .metadata
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("detach receipt must publish the shared work-unit contract");
+        assert_eq!(work.id, "bg-shell-test");
+        assert_eq!(work.status, WorkUnitStatus::Running);
+        assert_eq!(work.mode, WorkUnitObservationMode::Transition);
+        assert_eq!(work.wake_policy, WorkUnitWakePolicy::OnTerminal);
     }
 
     #[tokio::test]

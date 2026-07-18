@@ -67,6 +67,9 @@ pub struct AgentFanoutGroupProjection {
     pub parent_run_id: Option<String>,
     pub slots: Vec<AgentFanoutSlot>,
     pub status: AgentFanoutStatus,
+    /// Producer-owned material-state revision. Reads and LRU touches never
+    /// change it; every accepted projection mutation does.
+    pub revision: u64,
     /// Monotonic timestamp of last mutation or access.  Used for
     /// LRU eviction when the fanout-groups map exceeds its cap.
     pub last_touched: SystemTime,
@@ -184,6 +187,7 @@ impl AgentFanoutGroupProjection {
             parent_run_id: None,
             slots,
             status: AgentFanoutStatus::Planned,
+            revision: 0,
             last_touched: SystemTime::now(),
             summary_cache: AgentFanoutSummary {
                 target_count,
@@ -223,6 +227,7 @@ impl AgentFanoutGroupProjection {
         slot.slot_id = slot_id;
         slot.role = role.into();
         slot.requested_description = requested_description.into();
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -250,6 +255,7 @@ impl AgentFanoutGroupProjection {
             false,
         );
         self.recompute_status_from_cache();
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -289,6 +295,7 @@ impl AgentFanoutGroupProjection {
         self.apply_slot_status_transition(old_status, AgentFanoutSlotStatus::Running, true, false);
         self.agent_slot_index.insert(agent_id, slot_index);
         self.recompute_status_from_cache();
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -307,6 +314,7 @@ impl AgentFanoutGroupProjection {
             slot.result_collected = true;
             self.summary_cache.collected += 1;
             self.summary_cache.uncollected = self.summary_cache.uncollected.saturating_sub(1);
+            self.revision = self.revision.saturating_add(1);
         }
         true
     }
@@ -341,6 +349,7 @@ impl AgentFanoutGroupProjection {
         };
         self.apply_slot_status_transition(old_status, status, true, result_collected);
         self.recompute_status_from_cache();
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -553,6 +562,33 @@ mod tests {
         assert_eq!(group.target_count, 3);
         assert_eq!(group.slots.len(), 3);
         assert_eq!(group.slots[2].slot_index, 2);
+    }
+
+    #[test]
+    fn revision_changes_only_for_material_projection_mutations() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
+        assert_eq!(group.revision, 0);
+
+        group.touch();
+        assert_eq!(group.revision, 0, "reads and LRU touches are not progress");
+
+        group
+            .set_slot_request(0, None, "reviewer", "Review auth")
+            .unwrap();
+        assert_eq!(group.revision, 1);
+        group.record_spawn_accepted(0, "reviewer@run-1").unwrap();
+        assert_eq!(group.revision, 2);
+        group
+            .record_terminal_by_agent("reviewer@run-1", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        assert_eq!(group.revision, 3);
+        assert!(group.mark_result_collected("reviewer@run-1"));
+        assert_eq!(group.revision, 4);
+        assert!(group.mark_result_collected("reviewer@run-1"));
+        assert_eq!(
+            group.revision, 4,
+            "idempotent collection cannot manufacture progress"
+        );
     }
 
     #[test]

@@ -481,8 +481,6 @@ pub(crate) fn sync_background_task_footer_from_rows(
     } else {
         Some(counts)
     };
-    bottom_pane.footer.bg_fanout_summaries =
-        super::status_line::BackgroundTaskFanoutSummary::from_rows(rows);
 }
 
 pub(crate) async fn open_background_task_view(

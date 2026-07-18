@@ -6960,6 +6960,17 @@ mod tests {
                 .and_then(Value::as_str),
             Some("bg-shell-edge")
         );
+        let work = outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("edge detach receipt must publish the shared work-unit contract");
+        assert_eq!(work.id, "bg-shell-edge");
+        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
+        assert_eq!(
+            work.mode,
+            astra_core::work_unit::WorkUnitObservationMode::Transition
+        );
     }
 
     // ── D-9 regression: speculative success flag must gate reuse ──

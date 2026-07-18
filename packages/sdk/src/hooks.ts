@@ -617,10 +617,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
       case "tool_call_start":
       case "tool_transport_started": {
-        const args =
-          event.type === "tool_call_start"
-            ? event.arguments
-            : valueToToolString(event.arguments);
+        const args = valueToToolString(event.arguments);
         upsertToolCall(event.call_id, (existing) => ({
           ...existing,
           callId: event.call_id,

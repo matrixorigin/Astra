@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
@@ -684,6 +687,20 @@ impl BgTaskOutputStatus {
     fn should_wake_waiter(self) -> bool {
         self.is_terminal() || self == Self::WaitingForInput
     }
+
+    fn work_unit_status(self) -> WorkUnitStatus {
+        match self {
+            Self::Pending => WorkUnitStatus::Pending,
+            Self::Running => WorkUnitStatus::Running,
+            Self::WaitingForInput => WorkUnitStatus::WaitingForInput,
+            Self::Stopping => WorkUnitStatus::Stopping,
+            Self::Completed => WorkUnitStatus::Completed,
+            Self::Failed => WorkUnitStatus::Failed,
+            Self::Interrupted => WorkUnitStatus::Interrupted,
+            Self::Killed => WorkUnitStatus::Cancelled,
+            Self::Unavailable => WorkUnitStatus::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1202,7 +1219,7 @@ fn background_task_output_result_fields(
             BgTaskOutputReadMode::Historical => "historical",
         }
     };
-    serde_json::Map::from_iter([(
+    let mut fields = serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1211,7 +1228,22 @@ fn background_task_output_result_fields(
             "terminal": snapshot.status.is_terminal(),
             "mode": observation_mode,
         }),
-    )])
+    )]);
+    WorkUnitObservation::new(
+        task_id,
+        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
+        snapshot.status.work_unit_status(),
+        format!("{}:{}", snapshot.status.as_str(), snapshot.total_bytes),
+        match observation_mode {
+            "wait" => WorkUnitObservationMode::Wait,
+            "historical" => WorkUnitObservationMode::Historical,
+            _ => WorkUnitObservationMode::Current,
+        },
+    )
+    .expect("background snapshots have a task id, kind, and version")
+    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+    .insert_into(&mut fields);
+    fields
 }
 
 fn background_task_output_search_result_fields(
@@ -1219,7 +1251,7 @@ fn background_task_output_search_result_fields(
     pattern: &str,
     snapshot: &BgTaskOutputSearchSnapshot,
 ) -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
+    let mut fields = serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1231,7 +1263,23 @@ fn background_task_output_search_result_fields(
             "matching_lines": snapshot.matching_lines,
             "truncated": snapshot.truncated,
         }),
-    )])
+    )]);
+    WorkUnitObservation::new(
+        task_id,
+        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
+        snapshot.status.work_unit_status(),
+        format!(
+            "diagnostic:{}:{}:{}",
+            snapshot.status.as_str(),
+            snapshot.matching_lines,
+            snapshot.truncated
+        ),
+        WorkUnitObservationMode::Diagnostic,
+    )
+    .expect("background diagnostics have a task id, kind, and version")
+    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+    .insert_into(&mut fields);
+    fields
 }
 
 fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
@@ -7146,6 +7194,22 @@ mod tests {
         assert_eq!(observation["task_id"], "bg-shell-1");
         assert_eq!(observation["task_kind"], "shell");
         assert_eq!(observation["mode"], "current");
+        let work = result_fields
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("current task output must publish the shared work-unit contract");
+        assert_eq!(work.id, "bg-shell-1");
+        assert_eq!(work.kind, "shell");
+        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
+        assert_eq!(work.version, "running:1000");
+        assert_eq!(
+            work.mode,
+            astra_core::work_unit::WorkUnitObservationMode::Current
+        );
+        assert_eq!(
+            work.wake_policy,
+            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        );
     }
 
     #[tokio::test]
@@ -7210,6 +7274,19 @@ mod tests {
         assert_eq!(observation["mode"], "diagnostic");
         assert_eq!(observation["terminal"], true);
         assert_eq!(observation["matching_lines"], 1);
+        let work = result_fields
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("diagnostic output must still publish its non-live observation mode");
+        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Failed);
+        assert_eq!(
+            work.mode,
+            astra_core::work_unit::WorkUnitObservationMode::Diagnostic
+        );
+        assert_eq!(
+            work.wake_policy,
+            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        );
     }
 
     #[tokio::test]

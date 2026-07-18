@@ -41,6 +41,7 @@ import {
   failWorkSurfaceLoad,
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
+  type WorkSurfaceEvent,
   type WorkSurfaceResponse as WorkSurfaceProjection,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
@@ -179,7 +180,7 @@ export interface UseStreamLifecycleParams {
 
 export interface UseStreamLifecycleReturn {
   nextStreamAbortSignal: () => AbortSignal;
-  applyWorkSurfaceStreamEvent: (event: Record<string, unknown>) => void;
+  applyWorkSurfaceStreamEvent: (event: WorkSurfaceEvent) => void;
   resetWorkSurfaceRun: (
     runId: string | null,
     sessionId?: string | null,
@@ -268,6 +269,8 @@ export function useStreamLifecycle(
     }
   });
   const runControlMutationRef = useRef(false);
+  const workSurfaceRepairInFlightRef = useRef(false);
+  const workSurfaceRepairPendingRef = useRef(false);
 
   // -- Stream signal helpers --
   const nextStreamAbortSignal = useCallback(() => {
@@ -299,13 +302,6 @@ export function useStreamLifecycle(
       attachedRunRef.current = null;
     }
   }, []);
-
-  const applyWorkSurfaceStreamEvent = useCallback(
-    (event: Record<string, unknown>) => {
-      setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
-    },
-    [setWorkSurface],
-  );
 
   const resetWorkSurfaceRun = useCallback(
     (runId: string | null, sessionId?: string | null) => {
@@ -420,6 +416,34 @@ export function useStreamLifecycle(
       }
     },
     [detail.chat.id, detail.session?.backendSessionId, setWorkSurface],
+  );
+
+  const repairWorkSurfaceFromDurable = useCallback(() => {
+    if (workSurfaceRepairInFlightRef.current) {
+      workSurfaceRepairPendingRef.current = true;
+      return;
+    }
+    workSurfaceRepairInFlightRef.current = true;
+    void (async () => {
+      try {
+        do {
+          workSurfaceRepairPendingRef.current = false;
+          await hydrateWorkSurfaceForChat({ silent: true });
+        } while (workSurfaceRepairPendingRef.current);
+      } finally {
+        workSurfaceRepairInFlightRef.current = false;
+      }
+    })();
+  }, [hydrateWorkSurfaceForChat]);
+
+  const applyWorkSurfaceStreamEvent = useCallback(
+    (event: WorkSurfaceEvent) => {
+      setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
+      if (event.type === "agent_live_gap") {
+        repairWorkSurfaceFromDurable();
+      }
+    },
+    [repairWorkSurfaceFromDurable, setWorkSurface],
   );
 
   const loadAgentRunProjection = useCallback(

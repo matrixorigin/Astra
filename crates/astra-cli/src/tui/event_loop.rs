@@ -8449,9 +8449,6 @@ pub(crate) async fn run_tui_session(
                 } else {
                     Some(bg_counts)
                 };
-                bottom_pane.footer.bg_fanout_summaries =
-                    status_line::BackgroundTaskFanoutSummary::from_rows(&rows_for_footer);
-
                 plan_task_observer.set_view_mode(task_board.view_mode());
                 plan_task_observer.maybe_refresh();
                 let plan_task_projection = plan_task_observer.projection();
@@ -10287,7 +10284,7 @@ mod tests {
     }
 
     #[test]
-    fn background_local_agent_row_preserves_fanout_membership_for_footer_and_switcher() {
+    fn background_local_agent_row_preserves_fanout_membership_for_management_surface() {
         let mut agent = agent_info(
             "agent-auth",
             AgentStatus::Running {
@@ -10310,12 +10307,6 @@ mod tests {
         assert_eq!(fanout.group_title, "review fanout");
         assert_eq!(fanout.target_count, 3);
         assert_eq!(fanout.slot_index, 0);
-
-        let summaries =
-            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].target_count, 3);
-        assert_eq!(summaries[0].running, 1);
 
         let xml = render_background_task_rows_xml(&[row]);
         assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
@@ -10372,11 +10363,6 @@ mod tests {
         assert_eq!(fanout.target_count, 3);
         assert_eq!(fanout.slot_index, 1);
         assert_eq!(fanout.slot_label, "review API surface");
-
-        let summaries =
-            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].failed, 1);
 
         let xml = render_background_task_rows_xml(std::slice::from_ref(&row));
         assert!(
@@ -10604,7 +10590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
+    async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_surface() {
         let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
@@ -10624,12 +10610,6 @@ mod tests {
             row.status,
             bottom_pane::background_task_view::BackgroundTaskStatus::Running
         );
-
-        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&rows);
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].target_count, 3);
-        assert_eq!(summaries[0].running, 1);
-        assert_eq!(summaries[0].unavailable, 0);
 
         let xml = render_background_task_rows_xml(&rows);
         assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");

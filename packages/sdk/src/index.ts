@@ -41,6 +41,8 @@ export type {
   RunBlockedEvent,
   AgentDelegatedEvent,
   AgentSpawnedEvent,
+  AgentLiveEvent,
+  AgentLiveGapEvent,
   AgentWaitingEvent,
   AgentProgressEvent,
   AgentCompletedEvent,

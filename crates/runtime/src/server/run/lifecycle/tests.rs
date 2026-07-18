@@ -71,33 +71,90 @@ fn server_service_catalog_is_disabled_only_for_agent_binding_mode() {
     );
 }
 
-#[test]
-fn attached_stream_event_recovers_after_transient_backpressure() {
+#[tokio::test]
+async fn attached_stream_progress_recovers_after_transient_backpressure() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut attached = Some(tx);
 
-    try_send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1");
+    send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1").await;
     assert!(attached.is_some());
-    try_send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1");
+    send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1").await;
 
     assert!(
         attached.is_some(),
         "a momentarily full queue must not permanently detach a live observer"
     );
     assert_eq!(rx.try_recv().unwrap(), json!({"seq": 1}));
-    try_send_attached_stream_event(&mut attached, json!({"seq": 3}), "run-1");
+    send_attached_stream_event(&mut attached, json!({"seq": 3}), "run-1").await;
     assert_eq!(rx.try_recv().unwrap(), json!({"seq": 3}));
 }
 
-#[test]
-fn attached_stream_event_detaches_after_disconnect() {
+#[tokio::test]
+async fn attached_stream_event_detaches_after_disconnect() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx);
     let mut attached = Some(tx);
 
-    try_send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1");
+    send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1").await;
 
     assert!(attached.is_none());
+}
+
+#[tokio::test]
+async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(json!({"type": "text_delta", "content": "queued"}))
+        .await
+        .unwrap();
+    let mut attached = Some(tx);
+    let approval = json!({
+        "type": "approval_required",
+        "request_id": "approval-1",
+        "tool": "bash",
+    });
+
+    {
+        let delivery = send_attached_stream_event(&mut attached, approval.clone(), "run-1");
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "a full observer queue must backpressure the interaction boundary instead of dropping it"
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            json!({"type": "text_delta", "content": "queued"})
+        );
+        delivery.await;
+    }
+    assert_eq!(rx.recv().await.unwrap(), approval);
+    assert!(attached.is_some());
+}
+
+#[tokio::test]
+async fn attached_stream_closes_a_stalled_interaction_lane_for_durable_replay() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    tx.send(json!({"type": "text_delta", "content": "queued"}))
+        .await
+        .unwrap();
+    let mut attached = Some(tx);
+
+    tokio::time::timeout(
+        ATTACHED_INTERACTION_DELIVERY_GRACE + Duration::from_millis(100),
+        send_attached_stream_event(
+            &mut attached,
+            json!({"type": "user_prompt_required", "request_id": "question-1"}),
+            "run-1",
+        ),
+    )
+    .await
+    .expect("a stalled observer must not block the run indefinitely");
+
+    assert!(
+        attached.is_none(),
+        "the stale lane must close so a client can reconnect and replay durable truth"
+    );
 }
 
 struct StaticRunControlProvider {

@@ -4,6 +4,7 @@ import type {
   RuntimeTranscriptItemResponse,
   SessionAuditSummary,
 } from '@astra/sdk';
+import type { WorkSurfaceEvent } from '@/lib/work-surface';
 
 export type PlanTier = 'free' | 'pro' | 'team';
 export type Visibility = 'private' | 'team' | 'public';
@@ -176,20 +177,6 @@ export type ChatDetail = {
   workspaceSelectionExplicit?: boolean;
 };
 
-export type WorkSurfaceResponse = {
-  sessionId: string | null;
-  runId: string | null;
-  status?: string | null;
-  workspace?: Record<string, unknown> | null;
-  executor?: Record<string, unknown> | null;
-  transport?: string | null;
-  fallbackPolicy?: string | null;
-  tasks: Array<Record<string, unknown>>;
-  events: Array<Record<string, unknown>>;
-  generatedAt: string;
-  warnings?: string[];
-};
-
 export type WorkSurfaceRunResponse = {
   runId: string;
   sessionId: string | null;
@@ -198,7 +185,7 @@ export type WorkSurfaceRunResponse = {
   executor?: Record<string, unknown> | null;
   transport?: string | null;
   fallbackPolicy?: string | null;
-  events: Array<Record<string, unknown>>;
+  events: WorkSurfaceEvent[];
   transcript?: RuntimeTranscriptItemResponse[];
   transcriptComplete?: boolean;
   transcriptWarning?: string | null;

@@ -1,4 +1,5 @@
 import type {
+  StreamEvent,
   WorkspaceBinding,
   ExecutorBinding,
   ToolStatus,
@@ -15,6 +16,95 @@ import {
 
 const MAX_SURFACE_TOOLS = 40;
 const MAX_SURFACE_AGENTS = 60;
+
+const LIVE_WORK_SURFACE_EVENT_TYPES = [
+  "task_board_snapshot",
+  "run_started",
+  "run_input_queued",
+  "run_paused",
+  "run_waiting",
+  "run_blocked",
+  "run_resumed",
+  "run_error",
+  "run_interrupted",
+  "run_finished",
+  "workspace_bound",
+  "executor_bound",
+  "executor_status_changed",
+  "tool_call",
+  "tool_call_start",
+  "tool_transport_started",
+  "tool_routing_decision",
+  "tool_transport_completed",
+  "tool_transport_failed",
+  "tool_call_end",
+  "agent_delegated",
+  "agent_spawned",
+  "agent_live_event",
+  "agent_live_gap",
+  "agent_progress",
+  "agent_completed",
+  "agent_failed",
+  "agent_waiting",
+  "agent_cancelled",
+  "agent_interrupted",
+] as const;
+
+export type LiveWorkSurfaceEventType =
+  (typeof LIVE_WORK_SURFACE_EVENT_TYPES)[number];
+
+type LiveWorkSurfaceEvent = Extract<
+  StreamEvent,
+  { type: LiveWorkSurfaceEventType }
+>;
+
+export type BindingProjectionEvent = {
+  type: "binding_projection";
+  source: "durable_run_projection";
+  run_id?: string;
+  session_id?: string;
+  status?: string | null;
+  workspace?: WorkspaceBinding;
+  executor?: ExecutorBinding;
+  transport?: string;
+  fallback_policy?: string;
+};
+
+export type AgentProjectionEvent = {
+  type: "agent_projection";
+  source: "durable_run_tree";
+  agent_id: string;
+  run_id: string;
+  parent_run_id?: string;
+  description?: string;
+  status: string;
+  reason?: string;
+  error?: string;
+  total_tool_calls: number;
+  timestamp_epoch_ms: number;
+};
+
+export type WorkSurfaceEvent = (
+  | LiveWorkSurfaceEvent
+  | BindingProjectionEvent
+  | AgentProjectionEvent
+) &
+  Record<string, unknown>;
+
+const WORK_SURFACE_EVENT_TYPES = new Set<string>([
+  ...LIVE_WORK_SURFACE_EVENT_TYPES,
+  "binding_projection",
+  "agent_projection",
+]);
+
+export function parseWorkSurfaceEvent(value: unknown): WorkSurfaceEvent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const event = value as Record<string, unknown>;
+  return typeof event.type === "string" &&
+    WORK_SURFACE_EVENT_TYPES.has(event.type)
+    ? (event as WorkSurfaceEvent)
+    : null;
+}
 
 export type SessionSubtask = {
   id: string;
@@ -146,7 +236,7 @@ export type WorkSurfaceResponse = {
   transport?: string | null;
   fallbackPolicy?: string | null;
   tasks: SessionTask[];
-  events?: Record<string, unknown>[];
+  events?: unknown[];
   generatedAt?: string;
   warnings?: string[];
 };
@@ -249,8 +339,9 @@ export function hydrateWorkSurface(
     warnings: response.warnings ?? [],
     updatedAt: response.generatedAt ?? new Date().toISOString(),
   };
-  for (const event of response.events ?? []) {
-    next = applyWorkSurfaceEvent(next, event);
+  for (const rawEvent of response.events ?? []) {
+    const event = parseWorkSurfaceEvent(rawEvent);
+    if (event) next = applyWorkSurfaceEvent(next, event);
   }
   if (response.status && isTerminalRunStatus(response.status)) {
     next = applyRunFinished(next, {
@@ -265,7 +356,7 @@ export function hydrateWorkSurface(
 
 export function applyWorkSurfaceEvent(
   state: WorkSurfaceState,
-  event: Record<string, unknown>,
+  event: WorkSurfaceEvent,
 ): WorkSurfaceState {
   const type = typeof event.type === "string" ? event.type : "";
   if (type === "run_blocked") {
@@ -276,6 +367,8 @@ export function applyWorkSurfaceEvent(
       return applyTaskBoardSnapshot(state, event);
     case "run_started":
       return applyRunStarted(state, event);
+    case "binding_projection":
+      return applyBindingProjection(state, event);
     case "run_input_queued":
       return applyRunLifecycleStatus(state, event, "input-queued");
     case "run_paused":
@@ -316,10 +409,44 @@ export function applyWorkSurfaceEvent(
     case "agent_waiting":
     case "agent_cancelled":
     case "agent_interrupted":
+    case "agent_projection":
       return upsertAgent(state, event);
+    case "agent_live_gap":
+      return applyLiveProjectionGap(state, event);
     default:
       return state;
   }
+}
+
+function applyLiveProjectionGap(
+  state: WorkSurfaceState,
+  event: WorkSurfaceEvent,
+): WorkSurfaceState {
+  const dropped = numberField(event, "dropped_event_count") ?? 0;
+  const agentId = stringField(event, "agent_id") ?? "an agent";
+  const warning = `Live updates for ${agentId} were incomplete (${dropped} dropped); refreshing durable run state.`;
+  return {
+    ...state,
+    warnings: state.warnings.includes(warning)
+      ? state.warnings
+      : [...state.warnings, warning],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyBindingProjection(
+  state: WorkSurfaceState,
+  event: WorkSurfaceEvent,
+): WorkSurfaceState {
+  return {
+    ...state,
+    runId: stringField(event, "run_id") ?? state.runId,
+    sessionId: stringField(event, "session_id") ?? state.sessionId,
+    runStatus: stringField(event, "status") ?? state.runStatus,
+    workspace: workspaceBindingFromEvent(event) ?? state.workspace,
+    executor: executorBindingFromEvent(event) ?? state.executor,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function applyRunStarted(

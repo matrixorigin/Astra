@@ -9,9 +9,7 @@ use std::time::Duration;
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::cli::permission_manager::{PermissionMode, PermissionModeMirror};
-use crate::tui::status_line::{
-    BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine,
-};
+use crate::tui::status_line::{BackgroundTaskCounts, StatusContext, StatusLine};
 use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
 
 pub(crate) struct Footer {
@@ -39,7 +37,6 @@ pub(crate) struct Footer {
     /// visibility. Updated by the TUI event-loop tick. `None` keeps
     /// the chip hidden.
     pub bg_task_counts: Option<BackgroundTaskCounts>,
-    pub bg_fanout_summaries: Vec<BackgroundTaskFanoutSummary>,
     /// Lock-free mirror of the current permission mode. When set,
     /// `to_context()` reads the live mode from this mirror on every
     /// render instead of relying on the cached `permission_mode`
@@ -69,7 +66,6 @@ impl Footer {
             task_counts: None,
             task_board_expanded: false,
             bg_task_counts: None,
-            bg_fanout_summaries: Vec::new(),
             mode_mirror: None,
         }
     }
@@ -119,7 +115,6 @@ impl Footer {
             task_counts: self.task_counts,
             task_board_expanded: self.task_board_expanded,
             bg_task_counts: self.bg_task_counts,
-            bg_fanout_summaries: self.bg_fanout_summaries.clone(),
         }
     }
 

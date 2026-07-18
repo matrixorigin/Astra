@@ -41,6 +41,8 @@ export type StreamEventType =
   | "run_blocked"
   | "agent_delegated"
   | "agent_spawned"
+  | "agent_live_event"
+  | "agent_live_gap"
   | "agent_waiting"
   | "agent_progress"
   | "agent_completed"
@@ -204,7 +206,7 @@ export type ToolCallStartEvent = {
   type: "tool_call_start";
   tool: string;
   call_id: string;
-  arguments?: string;
+  arguments?: unknown;
 } & ExecutionBindingFields;
 
 export type ToolCallEvent = {
@@ -343,6 +345,44 @@ export type AgentProgressEvent = {
   total_completion_tokens?: number;
   total_tool_calls?: number;
   timestamp?: number;
+};
+
+export type AgentLiveEvent = {
+  type: "agent_live_event";
+  agent_id: string;
+  run_id?: string;
+  event_kind:
+    | "output_delta"
+    | "thinking_delta"
+    | "status"
+    | "signal"
+    | "tool_started"
+    | "tool_completed"
+    | "agent_terminated";
+  content?: string;
+  signal?: Record<string, unknown> | string;
+  name?: string;
+  description?: string;
+  tool_use_id?: string;
+  status?: string;
+  duration_ms?: number;
+  output_summary?: string | null;
+  output?: string | null;
+  termination?: "completed" | "delegated" | "failed" | "interrupted" | "cancelled";
+  reason?: string | null;
+  timestamp?: number;
+} & ExecutionBindingFields;
+
+/**
+ * A bounded live lane dropped one or more events. This is transport-integrity
+ * evidence, never agent output. Consumers repair from durable run truth.
+ */
+export type AgentLiveGapEvent = {
+  type: "agent_live_gap";
+  run_id: string;
+  agent_id: string;
+  dropped_event_count: number;
+  repair: "refresh_run_snapshot";
 };
 
 export type AgentCompletedEvent = {
@@ -598,6 +638,8 @@ export type StreamEvent = (
   | PlanStepDoneEvent
   | AgentDelegatedEvent
   | AgentSpawnedEvent
+  | AgentLiveEvent
+  | AgentLiveGapEvent
   | AgentWaitingEvent
   | AgentProgressEvent
   | AgentCompletedEvent

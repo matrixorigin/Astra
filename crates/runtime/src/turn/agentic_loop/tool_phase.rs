@@ -79,77 +79,10 @@ fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<Stri
     })
 }
 
-fn detached_background_task_id(
-    edge_tool_round: &[astra_turn_core::sse_stream_host::EdgeToolExecResult],
-    tool_results: &[Value],
-) -> Option<String> {
-    edge_tool_round
-        .iter()
-        .find_map(detached_background_task_id_from_edge_result)
-        .or_else(|| {
-            tool_results
-                .iter()
-                .find_map(detached_background_task_id_from_tool_result)
-        })
-}
-
-fn detached_background_task_id_from_edge_result(
+fn work_unit_observation(
     result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
-) -> Option<String> {
-    let fields = result.tool_result_fields.as_ref()?;
-    if fields.get("bash_detached").and_then(Value::as_bool) != Some(true) {
-        return None;
-    }
-    background_task_id_from_map(fields)
-}
-
-fn detached_background_task_id_from_tool_result(result: &Value) -> Option<String> {
-    let result = result.as_object()?;
-    let metadata = result.get("metadata").and_then(Value::as_object);
-    let detached = result.get("bash_detached").and_then(Value::as_bool) == Some(true)
-        || metadata.is_some_and(|metadata| {
-            metadata.get("bash_detached").and_then(Value::as_bool) == Some(true)
-        });
-    if !detached {
-        return None;
-    }
-    background_task_id_from_map(result).or_else(|| metadata.and_then(background_task_id_from_map))
-}
-
-fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<String> {
-    ["background_task_id", "task_id"]
-        .iter()
-        .find_map(|key| map.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn live_shell_background_task_observation_id(
-    result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
-) -> Option<String> {
-    let tool_name = astra_turn_core::tool_allowlist::normalize_tool_name(&result.tool)?;
-    if tool_name != "task_output" {
-        return None;
-    }
-    let observation = result
-        .tool_result_fields
-        .as_ref()?
-        .get("background_task_observation")?
-        .as_object()?;
-    let mode = observation.get("mode").and_then(Value::as_str)?;
-    if observation.get("task_kind").and_then(Value::as_str)? != "shell"
-        || observation.get("terminal").and_then(Value::as_bool) != Some(false)
-        || !matches!(mode, "current" | "wait" | "diagnostic")
-    {
-        return None;
-    }
-    observation
-        .get("task_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|task_id| !task_id.is_empty())
-        .map(ToString::to_string)
+) -> Option<astra_core::work_unit::WorkUnitObservation> {
+    astra_core::work_unit::WorkUnitObservation::from_fields(result.tool_result_fields.as_ref()?)
 }
 
 fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
@@ -1624,15 +1557,19 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
-    if let Some(task_id) = detached_background_task_id(&edge_tool_round, &new_tool_results) {
-        state.stall.same_turn_detached_task_ids.insert(task_id);
-    }
     for result in &edge_tool_round {
-        if let Some(task_id) = live_shell_background_task_observation_id(result) {
-            state
-                .stall
-                .observed_background_task_snapshots
-                .insert(task_id);
+        if let Some(observation) = work_unit_observation(result) {
+            let outcome = state.stall.work_unit_observations.observe(&observation);
+            tracing::debug!(
+                target: "astra::work_unit",
+                work_unit_id = %observation.id,
+                kind = %observation.kind,
+                status = ?observation.status,
+                version = %observation.version,
+                mode = ?observation.mode,
+                outcome = ?outcome,
+                "recorded producer-owned work-unit observation"
+            );
         }
     }
 
@@ -1717,47 +1654,33 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .record_tool_result(&edge_result.tool, &edge_result.output);
     }
 
-    // Preserve normal tool accounting and observability above, then close a
-    // repeated anti-poll violation at the runtime boundary. The detached task
-    // remains live; only this wasteful agentic turn is settled.
-    if state.stall.same_turn_detached_poll_attempts >= 2 {
-        let task_ids = state
+    // Bound unchanged live observations using the shared work-unit protocol.
+    // Historical pagination and diagnostics are excluded by the protocol;
+    // a producer version advance resets the counter for that work unit.
+    let unchanged_work_ids = state
+        .stall
+        .work_unit_observations
+        .repeatedly_unchanged_ids(2);
+    if !unchanged_work_ids.is_empty() {
+        let work_ids = unchanged_work_ids.join(", ");
+        let caller_owned_ids = state
             .stall
-            .same_turn_detached_task_ids
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        state.final_text = format!(
-            "Background task {task_ids} is still running. Its completion will be surfaced automatically; ask for progress in a later turn if needed."
-        );
+            .work_unit_observations
+            .repeatedly_unchanged_without_wake(2);
+        state.final_text = if caller_owned_ids.is_empty() {
+            format!(
+                "Work {work_ids} has not materially changed. No further live-status reads will run in this turn; the runtime owns its next meaningful update."
+            )
+        } else {
+            format!(
+                "Work {work_ids} has not materially changed. No further live-status reads will run in this turn. No automatic update is promised for {}; inspect it or request a fresh observation later.",
+                caller_owned_ids.join(", ")
+            )
+        };
         tracing::info!(
             target: "astra::loop_guard",
-            task_ids,
-            attempts = state.stall.same_turn_detached_poll_attempts,
-            "closing repeated same-turn background polling with a runtime acknowledgement"
-        );
-        state.step_recorder.end_turn(false);
-        finalize_and_render(host, state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
-    }
-
-    if state.stall.repeated_background_task_snapshot_attempts >= 2 {
-        let task_ids = state
-            .stall
-            .observed_background_task_snapshots
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        state.final_text = format!(
-            "Background task {task_ids} already has a current status snapshot in this turn. No further live-log polling will run; answer from the observed status and output."
-        );
-        tracing::info!(
-            target: "astra::loop_guard",
-            task_ids,
-            attempts = state.stall.repeated_background_task_snapshot_attempts,
-            "closing repeated background snapshot pagination with a runtime acknowledgement"
+            work_ids,
+            "closing repeated unchanged work-unit observations with a runtime acknowledgement"
         );
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
@@ -2189,33 +2112,34 @@ mod tests {
     }
 
     #[test]
-    fn detached_background_task_id_uses_structured_edge_fields() {
+    fn work_unit_observation_uses_the_shared_protocol_not_tool_names() {
+        let observation = astra_core::work_unit::WorkUnitObservation::new(
+            "work-1",
+            "future_background_capability",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            "revision-7",
+            astra_core::work_unit::WorkUnitObservationMode::Current,
+        )
+        .unwrap();
+        let mut fields = serde_json::Map::new();
+        observation.insert_into(&mut fields);
         let structured = astra_turn_core::sse_stream_host::EdgeToolExecResult {
             request_id: "req-1".into(),
-            tool: "bash".into(),
+            tool: "a_tool_that_did_not_exist_when_the_loop_was_written".into(),
             args: serde_json::json!({}),
-            output: "human-readable background notice".into(),
-            tool_result_fields: Some(serde_json::Map::from_iter([
-                ("bash_detached".into(), serde_json::json!(true)),
-                ("background_task_id".into(), serde_json::json!("bg-shell-1")),
-            ])),
+            output: "arbitrary human-readable notice".into(),
+            tool_result_fields: Some(fields),
             status: "completed".into(),
             duration_ms: 1,
         };
-        assert_eq!(
-            detached_background_task_id_from_edge_result(&structured).as_deref(),
-            Some("bg-shell-1")
-        );
+        assert_eq!(work_unit_observation(&structured), Some(observation));
 
         let text_only = astra_turn_core::sse_stream_host::EdgeToolExecResult {
             tool_result_fields: None,
-            output: "<bash_detached>bg-shell-1</bash_detached>".into(),
+            output: "work-1 is allegedly running".into(),
             ..structured
         };
-        assert_eq!(
-            detached_background_task_id_from_edge_result(&text_only),
-            None
-        );
+        assert_eq!(work_unit_observation(&text_only), None);
     }
 
     #[test]

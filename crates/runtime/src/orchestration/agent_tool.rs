@@ -16,6 +16,10 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 
+use astra_core::work_unit::{
+    WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus,
+    WorkUnitWakePolicy,
+};
 use astra_tools::agent_tool_contract::{
     AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
     has_malformed_tool_args,
@@ -1383,6 +1387,17 @@ async fn render_agent_fanout_results(
                 read_options.offset,
                 read_options.max_bytes,
             );
+            // The group envelope below is authoritative for fanout state.
+            // `agent.get_result` also attaches a full fanout summary to every
+            // child, which made a three-slot read repeat the same slot table
+            // three additional times. Besides wasting prompt budget, large
+            // terminal reads crossed the artifact threshold and forced the
+            // parent into several avoidable recovery turns. Preserve the
+            // child result itself and its result window, but carry group state
+            // exactly once.
+            if let Some(object) = value.as_object_mut() {
+                object.remove("fanout");
+            }
             let needs_recovery = agent_tool_result_needs_recovery(&value);
             let mut item = json!({
                 "slot_index": slot_index,
@@ -1457,6 +1472,33 @@ async fn render_agent_fanout_results(
         .count();
     let all_slots_delivered = summary.completed == summary.target_count;
     let incomplete_slot_count = summary.target_count.saturating_sub(summary.completed);
+    let has_failures = summary.failed > 0
+        || summary.interrupted > 0
+        || summary.spawn_rejected > 0
+        || summary.timed_out > 0
+        || summary.cancelled_by_user > 0
+        || summary.cancelled_by_parent_budget > 0;
+    let work_status = if summary.active > 0 {
+        WorkUnitStatus::Running
+    } else if has_failures {
+        WorkUnitStatus::CompletedWithIssues
+    } else {
+        WorkUnitStatus::Completed
+    };
+    let observation_mode = if read_options.slot_index.is_some() || read_options.offset > 0 {
+        WorkUnitObservationMode::Historical
+    } else {
+        WorkUnitObservationMode::Current
+    };
+    let work_observation = WorkUnitObservation::new(
+        group_id,
+        "agent_fanout",
+        work_status,
+        updated.revision.to_string(),
+        observation_mode,
+    )
+    .expect("fanout groups have non-empty identities and revisions")
+    .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
     let mut response = json!({
         "status": fanout_get_results_status_label(&updated),
         "group_id": group_id,
@@ -1499,6 +1541,10 @@ async fn render_agent_fanout_results(
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
+    obj.insert(
+        WORK_UNIT_OBSERVATION_FIELD.to_string(),
+        work_observation.to_value(),
+    );
     if incomplete_result_count > 0 {
         obj.insert("incomplete_results".into(), json!(incomplete_result_count));
         if let Some(recovery) = obj.get_mut("recovery").and_then(Value::as_object_mut) {
@@ -1512,12 +1558,6 @@ async fn render_agent_fanout_results(
     // Anti-respawn instruction: prevent LLM from spawning additional agents
     // to retry failed slots. The fanout group is a fixed-size contract;
     // retries inflate the group and corrupt accounting.
-    let has_failures = summary.failed > 0
-        || summary.interrupted > 0
-        || summary.spawn_rejected > 0
-        || summary.timed_out > 0
-        || summary.cancelled_by_user > 0
-        || summary.cancelled_by_parent_budget > 0;
     if summary.active > 0 {
         obj.insert(
             "instruction".into(),
@@ -1792,6 +1832,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "title": group.title,
         "parent_run_id": group.parent_run_id,
         "target_count": summary.target_count,
+        "revision": group.revision,
         "status": group.status.as_str(),
         "summary": group.summary_sentence(),
         "accepted": summary.accepted,
@@ -3680,6 +3721,59 @@ mod tests {
             ),
             "{result}"
         );
+        assert!(
+            slot["result"].get("fanout").is_none(),
+            "group accounting must appear once in the outer envelope, not once per slot: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_terminal_manifest_stays_directly_consumable() {
+        let output = "R".repeat(15_000);
+        let spawner = test_spawner(Arc::new(FixedOutputExecutor { output }));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-consumable",
+                "target_count": 3,
+                "slots": [
+                    {"id": "one", "description": "Review one", "prompt": "Review one"},
+                    {"id": "two", "description": "Review two", "prompt": "Review two"},
+                    {"id": "three", "description": "Review three", "prompt": "Review three"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let started: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(started["status"], "completed");
+
+        let rendered = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": "review-consumable"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["results"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            value[WORK_UNIT_OBSERVATION_FIELD]["wake_policy"],
+            "on_terminal"
+        );
+        assert!(
+            rendered.len() < 40_000,
+            "a routine three-agent terminal manifest must stay below tool artifact handoff size; got {} bytes",
+            rendered.len()
+        );
+        assert!(value["results"].as_array().unwrap().iter().all(|slot| {
+            slot["result"].get("fanout").is_none()
+                && slot["result_truncated"] == true
+                && slot["next_call"].is_string()
+        }));
     }
 
     #[tokio::test]

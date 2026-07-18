@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod identity;
+pub mod work_unit;
 
 pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]

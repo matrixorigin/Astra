@@ -176,16 +176,18 @@ describe('work surface reducer', () => {
     });
   });
 
-  it('rebuilds bindings from run_started projection events', () => {
+  it('rebuilds bindings from explicit durable projections without forging run_started', () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface('session-1'), {
       sessionId: 'session-1',
       runId: 'run-new',
       tasks: [],
       events: [
         {
-          type: 'run_started',
+          type: 'binding_projection',
+          source: 'durable_run_projection',
           run_id: 'run-new',
           session_id: 'session-1',
+          status: 'cancelled',
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
@@ -207,6 +209,7 @@ describe('work surface reducer', () => {
     });
 
     expect(state.runId).toBe('run-new');
+    expect(state.runStatus).toBe('cancelled');
     expect(state.workspace).toMatchObject({
       kind: 'edge_workspace',
       cwd: '/Users/xupeng/github/astra',
@@ -216,6 +219,29 @@ describe('work surface reducer', () => {
       executor_id: 'edge-macbook-1',
       transport: 'edge_ws',
     });
+  });
+
+  it('hydrates an agent projection as state rather than a fabricated lifecycle event', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'agent_projection',
+      source: 'durable_run_tree',
+      agent_id: 'reviewer',
+      run_id: 'child-1',
+      parent_run_id: 'root-1',
+      status: 'cancelled',
+      total_tool_calls: 4,
+      timestamp_epoch_ms: 1_800_000_000_000,
+    });
+
+    expect(state.agents).toEqual([
+      expect.objectContaining({
+        agentId: 'reviewer',
+        runId: 'child-1',
+        status: 'cancelled',
+        totalToolCalls: 4,
+      }),
+    ]);
+    expect(state.agents[0]?.events).toEqual([]);
   });
 
   it('tracks current-protocol tool calls through completion', () => {
@@ -1133,6 +1159,8 @@ describe('work surface reducer', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'agent_spawned',
       agent_id: 'agent-long-running',
+      run_id: 'agent-long-running-run',
+      parent_run_id: 'root-run',
       agent_type: 'code-review',
       description: 'long review',
       timestamp: 1_800_000_000_000,
@@ -1492,6 +1520,7 @@ describe('work surface reducer', () => {
     state = applyWorkSurfaceEvent(state, {
       type: 'agent_completed',
       agent_id: 'agent-1',
+      status: 'completed',
       result_summary: 'No blockers',
       total_tool_calls: 2,
     });
@@ -1741,7 +1770,9 @@ describe('work surface reducer', () => {
       type: 'agent_spawned',
       agent_id: 'agent-old',
       run_id: 'run-old',
+      parent_run_id: 'root-old',
       agent_type: 'reviewer',
+      description: 'Old review',
     });
 
     const hydrated = hydrateWorkSurface(state, {
@@ -1884,6 +1915,8 @@ describe('work surface reducer', () => {
       type: 'agent_spawned',
       agent_id: 'agent-live',
       run_id: 'child-run',
+      parent_run_id: 'root-run',
+      agent_type: 'reviewer',
       description: 'Review changes',
     });
     state = applyWorkSurfaceEvent(state, {
@@ -2003,5 +2036,20 @@ describe('work surface reducer', () => {
         executor_id: 'edge-macbook-1',
       },
     });
+  });
+
+  it('treats a live gap as repair evidence instead of fabricated agent output', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'agent_live_gap',
+      run_id: 'child-run-1',
+      agent_id: 'reviewer',
+      dropped_event_count: 7,
+      repair: 'refresh_run_snapshot',
+    });
+
+    expect(state.agents).toEqual([]);
+    expect(state.warnings).toEqual([
+      'Live updates for reviewer were incomplete (7 dropped); refreshing durable run state.',
+    ]);
   });
 });

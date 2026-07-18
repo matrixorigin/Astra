@@ -6,6 +6,9 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
 use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
@@ -4429,7 +4432,20 @@ impl ToolExecutor {
                 let output = render_bash_detached_marker(&task_id);
                 let mut tool_result_fields = serde_json::Map::new();
                 tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
-                tool_result_fields.insert("background_task_id".to_string(), Value::String(task_id));
+                tool_result_fields.insert(
+                    "background_task_id".to_string(),
+                    Value::String(task_id.clone()),
+                );
+                WorkUnitObservation::new(
+                    task_id,
+                    "shell",
+                    WorkUnitStatus::Running,
+                    "running:0",
+                    WorkUnitObservationMode::Transition,
+                )
+                .expect("detached shell task ids are non-empty")
+                .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+                .insert_into(&mut tool_result_fields);
                 Some(super::ToolExecutionOutcome {
                     output,
                     tool_result_fields: Some(tool_result_fields),
