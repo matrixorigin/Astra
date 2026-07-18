@@ -5353,25 +5353,42 @@ async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetit
     .await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r1"));
-    let status = post_tool_result(&app, "tc-analysis-r1", "src/lib.rs:12:// TODO", "success").await;
-    assert_eq!(status, StatusCode::OK);
+    // Drive every callback the runtime actually dispatches. Identical
+    // read-only calls may reuse the first result, so logical tool rounds and
+    // physical edge callbacks intentionally have different cardinalities.
+    let mut callback_request_ids = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("stream made no progress while awaiting a tool callback");
+        let Some(event) = event else { break };
+        if event.get("type").and_then(Value::as_str) != Some("tool_request") {
+            continue;
+        }
+        let request_id = event["request_id"]
+            .as_str()
+            .expect("tool_request.request_id")
+            .to_string();
+        let status = post_tool_result(&app, &request_id, "src/lib.rs:12:// TODO", "success").await;
+        assert_eq!(status, StatusCode::OK);
+        callback_request_ids.push(request_id);
+    }
 
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r2"));
-    let status = post_tool_result(&app, "tc-analysis-r2", "src/lib.rs:12:// TODO", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r3"));
-    let status = post_tool_result(&app, "tc-analysis-r3", "src/lib.rs:12:// TODO", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
         .expect("reader task failed");
+    assert_eq!(
+        callback_request_ids.first().map(String::as_str),
+        Some("tc-analysis-r1"),
+        "the first logical call must be dispatched before results can be reused"
+    );
+    assert!(
+        find_events(&events, "text_done")
+            .iter()
+            .any(|event| event["full_text"].as_str() == Some("Done reviewing.")),
+        "the repeated investigation should reach its final answer"
+    );
 
     let ow = observer_worker.clone();
     poll_until(
