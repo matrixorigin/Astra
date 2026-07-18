@@ -404,7 +404,6 @@ fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
 
 /// Normalize empty/whitespace-only tool output to a short marker.
 /// Prevents model confusion from truly empty tool results.
-/// Prevents model confusion from truly empty tool results.
 fn normalize_empty_output(output: String, tool_name: &str) -> String {
     if output.trim().is_empty() {
         format!("({tool_name} completed with no output)")

@@ -202,12 +202,6 @@ pub(crate) fn render_with(
         .render(inner, buf);
 }
 
-/// Backwards-compat alias — some callsites still use the older
-/// "scroll-only" signature.
-pub(crate) fn render_with_scroll(b: &ContextBreakdown, area: Rect, buf: &mut Buffer, scroll: u16) {
-    render_with(b, area, buf, scroll, ViewState::default())
-}
-
 /// Total logical line count of the breakdown at the given width
 /// and view state. The view wrapper uses this to clamp the scroll
 /// offset so the user can't scroll past the last line — when a
@@ -289,9 +283,7 @@ pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
 
 // ─── Line builder ─────────────────────────────────────────────────
 
-/// Convert the breakdown into a list of rendered lines — collapsed
-/// view, no focus highlight. Retained for stateless callers and
-/// legacy tests. Defers to [`build_lines_with`] under the hood.
+/// Convert the breakdown into a list of rendered lines with default view state.
 pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'static>> {
     build_layout_with(b, inner_width, ViewState::default()).lines
 }

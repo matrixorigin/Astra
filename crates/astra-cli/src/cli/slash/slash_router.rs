@@ -616,22 +616,31 @@ pub(crate) async fn handle_slash_command(
     Ok(false)
 }
 
-/// Fetch active model names from the API (for TUI inline selection).
-pub(crate) async fn fetch_model_list(
-    api: &astra_thin_client::ThinClient,
-    token: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let entries = fetch_model_list_raw(api, token).await?;
-    Ok(entries
-        .iter()
-        .filter_map(|m| {
-            let name = model_list_entry_name(m)?;
-            if !model_list_entry_is_active(m) {
-                return None;
-            }
-            Some(name.to_string())
-        })
-        .collect())
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelCatalogError {
+    #[error("not logged in")]
+    NotAuthenticated,
+    #[error(transparent)]
+    Request(#[from] astra_thin_client::ThinClientError),
+    #[error("invalid model catalog JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("model catalog response must be an array or an object with a `models` array")]
+    InvalidPayload,
+}
+
+impl ModelCatalogError {
+    pub(crate) fn is_authentication_failure(&self) -> bool {
+        matches!(self, Self::NotAuthenticated)
+            || matches!(
+                self,
+                Self::Request(astra_thin_client::ThinClientError::Api { status, .. })
+                    if *status == reqwest::StatusCode::UNAUTHORIZED
+            )
+    }
+
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        matches!(self, Self::Request(error) if error.is_transport())
+    }
 }
 
 /// Fetch the full JSON catalog (used when the caller needs
@@ -641,16 +650,15 @@ pub(crate) async fn fetch_model_list(
 pub(crate) async fn fetch_model_list_raw(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let tok = token.ok_or_else(|| "Not logged in".to_string())?;
-    let body = api.get_models_text(tok).await.map_err(|e| format!("{e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse model list response: {e}"))?;
+) -> Result<Vec<serde_json::Value>, ModelCatalogError> {
+    let tok = token.ok_or(ModelCatalogError::NotAuthenticated)?;
+    let body = api.get_models_text(tok).await?;
+    let value: serde_json::Value = serde_json::from_str(&body)?;
     let models = value
         .as_array()
         .cloned()
         .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
+        .ok_or(ModelCatalogError::InvalidPayload)?;
     Ok(models
         .into_iter()
         .filter(model_list_entry_is_active)
@@ -695,9 +703,31 @@ pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
 #[cfg(test)]
 mod model_list_json_tests {
     use super::{
-        entry_model_id, entry_model_is_active, entry_model_name, find_model_entry_by_name,
-        model_list_entry_is_active, model_list_entry_name, model_list_entry_thinking_capability,
+        ModelCatalogError, entry_model_id, entry_model_is_active, entry_model_name,
+        find_model_entry_by_name, model_list_entry_is_active, model_list_entry_name,
+        model_list_entry_thinking_capability,
     };
+
+    #[test]
+    fn model_catalog_auth_classification_uses_http_status_not_body_text() {
+        let unauthorized = ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "arbitrary provider response".into(),
+        });
+        assert!(unauthorized.is_authentication_failure());
+
+        let misleading_body = ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "request failed (401): not actually an auth response".into(),
+        });
+        assert!(!misleading_body.is_authentication_failure());
+    }
+
+    #[test]
+    fn missing_token_is_an_authentication_failure() {
+        assert!(ModelCatalogError::NotAuthenticated.is_authentication_failure());
+        assert!(!ModelCatalogError::InvalidPayload.is_authentication_failure());
+    }
 
     #[test]
     fn respects_is_active_false() {

@@ -187,6 +187,7 @@ dependencies = [
  "serial_test",
  "sha2",
  "shell-words",
+ "similar",
  "sqlx",
  "supports-color",
  "temp-env",

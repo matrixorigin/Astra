@@ -36,7 +36,6 @@ mod glyphs;
 mod history_cell;
 mod insert_history;
 mod keymap;
-mod layout;
 mod local_agent_journal;
 mod local_agent_snapshot;
 mod markdown;

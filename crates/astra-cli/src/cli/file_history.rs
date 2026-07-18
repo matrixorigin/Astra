@@ -9,6 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use similar::{ChangeTag, TextDiff};
+
 /// Maximum number of snapshots retained before evicting the oldest.
 const DEFAULT_MAX_SNAPSHOTS: usize = 100;
 
@@ -324,21 +326,33 @@ impl FileHistory {
         let mut stats = DiffStats::default();
 
         for backup in &snapshot.files {
-            let (backup_content, was_captured) = match &backup.state {
+            let backup_content = match &backup.state {
                 FileBackupState::Skipped { .. } => {
                     // We never captured this file's prior state — can't diff.
                     continue;
                 }
                 FileBackupState::Captured { backup_path } => {
-                    (fs::read_to_string(backup_path).ok(), true)
+                    Some(fs::read_to_string(backup_path).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("read checkpoint {}: {error}", backup_path.display()),
+                        )
+                    })?)
                 }
-                FileBackupState::AbsentBefore => (None, false),
+                FileBackupState::AbsentBefore => None,
             };
-            let _ = was_captured; // reserved for future: distinguish "empty pre" from "absent pre"
-            let current_content = if backup.original_path.exists() {
-                fs::read_to_string(&backup.original_path).ok()
-            } else {
-                None
+            let current_content = match fs::read_to_string(&backup.original_path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "read current file {}: {error}",
+                            backup.original_path.display()
+                        ),
+                    ));
+                }
             };
 
             match (&backup_content, &current_content) {
@@ -380,78 +394,18 @@ impl FileHistory {
     }
 }
 
-/// Compute a simple line-based diff: (insertions, deletions).
+/// Compute exact line-level insertion/deletion counts using the same edit-script
+/// semantics users expect from a source diff.
 fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Simple diff approximation: count lines present only in new (insertions)
-    // and lines present only in old (deletions).
     let mut insertions = 0;
     let mut deletions = 0;
-
-    // Use a basic LCS-approximation via matching.
-    let mut old_used = vec![false; old_lines.len()];
-    let mut new_used = vec![false; new_lines.len()];
-
-    // First pass: mark exact matches in order (greedy).
-    let mut oi = 0;
-    let mut ni = 0;
-    while oi < old_lines.len() && ni < new_lines.len() {
-        if old_lines[oi] == new_lines[ni] {
-            old_used[oi] = true;
-            new_used[ni] = true;
-            oi += 1;
-            ni += 1;
-        } else {
-            // Try to find old_lines[oi] in new_lines ahead.
-            let found_in_new = new_lines[ni..]
-                .iter()
-                .position(|l| *l == old_lines[oi])
-                .map(|p| p + ni);
-            let found_in_old = old_lines[oi..]
-                .iter()
-                .position(|l| *l == new_lines[ni])
-                .map(|p| p + oi);
-
-            match (found_in_new, found_in_old) {
-                (Some(npos), Some(opos)) => {
-                    // Pick the closer match.
-                    if (npos - ni) <= (opos - oi) {
-                        // Lines ni..npos are insertions.
-                        ni = npos;
-                    } else {
-                        // Lines oi..opos are deletions.
-                        oi = opos;
-                    }
-                }
-                (Some(npos), None) => {
-                    ni = npos;
-                }
-                (None, Some(opos)) => {
-                    oi = opos;
-                }
-                (None, None) => {
-                    oi += 1;
-                    ni += 1;
-                }
-            }
+    for change in TextDiff::from_lines(old, new).iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Insert => insertions += 1,
+            ChangeTag::Equal => {}
         }
     }
-
-    for (i, used) in old_used.iter().enumerate() {
-        if !*used {
-            // Check if this line appears in any unused new line (unmatched).
-            let _ = i; // suppress unused warning
-            deletions += 1;
-        }
-    }
-    for used in &new_used {
-        if !*used {
-            insertions += 1;
-        }
-    }
-
     (insertions, deletions)
 }
 
@@ -497,7 +451,7 @@ fn sanitize_path_for_backup(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_SNAPSHOTS, FileBackupState, FileHistory, MAX_CHECKPOINT_FILE_BYTES,
+        DEFAULT_MAX_SNAPSHOTS, DiffStats, FileBackupState, FileHistory, MAX_CHECKPOINT_FILE_BYTES,
         sanitize_path_for_backup,
     };
     use std::fs;
@@ -1042,8 +996,62 @@ mod tests {
         let stats = history.diff_since(snap_id).unwrap();
         assert_eq!(stats.files_changed, 1);
         // "line2" deleted, "modified" and "new_line" inserted.
-        assert!(stats.insertions > 0);
-        assert!(stats.deletions > 0);
+        assert_eq!(stats.insertions, 2);
+        assert_eq!(stats.deletions, 1);
+    }
+
+    #[test]
+    fn diff_stats_use_an_edit_script_for_repeated_lines() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let file_path = tmp.path().join("repeated.txt");
+        fs::write(&file_path, "anchor\nmoved\nanchor\n").unwrap();
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        fs::write(&file_path, "anchor\nanchor\nmoved\n").unwrap();
+
+        assert_eq!(
+            history.diff_since(snap_id).unwrap(),
+            DiffStats {
+                files_changed: 1,
+                insertions: 1,
+                deletions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn diff_since_surfaces_missing_checkpoint_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let file_path = tmp.path().join("tracked.txt");
+        fs::write(&file_path, "before\n").unwrap();
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+        let FileBackupState::Captured { backup_path } = &history.list_snapshots()[0].files[0].state
+        else {
+            panic!("small regular file must be captured");
+        };
+        fs::remove_file(backup_path).unwrap();
+
+        let error = history
+            .diff_since(snap_id)
+            .expect_err("missing durable checkpoint data must not look like an absent pre-state");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn diff_since_surfaces_unreadable_current_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let file_path = tmp.path().join("tracked.txt");
+        fs::write(&file_path, "before\n").unwrap();
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+        fs::remove_file(&file_path).unwrap();
+        fs::create_dir(&file_path).unwrap();
+
+        history
+            .diff_since(snap_id)
+            .expect_err("an unreadable current path must not be reported as a deletion");
     }
 
     #[test]

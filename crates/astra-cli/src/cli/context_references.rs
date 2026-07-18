@@ -1,7 +1,7 @@
 //! Inline context attachment system for the CLI.
 //!
 //! Users type `@file:src/main.rs`, `@file:path:10-20`, `@folder:src`, `@diff`,
-//! `@staged`, or `@url:https://...` in their message, and this module parses,
+//! or `@staged` in their message, and this module parses,
 //! validates, and expands those references into attached content.
 
 use std::path::{Path, PathBuf};
@@ -18,7 +18,6 @@ pub enum RefKind {
     Folder,
     Diff,
     Staged,
-    Url,
 }
 
 /// A parsed `@`-reference from the user message.
@@ -103,10 +102,6 @@ fn try_parse_at(chars: &[char], start: usize) -> Option<(ContextReference, usize
     if remaining.starts_with("staged") {
         return parse_keyword_ref(chars, start, "staged", RefKind::Staged);
     }
-    if remaining.starts_with("url:") {
-        return parse_url_ref(chars, start);
-    }
-
     None
 }
 
@@ -182,36 +177,6 @@ fn parse_keyword_ref(
             kind,
             raw,
             target: String::new(),
-            line_range: None,
-        },
-        end,
-    ))
-}
-
-/// Parse `@url:https://...` -- grab everything up to whitespace.
-fn parse_url_ref(chars: &[char], start: usize) -> Option<(ContextReference, usize)> {
-    let prefix_len = "@url:".len();
-    let url_start = start + prefix_len;
-    if url_start >= chars.len() {
-        return None;
-    }
-
-    let mut end = url_start;
-    while end < chars.len() && !chars[end].is_whitespace() {
-        end += 1;
-    }
-
-    let url: String = chars[url_start..end].iter().collect();
-    if url.is_empty() {
-        return None;
-    }
-
-    let raw: String = chars[start..end].iter().collect();
-    Some((
-        ContextReference {
-            kind: RefKind::Url,
-            raw,
-            target: url,
             line_range: None,
         },
         end,
@@ -464,7 +429,6 @@ fn expand_single(reference: &ContextReference, cwd: &Path) -> Result<String, Str
         RefKind::Folder => expand_folder(reference, cwd),
         RefKind::Diff => expand_diff(cwd),
         RefKind::Staged => expand_staged(cwd),
-        RefKind::Url => expand_url(reference),
     }
 }
 
@@ -588,14 +552,6 @@ fn expand_staged(cwd: &Path) -> Result<String, String> {
     run_git_command(cwd, &["diff", "--staged"])
 }
 
-/// Expand `@url:...` -- currently a TODO since reqwest-based fetch is on another branch.
-fn expand_url(reference: &ContextReference) -> Result<String, String> {
-    Err(format!(
-        "@url expansion not yet implemented (target: {})",
-        reference.target
-    ))
-}
-
 /// Run a git command and return its stdout.
 fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
@@ -707,7 +663,6 @@ fn reference_source_attr(reference: &ContextReference) -> String {
         RefKind::Folder => format!("{} (folder)", reference.target),
         RefKind::Diff => "git diff".to_string(),
         RefKind::Staged => "git diff --staged".to_string(),
-        RefKind::Url => reference.target.clone(),
     };
     raw.replace('"', "\\\"")
 }
@@ -728,7 +683,6 @@ fn format_label(reference: &ContextReference, tokens: usize) -> String {
         RefKind::Folder => format!("@folder:{} (~{} tokens)", reference.target, tokens),
         RefKind::Diff => format!("@diff (~{} tokens)", tokens),
         RefKind::Staged => format!("@staged (~{} tokens)", tokens),
-        RefKind::Url => format!("@url:{} (~{} tokens)", reference.target, tokens),
     }
 }
 
@@ -806,14 +760,6 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].kind, RefKind::Staged);
         assert_eq!(refs[0].raw, "@staged");
-    }
-
-    #[test]
-    fn test_parse_url_ref() {
-        let refs = parse_references("fetch @url:https://example.com/api/data");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].kind, RefKind::Url);
-        assert_eq!(refs[0].target, "https://example.com/api/data");
     }
 
     #[test]
@@ -1299,23 +1245,6 @@ mod tests {
         );
     }
 
-    // ===== URL expansion tests =====
-
-    #[tokio::test]
-    async fn test_expand_url_not_implemented() {
-        let dir = TempDir::new().unwrap();
-        let msg = "@url:https://example.com";
-        let result = expand_references(msg, dir.path(), 100_000).await;
-
-        assert_eq!(result.attachments.len(), 0);
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("not yet implemented"))
-        );
-    }
-
     // ===== Empty/invalid reference tests =====
 
     #[tokio::test]
@@ -1325,6 +1254,19 @@ mod tests {
         let result = expand_references(msg, dir.path(), 100_000).await;
 
         assert_eq!(result.message, "just a normal question");
+        assert!(result.attachments.is_empty());
+        assert!(result.warnings.is_empty());
+        assert!(!result.blocked);
+    }
+
+    #[tokio::test]
+    async fn url_like_text_is_not_a_hidden_attachment_protocol() {
+        let dir = TempDir::new().unwrap();
+        let message = "review @url:https://example.com/reference";
+
+        let result = expand_references(message, dir.path(), 100_000).await;
+
+        assert_eq!(result.message, message);
         assert!(result.attachments.is_empty());
         assert!(result.warnings.is_empty());
         assert!(!result.blocked);

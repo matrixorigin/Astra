@@ -2513,15 +2513,6 @@ pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
 /// the picker. The typed result lets the outer loop check the model's
 /// `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
-/// True when an error string represents an Astra session auth failure.
-/// Matches both session-specific error patterns (via `is_astra_session_auth_error`)
-/// and Astra's own HTTP 401 format (`"request failed (401): ..."`).
-/// Generic upstream `401 Unauthorized` text must NOT trigger `/login`.
-fn is_astra_auth_error(msg: &str) -> bool {
-    crate::cli::cli_config::cli_utils::is_astra_session_auth_error(msg)
-        || msg.contains("request failed (401)")
-}
-
 /// Whether a slash submission asks to browse the model catalog. Kept separate
 /// from direct model selection so the event loop can fetch the catalog without
 /// borrowing its UI state across a network wait.
@@ -2579,15 +2570,17 @@ pub(crate) fn push_model_picker(
     }
 }
 
-fn model_catalog_error_message(message: &str) -> String {
-    if is_astra_auth_error(message) {
+fn model_catalog_error_message(
+    error: &crate::cli::slash::slash_router::ModelCatalogError,
+) -> String {
+    if error.is_authentication_failure() {
         "Not authorized — try /login first".into()
-    } else if message.contains("connect") || message.contains("timeout") {
+    } else if error.is_transport_failure() {
         "Cannot reach server — check connection".into()
     } else {
         format!(
             "Failed to fetch models: {}",
-            message.lines().next().unwrap_or(message)
+            error.to_string().lines().next().unwrap_or("unknown error")
         )
     }
 }
@@ -2604,9 +2597,8 @@ pub(crate) async fn load_model_catalog(
     match crate::cli::slash::slash_router::fetch_model_list_raw(&api, token.as_deref()).await {
         Ok(models) => Ok(models),
         Err(error) => {
-            let message = error.to_string();
-            if !is_astra_auth_error(&message) {
-                return Err(model_catalog_error_message(&message));
+            if !error.is_authentication_failure() {
+                return Err(model_catalog_error_message(&error));
             }
 
             if crate::cli::session::session_runtime::attempt_token_refresh(&api, profile.as_deref())
@@ -2622,9 +2614,8 @@ pub(crate) async fn load_model_catalog(
                 {
                     Ok(models) => return Ok(models),
                     Err(retry_error) => {
-                        let retry_message = retry_error.to_string();
-                        if !is_astra_auth_error(&retry_message) {
-                            return Err(model_catalog_error_message(&retry_message));
+                        if !retry_error.is_authentication_failure() {
+                            return Err(model_catalog_error_message(&retry_error));
                         }
                     }
                 }
@@ -4077,6 +4068,121 @@ mod stats_view_tests {
 }
 
 #[cfg(test)]
+mod model_catalog_loading_tests {
+    use super::load_model_catalog;
+    use crate::cli::cli_config::cli_utils::{
+        CredentialsFile, Profile, load_credentials, save_credentials,
+    };
+    use crate::test_utils::ProcessEnvGuard;
+    use crate::tests::isolate_credentials;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn save_profile(access_token: &str, refresh_token: &str) {
+        let mut credentials = CredentialsFile {
+            current_profile: Some("default".into()),
+            ..Default::default()
+        };
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(access_token.into()),
+                refresh_token: Some(refresh_token.into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).expect("save isolated credentials");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_unauthorized_response_refreshes_and_retries_with_new_token() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("stale-access", "refresh-old");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer stale-access"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "refresh-new"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer fresh-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{
+                    "name": "gpt-5",
+                    "model_id": "provider-gpt-5",
+                    "is_active": true
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let models = load_model_catalog(api, None)
+            .await
+            .expect("refreshed catalog");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["model_id"], "provider-gpt-5");
+        let credentials = load_credentials();
+        let profile = credentials.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("refresh-new"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_invalid_payload_is_visible_without_auth_retry() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer valid-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = load_model_catalog(api, None)
+            .await
+            .expect_err("invalid catalog shape must fail visibly");
+
+        assert_eq!(
+            error,
+            "Failed to fetch models: model catalog response must be an array or an object with a `models` array"
+        );
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.access_token.as_deref()),
+            Some("valid-access")
+        );
+    }
+}
+
+#[cfg(test)]
 mod fmt_tokens_tests {
     use super::fmt_tokens;
 
@@ -4119,35 +4225,5 @@ mod session_hub_tests {
                 "degraded: workspace write failed · live session can continue; resume/fork metadata may be stale until the next successful save"
             )
         );
-    }
-}
-
-#[cfg(test)]
-mod auth_error_tests {
-    use super::is_astra_auth_error;
-
-    #[test]
-    fn matches_astra_session_auth_failures() {
-        let msg =
-            "request failed (401): invalid token\n  Hint: Authentication required — try /login";
-        assert!(is_astra_auth_error(msg));
-    }
-
-    #[test]
-    fn matches_bare_astra_401_without_known_body() {
-        // Astra API returns "request failed (401): <anything>" — must trigger /login
-        assert!(is_astra_auth_error(
-            "request failed (401): unexpected auth state"
-        ));
-    }
-
-    #[test]
-    fn matches_authentication_failed() {
-        assert!(is_astra_auth_error("Authentication failed"));
-    }
-
-    #[test]
-    fn ignores_generic_upstream_401s() {
-        assert!(!is_astra_auth_error("GitHub API Error: 401 Unauthorized"));
     }
 }
