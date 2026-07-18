@@ -1628,7 +1628,7 @@ impl InProcessChatTurnBridge {
         }
         let root_runtime_owns_turn_journal =
             bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
-        let _edge_callback_ledger = self.edge_callback_ledger.clone();
+        let edge_callback_ledger = self.edge_callback_ledger.clone();
 
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_for_stream: Option<Vec<Value>> =
@@ -4157,6 +4157,10 @@ impl InProcessChatTurnBridge {
                                     &turn_chain_id,
                                     request_id,
                                 );
+                            astra_turn_core::edge_ledger::expect_ledger_entry(
+                                &edge_callback_ledger,
+                                &astra_turn_core::edge_ledger::tool_callback_key(&identity),
+                            );
                             let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map, &identity);
                             yield render_sse_map(&req_event);
                         }

@@ -181,9 +181,9 @@ async fn matrixone_task_store_uses_owner_bound_counter_without_touching_foreign_
         counter_rows,
         vec![
             (other_user_id.clone(), 7, 3),
-            (owner_user_id.clone(), 102, 4),
+            (owner_user_id.clone(), 102, 3),
         ],
-        "owner writes must not overwrite the foreign counter row"
+        "owner writes must not overwrite the foreign counter row, and create is one atomic board mutation"
     );
 
     let owner_rows: i64 = sqlx::query_scalar(
@@ -259,7 +259,7 @@ async fn unknown_task_fields_are_rejected_through_matrixone_store() {
 
 #[tokio::test]
 #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-async fn matrixone_update_title_refuses_duplicate_open_task() {
+async fn matrixone_update_title_allows_duplicate_open_task_titles() {
     let pool = bootstrap_pool().await;
     let session_id = format!("s-dup-rename-{}", uuid::Uuid::new_v4());
     let user_id = format!("u-{}", session_id);
@@ -276,28 +276,30 @@ async fn matrixone_update_title_refuses_duplicate_open_task() {
     let second = mgr.create(&json!({"title": "Wire webhook"})).await;
     assert!(second.contains("\"success\":true"), "{second}");
 
-    let dup = mgr
+    let updated = mgr
         .update(&json!({
             "task_id": "task-2",
             "title": " implement oauth callback. "
         }))
         .await;
-    assert!(
-        dup.starts_with("Refused: open task #task-1") && dup.contains("\"success\":false"),
-        "MatrixOne-backed duplicate rename should be refused: {dup}"
-    );
+    let (_, updated_payload) = updated
+        .split_once('\n')
+        .expect("applied update should include a typed JSON payload");
+    let updated_payload: Value =
+        serde_json::from_str(updated_payload).expect("update payload should be valid JSON");
+    assert_eq!(updated_payload["success"], true, "{updated_payload}");
 
     let task_2: SessionTask =
         serde_json::from_str(&mgr.get(&json!({"task_id": "task-2"})).await).expect("task-2 json");
     assert_eq!(
-        task_2.title, "Wire webhook",
-        "refused MatrixOne rename must not mutate task-2"
+        task_2.title, " implement oauth callback. ",
+        "MatrixOne-backed title update must preserve the requested display text"
     );
     let list = mgr.list(&json!({"status_filter": "active"})).await;
     assert!(list.contains("\"count\":2"), "{list}");
     assert!(
-        list.contains("Implement OAuth callback") && list.contains("Wire webhook"),
-        "active list should retain the two distinct open task titles: {list}"
+        list.contains("Implement OAuth callback") && list.contains(" implement oauth callback. "),
+        "active list should retain both independently identified tasks: {list}"
     );
 
     cleanup(&pool, &session_id, &user_id).await;

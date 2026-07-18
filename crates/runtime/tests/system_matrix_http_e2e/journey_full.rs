@@ -779,7 +779,7 @@ pub async fn run_product_matrix_full_journey(
         "heartbeat must not return executable pending tool payloads"
     );
 
-    let (st_tool, tool_j) = post_json(
+    let (st_unexpected_tool, unexpected_tool) = post_json(
         app,
         "/tools/result",
         Some(auth_header),
@@ -796,8 +796,11 @@ pub async fn run_product_matrix_full_journey(
         }),
     )
     .await;
-    assert_eq!(st_tool, StatusCode::OK, "tools/result: {tool_j}");
-    assert_eq!(tool_j["ok"], true);
+    assert_eq!(
+        st_unexpected_tool,
+        StatusCode::NOT_FOUND,
+        "an authenticated edge must not submit a result for a request the server never emitted: {unexpected_tool}"
+    );
 
     let approval_run_id = format!("matrix-appr-run-{suffix}");
     seed_pending_approval(
