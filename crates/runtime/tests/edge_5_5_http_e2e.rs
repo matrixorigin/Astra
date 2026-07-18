@@ -8,7 +8,9 @@ use std::time::Duration;
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
-    turn::edge_ledger::{LEDGER_MAX_ENTRIES, take_ledger_entry, tool_callback_key},
+    turn::edge_ledger::{
+        LEDGER_MAX_ENTRIES, expect_ledger_entry, take_ledger_entry, tool_callback_key,
+    },
 };
 use astra_services::multi_agent::EdgeDispatchIdentity;
 use astra_services::runs::{
@@ -383,6 +385,7 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
     lifecycle.add_run("sess-tool", "run-tool");
     let (app, ledger) = e2e_app_with_lifecycle(lifecycle);
     let key = scoped_tool_key("sess-tool", "run-tool", "chain-tool", "tc-1");
+    expect_ledger_entry(&ledger, &key);
     let (st, j) = post_json(
         app.clone(),
         "/tools/result",
@@ -653,6 +656,7 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
         "chain-overflow",
         "tc-overflow",
     );
+    expect_ledger_entry(&ledger, &key);
     let (st, _) = post_json(
         app.clone(),
         "/tools/result",
