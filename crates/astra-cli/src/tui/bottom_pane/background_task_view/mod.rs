@@ -201,8 +201,8 @@ fn sort_rows_preserving_work_unit_order(
     let mut order = previous_order;
     for row in &initially_sorted {
         let key = work_unit_key(row);
-        if !order.contains_key(&key) {
-            order.insert(key, next_order);
+        if let std::collections::hash_map::Entry::Vacant(entry) = order.entry(key) {
+            entry.insert(next_order);
             next_order += 1;
         }
     }

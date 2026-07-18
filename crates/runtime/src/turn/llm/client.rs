@@ -1427,12 +1427,33 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
 ///
 /// Also strips top-level composition keywords (`allOf`/`oneOf`/`anyOf`)
 /// which Bedrock rejects with "input_schema does not support oneOf,
-/// allOf, or anyOf at the top level", and the `x-astra-per-action-required`
-/// vendor extension we use internally for per-action required hints
-/// (stripped defensively — providers should ignore `x-` keys, but
-/// some strict validators don't).
+/// allOf, or anyOf at the top level", plus all internal `x-astra-*`
+/// annotations. Providers should ignore vendor keys, but some strict
+/// validators reject them.
 fn strip_unsupported_schema_fields(value: &mut Value) {
+    strip_internal_schema_extensions(value);
     strip_unsupported_schema_fields_inner(value, /* is_top_level */ true);
+}
+
+/// Internal schema metadata belongs to Astra's discovery and validation
+/// layers, never to a provider wire contract. Strip the whole vendor prefix
+/// generically so adding a new internal annotation cannot break a strict
+/// provider or require another provider-specific exception.
+fn strip_internal_schema_extensions(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, _| !key.starts_with("x-astra-"));
+            for child in object.values_mut() {
+                strip_internal_schema_extensions(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_internal_schema_extensions(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Keys always stripped — Bedrock's strict validator rejects them
@@ -1470,9 +1491,6 @@ fn strip_unsupported_schema_fields_inner(value: &mut Value, is_top_level: bool) 
                 obj.remove(*key);
             }
         }
-        // Always strip our internal vendor extension at every level.
-        obj.remove(astra_turn_core::tool_schema_prune::PER_ACTION_REQUIRED_KEY);
-
         // Recurse into properties (nested = not top-level).
         if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
             for (_, prop_val) in props.iter_mut() {
@@ -1771,7 +1789,11 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 body["temperature"] = json!(temp);
             }
             if !tools.is_empty() {
-                body["tools"] = Value::Array(tools.to_vec());
+                let mut wire_tools = tools.to_vec();
+                for tool in &mut wire_tools {
+                    strip_internal_schema_extensions(tool);
+                }
+                body["tools"] = Value::Array(wire_tools);
                 body["tool_choice"] = Value::String("auto".to_string());
             }
             if provider_uses_dashscope_thinking(provider) {
@@ -10280,7 +10302,8 @@ mod tests {
                     ],
                     "oneOf": [{"required": ["description"]}],
                     "anyOf": [{"required": ["prompt"]}],
-                    "x-astra-per-action-required": {"spawn": ["description", "prompt"]}
+                    "x-astra-per-action-required": {"spawn": ["description", "prompt"]},
+                    "x-astra-discovery-summary": "spawn needs description+prompt"
                 }
             }
         })];
@@ -10293,6 +10316,7 @@ mod tests {
             schema.get("x-astra-per-action-required").is_none(),
             "internal vendor extension must not leak to the wire"
         );
+        assert!(schema.get("x-astra-discovery-summary").is_none());
         // Top-level required + properties + enum must survive.
         assert_eq!(schema["required"], json!(["action"]));
         assert!(schema["properties"]["action"].get("enum").is_some());
@@ -10315,7 +10339,8 @@ mod tests {
                     },
                     "required": ["action"],
                     "allOf": [{"required": ["description"]}],
-                    "x-astra-per-action-required": {"spawn": ["description"]}
+                    "x-astra-per-action-required": {"spawn": ["description"]},
+                    "x-astra-discovery-summary": "spawn needs description"
                 }
             }
         })];
@@ -10326,7 +10351,47 @@ mod tests {
             schema.get("x-astra-per-action-required").is_none(),
             "internal vendor extension must not leak to the wire"
         );
+        assert!(schema.get("x-astra-discovery-summary").is_none());
         assert_eq!(schema["required"], json!(["action"]));
+    }
+
+    #[test]
+    fn openai_tools_strip_internal_schema_extensions_before_send() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "future_work",
+                "description": "Future work",
+                "parameters": {
+                    "type": "object",
+                    "x-astra-discovery-summary": "start needs action",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "x-astra-private-hint": "internal"
+                        }
+                    }
+                }
+            }
+        })];
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "go"})],
+            &tools,
+            "test-model",
+            "openai",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(schema.get("x-astra-discovery-summary").is_none());
+        assert!(
+            schema["properties"]["action"]
+                .get("x-astra-private-hint")
+                .is_none()
+        );
+        assert_eq!(schema["properties"]["action"]["type"], "string");
     }
 
     // --- Regression: max_completion_tokens bump respects user's ceiling ---

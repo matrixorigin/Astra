@@ -727,7 +727,7 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
         .find(|seg| seg.text.contains("need input"))
         .expect("bg chip must render even when only stalled (the model needs to know)");
     assert_eq!(
-        chip.text, "2 need input",
+        chip.text, "2 need input · Shift+↓ manage",
         "stalled-only chip should be an attention state, not a vague background label"
     );
     assert_eq!(
@@ -754,7 +754,7 @@ fn bg_failed_only_chip_uses_error_attention() {
         .iter()
         .find(|seg| seg.text.contains("failed"))
         .expect("failed bg shell must stay visible as an attention state");
-    assert_eq!(chip.text, "1 shell failed");
+    assert_eq!(chip.text, "1 shell failed · Shift+↓ manage");
     assert_eq!(chip.style.fg, Some(current_theme().error));
 }
 

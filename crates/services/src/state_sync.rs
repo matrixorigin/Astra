@@ -900,20 +900,26 @@ impl StateSyncService for MatrixOneSyncService {
             applied_plans += 1;
         }
 
-        // Batch prefetch owners for every distinct plan_id referenced by the
-        // step_runs we might apply. One IN() query instead of N, and owners
-        // we just UPSERTed in this tx are already visible through the row
-        // cache. Include the plans we just applied so the owner lookup
-        // doesn't miss newly-inserted plans.
-        let mut run_plan_ids: std::collections::HashSet<&str> =
-            pack.step_runs.iter().map(|r| r.plan_id.as_str()).collect();
-        // Plans inserted earlier in the tx are visible to this SELECT (same
-        // connection, same transaction), so no special-casing needed — but
-        // we still read from the DB so step_runs referencing a completely
-        // fresh plan_id that only appears in this pack are resolved via the
-        // UPSERTed row.
-        let mut owners: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(run_plan_ids.len());
+        // Build the owner cache from two authoritative inputs:
+        //   1. user-owned plans validated and accepted above, and
+        //   2. one bulk read for referenced plans that were not in this pack.
+        //
+        // Do not rely on a SELECT observing every row just UPSERTed earlier in
+        // this transaction. MatrixOne can expose only a partial set of those
+        // distributed writes before commit; treating that transient read as
+        // ownership truth silently classified legitimate step runs as
+        // orphans. Successful UPSERT completion is already sufficient proof
+        // for the pack-owned rows.
+        let mut owners: std::collections::HashMap<String, String> = owned_plans
+            .iter()
+            .map(|plan| (plan.plan_id.clone(), user_id.to_string()))
+            .collect();
+        let mut run_plan_ids: std::collections::HashSet<&str> = pack
+            .step_runs
+            .iter()
+            .map(|run| run.plan_id.as_str())
+            .filter(|plan_id| !owners.contains_key(*plan_id))
+            .collect();
         if !run_plan_ids.is_empty() {
             let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "SELECT plan_id, user_id FROM plans WHERE user_id = ",

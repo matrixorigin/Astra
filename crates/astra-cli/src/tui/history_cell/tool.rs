@@ -942,7 +942,7 @@ fn non_empty_tool_text(value: Option<String>) -> Option<String> {
 fn failure_detail_fallback(name: &str, description: &str) -> String {
     let label = friendly_tool_display_name_for_context(name, description);
     if name == "agent_fanout" {
-        return "Fanout did not return a usable launch receipt.\nThe launch outcome is unconfirmed; Ctrl+G shows any observed agents.".into();
+        return "Fanout did not return a usable launch receipt.\nThe launch outcome is unconfirmed; Shift+↓ shows observed background work.".into();
     }
     let description = description.trim();
     if description.is_empty() {
@@ -1329,7 +1329,7 @@ mod tests {
             out.contains("Fanout did not return a usable launch receipt"),
             "{out}"
         );
-        assert!(out.contains("Ctrl+G"), "{out}");
+        assert!(out.contains("Shift+↓"), "{out}");
         assert!(!out.contains("agent_tool_reporting_error"), "{out}");
         assert!(!out.contains("failed before returning output"), "{out}");
     }

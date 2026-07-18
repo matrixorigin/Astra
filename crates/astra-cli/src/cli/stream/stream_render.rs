@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const AGENT_TOOL_OUTPUT_EVENT_LIMIT: usize = 50_000;
 const DEFAULT_TOOL_OUTPUT_EVENT_LIMIT: usize = 5_000;
+const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 
 pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
     args.get("action")
@@ -89,13 +89,37 @@ pub(crate) fn agent_id_from_output(output: &str) -> Option<String> {
         })
 }
 
-pub(crate) fn tool_output_event_text(tool: &str, output: &str) -> String {
-    let limit = if tool == "agent" {
-        AGENT_TOOL_OUTPUT_EVENT_LIMIT
-    } else {
-        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT
-    };
-    output.chars().take(limit).collect()
+pub(crate) fn tool_output_event_text(_tool: &str, output: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(output).ok();
+    let observation = parsed
+        .as_ref()
+        .and_then(|value| value.get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD))
+        .and_then(|value| {
+            serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value.clone()).ok()
+        })
+        .filter(astra_core::work_unit::WorkUnitObservation::is_valid);
+    if let (Some(parsed), Some(observation)) = (parsed.as_ref(), observation) {
+        if output.len() <= STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+            return output.to_string();
+        }
+        // Preserve lifecycle truth as valid JSON even when display payload is
+        // too large. Consumers can still settle the work unit and use the
+        // transcript/task surface for full output; they never have to parse a
+        // syntactically truncated JSON prefix.
+        return serde_json::json!({
+            "status": parsed.get("status").cloned().unwrap_or(Value::Null),
+            "agent_id": parsed.get("agent_id").cloned().unwrap_or(Value::Null),
+            "run_id": parsed.get("run_id").cloned().unwrap_or(Value::Null),
+            "work_unit_observation": observation,
+            "output_truncated": true,
+            "output_bytes": output.len(),
+        })
+        .to_string();
+    }
+    output
+        .chars()
+        .take(DEFAULT_TOOL_OUTPUT_EVENT_LIMIT)
+        .collect()
 }
 
 // CLI formatting utilities
@@ -6786,19 +6810,20 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 mod tests {
     use super::{
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
-        EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
-        EdgeToolExecResult, PostToolResultError, RenderPolicy, StreamRenderState, ToolBatchRequest,
-        ToolOutputSummary, ToolOutputSummaryKind, TurnResult, append_skill_loaded_marker,
-        apply_edge_auth_failure_result, approval_batch_group_key, approval_default_always_scope,
-        approval_memory_action, approval_memory_preview, approval_scope_context_for_tool,
-        approval_stale_revalidation_error, args_with_runtime_tool_call_id,
-        catch_tool_execution_panic, dispatch_turn_event_block, edge_tool_is_cacheable_read,
-        edge_tool_outcome_status, execute_with_metadata_responsive, extract_cli_diff_block,
-        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        reusable_speculative_output, sanitize_final_stream_text, style_tool_description,
-        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
-        theme, tool_completion_icon, tool_dedup_signature, turn_has_tool_work,
+        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry,
+        EdgeToolCacheValidation, EdgeToolExecResult, PostToolResultError, RenderPolicy,
+        StreamRenderState, ToolBatchRequest, ToolOutputSummary, ToolOutputSummaryKind, TurnResult,
+        append_skill_loaded_marker, apply_edge_auth_failure_result, approval_batch_group_key,
+        approval_default_always_scope, approval_memory_action, approval_memory_preview,
+        approval_scope_context_for_tool, approval_stale_revalidation_error,
+        args_with_runtime_tool_call_id, catch_tool_execution_panic, dispatch_turn_event_block,
+        edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
+        extract_cli_diff_block, format_terminal_tool_summary, format_tool_display_from_preview,
+        is_edge_auth_failure, merge_edge_tool_rounds, normalize_sandbox_denied_outcome,
+        path_mtime_ms, reusable_speculative_output, sanitize_final_stream_text,
+        style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
+        task_preview_from_args, theme, tool_completion_icon, tool_dedup_signature,
+        tool_output_event_text, turn_has_tool_work,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -6811,6 +6836,52 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn structured_work_output(payload_bytes: usize) -> String {
+        serde_json::json!({
+            "status": "completed",
+            "result": "x".repeat(payload_bytes),
+            "work_unit_observation": {
+                "id": "work-1",
+                "kind": "future_async_capability",
+                "status": "completed",
+                "version": "revision-2",
+                "mode": "transition",
+                "wake_policy": "none"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn structured_work_output_stays_parseable_without_tool_name_special_cases() {
+        let output = structured_work_output(6_000);
+        let event = tool_output_event_text("future_tool_unknown_to_cli", &output);
+
+        assert_eq!(event, output);
+        let parsed: Value = serde_json::from_str(&event).expect("event must remain valid JSON");
+        assert_eq!(parsed["work_unit_observation"]["status"], "completed");
+    }
+
+    #[test]
+    fn oversized_structured_work_output_preserves_lifecycle_envelope() {
+        let output = structured_work_output(70_000);
+        let event = tool_output_event_text("future_tool_unknown_to_cli", &output);
+        let parsed: Value = serde_json::from_str(&event).expect("event must remain valid JSON");
+
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["work_unit_observation"]["id"], "work-1");
+        assert_eq!(parsed["output_truncated"], true);
+        assert_eq!(parsed["output_bytes"], output.len());
+        assert!(event.len() < 1_000, "compact envelope was {event}");
+    }
+
+    #[test]
+    fn ordinary_display_output_remains_bounded() {
+        let output = "x".repeat(DEFAULT_TOOL_OUTPUT_EVENT_LIMIT + 100);
+        let event = tool_output_event_text("ordinary_tool", &output);
+        assert_eq!(event.len(), DEFAULT_TOOL_OUTPUT_EVENT_LIMIT);
+    }
 
     #[test]
     fn plan_decompose_defers_but_does_not_suppress_final_text() {

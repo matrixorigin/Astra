@@ -8,6 +8,19 @@ use super::tool_transport_metadata::{
     TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
 };
 
+fn parsed_work_unit_observation(parsed: Option<&Value>) -> Option<WorkUnitObservation> {
+    parsed?
+        .get(WORK_UNIT_OBSERVATION_FIELD)
+        .and_then(|value| serde_json::from_value::<WorkUnitObservation>(value.clone()).ok())
+        .filter(WorkUnitObservation::is_valid)
+}
+
+fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
+    if let Some(observation) = parsed_work_unit_observation(parsed) {
+        observation.insert_into(metadata);
+    }
+}
+
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed
@@ -38,12 +51,7 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
             Value::String(error_kind.to_string()),
         );
     }
-    if let Some(observation) = parsed
-        .as_ref()
-        .and_then(|value| value.get(WORK_UNIT_OBSERVATION_FIELD))
-        .and_then(|value| serde_json::from_value::<WorkUnitObservation>(value.clone()).ok())
-        .filter(WorkUnitObservation::is_valid)
-    {
+    if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
         let metadata = result.metadata.get_or_insert_with(Map::new);
         observation.insert_into(metadata);
     }
@@ -124,6 +132,7 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     {
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
+    insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     result.metadata = Some(metadata);
     result
 }
@@ -271,5 +280,35 @@ mod tests {
                 .and_then(WorkUnitObservation::from_fields)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn blocked_agent_result_preserves_work_observation_metadata() {
+        let result = agent_tool_result_from_output(
+            serde_json::json!({
+                "status": "waiting",
+                "agent_id": "future-agent-1",
+                "reason": "executor_offline",
+                "work_unit_observation": {
+                    "id": "future-agent-1",
+                    "kind": "future_capability",
+                    "status": "waiting_for_input",
+                    "version": "revision-10",
+                    "mode": "wait",
+                    "wake_policy": "on_attention_or_terminal"
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(result.is_error);
+        let observation = result
+            .metadata
+            .as_ref()
+            .and_then(WorkUnitObservation::from_fields)
+            .expect("specialized waiting metadata must retain the generic observation");
+        assert_eq!(observation.id, "future-agent-1");
+        assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
+        assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
     }
 }

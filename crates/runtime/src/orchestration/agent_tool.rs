@@ -55,6 +55,10 @@ const AGENT_RESULT_OBSERVE_GRACE: Duration = Duration::from_secs(1);
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
+/// A failed child admission must not turn one fanout slot into an unbounded
+/// aggregate result. The full error remains in runtime logs/transcript; the
+/// parent receives a bounded, UTF-8-safe explanation plus exact byte count.
+const MAX_FANOUT_SPAWN_ERROR_BYTES: usize = 4_096;
 const FANOUT_RESULT_DEFAULT_MAX_BYTES: usize = 8_192;
 const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
@@ -86,7 +90,42 @@ fn render_spawn_agent_output(
         "transcript_location".to_string(),
         Value::String(transcript_location.wire_value().to_string()),
     );
-    if object.get("status").and_then(Value::as_str) == Some("launched") {
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("failed")
+        .to_string();
+    if let (Some(agent_id), Some(run_id)) = (
+        object.get("agent_id").and_then(Value::as_str),
+        object.get("run_id").and_then(Value::as_str),
+    ) {
+        let work_status = match status.as_str() {
+            "launched" => WorkUnitStatus::Running,
+            "waiting" => WorkUnitStatus::WaitingForInput,
+            "completed" => WorkUnitStatus::Completed,
+            "interrupted" => WorkUnitStatus::Interrupted,
+            "cancelled" => WorkUnitStatus::Cancelled,
+            _ => WorkUnitStatus::Failed,
+        };
+        if let Some(observation) = WorkUnitObservation::new(
+            agent_id,
+            "agent",
+            work_status,
+            format!("{run_id}:{status}"),
+            WorkUnitObservationMode::Transition,
+        ) {
+            let observation = if work_status.is_terminal() {
+                observation
+            } else {
+                observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+            };
+            object.insert(
+                WORK_UNIT_OBSERVATION_FIELD.to_string(),
+                observation.to_value(),
+            );
+        }
+    }
+    if status == "launched" {
         object.insert(
             "lifecycle".to_string(),
             Value::String("running".to_string()),
@@ -143,6 +182,7 @@ fn render_agent_tool_contract_error(message: &str) -> String {
 
 #[derive(Default)]
 struct FanoutStartTerminalCauses {
+    spawn_rejected: usize,
     cancelled_by_user: usize,
     cancelled_by_parent_budget: usize,
     timed_out: usize,
@@ -157,6 +197,12 @@ impl FanoutStartTerminalCauses {
         for agent in agents {
             let status = agent.get("status").and_then(Value::as_str);
             let finish_reason = agent.get("finish_reason").and_then(Value::as_str);
+            let has_runtime_identity = ["agent_id", "run_id"].into_iter().any(|field| {
+                agent
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
             match status {
                 Some("cancelled") => {
                     if agent
@@ -180,6 +226,7 @@ impl FanoutStartTerminalCauses {
                     }
                     _ => causes.interrupted += 1,
                 },
+                Some("failed") if !has_runtime_identity => causes.spawn_rejected += 1,
                 Some("failed") => match finish_reason {
                     Some("executor_dropped") => causes.executor_dropped += 1,
                     Some(reason) if is_timeout_fanout_finish_reason(reason) => {
@@ -194,7 +241,8 @@ impl FanoutStartTerminalCauses {
     }
 
     fn has_stopped_slots(&self) -> bool {
-        self.cancelled_by_user
+        self.spawn_rejected
+            + self.cancelled_by_user
             + self.cancelled_by_parent_budget
             + self.timed_out
             + self.executor_dropped
@@ -205,6 +253,10 @@ impl FanoutStartTerminalCauses {
 
     fn insert_json_fields(&self, object: &mut serde_json::Map<String, Value>) {
         let mut causes = Vec::new();
+        if self.spawn_rejected > 0 {
+            object.insert("spawn_rejected".into(), json!(self.spawn_rejected));
+            causes.push("spawn_rejected");
+        }
         if self.cancelled_by_user > 0 {
             object.insert("cancelled_by_user".into(), json!(self.cancelled_by_user));
             causes.push("user_cancelled");
@@ -236,6 +288,39 @@ impl FanoutStartTerminalCauses {
             object.insert("interruption_causes".into(), json!(causes));
         }
     }
+}
+
+fn parsed_agent_output_or_bounded_error(rendered: String) -> Value {
+    let mut value = match serde_json::from_str::<Value>(&rendered) {
+        Ok(value) => value,
+        Err(_) => {
+            let bytes = rendered.len();
+            let bounded = truncate_str_at_char_boundary(&rendered, MAX_FANOUT_SPAWN_ERROR_BYTES);
+            return json!({
+                "status": "failed",
+                "error": bounded,
+                "error_bytes": bytes,
+                "error_truncated": bytes > bounded.len(),
+            });
+        }
+    };
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let Some(error) = object
+        .get("error")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return value;
+    };
+    if error.len() > MAX_FANOUT_SPAWN_ERROR_BYTES {
+        let bounded = truncate_str_at_char_boundary(&error, MAX_FANOUT_SPAWN_ERROR_BYTES);
+        object.insert("error".into(), Value::String(bounded.to_string()));
+        object.insert("error_bytes".into(), json!(error.len()));
+        object.insert("error_truncated".into(), Value::Bool(true));
+    }
+    value
 }
 
 fn is_parent_budget_fanout_finish_reason(reason: &str) -> bool {
@@ -1154,8 +1239,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             );
             Box::pin(async move {
                 let rendered = handle_agent_spawn_action(&spawn_args, Some(ctx)).await;
-                let rendered_value = serde_json::from_str::<Value>(&rendered)
-                    .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+                let rendered_value = parsed_agent_output_or_bounded_error(rendered);
                 json!({
                     "slot_index": slot_index,
                     "id": slot_id,
@@ -1164,6 +1248,9 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                     "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
                     "finish_reason": rendered_value.get("finish_reason").cloned().unwrap_or(Value::Null),
                     "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
+                    "error_bytes": rendered_value.get("error_bytes").cloned().unwrap_or(Value::Null),
+                    "error_truncated": rendered_value.get("error_truncated").cloned().unwrap_or(Value::Null),
+                    "error_kind": rendered_value.get("error_kind").cloned().unwrap_or(Value::Null),
                     "transcript_location": rendered_value.get("transcript_location").cloned().unwrap_or(Value::Null),
                 })
             })
@@ -1378,8 +1465,7 @@ async fn render_agent_fanout_results(
         }
         futs.push(Box::pin(async move {
             let rendered = handle_agent_get_result_action_inner(&get_args, Some(ctx), false).await;
-            let mut value = serde_json::from_str::<Value>(&rendered)
-                .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
+            let mut value = parsed_agent_output_or_bounded_error(rendered);
             let window = window_fanout_agent_result(
                 &mut value,
                 &group_id,
@@ -2301,6 +2387,66 @@ mod tests {
     use crate::server::delegation::engine::DelegationTracker;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn direct_agent_output_publishes_the_generic_work_contract() {
+        let rendered = render_spawn_agent_output(
+            SpawnAgentOutput::launched("reviewer-1", "run-1", "review runtime"),
+            AgentTranscriptLocation::DurableServer,
+        );
+        let parsed: Value = serde_json::from_str(&rendered).expect("spawn output is JSON");
+        let observation: WorkUnitObservation =
+            serde_json::from_value(parsed[WORK_UNIT_OBSERVATION_FIELD].clone())
+                .expect("spawn output carries a typed work observation");
+
+        assert_eq!(observation.id, "reviewer-1");
+        assert_eq!(observation.kind, "agent");
+        assert_eq!(observation.status, WorkUnitStatus::Running);
+        assert_eq!(observation.mode, WorkUnitObservationMode::Transition);
+        assert_eq!(observation.wake_policy, WorkUnitWakePolicy::OnTerminal);
+    }
+
+    #[test]
+    fn malformed_and_structured_spawn_errors_are_bounded_utf8_safe_json() {
+        let raw = format!("{{not-json \"{}", "错".repeat(3_000));
+        let raw_bytes = raw.len();
+        let parsed = parsed_agent_output_or_bounded_error(raw);
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(parsed["error_bytes"], raw_bytes);
+        assert_eq!(parsed["error_truncated"], true);
+        assert!(parsed["error"].as_str().unwrap().len() <= MAX_FANOUT_SPAWN_ERROR_BYTES);
+        serde_json::to_string(&parsed).expect("bounded error envelope must remain valid JSON");
+
+        let structured = parsed_agent_output_or_bounded_error(
+            json!({"status": "failed", "error": "x".repeat(10_000)}).to_string(),
+        );
+        assert_eq!(structured["error_bytes"], 10_000);
+        assert_eq!(structured["error_truncated"], true);
+        assert_eq!(structured["error"].as_str().unwrap().len(), 4_096);
+    }
+
+    #[test]
+    fn fanout_terminal_causes_distinguish_admission_rejection_from_child_failure() {
+        let causes = FanoutStartTerminalCauses::from_agents(&[
+            json!({"status": "failed", "error": "admission rejected"}),
+            json!({
+                "status": "failed",
+                "agent_id": "reviewer-1",
+                "run_id": "run-1",
+                "finish_reason": "model_error"
+            }),
+        ]);
+        assert_eq!(causes.spawn_rejected, 1);
+        assert_eq!(causes.failed, 1);
+        let mut fields = serde_json::Map::new();
+        causes.insert_json_fields(&mut fields);
+        assert_eq!(fields["spawn_rejected"], 1);
+        assert_eq!(fields["failed"], 1);
+        assert_eq!(
+            fields["interruption_causes"],
+            json!(["spawn_rejected", "failed"])
+        );
+    }
 
     #[tokio::test]
     async fn spawn_invalid_input_fails_before_context_lookup() {

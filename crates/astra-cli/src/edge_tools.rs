@@ -6953,7 +6953,7 @@ mod tests {
             .with_spawn_context(ctx)
             .with_bg_task_commands(commands);
 
-        let started = executor
+        let completed = executor
             .execute(
                 "agent_fanout",
                 &serde_json::json!({
@@ -6968,9 +6968,12 @@ mod tests {
                 }),
             )
             .await;
-        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "started", "{started}");
-        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
+        let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(completed_value["status"], "completed", "{completed}");
+        assert_eq!(
+            completed_value["fanout"]["status"], "finished",
+            "{completed}"
+        );
 
         let result = executor
             .task_output(&serde_json::json!({
@@ -7014,9 +7017,14 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
 
-        assert_eq!(parsed["status"], "launched", "{result}");
-        assert_eq!(parsed["lifecycle"], "running", "{result}");
-        assert_eq!(parsed["delivery"], "asynchronous", "{result}");
+        assert_eq!(parsed["status"], "completed", "{result}");
+        assert_eq!(parsed["result"], "child result", "{result}");
+        assert!(
+            parsed["run_id"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty()),
+            "{result}"
+        );
         assert!(
             parsed["agent_id"]
                 .as_str()
@@ -7035,7 +7043,7 @@ mod tests {
         let ctx = fanout_test_context(spawner);
         let executor = test_executor().with_spawn_context(ctx);
 
-        let started = executor
+        let completed = executor
             .execute(
                 "agent_fanout",
                 &serde_json::json!({
@@ -7050,9 +7058,12 @@ mod tests {
                 }),
             )
             .await;
-        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "started", "{started}");
-        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
+        let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(completed_value["status"], "completed", "{completed}");
+        assert_eq!(
+            completed_value["fanout"]["status"], "finished",
+            "{completed}"
+        );
 
         let result = executor.task_list_bg().await;
 

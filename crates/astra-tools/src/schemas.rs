@@ -877,6 +877,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
+                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: action+steps. send_message: action+to+message.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {"type": "array", "description": "REQUIRED for action='run_chain'. Sequence of chain steps to execute."},
@@ -918,6 +919,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
+                    "x-astra-discovery-summary": "start: action+target_count+exactly target_count slots; each slot needs description+prompt. Shared config goes in defaults; no brief/agents/background. Results use group_id.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results and stop_slot."},

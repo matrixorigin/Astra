@@ -9050,4 +9050,60 @@ mod tests {
             vec!["first-start", "first-end", "second"]
         );
     }
+
+    #[tokio::test]
+    async fn cancelled_persist_releases_the_next_session_write() {
+        use std::pin::Pin;
+
+        #[derive(Default)]
+        struct AbortableTracker {
+            handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        }
+
+        impl crate::matrix_cloud_runtime::BridgePersistTracker for AbortableTracker {
+            fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+                self.handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(tokio::spawn(task));
+            }
+        }
+
+        let tails: BridgePersistTails = Arc::new(Mutex::new(HashMap::new()));
+        let tracker = Arc::new(AbortableTracker::default());
+        let (first_started, first_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (second_started, second_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        track_ordered_bridge_persist(
+            &tails,
+            Some(tracker.clone()),
+            "session-cancel".into(),
+            async move {
+                let _ = first_started.send(());
+                std::future::pending::<()>().await;
+            },
+        );
+        first_started_rx.await.expect("first persist must start");
+        let first_handle = tracker
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .expect("tracker owns the first persist");
+
+        track_ordered_bridge_persist(
+            &tails,
+            Some(tracker.clone()),
+            "session-cancel".into(),
+            async move {
+                let _ = second_started.send(());
+            },
+        );
+        first_handle.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_started_rx)
+            .await
+            .expect("cancelling the predecessor must release its fence")
+            .expect("successor persist must run");
+    }
 }

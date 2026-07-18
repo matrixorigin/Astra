@@ -83,8 +83,9 @@ pub(crate) struct MultiAgentEntry {
 /// cancellation is an intent, not an alarm — surfacing it as a separate
 /// bucket avoids confusing a user-requested stop with an agent failure.
 ///
-/// Hint advertises both `Ctrl+G` (open monitor) and `X` (stop from
-/// inside the monitor) so the affordance is discoverable.
+/// The one visible management hint is shared with the status line and opens
+/// the canonical background-work surface. Individual rows belong there, not
+/// in a second list that competes with the conversation.
 pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     let total = cells.len();
     let uncertain = cells
@@ -185,16 +186,18 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
         format!(" · {}", breakdown.join(" · "))
     };
 
+    let noun = if total == 1 { "agent" } else { "agents" };
     format!(
-        "{} {total} parallel agents{breakdown} · Ctrl+G manage",
+        "{} {total} {noun}{breakdown} · {}",
         crate::tui::glyphs::current().agent_fanout,
+        crate::tui::background_shortcut::background_task_open_hint(),
     )
 }
 
 /// The workbench keeps this one-line activity strip visible above a focused
 /// root or agent transcript. It is intentionally a navigation/status cue,
-/// not a second agent list: `Ctrl+G` remains the place to inspect and control
-/// individual runs.
+/// not a second agent list: the background-work surface remains the place to
+/// inspect and control individual runs.
 fn workspace_agent_activity_line(cells: &[MultiAgentEntry], width: u16) -> Line<'static> {
     let text = truncate_label(&multi_agent_strip_header(cells), width as usize);
     Line::from(Span::styled(
@@ -809,23 +812,20 @@ pub(crate) fn do_draw(
         }
     };
 
-    // Multi-agent strip: one compact gradient-gutter frame containing a header and one short row
-    // per live agent. Renders as e.g.:
+    // Multi-agent strip: one compact aggregate line. Renders as e.g.:
     //
-    //   █ ▶ 3 parallel agents · 1 live · 1 failed · 1 done · Ctrl+G manage
-    //   █ ◦ review_tui      · 2 tools · 1 child · 12s
-    //   █ ✗ review_fixes    · 8s
-    //   █ ✓ review_refactor · 4 tools · 18s
+    //   █ ▶ 3 agents · 1 live · 1 failed · 1 done · Shift+↓ manage
     //
-    // (status: ◦ live / ✓ completed / ✗ failed)
+    // Per-agent detail is available on the background-work surface. Keeping a
+    // second independently updating list here caused visual jumps and forced
+    // users to reconcile two apparent task boards.
     let multi_agent_renderable: Option<RenderableItem<'_>> = multi_agent.map(|cells| {
         let theme = crate::tui::theme::current();
         // Split live / failed / done so a 3-agent strip with one
         // failure is visible at a glance — without this the user only
         // sees "▶ 3 parallel agents" while one is silently dead.
-        // The strip advertises the key that actually works from the chat
-        // surface. Stop controls are shown after Ctrl+G opens Workbench;
-        // claiming `X stop` here would conflict with ordinary text input.
+        // The strip advertises the same key as the footer. Controls are shown
+        // only after opening the task surface.
         let header_line = Line::from(ratatui::text::Span::styled(
             multi_agent_strip_header(&cells),
             ratatui::style::Style::default()
@@ -833,83 +833,10 @@ pub(crate) fn do_draw(
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
 
-        // Width budget for the label — leave room for status icon (2),
-        // Leave room for activity counts and elapsed time.
-        // (~6) ≈ 24 chars of overhead.
-        let total_overhead = 24;
-        let label_budget = (width as usize).saturating_sub(2 + total_overhead).max(10);
-
-        let dim = ratatui::style::Style::default().fg(theme.dim);
-        let glyphs = crate::tui::glyphs::current();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(cells.len() + 1);
-        lines.push(header_line);
-        for entry in cells {
-            let (icon, icon_color) = match entry.state.confidence {
-                AgentProjectionConfidence::Unconfirmed => (glyphs.agent_unconfirmed, theme.dim),
-                AgentProjectionConfidence::Stale => (glyphs.agent_stale, theme.warn),
-                AgentProjectionConfidence::Observed | AgentProjectionConfidence::Confirmed => {
-                    match entry.state.status {
-                        AgentRunStatus::Starting
-                        | AgentRunStatus::Running
-                        | AgentRunStatus::Pausing
-                        | AgentRunStatus::Resuming => (glyphs.agent_running, theme.warn),
-                        AgentRunStatus::Waiting | AgentRunStatus::Paused => {
-                            (glyphs.agent_waiting, theme.warn)
-                        }
-                        AgentRunStatus::Cancelling => (glyphs.agent_cancelling, theme.warn),
-                        AgentRunStatus::Completed | AgentRunStatus::Delegated => {
-                            (glyphs.agent_completed, theme.success)
-                        }
-                        AgentRunStatus::Interrupted => (glyphs.agent_interrupted, theme.warn),
-                        AgentRunStatus::Failed => (glyphs.agent_failed, theme.error),
-                        AgentRunStatus::Cancelled => (glyphs.agent_cancelled, theme.dim),
-                    }
-                }
-            };
-            let label = truncate_label(&entry.label, label_budget);
-            let trailing = match entry.state.confidence {
-                AgentProjectionConfidence::Unconfirmed => " · Status unconfirmed",
-                AgentProjectionConfidence::Stale => " · Stale",
-                AgentProjectionConfidence::Observed | AgentProjectionConfidence::Confirmed => {
-                    match entry.state.status {
-                        AgentRunStatus::Starting => " · Starting…",
-                        AgentRunStatus::Waiting => " · Waiting",
-                        AgentRunStatus::Paused => " · Paused",
-                        AgentRunStatus::Pausing => " · Pausing…",
-                        AgentRunStatus::Resuming => " · Resuming…",
-                        AgentRunStatus::Cancelling => " · Cancelling…",
-                        AgentRunStatus::Interrupted => " · Interrupted",
-                        AgentRunStatus::Cancelled => " · Cancelled",
-                        AgentRunStatus::Delegated => " · Delegated",
-                        AgentRunStatus::Running
-                        | AgentRunStatus::Completed
-                        | AgentRunStatus::Failed => "",
-                    }
-                }
-            };
-            let activity = compact_agent_activity(entry.activity);
-            let suffix = if activity.is_empty() {
-                format!(" · {}{}", format_short_elapsed(entry.elapsed_ms), trailing)
-            } else {
-                format!(
-                    " · {activity} · {}{}",
-                    format_short_elapsed(entry.elapsed_ms),
-                    trailing,
-                )
-            };
-            let row = Line::from(vec![
-                ratatui::text::Span::styled(
-                    icon.to_string(),
-                    ratatui::style::Style::default().fg(icon_color),
-                ),
-                ratatui::text::Span::raw(" "),
-                ratatui::text::Span::raw(label),
-                ratatui::text::Span::styled(suffix, dim),
-            ]);
-            lines.push(row);
-        }
-
-        let framed = LiveFramedCell { lines, live: true };
+        let framed = LiveFramedCell {
+            lines: vec![header_line],
+            live: true,
+        };
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
@@ -1062,60 +989,6 @@ fn set_char(
     let cell = &mut buf[(x, y)];
     cell.set_char(ch);
     cell.set_style(ratatui::style::Style::default().fg(fg));
-}
-
-/// Compact "12s" / "1m30s" / "850ms" — used by the multi-agent strip
-/// rows so each agent's elapsed time fits in ~6 chars.
-pub(crate) fn format_short_elapsed(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{}s", ms / 1_000)
-    } else {
-        let mins = ms / 60_000;
-        let secs = (ms % 60_000) / 1_000;
-        if secs == 0 {
-            format!("{mins}m")
-        } else {
-            format!("{mins}m{secs}s")
-        }
-    }
-}
-
-fn compact_agent_activity(
-    activity: crate::tui::agent_run_projection::AgentActivityCounts,
-) -> String {
-    let mut parts = Vec::new();
-    if activity.tool_calls > 0 {
-        parts.push(format!(
-            "{} tool{}",
-            activity.tool_calls,
-            if activity.tool_calls == 1 { "" } else { "s" }
-        ));
-    }
-    if activity.child_agents > 0 {
-        let qualifier = if activity.child_agents_partial {
-            "≥"
-        } else {
-            ""
-        };
-        parts.push(format!(
-            "{qualifier}{} child{}",
-            activity.child_agents,
-            if activity.child_agents == 1 {
-                ""
-            } else {
-                "ren"
-            }
-        ));
-    }
-    if activity.messages_sent > 0 || activity.messages_received > 0 {
-        parts.push(format!(
-            "↑{} ↓{}",
-            activity.messages_sent, activity.messages_received
-        ));
-    }
-    parts.join(" · ")
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1887,13 +1760,11 @@ mod task_board_draw_tests {
 
 #[cfg(test)]
 mod multi_agent_strip_tests {
-    //! Each row fits in one line and surfaces label, typed activity, and
-    //! elapsed time, plus a status icon that distinguishes live
-    //! agents from completed ones.
+    //! The chat surface owns one stable aggregate line. Per-agent activity and
+    //! controls live on the background-work surface.
     use super::{
-        LiveFramedCell, MultiAgentEntry, compact_agent_activity, format_short_elapsed,
-        multi_agent_strip_header, render_primary_workspace, should_show_multi_agent_strip,
-        truncate_label, workspace_agent_activity_line,
+        LiveFramedCell, MultiAgentEntry, multi_agent_strip_header, render_primary_workspace,
+        should_show_multi_agent_strip, truncate_label, workspace_agent_activity_line,
     };
     use crate::tui::agent_run_projection::{AgentRunState, AgentRunStatus};
 
@@ -1942,11 +1813,11 @@ mod multi_agent_strip_tests {
     fn header_only_shows_total_when_all_live() {
         let cells = vec![entry(true, false), entry(true, false)];
         let header = multi_agent_strip_header(&cells);
-        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 agents"));
         assert!(header.contains("2 live"));
         assert!(!header.contains("failed"));
         assert!(!header.contains("done"));
-        assert!(header.contains("Ctrl+G manage"));
+        assert!(header.contains("Shift+↓ manage"));
         assert!(!header.contains("X stop"));
     }
 
@@ -1957,7 +1828,7 @@ mod multi_agent_strip_tests {
         // failures so the user catches them at a glance.
         let cells = vec![entry(true, false), entry(false, true), entry(false, false)];
         let header = multi_agent_strip_header(&cells);
-        assert!(header.contains("3 parallel agents"));
+        assert!(header.contains("3 agents"));
         assert!(header.contains("1 live"));
         assert!(header.contains("1 failed"));
         assert!(header.contains("1 done"));
@@ -1967,7 +1838,7 @@ mod multi_agent_strip_tests {
     fn header_skips_zero_buckets() {
         let cells = vec![entry(false, false), entry(false, false)];
         let header = multi_agent_strip_header(&cells);
-        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 agents"));
         assert!(header.contains("2 done"));
         assert!(!header.contains("0 live"));
         assert!(!header.contains("0 failed"));
@@ -2062,7 +1933,7 @@ mod multi_agent_strip_tests {
     fn header_routes_management_through_the_workbench() {
         let cells = vec![entry(true, false)];
         let header = multi_agent_strip_header(&cells);
-        assert!(header.contains("Ctrl+G manage"), "{header}");
+        assert!(header.contains("Shift+↓ manage"), "{header}");
         assert!(!header.contains("X stop"), "{header}");
     }
 
@@ -2075,9 +1946,9 @@ mod multi_agent_strip_tests {
             .map(|span| span.content.as_ref())
             .collect();
 
-        assert!(text.contains("1 parallel agent"), "{text}");
+        assert!(text.contains("1 agent"), "{text}");
         assert!(text.contains("1 live"), "{text}");
-        assert!(text.contains("Ctrl+G manage"), "{text}");
+        assert!(text.contains("Shift+↓ manage"), "{text}");
     }
 
     #[test]
@@ -2099,8 +1970,8 @@ mod multi_agent_strip_tests {
         render_primary_workspace(area, &mut buffer, &mut pane, Some(&activity));
         let text = buffer_to_string(&buffer);
 
-        assert!(text.contains("1 parallel agent"), "{text}");
-        assert!(text.contains("Ctrl+G manage"), "{text}");
+        assert!(text.contains("1 agent"), "{text}");
+        assert!(text.contains("Shift+↓ manage"), "{text}");
         assert!(text.contains("Main conversation · Transcript"), "{text}");
     }
 
@@ -2254,53 +2125,6 @@ mod multi_agent_strip_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn elapsed_under_a_second_renders_in_milliseconds() {
-        assert_eq!(format_short_elapsed(0), "0ms");
-        assert_eq!(format_short_elapsed(150), "150ms");
-        assert_eq!(format_short_elapsed(999), "999ms");
-    }
-
-    #[test]
-    fn elapsed_seconds_render_compact_no_decimals() {
-        // Sub-minute durations stay compact because the strip row has limited width.
-        assert_eq!(format_short_elapsed(1_000), "1s");
-        assert_eq!(format_short_elapsed(12_500), "12s");
-        assert_eq!(format_short_elapsed(59_999), "59s");
-    }
-
-    #[test]
-    fn elapsed_minutes_drop_zero_seconds() {
-        assert_eq!(format_short_elapsed(60_000), "1m");
-        assert_eq!(format_short_elapsed(90_000), "1m30s");
-        assert_eq!(format_short_elapsed(120_000), "2m");
-        assert_eq!(format_short_elapsed(125_000), "2m5s");
-    }
-
-    #[test]
-    fn activity_copy_distinguishes_tools_children_and_partial_counts() {
-        assert_eq!(
-            compact_agent_activity(crate::tui::agent_run_projection::AgentActivityCounts {
-                tool_calls: 3,
-                child_agents: 1,
-                messages_sent: 2,
-                messages_received: 1,
-                child_agents_partial: false,
-            }),
-            "3 tools · 1 child · ↑2 ↓1"
-        );
-        assert_eq!(
-            compact_agent_activity(crate::tui::agent_run_projection::AgentActivityCounts {
-                tool_calls: 0,
-                child_agents: 4,
-                messages_sent: 0,
-                messages_received: 0,
-                child_agents_partial: true,
-            }),
-            "≥4 children"
-        );
     }
 
     /// Labels MUST be char-aware so a CJK label survives truncation

@@ -95,10 +95,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         continue;
                     };
                     let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                    let desc = func
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let desc = discovery_description(func);
                     let (compact_desc, desc_truncated) =
                         compact_description(desc, SELECT_DESCRIPTION_MAX_CHARS);
                     let mut entry = json!({
@@ -166,10 +163,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             let tool = valid_schemas[idx];
             let func = tool.get("function").unwrap_or(tool);
             let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-            let desc = func
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let desc = discovery_description(func);
             let (short_desc, was_truncated) =
                 compact_description(desc, KEYWORD_DESCRIPTION_MAX_CHARS);
             json!({
@@ -216,6 +210,21 @@ fn compact_description(description: &str, max_chars: usize) -> (String, bool) {
     } else {
         (description.to_string(), false)
     }
+}
+
+/// Return producer-owned discovery metadata when a schema supplies it.
+///
+/// Tool descriptions optimize for full invocation guidance and may be much
+/// longer than a deferred/search surface can safely retain. A generic schema
+/// extension lets every producer publish a compact, load-bearing summary
+/// without consumers guessing which clauses matter from prose or tool names.
+fn discovery_description(function: &Value) -> &str {
+    function
+        .get("parameters")
+        .and_then(|parameters| parameters.get("x-astra-discovery-summary"))
+        .and_then(Value::as_str)
+        .or_else(|| function.get("description").and_then(Value::as_str))
+        .unwrap_or("")
 }
 
 fn tool_search_error(message: &str) -> Value {
@@ -383,6 +392,7 @@ fn strip_schema_descriptions(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("description");
+            map.retain(|key, _| !key.starts_with("x-astra-"));
             for (key, child) in map {
                 if is_schema_map_key(key) {
                     strip_schema_map_descriptions(child);
@@ -882,6 +892,42 @@ mod tests {
     }
 
     #[test]
+    fn discovery_summary_is_producer_owned_and_does_not_leak_into_parameters() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "future_work",
+                "description": "A deliberately long consumer-opaque description that should not determine which invocation constraints survive compact discovery metadata.",
+                "parameters": {
+                    "type": "object",
+                    "x-astra-discovery-summary": "start needs action+scope; observe needs work_id",
+                    "properties": {"action": {"type": "string"}}
+                }
+            }
+        })];
+
+        let keyword = tool_search(&schemas, &json!({"query": "future_work"}));
+        let keyword: Value = serde_json::from_str(&keyword).unwrap();
+        assert_eq!(
+            keyword["matches"][0]["description"],
+            "start needs action+scope; observe needs work_id"
+        );
+
+        let selected = tool_search(&schemas, &json!({"query": "select:future_work"}));
+        let selected: Value = serde_json::from_str(&selected).unwrap();
+        assert_eq!(
+            selected["matches"][0]["description"],
+            "start needs action+scope; observe needs work_id"
+        );
+        assert!(
+            selected["matches"][0]["parameters"]
+                .get("x-astra-discovery-summary")
+                .is_none(),
+            "internal discovery metadata must not become model-callable schema"
+        );
+    }
+
+    #[test]
     fn select_vs_keyword_description() {
         // select and keyword stay compact; full prose arrives through the
         // selected tool schema in the next tools[] request.
@@ -942,7 +988,7 @@ mod tests {
         assert!(
             desc.contains("description+prompt")
                 && desc.contains("agent_id")
-                && desc.contains("asynchronous")
+                && desc.contains("foreground")
                 && desc.contains("run_chain"),
             "keyword summary must keep agent action constraints: {desc}"
         );

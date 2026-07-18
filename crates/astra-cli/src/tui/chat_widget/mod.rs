@@ -3649,7 +3649,7 @@ impl ChatWidget {
             Some(count) => (
                 "uncertain".to_string(),
                 Some(format!(
-                    "Observed {count} new agent run{} while the launch receipt was unavailable · Ctrl+G opens each conversation.",
+                    "Observed {count} new agent run{} while the launch receipt was unavailable · Shift+↓ opens background work.",
                     if count == 1 { "" } else { "s" }
                 )),
                 None,
@@ -6751,6 +6751,105 @@ mod tests {
                 .agent_run_cell("reviewer@one")
                 .map(|cell| cell.description.as_str()),
             Some("Correctness boundary review")
+        );
+    }
+
+    #[test]
+    fn large_terminal_fanout_receipt_settles_every_child_before_turn_end() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "review from three angles".into(),
+            tool_use_id: "fanout-terminal-large".into(),
+            parent_tool_use_id: None,
+        }));
+        let slots = (0..3)
+            .map(|slot| {
+                serde_json::json!({
+                    "slot_index": slot,
+                    "id": format!("review-{slot}"),
+                    "requested_description": format!("Review boundary {slot}"),
+                    "agent_id": format!("reviewer@{slot}"),
+                    "run_id": format!("run-review-{slot}"),
+                    "status": "completed",
+                    "transcript_location": "durable_server"
+                })
+            })
+            .collect::<Vec<_>>();
+        let launched_slots = slots
+            .iter()
+            .cloned()
+            .map(|mut slot| {
+                slot["status"] = serde_json::json!("launched");
+                slot
+            })
+            .collect::<Vec<_>>();
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "started",
+                "group_id": "review-large-terminal",
+                "title": "three-angle review",
+                "target_count": 3,
+                "transcript_location": "durable_server",
+                "fanout": {
+                    "parent_run_id": "root-run",
+                    "slots": launched_slots
+                }
+            })
+            .to_string(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let raw = serde_json::json!({
+            "status": "completed",
+            "group_id": "review-large-terminal",
+            "title": "three-angle review",
+            "target_count": 3,
+            "transcript_location": "durable_server",
+            "fanout": {
+                "parent_run_id": "root-run",
+                "slots": slots
+            },
+            "results": "x".repeat(6_000),
+            "work_unit_observation": {
+                "id": "review-large-terminal",
+                "kind": "agent_fanout",
+                "status": "completed",
+                "version": "terminal-3",
+                "mode": "transition",
+                "wake_policy": "none"
+            }
+        })
+        .to_string();
+        assert!(
+            raw.len() > 5_000,
+            "regression requires the old truncation boundary"
+        );
+        let event_output =
+            crate::cli::stream::stream_render::tool_output_event_text("agent_fanout", &raw);
+        serde_json::from_str::<serde_json::Value>(&event_output)
+            .expect("the CLI/UI boundary must preserve valid terminal JSON");
+
+        widget.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "review from three angles".into(),
+            status: "completed".into(),
+            duration_ms: 34_000,
+            output_summary: None,
+            output: Some(event_output),
+            tool_use_id: "fanout-terminal-large".into(),
+            parent_tool_use_id: None,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let rows = widget.agent_monitor_snapshot(3);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().all(|row| {
+                row.state.status == AgentRunStatus::Completed
+                    && row.state.confidence == AgentProjectionConfidence::Observed
+                    && row.elapsed_ms > 0
+            }),
+            "terminal children must not degrade to new 0ms unconfirmed placeholders"
         );
     }
 
