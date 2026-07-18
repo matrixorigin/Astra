@@ -163,9 +163,22 @@ fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersi
         // `llm_response` event below.
         _ => return None,
     };
+    // Tool-only model rounds intentionally have no user-visible assistant
+    // text. Persist their typed tool events, but do not materialize a blank
+    // transcript row on every bridge continuation.
+    if role == "assistant"
+        && event.content.trim().is_empty()
+        && event
+            .reasoning_content
+            .as_deref()
+            .is_none_or(|reasoning| reasoning.trim().is_empty())
+    {
+        return None;
+    }
     let payload = event
         .reasoning_content
         .as_ref()
+        .filter(|reasoning| !reasoning.trim().is_empty())
         .map(|reasoning| TranscriptPersistPayload {
             reasoning: Some(reasoning.clone()),
             reasoning_status: Some("completed".to_string()),
@@ -796,6 +809,21 @@ mod tests {
             bridge_transcript_item(&response).expect("runtime reply transcript item");
         assert_eq!(response_item.role, "assistant");
         assert_eq!(response_item.content, "reconciled result");
+    }
+
+    #[test]
+    fn bridge_transcript_projection_skips_blank_tool_only_model_rounds() {
+        let response = core_event(
+            "response-event",
+            "user-1",
+            "session-1",
+            "chain-1",
+            "llm_response",
+            "  ",
+            Some("user-event"),
+        );
+
+        assert!(bridge_transcript_item(&response).is_none());
     }
 
     fn core_event(

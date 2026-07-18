@@ -1688,6 +1688,18 @@ impl RunEngine {
             .await
     }
 
+    pub async fn list_active_session_runs_cursor(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<astra_services::runs::DurableRunListPage, String> {
+        self.store
+            .list_active_session_runs_cursor(user_id, session_id, limit, cursor)
+            .await
+    }
+
     pub async fn load_session_agent_recovery(
         &self,
         user_id: &str,

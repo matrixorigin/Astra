@@ -101,16 +101,6 @@ impl BackgroundTaskStatus {
         matches!(self, Self::Running | Self::WaitingForInput)
     }
 
-    pub(crate) fn attention_rank(self) -> u8 {
-        match self {
-            Self::WaitingForInput | Self::Interrupted | Self::Failed => 0,
-            Self::Running | Self::Pending => 1,
-            Self::Stopping | Self::Killed => 2,
-            Self::Completed => 3,
-            Self::Unavailable => 4,
-        }
-    }
-
     pub(crate) fn empty_output_state(self) -> &'static str {
         match self {
             Self::Pending => "Pending · no output yet",
@@ -321,7 +311,40 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn sort_rows(mut rows: Vec<BackgroundTaskRow>) -> Vec<BackgroundTaskRow> {
-    rows.sort_by_key(|row| (row.status.attention_rank(), row.elapsed_ms));
+    // The view is refreshed on every TUI tick. Status and elapsed time are
+    // mutable, so including either in this key makes rows jump while the user
+    // is reading or navigating the list. Fanout slots additionally need one
+    // shared anchor so that independently-started children remain contiguous.
+    let mut fanout_started_at = std::collections::HashMap::<String, u64>::new();
+    for row in &rows {
+        let (Some(fanout), Some(started_at_ms)) = (row.fanout.as_ref(), row.started_at_ms) else {
+            continue;
+        };
+        fanout_started_at
+            .entry(fanout.group_id.clone())
+            .and_modify(|current| *current = (*current).min(started_at_ms))
+            .or_insert(started_at_ms);
+    }
+    rows.sort_by_key(|row| {
+        if let Some(fanout) = row.fanout.as_ref() {
+            (
+                fanout_started_at
+                    .get(&fanout.group_id)
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                format!("fanout:{}", fanout.group_id),
+                fanout.slot_index,
+                row.id.clone(),
+            )
+        } else {
+            (
+                row.started_at_ms.unwrap_or(u64::MAX),
+                format!("task:{}", row.id),
+                0,
+                row.id.clone(),
+            )
+        }
+    });
     rows
 }
 

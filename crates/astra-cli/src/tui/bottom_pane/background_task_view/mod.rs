@@ -368,18 +368,59 @@ mod tests {
     }
 
     #[test]
-    fn list_orders_attention_rows_before_running_and_done() {
+    fn list_order_is_stable_across_status_and_elapsed_refreshes() {
         let view = BackgroundTaskView::new(vec![
-            row("done", "completed", "done task"),
-            row("run", "running", "running task"),
-            row("wait", "waiting_for_input", "waiting task"),
-            row("fail", "failed", "failed task"),
+            row("third", "completed", "third task").with_timing(Some(300), Some(350)),
+            row("first", "running", "first task").with_timing(Some(100), None),
+            row("second", "waiting_for_input", "second task").with_timing(Some(200), None),
         ]);
 
-        assert_eq!(view.rows[0].id, "wait");
-        assert_eq!(view.rows[1].id, "fail");
-        assert_eq!(view.rows[2].id, "run");
-        assert_eq!(view.rows[3].id, "done");
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+
+        let refreshed = sort_rows(vec![
+            row("third", "failed", "third task").with_timing(Some(300), Some(350)),
+            BackgroundTaskRow::shell("first", "completed", 99_000, "first task", None, None, None)
+                .with_timing(Some(100), Some(400)),
+            BackgroundTaskRow::shell("second", "running", 1, "second task", None, None, None)
+                .with_timing(Some(200), None),
+        ]);
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn list_keeps_fanout_slots_contiguous_and_in_slot_order() {
+        let view = BackgroundTaskView::new(vec![
+            row("slot-3", "failed", "third")
+                .with_timing(Some(300), Some(350))
+                .with_fanout(fanout("review-1", 3, 2)),
+            row("unrelated", "running", "unrelated").with_timing(Some(150), None),
+            row("slot-1", "completed", "first")
+                .with_timing(Some(100), Some(180))
+                .with_fanout(fanout("review-1", 3, 0)),
+            row("slot-2", "running", "second")
+                .with_timing(Some(200), None)
+                .with_fanout(fanout("review-1", 3, 1)),
+        ]);
+
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slot-1", "slot-2", "slot-3", "unrelated"]
+        );
     }
 
     #[test]

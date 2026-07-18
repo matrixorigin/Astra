@@ -71,9 +71,78 @@ fn server_service_catalog_is_disabled_only_for_agent_binding_mode() {
     );
 }
 
+#[test]
+fn attached_stream_event_detaches_instead_of_backpressuring_the_run() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut attached = Some(tx);
+
+    try_send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1");
+    assert!(attached.is_some());
+    try_send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1");
+
+    assert!(
+        attached.is_none(),
+        "a full observer queue must detach instead of stalling durable fanout"
+    );
+    assert_eq!(rx.try_recv().unwrap(), json!({"seq": 1}));
+}
+
+#[test]
+fn attached_stream_event_detaches_after_disconnect() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+    let mut attached = Some(tx);
+
+    try_send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1");
+
+    assert!(attached.is_none());
+}
+
 struct StaticRunControlProvider {
     status: Option<RunControlStatus>,
     calls: AtomicUsize,
+}
+
+struct HangingRunControlProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::turn::run_control::RunStatusProvider for HangingRunControlProvider {
+    async fn control_status(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<RunControlStatus>, String> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl UserIntentProvider for HangingRunControlProvider {
+    async fn poll_user_intents(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        after_event_index: usize,
+    ) -> crate::turn::run_control::UserIntentPoll {
+        crate::turn::run_control::UserIntentPoll {
+            next_cursor: after_event_index,
+            inputs: Vec::new(),
+            issues: Vec::new(),
+            error: None,
+        }
+    }
+
+    async fn mark_user_intents_applied(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _event_indices: &[usize],
+    ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
+    }
 }
 
 impl StaticRunControlProvider {
@@ -2683,6 +2752,93 @@ async fn durable_descendant_cancellation_sweep_converges_nested_active_runs() {
         assert!(run.events.iter().any(|event| {
             event["event_type"] == "run_finished" && event["data"]["ancestor_run_id"] == "root"
         }));
+    }
+}
+
+#[tokio::test]
+async fn durable_descendant_cancellation_pages_past_500_descendants_and_unrelated_runs() {
+    let service = test_service();
+    let engine = service.run_engine.clone();
+    engine
+        .start_run("other-root", "user-1", "session-wide")
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .persist_delegation_outcome_status(
+                "user-1",
+                "other-root",
+                STATUS_COMPLETED,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    );
+    engine
+        .start_run("root-wide", "user-1", "session-wide")
+        .await
+        .unwrap();
+
+    for index in 0..505 {
+        engine
+            .start_run_ext(
+                &format!("child-{index:03}"),
+                "user-1",
+                "session-wide",
+                Some("root-wide"),
+                None,
+                Some("reviewer"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // Insert newer, unrelated active runs so descendants are not guaranteed
+    // to occupy the first bounded page.
+    for index in 0..205 {
+        engine
+            .start_run_ext(
+                &format!("unrelated-{index:03}"),
+                "user-1",
+                "session-wide",
+                Some("other-root"),
+                None,
+                Some("unrelated-worker"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        AgenticRunLifecycleService::cancel_durable_run_descendants(
+            &engine,
+            "user-1",
+            "session-wide",
+            "root-wide",
+            "ancestor cancelled",
+        )
+        .await
+        .unwrap(),
+        505
+    );
+
+    for index in 0..505 {
+        let run = engine
+            .load_run("user-1", &format!("child-{index:03}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+    }
+    for index in 0..205 {
+        let run = engine
+            .load_run("user-1", &format!("unrelated-{index:03}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_RUNNING);
     }
 }
 
@@ -7207,6 +7363,42 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
     assert!(
         !cancel_token.is_cancelled(),
         "pause must not abort in-flight work"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() {
+    let provider = Arc::new(HangingRunControlProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let run_control: Arc<dyn RunControlProvider> = provider.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    let cancel_token = Arc::new(CancellationToken::new());
+
+    let _watcher = start_active_run_control_watcher(
+        Some(run_control),
+        "user-1".to_string(),
+        "run-1".to_string(),
+        cancel_flag,
+        pause_flag,
+        cancel_token,
+    )
+    .expect("watcher");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert_eq!(provider.calls.load(Ordering::Acquire), 1);
+
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        provider.calls.load(Ordering::Acquire),
+        2,
+        "a hung durable provider must not permanently stop control polling"
     );
 }
 

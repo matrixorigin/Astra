@@ -144,6 +144,39 @@ const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 
+/// Best-effort delivery to the currently attached SSE observer. A slow or
+/// disconnected observer must never backpressure the durable run fanout: the
+/// run remains replayable through its durable event projection and live
+/// broadcast channel.
+fn try_send_attached_stream_event(
+    sender: &mut Option<mpsc::Sender<Value>>,
+    event: Value,
+    run_id: &str,
+) {
+    let Some(attached) = sender.as_ref() else {
+        return;
+    };
+    match attached.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                "SSE observer disconnected; durable run continues detached"
+            );
+            *sender = None;
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                "SSE observer fell behind; detaching it so the durable run can continue"
+            );
+            *sender = None;
+        }
+    }
+}
+
 /// Normalize edge-ledger approval presentation events into individually
 /// addressable durable interaction facts. A batch is one UI event but each
 /// response has its own request identity, so storing only the outer batch
@@ -216,6 +249,7 @@ fn incrementally_persisted_edge_approval_event(event: &Value) -> bool {
     !canonical_edge_approval_requests(event).is_empty()
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
@@ -2162,23 +2196,36 @@ fn start_active_run_control_watcher(
                     if cancel_flag.load(Ordering::Acquire) || cancel_token.is_cancelled() {
                         break;
                     }
-                    match run_control.control_status(&user_id, &run_id).await {
-                        Ok(Some(RunControlStatus::Cancelled)) => {
+                    let control_status = tokio::time::timeout(
+                        ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT,
+                        run_control.control_status(&user_id, &run_id),
+                    )
+                    .await;
+                    match control_status {
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %run_id,
+                                timeout_ms = ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT.as_millis() as u64,
+                                "active run control watcher durable status poll timed out"
+                            );
+                        }
+                        Ok(Ok(Some(RunControlStatus::Cancelled))) => {
                             cancel_flag.store(true, Ordering::SeqCst);
                             cancel_token.cancel();
                             break;
                         }
-                        Ok(Some(RunControlStatus::Paused)) => {
+                        Ok(Ok(Some(RunControlStatus::Paused))) => {
                             pause_flag.store(true, Ordering::SeqCst);
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             // Resume is a durable fact. Clear only this run's
                             // private flag; dynamic children never share a
                             // parent's pause flag, so a child cannot unpause
                             // unrelated work.
                             pause_flag.store(false, Ordering::SeqCst);
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %run_id,
@@ -2751,31 +2798,25 @@ impl AgenticRunLifecycleService {
         const PAGE_LIMIT: u32 = 200;
         const MAX_PAGES: usize = 32;
         let mut cancelled = 0;
+        let mut cursor = None;
 
-        for _ in 0..MAX_PAGES {
+        for page_index in 0..MAX_PAGES {
             let page = run_engine
-                .list_session_runs(user_id, session_id, PAGE_LIMIT)
+                .list_active_session_runs_cursor(user_id, session_id, PAGE_LIMIT, cursor.take())
                 .await?;
+            let next_cursor = page.next_cursor;
             let mut descendants = page
                 .runs
                 .into_iter()
                 .filter(|run| {
                     run.run_id != parent_run_id
-                        && matches!(
-                            run.status.as_str(),
-                            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                        )
                         && run.ancestor_path.as_deref().is_some_and(|path| {
                             path.split('/').any(|segment| segment == parent_run_id)
                         })
                 })
                 .collect::<Vec<_>>();
-            if descendants.is_empty() {
-                return Ok(cancelled);
-            }
             descendants.sort_by_key(|run| std::cmp::Reverse(run.depth));
 
-            let mut page_updates = 0;
             for descendant in descendants {
                 let event = json!({
                     "event_type": "run_finished",
@@ -2798,13 +2839,18 @@ impl AgenticRunLifecycleService {
                     )
                     .await?
                 {
-                    page_updates += 1;
                     cancelled += 1;
                 }
             }
-            if page_updates == 0 {
-                break;
+            let Some(next_cursor) = next_cursor else {
+                return Ok(cancelled);
+            };
+            if page_index + 1 == MAX_PAGES {
+                return Err(format!(
+                    "active descendant cancellation exceeded {MAX_PAGES} pages for session {session_id}"
+                ));
             }
+            cursor = Some(next_cursor);
         }
         Ok(cancelled)
     }
@@ -8040,7 +8086,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
         let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
-        let client_event_tx_for_fanout = client_event_tx.clone();
+        let mut client_event_tx_for_fanout = Some(client_event_tx.clone());
         let fanout_runs = self.runs_handle();
         let fanout_run_engine = self.run_engine.clone();
         let fanout_user_id = user_id.clone();
@@ -8056,7 +8102,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 for gap in fanout_gap_tracker.drain() {
                                     let event = agent_live_gap_to_work_surface_sse(gap);
                                     let _ = live_tx_for_fanout.send(event.clone());
-                                    let _ = client_event_tx_for_fanout.send(event).await;
+                                    try_send_attached_stream_event(
+                                        &mut client_event_tx_for_fanout,
+                                        event,
+                                        &fanout_run_id,
+                                    );
                                 }
                                 break;
                             };
@@ -8099,7 +8149,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     "edge approval request persistence failed before delivery"
                                 );
                                 let _ = live_tx_for_fanout.send(failure.clone());
-                                let _ = client_event_tx_for_fanout.send(failure).await;
+                                try_send_attached_stream_event(
+                                    &mut client_event_tx_for_fanout,
+                                    failure,
+                                    &fanout_run_id,
+                                );
                                 break;
                             }
                             if live_delta_event_for_persistence(&event) {
@@ -8108,7 +8162,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                             }
                             let _ = live_tx_for_fanout.send(event.clone());
-                            let _ = client_event_tx_for_fanout.send(event).await;
+                            try_send_attached_stream_event(
+                                &mut client_event_tx_for_fanout,
+                                event,
+                                &fanout_run_id,
+                            );
                         }
                         changed = agent_live_gap_rx.changed(), if gap_watch_open => {
                             if changed.is_err() {
@@ -8118,7 +8176,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             for gap in fanout_gap_tracker.drain() {
                                 let event = agent_live_gap_to_work_surface_sse(gap);
                                 let _ = live_tx_for_fanout.send(event.clone());
-                                let _ = client_event_tx_for_fanout.send(event).await;
+                                try_send_attached_stream_event(
+                                    &mut client_event_tx_for_fanout,
+                                    event,
+                                    &fanout_run_id,
+                                );
                             }
                         }
                     }

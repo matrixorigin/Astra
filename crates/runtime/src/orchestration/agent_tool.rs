@@ -1183,6 +1183,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             "transcript_location": ctx.transcript_location.wire_value(),
             "agents": agents,
             "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
+            "instruction": "Fanout agents are running asynchronously. Do not busy-poll get_results: terminal updates arrive through the parent mailbox. Continue independent work or wait for that update; the user can inspect live progress with Shift+Down.",
         });
         if terminal_causes.has_stopped_slots() {
             let obj = resp.as_object_mut().unwrap();
@@ -1568,7 +1569,14 @@ async fn render_agent_fanout_results(
         || summary.timed_out > 0
         || summary.cancelled_by_user > 0
         || summary.cancelled_by_parent_budget > 0;
-    if has_failures {
+    if summary.active > 0 {
+        obj.insert(
+            "instruction".into(),
+            json!(
+                "Fanout agents are still running asynchronously. Do not busy-poll get_results: terminal updates arrive through the parent mailbox. Continue independent work or wait for that update; the user can inspect live progress with Shift+Down."
+            ),
+        );
+    } else if has_failures {
         obj.insert(
             "instruction".into(),
             json!(format!(
@@ -3165,6 +3173,12 @@ mod tests {
         assert_eq!(started["group_id"], "review-async");
         assert_eq!(started["fanout"]["status"], "running");
         assert_eq!(started["agents"][0]["status"], "launched");
+        assert!(
+            started["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("Do not busy-poll")),
+            "{started}"
+        );
 
         let value = collect_fanout_start(&result, &ctx).await;
         assert_eq!(value["status"], "completed");

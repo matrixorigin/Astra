@@ -2486,6 +2486,10 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            "Shift+Down",
+            "open and manage live background tasks and local agents".into(),
+        ),
+        (
             "/ then Tab",
             "browse and complete native workbench actions".into(),
         ),
@@ -3354,6 +3358,7 @@ mod routing_tests {
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+O"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+G"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+E"));
+        assert!(bindings.iter().any(|(key, _)| *key == "Shift+Down"));
     }
 
     #[test]

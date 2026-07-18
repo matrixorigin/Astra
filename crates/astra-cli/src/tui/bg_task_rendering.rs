@@ -802,25 +802,7 @@ pub(crate) fn render_background_task_rows_xml(
         return "<background_tasks count=\"0\" />".to_string();
     }
 
-    let mut rows = rows.to_vec();
-    rows.sort_by_key(|row| {
-        let attention_rank = match row.status {
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput
-            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Interrupted
-            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => 0,
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
-            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Pending => 1,
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Stopping
-            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => 2,
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => 3,
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable => 4,
-        };
-        (
-            attention_rank,
-            row.started_at_ms.unwrap_or(u64::MAX),
-            row.id.clone(),
-        )
-    });
+    let rows = crate::tui::bottom_pane::background_task_view::types::sort_rows(rows.to_vec());
 
     let mut out = format!("<background_tasks count=\"{}\">", rows.len());
     for row in rows {

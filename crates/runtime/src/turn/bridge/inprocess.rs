@@ -4221,7 +4221,11 @@ impl InProcessChatTurnBridge {
                 "bridge turn completed"
             );
 
-            // Persist events (fire-and-forget)
+            // Persist events at the turn boundary before the SSE stream
+            // closes. The next CLI continuation can arrive immediately after
+            // EOF, so fire-and-forget writes allowed adjacent turns to race
+            // and made outgoing tool calls appear before the incoming result
+            // that caused them.
             let user_content = latest_user_message_text(&messages).map(ToString::to_string);
 
             let has_tool_calls = !all_round_tool_calls.is_empty();
@@ -4281,9 +4285,12 @@ impl InProcessChatTurnBridge {
                 snapshot_link_plan: None,
             };
 
-            // Build tool event records for persistence
-            let tool_event_plan = {
-                let mut events = Vec::new();
+            // Incoming results belong before this model response; outgoing
+            // calls belong after it. Keep them in separate transactions so
+            // the durable event timeline matches the model's causal order.
+            let (incoming_tool_event_plan, outgoing_tool_event_plan) = {
+                let mut incoming_events = Vec::new();
+                let mut outgoing_events = Vec::new();
                 for (index, tool_call) in all_round_tool_calls.iter().enumerate() {
                     if let Some(tc) = tool_call.as_object() {
                         let payload = build_tool_call_event_payload(tc, index, &reasoning);
@@ -4296,7 +4303,7 @@ impl InProcessChatTurnBridge {
                             .map(ToString::to_string);
                         let mut metadata = payload.metadata;
                         metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
-                        events.push(TurnToolEventRecord {
+                        outgoing_events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
@@ -4332,7 +4339,7 @@ impl InProcessChatTurnBridge {
                             .map(ToString::to_string);
                         let mut metadata = payload.metadata;
                         metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
-                        events.push(TurnToolEventRecord {
+                        incoming_events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
@@ -4355,11 +4362,14 @@ impl InProcessChatTurnBridge {
                         });
                     }
                 }
-                if events.is_empty() {
-                    None
-                } else {
-                    Some(TurnToolEventPersistPlan { events })
-                }
+                (
+                    (!incoming_events.is_empty()).then_some(TurnToolEventPersistPlan {
+                        events: incoming_events,
+                    }),
+                    (!outgoing_events.is_empty()).then_some(TurnToolEventPersistPlan {
+                        events: outgoing_events,
+                    }),
+                )
             };
 
             let writer = turn_core_event_writer.clone();
@@ -4368,17 +4378,36 @@ impl InProcessChatTurnBridge {
             let sid = session_id.clone();
             let activity_user_id = user_id.clone();
             let user_query_event_id_for_activity = user_query_event_id.clone();
-            let core_event_count = usize::from(user_content.is_some()) + usize::from(should_persist_llm);
-            let tool_event_count = tool_event_plan
+            let core_event_count = usize::from(persist_plan.user_query_event.is_some())
+                + usize::from(persist_plan.llm_response_event.is_some());
+            let incoming_tool_event_count = incoming_tool_event_plan
                 .as_ref()
                 .map(|plan| plan.events.len())
                 .unwrap_or(0);
+            let outgoing_tool_event_count = outgoing_tool_event_plan
+                .as_ref()
+                .map(|plan| plan.events.len())
+                .unwrap_or(0);
+            let tool_event_count = incoming_tool_event_count + outgoing_tool_event_count;
 
-            // audit-#3 resolved: tasks are now routed through the shutdown-aware
-            // BridgePersistTracker so they drain on SIGTERM instead of being fire-and-forget.
-            let persist_tracker_for_main = persist_tracker_shared.clone();
             let persist_future = async move {
                 let persist_start = std::time::Instant::now();
+                let incoming_tool_events_persisted = match incoming_tool_event_plan {
+                    Some(plan) => match tool_writer.persist(plan).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            astra_core::agent_persist_fail!("bridge",
+                                session = sid,
+                                stage = "incoming_tool_events",
+                                count = incoming_tool_event_count,
+                                elapsed = format!("{:?}", persist_start.elapsed()),
+                                error = e
+                            );
+                            false
+                        }
+                    },
+                    None => false,
+                };
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
                     Err(e) => {
@@ -4392,13 +4421,13 @@ impl InProcessChatTurnBridge {
                         return;
                     }
                 };
-                let tool_events_persisted = match tool_event_plan {
+                let outgoing_tool_events_persisted = match outgoing_tool_event_plan {
                     Some(plan) => {
                         if let Err(e) = tool_writer.persist(plan).await {
                             astra_core::agent_persist_fail!("bridge",
                                 session = sid,
-                                stage = "tool_events",
-                                count = tool_event_count,
+                                stage = "outgoing_tool_events",
+                                count = outgoing_tool_event_count,
                                 elapsed = format!("{:?}", persist_start.elapsed()),
                                 error = e
                             );
@@ -4422,7 +4451,7 @@ impl InProcessChatTurnBridge {
                 if !has_inprocess_persisted_events(
                     core_event_count,
                     tool_event_count,
-                    tool_events_persisted,
+                    incoming_tool_events_persisted || outgoing_tool_events_persisted,
                 ) {
                     return;
                 }
@@ -4442,12 +4471,7 @@ impl InProcessChatTurnBridge {
                     );
                 }
             };
-            // HIGH #4: route through shutdown-aware tracker when available.
-            if let Some(tracker) = persist_tracker_for_main {
-                tracker.track_persist_task(Box::pin(persist_future));
-            } else {
-                tokio::spawn(persist_future);
-            }
+            persist_future.await;
 
             if !session_id.is_empty()
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())

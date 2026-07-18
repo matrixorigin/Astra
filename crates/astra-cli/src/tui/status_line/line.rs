@@ -165,6 +165,10 @@ pub(crate) struct BackgroundTaskFanoutSummary {
     pub failed: usize,
     pub stopped: usize,
     pub unavailable: usize,
+    /// Longest elapsed time among currently active slots. This keeps detached
+    /// fanout work visibly alive even while no foreground model request is
+    /// producing stream events.
+    pub active_elapsed_ms: Option<u64>,
 }
 
 impl BackgroundTaskFanoutSummary {
@@ -197,9 +201,21 @@ impl BackgroundTaskFanoutSummary {
                 | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
                 | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput => {
                     group.running += 1;
+                    group.active_elapsed_ms = Some(
+                        group
+                            .active_elapsed_ms
+                            .unwrap_or_default()
+                            .max(row.elapsed_ms),
+                    );
                 }
                 crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Stopping => {
                     group.stopping += 1;
+                    group.active_elapsed_ms = Some(
+                        group
+                            .active_elapsed_ms
+                            .unwrap_or_default()
+                            .max(row.elapsed_ms),
+                    );
                 }
                 crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => {
                     group.done += 1;
@@ -249,7 +265,19 @@ impl BackgroundTaskFanoutSummary {
         if self.unavailable > 0 {
             parts.push(format!("{} unavailable", self.unavailable));
         }
+        if let Some(elapsed_ms) = self.active_elapsed_ms {
+            parts.push(format_background_elapsed(elapsed_ms));
+        }
         format!("{} {}", truncate_end(&self.title, 24), parts.join(" · "))
+    }
+}
+
+fn format_background_elapsed(elapsed_ms: u64) -> String {
+    let elapsed_secs = elapsed_ms / 1_000;
+    if elapsed_secs < 60 {
+        format!("{elapsed_secs}s")
+    } else {
+        format!("{}m{:02}s", elapsed_secs / 60, elapsed_secs % 60)
     }
 }
 
@@ -515,7 +543,8 @@ impl StatusLine {
         if let Some(counts) = ctx.bg_task_counts
             && !counts.is_empty()
         {
-            let parts = background_task_count_parts(counts);
+            let mut parts = background_task_count_parts(counts);
+            parts.push(crate::tui::background_shortcut::background_task_open_hint().to_string());
             let style = if counts.failed_total() > 0 {
                 Style::default().fg(theme.error)
             } else if counts.waiting > 0 {

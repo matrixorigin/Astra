@@ -1425,6 +1425,21 @@ pub trait RunStateStore: Send + Sync {
         Err("session run listing is not supported by this store".to_string())
     }
 
+    /// Seek-page through only active runs in one session. Mutation workflows
+    /// use this instead of repeatedly reading the bounded tree projection,
+    /// where unrelated active rows can permanently hide descendants beyond
+    /// the first page.
+    async fn list_active_session_runs_cursor(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        let _ = (user_id, session_id, limit, cursor);
+        Err("active session run cursor pagination is not supported by this store".to_string())
+    }
+
     /// Load the same bounded session working set plus only the lifecycle
     /// events required to reconstruct read-only agent/fanout results. The
     /// database implementation overrides this with two batch queries; this
@@ -2648,6 +2663,52 @@ impl RunStateStore for InMemoryRunStateStore {
             runs: session_runs,
             limit,
             truncated,
+        })
+    }
+
+    async fn list_active_session_runs_cursor(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        if let Some(cursor) = &cursor {
+            run_list_cursor_run_id(cursor)?;
+        }
+        let limit = validate_run_list_limit(limit);
+        let runs = self.runs.read().await;
+        let mut active_runs = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        active_runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        if let Some(cursor) = &cursor {
+            active_runs.retain(|run| durable_run_after_cursor(run, cursor));
+        }
+        let has_more = active_runs.len() > limit as usize;
+        if has_more {
+            active_runs.truncate(limit as usize);
+        }
+        let next_cursor = has_more
+            .then(|| active_runs.last().map(durable_run_list_next_cursor))
+            .flatten();
+        Ok(DurableRunListPage {
+            runs: active_runs,
+            total: None,
+            next_cursor,
         })
     }
 
@@ -5596,6 +5657,76 @@ impl RunStateStore for DatabaseRunStateStore {
             runs,
             limit,
             truncated,
+        })
+    }
+
+    async fn list_active_session_runs_cursor(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let query_limit = run_list_query_limit(limit);
+        let rows = if let Some(cursor) = cursor {
+            let updated_at = run_list_cursor_db_updated_at(&cursor)?;
+            let run_id = run_list_cursor_run_id(&cursor)?;
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ? AND session_id = ? AND status IN (?, ?, ?)\
+                 {RUN_LIST_CURSOR_FILTER_SQL}?{RUN_LIST_CURSOR_TIE_SQL}? AND run_id < ?))\
+                 {RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(session_id)
+                .bind(STATUS_RUNNING)
+                .bind(STATUS_WAITING)
+                .bind(STATUS_PAUSED)
+                .bind(updated_at.clone())
+                .bind(updated_at)
+                .bind(run_id)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        } else {
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ? AND session_id = ? AND status IN (?, ?, ?)\
+                 {RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(session_id)
+                .bind(STATUS_RUNNING)
+                .bind(STATUS_WAITING)
+                .bind(STATUS_PAUSED)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        }
+        .map_err(|source| {
+            db_error("list_active_session_runs_cursor", session_id, source).to_string()
+        })?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cursor = run_list_cursor_from_row(&row).map_err(|error| error.to_string())?;
+            let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+            entries.push((run, cursor));
+        }
+        let has_more = entries.len() > limit as usize;
+        if has_more {
+            entries.truncate(limit as usize);
+        }
+        let next_cursor = has_more
+            .then(|| entries.last().map(|(_, cursor)| cursor.clone()))
+            .flatten();
+        Ok(DurableRunListPage {
+            runs: entries.into_iter().map(|(run, _)| run).collect(),
+            total: None,
+            next_cursor,
         })
     }
 
@@ -8662,6 +8793,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_active_session_cursor_pages_605_runs_after_prior_page_mutation() {
+        let store = InMemoryRunStateStore::new();
+        for index in 0..605 {
+            let mut run = durable_run_record(&format!("active-{index:03}"));
+            run.parent_run_id = Some("root".into());
+            run.root_run_id = Some("root".into());
+            run.ancestor_path = Some("root".into());
+            run.depth = 1;
+            run.status = STATUS_RUNNING.into();
+            run.updated_at = format!("2026-07-03T10:{:02}:00.000000Z", index / 60);
+            store.runs.write().await.insert(run.run_id.clone(), run);
+        }
+        let mut unrelated = durable_run_record("unrelated-session");
+        unrelated.session_id = "s2".into();
+        store
+            .runs
+            .write()
+            .await
+            .insert(unrelated.run_id.clone(), unrelated);
+
+        let first = store
+            .list_active_session_runs_cursor("u1", "s1", 200, None)
+            .await
+            .unwrap();
+        assert_eq!(first.runs.len(), 200);
+        let first_cursor = first.next_cursor.expect("more active runs");
+        {
+            let mut runs = store.runs.write().await;
+            for run in &first.runs {
+                let stored = runs.get_mut(&run.run_id).unwrap();
+                stored.status = STATUS_CANCELLED.into();
+                stored.updated_at = "2026-07-18T12:00:00.000000Z".into();
+            }
+        }
+
+        let second = store
+            .list_active_session_runs_cursor("u1", "s1", 200, Some(first_cursor))
+            .await
+            .unwrap();
+        assert_eq!(second.runs.len(), 200);
+        let third = store
+            .list_active_session_runs_cursor(
+                "u1",
+                "s1",
+                200,
+                Some(second.next_cursor.expect("third page cursor")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.runs.len(), 200);
+        let fourth = store
+            .list_active_session_runs_cursor(
+                "u1",
+                "s1",
+                200,
+                Some(third.next_cursor.expect("fourth page cursor")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fourth.runs.len(), 5);
+        assert!(fourth.next_cursor.is_none());
+    }
+
+    #[tokio::test]
     async fn in_memory_session_run_snapshot_is_scoped_bounded_and_keeps_active_work() {
         let store = InMemoryRunStateStore::new();
 
@@ -8790,6 +8985,88 @@ mod tests {
         for run_id in &run_ids {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_active_session_cursor_pages_605_runs_after_first_page_mutation() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        // Production identity columns are VARCHAR(64); keep the real-DB
+        // fixture inside the same wire contract instead of relying on an
+        // in-memory-only oversized identifier.
+        let user_id = format!("runs-ac-u-{}", Uuid::new_v4());
+        let session_id = format!("runs-ac-s-{}", Uuid::new_v4());
+        let root_run_id = format!("runs-ac-r-{}", Uuid::new_v4());
+
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_runs \
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status) ",
+        );
+        insert.push_values(0..605, |mut row, index| {
+            row.push_bind(format!("active-{index:03}-{}", Uuid::new_v4()))
+                .push_bind(&user_id)
+                .push_bind(&session_id)
+                .push_bind(&root_run_id)
+                .push_bind(&root_run_id)
+                .push_bind(&root_run_id)
+                .push_bind(1_i32)
+                .push_bind(STATUS_RUNNING);
+        });
+        insert
+            .build()
+            .execute(pool.get())
+            .await
+            .expect("insert 605 active descendants");
+
+        let first = store
+            .list_active_session_runs_cursor(&user_id, &session_id, 200, None)
+            .await
+            .expect("first active page");
+        assert_eq!(first.runs.len(), 200);
+        let first_cursor = first.next_cursor.expect("second page cursor");
+
+        let mut cancel_first =
+            sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        cancel_first
+            .push_bind(STATUS_CANCELLED)
+            .push(", updated_at = NOW(6) WHERE user_id = ")
+            .push_bind(&user_id)
+            .push(" AND run_id IN (");
+        {
+            let mut ids = cancel_first.separated(",");
+            for run in &first.runs {
+                ids.push_bind(&run.run_id);
+            }
+        }
+        cancel_first.push(")");
+        cancel_first
+            .build()
+            .execute(pool.get())
+            .await
+            .expect("mutate first page");
+
+        let second = store
+            .list_active_session_runs_cursor(&user_id, &session_id, 200, Some(first_cursor))
+            .await
+            .expect("second active page");
+        assert_eq!(second.runs.len(), 200);
+        let third = store
+            .list_active_session_runs_cursor(&user_id, &session_id, 200, second.next_cursor)
+            .await
+            .expect("third active page");
+        assert_eq!(third.runs.len(), 200);
+        let fourth = store
+            .list_active_session_runs_cursor(&user_id, &session_id, 200, third.next_cursor)
+            .await
+            .expect("fourth active page");
+        assert_eq!(fourth.runs.len(), 5);
+        assert!(fourth.next_cursor.is_none());
+
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup active cursor fixtures");
     }
 
     #[tokio::test]

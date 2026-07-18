@@ -642,6 +642,10 @@ fn bg_running_only_renders_count() {
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
+        plain.contains("Shift+↓ manage"),
+        "live background work must advertise its management shortcut; got {plain:?}"
+    );
+    assert!(
         !plain.contains("background commands"),
         "chip must use typed task vocabulary; got {plain:?}"
     );
@@ -875,6 +879,7 @@ fn bg_footer_calls_out_active_fanout_group_accounting() {
             failed: 0,
             stopped: 1,
             unavailable: 0,
+            active_elapsed_ms: Some(125_000),
         }],
         bg_task_counts: Some(BackgroundTaskCounts {
             local_agents: 2,
@@ -885,7 +890,7 @@ fn bg_footer_calls_out_active_fanout_group_accounting() {
 
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("review fanout 2/3 running · 1 stopped"),
+        plain.contains("review fanout 2/3 running · 1 stopped · 2m05s"),
         "fanout footer must preserve target count and stopped slots; got {plain:?}"
     );
     assert!(

@@ -1015,7 +1015,11 @@ pub(crate) async fn execute_todo_handler(
     let mut fork_copy = None;
     let output = match action {
         "create" => {
-            let key = create_idempotency_key.expect("create idempotency key validated");
+            let Some(key) = create_idempotency_key else {
+                return Ok(Json(ExecuteTodoResponse::output(
+                    "Error: create idempotency key was not validated",
+                )));
+            };
             let pool = state.shared_pool.as_ref().ok_or_else(|| {
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,

@@ -162,6 +162,28 @@ impl PtyAstra {
         }
     }
 
+    fn wait_for_absent(&mut self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.current_screen().contains(needle) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll Astra child") {
+                panic!(
+                    "Astra exited before clearing {needle:?} ({status})\n{}",
+                    self.screen_diagnostic()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {needle:?} to clear\n{}",
+                self.screen_diagnostic()
+            );
+            self.receive(remaining.min(Duration::from_millis(100)));
+        }
+    }
+
     fn receive(&mut self, timeout: Duration) {
         match self.output_rx.recv_timeout(timeout) {
             Ok(chunk) => {
@@ -576,6 +598,16 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"delegate_one_child_and_keep_it_observable\r");
     wait_for_agent_journey_child_request(&mock, &mut astra, UI_TRANSITION_TIMEOUT).await;
+
+    // Match the established Claude Code task-management mental model: while
+    // detached work is live, the footer advertises the Shift+Down route and
+    // that exact key opens the background-task manager.
+    astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[1;2B"); // xterm Shift+Down
+    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b"); // close the manager before opening Conversations
+    astra.wait_for_absent("Background tasks", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x07]); // Ctrl+G while the child response is still pending.
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);

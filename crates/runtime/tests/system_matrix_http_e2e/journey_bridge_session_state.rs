@@ -24,6 +24,33 @@ const RECONCILIATION_ENVELOPE: &str =
     astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE;
 const RECONCILED_REPLY: &str = "All three durable review results are now reconciled.";
 
+async fn post_mock_bridge_payload(app: &axum::Router, auth: &str, payload: Value) -> String {
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", auth)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", test_secret)
+        .body(Body::from(payload.to_string()))
+        .expect("bridge state request");
+    let response = app.clone().oneshot(request).await.expect("bridge oneshot");
+    assert_eq!(response.status(), StatusCode::OK, "bridge turn status");
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        bytes.extend_from_slice(&chunk.expect("bridge SSE chunk"));
+    }
+    let sse = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        sse.contains("turn_complete"),
+        "bridge turn did not complete: {sse}"
+    );
+    sse
+}
+
 async fn run_mock_bridge_turn(
     app: &axum::Router,
     auth: &str,
@@ -58,29 +85,7 @@ async fn run_mock_bridge_turn(
             }
         }]
     });
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let request = Request::builder()
-        .method("POST")
-        .uri("/chat/turn")
-        .header("authorization", auth)
-        .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
-        .body(Body::from(payload.to_string()))
-        .expect("bridge state request");
-    let response = app.clone().oneshot(request).await.expect("bridge oneshot");
-    assert_eq!(response.status(), StatusCode::OK, "bridge turn status");
-
-    let mut stream = response.into_body().into_data_stream();
-    let mut bytes = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        bytes.extend_from_slice(&chunk.expect("bridge SSE chunk"));
-    }
-    let sse = String::from_utf8_lossy(&bytes).into_owned();
-    assert!(
-        sse.contains("turn_complete"),
-        "bridge turn did not complete: {sse}"
-    );
+    let sse = post_mock_bridge_payload(app, auth, payload).await;
     assert!(sse.contains(reply), "bridge reply missing from SSE: {sse}");
     let session_info = sse_first_data_json_with_type(&sse, "session_info")
         .unwrap_or_else(|| panic!("missing session_info: {sse}"));
@@ -368,6 +373,167 @@ pub async fn run_cli_bridge_session_views_remain_consistent() {
             .iter()
             .all(|item| item["content"].as_str() != Some(RECONCILIATION_ENVELOPE)),
         "runtime envelope must not appear as user speech: {transcript}"
+    );
+
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
+    ctx.pool.close().await;
+}
+
+/// A tool-only model boundary must not create a blank transcript row, and a
+/// continuation's incoming tool result must be durable before the response it
+/// triggers. This reproduces the ordering seen in real multi-agent CLI turns.
+pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let user_id = &ctx.user_id;
+
+    let (status, created) = post_json(
+        app,
+        "/sessions",
+        Some(auth),
+        json!({"title": "bridge tool causal order"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create session: {created}");
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("created session_id")
+        .to_string();
+    let turn_chain_id = format!("bridge-tool-chain-{}", Uuid::new_v4());
+    let user_query_event_id = format!("bridge-tool-query-{}", Uuid::new_v4());
+    let tool_call_id = format!("bridge-tool-call-{}", Uuid::new_v4());
+    let user_message = "read the task state before answering";
+    let tool_schema = json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }
+    });
+    let tool_call = json!({
+        "id": tool_call_id,
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\":\"state.txt\"}"}
+    });
+
+    let first_sse = post_mock_bridge_payload(
+        app,
+        auth,
+        json!({
+            "agent_id": "astra-cli",
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": user_message}],
+            "selected_model": seeded_selected_model(ctx),
+            "edge_tools": [tool_schema.clone()],
+            "session_turn": 1,
+            "turn_chain_id": turn_chain_id,
+            "user_query_event_id": user_query_event_id,
+            "test_llm_rounds": [{"full_text": "", "tool_calls": [tool_call.clone()]}]
+        }),
+    )
+    .await;
+    assert!(first_sse.contains("tool_request"), "{first_sse}");
+
+    let final_reply = "The durable task state is ready.";
+    let second_sse = post_mock_bridge_payload(
+        app,
+        auth,
+        json!({
+            "agent_id": "astra-cli",
+            "session_id": session_id,
+            "messages": [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": tool_call_id, "content": "state=ready"}
+            ],
+            "selected_model": seeded_selected_model(ctx),
+            "edge_tools": [tool_schema],
+            "tool_results": [{
+                "tool_call_id": tool_call_id,
+                "request_id": tool_call_id,
+                "name": "read_file",
+                "status": "completed",
+                "content": "state=ready",
+                "output": "state=ready"
+            }],
+            "session_turn": 1,
+            "turn_chain_id": turn_chain_id,
+            "user_query_event_id": user_query_event_id,
+            "test_llm_rounds": [{"full_text": final_reply}]
+        }),
+    )
+    .await;
+    assert!(second_sse.contains(final_reply), "{second_sse}");
+
+    let rows = sqlx::query(
+        "SELECT event_type, content, tool_call_id FROM agent_events \
+         WHERE user_id = ? AND session_id = ? \
+           AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result') \
+         ORDER BY created_at ASC, event_id ASC",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_all(&ctx.pool)
+    .await
+    .expect("load causal bridge events");
+    let event_types = rows
+        .iter()
+        .map(|row| row.get::<String, _>("event_type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        vec![
+            "user_query",
+            "llm_response",
+            "tool_call",
+            "tool_result",
+            "llm_response"
+        ],
+        "bridge event order must follow user -> model call -> tool result -> model reply"
+    );
+    assert_eq!(rows[1].get::<String, _>("content"), "");
+    assert_eq!(rows[4].get::<String, _>("content"), final_reply);
+    assert_eq!(
+        rows[2].get::<Option<String>, _>("tool_call_id").as_deref(),
+        Some(tool_call_id.as_str())
+    );
+    assert_eq!(
+        rows[3].get::<Option<String>, _>("tool_call_id").as_deref(),
+        Some(tool_call_id.as_str())
+    );
+
+    let transcript_rows = sqlx::query(
+        "SELECT role, content FROM session_transcript_items \
+         WHERE user_id = ? AND session_id = ? ORDER BY item_seq ASC",
+    )
+    .bind(user_id)
+    .bind(&session_id)
+    .fetch_all(&ctx.pool)
+    .await
+    .expect("load bridge tool transcript");
+    let transcript = transcript_rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("role"),
+                row.get::<String, _>("content"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transcript,
+        vec![
+            ("user".to_string(), user_message.to_string()),
+            ("assistant".to_string(), final_reply.to_string()),
+        ],
+        "tool-only model boundaries must not materialize blank assistant rows"
     );
 
     cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
