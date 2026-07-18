@@ -51,6 +51,41 @@ pub struct ReflectReport {
     pub budget_result: ObservationBudgetResult,
 }
 
+/// Session-wide child-delivery accounting shared by local journal reflection
+/// and server-backed reflection. This reports lifecycle evidence only; it does
+/// not infer consensus or validation from a spawn count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentDeliveryRollup {
+    pub spawned: usize,
+    pub completed: usize,
+    pub interrupted: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub other_terminal: usize,
+}
+
+impl AgentDeliveryRollup {
+    #[must_use]
+    pub fn render_session_summary(&self) -> Option<String> {
+        if self.spawned == 0 {
+            return None;
+        }
+        let terminal =
+            self.completed + self.interrupted + self.failed + self.cancelled + self.other_terminal;
+        let without_terminal = self.spawned.saturating_sub(terminal);
+        Some(format!(
+            "Session agent delivery: {}/{} spawned agents produced complete deliverables; {} interrupted, {} failed, {} cancelled, {} other terminal, {} without terminal evidence.",
+            self.completed,
+            self.spawned,
+            self.interrupted,
+            self.failed,
+            self.cancelled,
+            self.other_terminal,
+            without_terminal,
+        ))
+    }
+}
+
 // Type aliases removed — use Observation* types from astra_core directly
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -340,6 +375,23 @@ fn reflect_row_non_negative_i64(
         ));
     }
     Ok(value)
+}
+
+fn reflect_row_usize(row: &impl ReflectRow, context: &str, column: &str) -> ServiceResult<usize> {
+    let value = reflect_row_non_negative_i64(row, context, column)?;
+    usize::try_from(value).map_err(|error| reflect_decode_error(context, column, error))
+}
+
+fn agent_delivery_rollup_from_row(row: &impl ReflectRow) -> ServiceResult<AgentDeliveryRollup> {
+    const CONTEXT: &str = "agent_delivery_agg_row";
+    Ok(AgentDeliveryRollup {
+        spawned: reflect_row_usize(row, CONTEXT, "spawned")?,
+        completed: reflect_row_usize(row, CONTEXT, "completed")?,
+        interrupted: reflect_row_usize(row, CONTEXT, "interrupted")?,
+        failed: reflect_row_usize(row, CONTEXT, "failed")?,
+        cancelled: reflect_row_usize(row, CONTEXT, "cancelled")?,
+        other_terminal: 0,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -954,6 +1006,22 @@ impl ReflectService for DatabaseReflectService {
 
         let overview_agg = reflect_overview_agg_from_row(&overview_row)?;
 
+        let agent_delivery_row = query(
+            "SELECT \
+               COUNT(DISTINCT CASE WHEN event_type = 'agent_spawned' THEN COALESCE(run_id, agent_id, event_id) END) AS spawned, \
+               COUNT(DISTINCT CASE WHEN event_type = 'agent_completed' THEN COALESCE(run_id, agent_id, event_id) END) AS completed, \
+               COUNT(DISTINCT CASE WHEN event_type = 'agent_interrupted' THEN COALESCE(run_id, agent_id, event_id) END) AS interrupted, \
+               COUNT(DISTINCT CASE WHEN event_type = 'agent_failed' THEN COALESCE(run_id, agent_id, event_id) END) AS failed, \
+               COUNT(DISTINCT CASE WHEN event_type = 'agent_cancelled' THEN COALESCE(run_id, agent_id, event_id) END) AS cancelled \
+             FROM agent_events WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| internal_error(format!("agent delivery query: {e}")))?;
+        let agent_delivery = agent_delivery_rollup_from_row(&agent_delivery_row)?;
+
         // Compute duration in Rust from timestamp strings
         let duration_minutes = compute_duration_minutes(
             overview_agg.first_event.as_deref(),
@@ -1098,7 +1166,7 @@ impl ReflectService for DatabaseReflectService {
             )
             .await?;
         let (evidence_graph, budget_result) = budget_reflect_evidence_graph(raw_evidence_graph);
-        let (summary, observations, evidence, action_hints, failure_clusters) =
+        let (mut summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope(
                 session_id,
                 &request,
@@ -1108,6 +1176,10 @@ impl ReflectService for DatabaseReflectService {
                 &recommendations,
                 evidence_graph.as_ref(),
             );
+        if let Some(agent_delivery) = agent_delivery.render_session_summary() {
+            summary.push(' ');
+            summary.push_str(&agent_delivery);
+        }
         let graph_slice = build_reflect_graph_slice(
             evidence_graph,
             &observations,
@@ -1336,6 +1408,23 @@ use astra_core::ObservationGraphEdge;
 mod tests {
     use super::*;
     use astra_core::EvidenceRef;
+
+    #[test]
+    fn agent_delivery_rollup_reports_complete_deliverables_not_spawn_consensus() {
+        let summary = AgentDeliveryRollup {
+            spawned: 3,
+            completed: 0,
+            interrupted: 3,
+            ..AgentDeliveryRollup::default()
+        }
+        .render_session_summary()
+        .unwrap();
+
+        assert!(summary.contains("0/3"), "{summary}");
+        assert!(summary.contains("3 interrupted"), "{summary}");
+        assert!(summary.contains("0 other terminal"), "{summary}");
+        assert!(!summary.contains("validated"), "{summary}");
+    }
 
     fn make_overview(
         total_events: i64,

@@ -1645,6 +1645,12 @@ pub struct StopHookState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompletionSettlementState {
     pub reconciliation_attempts: u32,
+    /// Number of same-turn recovery calls made after the provider returned a
+    /// successful response with neither tool calls nor user-visible text.
+    pub textless_response_retries: u32,
+    /// The next LLM boundary is a bounded final-answer recovery call. Hosts
+    /// must advertise no tools and reject tool execution while this is set.
+    pub text_only: bool,
     pub deferred_candidate_text: Option<String>,
 }
 
@@ -1801,6 +1807,10 @@ pub enum VolatileKind {
     /// work or broad work that may benefit from a board. It never gates tools,
     /// delegation, or completion.
     TaskBoardAdvisory,
+    /// Required context for the single bounded retry after a provider returns
+    /// neither tool calls nor final text. Hosts pair this typed signal with a
+    /// physically empty tool surface for the recovery call.
+    FinalAnswerSettlement,
     /// Configured stop-hook expectations surfaced before model decisions.
     StopHookEvidence,
     /// Context produced by configured session-start hooks. It is required for
@@ -1838,6 +1848,7 @@ impl VolatileKind {
                 | Self::CompactResume
                 | Self::CircuitBreaker
                 | Self::TaskBoardAdvisory
+                | Self::FinalAnswerSettlement
                 | Self::StopHookEvidence
                 | Self::SessionHookContext
                 | Self::HarnessBoundary
@@ -1863,6 +1874,7 @@ impl VolatileKind {
             | Self::CompactResume
             | Self::Mailbox
             | Self::BackgroundTaskNotification
+            | Self::FinalAnswerSettlement
             | Self::SessionHookContext
             | Self::PlanModeMarker
             | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
@@ -2698,18 +2710,16 @@ fn harness_pause_finalization_message(reason: &str, original_query: &str) -> Str
 }
 
 #[cfg(feature = "harness")]
-fn force_text_only_harness_finalization<H: AgenticLoopHost>(
-    host: &H,
-    state: &mut AgenticLoopState,
-    reason: &str,
-) {
+fn force_text_only_harness_finalization(state: &mut AgenticLoopState, reason: &str) {
     // Reserve one last LLM call for the user-visible summary. Without this,
     // the recovery turns themselves can consume the remaining budget and the
     // user sees a BudgetExhausted interruption instead of the intended wrap-up.
     state.remaining_turns = state.remaining_turns.max(1);
-    for name in host.valid_tool_names() {
-        state.restricted_tools.insert(name.clone());
-    }
+    // Reuse the same capability boundary as empty-response settlement. Hosts
+    // enforce this across built-in, edge, deferred, and dynamically offered
+    // tools; maintaining a second denylist here would inevitably drift as new
+    // tool surfaces are added.
+    state.hooks.completion_settlement.text_only = true;
     state.push_volatile(
         VolatileKind::HarnessBoundary,
         harness_pause_finalization_message(reason, &state.message),
@@ -3150,7 +3160,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         reason = %reason,
                         "harness pause recovery limit exceeded at PostTurn; forcing text-only finalization"
                     );
-                    force_text_only_harness_finalization(host, state, &reason);
+                    force_text_only_harness_finalization(state, &reason);
                     continue;
                 }
                 tracing::info!(
@@ -3568,6 +3578,7 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) final_output_ready: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
+        pub(crate) text_only_turns: Vec<bool>,
         pub(crate) turn_intent: Option<TurnIntent>,
         pub(crate) skill_auto_route_decision: Option<String>,
         pub(crate) skill_auto_route_queries: Vec<String>,
@@ -3594,6 +3605,7 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 final_output_ready: Vec::new(),
                 executed_messages: Vec::new(),
+                text_only_turns: Vec::new(),
                 turn_intent: None,
                 skill_auto_route_decision: None,
                 skill_auto_route_queries: Vec::new(),
@@ -3669,6 +3681,8 @@ pub(crate) mod tests {
                 ));
             }
             self.executed_messages.push(state.messages.clone());
+            self.text_only_turns
+                .push(state.hooks.completion_settlement.text_only);
             let result = self.turn_results.remove(0);
             for edge_result in &result.edge_tool_round {
                 self.valid_tools.insert(edge_result.tool.clone());
@@ -4737,6 +4751,62 @@ pub(crate) mod tests {
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn textless_provider_response_gets_one_text_only_settlement_round() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
+            text_result("", 15, 0, Some(30)),
+            text_result("The review is complete.", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected bounded recovery: {outcome:?}");
+        assert_eq!(host.turn_count(), 3);
+        assert_eq!(host.text_only_turns, vec![false, false, true]);
+        assert_eq!(state.final_text, "The review is complete.");
+        assert!(state.interruption.is_none());
+        let settlement = state
+            .volatile_pending
+            .iter()
+            .find(|injection| injection.kind == VolatileKind::FinalAnswerSettlement)
+            .expect("textless retry must cross the typed required-context lane");
+        assert_eq!(settlement.payload["schema"], "final_answer_settlement.v1");
+        assert_eq!(
+            VolatileKind::FinalAnswerSettlement.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_textless_response_stops_bounded_with_human_copy() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
+            text_result("", 15, 0, Some(30)),
+            text_result("", 15, 0, Some(30)),
+            text_result("must not run", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(host.turn_count(), 3, "empty recovery must be bounded");
+        assert_eq!(host.text_only_turns, vec![false, false, true]);
+        assert_eq!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(astra_turn_core::interruption::InterruptionKind::EmptyCompletion)
+        );
+        assert!(
+            state.final_text.contains("final answer"),
+            "{}",
+            state.final_text
+        );
+        assert!(!state.final_text.contains("empty_completion"));
+        assert!(!state.final_text.contains("[turn_interrupted]"));
     }
 
     #[tokio::test]

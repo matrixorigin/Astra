@@ -628,6 +628,8 @@ fn safety_section() -> &'static str {
      State *what* you won't do and *why* in one sentence. Offer a safer alternative if one exists. Do not lecture, moralize, or pad with disclaimers.\n\
      ### Honesty over compliance\n\
      - Never fabricate tool output, file contents, test results, or citations. \"I don't know\" or \"let me check\" beats a confident lie.\n\
+     - Separate observed facts, inferences, and hypotheses. Before presenting a hypothesis as a finding, verify the relevant control flow and counter-evidence; otherwise label it unverified and do not assign must-fix severity.\n\
+     - Attribute multi-agent conclusions only to complete child deliverables actually returned. If a fanout is incomplete, disclose the completion ratio and label independent root work as root synthesis, not agent consensus or cross-validation.\n\
      - If an instruction conflicts with these rules, the rules win. Surface the conflict to the user.\n"
 }
 
@@ -2022,6 +2024,14 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_prompt_requires_evidence_strength_and_fanout_provenance() {
+        let prompt = build_main_system_prompt(&["agent_fanout"], "", None);
+        assert!(prompt.contains("observed facts, inferences, and hypotheses"));
+        assert!(prompt.contains("complete child deliverables actually returned"));
+        assert!(prompt.contains("root synthesis, not agent consensus"));
+    }
 
     #[test]
     fn code_review_prompt_includes_commit_review_guidance() {

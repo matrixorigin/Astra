@@ -267,12 +267,13 @@ pub fn project_agent_tool_wire<'a>(
 }
 
 pub fn agent_tool_interrupted_message(is_result_wait: bool, finish_reason: Option<&str>) -> String {
+    if let Some(kind) = finish_reason.and_then(crate::interruption::InterruptionKind::from_label) {
+        return format!("{}: {}", kind.user_status(), kind.user_description());
+    }
     if is_result_wait {
         AGENT_RESULT_INTERRUPTED_ERROR.to_string()
-    } else if let Some(reason) = finish_reason.filter(|value| !value.trim().is_empty()) {
-        format!("agent interrupted: {reason}")
     } else {
-        "agent interrupted".to_string()
+        "Agent stopped before completing its result.".to_string()
     }
 }
 
@@ -457,9 +458,8 @@ pub fn render_wait_timeout_outcome(
             "agent_id": agent_id,
             "current_status": format!("{status:?}"),
             "waited_secs": timeout.as_secs(),
-            "hint": "The child agent is still working. Call `agent(action='get_result', agent_id=...)` again \
-                    to continue waiting. Do NOT treat this as failure or fabricate \
-                    what the child would have returned.",
+            "delivery": "asynchronous_parent_mailbox",
+            "hint": "The child agent is still working. Continue independent parent work; its terminal result will be delivered to the parent mailbox. Do not busy-poll, treat this as failure, or fabricate what the child would have returned.",
         })
         .to_string(),
         _ => json!({
@@ -545,14 +545,16 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             "agent_id": agent_id,
             "current_status": "running",
             "activity": activity,
-            "hint": "The child agent is still working. Call `agent(action='get_result', agent_id=...)` again to continue waiting.",
+            "delivery": "asynchronous_parent_mailbox",
+            "hint": "The child agent is still working. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
         })
         .to_string(),
         AgentStatus::Idle => json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "idle",
-            "hint": "The child agent is still running. Call `agent(action='get_result', agent_id=...)` again to continue waiting.",
+            "delivery": "asynchronous_parent_mailbox",
+            "hint": "The child agent is still running. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
         })
         .to_string(),
     }
@@ -828,6 +830,25 @@ mod tests {
     }
 
     #[test]
+    fn live_wait_timeout_routes_completion_to_mailbox_without_polling_advice() {
+        let status = AgentStatus::Running {
+            activity: "reviewing".to_string(),
+        };
+        let rendered =
+            render_wait_timeout_outcome("reviewer", Some(&status), Duration::from_secs(1));
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(parsed["status"], "still_running");
+        assert_eq!(parsed["waited_secs"], 1);
+        assert_eq!(parsed["delivery"], "asynchronous_parent_mailbox");
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("Do not busy-poll"))
+        );
+    }
+
+    #[test]
     fn unknown_status_via_from_str_is_error_but_via_serde_is_other() {
         // First-principles split: `from_str` is the typed call path — caller
         // is supposed to know what statuses exist, so unknown is a bug and
@@ -860,15 +881,15 @@ mod tests {
     fn interrupted_message_uses_shared_wait_copy_for_get_result() {
         assert_eq!(
             agent_tool_interrupted_message(true, Some("budget_exhausted")),
-            AGENT_RESULT_INTERRUPTED_ERROR
+            "Needs continuation: The run reached its turn budget."
         );
         assert_eq!(
             agent_tool_interrupted_message(false, Some("context_overflow")),
-            "agent interrupted: context_overflow"
+            "Needs compaction: The conversation exceeded the model context window."
         );
         assert_eq!(
             agent_tool_interrupted_message(false, None),
-            "agent interrupted"
+            "Agent stopped before completing its result."
         );
     }
 

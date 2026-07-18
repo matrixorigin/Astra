@@ -1,4 +1,5 @@
 import {
+  agentInterruptionPresentation,
   applyWorkSurfaceEvent,
   createEmptyWorkSurface,
   hydrateWorkSurface,
@@ -15,6 +16,20 @@ const task = {
 };
 
 describe('work surface reducer', () => {
+  it('projects canonical interruption kinds without exposing wire codes', () => {
+    expect(agentInterruptionPresentation('context_overflow')).toEqual({
+      label: 'Needs compaction',
+      detail: 'The subagent exceeded the model context window.',
+      tone: 'warning',
+    });
+    expect(agentInterruptionPresentation('unknown_future_reason')).toEqual({
+      label: 'Needs attention',
+      detail:
+        'The subagent stopped before completing its result. Open the transcript for details.',
+      tone: 'danger',
+    });
+  });
+
   it('applies task board snapshots as the authoritative task state', () => {
     const state = applyWorkSurfaceEvent(createEmptyWorkSurface(), {
       type: 'task_board_snapshot',
@@ -685,6 +700,41 @@ describe('work surface reducer', () => {
       detail: '上海今日小雨，33°C / 25°C。',
       tone: 'warning',
     });
+  });
+
+  it('projects live interrupted termination through the same human presentation', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'agent_spawned',
+      agent_id: 'agent-live',
+      run_id: 'child-live',
+      parent_run_id: 'run-1',
+      agent_type: 'research',
+      description: 'Inspect live state',
+    });
+
+    state = applyWorkSurfaceEvent(state, {
+      type: 'agent_live_event',
+      event_kind: 'agent_terminated',
+      agent_id: 'agent-live',
+      run_id: 'child-live',
+      termination: 'interrupted',
+      reason: 'empty_completion',
+      timestamp: 1_801_000_001_000,
+    });
+
+    expect(state.agents[0]).toMatchObject({
+      status: 'interrupted',
+      reason: 'empty_completion',
+    });
+    expect(state.agents[0].events?.at(-1)).toMatchObject({
+      label: 'Needs final answer',
+      detail:
+        'The subagent stopped before producing a final answer. Its progress is saved.',
+      tone: 'warning',
+    });
+    expect(state.agents[0].events?.at(-1)?.detail).not.toContain(
+      'empty_completion',
+    );
   });
 
   it('keeps completed tool cards successful when a later run interruption arrives', () => {

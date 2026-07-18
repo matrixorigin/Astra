@@ -23,7 +23,7 @@ use astra_runtime::{
 use astra_turn_core::{
     chat_turn_sse_dispatch::ChatTurnSseAccum, compaction_types::CompactionEvent,
     orchestration::agent_result_wire::render_agent_tool_error, sse_stream_host::EdgeToolExecResult,
-    tool_result_semantics::cloud_tool_result_status_label,
+    tool::schema::tool_names_from_schemas, tool_result_semantics::cloud_tool_result_status_label,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -663,6 +663,16 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state
             .restricted_tools
             .extend(request_scoped_restrictions.iter().cloned());
+
+        // A textless provider response gets one bounded settlement call. The
+        // runtime state is authoritative: remove every advertised schema for
+        // this boundary so "produce the final answer" is enforced by the
+        // capability surface rather than left as prompt-only guidance.
+        if state.hooks.completion_settlement.text_only {
+            state
+                .restricted_tools
+                .extend(tool_names_from_schemas(&self.all_schemas));
+        }
 
         // Plan mode is a permission overlay, not a schema-pruning policy.
         // This returns an empty set by design so plan/default transitions do

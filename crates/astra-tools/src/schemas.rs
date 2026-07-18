@@ -561,7 +561,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "base_ref": {
                             "type": "string",
-                            "description": "Base ref for range diffs. Used by: diff (with ref: diff base_ref..ref)."
+                            "description": "Single base ref for range diffs. Used by diff with ref as base_ref..ref. For a complete A..B or A...B range, pass it in ref and omit base_ref."
                         },
                         "revision": {
                             "type": "string",
@@ -864,7 +864,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
-         `spawn` is asynchronous by contract: it returns after the child has a stable agent_id/run_id and keeps the parent agent free to continue independent work. Terminal child results are delivered to the parent mailbox automatically. Use `send_message` for corrections and `get_result` only for an explicit observe/wait step; do not pass a background flag.\n\n\
+         `spawn` is asynchronous by contract: it returns after the child has a stable agent_id/run_id and keeps the parent agent free to continue independent work. Terminal child results are delivered to the parent mailbox automatically. Use `send_message` for corrections and `get_result` only for a short non-blocking observation; do not busy-poll or pass a background flag.\n\n\
          ## Parallel sub-agent fan-out\n\
          For a fixed-size parallel group, call `agent_fanout` with its JSON object schema; do not simulate it with an `agents:[...]` payload on `agent`. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
@@ -913,7 +913,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
          Actions:\n\
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
-         - `get_results`: requires `action` and returned `group_id`. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
+         - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start returns stable child identities without waiting for the full group to finish; terminal results flow back through parent mailboxes and get_results remains available for explicit inspection.",
                 "parameters": {
@@ -1447,6 +1447,8 @@ mod tests {
         assert!(desc.contains("`id`"));
         assert!(desc.contains("without waiting for the full group"));
         assert!(desc.contains("parent mailboxes"));
+        assert!(desc.contains("non-blocking snapshot"));
+        assert!(desc.contains("do not busy-poll"));
         assert!(desc.contains("bounded result window"));
         assert!(desc.contains("results[].next_call"));
         assert!(desc.contains("top-level `brief`"));

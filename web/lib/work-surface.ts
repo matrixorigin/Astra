@@ -926,9 +926,18 @@ function describeAgentEvent(
           : "success";
     } else if (liveKind === "agent_terminated") {
       const termination = stringField(event, "termination") ?? "completed";
-      label = statusLabel(termination);
-      detail = stringField(event, "reason");
-      tone = termination === "completed" ? "success" : "danger";
+      if (termination === "interrupted") {
+        const display = agentInterruptionPresentation(
+          stringField(event, "reason"),
+        );
+        label = display.label;
+        detail = display.detail;
+        tone = display.tone;
+      } else {
+        label = statusLabel(termination);
+        detail = stringField(event, "reason");
+        tone = termination === "completed" ? "success" : "danger";
+      }
     } else {
       label = statusLabel(liveKind);
       detail = stringField(event, "content");
@@ -997,7 +1006,7 @@ function describeAgentEvent(
     tone = "danger";
   } else if (type === "agent_interrupted") {
     const reason = agent.reason ?? stringField(event, "reason");
-    const display = agentInterruptionDisplay(reason);
+    const display = agentInterruptionPresentation(reason);
     label = display.label;
     detail = agent.resultSummary ?? display.detail ?? progress;
     tone = display.tone;
@@ -1017,21 +1026,19 @@ function describeAgentEvent(
   return { id, type: eventType, label, detail, tone, timestamp };
 }
 
-function agentInterruptionDisplay(reason?: string): {
+export function agentInterruptionPresentation(reason?: string): {
   label: string;
   detail?: string;
   tone: AgentSurfaceEvent["tone"];
 } {
   const normalized = (reason ?? "").trim().toLowerCase();
-  if (!normalized || normalized === "interrupted" || normalized === "empty_completion") {
-    return {
-      label: "Needs final answer",
-      detail: "The subagent stopped before producing a final answer.",
-      tone: "warning",
-    };
+  const canonical = CANONICAL_AGENT_INTERRUPTION_PRESENTATIONS[normalized];
+  if (canonical) {
+    return canonical;
   }
+  // Compatibility parsing is intentionally isolated at this wire boundary.
+  // New producers emit canonical interruption kinds.
   if (
-    normalized === "budget_exhausted" ||
     normalized === "turn_budget_exhausted" ||
     normalized === "max_turns_exceeded" ||
     normalized === "max_turns"
@@ -1043,11 +1050,118 @@ function agentInterruptionDisplay(reason?: string): {
     };
   }
   return {
-    label: "Interrupted",
-    detail: reason,
+    label: "Needs attention",
+    detail: "The subagent stopped before completing its result. Open the transcript for details.",
     tone: "danger",
   };
 }
+
+const CANONICAL_AGENT_INTERRUPTION_PRESENTATIONS: Record<
+  string,
+  { label: string; detail: string; tone: AgentSurfaceEvent["tone"] }
+> = {
+  "": {
+    label: "Needs continuation",
+    detail: "The subagent stopped before completing its result.",
+    tone: "warning",
+  },
+  interrupted: {
+    label: "Needs continuation",
+    detail: "The subagent stopped before completing its result.",
+    tone: "warning",
+  },
+  empty_completion: {
+    label: "Needs final answer",
+    detail:
+      "The subagent stopped before producing a final answer. Its progress is saved.",
+    tone: "warning",
+  },
+  budget_exhausted: {
+    label: "Needs continuation",
+    detail: "The subagent reached its turn budget.",
+    tone: "warning",
+  },
+  token_budget_exceeded: {
+    label: "Needs continuation",
+    detail: "The subagent exceeded its input token budget.",
+    tone: "warning",
+  },
+  cumulative_budget_exceeded: {
+    label: "Needs continuation",
+    detail: "The subagent reached its cumulative token budget.",
+    tone: "warning",
+  },
+  rate_limited: {
+    label: "Retry later",
+    detail: "The model provider is temporarily rate limited.",
+    tone: "warning",
+  },
+  cooldown_rejected: {
+    label: "Retry later",
+    detail: "The model provider is still in its retry cooldown.",
+    tone: "warning",
+  },
+  user_cancelled: {
+    label: "Cancelled",
+    detail: "The subagent was cancelled.",
+    tone: "warning",
+  },
+  context_overflow: {
+    label: "Needs compaction",
+    detail: "The subagent exceeded the model context window.",
+    tone: "warning",
+  },
+  auth_failure: {
+    label: "Needs authentication",
+    detail: "The model provider rejected the current credentials.",
+    tone: "danger",
+  },
+  critical_verdict: {
+    label: "Needs attention",
+    detail: "A runtime safety check stopped the subagent.",
+    tone: "danger",
+  },
+  approval_rejected: {
+    label: "Approval declined",
+    detail: "A requested subagent action was not approved.",
+    tone: "warning",
+  },
+  server_overload: {
+    label: "Retry later",
+    detail: "The model provider is temporarily overloaded.",
+    tone: "warning",
+  },
+  stream_transport: {
+    label: "Connection interrupted",
+    detail: "The model response connection failed.",
+    tone: "warning",
+  },
+  stream_idle: {
+    label: "Connection interrupted",
+    detail: "The model response stopped making progress.",
+    tone: "warning",
+  },
+  harness_blocked: {
+    label: "Needs attention",
+    detail: "The execution harness blocked the subagent.",
+    tone: "danger",
+  },
+  harness_paused: {
+    label: "Paused",
+    detail: "The execution harness paused the subagent.",
+    tone: "warning",
+  },
+  execution_incomplete: {
+    label: "Needs continuation",
+    detail: "The requested subagent execution did not complete.",
+    tone: "warning",
+  },
+  executor_dropped: {
+    label: "Needs continuation",
+    detail: "The execution worker stopped before returning a result.",
+    tone: "warning",
+  },
+};
 
 function turnDetail(event: Record<string, unknown>) {
   const turn = numberField(event, "turn");

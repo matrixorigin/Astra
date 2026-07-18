@@ -865,13 +865,32 @@ impl AgentTranscriptView {
                         "cancelled"
                     }
                 };
-                self.live.notice(
+                let notice = if matches!(
+                    termination,
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+                ) {
+                    reason
+                        .and_then(astra_turn_core::interruption::InterruptionKind::from_label)
+                        .map_or_else(
+                            || {
+                                "Agent needs continuation · The run stopped before it completed."
+                                    .to_string()
+                            },
+                            |kind| {
+                                format!(
+                                    "Agent {} · {}",
+                                    kind.user_status().to_ascii_lowercase(),
+                                    kind.user_description()
+                                )
+                            },
+                        )
+                } else {
                     match reason {
                         Some(reason) => format!("Agent {status} · {reason}"),
                         None => format!("Agent {status}"),
-                    },
-                    None,
-                );
+                    }
+                };
+                self.live.notice(notice, None);
                 self.live.mark_settled();
                 // Local sub-runners and the durable server attempt transcript
                 // persistence before publishing this terminal lifecycle edge.
@@ -1639,6 +1658,30 @@ mod tests {
             "{settled}"
         );
         assert!(settled.contains("unreconciled live finding"), "{settled}");
+    }
+
+    #[test]
+    fn empty_completion_termination_renders_human_state_not_wire_reason() {
+        let mut view = loading_view(100, 24);
+        view.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+
+        assert!(view.apply_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted,
+                duration_ms: 1_000,
+                reason: Some("empty_completion".into()),
+            },
+        }));
+
+        let output = rendered(&view);
+        assert!(output.contains("Agent needs final answer"), "{output}");
+        assert!(
+            output.contains("stopped before producing a final answer"),
+            "{output}"
+        );
+        assert!(!output.contains("empty_completion"), "{output}");
     }
 
     #[test]

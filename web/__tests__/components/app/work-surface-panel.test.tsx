@@ -925,7 +925,11 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getAllByText("Needs final answer").length).toBeGreaterThan(0);
     expect(screen.queryByText("Interrupted")).toBeNull();
     expect(screen.getByText("Needs attention")).toBeInTheDocument();
-    expect(await screen.findByText("No final answer")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "The subagent stopped before producing a final answer. Its progress is saved.",
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.getAllByText("上海今日小雨，33°C / 25°C。").length,
     ).toBeGreaterThan(0);

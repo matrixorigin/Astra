@@ -872,12 +872,11 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         }
         return;
     }
-    // When the model produced tool calls (reads, edits, etc.) but no summary
-    // text, the turn was doing active work — not a truly empty completion.
-    // Use EmptyCompletion (semantically correct: loop ended, no final answer)
-    // but provide rich context so the user sees progress, not silence.
+    // When the model produced tool calls but no final text even after the
+    // bounded text-only recovery call, preserve a typed interruption for
+    // durability and render human copy. Internal reason codes and scheduler
+    // counters remain observability data; they are not user-facing prose.
     if state.total_tool_calls > 0 {
-        // ── Build tool summary (include failed tools marked as such) ──
         let recent_tools: Vec<String> = state
             .stall
             .tool_call_records
@@ -902,62 +901,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 .filter(|n| seen.insert(n.as_str()))
                 .map(|s| s.as_str())
                 .collect();
-            format!(
-                " Recent tools: {}. You can continue without re-reading — results are above.",
-                unique.join(", ")
-            )
-        };
-        let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
-            " A checkpoint was saved."
-        } else {
-            ""
-        };
-        // ── Surface pre-existing interruption reason ──
-        // When a real execution boundary (for example BudgetExhausted) stops
-        // the loop, the user deserves to know why instead of only that tools ran.
-        // the user deserves to know *why*, not just that tools ran.
-        let reason_note = match state.interruption.as_ref() {
-            Some(i)
-                if !matches!(
-                    i.kind,
-                    astra_turn_core::interruption::InterruptionKind::EmptyCompletion
-                ) =>
-            {
-                let mut note = format!(" Interruption: {}.", i.kind.label());
-                append_interruption_detail(&mut note, i);
-                note
-            }
-            _ => String::new(),
-        };
-        let textless_note = if state.last_finish_reason.as_deref() == Some("tool_calls") {
-            " The model was still requesting tools and did not produce final text."
-        } else {
-            " The loop ended without final text."
+            format!(" Completed tools included: {}.", unique.join(", "))
         };
         let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
-        let budget_note = if state.max_turns > 0 {
-            format!(
-                " Rounds: {rounds_completed}/{} completed, {} remaining.",
-                state.max_turns, state.remaining_turns
-            )
-        } else {
-            String::new()
-        };
-        let next_step_note = " Continue to resume from the preserved state; first summarize the evidence already gathered, then choose the next targeted action or provide the final answer.";
-        // Set final_text BEFORE interruption so settlement_interruption_summary
-        // sees the populated value (avoid coupling trap).
-        state.final_text = format!(
-            "[turn_interrupted] {} tool call(s) completed.{}{}{} Work preserved above.{}{}{}",
-            state.total_tool_calls,
-            reason_note,
-            textless_note,
-            budget_note,
-            checkpoint_note,
-            tool_summary,
-            next_step_note,
-        );
-        state.final_text_streamed = false;
-
         let detail = format!(
             "turn ended while working: {} tool call(s) completed, last_finish_reason={}, rounds_completed={}, remaining_turns={}, max_turns={}",
             state.total_tool_calls,
@@ -972,6 +918,11 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 astra_turn_core::interruption::ResumeAction::ContinueImmediately,
                 settlement_interruption_summary(state, Some(detail)),
             ));
+        }
+        if let Some(interruption) = state.interruption.as_ref() {
+            state.final_text = interruption_terminal_message(interruption);
+            state.final_text.push_str(&tool_summary);
+            state.final_text_streamed = false;
         }
         return;
     }
@@ -1389,10 +1340,10 @@ mod tests {
             Vec::<String>::new(),
             "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
-        assert!(state.final_text.contains("[turn_interrupted]"));
-        assert!(state.final_text.contains("tool call(s) completed"));
-        assert!(state.final_text.contains("Rounds:"));
-        assert!(state.final_text.contains("Continue to resume"));
+        assert!(state.final_text.contains("final answer"));
+        assert!(state.final_text.contains("Continue this session to resume"));
+        assert!(!state.final_text.contains("empty_completion"));
+        assert!(!state.final_text.contains("[turn_interrupted]"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

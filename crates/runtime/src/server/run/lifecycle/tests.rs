@@ -1879,9 +1879,7 @@ fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
         None,
         None,
     );
-    state.final_text =
-        "[turn_interrupted] 1 tool call(s) completed. Work preserved above.".to_string();
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+    let interruption = astra_turn_core::interruption::InterruptionRecord::new(
         astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
         astra_turn_core::interruption::ResumeAction::ContinueImmediately,
         astra_turn_core::interruption::InterruptionStateSummary {
@@ -1893,7 +1891,9 @@ fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
             stall_signal: None,
             resume_restricted_tools: vec![],
         },
-    ));
+    );
+    state.final_text = interruption.user_message.clone();
+    state.interruption = Some(interruption);
 
     assert_eq!(
         server_subrun_completed_agent_status(&state),

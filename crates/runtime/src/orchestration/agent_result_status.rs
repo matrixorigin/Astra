@@ -7,12 +7,12 @@ use astra_turn_core::orchestration_types::AgentStatus;
 use serde_json::json;
 
 use astra_turn_core::orchestration::agent_result_wire::{
-    AGENT_RESULT_INTERRUPTED_ERROR, AgentToolResultStatusKind, AgentToolWireOutcomeKind,
-    AgentToolWireProjection, agent_tool_completed_result_text, agent_tool_error_message,
-    agent_tool_incomplete_reason, agent_tool_interrupted_message, agent_tool_result_output_summary,
-    agent_tool_running_preview, agent_tool_status_summary, project_agent_tool_wire,
-    render_agent_tool_error, render_completed_agent_result, render_unknown_agent_result,
-    render_wait_for_agent_status, render_wait_timeout_outcome,
+    AgentToolResultStatusKind, AgentToolWireOutcomeKind, AgentToolWireProjection,
+    agent_tool_completed_result_text, agent_tool_error_message, agent_tool_incomplete_reason,
+    agent_tool_interrupted_message, agent_tool_result_output_summary, agent_tool_running_preview,
+    agent_tool_status_summary, project_agent_tool_wire, render_agent_tool_error,
+    render_completed_agent_result, render_unknown_agent_result, render_wait_for_agent_status,
+    render_wait_timeout_outcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,15 +209,15 @@ mod tests {
     fn interrupted_message_uses_shared_wait_copy_for_get_result() {
         assert_eq!(
             agent_tool_interrupted_message(true, Some("budget_exhausted")),
-            AGENT_RESULT_INTERRUPTED_ERROR
+            "Needs continuation: The run reached its turn budget."
         );
         assert_eq!(
             agent_tool_interrupted_message(false, Some("context_overflow")),
-            "agent interrupted: context_overflow"
+            "Needs compaction: The conversation exceeded the model context window."
         );
         assert_eq!(
             agent_tool_interrupted_message(false, None),
-            "agent interrupted"
+            "Agent stopped before completing its result."
         );
     }
 
@@ -249,6 +249,13 @@ mod tests {
         assert_eq!(
             v["status"],
             AgentToolResultStatusKind::StillRunning.as_str()
+        );
+        assert_eq!(v["delivery"], "asynchronous_parent_mailbox");
+        assert!(
+            v["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("Do not busy-poll")),
+            "{v}"
         );
     }
 

@@ -1609,7 +1609,16 @@ fn apply_local_agent_status(
             if !partial_result.trim().is_empty() {
                 projection.detail.output_summary = Some(partial_result.clone());
             }
-            projection.detail.error = Some(finish_reason.clone());
+            let interruption_kind =
+                astra_turn_core::interruption::InterruptionKind::from_label(finish_reason);
+            projection.detail.error = Some(interruption_kind.map_or_else(
+                || "The agent stopped before completing its result.".to_string(),
+                |kind| kind.user_description().to_string(),
+            ));
+            projection.set_attention_summary(Some(interruption_kind.map_or_else(
+                || "Needs continuation".to_string(),
+                |kind| kind.user_status().to_string(),
+            )));
         }
         AgentStatus::Failed { error, .. } => {
             projection
@@ -6908,7 +6917,7 @@ mod tests {
         ));
         assert_eq!(
             detail.error.as_deref(),
-            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some("Needs continuation: The run reached its turn budget.")
         );
     }
 
@@ -6935,7 +6944,7 @@ mod tests {
         assert_eq!(detail.output_summary.as_deref(), Some("partial draft"));
         assert_eq!(
             detail.error.as_deref(),
-            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some("Needs continuation: The run reached its turn budget.")
         );
     }
 

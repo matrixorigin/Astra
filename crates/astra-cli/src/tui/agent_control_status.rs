@@ -10,7 +10,6 @@ mod tests {
     use std::str::FromStr;
 
     use super::agent_control_interrupted_message;
-    use astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR;
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
 
     #[test]
@@ -34,15 +33,15 @@ mod tests {
     fn interrupted_message_uses_shared_wait_copy_for_get_result() {
         assert_eq!(
             agent_control_interrupted_message(true, Some("budget_exhausted")),
-            AGENT_RESULT_INTERRUPTED_ERROR
+            "Needs continuation: The run reached its turn budget."
         );
         assert_eq!(
             agent_control_interrupted_message(false, Some("context_overflow")),
-            "agent interrupted: context_overflow"
+            "Needs compaction: The conversation exceeded the model context window."
         );
         assert_eq!(
             agent_control_interrupted_message(false, None),
-            "agent interrupted"
+            "Agent stopped before completing its result."
         );
     }
 }

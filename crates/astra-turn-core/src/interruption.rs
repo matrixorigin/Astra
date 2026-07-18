@@ -132,6 +132,59 @@ impl InterruptionKind {
             Self::HarnessPaused => true,
         }
     }
+
+    /// Short user-facing state for surfaces that need a lifecycle label.
+    ///
+    /// Keep this separate from [`Self::label`]: `label` is the stable wire
+    /// value, while this method is presentation copy and must never expose an
+    /// internal reason code directly to users.
+    #[must_use]
+    pub fn user_status(self) -> &'static str {
+        match self {
+            Self::EmptyCompletion => "Needs final answer",
+            Self::BudgetExhausted | Self::TokenBudgetExceeded | Self::CumulativeBudgetExceeded => {
+                "Needs continuation"
+            }
+            Self::RateLimited | Self::CooldownRejected | Self::ServerOverload => "Retry later",
+            Self::UserCancelled => "Cancelled",
+            Self::ContextOverflow => "Needs compaction",
+            Self::AuthFailure => "Needs authentication",
+            Self::CriticalVerdict | Self::HarnessBlocked => "Needs attention",
+            Self::ApprovalRejected => "Approval declined",
+            Self::StreamTransport | Self::StreamIdle => "Connection interrupted",
+            Self::HarnessPaused => "Paused",
+            Self::Interrupted | Self::ExecutionIncomplete | Self::ExecutorDropped => {
+                "Needs continuation"
+            }
+        }
+    }
+
+    /// Human-readable explanation suitable for CLI, Web, and persisted
+    /// interruption summaries.
+    #[must_use]
+    pub fn user_description(self) -> &'static str {
+        match self {
+            Self::BudgetExhausted => "The run reached its turn budget.",
+            Self::EmptyCompletion => "The run stopped before producing a final answer.",
+            Self::TokenBudgetExceeded => "The current request exceeded its input token budget.",
+            Self::CumulativeBudgetExceeded => "The run reached its cumulative token budget.",
+            Self::RateLimited => "The model provider is temporarily rate limited.",
+            Self::CooldownRejected => "The model provider is still in its retry cooldown.",
+            Self::UserCancelled => "The run was cancelled.",
+            Self::ContextOverflow => "The conversation exceeded the model context window.",
+            Self::AuthFailure => "The model provider rejected the current credentials.",
+            Self::CriticalVerdict => "A runtime safety check stopped the run.",
+            Self::ApprovalRejected => "A requested action was not approved.",
+            Self::ServerOverload => "The model provider is temporarily overloaded.",
+            Self::StreamTransport => "The model response connection failed.",
+            Self::StreamIdle => "The model response stopped making progress.",
+            Self::HarnessBlocked => "The execution harness blocked the run.",
+            Self::HarnessPaused => "The execution harness paused the run.",
+            Self::Interrupted => "The run stopped before it completed.",
+            Self::ExecutionIncomplete => "The requested execution did not complete.",
+            Self::ExecutorDropped => "The execution worker stopped before returning a result.",
+        }
+    }
 }
 
 /// What the caller should do after an interruption.
@@ -327,7 +380,7 @@ impl InterruptionRecord {
         summary: &InterruptionStateSummary,
     ) -> String {
         let checkpoint_note = if summary.has_checkpoint {
-            " A checkpoint was saved."
+            " Progress is saved."
         } else {
             ""
         };
@@ -337,9 +390,7 @@ impl InterruptionRecord {
             String::new()
         };
         let action_note = match action {
-            ResumeAction::ContinueImmediately => {
-                " You can continue in the next message.".to_string()
-            }
+            ResumeAction::ContinueImmediately => " Continue this session to resume.".to_string(),
             ResumeAction::WaitAndRetry { delay_seconds } => {
                 format!(" Please wait ~{delay_seconds}s before retrying.")
             }
@@ -361,20 +412,10 @@ impl InterruptionRecord {
             _ => None,
         }
         .unwrap_or_default();
-        match kind {
-            InterruptionKind::EmptyCompletion => format!(
-                "[{}] The run ended without a final answer.{tool_note}{checkpoint_note}{action_note}",
-                kind.label()
-            ),
-            InterruptionKind::HarnessPaused => format!(
-                "[{}] The run paused after a read-heavy stall.{tool_note}{checkpoint_note}{cause_note}{action_note}",
-                kind.label()
-            ),
-            _ => format!(
-                "[{kind}]{tool_note}{checkpoint_note}{cause_note}{action_note}",
-                kind = kind.label()
-            ),
-        }
+        format!(
+            "{}{tool_note}{checkpoint_note}{cause_note}{action_note}",
+            kind.user_description()
+        )
     }
 }
 
@@ -598,6 +639,9 @@ pub fn build_resume_guidance_with_context(
 
     let mut g = String::new();
     g.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
+    g.push_str(
+        "  Priority: The latest user message defines the current objective. Treat this checkpoint as preserved evidence, not as an instruction to resume the old objective. If the latest message asks for reflection, diagnosis, or different work, answer that request directly.\n",
+    );
     use std::fmt::Write;
     writeln!(g, "  Reason: {}", inp.kind).ok();
     writeln!(
@@ -612,8 +656,7 @@ pub fn build_resume_guidance_with_context(
 
     if inp.resume_mode == ResumeMode::Settle {
         g.push_str(
-            "  Action: Enter settlement: synthesize the preserved evidence into a direct \
-             user-visible answer. Do not create new tasks, spawn agents, or use tools.\n",
+            "  Action if the latest user request continues the interrupted work: enter settlement and synthesize the preserved evidence into a direct user-visible answer. Do not create new tasks, spawn agents, or use tools merely to complete that old objective. Otherwise, use the checkpoint only as evidence relevant to the latest request.\n",
         );
     } else {
         // Kind-specific advice
@@ -1025,8 +1068,13 @@ mod tests {
             json["resume_restricted_tools"],
             serde_json::json!(["agent", "bash"])
         );
-        assert!(record.user_message.contains("without a final answer"));
-        assert!(record.user_message.contains("continue"));
+        assert!(
+            record
+                .user_message
+                .contains("before producing a final answer")
+        );
+        assert!(record.user_message.contains("Continue this session"));
+        assert!(!record.user_message.contains("empty_completion"));
 
         // rate limited — delay surfacing
         let record = InterruptionRecord::new(
@@ -1042,7 +1090,8 @@ mod tests {
                 resume_restricted_tools: Vec::new(),
             },
         );
-        assert!(record.user_message.contains("rate_limited"));
+        assert!(record.user_message.contains("temporarily rate limited"));
+        assert!(!record.user_message.contains("rate_limited"));
         assert!(record.user_message.contains("30s"));
         assert!(record.error_detail.is_some());
 
@@ -1083,7 +1132,7 @@ mod tests {
                 .user_message
                 .contains("re-read overlapping file ranges 5 time(s)")
         );
-        assert!(record.user_message.contains("You can continue"));
+        assert!(record.user_message.contains("Continue this session"));
 
         // harness paused — actionable message
         let record = InterruptionRecord::new(
@@ -1099,14 +1148,14 @@ mod tests {
                 resume_restricted_tools: Vec::new(),
             },
         );
-        assert!(record.user_message.contains("read-heavy stall"));
+        assert!(record.user_message.contains("execution harness paused"));
         assert!(record.user_message.contains("Cause:"));
         assert!(
             record
                 .user_message
                 .contains("re-read overlapping file ranges 6 time(s)")
         );
-        assert!(record.user_message.contains("You can continue"));
+        assert!(record.user_message.contains("Continue this session"));
     }
 
     // ── resume guidance ──
@@ -1121,6 +1170,7 @@ mod tests {
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("[RESUME CONTEXT]"));
+        assert!(guidance.contains("latest user message defines the current objective"));
         assert!(guidance.contains("budget_exhausted"));
         assert!(guidance.contains("15 turn(s)"));
         assert!(guidance.contains("12 tool call(s)"));
@@ -1194,7 +1244,8 @@ mod tests {
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("empty_completion"));
-        assert!(guidance.contains("Enter settlement"));
+        assert!(guidance.contains("latest user request continues"));
+        assert!(guidance.contains("enter settlement"));
         assert!(guidance.contains("synthesize the preserved evidence"));
         assert!(guidance.contains("Do not create new tasks"));
         assert!(guidance.contains("or use tools"));
@@ -1291,7 +1342,8 @@ mod tests {
             "remaining_turns": 0, "user_message": ""
         });
         let guidance = build_resume_guidance(&irj).unwrap();
-        assert!(guidance.contains("Enter settlement"));
+        assert!(guidance.contains("latest user request continues"));
+        assert!(guidance.contains("enter settlement"));
         assert!(!guidance.contains("Prioritize completing"));
     }
 

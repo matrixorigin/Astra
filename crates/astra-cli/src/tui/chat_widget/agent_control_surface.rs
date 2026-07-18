@@ -195,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             surface.failure_message().as_deref(),
-            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some("Needs continuation: The run reached its turn budget.")
         );
     }
 

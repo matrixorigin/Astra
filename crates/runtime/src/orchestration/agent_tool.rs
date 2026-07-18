@@ -42,6 +42,10 @@ use astra_turn_core::trace_event::TraceContext;
 /// rejecting the request without echoing the value. Bytes (not chars)
 /// because the limit is really about prompt-injection / log-bloat budget.
 const MAX_AGENT_ID_BYTES: usize = 256;
+/// `get_result` is an observation boundary, not a two-minute synchronization
+/// barrier. Completion is delivered through the parent mailbox; this short
+/// grace period only closes races with children that are already finishing.
+const AGENT_RESULT_OBSERVE_GRACE: Duration = Duration::from_secs(1);
 /// Total aggregate byte limit for the combined `results[]` array in
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
@@ -1486,6 +1490,8 @@ async fn render_agent_fanout_results(
         .iter()
         .filter(|item| fanout_result_item_has_terminal_incomplete(item))
         .count();
+    let all_slots_delivered = summary.completed == summary.target_count;
+    let incomplete_slot_count = summary.target_count.saturating_sub(summary.completed);
     let mut response = json!({
         "status": fanout_get_results_status_label(&updated),
         "group_id": group_id,
@@ -1507,6 +1513,15 @@ async fn render_agent_fanout_results(
             "max_bytes": read_options.max_bytes,
         },
         "fanout": fanout_group_to_json(&updated),
+        "provenance": {
+            "source": "fanout_group",
+            "target_count": summary.target_count,
+            "complete_deliverables": summary.completed,
+            "incomplete_slots": incomplete_slot_count,
+            "all_slots_delivered": all_slots_delivered,
+            "observed_terminal_incomplete_results": incomplete_result_count,
+            "attribution_contract": "Attribute a finding to a child only when that child's returned result contains it. If all_slots_delivered is false, disclose the completion ratio and label any independent parent analysis as parent synthesis rather than fanout consensus.",
+        },
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -1556,11 +1571,10 @@ async fn render_agent_fanout_results(
     if has_failures {
         obj.insert(
             "instruction".into(),
-            json!(
-            "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. \
-             The fanout group has a fixed target_count and adding agents corrupts accounting. \
-             Work with the results you have, or ask the user how to proceed."
-        ),
+            json!(format!(
+                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables. Disclose that ratio; do not describe incomplete slots as reviewers or validators, and label independent parent analysis as parent synthesis. Work with the results you have, or ask the user how to proceed.",
+                summary.completed, summary.target_count
+            )),
         );
     } else if summary.active == 0 && summary.terminal == summary.target_count {
         obj.insert(
@@ -2089,7 +2103,7 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
 
     if obj.contains_key("run_in_background") {
         return Err(
-            "unsupported `run_in_background` field for `agent(action='spawn')`: spawn is asynchronous by contract, so omit the field. Use get_result only for an explicit observe/wait step."
+            "unsupported `run_in_background` field for `agent(action='spawn')`: spawn is asynchronous by contract, so omit the field. Use get_result only for a short non-blocking observation; terminal results arrive through the parent mailbox."
                 .to_string(),
         );
     }
@@ -2193,7 +2207,7 @@ async fn handle_agent_get_result_action_inner(
         );
     }
 
-    let timeout = Duration::from_secs(120);
+    let timeout = AGENT_RESULT_OBSERVE_GRACE;
     match ctx.spawner.wait_for_agent_outcome(agent_id, timeout).await {
         WaitForAgentOutcome::Status(status) => {
             ctx.spawner
@@ -2268,6 +2282,7 @@ fn attach_fanout_to_agent_result(
             "active": summary.active,
             "terminal": summary.terminal,
             "completed": summary.completed,
+            "all_slots_delivered": summary.completed == summary.target_count,
             "interrupted": summary.interrupted,
             "failed": summary.failed,
             "cancelled_by_user": summary.cancelled_by_user,
@@ -4222,6 +4237,16 @@ mod tests {
             "budget_exhausted"
         );
         assert_eq!(collected_value["incomplete_results"], 1);
+        assert_eq!(collected_value["provenance"]["complete_deliverables"], 0);
+        assert_eq!(collected_value["provenance"]["incomplete_slots"], 1);
+        assert_eq!(collected_value["provenance"]["all_slots_delivered"], false);
+        assert!(
+            collected_value["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("0/1")
+                    && instruction.contains("parent synthesis")),
+            "{collected_value}"
+        );
         assert_eq!(
             collected_value["recovery"]["resume_existing_work_before_rerun"],
             true
@@ -4358,7 +4383,39 @@ mod tests {
         assert_eq!(value["fanout"]["slot_index"], 1);
         assert_eq!(value["fanout"]["id"], "storage");
         assert_eq!(value["fanout"]["completed"], 1);
+        assert_eq!(value["fanout"]["all_slots_delivered"], false);
         assert_eq!(value["fanout"]["collected"], 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_result_is_a_short_snapshot_not_a_two_minute_barrier() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Long review",
+                "prompt": "Keep reviewing until externally stopped",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let spawned: Value = serde_json::from_str(&spawn).unwrap();
+        let agent_id = spawned["agent_id"].as_str().unwrap();
+
+        let result =
+            handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "still_running");
+        assert_eq!(value["waited_secs"], 1);
+        assert_eq!(value["delivery"], "asynchronous_parent_mailbox");
+        assert!(
+            value["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("Do not busy-poll")),
+            "{value}"
+        );
     }
 
     #[tokio::test]

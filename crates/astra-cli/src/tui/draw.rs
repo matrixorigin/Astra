@@ -476,9 +476,9 @@ pub(crate) fn active_viewport(
     // Visibility rule: show the strip while ANY agent is still live
     // (running/cancelling). Completed-only and cancelled-only strips
     // linger for `STRIP_LINGER` so the user can glance at the final
-    // state, then dismiss. Failed entries stay visible until a new
-    // turn state replaces them, so failures are not silently missed
-    // after a short linger timeout. Users can still drill in via Ctrl+G.
+    // state, then dismiss. Every confirmed terminal state follows the same
+    // rule: failures and interruptions remain available in history and via
+    // Ctrl+G, but must not permanently occupy the live viewport.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
     let agent_ids = chat_widget.agent_status_strip_ids();
@@ -676,15 +676,13 @@ pub(crate) fn active_viewport(
 
 fn should_show_multi_agent_strip(cells: &[MultiAgentEntry], any_recently_terminal: bool) -> bool {
     let any_live = cells.iter().any(|entry| entry.state.is_actionable_active());
-    let any_attention = cells.iter().any(|entry| {
-        entry.state.status.is_failure()
-            || entry.state.status == AgentRunStatus::Interrupted
-            || matches!(
-                entry.state.confidence,
-                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
-            )
+    let any_uncertain = cells.iter().any(|entry| {
+        matches!(
+            entry.state.confidence,
+            AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+        )
     });
-    any_live || any_attention || any_recently_terminal
+    any_live || any_uncertain || any_recently_terminal
 }
 
 /// Pure priority resolver. Priority: **Active > Status > NextHint >
@@ -2029,9 +2027,26 @@ mod multi_agent_strip_tests {
     }
 
     #[test]
-    fn failed_and_cancelling_rows_keep_strip_visible() {
-        assert!(should_show_multi_agent_strip(&[entry(false, true)], false));
+    fn terminal_failure_dismisses_but_cancelling_stays_visible() {
+        assert!(
+            !should_show_multi_agent_strip(&[entry(false, true)], false),
+            "confirmed terminal failures remain in history and must not pin the live viewport"
+        );
         assert!(should_show_multi_agent_strip(&[cancelling_entry()], false));
+    }
+
+    #[test]
+    fn interrupted_only_strip_lingers_then_dismisses() {
+        let mut interrupted = entry(false, false);
+        interrupted.state = AgentRunState::observed(AgentRunStatus::Interrupted);
+        assert!(should_show_multi_agent_strip(
+            std::slice::from_ref(&interrupted),
+            true
+        ));
+        assert!(
+            !should_show_multi_agent_strip(&[interrupted], false),
+            "interrupted agents remain available through Ctrl+G without pinning the live strip"
+        );
     }
 
     #[test]

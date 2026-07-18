@@ -40,6 +40,7 @@ import {
 } from "@/lib/chat-scroll-state";
 import {
   ACTIVE_AGENT_SURFACE_STATUSES,
+  agentInterruptionPresentation,
   createEmptyWorkSurface,
   type AgentSurfaceItem,
   type SessionTask,
@@ -1012,28 +1013,19 @@ function agentNeedsConversationSignal(agent: AgentSurfaceItem) {
 function isDangerAgent(agent: AgentSurfaceItem) {
   const normalized = agent.status.toLowerCase();
   if (normalized === "failed" || normalized === "cancelled") return true;
-  if (normalized === "interrupted") return !isSoftAgentInterruption(agent);
+  if (normalized === "interrupted") {
+    return agentInterruptionPresentation(agent.reason).tone === "danger";
+  }
   return Boolean(agent.error);
 }
 
 function isWarningAgent(agent: AgentSurfaceItem) {
   const normalized = agent.status.toLowerCase();
   if (normalized === "waiting") return true;
-  if (normalized === "interrupted") return !isDangerAgent(agent);
+  if (normalized === "interrupted") {
+    return agentInterruptionPresentation(agent.reason).tone === "warning";
+  }
   return false;
-}
-
-function isSoftAgentInterruption(agent: AgentSurfaceItem) {
-  const reason = (agent.reason ?? "").trim().toLowerCase();
-  return (
-    !reason ||
-    reason === "interrupted" ||
-    reason === "empty_completion" ||
-    reason === "budget_exhausted" ||
-    reason === "turn_budget_exhausted" ||
-    reason === "max_turns_exceeded" ||
-    reason === "max_turns"
-  );
 }
 
 function conversationAgentTone(agent: AgentSurfaceItem): ConversationTone {
@@ -1053,22 +1045,7 @@ function conversationStatusLabel(agentOrStatus: AgentSurfaceItem | string) {
   const status = agentOrStatus.status.toLowerCase();
   if (status === "waiting") return "Waiting";
   if (status === "interrupted") {
-    const reason = (agentOrStatus.reason ?? "").trim().toLowerCase();
-    if (
-      !reason ||
-      reason === "interrupted" ||
-      reason === "empty_completion"
-    ) {
-      return "Needs final answer";
-    }
-    if (
-      reason === "budget_exhausted" ||
-      reason === "turn_budget_exhausted" ||
-      reason === "max_turns_exceeded" ||
-      reason === "max_turns"
-    ) {
-      return "Needs continuation";
-    }
+    return agentInterruptionPresentation(agentOrStatus.reason).label;
   }
   return statusLabel(agentOrStatus.status);
 }

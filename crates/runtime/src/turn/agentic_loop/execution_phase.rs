@@ -28,6 +28,44 @@ use crate::turn::observation_dispatcher::{
 };
 
 const USER_INTENT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_TEXTLESS_RESPONSE_RETRIES: u32 = 1;
+
+fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
+    turn_result.accum.tool_calls.is_empty()
+        && turn_result.accum.full_text.trim().is_empty()
+        && state.final_text.trim().is_empty()
+        && state
+            .hooks
+            .completion_settlement
+            .deferred_candidate_text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        && state.interruption.is_none()
+        && state.remaining_turns > 0
+        && state.hooks.completion_settlement.textless_response_retries
+            < MAX_TEXTLESS_RESPONSE_RETRIES
+}
+
+fn begin_textless_response_retry(state: &mut AgenticLoopState) {
+    let settlement = &mut state.hooks.completion_settlement;
+    settlement.textless_response_retries += 1;
+    settlement.text_only = true;
+    let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
+    state.push_volatile_payload(
+        super::host::VolatileKind::FinalAnswerSettlement,
+        serde_json::json!({
+            "schema": "final_answer_settlement.v1",
+            "signal": "textless_provider_response",
+            "evidence": {
+                "tool_calls_completed": state.total_tool_calls,
+                "rounds_completed": rounds_completed,
+                "remaining_turns": state.remaining_turns,
+            },
+            "instruction": "The previous model response ended without user-visible text. Produce a concise, direct final answer from the preserved evidence now. This recovery boundary is text-only; do not request tools, create tasks, or delegate work.",
+            "authority": "runtime_bounded_text_only_retry",
+        }),
+    );
+}
 
 /// Lazily-initialized process-wide alert dispatcher.
 ///
@@ -1169,6 +1207,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         "LLM call started"
     );
     let turn_result = host.execute_turn(state).await;
+    // `text_only` applies to exactly one model boundary. Clear it as soon as
+    // the host returns, including error paths, so a failed settlement request
+    // cannot restrict a later retry.
+    state.hooks.completion_settlement.text_only = false;
     tracing::debug!(
         target: "astra_timing",
         llm_round = llm_attempt_index,
@@ -1667,6 +1709,25 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(e);
         }
         AgenticIngestIterationControl::BreakLoop => {
+            // A successful provider response with neither tool calls nor text
+            // is not a completed user turn while budget remains. Retry once in
+            // an explicitly text-only settlement mode. This handles transient
+            // empty provider responses inside the runtime instead of exposing
+            // an internal `empty_completion` reason and asking the user to
+            // manually drive a continuation.
+            if should_retry_textless_response(state, &turn_result) {
+                begin_textless_response_retry(state);
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("textless_response_retry"),
+                );
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
             // Reconcile durable unfinished-work evidence once before accepting
             // a candidate final answer. This is independent of task type and
             // mutation heuristics, but respects the board's domain semantics:
@@ -1679,7 +1740,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // store read here would only add latency/failure exposure to the
             // final-answer path.
             let board = &state.hooks.task_board_snapshot;
-            let should_reconcile_completion = board.reconcilable_in_progress_count > 0
+            let has_candidate_answer = !state.final_text.trim().is_empty()
+                || state
+                    .hooks
+                    .completion_settlement
+                    .deferred_candidate_text
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty());
+            let should_reconcile_completion = has_candidate_answer
+                && board.reconcilable_in_progress_count > 0
                 && state.hooks.completion_settlement.reconciliation_attempts == 0
                 && state.remaining_turns > 0
                 && state.interruption.is_none();

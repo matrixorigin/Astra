@@ -4074,6 +4074,16 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         state: &AgenticLoopState,
     ) {
+        if state.hooks.completion_settlement.text_only {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_current_activatable_tool_names(HashSet::new());
+                executor.set_current_searchable_tool_schemas(&[]);
+                executor.set_current_selected_tool_offers(HashMap::new());
+            }
+            self.current_deferred_tool_names.clear();
+            self.valid_tools.clear();
+            return;
+        }
         let mut extras = self.admissible_extras.clone();
         let activatable_deferred_tool_names = self.deferred_tool_names_for_wire_tools(
             wire_tools,
@@ -4231,6 +4241,9 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         model_context_window: Option<u32>,
     ) -> String {
+        if state.hooks.completion_settlement.text_only {
+            return String::new();
+        }
         let manifest_names = self.deferred_tool_names_for_wire_tools(
             wire_tools,
             Some(model_name),
@@ -4291,6 +4304,15 @@ impl ServerAgenticLoopHost {
         effective.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
+        if state.hooks.completion_settlement.text_only {
+            effective.extend(
+                self.tool_schemas
+                    .iter()
+                    .chain(self.admission_tool_schemas.iter())
+                    .filter_map(tool_schema_name)
+                    .map(str::to_string),
+            );
+        }
         effective
     }
 
@@ -4951,6 +4973,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
+        let final_answer_settlement_text_only = state.hooks.completion_settlement.text_only;
         let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
 
@@ -5112,14 +5135,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
             );
-        let mut final_tools = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
-            &final_pipeline_tool_schemas,
-            &state.sticky_tool_schemas,
-            &visible_tools,
-            cache_cap,
-            state.llm_rounds_completed,
-        );
-        state.sticky_tool_schemas = final_tools.clone();
+        let mut final_tools = if final_answer_settlement_text_only {
+            Vec::new()
+        } else {
+            crate::turn::llm::context::stabilize_tool_schemas_for_cache(
+                &final_pipeline_tool_schemas,
+                &state.sticky_tool_schemas,
+                &visible_tools,
+                cache_cap,
+                state.llm_rounds_completed,
+            )
+        };
+        if !final_answer_settlement_text_only {
+            state.sticky_tool_schemas = final_tools.clone();
+        }
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut final_tools,
@@ -10413,6 +10442,33 @@ mod tests {
             "soft health must not mutate hard restricted_tools"
         );
         assert!(state.restricted_tools.contains("read_file"));
+    }
+
+    #[test]
+    fn final_answer_settlement_has_no_server_or_edge_tool_surface() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.text_only = true;
+
+        let visible = host.visible_turn_tools(&mut state);
+
+        assert!(visible.is_empty(), "settlement must advertise no tools");
+        assert!(
+            host.valid_tools.is_empty(),
+            "runtime admission must mirror the empty settlement surface"
+        );
+        assert!(
+            host.current_deferred_tool_names.is_empty(),
+            "deferred activation cannot bypass text-only settlement"
+        );
     }
 
     #[test]

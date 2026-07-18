@@ -394,6 +394,9 @@ impl AgenticLoopHost for SubRunHost {
             interaction_scoped_tool_restrictions(interaction_mode);
         let mut effective_restricted_tools = state.restricted_tools.clone();
         effective_restricted_tools.extend(interaction_scoped_restrictions);
+        if state.hooks.completion_settlement.text_only {
+            effective_restricted_tools.extend(tool_names_from_schemas(&self.all_schemas));
+        }
 
         let runtime_decision_user_intent = state.runtime_decision_user_intent();
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {

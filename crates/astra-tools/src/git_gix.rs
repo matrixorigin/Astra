@@ -1319,6 +1319,46 @@ fn validate_diff_path_exists(project_root: &Path, path_filter: &str) -> Result<(
     ))
 }
 
+/// Normalize the two supported range shapes at the tool boundary:
+/// `base_ref` + optional single `ref`, or one complete range supplied in
+/// `base_ref` by older callers. A complete range must never have `..HEAD`
+/// appended a second time.
+fn normalized_diff_range(base_ref: &str, tip_ref: Option<&str>) -> Result<String, String> {
+    if let Err(error) = reject_shell_meta(base_ref) {
+        return Err(error);
+    }
+    if base_ref.contains("..") {
+        if tip_ref.is_some() {
+            return Err(
+                "Error: git(action=diff): base_ref already contains a complete range; omit ref, or pass the complete range in ref and omit base_ref"
+                    .to_string(),
+            );
+        }
+        let separator = if base_ref.contains("...") {
+            "..."
+        } else {
+            ".."
+        };
+        let Some((base, tip)) = base_ref.split_once(separator) else {
+            return Err(format!(
+                "Error: malformed range '{base_ref}' — expected A..B or A...B"
+            ));
+        };
+        if base.is_empty() || tip.is_empty() {
+            return Err(format!(
+                "Error: malformed range '{base_ref}' — both endpoints are required"
+            ));
+        }
+        reject_shell_meta(base)?;
+        reject_shell_meta(tip)?;
+        return Ok(base_ref.to_string());
+    }
+
+    let tip = tip_ref.unwrap_or("HEAD");
+    reject_shell_meta(tip)?;
+    Ok(format!("{base_ref}..{tip}"))
+}
+
 /// `git diff … --stat` via the real `git` CLI (same sources as full diff, no bash).
 fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
@@ -1340,14 +1380,11 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
 
     let mut parts: Vec<String> = vec!["diff".into()];
     if let Some(base) = base_ref {
-        if let Err(e) = reject_shell_meta(base) {
-            return e;
-        }
-        let tip = git_ref.unwrap_or("HEAD");
-        if let Err(e) = reject_shell_meta(tip) {
-            return e;
-        }
-        parts.push(format!("{base}..{tip}"));
+        let range = match normalized_diff_range(base, git_ref) {
+            Ok(range) => range,
+            Err(error) => return error,
+        };
+        parts.push(range);
     } else if staged {
         parts.push("--cached".into());
     } else if let Some(r) = git_ref {
@@ -1403,14 +1440,10 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
 
     // Range diff: base_ref..ref (e.g., HEAD~5..HEAD)
     if let Some(base) = base_ref {
-        if let Err(e) = reject_shell_meta(base) {
-            return e;
-        }
-        let tip = git_ref.unwrap_or("HEAD");
-        if let Err(e) = reject_shell_meta(tip) {
-            return e;
-        }
-        let range = format!("{base}..{tip}");
+        let range = match normalized_diff_range(base, git_ref) {
+            Ok(range) => range,
+            Err(error) => return error,
+        };
         let mut cli_args = vec!["diff", &range, "--no-ext-diff", "--no-color"];
         let path_owned;
         if let Some(p) = path_filter {
@@ -3386,6 +3419,35 @@ mod tests {
         assert!(
             !result.starts_with("Error:"),
             "base_ref without ref should default tip to HEAD: {result}"
+        );
+    }
+
+    #[test]
+    fn git_action_diff_complete_range_is_not_appended_twice() {
+        assert_eq!(
+            normalized_diff_range("HEAD~1...HEAD", None).unwrap(),
+            "HEAD~1...HEAD"
+        );
+        let dir = init_temp_repo_with_linear_diff_history(2);
+        let result = diff(dir.path(), &json!({"base_ref": "HEAD~1...HEAD"}), 0.0, 0);
+        assert!(
+            !result.starts_with("Error:"),
+            "a complete compatibility range must execute once, not be composed with another tip: {result}"
+        );
+    }
+
+    #[test]
+    fn git_action_diff_complete_base_range_rejects_conflicting_ref() {
+        let dir = init_temp_repo_with_linear_diff_history(2);
+        let result = diff(
+            dir.path(),
+            &json!({"base_ref": "HEAD~1..HEAD", "ref": "HEAD"}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.contains("already contains a complete range"),
+            "{result}"
         );
     }
 

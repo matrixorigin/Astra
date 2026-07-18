@@ -18,7 +18,10 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ACTIVE_AGENT_SURFACE_STATUSES } from "@/lib/work-surface";
+import {
+  ACTIVE_AGENT_SURFACE_STATUSES,
+  agentInterruptionPresentation,
+} from "@/lib/work-surface";
 import type {
   AgentSurfaceItem,
   ExecutorBinding,
@@ -1465,19 +1468,11 @@ function agentDisplayState(agent: AgentSurfaceItem): {
     return { label: "Cancelled", tone: "danger" };
   }
   if (status === "interrupted") {
-    const reason = (agent.reason ?? "").trim().toLowerCase();
-    if (!reason || reason === "interrupted" || reason === "empty_completion") {
-      return { label: "Needs final answer", tone: "warning" };
-    }
-    if (
-      reason === "budget_exhausted" ||
-      reason === "turn_budget_exhausted" ||
-      reason === "max_turns_exceeded" ||
-      reason === "max_turns"
-    ) {
-      return { label: "Needs continuation", tone: "warning" };
-    }
-    return { label: "Interrupted", tone: "danger" };
+    const display = agentInterruptionPresentation(agent.reason);
+    return {
+      label: display.label,
+      tone: display.tone === "danger" ? "danger" : "warning",
+    };
   }
   return { label: statusLabel(agent.status), tone: "neutral" };
 }
@@ -1592,17 +1587,8 @@ function agentReasonText(
   agent: AgentSurfaceItem,
   display: ReturnType<typeof agentDisplayState>,
 ) {
-  const reason = (agent.reason ?? "").trim().toLowerCase();
-  if (!reason || reason === "interrupted" || reason === "empty_completion") {
-    return "No final answer";
-  }
-  if (
-    reason === "budget_exhausted" ||
-    reason === "turn_budget_exhausted" ||
-    reason === "max_turns_exceeded" ||
-    reason === "max_turns"
-  ) {
-    return "Turn budget reached";
+  if (agent.status.trim().toLowerCase() === "interrupted") {
+    return agentInterruptionPresentation(agent.reason).detail ?? display.label;
   }
   if (display.tone === "warning") {
     return display.label;
