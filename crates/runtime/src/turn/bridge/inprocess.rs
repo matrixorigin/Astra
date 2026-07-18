@@ -1630,6 +1630,29 @@ impl InProcessChatTurnBridge {
             bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
         let edge_callback_ledger = self.edge_callback_ledger.clone();
 
+        // The continuation payload is the sole prompt-facing tool-result
+        // authority. `/tools/result` is an authenticated delivery receipt,
+        // retained only long enough to make callback retries idempotent. Once
+        // the continuation arrives, consume that receipt and its expectation
+        // so successful tool rounds cannot fill the process ledger.
+        for tool_result in &tool_results {
+            let Some(request_id) = tool_result.get("request_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                &user_id,
+                &session_id,
+                &turn_chain_id,
+                &turn_chain_id,
+                request_id,
+            );
+            astra_turn_core::edge_ledger::acknowledge_ledger_entry(
+                &edge_callback_ledger,
+                &astra_turn_core::edge_ledger::tool_callback_key(&identity),
+            )
+            .await;
+        }
+
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_for_stream: Option<Vec<Value>> =
             if astra_turn_core::bridge_e2e_hooks::authorized(headers) {

@@ -162,22 +162,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
     }
 
-    // 1. Journal: session end event (idempotent — panic hook may have already written it)
-    if let Some(ref j) = state.journal {
-        let wrote =
-            super::session_guard::try_write_session_end(j, state.session_id.as_deref(), state.turn);
-        if wrote {
-            let end_event =
-                session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
-            enqueue_ingestion_pub(state, &end_event);
-        }
-    }
-    // 2. Finalize workspace: persist compact summary + mark completed
-    if state.turn > 0 {
-        if let Some(ref sid) = state.session_id {
-            astra_services::session_workspace::finalize_workspace_on_end(sid);
-        }
-    }
+    finalize_session_durable_boundary(state);
     // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
     let (gov_handle, con_handle) = if typed_memory_governance_ran {
         (None, None)
@@ -258,11 +243,6 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
             });
         }
     }
-    // 3e. End observability only after session-derived lessons/outcomes have
-    // been persisted so the lifecycle boundary matches the data flow.
-    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
-        let _ = hub.end_session(session_id);
-    }
     // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit)
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         if let Some(handle) = gov_handle {
@@ -273,6 +253,40 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
     })
     .await;
+    finalize_session_process_boundary(state);
+}
+
+/// Commit the local session boundary that must survive a slow or unavailable
+/// optional projection service. This is idempotent so a bounded frontend can
+/// call it after timing out the full finalizer without duplicating journal
+/// state.
+pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) {
+    if let Some(ref journal) = state.journal {
+        let wrote = super::session_guard::try_write_session_end(
+            journal,
+            state.session_id.as_deref(),
+            state.turn,
+        );
+        if wrote {
+            let end_event =
+                session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
+            enqueue_ingestion_pub(state, &end_event);
+        }
+    }
+    if state.turn > 0
+        && let Some(ref session_id) = state.session_id
+    {
+        astra_services::session_workspace::finalize_workspace_on_end(session_id);
+    }
+}
+
+/// Release process-local session state after the durable boundary is safe.
+/// Kept separate from optional memory maintenance so signal-driven shutdown
+/// can always converge within its frontend budget.
+pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
+    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
+        let _ = hub.end_session(session_id);
+    }
     if let Some(sid) = state.session_id.as_deref() {
         let dropped =
             super::session_side_effects::drop_unattributed_memory_recalls_at_turn_end(Some(sid));
@@ -285,7 +299,6 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
-    // 5. Clear panic guard
     clear_panic_guard();
 }
 

@@ -3,6 +3,7 @@
 //!
 //! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_TEST_BRIDGE_SECRET` (set below).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -21,7 +22,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 
@@ -202,7 +203,7 @@ fn matrixone_dummy() -> MatrixOneSettings {
     MatrixOneSettings::mock()
 }
 
-fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
+fn ledger_inject_app(capture: ToolPersistCapture) -> (Router, Arc<Mutex<HashMap<String, Value>>>) {
     let encryptor =
         Arc::new(FernetTokenEncryptor::new("ledger-e2e-fernet-key").expect("test fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -213,18 +214,18 @@ fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
         }));
     let ledger = base.edge_callback_ledger();
     let bridge = InProcessChatTurnBridge::new(matrixone_dummy(), encryptor)
-        .with_edge_callback_ledger(ledger);
+        .with_edge_callback_ledger(ledger.clone());
     let state = base
         .with_chat_turn_bridge(Arc::new(bridge))
         .with_chat_turn_bridge_secret("ledger-e2e-bridge-secret");
-    build_app(state)
+    (build_app(state), ledger)
 }
 
 #[tokio::test]
-async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round() {
+async fn canonical_tool_result_continuation_consumes_callback_receipt() {
     ensure_bridge_test_secret_env();
     let capture = ToolPersistCapture::default();
-    let app = ledger_inject_app(capture.clone());
+    let (app, ledger) = ledger_inject_app(capture.clone());
 
     let read_file_tool = json!({
         "type": "function",
@@ -244,6 +245,10 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
     // the tool or proceed to round 2.  The tool_calls appear in turn_complete.
     let payload = json!({
         "agent_id": "ledger-e2e-agent",
+        "session_id": "s-ledger-e2e",
+        "session_turn": 1,
+        "turn_chain_id": "chain-ledger-e2e",
+        "user_query_event_id": "query-ledger-e2e",
         "selected_model": { "model": "mock-model" },
         "messages": [{ "role": "user", "content": "read README" }],
         "edge_tools": [read_file_tool],
@@ -307,4 +312,57 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
         full.contains("\"has_tool_calls\":true"),
         "turn_complete should indicate tool calls: {full}"
     );
+
+    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        "ledger-e2e-user",
+        "s-ledger-e2e",
+        "chain-ledger-e2e",
+        "chain-ledger-e2e",
+        "call-ledger-e2e-1",
+    );
+    let callback_key = astra_turn_core::edge_ledger::tool_callback_key(&identity);
+    assert!(
+        astra_turn_core::edge_ledger::ledger_entry_is_expected(&ledger, &callback_key),
+        "tool_request must authorize its matching callback"
+    );
+    ledger.lock().await.insert(
+        callback_key.clone(),
+        json!({"body": {"status": "completed", "output": "README"}}),
+    );
+
+    // The next request carries the canonical prompt-facing result. Accepting
+    // it must consume the duplicate callback receipt and authorization before
+    // the second model round starts.
+    let continuation = json!({
+        "agent_id": "ledger-e2e-agent",
+        "session_id": "s-ledger-e2e",
+        "session_turn": 1,
+        "turn_chain_id": "chain-ledger-e2e",
+        "user_query_event_id": "query-ledger-e2e",
+        "selected_model": { "model": "mock-model" },
+        "messages": [{ "role": "user", "content": "read README" }],
+        "tool_results": [{
+            "request_id": "call-ledger-e2e-1",
+            "name": "read_file",
+            "status": "completed",
+            "output": "README",
+            "duration_ms": 1
+        }],
+        "test_llm_rounds": [{ "full_text": "continued" }]
+    });
+    let continuation_request = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", "Bearer ledger-e2e-token")
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", "ledger-inject-e2e-secret")
+        .body(Body::from(continuation.to_string()))
+        .unwrap();
+    let continuation_response = app.clone().oneshot(continuation_request).await.unwrap();
+    assert_eq!(continuation_response.status(), StatusCode::OK);
+    assert!(!ledger.lock().await.contains_key(&callback_key));
+    assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
+        &ledger,
+        &callback_key
+    ));
 }

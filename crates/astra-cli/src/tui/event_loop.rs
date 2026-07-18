@@ -932,19 +932,33 @@ async fn retire_local_agent_spawner_with_reason(
     reason: &str,
     drain: Duration,
 ) -> usize {
-    let active_agent_ids: Vec<_> = spawner
+    let active_agent_count = spawner
         .get_agent_history(None)
         .await
         .into_iter()
         .filter(|agent| !agent.status.is_terminal())
-        .map(|agent| agent.agent_id)
-        .collect();
-    let mut cancelled = 0;
-    for agent_id in active_agent_ids {
-        cancelled += usize::from(spawner.cancel_agent(&agent_id, reason).await);
+        .count();
+    // `drain` is the graceful-work budget, not merely the initial JoinSet
+    // wait. Bound the complete retirement future as well: durable cancellation
+    // may involve a slow server or mailbox store and must not pin terminal
+    // restoration indefinitely. Dropping the spawner-owned JoinSet aborts any
+    // remaining local hosts; durable active runs stay recoverable by lease.
+    let total_budget = drain.saturating_add(Duration::from_millis(500));
+    if tokio::time::timeout(
+        total_budget,
+        spawner.shutdown_and_wait_with_reason(drain, reason),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            reason,
+            budget_ms = total_budget.as_millis(),
+            active_agent_count,
+            "local agent retirement exceeded the total shutdown budget"
+        );
     }
-    spawner.shutdown_and_wait(drain).await;
-    cancelled
+    active_agent_count
 }
 
 fn ctrl_b_promoted_agent_message(
@@ -4267,10 +4281,54 @@ fn local_background_shell_started_message(task_id: &str, command: &str) -> Strin
     )
 }
 
-async fn run_interactive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+async fn run_interactive_shell_command(
+    command: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     let mut child = tokio::process::Command::new("sh");
     child.arg("-c").arg(command).kill_on_drop(true);
-    child.status().await
+    #[cfg(unix)]
+    {
+        // Give the interactive command its own process group so shutdown also
+        // reaches grandchildren launched by the shell.
+        unsafe {
+            child.pre_exec(|| {
+                if nix::libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let mut child = child.spawn()?;
+    tokio::select! {
+        status = child.wait() => status.map(Some),
+        _ = shutdown.cancelled() => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+            if child.id().is_some() {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Whether a `!cmd` shell command needs a real TTY (inherited stdio).
@@ -4489,11 +4547,18 @@ pub(crate) async fn run_tui_session(
                 )
                 .await;
             }
-            state.unregister_root_mailbox().await;
+            if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
+                .await
+                .is_err()
+            {
+                tracing::warn!("root mailbox unregister exceeded TUI init-failure budget");
+            }
             if let Some(task) = edge_heartbeat_task.take() {
                 task.abort();
                 let _ = task.await;
             }
+            crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
+            crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
             drop(pipeline_modules);
             return Err(format!("TUI init failed: {error}"));
         }
@@ -5162,23 +5227,28 @@ pub(crate) async fn run_tui_session(
                                     }
                                     LocalShellSubmission::Interactive(command) => {
                                         let command_for_child = command.clone();
+                                        let shell_shutdown = session_shutdown_token.clone();
                                         let status = guard
                                             .with_restored(|| async move {
                                                 println!("! {command_for_child}");
-                                                run_interactive_shell_command(&command_for_child)
-                                                    .await
+                                                run_interactive_shell_command(
+                                                    &command_for_child,
+                                                    &shell_shutdown,
+                                                )
+                                                .await
                                             })
                                             .await;
                                         guard.terminal.invalidate_viewport();
                                         match status {
-                                            Ok(Ok(status)) if status.success() => {
+                                            Ok(Ok(None)) => break 'main Ok(()),
+                                            Ok(Ok(Some(status))) if status.success() => {
                                                 chat_widget.commit_system(
                                                     history_cell::system::SystemCell::response(
                                                         format!("! {command}"),
                                                     ),
                                                 );
                                             }
-                                            Ok(Ok(status)) => {
+                                            Ok(Ok(Some(status))) => {
                                                 chat_widget.commit_system(
                                                     history_cell::system::SystemCell::error(format!(
                                                         "! {command}: exit {}",
@@ -8325,6 +8395,7 @@ pub(crate) async fn run_tui_session(
         let _ = shutdown_monitor.await;
         None
     };
+    let signal_driven_shutdown = shutdown_signal.is_some();
     if let Some(signal) = shutdown_signal {
         tracing::info!(
             signal = signal.label(),
@@ -8348,7 +8419,12 @@ pub(crate) async fn run_tui_session(
         )
         .await;
     }
-    state.unregister_root_mailbox().await;
+    if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
+        .await
+        .is_err()
+    {
+        tracing::warn!("root mailbox unregister exceeded TUI shutdown budget");
+    }
     if let Some(task) = edge_heartbeat_task.take() {
         task.abort();
         let _ = task.await;
@@ -8390,8 +8466,10 @@ pub(crate) async fn run_tui_session(
         &mut background_task_projection_cache,
     )
     .await;
-    if let Err(error) = file_writer_runtime.shutdown().await {
-        tracing::warn!(%error, "TUI file writer did not shut down cleanly");
+    match tokio::time::timeout(Duration::from_secs(2), file_writer_runtime.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "TUI file writer did not shut down cleanly"),
+        Err(_) => tracing::warn!("TUI file writer exceeded shutdown budget"),
     }
     surface_tui_file_write_errors(
         &mut file_write_errors,
@@ -8402,14 +8480,29 @@ pub(crate) async fn run_tui_session(
     );
     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
     flush_chat_widget(&mut guard, &mut chat_widget, width);
-    if let Some(journal) = state.journal.as_ref() {
-        crate::cli::session::session_guard::try_write_session_end(
-            journal,
-            state.session_id.as_deref(),
-            state.turn,
+    let finalization_budget = if signal_driven_shutdown {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(8)
+    };
+    let finalization_completed = tokio::time::timeout(
+        finalization_budget,
+        crate::cli::session::session_cleanup::finalize_session(&mut state),
+    )
+    .await
+    .is_ok();
+    if !finalization_completed {
+        tracing::warn!(
+            budget_ms = finalization_budget.as_millis(),
+            "optional session finalization exceeded TUI shutdown budget"
         );
+        // These two idempotent boundaries are mandatory even when optional
+        // memory governance timed out: the canonical session is resumable,
+        // cloud ingest is notified, and process-local lifecycle state is
+        // released.
+        crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
+        crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
     }
-    crate::cli::session::session_guard::clear_panic_guard();
     // The pipeline bundle owns the skill watcher. Drop it only after all
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
@@ -9512,7 +9605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_rebind_retires_active_local_agents_with_explicit_terminal_state() {
+    async fn session_rebind_retires_active_local_agents_as_system_lifecycle_work() {
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let output = spawner
             .spawn(
@@ -9541,7 +9634,7 @@ mod tests {
         assert!(matches!(
             state.status,
             AgentStatus::Cancelled {
-                by_user: true,
+                by_user: false,
                 ref reason,
             } if reason == LOCAL_AGENT_SESSION_REBIND_REASON
         ));
@@ -12313,7 +12406,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_shell_wait_yields_to_runtime_timers() {
-        let shell = run_interactive_shell_command("sleep 0.15");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shell = run_interactive_shell_command("sleep 0.15", &shutdown);
         tokio::pin!(shell);
 
         assert!(
@@ -12322,7 +12416,35 @@ mod tests {
                 .is_err(),
             "the child should still be running while the runtime timer fires"
         );
-        assert!(shell.await.expect("wait for shell").success());
+        assert!(
+            shell
+                .await
+                .expect("wait for shell")
+                .expect("ordinary child exit")
+                .success()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_shell_converges_when_session_shuts_down() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let trigger = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_interactive_shell_command("sleep 30", &shutdown),
+        )
+        .await
+        .expect("shutdown must bound the interactive child wait")
+        .expect("spawn interactive child");
+        assert!(
+            outcome.is_none(),
+            "shutdown should not look like child exit"
+        );
     }
 
     #[test]

@@ -3392,6 +3392,24 @@ impl DynamicAgentSpawner {
     /// Tasks that exceed `deadline` are cancelled through the normal
     /// finalization path before their host tasks are reaped.
     pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) -> Vec<(String, String)> {
+        self.shutdown_and_wait_with_reason(
+            deadline,
+            "one-shot caller deadline elapsed while waiting for background agent",
+        )
+        .await
+    }
+
+    /// Drain background agents within `deadline`, then cancel unfinished work
+    /// as a system lifecycle action using the caller-provided reason.
+    ///
+    /// Session shutdown and session rebind are not user cancellation. Keeping
+    /// that distinction here prevents frontends from calling the public
+    /// user-action API merely to converge owned work during teardown.
+    pub async fn shutdown_and_wait_with_reason(
+        &self,
+        deadline: std::time::Duration,
+        reason: &str,
+    ) -> Vec<(String, String)> {
         let mut set = self
             .background_tasks
             .lock()
@@ -3435,11 +3453,7 @@ impl DynamicAgentSpawner {
                     .clone();
                 for agent_id in unfinished {
                     let _ = self
-                        .cancel_agent_with_origin(
-                            &agent_id,
-                            "one-shot caller deadline elapsed while waiting for background agent",
-                            CancelOrigin::System,
-                        )
+                        .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::System)
                         .await;
                 }
                 set.abort_all();

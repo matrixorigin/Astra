@@ -5419,16 +5419,26 @@ printf 'probe.txt:1:needle\n'
 
     #[tokio::test]
     async fn readonly_command_cancels_and_keeps_partial_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("readonly-command-ready");
         let token = CancellationToken::new();
         let trigger = token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            trigger.cancel();
+        let ready_for_trigger = ready.clone();
+        let trigger_task = tokio::spawn(async move {
+            for _ in 0..200 {
+                if ready_for_trigger.exists() {
+                    trigger.cancel();
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
         });
 
         let mut cmd = Command::new("bash");
+        cmd.current_dir(dir.path());
         cmd.arg("-c")
-            .arg("for i in $(seq 1 5); do echo line_$i; sleep 0.1; done; sleep 5");
+            .arg("echo line_1; touch readonly-command-ready; sleep 5");
 
         let output = run_readonly_command_with_partial(
             &mut cmd,
@@ -5441,6 +5451,10 @@ printf 'probe.txt:1:needle\n'
         .await
         .expect("command should return partial output on cancellation");
 
+        assert!(
+            trigger_task.await.expect("cancellation trigger task"),
+            "child did not reach the cancellation boundary"
+        );
         assert!(output.cancelled, "expected cancelled output");
         assert!(!output.timed_out, "cancellation should not report timeout");
         assert!(

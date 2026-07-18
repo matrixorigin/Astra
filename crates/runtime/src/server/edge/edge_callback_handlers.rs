@@ -1,9 +1,9 @@
 //! §5.5 edge callbacks: tool results and approval responses from thin clients / edge executors.
 //!
 //! Entries are keyed `{user_id}:tool:{request_id}` / `{user_id}:approval:{request_id}`.
-//! [`InProcessChatTurnBridge`](crate::turn::bridge::inprocess::InProcessChatTurnBridge) and
-//! [`astra_turn_core::cloud_tool_delivery`] poll and `remove` keys until `turn_timeout_s` (user id from
-//! `x-mo-user-id` on the chat turn).
+//! Runtime consumers either take the callback payload or acknowledge the
+//! canonical continuation and remove its receipt. User identity comes from
+//! the authenticated chat-turn boundary, never from an untrusted callback key.
 
 use axum::extract::Extension;
 
@@ -20,7 +20,8 @@ use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use serde_json::Value;
 
 use astra_turn_core::edge_ledger::{
-    LEDGER_MAX_ENTRIES, approval_callback_key, ledger_entry_is_expected, tool_callback_key,
+    LEDGER_MAX_ENTRIES, approval_callback_key, ledger_entry_is_expected,
+    sweep_expired_entries_locked, tool_callback_key,
 };
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
@@ -90,6 +91,7 @@ pub(crate) fn insert_ledger_entry(
     key: String,
     value: serde_json::Value,
 ) -> Result<bool, LedgerInsertError> {
+    sweep_expired_entries_locked(ledger);
     if let Some(existing) = ledger.get(&key) {
         if existing == &value {
             return Ok(false);
@@ -116,6 +118,7 @@ fn insert_approval_ledger_entry(
     value: serde_json::Value,
     durable_fallback_ready: bool,
 ) -> Result<bool, LedgerInsertError> {
+    sweep_expired_entries_locked(ledger);
     if let Some(existing) = ledger.get(&key) {
         return if existing == &value {
             Ok(false)
