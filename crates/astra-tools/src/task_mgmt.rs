@@ -220,17 +220,18 @@ fn add_dependency_edge(
         .blocked_by
         .iter()
         .any(|id| id == blocker_id);
-    if blocker_has_edge && blocked_has_reverse {
-        return Ok(());
-    }
-
     // Cycle detection: adding blocker_id → blocked_id must not create a path
-    // from blocked_id back to blocker_id.
-    if !blocker_has_edge && would_create_cycle(tasks, blocker_id, blocked_id) {
+    // from blocked_id back to blocker_id. Validate legacy/asymmetric forward
+    // halves too: repairing their reverse metadata must not silently bless an
+    // already-cyclic persisted graph.
+    if would_create_cycle(tasks, blocker_id, blocked_id) {
         return Err(format!(
             "adding dependency '{}' → '{}' would create a cycle. Review the dependency graph",
             blocker_id, blocked_id
         ));
+    }
+    if blocker_has_edge && blocked_has_reverse {
+        return Ok(());
     }
 
     // Repair either half of a legacy/asymmetric edge independently. Treating
@@ -738,21 +739,69 @@ impl TaskMutationStatus {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TaskMutationOutcome {
     pub output: String,
-    /// Canonical control-flow evidence. The booleans below remain on the wire
-    /// for compatibility, but internal callers must branch on this enum.
+    /// Canonical control-flow evidence. Compatibility booleans are derived
+    /// during serialization and are never stored as a second mutable truth.
     pub status: TaskMutationStatus,
-    pub success: bool,
-    pub changed: bool,
     pub data: Value,
+}
+
+impl serde::Serialize for TaskMutationOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TaskMutationOutcome", 5)?;
+        state.serialize_field("output", &self.output)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("success", &self.status.is_success())?;
+        state.serialize_field("changed", &self.status.changed())?;
+        state.serialize_field("data", &self.data)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TaskMutationOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct WireOutcome {
+            output: String,
+            status: TaskMutationStatus,
+            #[serde(default)]
+            success: Option<bool>,
+            #[serde(default)]
+            changed: Option<bool>,
+            data: Value,
+        }
+
+        let WireOutcome {
+            output,
+            status,
+            success: _legacy_success,
+            changed: _legacy_changed,
+            mut data,
+        } = WireOutcome::deserialize(deserializer)?;
+        if let Some(object) = data.as_object_mut() {
+            object.insert("success".to_string(), Value::Bool(status.is_success()));
+            object.insert("mutation_status".to_string(), json!(status));
+        }
+        Ok(Self {
+            output,
+            status,
+            data,
+        })
+    }
 }
 
 impl TaskMutationOutcome {
     fn from_parts(summary: impl Into<String>, mut data: Value, status: TaskMutationStatus) -> Self {
         let success = status.is_success();
-        let changed = status.changed();
         if let Some(object) = data.as_object_mut() {
             object.insert("success".to_string(), Value::Bool(success));
             object.insert("mutation_status".to_string(), json!(status));
@@ -760,8 +809,6 @@ impl TaskMutationOutcome {
         Self {
             output: prefix_summary(summary.into(), data.to_string()),
             status,
-            success,
-            changed,
             data,
         }
     }
@@ -771,8 +818,6 @@ impl TaskMutationOutcome {
         Self {
             output: format!("Error: {message}"),
             status: TaskMutationStatus::Failed,
-            success: false,
-            changed: false,
             data: json!({
                 "success": false,
                 "mutation_status": TaskMutationStatus::Failed,
@@ -798,8 +843,6 @@ impl TaskMutationOutcome {
         Self {
             output: format!("Indeterminate: {message}"),
             status: TaskMutationStatus::Indeterminate,
-            success: false,
-            changed: false,
             data: json!({
                 "success": false,
                 "mutation_status": TaskMutationStatus::Indeterminate,
@@ -5098,7 +5141,7 @@ mod tests {
             )
             .await
             .expect("typed applied outcome");
-        assert!(applied.success && applied.changed);
+        assert!(applied.status.is_success() && applied.status.changed());
         assert_eq!(
             store
                 .get_session_version("typed-protocol")
@@ -5120,7 +5163,7 @@ mod tests {
             )
             .await
             .expect("typed refused outcome");
-        assert!(!refused.success && !refused.changed);
+        assert!(!refused.status.is_success() && !refused.status.changed());
         assert_eq!(
             store
                 .get_session_version("typed-protocol")
@@ -5536,6 +5579,59 @@ mod tests {
         let tasks = m.snapshot().await.unwrap();
         assert_eq!(tasks[0].blocks, ["task-2"]);
         assert_eq!(tasks[1].blocked_by, ["task-1"]);
+    }
+
+    #[tokio::test]
+    async fn dependency_repair_rejects_an_asymmetric_edge_inside_a_cycle() {
+        let m = mgr();
+        for title in ["a", "b", "c"] {
+            m.create(&json!({"title": title})).await;
+        }
+        let mut snapshot = m.try_snapshot_state().await.unwrap();
+        snapshot.tasks[0].blocks.push("task-2".into());
+        snapshot.tasks[0].blocked_by.clear();
+        snapshot.tasks[1].blocked_by.push("task-1".into());
+        snapshot.tasks[1].blocks.push("task-3".into());
+        snapshot.tasks[2].blocked_by.push("task-2".into());
+        // Persisted forward half C -> A closes the cycle, but its reverse
+        // metadata is missing. Repair must surface corruption, not bless it.
+        snapshot.tasks[2].blocks.push("task-1".into());
+        m.restore_snapshot(&snapshot).await.unwrap();
+
+        let repaired = m
+            .update_outcome(&json!({"task_id": "task-3", "add_blocks": ["task-1"]}))
+            .await;
+
+        assert_eq!(repaired.status, TaskMutationStatus::Failed, "{repaired:?}");
+        assert!(repaired.output.contains("create a cycle"), "{repaired:?}");
+        let tasks = m.snapshot().await.unwrap();
+        assert!(
+            tasks[0].blocked_by.is_empty(),
+            "failed repair mutated graph: {tasks:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_outcome_deserialization_normalizes_legacy_duplicate_truth() {
+        let outcome: TaskMutationOutcome = serde_json::from_value(json!({
+            "output": "legacy",
+            "status": "applied",
+            "success": false,
+            "changed": false,
+            "data": {
+                "success": false,
+                "mutation_status": "failed"
+            }
+        }))
+        .unwrap();
+
+        assert!(outcome.status.is_success());
+        assert!(outcome.status.changed());
+        assert_eq!(outcome.data["success"], true);
+        assert_eq!(outcome.data["mutation_status"], "applied");
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(encoded["success"], true);
+        assert_eq!(encoded["changed"], true);
     }
 
     #[tokio::test]

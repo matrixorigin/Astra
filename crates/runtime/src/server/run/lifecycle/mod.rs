@@ -170,9 +170,8 @@ fn try_send_attached_stream_event(
             tracing::warn!(
                 target: "astra_runtime::run_lifecycle",
                 run_id,
-                "SSE observer fell behind; detaching it so the durable run can continue"
+                "SSE observer fell behind; dropping this live event while keeping the observer attached for subsequent events and durable replay"
             );
-            *sender = None;
         }
     }
 }

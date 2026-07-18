@@ -906,6 +906,10 @@ pub struct DynamicAgentSpawner {
     mailbox_router: Arc<AgentMailboxRouter>,
     /// For tracking spawned agents.
     active_agents: Arc<RwLock<HashMap<String, SpawnedAgentState>>>,
+    /// Parent run ids whose descendant trees are being or have been
+    /// cancelled. Spawn reservation takes a read fence before inserting;
+    /// cancellation takes the write fence before its authoritative snapshot.
+    cancelling_parent_runs: Arc<RwLock<HashSet<String>>>,
     /// Progress event broadcaster.
     progress_broadcaster: Arc<ProgressBroadcaster>,
     /// Shared context cache for cross-agent knowledge sharing.
@@ -993,6 +997,7 @@ impl DynamicAgentSpawner {
         Self {
             mailbox_router,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
+            cancelling_parent_runs: Arc::new(RwLock::new(HashSet::new())),
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
@@ -2368,6 +2373,27 @@ impl DynamicAgentSpawner {
             execution_metadata: context.execution_metadata.clone(),
         };
         {
+            // Hold the cancellation read fence through reservation. Therefore
+            // cancellation either snapshots this child or wins first and
+            // rejects it; no descendant can appear after the snapshot.
+            let cancellation_fence = self.cancelling_parent_runs.read().await;
+            if cancellation_fence.contains(&context.parent_run_id) {
+                drop(cancellation_fence);
+                self.record_fanout_spawn_rejected_for_input(
+                    fanout_slot.as_ref(),
+                    &input,
+                    context,
+                    format!(
+                        "parent run '{}' is cancelled; descendant spawn rejected",
+                        context.parent_run_id
+                    ),
+                )
+                .await;
+                return Err(SpawnError::Race(format!(
+                    "parent run '{}' is cancelled; descendant spawn rejected",
+                    context.parent_run_id
+                )));
+            }
             let mut active_agents = self.active_agents.write().await;
             if let Some(limit) = self.max_concurrent_agents {
                 let active = active_agents.len();
@@ -2390,6 +2416,8 @@ impl DynamicAgentSpawner {
                 }
             }
             active_agents.insert(agent_id.clone(), state);
+            drop(active_agents);
+            drop(cancellation_fence);
         }
 
         // 5. Every dynamic agent is an addressable runtime object. Mailbox
@@ -2859,6 +2887,11 @@ impl DynamicAgentSpawner {
         reason: DescendantCancellationReason,
     ) -> usize {
         let reason = reason.as_str();
+        // Serialize the snapshot boundary with spawn reservation. Any spawn
+        // already holding the read fence finishes insertion and is included;
+        // any later spawn observes the cancellation marker and is rejected.
+        let mut cancellation_fence = self.cancelling_parent_runs.write().await;
+        cancellation_fence.insert(parent_run_id.to_string());
         let mut children_by_parent: HashMap<String, Vec<(String, String)>> = HashMap::new();
         {
             let active = self.active_agents.read().await;
@@ -2882,9 +2915,11 @@ impl DynamicAgentSpawner {
             };
             for (agent_id, child_run_id) in children {
                 descendants.push(agent_id.clone());
+                cancellation_fence.insert(child_run_id.clone());
                 pending.push_back(child_run_id.clone());
             }
         }
+        drop(cancellation_fence);
 
         let mut cancelled = 0;
         for agent_id in descendants.into_iter().rev() {
@@ -3354,6 +3389,7 @@ impl DynamicAgentSpawner {
         Self {
             mailbox_router: Arc::clone(&self.mailbox_router),
             active_agents: Arc::clone(&self.active_agents),
+            cancelling_parent_runs: Arc::clone(&self.cancelling_parent_runs),
             progress_broadcaster: Arc::clone(&self.progress_broadcaster),
             context_cache: Arc::clone(&self.context_cache),
             executor: self.executor.clone(),
@@ -6820,7 +6856,7 @@ mod tests {
         };
 
         let mut nested_context = make_bg_context();
-        nested_context.parent_run_id = first_run_id;
+        nested_context.parent_run_id = first_run_id.clone();
         nested_context.parent_agent_id = first_agent_id.clone();
         nested_context.recursion_depth = 1;
         let nested = spawner
@@ -6855,6 +6891,24 @@ mod tests {
                 } if reason == DescendantCancellationReason::AncestorCancelled.as_str()
             ));
         }
+
+        let rejected_root_child = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(
+            matches!(rejected_root_child, Err(SpawnError::Race(ref error)) if error.contains("parent run 'root' is cancelled")),
+            "a cancelled parent must be fenced against late descendants: {rejected_root_child:?}"
+        );
+
+        let mut rejected_nested_context = make_bg_context();
+        rejected_nested_context.parent_run_id = first_run_id;
+        rejected_nested_context.parent_agent_id = first_agent_id.clone();
+        rejected_nested_context.recursion_depth = 1;
+        let rejected_nested = spawner
+            .spawn(make_bg_input(), &rejected_nested_context)
+            .await;
+        assert!(
+            matches!(rejected_nested, Err(SpawnError::Race(ref error)) if error.contains("descendant spawn rejected")),
+            "every cancelled descendant run must also fence new children: {rejected_nested:?}"
+        );
     }
 
     /// REGRESSION (reviewer L2-3): after `spawn(run_in_background:true)`

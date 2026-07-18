@@ -868,6 +868,7 @@ impl SessionState {
     /// different session id.
     pub async fn prepare_for_session_rebind(&mut self) {
         self.unregister_root_mailbox().await;
+        self.bg_task_list_cache.write().await.clear();
     }
 
     /// Unregister and drop the root mailbox so a subsequent turn can
@@ -1180,10 +1181,13 @@ mod default_tests {
 
         let mut state = SessionState::default();
         state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
+        *state.bg_task_list_cache.write().await =
+            "<background_tasks count=\"1\"><task id=\"old\" /></background_tasks>".into();
 
         state.prepare_for_session_rebind().await;
 
         assert!(state.root_mailbox.is_none());
+        assert!(state.bg_task_list_cache.read().await.is_empty());
         router
             .register(root_addr, None)
             .await

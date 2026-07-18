@@ -85,8 +85,8 @@ impl From<&astra_tools::task_mgmt::TaskMutationOutcome> for TodoMutationResult {
     fn from(outcome: &astra_tools::task_mgmt::TaskMutationOutcome) -> Self {
         Self {
             status: outcome.status,
-            success: outcome.success,
-            changed: outcome.changed,
+            success: outcome.status.is_success(),
+            changed: outcome.status.changed(),
             data: outcome.data.clone(),
         }
     }
@@ -498,6 +498,30 @@ fn session_todo_owner_mismatch_error(session_id: &str, user_id: &str, reason: &s
     )
 }
 
+fn decode_adopt_task_edges(
+    raw: Option<&str>,
+    task_id: &str,
+    column: &str,
+) -> Result<Vec<String>, String> {
+    raw.map(|value| {
+        serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+            format!("source task {task_id} has invalid {column} dependency JSON: {error}")
+        })
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
+}
+
+fn encode_adopt_task_edges(edges: Vec<String>) -> Result<Option<String>, String> {
+    if edges.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(&edges)
+            .map(Some)
+            .map_err(|error| format!("encode detached source dependency edges: {error}"))
+    }
+}
+
 async fn ensure_session_todo_session_owner(
     executor: &mut sqlx::MySqlConnection,
     session_id: &str,
@@ -609,25 +633,32 @@ async fn adopt_task_into_session_atomic(
         }
     }
 
-    let source_row: Option<(
+    let source_rows: Vec<(
+        String,
         String,
         Option<String>,
         Option<String>,
         Option<String>,
         String,
+        Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT title, description, subtasks, metadata, status FROM session_todos \
-             WHERE session_id = ? AND todo_id = ? AND user_id = ? \
-               AND status NOT IN ('migrated', 'deleted') \
-             LIMIT 1 FOR UPDATE",
+        "SELECT todo_id, title, description, subtasks, metadata, status, blocks, blocked_by \
+         FROM session_todos WHERE session_id = ? AND user_id = ? \
+         ORDER BY ordinal ASC FOR UPDATE",
     )
     .bind(source_session)
-    .bind(source_task_id)
     .bind(user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| format!("source lookup failed: {e}"))?;
-    let Some((title, description, subtasks_json, source_metadata, source_status)) = source_row
+    let Some((_, title, description, subtasks_json, source_metadata, source_status, _, _)) =
+        source_rows
+            .iter()
+            .find(|(todo_id, _, _, _, _, status, _, _)| {
+                todo_id == source_task_id && status != "migrated" && status != "deleted"
+            })
+            .cloned()
     else {
         return Err(format!(
             "source task {source_session}:{source_task_id} not found, not owned by you, or already migrated"
@@ -652,8 +683,51 @@ async fn adopt_task_into_session_atomic(
             format!("source task {source_session}:{source_task_id} has invalid metadata: {error}")
         })?;
 
+    // Moving a node across task graphs must remove every source-board edge
+    // that references it. Leaving a peer's `blocked_by` pointing at the
+    // migrated tombstone makes otherwise runnable work permanently blocked.
+    let mut peer_edge_updates = Vec::new();
+    for (todo_id, _, _, _, _, _, raw_blocks, raw_blocked_by) in &source_rows {
+        let mut blocks = decode_adopt_task_edges(raw_blocks.as_deref(), todo_id, "blocks")?;
+        let mut blocked_by =
+            decode_adopt_task_edges(raw_blocked_by.as_deref(), todo_id, "blocked_by")?;
+        let old_blocks = blocks.clone();
+        let old_blocked_by = blocked_by.clone();
+        if todo_id == source_task_id {
+            blocks.clear();
+            blocked_by.clear();
+        } else {
+            blocks.retain(|id| id != source_task_id);
+            blocked_by.retain(|id| id != source_task_id);
+        }
+        if blocks != old_blocks || blocked_by != old_blocked_by {
+            peer_edge_updates.push((
+                todo_id.clone(),
+                encode_adopt_task_edges(blocks)?,
+                encode_adopt_task_edges(blocked_by)?,
+            ));
+        }
+    }
+    for (todo_id, blocks, blocked_by) in peer_edge_updates {
+        if todo_id == source_task_id {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE session_todos SET blocks = ?, blocked_by = ?, updated_at = NOW(6) \
+             WHERE session_id = ? AND todo_id = ? AND user_id = ?",
+        )
+        .bind(blocks)
+        .bind(blocked_by)
+        .bind(source_session)
+        .bind(&todo_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("detach adopted source edge from {todo_id}: {error}"))?;
+    }
+
     let migrate = sqlx::query(
-        "UPDATE session_todos SET status = 'migrated', updated_at = NOW(6) \
+        "UPDATE session_todos SET status = 'migrated', blocks = NULL, blocked_by = NULL, updated_at = NOW(6) \
          WHERE session_id = ? AND todo_id = ? AND user_id = ? AND status = ?",
     )
     .bind(source_session)
@@ -1617,7 +1691,10 @@ mod tests {
         )
         .await;
 
-        assert!(outcome.success && !outcome.changed, "{outcome:?}");
+        assert!(
+            outcome.status.is_success() && !outcome.status.changed(),
+            "{outcome:?}"
+        );
         assert_eq!(outcome.data["noop"], true);
         assert_eq!(outcome.data["reason"], "source_session_is_current_session");
         assert_eq!(outcome.data["task_id"], "task-7");
@@ -2561,7 +2638,7 @@ mod tests {
             }),
         )
         .await;
-        assert!(out.success && out.changed, "{out:?}");
+        assert!(out.status.is_success() && out.status.changed(), "{out:?}");
         assert_eq!(out.data["task_id"], "task-1");
 
         let source_status: String = sqlx::query_scalar(
@@ -2678,7 +2755,7 @@ mod tests {
             }),
         )
         .await;
-        assert!(!out.success && !out.changed, "{out:?}");
+        assert!(!out.status.is_success() && !out.status.changed(), "{out:?}");
         assert!(
             out.output.contains("invalid subtasks") && out.output.contains("unknown dependency"),
             "{out:?}"
@@ -2752,7 +2829,7 @@ mod tests {
             }),
         )
         .await;
-        assert!(out.success && out.changed, "{out:?}");
+        assert!(out.status.is_success() && out.status.changed(), "{out:?}");
         assert_eq!(out.data["task_id"], "task-1");
 
         let target_row: (Option<String>, Option<String>) = sqlx::query_as(
@@ -2769,6 +2846,32 @@ mod tests {
             target_row,
             (None, None),
             "single-task adopt must not bring source-session task edges into target"
+        );
+
+        let source_consumer: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT blocks, blocked_by FROM session_todos \
+             WHERE session_id = ? AND todo_id = ? AND user_id = ?",
+        )
+        .bind(&source_session)
+        .bind("task-2")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("source consumer dependency columns");
+        assert_eq!(
+            source_consumer,
+            (None, None),
+            "adopt must detach the migrated blocker from remaining source work"
+        );
+        let source_consumer_start = source
+            .update(&serde_json::json!({
+                "task_id": "task-2",
+                "new_status": "in_progress"
+            }))
+            .await;
+        assert!(
+            source_consumer_start.contains("\"status\":\"in_progress\""),
+            "source consumer should no longer be stuck behind migrated work: {source_consumer_start}"
         );
 
         cleanup_session_rows(&pool, &source_session, &user_id).await;
@@ -3453,7 +3556,7 @@ mod tests {
             }),
         )
         .await;
-        assert!(!out.success && !out.changed, "{out:?}");
+        assert!(!out.status.is_success() && !out.status.changed(), "{out:?}");
         assert!(
             out.output.contains("completed")
                 && out.output.contains("only pending, in_progress, or paused"),

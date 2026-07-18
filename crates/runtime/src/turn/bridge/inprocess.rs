@@ -34,7 +34,11 @@
 ///   for each tool round blocks on [`astra_turn_core::edge_ledger`] until `POST /tools/result` (or timeout).
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    future::Future,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -69,6 +73,80 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
+
+/// Completion link in a per-session asynchronous persistence chain. The link
+/// is completed from `Drop` as well as the normal path, so a cancelled or
+/// panicking write cannot strand every later turn behind it.
+#[derive(Default)]
+struct BridgePersistFence {
+    completed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl BridgePersistFence {
+    async fn wait(&self) {
+        loop {
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn complete(&self) {
+        if !self.completed.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+struct BridgePersistFenceGuard(Arc<BridgePersistFence>);
+
+impl Drop for BridgePersistFenceGuard {
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+type BridgePersistTails = Arc<Mutex<HashMap<String, Weak<BridgePersistFence>>>>;
+
+fn track_ordered_bridge_persist<F>(
+    tails: &BridgePersistTails,
+    tracker: Option<Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>>,
+    session_id: String,
+    persist: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let current = Arc::new(BridgePersistFence::default());
+    let previous = {
+        let mut tails = tails
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Weak tails keep inactive sessions from retaining futures. Opportunistic
+        // compaction bounds the key map without a cleanup task on the hot path.
+        tails.retain(|_, tail| tail.strong_count() > 0);
+        tails
+            .insert(session_id, Arc::downgrade(&current))
+            .and_then(|tail| tail.upgrade())
+    };
+    let ordered = async move {
+        let _completion = BridgePersistFenceGuard(current);
+        if let Some(previous) = previous {
+            previous.wait().await;
+        }
+        persist.await;
+    };
+    if let Some(tracker) = tracker {
+        tracker.track_persist_task(Box::pin(ordered));
+    } else {
+        tokio::spawn(ordered);
+    }
+}
 
 fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
     payload
@@ -1480,6 +1558,9 @@ pub struct InProcessChatTurnBridge {
     /// Shutdown-aware tracker for fire-and-forget SSE persist tasks (HIGH #4).
     /// When `None` the bridge falls back to raw `tokio::spawn` (dev / test mode).
     pub persist_tracker: Option<Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>>,
+    /// Per-session causal persistence chain. SSE completion never waits for
+    /// MatrixOne, while adjacent continuations still commit in request order.
+    persist_tails: BridgePersistTails,
 }
 
 impl InProcessChatTurnBridge {
@@ -1494,6 +1575,7 @@ impl InProcessChatTurnBridge {
             session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
             persist_tracker: None,
+            persist_tails: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1703,6 +1785,7 @@ impl InProcessChatTurnBridge {
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
+        let persist_tails_shared = self.persist_tails.clone();
         let mut remote_artifact_store =
             astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
         if let Some(pool) = self.shared_pool.clone() {
@@ -4221,11 +4304,9 @@ impl InProcessChatTurnBridge {
                 "bridge turn completed"
             );
 
-            // Persist events at the turn boundary before the SSE stream
-            // closes. The next CLI continuation can arrive immediately after
-            // EOF, so fire-and-forget writes allowed adjacent turns to race
-            // and made outgoing tool calls appear before the incoming result
-            // that caused them.
+            // Enqueue persistence at the turn boundary without blocking SSE.
+            // A per-session causal chain prevents an immediate continuation
+            // from overtaking this write under MatrixOne load.
             let user_content = latest_user_message_text(&messages).map(ToString::to_string);
 
             let has_tool_calls = !all_round_tool_calls.is_empty();
@@ -4471,7 +4552,12 @@ impl InProcessChatTurnBridge {
                     );
                 }
             };
-            persist_future.await;
+            track_ordered_bridge_persist(
+                &persist_tails_shared,
+                persist_tracker_shared.clone(),
+                session_id.clone(),
+                persist_future,
+            );
 
             if !session_id.is_empty()
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
@@ -8922,6 +9008,46 @@ mod tests {
         assert_eq!(
             records[0].result_preview, None,
             "missing output field → None (not empty string)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_persist_chain_is_nonblocking_and_preserves_session_order() {
+        let tails: BridgePersistTails = Arc::new(Mutex::new(HashMap::new()));
+        let order = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let (release_first, wait_first) = tokio::sync::oneshot::channel::<()>();
+        let (first_started, first_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (second_started, mut second_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first_order = order.clone();
+        track_ordered_bridge_persist(&tails, None, "session-order".into(), async move {
+            first_order.lock().await.push("first-start");
+            let _ = first_started.send(());
+            let _ = wait_first.await;
+            first_order.lock().await.push("first-end");
+        });
+        first_started_rx.await.unwrap();
+
+        let second_order = order.clone();
+        track_ordered_bridge_persist(&tails, None, "session-order".into(), async move {
+            second_order.lock().await.push("second");
+            let _ = second_started.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second_started_rx)
+                .await
+                .is_err(),
+            "the second write must wait behind the first without blocking enqueue"
+        );
+        let _ = release_first.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second_started_rx)
+            .await
+            .expect("second persist should run after its predecessor")
+            .unwrap();
+        assert_eq!(
+            *order.lock().await,
+            vec!["first-start", "first-end", "second"]
         );
     }
 }

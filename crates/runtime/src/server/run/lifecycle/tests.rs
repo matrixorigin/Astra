@@ -72,7 +72,7 @@ fn server_service_catalog_is_disabled_only_for_agent_binding_mode() {
 }
 
 #[test]
-fn attached_stream_event_detaches_instead_of_backpressuring_the_run() {
+fn attached_stream_event_recovers_after_transient_backpressure() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut attached = Some(tx);
 
@@ -81,10 +81,12 @@ fn attached_stream_event_detaches_instead_of_backpressuring_the_run() {
     try_send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1");
 
     assert!(
-        attached.is_none(),
-        "a full observer queue must detach instead of stalling durable fanout"
+        attached.is_some(),
+        "a momentarily full queue must not permanently detach a live observer"
     );
     assert_eq!(rx.try_recv().unwrap(), json!({"seq": 1}));
+    try_send_attached_stream_event(&mut attached, json!({"seq": 3}), "run-1");
+    assert_eq!(rx.try_recv().unwrap(), json!({"seq": 3}));
 }
 
 #[test]

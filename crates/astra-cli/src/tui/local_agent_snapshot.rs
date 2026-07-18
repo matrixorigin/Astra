@@ -57,9 +57,20 @@ impl LocalAgentSnapshot {
         };
         if value.get("schema").and_then(serde_json::Value::as_str)
             != Some("agent_attention_hint.v1")
-            || value.get("event").and_then(serde_json::Value::as_str)
-                != Some("agent_status_changed")
         {
+            return true;
+        }
+        if value.get("event").and_then(serde_json::Value::as_str) == Some("fanout_group_settled") {
+            let Some(group_id) = value.get("group_id").and_then(serde_json::Value::as_str) else {
+                return true;
+            };
+            return !self.fanout_groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.is_terminal()
+                    && group.summary().uncollected == 0
+            });
+        }
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("agent_status_changed") {
             return true;
         }
         let Some(agent_id) = value.get("agent_id").and_then(serde_json::Value::as_str) else {
@@ -80,23 +91,32 @@ impl LocalAgentSnapshot {
             })
     }
 
-    /// Return only newly attention-worthy child transitions. Ordinary running
-    /// progress stays in the task UI; terminal/waiting facts wake the parent
-    /// exactly once when the snapshot crosses that lifecycle boundary.
+    /// Return only newly attention-worthy work-unit transitions. Ordinary
+    /// running progress and individual terminal fanout slots stay in the task
+    /// UI. A fanout wakes the parent once, when the fixed-size group settles;
+    /// otherwise three reviewers finishing means three wasteful model turns
+    /// and three contradictory partial summaries.
     pub(crate) fn attention_notifications_since(&self, previous: &Self) -> Vec<String> {
         let previous_status = previous
             .agents
             .iter()
             .map(|agent| (agent.run_id.as_str(), &agent.status))
             .collect::<BTreeMap<_, _>>();
-        self.agents
+        let fanout_agent_ids = self
+            .fanout_groups
+            .iter()
+            .flat_map(|group| &group.slots)
+            .filter_map(|slot| slot.agent_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut notifications = self
+            .agents
             .iter()
             .filter(|agent| {
-                agent.status.is_terminal()
-                    || matches!(
-                        agent.status,
-                        astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
-                    )
+                matches!(
+                    agent.status,
+                    astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
+                ) || (agent.status.is_terminal()
+                    && !fanout_agent_ids.contains(agent.agent_id.as_str()))
             })
             .filter(|agent| {
                 previous_status
@@ -141,7 +161,52 @@ impl LocalAgentSnapshot {
                 })
                 .to_string()
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        let previous_groups = previous
+            .fanout_groups
+            .iter()
+            .map(|group| (group.group_id.as_str(), group))
+            .collect::<BTreeMap<_, _>>();
+        notifications.extend(
+            self.fanout_groups
+                .iter()
+                .filter(|group| group.is_terminal())
+                .filter(|group| {
+                    previous_groups
+                        .get(group.group_id.as_str())
+                        .is_none_or(|previous| !previous.is_terminal())
+                })
+                .map(|group| {
+                    let summary = group.summary();
+                    serde_json::json!({
+                        "schema": "agent_attention_hint.v1",
+                        "event": "fanout_group_settled",
+                        "group_id": group.group_id,
+                        "title": group.title,
+                        "parent_run_id": group.parent_run_id,
+                        "status": group.status.as_str(),
+                        "target_count": summary.target_count,
+                        "terminal": summary.terminal,
+                        "completed": summary.completed,
+                        "failed": summary.failed,
+                        "interrupted": summary.interrupted,
+                        "cancelled_by_user": summary.cancelled_by_user,
+                        "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+                        "timed_out": summary.timed_out,
+                        "spawn_rejected": summary.spawn_rejected,
+                        "uncollected": summary.uncollected,
+                        "authoritative_result_call": {
+                            "tool": "agent_fanout",
+                            "action": "get_results",
+                            "group_id": group.group_id,
+                        },
+                        "instruction": "Reconcile this fanout once as one work unit. Use only this canonical group_id; do not analyze individual slot completions separately.",
+                    })
+                    .to_string()
+                }),
+        );
+        notifications
     }
 }
 
@@ -151,6 +216,27 @@ mod tests {
     use astra_turn_core::orchestration_fanout_group::{
         AgentFanoutGroupProjection, AgentFanoutSlotStatus,
     };
+    use astra_turn_core::orchestration_types::{
+        AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
+    };
+
+    fn agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
+        SpawnedAgentInfo {
+            agent_id: agent_id.into(),
+            run_id: run_id.into(),
+            parent_run_id: "root-run".into(),
+            agent_type: "review".into(),
+            description: format!("review {agent_id}"),
+            ended_at: status.is_terminal().then(std::time::SystemTime::now),
+            status,
+            started_at: std::time::SystemTime::now(),
+            metrics: SpawnedAgentMetrics::default(),
+            has_permission_issues: false,
+            run_in_background: true,
+            spawn_tool_call_id: None,
+            fanout_slot: None,
+        }
+    }
 
     #[test]
     fn collected_fanout_result_suppresses_only_its_stale_attention_hint() {
@@ -193,5 +279,146 @@ mod tests {
         assert!(collected.notification_still_requires_reconciliation(
             "<task_notification>done</task_notification>"
         ));
+    }
+
+    #[test]
+    fn fanout_slot_completions_wake_once_only_when_the_group_settles() {
+        let mut running = AgentFanoutGroupProjection::new("review-group", "Three reviews", 3);
+        running.parent_run_id = Some("root-run".into());
+        for index in 0..3 {
+            running
+                .record_spawn_accepted_with_run(
+                    index,
+                    format!("reviewer-{index}"),
+                    Some(format!("run-{index}")),
+                )
+                .unwrap();
+        }
+        let before = LocalAgentSnapshot {
+            available: true,
+            agents: (0..3)
+                .map(|index| {
+                    agent(
+                        &format!("reviewer-{index}"),
+                        &format!("run-{index}"),
+                        AgentStatus::Running {
+                            activity: "reviewing".into(),
+                        },
+                    )
+                })
+                .collect(),
+            fanout_groups: vec![running.clone()],
+        };
+
+        running
+            .record_terminal_by_agent("reviewer-0", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        let first_done = LocalAgentSnapshot {
+            available: true,
+            agents: vec![
+                agent(
+                    "reviewer-0",
+                    "run-0",
+                    AgentStatus::Completed {
+                        result: "one".into(),
+                        finish_reason: None,
+                    },
+                ),
+                agent(
+                    "reviewer-1",
+                    "run-1",
+                    AgentStatus::Running {
+                        activity: "reviewing".into(),
+                    },
+                ),
+                agent(
+                    "reviewer-2",
+                    "run-2",
+                    AgentStatus::Running {
+                        activity: "reviewing".into(),
+                    },
+                ),
+            ],
+            fanout_groups: vec![running.clone()],
+        };
+        assert!(first_done.attention_notifications_since(&before).is_empty());
+
+        running
+            .record_terminal_by_agent("reviewer-1", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        let second_done = LocalAgentSnapshot {
+            available: true,
+            agents: vec![
+                agent(
+                    "reviewer-0",
+                    "run-0",
+                    AgentStatus::Completed {
+                        result: "one".into(),
+                        finish_reason: None,
+                    },
+                ),
+                agent(
+                    "reviewer-1",
+                    "run-1",
+                    AgentStatus::Completed {
+                        result: "two".into(),
+                        finish_reason: None,
+                    },
+                ),
+                agent(
+                    "reviewer-2",
+                    "run-2",
+                    AgentStatus::Running {
+                        activity: "reviewing".into(),
+                    },
+                ),
+            ],
+            fanout_groups: vec![running.clone()],
+        };
+        assert!(
+            second_done
+                .attention_notifications_since(&first_done)
+                .is_empty()
+        );
+
+        running
+            .record_terminal_by_agent("reviewer-2", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        let settled = LocalAgentSnapshot {
+            available: true,
+            agents: vec![
+                agent(
+                    "reviewer-0",
+                    "run-0",
+                    AgentStatus::Completed {
+                        result: "one".into(),
+                        finish_reason: None,
+                    },
+                ),
+                agent(
+                    "reviewer-1",
+                    "run-1",
+                    AgentStatus::Completed {
+                        result: "two".into(),
+                        finish_reason: None,
+                    },
+                ),
+                agent(
+                    "reviewer-2",
+                    "run-2",
+                    AgentStatus::Completed {
+                        result: "three".into(),
+                        finish_reason: None,
+                    },
+                ),
+            ],
+            fanout_groups: vec![running],
+        };
+        let notifications = settled.attention_notifications_since(&second_done);
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        let value: serde_json::Value = serde_json::from_str(&notifications[0]).unwrap();
+        assert_eq!(value["event"], "fanout_group_settled");
+        assert_eq!(value["group_id"], "review-group");
+        assert_eq!(value["completed"], 3);
     }
 }
