@@ -463,6 +463,78 @@ async fn wait_for_agent_journey_child_request(
     }
 }
 
+fn is_fanout_journey_child_request(request: &serde_json::Value) -> bool {
+    request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|content| {
+            astra_cli::cli::mock_llm::FANOUT_JOURNEY_CHILD_TASKS.contains(&content)
+        })
+}
+
+fn is_fanout_reconciliation_request(request: &serde_json::Value) -> bool {
+    request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        == Some(astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE)
+}
+
+fn summarize_fanout_reconciliation_request(request: &serde_json::Value) -> String {
+    let tool_results = request
+        .get("tool_results")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| result.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    format!(
+        "session_turn={:?} turn_chain_id={:?} reconciliation_flag={:?} messages={} tool_results={tool_results:?}",
+        request.get("session_turn"),
+        request.get("turn_chain_id"),
+        request.pointer("/edge_profile/runtime_reconciliation_turn"),
+        request
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+    )
+}
+
+async fn wait_for_three_fanout_children(
+    mock: &astra_cli::cli::mock_llm::MockLlmServer,
+    astra: &mut PtyAstra,
+) {
+    let deadline = tokio::time::Instant::now() + UI_TRANSITION_TIMEOUT;
+    loop {
+        let count = mock
+            .received_requests()
+            .iter()
+            .filter(|request| is_fanout_journey_child_request(request))
+            .count();
+        if count == 3 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected three fanout child requests, got {count}\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     let _journey = pty_journey_lock().lock().await;
@@ -642,4 +714,84 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         1,
         "one canonical spawn result must advance the parent instead of repeating delegation"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_is_one_background_work_unit_with_one_terminal_reconciliation() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .expect("start scripted fanout LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"launch_three_reviews_as_one_group\r");
+    astra.wait_for(
+        "Three mock reviews are running in the background as one work group.",
+        UI_TRANSITION_TIMEOUT,
+    );
+    wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
+
+    // A normal user turn receives the authoritative live snapshot without
+    // first discovering/calling task_list. This is the exact "what is still
+    // running?" product contract from the reported session.
+    astra.write(
+        format!(
+            "{}\r",
+            astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION
+        )
+        .as_bytes(),
+    );
+    astra.wait_for(
+        "Astra knows Three mock reviews are running as one background work group.",
+        UI_TRANSITION_TIMEOUT,
+    );
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        0,
+        "the first or second child completion must not wake a foreground analysis turn"
+    );
+
+    astra.write(b"\x1b[1;2B");
+    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Three mock reviews", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+
+    astra.wait_for(
+        "Parent reconciled one terminal fanout group exactly once.",
+        Duration::from_secs(10),
+    );
+    let received = mock.received_requests();
+    let reconciliation_requests = received
+        .iter()
+        .filter(|request| is_fanout_reconciliation_request(request))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reconciliation_requests.len(),
+        1,
+        "one fanout group must produce exactly one terminal model reconciliation; reconciliation requests: {:#?}",
+        reconciliation_requests
+            .iter()
+            .map(|request| summarize_fanout_reconciliation_request(request))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reconciliation_requests[0]
+            .pointer("/edge_profile/runtime_reconciliation_turn")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the one terminal continuation must use the typed reconciliation lane"
+    );
+
+    astra.write(b"/exit\r");
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
 }

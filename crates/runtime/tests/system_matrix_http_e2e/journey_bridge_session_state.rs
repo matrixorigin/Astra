@@ -472,6 +472,31 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
     .await;
     assert!(second_sse.contains(final_reply), "{second_sse}");
 
+    // SSE completion acknowledges that the ordered persist was enqueued, not
+    // that MatrixOne latency has been paid by the user. Poll the durable view
+    // just as a reconnecting client would, while retaining a strict bound.
+    let persist_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events \
+             WHERE user_id = ? AND session_id = ? \
+               AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("count causal bridge events");
+        if count == 5 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < persist_deadline,
+            "expected five causally ordered bridge events, got {count}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     let rows = sqlx::query(
         "SELECT event_type, content, tool_call_id FROM agent_events \
          WHERE user_id = ? AND session_id = ? \

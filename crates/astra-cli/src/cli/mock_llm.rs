@@ -44,6 +44,9 @@ pub enum MockScenario {
     /// Root activates and calls one foreground child agent, then synthesizes
     /// the child's completion.
     AgentThenComplete,
+    /// Root launches one three-slot fanout. Individual slots settle at
+    /// different times; only the terminal group notification is reconciled.
+    FanoutThenComplete,
     /// Adversarial: a single tool_call_start event's JSON is split across
     /// multiple SSE `data:` chunks (with blank lines in between) so a naive
     /// per-chunk JSON decoder will fail on each half. A correct client must
@@ -72,6 +75,7 @@ impl MockScenario {
             "fail" | "error" => Some(Self::Fail),
             "slow" => Some(Self::Slow),
             "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
+            "fanout_then_complete" | "fanout" => Some(Self::FanoutThenComplete),
             "sse_chunk_split" | "sse_split" | "chunk_split" => Some(Self::SseChunkSplit),
             "malformed_json" | "malformed" | "bad_json" => Some(Self::MalformedJson),
             "rate_limited" | "rate_limit" | "429" => Some(Self::RateLimited),
@@ -88,6 +92,9 @@ impl MockScenario {
             Self::Fail => "agent returns error",
             Self::Slow => "3s delay before response (tests progress display)",
             Self::AgentThenComplete => "one foreground child agent, then parent synthesis",
+            Self::FanoutThenComplete => {
+                "three background fanout slots, one terminal group reconciliation"
+            }
             Self::SseChunkSplit => "tool_call JSON split across SSE frames (adversarial)",
             Self::MalformedJson => "one SSE event carries malformed JSON (adversarial)",
             Self::RateLimited => "HTTP 429 with Retry-After (adversarial)",
@@ -108,6 +115,10 @@ impl MockScenario {
             (
                 "agent_then_complete",
                 "one foreground child agent, then parent synthesis",
+            ),
+            (
+                "fanout_then_complete",
+                "three background fanout slots, one terminal group reconciliation",
             ),
             (
                 "sse_chunk_split",
@@ -424,6 +435,123 @@ async fn body_agent_then_complete(body: &Value) -> String {
     }
 }
 
+pub const FANOUT_JOURNEY_CHILD_TASKS: [&str; 3] = [
+    "Inspect storage behavior and return one evidence-backed finding.",
+    "Inspect runtime behavior and return one evidence-backed finding.",
+    "Inspect user experience and return one evidence-backed finding.",
+];
+pub const FANOUT_JOURNEY_STATUS_QUESTION: &str = "what_background_work_is_running";
+
+fn latest_user_message(body: &Value) -> Option<&str> {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+}
+
+fn fanout_journey_child_index(body: &Value) -> Option<usize> {
+    let prompt = latest_user_message(body)?;
+    FANOUT_JOURNEY_CHILD_TASKS
+        .iter()
+        .position(|candidate| *candidate == prompt)
+}
+
+async fn body_fanout_then_complete(body: &Value) -> String {
+    if let Some(index) = fanout_journey_child_index(body) {
+        tokio::time::sleep(std::time::Duration::from_millis(match index {
+            0 => 250,
+            1 => 700,
+            _ => 6_000,
+        }))
+        .await;
+        let message = format!("fanout_child_{}_evidence_visible", index + 1);
+        let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
+        stream.push_str(&text_delta(&message));
+        stream.push_str(&text_done(&message));
+        stream.push_str(&done_event(100));
+        return stream;
+    }
+
+    // Runtime reconciliation is a typed, already-authorized continuation of
+    // the existing fanout. Handle it before ordinary tool discovery so this
+    // journey fails if a terminal notification accidentally re-enters the
+    // delegation bootstrap and creates the work again.
+    let latest_user = latest_user_message(body).unwrap_or_default();
+    if latest_user == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
+    {
+        let message = "Parent reconciled one terminal fanout group exactly once.";
+        let mut stream = session_info("mock-run-fanout-root");
+        stream.push_str(&text_delta(message));
+        stream.push_str(&text_done(message));
+        stream.push_str(&done_event(140));
+        return stream;
+    }
+    if latest_user == FANOUT_JOURNEY_STATUS_QUESTION {
+        let request = body.to_string();
+        let message = if request.contains("Current background work snapshot")
+            && request.contains("mock-review-group")
+        {
+            "Astra knows Three mock reviews are running as one background work group."
+        } else {
+            "ERROR: authoritative background work snapshot is missing."
+        };
+        let mut stream = session_info("mock-run-fanout-root");
+        stream.push_str(&text_delta(message));
+        stream.push_str(&text_done(message));
+        stream.push_str(&done_event(140));
+        return stream;
+    }
+
+    if !root_has_tool_result(body, "tool_search") {
+        let mut stream = session_info("mock-run-fanout-root");
+        let args = serde_json::json!({"query": "select:agent_fanout"});
+        stream.push_str(&tool_call_start(
+            "call-activate-fanout",
+            "tool_search",
+            args.clone(),
+        ));
+        stream.push_str(&tool_request("call-activate-fanout", "tool_search", args));
+        stream.push_str(&done_event(40));
+        return stream;
+    }
+    if !root_has_tool_result(body, "agent_fanout") {
+        let mut stream = session_info("mock-run-fanout-root");
+        let args = serde_json::json!({
+            "action": "start",
+            "group_id": "mock-review-group",
+            "title": "Three mock reviews",
+            "target_count": 3,
+            "defaults": {"agent_type": "general-purpose"},
+            "slots": FANOUT_JOURNEY_CHILD_TASKS.iter().enumerate().map(|(index, prompt)| {
+                serde_json::json!({
+                    "id": format!("review-{}", index + 1),
+                    "description": format!("Mock review {}", index + 1),
+                    "prompt": prompt,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        stream.push_str(&tool_call_start(
+            "call-start-fanout",
+            "agent_fanout",
+            args.clone(),
+        ));
+        stream.push_str(&tool_request("call-start-fanout", "agent_fanout", args));
+        stream.push_str(&done_event(80));
+        return stream;
+    }
+
+    let message = "Three mock reviews are running in the background as one work group.";
+    let mut stream = session_info("mock-run-fanout-root");
+    stream.push_str(&text_delta(message));
+    stream.push_str(&text_done(message));
+    stream.push_str(&done_event(140));
+    stream
+}
+
 // ─── Adversarial bodies (P1 hardening) ──────────────────────────────────────
 
 /// Split one `tool_call_start` event across multiple SSE frames.
@@ -559,6 +687,7 @@ async fn handle_chat_turn(
         MockScenario::Fail => body_fail(&agent_id, turn),
         MockScenario::Slow => body_slow(&agent_id, turn).await,
         MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
+        MockScenario::FanoutThenComplete => body_fanout_then_complete(&request_body).await,
         MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
         MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
         MockScenario::TextOnly => body_text_only(&agent_id, turn),
