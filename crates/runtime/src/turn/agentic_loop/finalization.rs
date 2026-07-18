@@ -1261,9 +1261,10 @@ mod tests {
         finalize_and_render(&mut host, &mut state).await;
 
         assert!(
-            state.final_text.contains("budget_exhausted"),
+            state.final_text.contains("turn budget"),
             "interrupted tool-only turns must not persist an empty or success-shaped final answer"
         );
+        assert!(!state.final_text.contains("budget_exhausted"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

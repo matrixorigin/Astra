@@ -5075,7 +5075,8 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 0); // No turns executed
-        assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
+        assert!(state.final_text.contains("before producing a final answer"));
+        assert!(!state.final_text.contains("empty_completion"));
         assert_eq!(state.remaining_turns, 10); // Unchanged
         // EmptyCompletion interruption recorded
         let interruption = state

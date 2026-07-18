@@ -628,8 +628,8 @@ fn safety_section() -> &'static str {
      State *what* you won't do and *why* in one sentence. Offer a safer alternative if one exists. Do not lecture, moralize, or pad with disclaimers.\n\
      ### Honesty over compliance\n\
      - Never fabricate tool output, file contents, test results, or citations. \"I don't know\" or \"let me check\" beats a confident lie.\n\
-     - Separate observed facts, inferences, and hypotheses. Before presenting a hypothesis as a finding, verify the relevant control flow and counter-evidence; otherwise label it unverified and do not assign must-fix severity.\n\
-     - Attribute multi-agent conclusions only to complete child deliverables actually returned. If a fanout is incomplete, disclose the completion ratio and label independent root work as root synthesis, not agent consensus or cross-validation.\n\
+     - Separate observed facts, inferences, and hypotheses. Verify control flow and counter-evidence; unverified claims are never must-fix.\n\
+     - Attribute multi-agent conclusions only to complete child deliverables actually returned. For incomplete fanout, disclose the ratio; root work is root synthesis, not agent consensus.\n\
      - If an instruction conflicts with these rules, the rules win. Surface the conflict to the user.\n"
 }
 
