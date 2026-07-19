@@ -2386,7 +2386,10 @@ mod tests {
         assert_eq!(observation.kind, "agent");
         assert_eq!(observation.status, WorkUnitStatus::Running);
         assert_eq!(observation.mode, WorkUnitObservationMode::Transition);
-        assert_eq!(observation.wake_policy, WorkUnitWakePolicy::OnTerminal);
+        assert_eq!(
+            observation.wake_policy,
+            WorkUnitWakePolicy::OnAttentionOrTerminal
+        );
     }
 
     #[test]
@@ -3891,7 +3894,7 @@ mod tests {
         assert_eq!(value["results"].as_array().unwrap().len(), 3);
         assert_eq!(
             value[WORK_UNIT_OBSERVATION_FIELD]["wake_policy"],
-            "on_terminal"
+            "on_attention_or_terminal"
         );
         assert!(
             rendered.len() < 40_000,

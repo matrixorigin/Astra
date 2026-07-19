@@ -580,7 +580,7 @@ mod tests {
             typed_row(
                 "agent-storage",
                 BackgroundTaskKind::LocalAgent,
-                "killed",
+                "cancelled",
                 "storage review",
             )
             .with_fanout(fanout("review-1", 3, 1)),

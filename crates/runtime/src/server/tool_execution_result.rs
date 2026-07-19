@@ -240,7 +240,7 @@ mod tests {
                     "id": "future-work-1",
                     "kind": "future_capability",
                     "status": "running",
-                    "version": "revision-9",
+                    "revision": 9,
                     "mode": "current"
                 }
             })
@@ -266,7 +266,7 @@ mod tests {
                     "id": "",
                     "kind": "future_capability",
                     "status": "running",
-                    "version": "revision-9",
+                    "revision": 9,
                     "mode": "current"
                 }
             })
@@ -293,7 +293,7 @@ mod tests {
                     "id": "future-agent-1",
                     "kind": "future_capability",
                     "status": "waiting_for_input",
-                    "version": "revision-10",
+                    "revision": 10,
                     "mode": "wait",
                     "wake_policy": "on_attention_or_terminal"
                 }

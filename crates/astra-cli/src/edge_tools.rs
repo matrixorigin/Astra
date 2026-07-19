@@ -4054,7 +4054,7 @@ impl ToolExecutor {
                     observation_mode,
                 )
                 .expect("fanout task projections have canonical identities and revisions")
-                .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+                .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal);
                 let mut fields = background_task_output_result_fields(
                     &projection.group_id,
                     &projection.snapshot,
@@ -6405,7 +6405,7 @@ mod tests {
                     "id": "fanout-group-1",
                     "kind": "agent_fanout",
                     "status": "completed",
-                    "version": "revision-4",
+                    "revision": 4,
                     "mode": "current",
                     "wake_policy": "on_terminal"
                 }
@@ -8110,23 +8110,26 @@ mod tests {
     }
 
     #[test]
-    fn background_task_output_projection_names_failed_and_killed_empty_states() {
+    fn background_task_output_projection_names_failed_and_cancelled_empty_states() {
         let failed = format_background_task_output(
             "bg-shell-1",
             0,
             &bg_snapshot(0, 0, 0, "failed", ""),
             BgTaskOutputReadMode::Current,
         );
-        let killed = format_background_task_output(
+        let cancelled = format_background_task_output(
             "bg-shell-2",
             0,
-            &bg_snapshot(0, 0, 0, "killed", ""),
+            &bg_snapshot(0, 0, 0, "cancelled", ""),
             BgTaskOutputReadMode::Current,
         );
         assert!(failed.contains("Failed with no output"), "{failed}");
-        assert!(killed.contains("Stopped with no output"), "{killed}");
+        assert!(cancelled.contains("Stopped with no output"), "{cancelled}");
         assert!(!failed.contains("Completed with no output"), "{failed}");
-        assert!(!killed.contains("Completed with no output"), "{killed}");
+        assert!(
+            !cancelled.contains("Completed with no output"),
+            "{cancelled}"
+        );
         assert!(failed.contains("failure_cause unverified"), "{failed}");
         assert!(failed.contains("task_output(pattern=...)"), "{failed}");
         assert!(

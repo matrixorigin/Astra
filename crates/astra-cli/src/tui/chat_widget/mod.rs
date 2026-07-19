@@ -6813,7 +6813,7 @@ mod tests {
                 "id": "review-large-terminal",
                 "kind": "agent_fanout",
                 "status": "completed",
-                "version": "terminal-3",
+                "revision": 3,
                 "mode": "transition",
                 "wake_policy": "none"
             }

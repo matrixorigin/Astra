@@ -6843,7 +6843,7 @@ mod tests {
                 "id": "work-1",
                 "kind": "future_async_capability",
                 "status": "completed",
-                "version": "revision-2",
+                "revision": 2,
                 "mode": "transition",
                 "wake_policy": "none"
             }
