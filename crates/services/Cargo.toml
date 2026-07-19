@@ -20,6 +20,7 @@ bcrypt.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 fernet.workspace = true
 flate2.workspace = true
+futures-util.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
 regex.workspace = true

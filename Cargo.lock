@@ -561,6 +561,7 @@ dependencies = [
  "filetime",
  "flate2",
  "fs2",
+ "futures-util",
  "hmac",
  "jsonwebtoken",
  "openssl",

@@ -5,9 +5,11 @@ use astra_core::{
     internal_error,
 };
 use axum::{Json, http::StatusCode};
-use sqlx::{Executor, MySql, QueryBuilder, Row, query};
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
+use sha2::Digest;
+use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, query};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
@@ -49,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-16-v1";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-19-v2";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -62,6 +64,16 @@ const CORE_SCHEMA_LEASE_TABLE_SQL: &str =
     lease_expires_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 )";
+const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS astra_schema_table_contracts (
+    table_name VARCHAR(128) NOT NULL PRIMARY KEY,
+    component VARCHAR(64) NOT NULL,
+    owner VARCHAR(128) NOT NULL,
+    contract_version VARCHAR(64) NOT NULL,
+    ddl_sha256 CHAR(64) NOT NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_schema_table_contract_component (component, contract_version, table_name)
+)";
 const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
     "SELECT 1 FROM agent_sessions LIMIT 0",
     "SELECT 1 FROM prompt_deltas LIMIT 0",
@@ -70,416 +82,173 @@ const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
     "SELECT 1 FROM config_versions LIMIT 0",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreSchemaTableSpec {
-    pub name: &'static str,
-    pub owner: &'static str,
+    pub name: String,
+    pub owner: String,
+    pub ddl_sha256: String,
 }
 
-/// Canonical inventory for tables created by `ensure_core_schema`.
-///
-/// This is data, not a source-text convention. Bootstrap validates the live
-/// MatrixOne catalog against this inventory before publishing its schema
-/// contract, while tests can assert uniqueness and repeated-bootstrap
-/// behavior without parsing Rust files or SQL formatting.
-pub const CORE_SCHEMA_TABLES: &[CoreSchemaTableSpec] = &[
-    CoreSchemaTableSpec {
-        name: "admin_config",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_agents",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_bindings",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_event_edges",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_events",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_run_events",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_runs",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_session_execution_slots",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_sessions",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "agent_tasks",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "astra_schema_bootstrap_leases",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "astra_schema_contracts",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_audit_logs",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_provider_request_replay",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_refresh_tokens",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_roles",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_tokens",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_user_roles",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "auth_users",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "config_versions",
-        owner: "config_version_cloud",
-    },
-    CoreSchemaTableSpec {
-        name: "context_manifest_items",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "context_manifests",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "conversation_log",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "ctx_decision_audits",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "ctx_snapshots",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "data_versioning_checkpoints",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "edge_agent_registry",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "edge_pending_dispatch",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "eval_calibration_assessments",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "eval_gate_results",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "eval_quality_assessments",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "eval_training_datasets",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "eval_user_feedback",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_citations",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_items",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_runs",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_skill_drafts",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_skill_rules",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "harness_snapshots",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "infra_llm_models",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "infra_sandbox_metadata",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "maintenance_sweep_cursors",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "mcp_bindings",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "mcp_servers",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "mcp_tools",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "model_gateways",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "plan_step_runs",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "plan_templates",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "plans",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "preview_template_registry",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "prompt_deltas",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "prompt_request_records",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "raw_ref_scheme_registry",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "run_checkpoints",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "run_display_projections",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "runtime_llm_trusted_domains",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "semantic_read_observation_budgets",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "semantic_read_observations",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_artifact_references",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_artifacts",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_artifacts_grants",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_checkpoints",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_delegations",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_device_lease_events",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_device_leases",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_history_chunks",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_state_item_events",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_state_items",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_state_revisions",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_todo_counters",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_todo_idempotency",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_todos",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_tool_output_batches",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_tool_outputs",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "session_transcript_items",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_installations",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_metrics",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_resource_bindings",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_selection_events",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_settings",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skill_user_credentials",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "skills_registry",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "sweeper_leases",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "task_contracts",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "task_leases",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "team_definitions",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "team_execution_history",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "team_snapshots",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "tool_invocation_archive_chunks",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "tool_invocation_ledger",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "transcript_pages",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "user_preferences",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "user_skill_evaluations",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "user_skill_sources",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "user_skill_versions",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "verification_results",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "wf_triggers",
-        owner: "storage",
-    },
-    CoreSchemaTableSpec {
-        name: "workspace_cleanup_debts",
-        owner: "workspace_records",
-    },
-    CoreSchemaTableSpec {
-        name: "workspace_records",
-        owner: "workspace_records",
-    },
-];
+#[derive(Clone, Debug)]
+struct CoreSchemaDeclaration {
+    owner: String,
+    ddl_sha256: String,
+    count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CoreSchemaAuthority(Arc<StdMutex<BTreeMap<String, CoreSchemaDeclaration>>>);
+
+impl CoreSchemaAuthority {
+    fn observe(&self, owner: &str, sql: &str) {
+        let Some(table_name) = created_table_name(sql) else {
+            return;
+        };
+        let ddl_sha256 = format!("{:x}", sha2::Sha256::digest(sql.trim().as_bytes()));
+        let mut declarations = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        declarations
+            .entry(table_name)
+            .and_modify(|declaration| declaration.count = declaration.count.saturating_add(1))
+            .or_insert_with(|| CoreSchemaDeclaration {
+                owner: owner.to_string(),
+                ddl_sha256,
+                count: 1,
+            });
+    }
+
+    fn declarations(&self) -> Result<Vec<CoreSchemaTableSpec>, sqlx::Error> {
+        let declarations = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let conflicts = declarations
+            .iter()
+            .filter(|(_, declaration)| declaration.count != 1)
+            .map(|(table, declaration)| format!("{table} (claims={})", declaration.count))
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Err(sqlx::Error::Protocol(format!(
+                "core schema has multiple lifecycle producers for tables: {}",
+                conflicts.join(", ")
+            )));
+        }
+        Ok(declarations
+            .iter()
+            .map(|(name, declaration)| CoreSchemaTableSpec {
+                name: name.clone(),
+                owner: declaration.owner.clone(),
+                ddl_sha256: declaration.ddl_sha256.clone(),
+            })
+            .collect())
+    }
+}
+
+fn created_table_name(sql: &str) -> Option<String> {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 3
+        || !tokens[0].eq_ignore_ascii_case("create")
+        || !tokens[1].eq_ignore_ascii_case("table")
+    {
+        return None;
+    }
+    let name_index = if tokens.get(2..5).is_some_and(|tokens| {
+        tokens[0].eq_ignore_ascii_case("if")
+            && tokens[1].eq_ignore_ascii_case("not")
+            && tokens[2].eq_ignore_ascii_case("exists")
+    }) {
+        5
+    } else {
+        2
+    };
+    tokens.get(name_index).map(|name| {
+        name.trim_matches(|character: char| {
+            character == '`' || character == '(' || character == ';'
+        })
+        .to_string()
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CoreSchemaExecutor {
+    pool: sqlx::Pool<MySql>,
+    authority: CoreSchemaAuthority,
+    owner: &'static str,
+}
+
+impl CoreSchemaExecutor {
+    fn new(pool: sqlx::Pool<MySql>) -> Self {
+        Self {
+            pool,
+            authority: CoreSchemaAuthority::default(),
+            owner: "storage",
+        }
+    }
+
+    fn owned_by(&self, owner: &'static str) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            authority: self.authority.clone(),
+            owner,
+        }
+    }
+}
+
+impl Deref for CoreSchemaExecutor {
+    type Target = sqlx::Pool<MySql>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
+    type Database = MySql;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_util::stream::BoxStream<
+        'e,
+        Result<sqlx::Either<sqlx::mysql::MySqlQueryResult, sqlx::mysql::MySqlRow>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.authority.observe(self.owner, query.sql());
+        (&self.pool).fetch_many(query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_util::future::BoxFuture<'e, Result<Option<sqlx::mysql::MySqlRow>, sqlx::Error>>
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.authority.observe(self.owner, query.sql());
+        (&self.pool).fetch_optional(query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [sqlx::mysql::MySqlTypeInfo],
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement<'q>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        (&self.pool).prepare_with(sql, parameters)
+    }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::Describe<MySql>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        (&self.pool).describe(sql)
+    }
+}
 
 pub(crate) fn rows_affected_to_i64(rows: u64, context: &str) -> Result<i64, sqlx::Error> {
     i64::try_from(rows).map_err(|_| {
@@ -704,6 +473,7 @@ impl Drop for CoreSchemaDatabaseLease {
 
 async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<bool, sqlx::Error> {
     query(CORE_SCHEMA_CONTRACT_TABLE_SQL).execute(pool).await?;
+    query(CORE_SCHEMA_TABLE_CONTRACT_SQL).execute(pool).await?;
     let persisted: Option<String> = sqlx::query_scalar(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
@@ -713,10 +483,32 @@ async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<boo
     match persisted {
         None => Ok(false),
         Some(version) if version == CORE_SCHEMA_CONTRACT_VERSION => Ok(true),
-        Some(version) => Err(sqlx::Error::Protocol(format!(
-            "core schema contract mismatch: database has {version}, binary requires {CORE_SCHEMA_CONTRACT_VERSION}; provision a database with the current canonical schema"
-        ))),
+        Some(_) => Ok(false),
     }
+}
+
+pub async fn load_core_schema_table_contracts(
+    pool: &sqlx::Pool<MySql>,
+) -> Result<Vec<CoreSchemaTableSpec>, sqlx::Error> {
+    query(
+        "SELECT table_name, owner, ddl_sha256
+         FROM astra_schema_table_contracts
+         WHERE component = ? AND contract_version = ?
+         ORDER BY table_name",
+    )
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .bind(CORE_SCHEMA_CONTRACT_VERSION)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(CoreSchemaTableSpec {
+            name: row.try_get("table_name")?,
+            owner: row.try_get("owner")?,
+            ddl_sha256: row.try_get("ddl_sha256")?,
+        })
+    })
+    .collect()
 }
 
 async fn verify_core_schema_catalog(
@@ -731,9 +523,30 @@ async fn verify_core_schema_catalog(
         .into_iter()
         .map(|row| row.try_get::<String, _>("TABLE_NAME"))
         .collect::<Result<BTreeSet<_>, _>>()?;
-    let missing = CORE_SCHEMA_TABLES
+    let contracts = load_core_schema_table_contracts(pool).await?;
+    if contracts.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "core schema table authority is empty for the current contract".to_string(),
+        ));
+    }
+    let malformed = contracts
         .iter()
-        .filter(|table| !existing.contains(table.name))
+        .filter(|table| {
+            table.name.trim().is_empty()
+                || table.owner.trim().is_empty()
+                || table.ddl_sha256.len() != 64
+        })
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    if !malformed.is_empty() {
+        return Err(sqlx::Error::Protocol(format!(
+            "core schema table authority contains malformed claims: {}",
+            malformed.join(", ")
+        )));
+    }
+    let missing = contracts
+        .iter()
+        .filter(|table| !existing.contains(&table.name))
         .map(|table| format!("{} (owner={})", table.name, table.owner))
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -746,10 +559,51 @@ async fn verify_core_schema_catalog(
     }
 }
 
+async fn publish_core_schema_table_contracts(
+    pool: &sqlx::Pool<MySql>,
+    declarations: &[CoreSchemaTableSpec],
+) -> Result<(), sqlx::Error> {
+    if declarations.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "core schema bootstrap produced no table declarations".to_string(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    query("DELETE FROM astra_schema_table_contracts WHERE component = ?")
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .execute(&mut *transaction)
+        .await?;
+    for declaration in declarations {
+        query(
+            "INSERT INTO astra_schema_table_contracts
+             (table_name, component, owner, contract_version, ddl_sha256)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&declaration.name)
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .bind(&declaration.owner)
+        .bind(CORE_SCHEMA_CONTRACT_VERSION)
+        .bind(&declaration.ddl_sha256)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "schema table {} is already claimed by another lifecycle owner: {error}",
+                declaration.name
+            ))
+        })?;
+    }
+    transaction.commit().await
+}
+
 async fn mark_core_schema_contract_current(
     pool: &sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    query("DELETE FROM astra_schema_contracts WHERE component = ?")
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .execute(pool)
+        .await?;
     let result = query(
         "INSERT INTO astra_schema_contracts (component, contract_version) \
          SELECT ?, ? FROM astra_schema_bootstrap_leases \
@@ -1823,6 +1677,18 @@ async fn ensure_core_schema_while_leased(
     // observes the same principal contract during startup.
     migrate_user_identity_column_widths(&pool, &settings.database).await?;
 
+    // The executor observes the exact CREATE TABLE statements that bootstrap
+    // executes. This makes DDL the declaration and the ownership catalog its
+    // generated contract, rather than maintaining a second list of names.
+    let pool = CoreSchemaExecutor::new(pool);
+    for ddl in [
+        CORE_SCHEMA_CONTRACT_TABLE_SQL,
+        CORE_SCHEMA_LEASE_TABLE_SQL,
+        CORE_SCHEMA_TABLE_CONTRACT_SQL,
+    ] {
+        pool.authority.observe("storage", ddl);
+    }
+
     // Auth
     query(
         "CREATE TABLE IF NOT EXISTS auth_users (
@@ -2125,7 +1991,11 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
-    crate::workspace_records::ensure_workspace_record_tables(&pool).await?;
+    let workspace_schema = pool.owned_by("workspace_records");
+    for ddl in crate::workspace_records::WORKSPACE_RECORD_TABLE_DDLS {
+        query(ddl).execute(&workspace_schema).await?;
+    }
+    crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     query(
@@ -5995,9 +5865,11 @@ async fn ensure_core_schema_while_leased(
     // that the push / pull pipeline uses.
 
     query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
-        .execute(&pool)
+        .execute(&pool.owned_by("config_version_cloud"))
         .await?;
 
+    let declarations = pool.authority.declarations()?;
+    publish_core_schema_table_contracts(&pool, &declarations).await?;
     verify_core_schema_catalog(&pool, &settings.database).await?;
     mark_core_schema_contract_current(&pool, holder_id).await?;
     Ok(())
@@ -7533,17 +7405,35 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_catalog_has_unique_owned_table_names() {
-        let mut names = BTreeSet::new();
-        for table in CORE_SCHEMA_TABLES {
-            assert!(!table.name.is_empty());
-            assert!(!table.owner.is_empty());
-            assert!(
-                names.insert(table.name),
-                "core schema catalog has duplicate ownership for {}",
-                table.name
-            );
-        }
+    fn core_schema_authority_is_derived_from_executed_ddl() {
+        let authority = CoreSchemaAuthority::default();
+        authority.observe(
+            "storage",
+            "CREATE TABLE IF NOT EXISTS canonical_table (id BIGINT PRIMARY KEY)",
+        );
+        authority.observe(
+            "storage",
+            "ALTER TABLE canonical_table ADD COLUMN value TEXT",
+        );
+
+        let declarations = authority.declarations().unwrap();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "canonical_table");
+        assert_eq!(declarations[0].owner, "storage");
+        assert_eq!(declarations[0].ddl_sha256.len(), 64);
+    }
+
+    #[test]
+    fn core_schema_authority_rejects_multiple_lifecycle_producers() {
+        let authority = CoreSchemaAuthority::default();
+        authority.observe("storage", "CREATE TABLE duplicate_owner (id BIGINT)");
+        authority.observe(
+            "another_module",
+            "CREATE TABLE IF NOT EXISTS duplicate_owner (id BIGINT)",
+        );
+
+        let error = authority.declarations().unwrap_err().to_string();
+        assert!(error.contains("duplicate_owner (claims=2)"), "{error}");
     }
 
     #[test]

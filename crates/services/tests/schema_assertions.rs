@@ -4,7 +4,7 @@ use sqlx::Row;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use astra_services::storage::{CORE_SCHEMA_TABLES, ensure_core_schema};
+use astra_services::storage::{ensure_core_schema, load_core_schema_table_contracts};
 
 #[test]
 fn service_table_queries_name_columns_explicitly() {
@@ -71,12 +71,21 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             .into_iter()
             .map(|row| row.try_get::<String, _>("TABLE_NAME").unwrap())
             .collect::<BTreeSet<_>>();
-    let missing = CORE_SCHEMA_TABLES
+    let contracts = load_core_schema_table_contracts(pool.get())
+        .await
+        .expect("load generated core schema table authority");
+    assert!(
+        contracts.len() >= 90,
+        "bootstrap must publish the complete generated authority, got {} claims",
+        contracts.len()
+    );
+    let missing = contracts
         .iter()
-        .filter(|table| !existing.contains(table.name))
+        .filter(|table| !existing.contains(&table.name))
         .map(|table| format!("{} ({})", table.name, table.owner))
         .collect::<Vec<_>>();
     assert!(missing.is_empty(), "missing catalog tables: {missing:?}");
+    assert!(contracts.iter().all(|table| table.ddl_sha256.len() == 64));
 
     let contracts = sqlx::query(
         "SELECT COUNT(*) AS count FROM astra_schema_contracts WHERE component = 'astra-core'",

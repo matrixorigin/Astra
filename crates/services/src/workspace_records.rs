@@ -403,23 +403,24 @@ const WORKSPACE_CLEANUP_DEBTS_CREATE_SQL: &str = r#"
             )
             "#;
 
+/// Actual declarations owned by the workspace-record lifecycle. Core schema
+/// bootstrap executes these statements through its authority-tracking
+/// executor; standalone callers use the same slice below.
+pub(crate) const WORKSPACE_RECORD_TABLE_DDLS: &[&str] = &[
+    WORKSPACE_RECORDS_CREATE_SQL,
+    WORKSPACE_CLEANUP_DEBTS_CREATE_SQL,
+];
+
 impl DatabaseWorkspaceRecordStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
     }
 }
 
-pub(crate) async fn ensure_workspace_record_tables(
+pub(crate) async fn verify_workspace_record_tables(
     pool: &sqlx::Pool<sqlx::MySql>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(WORKSPACE_RECORDS_CREATE_SQL)
-        .execute(pool)
-        .await?;
-    verify_workspace_records_source_key_contract(pool).await?;
-    sqlx::query(WORKSPACE_CLEANUP_DEBTS_CREATE_SQL)
-        .execute(pool)
-        .await?;
-    Ok(())
+    verify_workspace_records_source_key_contract(pool).await
 }
 
 async fn verify_workspace_records_source_key_contract(
