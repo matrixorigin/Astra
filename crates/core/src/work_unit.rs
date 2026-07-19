@@ -253,12 +253,6 @@ impl WorkUnitObservationTracker {
             }
             self.cursors.remove(&identity);
             self.terminal.insert(identity, observation.clone());
-            while self.terminal.len() > 256 {
-                let Some(oldest_identity) = self.terminal.keys().next().cloned() else {
-                    break;
-                };
-                self.terminal.remove(&oldest_identity);
-            }
             return WorkUnitObservationOutcome::Terminal;
         }
         match self.cursors.get_mut(&identity) {
@@ -549,6 +543,49 @@ mod tests {
             )),
             WorkUnitObservationOutcome::Ignored,
             "a delayed non-terminal snapshot must not resurrect terminal work"
+        );
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn terminal_truth_is_not_evicted_during_a_long_session() {
+        let mut tracker = WorkUnitObservationTracker::default();
+        for index in 0..512 {
+            let running = WorkUnitObservation::new(
+                format!("work-{index:04}"),
+                "agent",
+                WorkUnitStatus::Running,
+                1,
+                WorkUnitObservationMode::Transition,
+            )
+            .unwrap();
+            let completed = WorkUnitObservation::new(
+                format!("work-{index:04}"),
+                "agent",
+                WorkUnitStatus::Completed,
+                2,
+                WorkUnitObservationMode::Transition,
+            )
+            .unwrap();
+            assert_eq!(tracker.observe(&running), WorkUnitObservationOutcome::First);
+            assert_eq!(
+                tracker.observe(&completed),
+                WorkUnitObservationOutcome::Terminal
+            );
+        }
+
+        let delayed = WorkUnitObservation::new(
+            "work-0000",
+            "agent",
+            WorkUnitStatus::Running,
+            1,
+            WorkUnitObservationMode::Current,
+        )
+        .unwrap();
+        assert_eq!(
+            tracker.observe(&delayed),
+            WorkUnitObservationOutcome::Ignored,
+            "session-scoped terminal truth must remain absorbing regardless of identity order"
         );
         assert!(tracker.is_empty());
     }

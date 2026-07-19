@@ -650,22 +650,6 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 /// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
 pub type BgTaskOutputStatus = WorkUnitStatus;
 
-fn shell_work_revision(status: WorkUnitStatus, total_bytes: u64) -> u64 {
-    let phase = match status {
-        WorkUnitStatus::Pending => 1,
-        WorkUnitStatus::Running => 2,
-        WorkUnitStatus::WaitingForInput => 3,
-        WorkUnitStatus::Stopping => 4,
-        WorkUnitStatus::Completed
-        | WorkUnitStatus::CompletedWithIssues
-        | WorkUnitStatus::Failed
-        | WorkUnitStatus::Interrupted
-        | WorkUnitStatus::Cancelled
-        | WorkUnitStatus::Unavailable => 5,
-    };
-    total_bytes.saturating_mul(8).saturating_add(phase)
-}
-
 #[derive(Debug, Clone)]
 pub struct BgTaskOutputSnapshot {
     pub kind: String,
@@ -1194,7 +1178,7 @@ fn background_task_output_result_fields(
             BgTaskOutputReadMode::Historical => "historical",
         }
     };
-    let mut fields = serde_json::Map::from_iter([(
+    serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1203,22 +1187,7 @@ fn background_task_output_result_fields(
             "terminal": snapshot.status.is_terminal(),
             "mode": observation_mode,
         }),
-    )]);
-    WorkUnitObservation::new(
-        task_id,
-        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
-        snapshot.status,
-        shell_work_revision(snapshot.status, snapshot.total_bytes),
-        match observation_mode {
-            "wait" => WorkUnitObservationMode::Wait,
-            "historical" => WorkUnitObservationMode::Historical,
-            _ => WorkUnitObservationMode::Current,
-        },
-    )
-    .expect("background snapshots have a task id, kind, and version")
-    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
-    .insert_into(&mut fields);
-    fields
+    )])
 }
 
 fn background_task_output_search_result_fields(
@@ -1226,7 +1195,7 @@ fn background_task_output_search_result_fields(
     pattern: &str,
     snapshot: &BgTaskOutputSearchSnapshot,
 ) -> serde_json::Map<String, Value> {
-    let mut fields = serde_json::Map::from_iter([(
+    serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1238,18 +1207,7 @@ fn background_task_output_search_result_fields(
             "matching_lines": snapshot.matching_lines,
             "truncated": snapshot.truncated,
         }),
-    )]);
-    WorkUnitObservation::new(
-        task_id,
-        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
-        snapshot.status,
-        snapshot.matching_lines.saturating_add(1),
-        WorkUnitObservationMode::Diagnostic,
-    )
-    .expect("background diagnostics have a task id, kind, and version")
-    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
-    .insert_into(&mut fields);
-    fields
+    )])
 }
 
 fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
@@ -6379,9 +6337,10 @@ mod tests {
     use super::{
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot,
         BgTaskOutputSnapshot, BgTaskOutputStatus, PERSIST_THRESHOLD, ToolExecutor,
-        WorkUnitObservation, WorkUnitStatus, all_tool_schemas, cli_tool_output_is_error,
-        detect_git_remote_repos, embedded_work_unit_observation, extract_github_owner_repo,
-        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
+        WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
+        background_task_output_result_fields, cli_tool_output_is_error, detect_git_remote_repos,
+        embedded_work_unit_observation, extract_github_owner_repo, file_checkpoint_dir_for,
+        format_background_task_error, format_background_task_output,
         format_background_task_output_wait_timeout, format_background_task_stop_error,
         git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
@@ -7404,21 +7363,12 @@ mod tests {
         assert_eq!(observation["task_id"], "bg-shell-1");
         assert_eq!(observation["task_kind"], "shell");
         assert_eq!(observation["mode"], "current");
-        let work = result_fields
-            .as_ref()
-            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-            .expect("current task output must publish the shared work-unit contract");
-        assert_eq!(work.id, "bg-shell-1");
-        assert_eq!(work.kind, "shell");
-        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
-        assert_eq!(work.revision, 8002);
-        assert_eq!(
-            work.mode,
-            astra_core::work_unit::WorkUnitObservationMode::Current
-        );
-        assert_eq!(
-            work.wake_policy,
-            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        assert!(
+            result_fields
+                .as_ref()
+                .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+                .is_none(),
+            "task_output is a reader; only the shell producer may advance lifecycle revision"
         );
     }
 
@@ -7484,18 +7434,12 @@ mod tests {
         assert_eq!(observation["mode"], "diagnostic");
         assert_eq!(observation["terminal"], true);
         assert_eq!(observation["matching_lines"], 1);
-        let work = result_fields
-            .as_ref()
-            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-            .expect("diagnostic output must still publish its non-live observation mode");
-        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Failed);
-        assert_eq!(
-            work.mode,
-            astra_core::work_unit::WorkUnitObservationMode::Diagnostic
-        );
-        assert_eq!(
-            work.wake_policy,
-            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        assert!(
+            result_fields
+                .as_ref()
+                .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+                .is_none(),
+            "diagnostic reads must not publish lifecycle identity or revision"
         );
     }
 
@@ -8051,6 +7995,34 @@ mod tests {
         assert!(output.contains("title review auth flow"), "{output}");
         assert!(!output.contains("Read shell output"), "{output}");
         assert!(!output.contains("Job"), "{output}");
+    }
+
+    #[test]
+    fn task_output_readers_never_publish_lifecycle_identity_or_revision() {
+        for kind in ["shell", "local agent"] {
+            let snapshot = BgTaskOutputSnapshot {
+                kind: kind.to_string(),
+                title: Some("background work".to_string()),
+                output: "progress".to_string(),
+                end_offset: 8,
+                total_bytes: 8,
+                total_lines: 1,
+                status: BgTaskOutputStatus::Running,
+                output_ref: "producer-owned".to_string(),
+            };
+            let fields = background_task_output_result_fields(
+                "work-1",
+                &snapshot,
+                BgTaskOutputReadMode::Current,
+                false,
+            );
+
+            assert!(fields.contains_key("background_task_observation"));
+            assert!(
+                WorkUnitObservation::from_fields(&fields).is_none(),
+                "{kind} task_output must return read evidence without becoming a lifecycle producer"
+            );
+        }
     }
 
     #[test]
