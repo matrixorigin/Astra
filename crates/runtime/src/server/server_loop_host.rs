@@ -6813,6 +6813,27 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct InMemoryInteractionSink {
+        committed: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for InMemoryInteractionSink {
+        async fn commit_and_deliver(&self, event: Value) -> Result<(), String> {
+            self.committed.lock().expect("interaction sink").push(event);
+            Ok(())
+        }
+    }
+
+    fn install_in_memory_interaction_sink(
+        host: &mut ServerAgenticLoopHost,
+    ) -> Arc<InMemoryInteractionSink> {
+        let sink = Arc::new(InMemoryInteractionSink::default());
+        host.set_interaction_sink(sink.clone());
+        sink
+    }
+
+    #[derive(Default)]
     struct ServerOnlyPromptMemory {
         calls: std::sync::atomic::AtomicUsize,
         scopes: std::sync::Mutex<Vec<(String, String)>>,
@@ -9750,6 +9771,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        let interaction_sink = install_in_memory_interaction_sink(&mut host);
         host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(
@@ -9819,6 +9841,22 @@ mod tests {
             })
             .expect("approval batch event");
         assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            interaction_sink
+                .committed
+                .lock()
+                .expect("committed interactions")
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.get("type").and_then(Value::as_str),
+                        Some("approval_batch_required" | "tool_request")
+                    )
+                })
+                .count(),
+            3,
+            "the approval batch and both executable requests must cross the commit boundary"
+        );
 
         let tool_request_positions: Vec<_> = host
             .emitted_events
@@ -9923,6 +9961,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        install_in_memory_interaction_sink(&mut host);
         // Register read_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -10047,6 +10086,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        install_in_memory_interaction_sink(&mut host);
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
         host.install_runtime_tool_schemas(
             vec![
