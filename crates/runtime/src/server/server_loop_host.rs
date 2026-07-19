@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1262,9 +1262,22 @@ struct AgentLiveMirror {
     sink: SharedAgentLiveEventSink,
 }
 
-enum ServerEventSender {
-    Bounded(tokio::sync::mpsc::Sender<Value>),
-    Unbounded(tokio::sync::mpsc::UnboundedSender<Value>),
+#[derive(Clone, Default)]
+pub(crate) struct HostEventGapTracker(Arc<AtomicU64>);
+
+impl HostEventGapTracker {
+    pub(crate) fn record_drop(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::AcqRel)
+    }
+}
+
+struct ServerEventSender {
+    tx: tokio::sync::mpsc::Sender<Value>,
+    gap: HostEventGapTracker,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -2473,27 +2486,28 @@ impl ServerAgenticLoopHost {
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
-    /// The internal host → fanout lane is lossless: it carries approvals as
-    /// well as progress and is isolated from network backpressure by the
-    /// fanout's bounded observer channel. A closed receiver detaches delivery.
+    /// The internal host → fanout lane is bounded. When progress outruns its
+    /// consumer, the producer records a coalesced gap instead of accumulating
+    /// unbounded memory; the bridge emits a durable-snapshot repair boundary
+    /// before the next event. A closed receiver detaches delivery.
     fn emit_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
         let streaming_turn = self.event_tx.is_some();
-        if let Some(sender) = &self.event_tx {
-            let disconnected = match sender {
-                ServerEventSender::Bounded(tx) => match tx.try_send(event.clone()) {
-                    Ok(()) => false,
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Compatibility-only bounded hosts retain the old
-                        // detached behavior. Production root and child loops
-                        // install the lossless internal lane below.
-                        tracing::warn!(target: "sse_channel", "bounded compatibility stream filled; detaching it while durable run continues");
-                        true
-                    }
-                },
-                ServerEventSender::Unbounded(tx) => tx.send(event.clone()).is_err(),
+        let uses_attached_lane = !self.prefer_client_tool_delivery
+            || matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("approval_required" | "approval_batch_required" | "tool_request")
+            );
+        if uses_attached_lane && let Some(sender) = &self.event_tx {
+            let disconnected = match sender.tx.try_send(event.clone()) {
+                Ok(()) => false,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    sender.gap.record_drop();
+                    tracing::warn!(target: "sse_channel", "bounded host event lane filled; recording a durable repair boundary");
+                    false
+                }
             };
             if disconnected {
                 tracing::debug!(target: "sse_channel", "stream fanout disconnected; detaching live delivery while durable run continues");
@@ -2674,23 +2688,18 @@ impl ServerAgenticLoopHost {
         }
         std::mem::take(&mut self.emitted_events)
     }
-    /// Attach an incremental SSE channel. Events will be pushed through
-    /// this sender as they are emitted, enabling streaming to the client.
-    /// Channel closure detaches this observer; it does not cancel the run.
-    pub(crate) fn set_unbounded_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
-        // In live streaming mode, run_lifecycle owns the dedicated progress
-        // bridge. Keeping the host subscription active would replay the same
-        // agent progress events at turn-boundary drains, duplicating cards and
-        // persisted work-surface deltas.
-        self.progress_rx = None;
-        self.progress_filter = None;
-        self.event_tx = Some(ServerEventSender::Unbounded(tx));
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+        self.set_event_tx_with_gap(tx, HostEventGapTracker::default());
     }
 
-    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+    pub(crate) fn set_event_tx_with_gap(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<Value>,
+        gap: HostEventGapTracker,
+    ) {
         self.progress_rx = None;
         self.progress_filter = None;
-        self.event_tx = Some(ServerEventSender::Bounded(tx));
+        self.event_tx = Some(ServerEventSender { tx, gap });
     }
 
     pub(crate) fn detach_event_tx(&mut self) {
@@ -12640,7 +12649,7 @@ mod tests {
     }
 
     #[test]
-    fn lossless_internal_stream_preserves_approval_after_progress_burst() {
+    fn bounded_internal_stream_coalesces_overflow_without_permanent_detach() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -12652,10 +12661,15 @@ mod tests {
         let cancel_token = Arc::new(CancellationToken::new());
         host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        host.set_unbounded_event_tx(tx);
-        for sequence in 0..1_024 {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let gap = HostEventGapTracker::default();
+        host.set_event_tx_with_gap(tx, gap.clone());
+        for sequence in 0..8 {
             host.emit_event(json!({"type": "text_delta", "sequence": sequence}));
+        }
+        for expected_sequence in 0..4 {
+            let event = rx.try_recv().expect("bounded prefix remains ordered");
+            assert_eq!(event["sequence"], expected_sequence);
         }
         host.emit_event(json!({
             "type": "approval_required",
@@ -12671,14 +12685,11 @@ mod tests {
             "LLM cancellation token must remain active on channel backpressure"
         );
         assert!(host.event_tx.is_some());
-        for expected_sequence in 0..1_024 {
-            let event = rx.try_recv().expect("every progress event remains ordered");
-            assert_eq!(event["sequence"], expected_sequence);
-        }
         let approval = rx.try_recv().expect("approval survives the progress burst");
         assert_eq!(approval["type"], "approval_required");
         assert_eq!(approval["request_id"], "approval-after-burst");
-        assert_eq!(host.emitted_events.len(), 1_025);
+        assert_eq!(gap.take(), 4, "overflow is one coalesced repair boundary");
+        assert_eq!(host.emitted_events.len(), 9);
     }
 
     #[test]

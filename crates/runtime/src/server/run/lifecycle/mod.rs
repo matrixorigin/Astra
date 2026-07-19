@@ -8376,16 +8376,42 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             state.session_turn,
             request.agent_id.clone(),
         );
-        let (host_event_tx, mut host_event_rx) = mpsc::unbounded_channel::<Value>();
+        const HOST_EVENT_CHANNEL_CAPACITY: usize = 256;
+        let (host_event_tx, mut host_event_rx) =
+            mpsc::channel::<Value>(HOST_EVENT_CHANNEL_CAPACITY);
+        let host_event_gap = server_loop_host::HostEventGapTracker::default();
+        let bridge_gap = host_event_gap.clone();
         let host_event_bridge_tx = event_tx.clone();
-        let host_event_bridge = tokio::spawn(async move {
+        let host_event_bridge_run_id = run_id.clone();
+        let mut host_event_bridge = tokio::spawn(async move {
             while let Some(event) = host_event_rx.recv().await {
+                let dropped = bridge_gap.take();
+                if dropped > 0
+                    && host_event_bridge_tx
+                        .send(stream_delivery_gap_event(
+                            &host_event_bridge_run_id,
+                            dropped,
+                        ))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
                 if host_event_bridge_tx.send(event).await.is_err() {
-                    break;
+                    return;
                 }
             }
+            let dropped = bridge_gap.take();
+            if dropped > 0 {
+                let _ = host_event_bridge_tx
+                    .send(stream_delivery_gap_event(
+                        &host_event_bridge_run_id,
+                        dropped,
+                    ))
+                    .await;
+            }
         });
-        host.set_unbounded_event_tx(host_event_tx);
+        host.set_event_tx_with_gap(host_event_tx, host_event_gap);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
@@ -8906,13 +8932,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 host.detach_event_tx();
-                if let Err(error) = host_event_bridge.await {
-                    tracing::warn!(
+                match tokio::time::timeout(Duration::from_secs(2), &mut host_event_bridge).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(
                         target: "astra_runtime::run_lifecycle",
                         run_id = %bg_run_id,
                         error = %error,
-                        "lossless host event bridge stopped before draining"
-                    );
+                        "bounded host event bridge stopped before draining"
+                    ),
+                    Err(_) => {
+                        host_event_bridge.abort();
+                        let _ = host_event_bridge.await;
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            "bounded host event bridge drain exceeded 2 seconds; detached remaining live progress"
+                        );
+                    }
                 }
                 park_server_root_mailbox(&mut state).await;
                 let loop_success = loop_result.is_ok();
@@ -10876,10 +10912,20 @@ fn start_child_client_tool_delivery_bridge(
     child_run_id: String,
     child_agent_id: String,
     session_id: String,
-    mut child_rx: mpsc::UnboundedReceiver<Value>,
+    mut child_rx: mpsc::Receiver<Value>,
+    gap: server_loop_host::HostEventGapTracker,
 ) -> ChildClientToolDeliveryBridge {
     let join = tokio::spawn(async move {
         while let Some(mut event) = child_rx.recv().await {
+            let dropped = gap.take();
+            if dropped > 0
+                && parent_tx
+                    .send(stream_delivery_gap_event(&child_run_id, dropped))
+                    .await
+                    .is_err()
+            {
+                break;
+            }
             if !is_client_tool_delivery_event(&event) {
                 continue;
             }
@@ -10903,6 +10949,12 @@ fn start_child_client_tool_delivery_bridge(
                 );
                 break;
             }
+        }
+        let dropped = gap.take();
+        if dropped > 0 {
+            let _ = parent_tx
+                .send(stream_delivery_gap_event(&child_run_id, dropped))
+                .await;
         }
     });
     ChildClientToolDeliveryBridge { join }
@@ -11388,8 +11440,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             );
         }
         let _client_tool_delivery_bridge = if client_tool_delivery_available {
-            let (child_tx, child_rx) = mpsc::unbounded_channel();
-            host.set_unbounded_event_tx(child_tx);
+            const CHILD_CLIENT_EVENT_CHANNEL_CAPACITY: usize = 64;
+            let (child_tx, child_rx) = mpsc::channel(CHILD_CLIENT_EVENT_CHANNEL_CAPACITY);
+            let child_event_gap = server_loop_host::HostEventGapTracker::default();
+            host.set_event_tx_with_gap(child_tx, child_event_gap.clone());
             host.prefer_client_tool_delivery();
             Some(start_child_client_tool_delivery_bridge(
                 self.client_tool_delivery_tx
@@ -11399,6 +11453,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 config.agent_profile.agent_id.clone(),
                 config.session_id.clone(),
                 child_rx,
+                child_event_gap,
             ))
         } else {
             None

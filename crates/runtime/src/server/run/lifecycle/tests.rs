@@ -12630,20 +12630,23 @@ fn edge_approval_persistence_rejects_unaddressable_items() {
 #[tokio::test]
 async fn child_client_tool_delivery_forwards_requests_without_leaking_child_transcript() {
     let (parent_tx, mut parent_rx) = mpsc::channel(8);
-    let (child_tx, child_rx) = mpsc::unbounded_channel();
+    let (child_tx, child_rx) = mpsc::channel(8);
     let _bridge = start_child_client_tool_delivery_bridge(
         parent_tx,
         "child-run".to_string(),
         "researcher".to_string(),
         "session-1".to_string(),
         child_rx,
+        server_loop_host::HostEventGapTracker::default(),
     );
 
     child_tx
         .send(json!({"type": "text_delta", "content": "private child output"}))
+        .await
         .unwrap();
     child_tx
         .send(json!({"type": "tool_request", "request_id": "tool-1"}))
+        .await
         .unwrap();
     child_tx
         .send(json!({
@@ -12651,6 +12654,7 @@ async fn child_client_tool_delivery_forwards_requests_without_leaking_child_tran
             "request_id": "approval-1",
             "tool": "bash"
         }))
+        .await
         .unwrap();
 
     let tool_request = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
@@ -12674,6 +12678,34 @@ async fn child_client_tool_delivery_forwards_requests_without_leaking_child_tran
             .is_err(),
         "child text must remain on the typed agent-live transcript lane"
     );
+}
+
+#[tokio::test]
+async fn child_client_tool_delivery_surfaces_coalesced_gap_before_next_request() {
+    let (parent_tx, mut parent_rx) = mpsc::channel(8);
+    let (child_tx, child_rx) = mpsc::channel(1);
+    let gap = server_loop_host::HostEventGapTracker::default();
+    gap.record_drop();
+    gap.record_drop();
+    let _bridge = start_child_client_tool_delivery_bridge(
+        parent_tx,
+        "child-run".to_string(),
+        "researcher".to_string(),
+        "session-1".to_string(),
+        child_rx,
+        gap,
+    );
+    child_tx
+        .send(json!({"type": "tool_request", "request_id": "tool-1"}))
+        .await
+        .unwrap();
+
+    let repair = parent_rx.recv().await.unwrap();
+    let request = parent_rx.recv().await.unwrap();
+    assert_eq!(repair["type"], "stream_gap");
+    assert_eq!(repair["run_id"], "child-run");
+    assert_eq!(repair["dropped_event_count"], 2);
+    assert_eq!(request["type"], "tool_request");
 }
 
 #[test]
