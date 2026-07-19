@@ -35,19 +35,6 @@ pub(crate) async fn finalize_effective_line(
     let mut runtime_required_texts = Vec::new();
     let mut runtime_volatile_texts = Vec::new();
 
-    // A background agent group is part of the current conversation state, not
-    // optional tool-discovery trivia. Inject the same runtime-owned projection
-    // shown by Shift+Down on every ordinary turn so questions such as "what is
-    // still running?" cannot hallucinate from stale transcript text.
-    let background_work_snapshot = state.bg_task_list_cache.read().await.clone();
-    if !background_work_snapshot.trim().is_empty()
-        && background_work_snapshot.trim() != "<background_tasks count=\"0\" />"
-    {
-        runtime_volatile_texts.push(format!(
-            "Current background work snapshot (runtime-owned and authoritative for this turn):\n{background_work_snapshot}\nUse canonical task/group IDs from this snapshot. Treat a fanout as one user-visible work unit; do not infer group completion from individual agent events."
-        ));
-    }
-
     if !state.pending_bg_notifications.is_empty() {
         let notifications = state
             .pending_bg_notifications
@@ -722,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_effective_line_always_injects_authoritative_background_work() {
+    async fn finalize_effective_line_does_not_parse_ui_task_projection_as_runtime_truth() {
         let mut state = SessionState::default();
         *state.bg_task_list_cache.write().await = r#"<background_tasks count="1"><task id="fanout:review-group" kind="agent_fanout" status="running" completed="1" active="2" recovery_call="agent_fanout(action='get_results', group_id='review-group')" /></background_tasks>"#.into();
 
@@ -734,28 +721,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
-        let snapshot = &finalized.runtime_volatile_texts[0];
         assert!(
-            snapshot.contains("runtime-owned and authoritative"),
-            "{snapshot}"
-        );
-        assert!(snapshot.contains("review-group"), "{snapshot}");
-        assert!(
-            snapshot.contains("completed=\"1\" active=\"2\""),
-            "{snapshot}"
+            finalized.runtime_volatile_texts.is_empty(),
+            "rendered UI state must not become a parallel model truth lane: {finalized:?}"
         );
         assert!(!finalized.user_message.contains("background_tasks"));
-    }
-
-    #[tokio::test]
-    async fn finalize_effective_line_does_not_inject_empty_background_work() {
-        let mut state = SessionState::default();
-        *state.bg_task_list_cache.write().await = "<background_tasks count=\"0\" />".into();
-
-        let finalized =
-            finalize_effective_line("hello".into(), "hello".into(), None, &mut state).await;
-
-        assert!(finalized.runtime_volatile_texts.is_empty(), "{finalized:?}");
     }
 }

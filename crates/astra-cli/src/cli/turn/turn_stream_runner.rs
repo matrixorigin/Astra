@@ -18,6 +18,7 @@ struct PreparedTurnStreamState {
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
     append_system_prompt: Option<String>,
+    input_work_unit_observations: Vec<astra_core::work_unit::WorkUnitObservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +73,14 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
 async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamState {
     let append_system_prompt = crate::cli::execution_state_summary::format_for_session_state(state);
 
+    // Capture producer truth at the actual model boundary. This refreshes on
+    // retries and wake turns and avoids feeding the TUI's rendered XML cache
+    // back into lifecycle decisions.
+    let input_work_unit_observations = match state.agent_spawner.as_ref() {
+        Some(spawner) => spawner.active_fanout_work_unit_observations().await,
+        None => Vec::new(),
+    };
+
     let run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
             .clone()
@@ -87,6 +96,7 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
         observability_hub: state.observability_hub.clone(),
         observability_session: state.observability_session.clone(),
         append_system_prompt,
+        input_work_unit_observations,
     }
 }
 
@@ -103,6 +113,7 @@ fn build_turn_stream_params<'a>(
         user_intent: input.user_intent,
         input_runtime_required_texts: input.input_runtime_required_texts,
         input_runtime_volatile_texts: input.input_runtime_volatile_texts,
+        input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
         session_id: input.session_id,
         model_id: crate::cli::slash::slash_config::active_model_id_for_request(),
@@ -319,6 +330,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prepare_turn_stream_state_captures_canonical_active_fanout_truth() {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+            router,
+        ));
+        spawner
+            .declare_fanout_group(
+                "review-group",
+                "Three-angle review",
+                3,
+                Some("tool-fanout"),
+                "prior-root-run",
+            )
+            .await
+            .unwrap();
+        let state = SessionState {
+            agent_spawner: Some(spawner),
+            ..SessionState::default()
+        };
+
+        let prepared = prepare_turn_stream_state(&state).await;
+
+        assert_eq!(prepared.input_work_unit_observations.len(), 1);
+        let observation = &prepared.input_work_unit_observations[0];
+        assert_eq!(observation.id, "review-group");
+        assert_eq!(observation.kind, "agent_fanout");
+        assert_eq!(
+            observation.status,
+            astra_core::work_unit::WorkUnitStatus::Pending
+        );
+        assert_eq!(
+            observation.wake_policy,
+            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        );
+    }
+
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
         let mut state = SessionState {
@@ -347,6 +397,7 @@ mod tests {
             observability_hub: None,
             observability_session: None,
             append_system_prompt: Some("task board".into()),
+            input_work_unit_observations: Vec::new(),
         };
 
         let params = build_turn_stream_params(

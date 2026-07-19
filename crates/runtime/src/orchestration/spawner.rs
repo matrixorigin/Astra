@@ -1369,6 +1369,22 @@ impl DynamicAgentSpawner {
         groups
     }
 
+    /// Snapshot every currently active fanout as producer-owned work truth.
+    ///
+    /// This is the session-turn boundary API. Callers should not route the UI
+    /// task-list rendering back into model context or reconstruct group state
+    /// from individual child histories.
+    pub async fn active_fanout_work_unit_observations(
+        &self,
+    ) -> Vec<astra_core::work_unit::WorkUnitObservation> {
+        self.list_fanout_groups()
+            .await
+            .into_iter()
+            .filter(|group| !group.is_terminal())
+            .filter_map(|group| group.work_unit_observation())
+            .collect()
+    }
+
     pub async fn declare_fanout_group(
         &self,
         group_id: &str,

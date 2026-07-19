@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use astra_core::work_unit::WorkUnitStatus;
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFanoutSlotIdentity {
@@ -238,6 +240,23 @@ impl AgentFanoutGroupProjection {
         } else {
             WorkUnitStatus::CompletedWithIssues
         }
+    }
+
+    /// Producer-owned lifecycle observation for this fanout as one work unit.
+    ///
+    /// Consumers must carry this value across model/UI boundaries instead of
+    /// rebuilding lifecycle truth from child events, XML projections, or
+    /// hand-copied agent IDs. The group revision is the opaque material-state
+    /// version and the runtime owns one update when the group settles.
+    pub fn work_unit_observation(&self) -> Option<WorkUnitObservation> {
+        WorkUnitObservation::new(
+            &self.group_id,
+            "agent_fanout",
+            self.work_unit_status(),
+            self.revision.to_string(),
+            WorkUnitObservationMode::Current,
+        )
+        .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal))
     }
 
     pub fn set_slot_request(
@@ -782,6 +801,15 @@ mod tests {
     fn work_unit_status_is_one_canonical_projection_for_every_slot_outcome() {
         let planned = AgentFanoutGroupProjection::new("planned", "Planned", 1);
         assert_eq!(planned.work_unit_status(), WorkUnitStatus::Pending);
+        let planned_observation = planned.work_unit_observation().unwrap();
+        assert_eq!(planned_observation.id, "planned");
+        assert_eq!(planned_observation.kind, "agent_fanout");
+        assert_eq!(planned_observation.status, WorkUnitStatus::Pending);
+        assert_eq!(planned_observation.version, planned.revision.to_string());
+        assert_eq!(
+            planned_observation.wake_policy,
+            WorkUnitWakePolicy::OnTerminal
+        );
 
         let mut completed = AgentFanoutGroupProjection::new("completed", "Completed", 1);
         completed.record_spawn_accepted(0, "reviewer").unwrap();

@@ -53,22 +53,9 @@ impl LocalAgentSnapshot {
     pub(crate) fn fanout_work_unit_observations(
         &self,
     ) -> Vec<astra_core::work_unit::WorkUnitObservation> {
-        use astra_core::work_unit::{
-            WorkUnitObservation, WorkUnitObservationMode, WorkUnitWakePolicy,
-        };
-
         self.fanout_groups
             .iter()
-            .filter_map(|group| {
-                WorkUnitObservation::new(
-                    &group.group_id,
-                    "agent_fanout",
-                    group.work_unit_status(),
-                    group.revision.to_string(),
-                    WorkUnitObservationMode::Current,
-                )
-                .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal))
-            })
+            .filter_map(|group| group.work_unit_observation())
             .collect()
     }
 

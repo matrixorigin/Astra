@@ -129,6 +129,7 @@ impl<'a> CompactCtx<'a> {
             user_intent: message,
             input_runtime_required_texts: &[],
             input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id: self.state.session_id.as_deref(),
             model_id: None,

@@ -1337,6 +1337,7 @@ pub(crate) async fn handle_info_command(
                 user_intent: &prompt,
                 input_runtime_required_texts: &[],
                 input_runtime_volatile_texts: &[],
+                input_work_unit_observations: &[],
                 semantic_query_override: None,
                 session_id: state.session_id.as_deref(),
                 model_id: None,

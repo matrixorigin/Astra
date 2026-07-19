@@ -1019,6 +1019,27 @@ pub(crate) async fn stream_chat_sse(
         },
     };
 
+    let input_work_unit_observations = p
+        .input_work_unit_observations
+        .iter()
+        .filter(|observation| observation.is_valid())
+        .cloned()
+        .collect::<Vec<_>>();
+    for observation in &input_work_unit_observations {
+        state.observe_work_unit(observation);
+    }
+    if !input_work_unit_observations.is_empty() {
+        state.push_volatile_payload(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::ActiveWorkSnapshot,
+            serde_json::json!({
+                "schema": "active_work_snapshot.v1",
+                "work_unit_observations": input_work_unit_observations,
+                "instruction": "This is producer-owned session work state at the current model boundary. Use canonical group IDs. A fanout is one work unit: do not copy child IDs or infer group completion from individual events. Non-terminal work makes any current answer a partial snapshot, not a completion report.",
+                "authority": "runtime_producer",
+            }),
+        );
+    }
+
     // Root and child runs capture the same append-only transcript lane. This
     // must happen before the first model boundary; final prompt history can
     // later be compacted and is not a valid recovery source for this data.
