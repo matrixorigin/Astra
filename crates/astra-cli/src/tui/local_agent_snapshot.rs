@@ -54,30 +54,16 @@ impl LocalAgentSnapshot {
         &self,
     ) -> Vec<astra_core::work_unit::WorkUnitObservation> {
         use astra_core::work_unit::{
-            WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+            WorkUnitObservation, WorkUnitObservationMode, WorkUnitWakePolicy,
         };
 
         self.fanout_groups
             .iter()
             .filter_map(|group| {
-                let summary = group.summary();
-                let has_issues = summary.failed > 0
-                    || summary.interrupted > 0
-                    || summary.spawn_rejected > 0
-                    || summary.timed_out > 0
-                    || summary.cancelled_by_user > 0
-                    || summary.cancelled_by_parent_budget > 0;
-                let status = if summary.active > 0 || summary.planned > 0 {
-                    WorkUnitStatus::Running
-                } else if has_issues {
-                    WorkUnitStatus::CompletedWithIssues
-                } else {
-                    WorkUnitStatus::Completed
-                };
                 WorkUnitObservation::new(
                     &group.group_id,
                     "agent_fanout",
-                    status,
+                    group.work_unit_status(),
                     group.revision.to_string(),
                     WorkUnitObservationMode::Current,
                 )

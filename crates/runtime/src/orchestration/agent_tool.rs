@@ -1558,19 +1558,7 @@ async fn render_agent_fanout_results(
         .count();
     let all_slots_delivered = summary.completed == summary.target_count;
     let incomplete_slot_count = summary.target_count.saturating_sub(summary.completed);
-    let has_failures = summary.failed > 0
-        || summary.interrupted > 0
-        || summary.spawn_rejected > 0
-        || summary.timed_out > 0
-        || summary.cancelled_by_user > 0
-        || summary.cancelled_by_parent_budget > 0;
-    let work_status = if summary.active > 0 {
-        WorkUnitStatus::Running
-    } else if has_failures {
-        WorkUnitStatus::CompletedWithIssues
-    } else {
-        WorkUnitStatus::Completed
-    };
+    let work_status = updated.work_unit_status();
     let observation_mode = if read_options.slot_index.is_some() || read_options.offset > 0 {
         WorkUnitObservationMode::Historical
     } else {
@@ -1651,7 +1639,7 @@ async fn render_agent_fanout_results(
                 "This explicitly backgrounded fanout group is still running. Do not busy-poll get_results or analyze individual slot events; the runtime will surface one terminal group update. Live progress remains available with Shift+Down."
             ),
         );
-    } else if has_failures {
+    } else if work_status == WorkUnitStatus::CompletedWithIssues {
         obj.insert(
             "instruction".into(),
             json!(format!(
@@ -1948,19 +1936,10 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
 }
 
 fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'static str {
-    let summary = group.summary();
-    if summary.active > 0 {
-        "incomplete"
-    } else if summary.spawn_rejected > 0
-        || summary.cancelled_by_parent_budget > 0
-        || summary.failed > 0
-        || summary.timed_out > 0
-        || summary.interrupted > 0
-        || summary.cancelled_by_user > 0
-    {
-        "completed_with_issues"
-    } else {
-        "completed"
+    match group.work_unit_status() {
+        WorkUnitStatus::Completed => "completed",
+        WorkUnitStatus::CompletedWithIssues => "completed_with_issues",
+        _ => "incomplete",
     }
 }
 

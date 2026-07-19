@@ -3752,17 +3752,7 @@ impl ToolExecutor {
         );
         for group in groups.iter().take(MAX_GROUPS_IN_TASK_LIST) {
             let summary = group.summary();
-            let status = if group.is_terminal() {
-                if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
-                    "failed"
-                } else {
-                    "completed"
-                }
-            } else if summary.active > 0 {
-                "running"
-            } else {
-                "pending"
-            };
+            let status = group.work_unit_status().as_str();
             let get_results_call = format!(
                 "agent_fanout(action='get_results', group_id='{}')",
                 group.group_id
@@ -4106,18 +4096,7 @@ impl ToolExecutor {
                     })
             })?;
         let summary = group.summary();
-        let terminal = group.is_terminal();
-        let status = if terminal {
-            if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
-                BgTaskOutputStatus::Failed
-            } else {
-                BgTaskOutputStatus::Completed
-            }
-        } else if summary.active > 0 {
-            BgTaskOutputStatus::Running
-        } else {
-            BgTaskOutputStatus::Pending
-        };
+        let status = group.work_unit_status();
         // Estimate ~150 bytes per slot JSON entry. Cap serialized slots to avoid
         // allocating hundreds of KB for large fanout groups when the caller only
         // needs a small window.
@@ -6438,6 +6417,10 @@ mod tests {
 
     struct ImmediateSpawnExecutor;
 
+    struct GatedSpawnExecutor {
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
     struct NoopDelegationLookup;
 
     #[async_trait::async_trait]
@@ -6463,6 +6446,37 @@ mod tests {
             &self,
             config: astra_runtime::orchestration::SpawnRunConfig,
         ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+            Ok(astra_runtime::orchestration::SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                cancelled_by_user: None,
+                output: Some("child result".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                turns_completed: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl astra_runtime::orchestration::SpawnAgentExecutor for GatedSpawnExecutor {
+        async fn execute(
+            &self,
+            config: astra_runtime::orchestration::SpawnRunConfig,
+        ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "test spawn gate closed".to_string())?
+                .forget();
             Ok(astra_runtime::orchestration::SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
@@ -6514,6 +6528,18 @@ mod tests {
         Arc::new(
             astra_runtime::orchestration::DynamicAgentSpawner::new(router)
                 .with_executor(Arc::new(ImmediateSpawnExecutor)),
+        )
+    }
+
+    fn gated_test_spawner(
+        release: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(NoopDelegationLookup);
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router)
+                .with_executor(Arc::new(GatedSpawnExecutor { release })),
         )
     }
 
@@ -7082,6 +7108,81 @@ mod tests {
             alias_fields.as_ref().unwrap()["requested_task_output_id"],
             child_id
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_live_child_reads_resolve_to_the_running_fanout_group() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let spawner = gated_test_spawner(release.clone());
+        let executor = Arc::new(
+            test_executor()
+                .with_spawn_context(fanout_test_context(spawner.clone()))
+                .with_bg_task_commands(commands),
+        );
+        let launch_executor = executor.clone();
+        let launch = tokio::spawn(async move {
+            launch_executor
+                .execute(
+                    "agent_fanout",
+                    &serde_json::json!({
+                        "action": "start",
+                        "group_id": "live-review-fanout",
+                        "target_count": 3,
+                        "slots": [
+                            {"id": "one", "description": "Review one", "prompt": "one"},
+                            {"id": "two", "description": "Review two", "prompt": "two"},
+                            {"id": "three", "description": "Review three", "prompt": "three"}
+                        ]
+                    }),
+                )
+                .await
+        });
+
+        let child_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(child_id) = spawner
+                    .list_fanout_groups()
+                    .await
+                    .into_iter()
+                    .find(|group| group.group_id == "live-review-fanout")
+                    .and_then(|group| {
+                        (group.summary().active > 0)
+                            .then(|| group.slots.iter().find_map(|slot| slot.agent_id.clone()))
+                            .flatten()
+                    })
+                {
+                    break child_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fanout must publish a live child identity before it settles");
+
+        for _ in 0..2 {
+            let mut fields = None;
+            let output = executor
+                .task_output_with_fields(&serde_json::json!({"task_id": &child_id}), &mut fields)
+                .await;
+            assert!(
+                output.contains("Read agent fanout output live-review-fanout"),
+                "a known live child must never fall through to background-task not_found: {output}"
+            );
+            assert!(!output.contains("not_found"), "{output}");
+            let observation = fields
+                .as_ref()
+                .and_then(WorkUnitObservation::from_fields)
+                .expect("live child alias must publish canonical group truth");
+            assert_eq!(observation.id, "live-review-fanout");
+            assert_eq!(observation.status, WorkUnitStatus::Running);
+        }
+
+        release.add_permits(3);
+        let completed = launch.await.expect("fanout launch task");
+        let completed: serde_json::Value =
+            serde_json::from_str(&completed).expect("fanout result JSON");
+        assert_eq!(completed["status"], "completed", "{completed}");
     }
 
     #[tokio::test]
