@@ -1105,6 +1105,10 @@ async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
     );
     astra.wait_for("one update after the group settles", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Shift+↓ inspect", UI_TRANSITION_TIMEOUT);
+    astra.wait_for(
+        "Three mock reviews finished · 3/3 completed",
+        UI_TRANSITION_TIMEOUT,
+    );
 
     // Backgrounding does not replace the conversation with a panel. The same
     // advertised Shift+Down route opens the now-detached group on demand.

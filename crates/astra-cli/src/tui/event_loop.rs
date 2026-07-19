@@ -7069,20 +7069,25 @@ pub(crate) async fn run_tui_session(
                                                                 ),
                                                             );
                                                         }
-                                                        let notifications = next_snapshot
-                                                            .attention_notifications_since(
+                                                        let attention_updates = next_snapshot
+                                                            .attention_updates_since(
                                                                 &local_agent_snapshot,
                                                             );
-                                                        for notification in notifications {
+                                                        for update in attention_updates {
+                                                            chat_widget.commit_concurrent_system(
+                                                                history_cell::system::SystemCell::runtime_work(
+                                                                    update.receipt,
+                                                                ),
+                                                            );
                                                             if submit_active_runtime_notification(
                                                                 &active_turn_local_run_control,
-                                                                &notification,
+                                                                &update.notification,
                                                             )
                                                             .await
                                                             .is_err()
                                                             {
                                                                 deferred_active_bg_notifications
-                                                                    .push(notification);
+                                                                    .push(update.notification);
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
@@ -8378,8 +8383,16 @@ pub(crate) async fn run_tui_session(
                         );
                         frame_requester.schedule_frame();
                     }
-                    let agent_notifications = next_local_agent_snapshot
-                        .attention_notifications_since(&local_agent_snapshot);
+                    let attention_updates = next_local_agent_snapshot
+                        .attention_updates_since(&local_agent_snapshot);
+                    let mut agent_notifications = Vec::with_capacity(attention_updates.len());
+                    for update in attention_updates {
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::runtime_work(update.receipt),
+                        );
+                        agent_notifications.push(update.notification);
+                        frame_requester.schedule_frame();
+                    }
                     if !agent_notifications.is_empty() {
                         state.pending_bg_notifications.extend(agent_notifications);
                         schedule_runtime_notification_wake(

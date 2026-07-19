@@ -16,6 +16,17 @@ pub(crate) struct LocalAgentSnapshot {
     pub fanout_groups: Vec<astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection>,
 }
 
+/// One producer transition projected onto its two distinct consumers.
+///
+/// The receipt makes lifecycle truth visible immediately without an LLM. The
+/// notification schedules at most one semantic reconciliation boundary. They
+/// are created together so UI visibility and model wake policy cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAgentAttentionUpdate {
+    pub receipt: String,
+    pub notification: String,
+}
+
 impl LocalAgentSnapshot {
     pub(crate) async fn capture(
         spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -240,7 +251,10 @@ impl LocalAgentSnapshot {
     /// UI. A fanout wakes the parent once, when the fixed-size group settles;
     /// otherwise three reviewers finishing means three wasteful model turns
     /// and three contradictory partial summaries.
-    pub(crate) fn attention_notifications_since(&self, previous: &Self) -> Vec<String> {
+    pub(crate) fn attention_updates_since(
+        &self,
+        previous: &Self,
+    ) -> Vec<LocalAgentAttentionUpdate> {
         let previous_status = previous
             .agents
             .iter()
@@ -252,7 +266,7 @@ impl LocalAgentSnapshot {
             .flat_map(|group| &group.slots)
             .filter_map(|slot| slot.agent_id.as_deref())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut notifications = self
+        let mut updates = self
             .agents
             .iter()
             // Foreground children return through the tool result that is
@@ -297,7 +311,21 @@ impl LocalAgentSnapshot {
                 // mailbox; keep only a bounded preview as a fallback instead
                 // of injecting the same multi-kilobyte result twice.
                 let detail_preview = detail.chars().take(500).collect::<String>();
-                serde_json::json!({
+                let subject = agent.description.trim();
+                let subject = if subject.is_empty() {
+                    agent.agent_type.as_str()
+                } else {
+                    subject
+                };
+                let subject = subject.chars().take(80).collect::<String>();
+                let lifecycle = match status {
+                    "needs_input" => "needs input",
+                    "completed" => "finished",
+                    _ => "finished with issues",
+                };
+                LocalAgentAttentionUpdate {
+                    receipt: format!("{subject} {lifecycle} · Shift+↓ inspect"),
+                    notification: serde_json::json!({
                     "schema": "agent_attention_hint.v1",
                     "event": "agent_status_changed",
                     "agent_id": agent.agent_id,
@@ -307,8 +335,9 @@ impl LocalAgentSnapshot {
                     "status": status,
                     "detail_preview": detail_preview,
                     "authoritative_delivery": "parent_mailbox",
-                })
-                .to_string()
+                    })
+                    .to_string(),
+                }
             })
             .collect::<Vec<_>>();
 
@@ -317,7 +346,7 @@ impl LocalAgentSnapshot {
             .iter()
             .map(|group| (group.group_id.as_str(), group))
             .collect::<BTreeMap<_, _>>();
-        notifications.extend(
+        updates.extend(
             self.fanout_groups
                 .iter()
                 .filter(|group| group.is_terminal())
@@ -328,34 +357,48 @@ impl LocalAgentSnapshot {
                 })
                 .map(|group| {
                     let summary = group.summary();
-                    serde_json::json!({
-                        "schema": "agent_attention_hint.v1",
-                        "event": "fanout_group_settled",
-                        "group_id": group.group_id,
-                        "title": group.title,
-                        "parent_run_id": group.parent_run_id,
-                        "status": group.status.as_str(),
-                        "target_count": summary.target_count,
-                        "terminal": summary.terminal,
-                        "completed": summary.completed,
-                        "failed": summary.failed,
-                        "interrupted": summary.interrupted,
-                        "cancelled_by_user": summary.cancelled_by_user,
-                        "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
-                        "timed_out": summary.timed_out,
-                        "spawn_rejected": summary.spawn_rejected,
-                        "uncollected": summary.uncollected,
-                        "authoritative_result_call": {
-                            "tool": "agent_fanout",
-                            "action": "get_results",
+                    let title = group.title.trim();
+                    let title = if title.is_empty() {
+                        "Agent group".to_string()
+                    } else {
+                        title.chars().take(80).collect::<String>()
+                    };
+                    let outcome = if summary.completed == summary.target_count {
+                        format!("{}/{} completed", summary.completed, summary.target_count)
+                    } else {
+                        format!("{}/{} settled with issues", summary.terminal, summary.target_count)
+                    };
+                    LocalAgentAttentionUpdate {
+                        receipt: format!("{title} finished · {outcome} · Shift+↓ inspect"),
+                        notification: serde_json::json!({
+                            "schema": "agent_attention_hint.v1",
+                            "event": "fanout_group_settled",
                             "group_id": group.group_id,
-                        },
-                        "instruction": "Reconcile this fanout once as one work unit. Use only this canonical group_id; do not analyze individual slot completions separately.",
-                    })
-                    .to_string()
+                            "title": group.title,
+                            "parent_run_id": group.parent_run_id,
+                            "status": group.status.as_str(),
+                            "target_count": summary.target_count,
+                            "terminal": summary.terminal,
+                            "completed": summary.completed,
+                            "failed": summary.failed,
+                            "interrupted": summary.interrupted,
+                            "cancelled_by_user": summary.cancelled_by_user,
+                            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+                            "timed_out": summary.timed_out,
+                            "spawn_rejected": summary.spawn_rejected,
+                            "uncollected": summary.uncollected,
+                            "authoritative_result_call": {
+                                "tool": "agent_fanout",
+                                "action": "get_results",
+                                "group_id": group.group_id,
+                            },
+                            "instruction": "Reconcile this fanout once as one work unit. Use only this canonical group_id; do not analyze individual slot completions separately.",
+                        })
+                        .to_string(),
+                    }
                 }),
         );
-        notifications
+        updates
     }
 }
 
@@ -538,7 +581,7 @@ mod tests {
             ],
             fanout_groups: vec![running.clone()],
         };
-        assert!(first_done.attention_notifications_since(&before).is_empty());
+        assert!(first_done.attention_updates_since(&before).is_empty());
 
         running
             .record_terminal_by_agent("reviewer-1", AgentFanoutSlotStatus::Completed, None)
@@ -572,11 +615,7 @@ mod tests {
             ],
             fanout_groups: vec![running.clone()],
         };
-        assert!(
-            second_done
-                .attention_notifications_since(&first_done)
-                .is_empty()
-        );
+        assert!(second_done.attention_updates_since(&first_done).is_empty());
 
         running
             .record_terminal_by_agent("reviewer-2", AgentFanoutSlotStatus::Completed, None)
@@ -611,9 +650,13 @@ mod tests {
             ],
             fanout_groups: vec![running],
         };
-        let notifications = settled.attention_notifications_since(&second_done);
-        assert_eq!(notifications.len(), 1, "{notifications:?}");
-        let value: serde_json::Value = serde_json::from_str(&notifications[0]).unwrap();
+        let updates = settled.attention_updates_since(&second_done);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(
+            updates[0].receipt,
+            "Three reviews finished · 3/3 completed · Shift+↓ inspect"
+        );
+        let value: serde_json::Value = serde_json::from_str(&updates[0].notification).unwrap();
         assert_eq!(value["event"], "fanout_group_settled");
         assert_eq!(value["group_id"], "review-group");
         assert_eq!(value["completed"], 3);
@@ -649,7 +692,47 @@ mod tests {
             ..LocalAgentSnapshot::default()
         };
 
-        assert!(after.attention_notifications_since(&before).is_empty());
+        assert!(after.attention_updates_since(&before).is_empty());
+    }
+
+    #[test]
+    fn background_child_terminal_transition_has_one_receipt_and_one_wake() {
+        let before = LocalAgentSnapshot {
+            available: true,
+            agents: vec![agent(
+                "solo-reviewer",
+                "run-solo",
+                AgentStatus::Running {
+                    activity: "reviewing".into(),
+                },
+            )],
+            ..LocalAgentSnapshot::default()
+        };
+        let after = LocalAgentSnapshot {
+            available: true,
+            agents: vec![agent(
+                "solo-reviewer",
+                "run-solo",
+                AgentStatus::Completed {
+                    result: "evidence".into(),
+                    finish_reason: None,
+                },
+            )],
+            ..LocalAgentSnapshot::default()
+        };
+
+        let updates = after.attention_updates_since(&before);
+
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(
+            updates[0].receipt,
+            "review solo-reviewer finished · Shift+↓ inspect"
+        );
+        let notification: serde_json::Value =
+            serde_json::from_str(&updates[0].notification).unwrap();
+        assert_eq!(notification["event"], "agent_status_changed");
+        assert_eq!(notification["agent_id"], "solo-reviewer");
+        assert_eq!(notification["status"], "completed");
     }
 
     #[test]
