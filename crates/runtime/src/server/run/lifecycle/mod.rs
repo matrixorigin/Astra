@@ -7805,9 +7805,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
                 park_server_root_mailbox(&mut loop_state).await;
+                let (outcome, events) = host.settle_loop_turn(outcome);
                 let loop_success = outcome.is_ok();
                 let (events, final_status, error_msg) =
-                    Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
+                    Self::finalize_run_events(outcome, events, &loop_state);
 
                 // Clean up channels for this run.
                 bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -9068,6 +9069,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 park_server_root_mailbox(&mut state).await;
+                let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 let loop_success = loop_result.is_ok();
 
                 // Best-effort post-loop persistence (core events, tool events,
@@ -9082,7 +9084,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
 
                 let (final_events, final_status, error_msg) =
-                    Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+                    Self::finalize_run_events(loop_result, emitted_events, &state);
                 if matches!(&final_status, RunStatus::Cancelled) {
                     let cancelled_children = missing_lifecycle_spawner
                         .cancel_descendants_of_parent_run(
@@ -11864,6 +11866,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+        let outcome = host.settle_loop_outcome(outcome);
         if matches!(&outcome, Ok(AgenticLoopOutcome::Completed)) {
             crate::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
                 &mut loop_state,

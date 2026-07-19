@@ -33,6 +33,11 @@ pub enum ErrorKind {
     /// 400 other (duplicate function name, bad schema, malformed request).
     InvalidRequest,
 
+    // ── Internal contracts ──────────────────────────────────
+    /// A runtime producer/consumer protocol or lifecycle invariant was
+    /// violated. This is an implementation defect, not invalid user input.
+    ContractViolation,
+
     // ── Streaming ────────────────────────────────────
     /// No SSE chunk received within the idle timeout.
     StreamIdle,
@@ -159,6 +164,7 @@ impl ErrorKind {
             Self::Auth => "auth",
             Self::ContextWindow => "context_window",
             Self::InvalidRequest => "invalid_request",
+            Self::ContractViolation => "contract_violation",
             Self::StreamIdle => "stream_idle",
             Self::StreamTransport => "stream_transport",
             Self::ConnectionPoolExhausted => "connection_pool_exhausted",
@@ -239,6 +245,10 @@ impl ErrorKind {
             Self::InvalidRequest => {
                 "The request was rejected by the LLM provider (400). \
                  This may indicate a bug in request assembly. Do NOT retry with the same parameters."
+            }
+            Self::ContractViolation => {
+                "The runtime violated an internal lifecycle or delivery contract. \
+                 Stop this execution path and preserve the structured failure for operator diagnosis."
             }
             Self::StreamIdle => {
                 "Model stopped sending tokens mid-stream (idle timeout). \
@@ -336,6 +346,10 @@ impl ErrorKind {
                 "Request assembly bug or stale tool schema. Inspect the provider \
                  payload and fix at the source — do not retry blindly."
             }
+            Self::ContractViolation => {
+                "Inspect the structured source/error_code fields and repair the producer/consumer \
+                 contract. Treat this as a runtime defect, not user input or a retryable outage."
+            }
             Self::StreamIdle => {
                 "Model stalled mid-stream. If recurring, switch model or reduce input size."
             }
@@ -427,6 +441,7 @@ impl ErrorKind {
             "auth" => Some(Self::Auth),
             "context_window" => Some(Self::ContextWindow),
             "invalid_request" => Some(Self::InvalidRequest),
+            "contract_violation" => Some(Self::ContractViolation),
             "stream_idle" => Some(Self::StreamIdle),
             "stream_transport" => Some(Self::StreamTransport),
             "connection_pool_exhausted" => Some(Self::ConnectionPoolExhausted),
@@ -984,6 +999,7 @@ mod tests {
         ErrorKind::Auth,
         ErrorKind::ContextWindow,
         ErrorKind::InvalidRequest,
+        ErrorKind::ContractViolation,
         ErrorKind::StreamIdle,
         ErrorKind::StreamTransport,
         ErrorKind::ConnectionPoolExhausted,

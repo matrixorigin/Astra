@@ -5932,6 +5932,47 @@ fn finalize_run_events_preserves_classified_error_code() {
 }
 
 #[test]
+fn finalize_run_events_preserves_host_event_route_contract_code() {
+    let svc = test_service();
+    let request = test_request("route fault");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let classified = astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContractViolation,
+        "host_event_route_contract_violation: approval used the progress lane",
+    )
+    .with_details_json(
+        json!({
+            "source": server_loop_host::HOST_EVENT_ROUTER_SOURCE,
+            "error_code": server_loop_host::HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE,
+        })
+        .to_string(),
+    );
+
+    let (events, status, error) =
+        AgenticRunLifecycleService::finalize_run_events(Err(classified), vec![], &state);
+
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.is_some());
+    assert_eq!(
+        events[0]["data"]["error_code"],
+        "host_event_route_contract_violation"
+    );
+    assert_eq!(events[0]["data"]["error_kind"], "contract_violation");
+    assert_eq!(
+        events[1]["data"]["error_code"],
+        "host_event_route_contract_violation"
+    );
+}
+
+#[test]
 fn finalize_run_events_distinguishes_provider_admission_rejection() {
     let svc = test_service();
     let request = test_request("admission");

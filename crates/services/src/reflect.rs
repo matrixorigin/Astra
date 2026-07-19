@@ -607,7 +607,10 @@ fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
     use astra_core::ErrorKind as K;
     match (kind, count) {
         // Always critical — system-level or data-integrity
-        (K::ResourceLimit | K::DatabaseError | K::ConnectionPoolExhausted, _) => "critical",
+        (
+            K::ContractViolation | K::ResourceLimit | K::DatabaseError | K::ConnectionPoolExhausted,
+            _,
+        ) => "critical",
         // Stall ramps with repetition
         (K::Stall, n) if n >= 3 => "warning",
         (K::Stall, _) => "info",
@@ -642,6 +645,9 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::ToolInvalidArgs | K::InvalidRequest => {
             format!("Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences")
         }
+        K::ContractViolation => format!(
+            "Runtime contract violation ({tool}): an internal producer/consumer invariant failed — {count} occurrences"
+        ),
         K::ToolUnavailable => {
             format!("Tool not available in this environment ({tool}) — {count} occurrences")
         }
@@ -3050,6 +3056,15 @@ mod tests {
         }];
         let diags = build_diagnoses(&errors);
         assert_eq!(diags[0].severity, "critical");
+    }
+
+    #[test]
+    fn contract_violations_are_critical_runtime_defects() {
+        let kind = astra_core::ErrorKind::ContractViolation;
+
+        assert_eq!(severity_for(kind, 1), "critical");
+        assert!(summary_for(kind, "server_host_event_router", 1).contains("Runtime contract"));
+        assert!(kind.diagnosis_hint().contains("producer/consumer"));
     }
 
     #[test]

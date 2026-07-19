@@ -45,7 +45,7 @@ use crate::server::tool_transport::{
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopState, HostTurnResult, SkillAutoRouteDecision,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, SkillAutoRouteDecision,
     SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions,
 };
@@ -78,6 +78,8 @@ use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
+pub(crate) const HOST_EVENT_ROUTER_SOURCE: &str = "server_host_event_router";
+pub(crate) const HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE: &str = "host_event_route_contract_violation";
 const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
@@ -205,6 +207,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::Auth => "error_auth",
         astra_core::ErrorKind::ContextWindow => "error_context_window",
         astra_core::ErrorKind::InvalidRequest => "error_invalid_request",
+        astra_core::ErrorKind::ContractViolation => "error_contract_violation",
         astra_core::ErrorKind::StreamIdle => "error_stream_idle",
         astra_core::ErrorKind::StreamTransport => "error_stream_transport",
         astra_core::ErrorKind::ConnectionPoolExhausted => "error_connection_pool_exhausted",
@@ -459,6 +462,7 @@ fn mock_error_kind_from_str(kind: &str) -> astra_core::ErrorKind {
         "auth" => astra_core::ErrorKind::Auth,
         "context_window" => astra_core::ErrorKind::ContextWindow,
         "invalid_request" => astra_core::ErrorKind::InvalidRequest,
+        "contract_violation" => astra_core::ErrorKind::ContractViolation,
         "stream_idle" => astra_core::ErrorKind::StreamIdle,
         "stream_transport" => astra_core::ErrorKind::StreamTransport,
         "budget_exhausted" => astra_core::ErrorKind::BudgetExhausted,
@@ -1159,6 +1163,13 @@ pub struct ServerAgenticLoopHost {
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
     emitted_events: Vec<Value>,
+    /// First event-lane contract violation observed during this host turn.
+    ///
+    /// Ordinary event producers are intentionally infallible at the call site,
+    /// but a dynamic event must never disappear just because it was routed to
+    /// the wrong lane. The fault is therefore latched here and reconciled into
+    /// the loop outcome at the single turn-settlement boundary.
+    event_protocol_fault: Option<astra_core::ClassifiedError>,
     /// When set, SSE events are also pushed through this channel for
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
@@ -1786,6 +1797,7 @@ impl ServerAgenticLoopHostBuilder {
                 Some(std::time::Duration::from_secs(30)),
             ),
             emitted_events: Vec::new(),
+            event_protocol_fault: None,
             event_tx: None,
             interaction_sink: None,
             prefer_client_tool_delivery: false,
@@ -2515,6 +2527,57 @@ impl ServerAgenticLoopHost {
         )
     }
 
+    fn event_route_contract_error(
+        event: &Value,
+        actual_lane: &'static str,
+        required_lane: &'static str,
+    ) -> astra_core::ClassifiedError {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .take(128)
+            .collect::<String>();
+        let message = format!(
+            "{HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE}: event type {event_type} was routed through {actual_lane}; use {required_lane}"
+        );
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+            .with_details_json(
+                json!({
+                    "source": HOST_EVENT_ROUTER_SOURCE,
+                    "error_code": HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE,
+                    "event_type": event_type,
+                    "actual_lane": actual_lane,
+                    "required_lane": required_lane,
+                })
+                .to_string(),
+            )
+    }
+
+    fn record_event_protocol_fault(&mut self, fault: astra_core::ClassifiedError) {
+        if self.event_protocol_fault.is_some() {
+            return;
+        }
+        tracing::error!(
+            target: "astra_runtime::server_loop_host",
+            error = %fault,
+            "host event lane contract violated; turn will settle as failed"
+        );
+        self.event_protocol_fault = Some(fault);
+    }
+
+    fn validate_progress_event_lane(&mut self, event: &Value) -> Result<(), String> {
+        if !Self::interaction_event_requires_commit(event) {
+            return Ok(());
+        }
+        let fault =
+            Self::event_route_contract_error(event, "progress lane", "emit_committed_interaction");
+        let message = fault.message.clone();
+        self.record_event_protocol_fault(fault);
+        Err(message)
+    }
+
     fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
         self.emitted_events.push(event);
         if streaming_turn && self.emitted_events.len() > MAX_STREAMED_TURN_EVENT_BUFFER {
@@ -2530,11 +2593,22 @@ impl ServerAgenticLoopHost {
     /// buffer. Progress may be coalesced behind an explicit repair boundary;
     /// interactions that can block execution must use
     /// [`Self::emit_committed_interaction`] instead.
-    fn emit_event(&mut self, mut event: Value) {
-        debug_assert!(
-            !Self::interaction_event_requires_commit(&event),
-            "blocking interactions require durable commit acknowledgement"
-        );
+    fn emit_progress_event(&mut self, event: Value) {
+        if self.validate_progress_event_lane(&event).is_err() {
+            return;
+        }
+        self.emit_validated_progress_event(event);
+    }
+
+    /// Strict progress-lane entry used by delivery code that must immediately
+    /// withdraw callback authority when an event producer violates its route.
+    fn try_emit_progress_event(&mut self, event: Value) -> Result<(), String> {
+        self.validate_progress_event_lane(&event)?;
+        self.emit_validated_progress_event(event);
+        Ok(())
+    }
+
+    fn emit_validated_progress_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
         let streaming_turn = self.event_tx.is_some();
@@ -2562,7 +2636,16 @@ impl ServerAgenticLoopHost {
     /// for its callback. Production installs a durable sink; direct host tests
     /// fall back to bounded channel send, which is still lossless.
     async fn emit_committed_interaction(&mut self, mut event: Value) -> Result<(), String> {
-        debug_assert!(Self::interaction_event_requires_commit(&event));
+        if !Self::interaction_event_requires_commit(&event) {
+            let fault = Self::event_route_contract_error(
+                &event,
+                "committed interaction lane",
+                "emit_progress_event",
+            );
+            let message = fault.message.clone();
+            self.record_event_protocol_fault(fault);
+            return Err(message);
+        }
         self.attach_execution_metadata_to_tool_event(&mut event);
         let streaming_turn = self.event_tx.is_some() || self.interaction_sink.is_some();
 
@@ -2650,11 +2733,11 @@ impl ServerAgenticLoopHost {
         if reasoning.is_empty() {
             return;
         }
-        self.emit_event(json!({
+        self.emit_progress_event(json!({
             "type": "reasoning_delta",
             "content": reasoning,
         }));
-        self.emit_event(json!({
+        self.emit_progress_event(json!({
             "type": "reasoning_done",
         }));
     }
@@ -2668,14 +2751,14 @@ impl ServerAgenticLoopHost {
         for update in updates {
             match update {
                 LlmStreamUpdate::Text(content) if !content.is_empty() => {
-                    self.emit_event(json!({
+                    self.emit_progress_event(json!({
                         "type": "text_delta",
                         "content": content,
                     }));
                     streamed_text.push_str(&content);
                 }
                 LlmStreamUpdate::Reasoning(content) if !content.is_empty() => {
-                    self.emit_event(json!({
+                    self.emit_progress_event(json!({
                         "type": "reasoning_delta",
                         "content": content,
                     }));
@@ -2695,19 +2778,17 @@ impl ServerAgenticLoopHost {
         match outcome {
             crate::turn::terminal_control::TerminalControlOutcome::Passthrough => {}
             crate::turn::terminal_control::TerminalControlOutcome::Requested(request) => {
-                self.emit_event(request.event());
+                self.emit_progress_event(request.event());
                 self.pending_terminal_control_outcome = Some(outcome.clone());
             }
             crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection) => {
-                self.emit_event(rejection.event());
+                self.emit_progress_event(rejection.event());
                 self.pending_terminal_control_outcome = Some(outcome.clone());
             }
         }
     }
 
-    /// Access collected SSE events from the last turn.
-    /// Also drains any pending agent progress events into the result.
-    pub fn take_emitted_events(&mut self) -> Vec<Value> {
+    fn drain_pending_progress_events(&mut self) {
         // Drain pending progress events from the broadcast receiver.
         // Treat `Lagged(n)` as a recoverable warning: the receiver continues
         // and we collect every still-buffered event after the gap, preventing
@@ -2742,10 +2823,54 @@ impl ServerAgenticLoopHost {
             }
         }
         for evt in progress_events {
-            self.emit_event(evt);
+            self.emit_progress_event(evt);
         }
+    }
+
+    /// Make a host event-lane violation authoritative at the same boundary as
+    /// the agentic-loop outcome. Draining typed progress first ensures a late
+    /// producer fault cannot be missed by settlement.
+    pub(crate) fn settle_loop_outcome(
+        &mut self,
+        outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+        self.settle_loop_turn(outcome).0
+    }
+
+    /// Atomically settle the loop result and the host-owned event buffer so a
+    /// fault discovered while draining progress cannot fall between two
+    /// lifecycle calls.
+    pub(crate) fn settle_loop_turn(
+        &mut self,
+        outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) -> (
+        Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+        Vec<Value>,
+    ) {
+        self.drain_pending_progress_events();
+        let events = std::mem::take(&mut self.emitted_events);
+        (self.reconcile_event_protocol_fault(outcome), events)
+    }
+
+    fn reconcile_event_protocol_fault(
+        &mut self,
+        outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+        match self.event_protocol_fault.take() {
+            Some(fault) => Err(fault),
+            None => outcome,
+        }
+    }
+
+    /// **Test-only.** Access collected events without settling a loop result.
+    /// Production lifecycle owners must use [`Self::settle_loop_turn`] so a
+    /// latched protocol fault cannot be bypassed.
+    #[cfg(any(test, feature = "bridge-e2e-hooks"))]
+    pub fn take_emitted_events(&mut self) -> Vec<Value> {
+        self.drain_pending_progress_events();
         std::mem::take(&mut self.emitted_events)
     }
+
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         self.set_event_tx_with_gap(tx, HostEventGapTracker::default());
     }
@@ -2989,7 +3114,7 @@ impl ServerAgenticLoopHost {
 
         if let Some(error) = mock_round_error(round) {
             if let Some(partial_text) = mock_round_partial_text(&error) {
-                self.emit_event(json!({ "type": "text_delta", "content": partial_text }));
+                self.emit_progress_event(json!({ "type": "text_delta", "content": partial_text }));
             }
             if !self.session_id.is_empty() {
                 let mut artifact_store =
@@ -3075,7 +3200,7 @@ impl ServerAgenticLoopHost {
             self.push_reasoning_events(&reasoning);
         }
         if !suppress_source_projection && !full_text.is_empty() {
-            self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
+            self.emit_progress_event(json!({ "type": "text_delta", "content": &full_text }));
         }
         // Tool_call dedup — two distinct concerns, two distinct scopes:
         //
@@ -3121,7 +3246,7 @@ impl ServerAgenticLoopHost {
                     astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
                 shared.insert(key);
             }
-            self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
+            self.emit_progress_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
         // Mock fixtures use upstream OpenAI-native keys (`prompt_tokens` /
         // `completion_tokens` / `prompt_tokens_details.cached_tokens`), plus
@@ -3138,7 +3263,7 @@ impl ServerAgenticLoopHost {
             cache_creation_tokens: 0,
             output_tokens: 5,
         });
-        self.emit_event(json!({
+        self.emit_progress_event(json!({
             "type": "usage",
             "input_tokens": u.input_tokens,
             "cached_input_tokens": u.cached_input_tokens,
@@ -3363,7 +3488,7 @@ impl ServerAgenticLoopHost {
         );
         failed.insert("output".to_string(), Value::String(output.to_string()));
         insert_event_fields(&mut failed, fields);
-        self.emit_event(Value::Object(failed));
+        self.emit_progress_event(Value::Object(failed));
 
         let mut executor_event = Map::new();
         executor_event.insert(
@@ -3383,7 +3508,7 @@ impl ServerAgenticLoopHost {
         executor_event.insert("tool".to_string(), Value::String(tool_name.to_string()));
         executor_event.insert("message".to_string(), Value::String(output.to_string()));
         insert_event_fields(&mut executor_event, fields);
-        self.emit_event(Value::Object(executor_event));
+        self.emit_progress_event(Value::Object(executor_event));
 
         let mut blocked = Map::new();
         blocked.insert("type".to_string(), Value::String("run_blocked".to_string()));
@@ -3399,7 +3524,7 @@ impl ServerAgenticLoopHost {
         blocked.insert("tool".to_string(), Value::String(tool_name.to_string()));
         blocked.insert("message".to_string(), Value::String(output.to_string()));
         insert_event_fields(&mut blocked, fields);
-        self.emit_event(Value::Object(blocked));
+        self.emit_progress_event(Value::Object(blocked));
 
         let mut waiting = Map::new();
         waiting.insert("type".to_string(), Value::String("run_waiting".to_string()));
@@ -3414,7 +3539,7 @@ impl ServerAgenticLoopHost {
         waiting.insert("call_id".to_string(), Value::String(request_id.to_string()));
         waiting.insert("tool".to_string(), Value::String(tool_name.to_string()));
         insert_event_fields(&mut waiting, fields);
-        self.emit_event(Value::Object(waiting));
+        self.emit_progress_event(Value::Object(waiting));
     }
 
     /// Deliver edge tool calls via the ledger protocol.
@@ -3592,7 +3717,7 @@ impl ServerAgenticLoopHost {
             let output = astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
                 &tool_name, false,
             );
-            self.emit_event(Value::Object(build_tool_call_end_event(
+            self.emit_progress_event(Value::Object(build_tool_call_end_event(
                 &request_id,
                 json!({
                     "status": "error",
@@ -3707,7 +3832,7 @@ impl ServerAgenticLoopHost {
                     .await
                     {
                         for m in denied.sse_maps {
-                            self.emit_event(Value::Object(m));
+                            self.emit_progress_event(Value::Object(m));
                         }
                         results_by_id.insert(
                             request_id.clone(),
@@ -3821,7 +3946,10 @@ impl ServerAgenticLoopHost {
                             break;
                         }
                     } else {
-                        self.emit_event(event);
+                        if let Err(error) = self.try_emit_progress_event(event) {
+                            delivery_error = Some(error);
+                            break;
+                        }
                     }
                 }
                 if let Some(error) = delivery_error {
@@ -3894,7 +4022,14 @@ impl ServerAgenticLoopHost {
                 );
 
                 for m in delivery_sse_maps {
-                    self.emit_event(Value::Object(m));
+                    if let Err(error) = self.try_emit_progress_event(Value::Object(m)) {
+                        tracing::error!(
+                            target: "astra_runtime::server_loop_host",
+                            run_id,
+                            error = %error,
+                            "delivery SSE map was misrouted as an interaction event; skipping"
+                        );
+                    }
                 }
 
                 results_by_id.insert(
@@ -4045,7 +4180,7 @@ impl ServerAgenticLoopHost {
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
         manifest_trace: Option<&Value>,
     ) {
-        self.emit_event(crate::turn::llm::context::context_meta_event(
+        self.emit_progress_event(crate::turn::llm::context::context_meta_event(
             breakdown,
             manifest_trace,
         ));
@@ -4934,12 +5069,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn render_final_text(&mut self, text: &str) {
         if !text.is_empty() {
-            self.emit_event(json!({ "type": "text_delta", "content": text }));
+            self.emit_progress_event(json!({ "type": "text_delta", "content": text }));
         }
     }
 
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
-        self.emit_event(json!({ "type": "assistant_output_settled" }));
+        self.emit_progress_event(json!({ "type": "assistant_output_settled" }));
     }
 
     fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
@@ -4954,7 +5089,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             "type".to_string(),
             Value::String("agent_communication".to_string()),
         );
-        self.emit_event(Value::Object(payload));
+        self.emit_progress_event(Value::Object(payload));
     }
 
     fn apply_user_intent_context(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
@@ -4980,7 +5115,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn on_user_intent_applied(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
         if let Some(content) = crate::turn::run_control::user_intent_content(&event.input) {
-            self.emit_event(json!({
+            self.emit_progress_event(json!({
                 "type": "user_intent_applied",
                 "intent_id": event.intent_id,
                 "delivery": event.delivery,
@@ -5015,7 +5150,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if self.test_llm_rounds_wired {
                 // All mock rounds consumed — return a no-op text result so the
                 // agentic loop terminates cleanly (no real LLM fallback).
-                self.emit_event(
+                self.emit_progress_event(
                     json!({ "type": "text_delta", "content": "[mock rounds exhausted]" }),
                 );
                 state.final_text = "[mock rounds exhausted]".to_string();
@@ -5470,13 +5605,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
                             && !suffix.is_empty()
                         {
-                            self.emit_event(json!({
+                            self.emit_progress_event(json!({
                                 "type": "text_delta",
                                 "content": suffix,
                             }));
                             streamed_text.push_str(suffix);
                         } else if streamed_text.is_empty() {
-                            self.emit_event(json!({
+                            self.emit_progress_event(json!({
                                 "type": "text_delta",
                                 "content": content,
                             }));
@@ -5502,13 +5637,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         if let Some(suffix) = attempt_reasoning.strip_prefix(&streamed_reasoning)
                             && !suffix.is_empty()
                         {
-                            self.emit_event(json!({
+                            self.emit_progress_event(json!({
                                 "type": "reasoning_delta",
                                 "content": suffix,
                             }));
                             streamed_reasoning.push_str(suffix);
                         } else if streamed_reasoning.is_empty() {
-                            self.emit_event(json!({
+                            self.emit_progress_event(json!({
                                 "type": "reasoning_delta",
                                 "content": content,
                             }));
@@ -5857,7 +5992,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !suppress_source_projection && !result.full_text.is_empty() {
             if streamed_text.is_empty() {
-                self.emit_event(json!({
+                self.emit_progress_event(json!({
                     "type": "text_delta",
                     "content": result.full_text,
                 }));
@@ -5865,7 +6000,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else if let Some(suffix) = result.full_text.strip_prefix(&streamed_text)
                 && !suffix.is_empty()
             {
-                self.emit_event(json!({
+                self.emit_progress_event(json!({
                     "type": "text_delta",
                     "content": suffix,
                 }));
@@ -5877,7 +6012,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // intentionally absent from the parent projection.
         } else if result.reasoning.is_empty() {
             if !streamed_reasoning.is_empty() {
-                self.emit_event(json!({ "type": "reasoning_done" }));
+                self.emit_progress_event(json!({ "type": "reasoning_done" }));
             }
         } else if streamed_reasoning.is_empty() {
             self.push_reasoning_events(&result.reasoning);
@@ -5885,13 +6020,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if let Some(suffix) = result.reasoning.strip_prefix(&streamed_reasoning)
                 && !suffix.is_empty()
             {
-                self.emit_event(json!({
+                self.emit_progress_event(json!({
                     "type": "reasoning_delta",
                     "content": suffix,
                 }));
                 streamed_reasoning.push_str(suffix);
             }
-            self.emit_event(json!({ "type": "reasoning_done" }));
+            self.emit_progress_event(json!({ "type": "reasoning_done" }));
         }
         if !suppress_source_projection
             && !result.full_text.is_empty()
@@ -5901,7 +6036,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if !result.usage.is_empty() {
             let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
-            self.emit_event(json!({
+            self.emit_progress_event(json!({
                 "type": "usage",
                 "input_tokens": u.input_tokens,
                 "cached_input_tokens": u.cached_input_tokens,
@@ -5943,7 +6078,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-        self.emit_event(json!({
+        self.emit_progress_event(json!({
             "type": "headless_line",
             "content": line,
         }));
@@ -12813,6 +12948,84 @@ mod tests {
         assert!(host.progress_filter.is_none());
     }
 
+    #[test]
+    fn interaction_misrouted_to_progress_lane_fails_turn_without_delivery() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+
+        host.emit_progress_event(json!({
+            "type": "approval_required",
+            "request_id": "misrouted-approval",
+            "tool": "bash",
+        }));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "misrouted approval must not enter the lossy progress lane"
+        );
+        assert!(
+            host.emitted_events.is_empty(),
+            "misrouted approval must not enter terminal replay as an uncommitted fact"
+        );
+        let (outcome, events) = host.settle_loop_turn(Ok(AgenticLoopOutcome::Completed));
+        assert!(events.is_empty());
+        let fault =
+            outcome.expect_err("the latched route fault must override a successful loop outcome");
+        assert_eq!(fault.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            fault
+                .message
+                .contains("host_event_route_contract_violation")
+        );
+        let details: Value = serde_json::from_str(
+            fault
+                .details_json
+                .as_deref()
+                .expect("structured route fault"),
+        )
+        .expect("valid route fault details");
+        assert_eq!(details["error_code"], "host_event_route_contract_violation");
+        assert_eq!(details["event_type"], "approval_required");
+    }
+
+    #[tokio::test]
+    async fn progress_misrouted_to_committed_lane_fails_before_delivery() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+
+        let error = host
+            .emit_committed_interaction(json!({
+                "type": "text_delta",
+                "content": "not an interaction",
+            }))
+            .await
+            .expect_err("progress cannot use the committed interaction lane");
+
+        assert!(error.contains("host_event_route_contract_violation"));
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid committed-lane input must not be delivered"
+        );
+        let fault = host
+            .settle_loop_outcome(Ok(AgenticLoopOutcome::Completed))
+            .expect_err("ignored delivery errors must still fail turn settlement");
+        assert_eq!(fault.kind, astra_core::ErrorKind::ContractViolation);
+    }
+
     #[tokio::test]
     async fn full_progress_queue_backpressures_instead_of_dropping_interaction() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -12830,7 +13043,7 @@ mod tests {
         let gap = HostEventGapTracker::default();
         host.set_event_tx_with_gap(tx, gap.clone());
         for sequence in 0..8 {
-            host.emit_event(json!({"type": "text_delta", "sequence": sequence}));
+            host.emit_progress_event(json!({"type": "text_delta", "sequence": sequence}));
         }
         {
             let interaction = host.emit_committed_interaction(json!({
@@ -12902,7 +13115,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         host.set_event_tx(tx);
-        host.emit_event(json!({"type": "text_delta", "content": "detached"}));
+        host.emit_progress_event(json!({"type": "text_delta", "content": "detached"}));
 
         assert!(!cancel_flag.load(Ordering::SeqCst));
         assert!(!cancel_token.is_cancelled());
@@ -12938,7 +13151,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
 
-        host.emit_event(json!({
+        host.emit_progress_event(json!({
             "type": "tool_call_start",
             "call_id": "call-1",
             "tool": "bash"
@@ -12980,7 +13193,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
 
-        host.emit_event(json!({
+        host.emit_progress_event(json!({
             "type": "tool_call",
             "tool_call": {
                 "id": "call-1",
@@ -13028,7 +13241,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
 
-        host.emit_event(json!({
+        host.emit_progress_event(json!({
             "type": "tool_call_start",
             "call_id": "call-web-search",
             "tool": "web_search"
@@ -13071,7 +13284,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
 
-        host.emit_event(json!({
+        host.emit_progress_event(json!({
             "type": "tool_call_start",
             "tool_call": {
                 "id": "call-mcp",
@@ -13119,7 +13332,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
 
-        host.emit_event(json!({
+        host.emit_progress_event(json!({
             "type": "tool_call_start",
             "tool_call": {
                 "id": "call-mcp",

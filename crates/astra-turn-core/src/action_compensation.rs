@@ -199,7 +199,7 @@ fn classify_error_kind_outcome(
             ExecutionOutcome::Failure,
             Some(FailureCategory::ValidationError),
         ),
-        ErrorKind::DatabaseError => (
+        ErrorKind::ContractViolation | ErrorKind::DatabaseError => (
             ExecutionOutcome::Failure,
             Some(FailureCategory::RuntimeError),
         ),
@@ -1523,6 +1523,13 @@ mod tests {
                 None,
                 ExecutionOutcome::Failure,
                 Some(FailureCategory::ValidationError),
+            ),
+            (
+                Some(astra_core::ErrorKind::ContractViolation),
+                None,
+                None,
+                ExecutionOutcome::Failure,
+                Some(FailureCategory::RuntimeError),
             ),
             (
                 None,

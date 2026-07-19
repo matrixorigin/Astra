@@ -193,9 +193,22 @@ pub(super) fn per_user_run_quota_terminal_events(
 pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError) -> String {
     if let Some(details_json) = error.details_json.as_deref()
         && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
-        && details.get("source").and_then(Value::as_str) == Some("llm_provider_admission")
     {
-        return "llm_provider_admission_rejected".to_string();
+        match details.get("source").and_then(Value::as_str) {
+            Some("llm_provider_admission") => {
+                return "llm_provider_admission_rejected".to_string();
+            }
+            Some(crate::server::server_loop_host::HOST_EVENT_ROUTER_SOURCE)
+                if details.get("error_code").and_then(Value::as_str)
+                    == Some(
+                        crate::server::server_loop_host::HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE,
+                    ) =>
+            {
+                return crate::server::server_loop_host::HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE
+                    .to_string();
+            }
+            _ => {}
+        }
     }
     error.kind.as_str().to_string()
 }

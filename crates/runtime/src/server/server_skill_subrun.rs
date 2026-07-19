@@ -581,6 +581,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         }
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let loop_result = host.settle_loop_outcome(loop_result);
         let outcome = project_skill_subrun_outcome(&loop_result, &state);
 
         // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
