@@ -453,6 +453,7 @@ fn record_early_exit_llm_round(
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
+            parent_run_id: None,
             tool_calls: None,
             agent_id: None,
         });

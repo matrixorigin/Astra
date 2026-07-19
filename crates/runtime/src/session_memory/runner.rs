@@ -12,9 +12,7 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::{
-    InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts,
-};
+use astra_turn_types::{InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts};
 
 use crate::memory_hooks::{MemoryInferencePort, MemoryInferenceRequest};
 use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};

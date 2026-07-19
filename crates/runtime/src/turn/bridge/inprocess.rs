@@ -3864,6 +3864,7 @@ impl InProcessChatTurnBridge {
                         agentic_step: u32::try_from(capture_round_ix).ok(),
                         source: Some("bridge_inprocess".to_string()),
                         run_id: Some(run_id.clone()),
+                        parent_run_id: None,
                         tool_calls: None,
                         agent_id: agent_id.clone(),
                     });
