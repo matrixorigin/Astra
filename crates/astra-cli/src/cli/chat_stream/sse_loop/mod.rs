@@ -1340,7 +1340,9 @@ fn load_turn_messages(
     current_message: &str,
 ) -> Vec<serde_json::Value> {
     if let Some(mut msgs) = pre_loaded_messages {
-        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
+        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
+            msgs,
+        );
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }

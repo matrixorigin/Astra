@@ -48,12 +48,16 @@ pub(crate) async fn apply_turn_success_async(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
-    mut result: StreamResult,
+    result: StreamResult,
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
     post_commit_tx: Option<&tokio::sync::mpsc::Sender<TurnPostCommitJob>>,
 ) {
-    let final_messages = std::mem::take(&mut result.final_messages);
+    // Primary settlement projects the continuation anchor from typed message
+    // semantics. Keep the messages on `result` until that synchronous state
+    // transition completes; the deferred CSL worker receives its own owned
+    // snapshot.
+    let final_messages = result.final_messages.clone();
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     let primary_commit_started = Instant::now();
     let primary_commit =
@@ -854,13 +858,25 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut ui = crate::tests::TestUi::default();
+        let mut result = crate::tests::stub_stream_result("The canonical event is durable.");
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect persistence"}),
+            serde_json::json!({"role": "assistant", "content": "The canonical event is durable."}),
+        ];
+        astra_turn_types::mark_user_turn_semantics(
+            &mut result.final_messages[0],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
 
         apply_turn_success_async(
             &mut state,
             &api,
             None,
             "inspect persistence",
-            crate::tests::stub_stream_result("The canonical event is durable."),
+            result,
             Instant::now(),
             &mut ui,
             Some(&tx),
@@ -872,6 +888,14 @@ mod tests {
             primary_events
                 .iter()
                 .any(|event| { event.event_type == session_journal::JournalEventType::Turn })
+        );
+        let anchor = state
+            .continuation_anchor
+            .as_ref()
+            .expect("typed objective should reach foreground continuation projection");
+        assert_eq!(
+            anchor.objective_context,
+            vec!["objective: inspect persistence"]
         );
         assert!(
             !primary_events.iter().any(|event| {

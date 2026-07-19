@@ -625,7 +625,6 @@ mod tests {
             "_turns_removed": 2,
             astra_turn_types::USER_TURN_SEMANTICS_FIELD: {
                 "schema_version": 1,
-                "session_turn": 3,
                 "objective_relation": "refine"
             },
             "custom_provider_field": {"ok": true}

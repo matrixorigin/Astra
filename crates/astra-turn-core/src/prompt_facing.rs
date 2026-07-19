@@ -42,9 +42,10 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
     sanitize_prompt_facing_messages_impl(messages, false)
 }
 
-/// Resume-only prompt projection that retains validated user-turn semantics.
-/// Provider/session-memory projections use [`sanitize_prompt_facing_messages`]
-/// and therefore never receive this internal metadata.
+/// Canonical continuation/resume projection that retains validated user-turn
+/// semantics between runtime boundaries. Provider/session-memory projections
+/// use [`sanitize_prompt_facing_messages`] and therefore never receive this
+/// internal metadata.
 pub fn sanitize_prompt_facing_messages_with_turn_semantics(messages: Vec<Value>) -> Vec<Value> {
     sanitize_prompt_facing_messages_impl(messages, true)
 }

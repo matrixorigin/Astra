@@ -198,34 +198,12 @@ fn record_current_user_turn_semantics(
                 .any(|submitted| !submitted.is_empty() && content.trim() == *submitted)
                 .then_some(index)
         });
-    let index = matching_owner.or_else(|| {
-        state.messages.iter().rposition(|message| {
-            message.get("role").and_then(Value::as_str) == Some("user")
-                && !astra_turn_types::is_runtime_owned_message(message)
-        })
-    });
-    let Some(index) = index else {
-        tracing::warn!(
-            "turn intent was judged without a canonical user message to own its semantics"
-        );
+    let Some(index) = matching_owner else {
+        tracing::warn!("turn intent was judged without an exact canonical user-message owner");
         return false;
     };
 
-    let session_turn = if state.session_turn > 0 {
-        state.session_turn
-    } else {
-        state.messages[..=index]
-            .iter()
-            .filter(|message| {
-                message.get("role").and_then(Value::as_str) == Some("user")
-                    && !astra_turn_types::is_runtime_owned_message(message)
-            })
-            .count()
-            .min(u32::MAX as usize) as u32
-    }
-    .max(1);
     let semantics = astra_turn_types::UserTurnSemantics::new(
-        session_turn,
         intent
             .map(|intent| intent.objective_relation)
             .unwrap_or_default(),
@@ -247,10 +225,7 @@ fn record_current_user_turn_semantics(
     let message = &mut state.messages[index];
     let recorded = astra_turn_types::mark_user_turn_semantics(message, semantics);
     if !recorded {
-        tracing::warn!(
-            session_turn,
-            "canonical turn-semantics owner was not a user message"
-        );
+        tracing::warn!("canonical turn-semantics owner was not a user message");
     }
     recorded
 }
@@ -3034,7 +3009,8 @@ mod tests {
     #[test]
     fn turn_semantics_only_advance_from_unknown_once() {
         let mut state = make_state();
-        state.session_turn = 3;
+        state.message = "repair it".into();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": "repair it"})];
 
         assert!(record_current_user_turn_semantics(&mut state, None));

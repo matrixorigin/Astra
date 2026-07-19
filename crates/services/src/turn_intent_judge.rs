@@ -106,7 +106,7 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          Output ONLY a JSON object with these fields:\n\
          {\n  \
             \"requested_scenario\": <scenario | null>,\n  \
-            \"prohibited_scenarios\": [<scenario>, ...],   // may be empty\n  \
+            \"prohibited_scenarios\": [<scenario>, ...],\n  \
             \"objective_relation\": \"acknowledge\" | \"continue\" | \"refine\" | \"correct\" | \"replace\" | \"unknown\",\n  \
             \"feedback\": null | {\"kind\": \"approval\" | \"correction\" | \"clarification\" | \"requirement\" | \"preference\", \"target\": \"objective\" | \"scope\" | \"approach\" | \"output\" | \"verification\" | \"general\"},\n  \
             \"workspace_mutation\": \"read_only\" | \"may_mutate\" | \"must_mutate\" | \"unknown\",\n  \
@@ -178,12 +178,13 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
         prompt.push_str(&format!("Recent tools: {}\n", preview.join(", ")));
     }
 
-    // Sanitize: strip backticks from the user message so a `User: "..."` block
-    // can't be turned into a markdown fence by adversarial input. The judge
-    // treats the message as data, not code, so this preserves intent while
-    // closing a trivial prompt-injection vector.
-    let sanitized = ctx.message.replace('`', "'");
-    prompt.push_str(&format!("\nUser: \"{}\"\n", sanitized));
+    // Serialize instead of interpolating into a hand-written quoted string.
+    // This preserves the exact instruction while giving quotes, newlines, and
+    // delimiter-like text one unambiguous data representation.
+    let encoded_message = serde_json::Value::String(ctx.message.clone()).to_string();
+    prompt.push_str("\nUser message JSON: ");
+    prompt.push_str(&encoded_message);
+    prompt.push('\n');
 
     prompt
 }
@@ -286,19 +287,15 @@ mod tests {
     }
 
     #[test]
-    fn prompt_strips_backticks_in_user_message() {
+    fn prompt_json_encodes_user_message_without_mutating_it() {
         let ctx = TurnIntentJudgeContext {
-            message: "run `rm -rf /` then ```fix``` it".into(),
+            message: "quote: \"x\"\nrun `literal`".into(),
             turn_count: 1,
             recent_tools: vec![],
             has_prior_assistant_turn: false,
         };
         let prompt = build_turn_intent_prompt(&ctx);
-        assert!(
-            !prompt.contains('`'),
-            "prompt must not contain backticks from user input: {prompt}"
-        );
-        assert!(prompt.contains("run 'rm -rf /' then '''fix''' it"));
+        assert!(prompt.contains(r#"User message JSON: "quote: \"x\"\nrun `literal`""#));
     }
 
     #[test]

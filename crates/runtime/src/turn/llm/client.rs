@@ -7699,7 +7699,6 @@ mod tests {
         runtime["_compact_boundary"] = Value::Bool(true);
         runtime[astra_turn_types::USER_TURN_SEMANTICS_FIELD] = json!({
             "schema_version": 1,
-            "session_turn": 2,
             "objective_relation": "continue"
         });
 

@@ -437,7 +437,6 @@ mod tests {
         astra_turn_types::mark_user_turn_semantics(
             &mut objective,
             astra_turn_types::UserTurnSemantics::new(
-                1,
                 astra_turn_types::ObjectiveRelation::Replace,
                 None,
             ),

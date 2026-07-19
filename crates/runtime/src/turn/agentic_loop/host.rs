@@ -9231,7 +9231,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
-    fn feedback_records_completion_token_pressure_and_acceptance_signals() {
+    fn completion_feedback_does_not_manufacture_user_acceptance() {
         let hub = make_hub();
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
@@ -9260,8 +9260,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             }
         )));
         assert!(
-            signals.iter().any(|signal| {
-                signal.signal_type == astra_core::feedback::SignalType::Acceptance
+            signals.iter().all(|signal| {
+                signal.signal_type != astra_core::feedback::SignalType::Acceptance
             })
         );
     }

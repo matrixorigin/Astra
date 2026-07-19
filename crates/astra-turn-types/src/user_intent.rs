@@ -116,7 +116,6 @@ pub struct UserFeedback {
 #[serde(deny_unknown_fields)]
 pub struct UserTurnSemantics {
     pub schema_version: u8,
-    pub session_turn: u32,
     pub objective_relation: ObjectiveRelation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<UserFeedback>,
@@ -125,13 +124,11 @@ pub struct UserTurnSemantics {
 impl UserTurnSemantics {
     #[must_use]
     pub const fn new(
-        session_turn: u32,
         objective_relation: ObjectiveRelation,
         feedback: Option<UserFeedback>,
     ) -> Self {
         Self {
             schema_version: USER_TURN_SEMANTICS_SCHEMA_VERSION,
-            session_turn,
             objective_relation,
             feedback,
         }
@@ -202,7 +199,6 @@ mod tests {
     #[test]
     fn user_turn_semantics_round_trip_without_text_classification() {
         let semantics = UserTurnSemantics::new(
-            7,
             ObjectiveRelation::Correct,
             Some(UserFeedback {
                 kind: UserFeedbackKind::Correction,
@@ -217,7 +213,7 @@ mod tests {
 
     #[test]
     fn semantics_cannot_claim_non_user_messages() {
-        let semantics = UserTurnSemantics::new(1, ObjectiveRelation::Replace, None);
+        let semantics = UserTurnSemantics::new(ObjectiveRelation::Replace, None);
         let mut assistant = json!({"role": "assistant", "content": "done"});
 
         assert!(!mark_user_turn_semantics(&mut assistant, semantics));

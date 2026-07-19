@@ -140,7 +140,8 @@ fn heavy_checkpoint_prompt_state(
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
-    msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
+    msgs =
+        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(msgs);
     msgs
 }
 
@@ -416,6 +417,26 @@ mod tests {
         assert_eq!(result[0]["content"], "review code");
         assert_eq!(result[1]["content"], "Here is the review...");
         assert_eq!(result[2], ordinary);
+    }
+
+    #[test]
+    fn sanitize_keeps_canonical_turn_semantics_for_the_next_runtime() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = json!({"role": "user", "content": "repair lifecycle"});
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+
+        let result = super::sanitize_continuation_messages(vec![
+            objective,
+            json!({"role": "assistant", "content": "working"}),
+        ]);
+
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&result[0]),
+            Some(semantics)
+        );
     }
 
     #[test]

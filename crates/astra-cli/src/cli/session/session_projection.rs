@@ -302,16 +302,7 @@ fn objective_context_for_anchor(state: &SessionState, result: &StreamResult) -> 
             .map(|anchor| anchor.objective_context.clone())
             .unwrap_or_default()
     };
-    for item in projected {
-        let label = match item.relation {
-            astra_turn_types::ObjectiveRelation::Replace => "objective",
-            astra_turn_types::ObjectiveRelation::Refine => "refinement",
-            astra_turn_types::ObjectiveRelation::Correct => "correction",
-            astra_turn_types::ObjectiveRelation::Unknown => "initial objective",
-            astra_turn_types::ObjectiveRelation::Acknowledge
-            | astra_turn_types::ObjectiveRelation::Continue => continue,
-        };
-        let rendered = format!("{label}: {}", truncate_str(&item.text, 220));
+    for rendered in render_objective_context_items(projected) {
         if !context.contains(&rendered) {
             context.push(rendered);
         }
@@ -320,6 +311,53 @@ fn objective_context_for_anchor(state: &SessionState, result: &StreamResult) -> 
         context.remove(1);
     }
     context
+}
+
+fn render_objective_context_items(
+    items: Vec<astra_turn_core::resume_hydration::ObjectiveContextItem>,
+) -> Vec<String> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let label = match item.relation {
+                astra_turn_types::ObjectiveRelation::Replace => "objective",
+                astra_turn_types::ObjectiveRelation::Refine => "refinement",
+                astra_turn_types::ObjectiveRelation::Correct => "correction",
+                astra_turn_types::ObjectiveRelation::Unknown => "initial objective",
+                astra_turn_types::ObjectiveRelation::Acknowledge
+                | astra_turn_types::ObjectiveRelation::Continue => return None,
+            };
+            Some(format!("{label}: {}", truncate_str(&item.text, 220)))
+        })
+        .collect()
+}
+
+/// Seed the live continuation projection from canonical typed messages before
+/// rebuilding the rest of the anchor. Untyped history is intentionally not
+/// interpreted.
+pub(crate) fn seed_continuation_objective_from_messages(
+    state: &mut SessionState,
+    messages: &[serde_json::Value],
+) {
+    let objective_context = render_objective_context_items(
+        astra_turn_core::resume_hydration::objective_context_from_messages(messages),
+    );
+    if objective_context.is_empty() {
+        return;
+    }
+
+    match state.continuation_anchor.as_mut() {
+        Some(anchor) => anchor.objective_context = objective_context,
+        None => {
+            state.continuation_anchor = Some(ContinuationAnchor::from_parts(
+                String::new(),
+                None,
+                objective_context,
+                None,
+                Vec::new(),
+            ));
+        }
+    }
 }
 
 fn objective_context_section(items: &[String]) -> Option<String> {
@@ -409,8 +447,29 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
 ) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
+    let objective_context = state
+        .continuation_anchor
+        .as_ref()
+        .map(|anchor| anchor.objective_context.clone())
+        .unwrap_or_default();
+
     let Some((user_line, assistant_text)) = state.history.last() else {
-        state.continuation_anchor = None;
+        let mut sections = Vec::new();
+        if let Some(objective_section) = objective_context_section(&objective_context) {
+            sections.push(objective_section);
+        }
+        if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
+            sections.push(task_section);
+        }
+        state.continuation_anchor = (!sections.is_empty()).then(|| {
+            ContinuationAnchor::from_parts(
+                sections.join("\n"),
+                None,
+                objective_context,
+                None,
+                active_task_board,
+            )
+        });
         return;
     };
     if user_line.trim().is_empty() {
@@ -419,11 +478,6 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
     }
 
     let recent_user_input = Some(truncate_str(user_line, 220).to_string());
-    let objective_context = state
-        .continuation_anchor
-        .as_ref()
-        .map(|anchor| anchor.objective_context.clone())
-        .unwrap_or_default();
     let mut sections = Vec::new();
     if let Some(objective_section) = objective_context_section(&objective_context) {
         sections.push(objective_section);
@@ -551,6 +605,8 @@ mod tests {
         CslCheckpointFields, build_continuation_anchor, build_full_session_state_compact,
         history_as_messages, merge_continuation_anchor_with_session_memory,
         rebuild_continuation_anchor_from_live_state,
+        rebuild_continuation_anchor_from_state_with_active_task_items,
+        seed_continuation_objective_from_messages,
     };
     use crate::cli::session::session_input::prepare_input;
     use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
@@ -674,7 +730,6 @@ mod tests {
         astra_turn_types::mark_user_turn_semantics(
             &mut result.final_messages[0],
             astra_turn_types::UserTurnSemantics::new(
-                1,
                 astra_turn_types::ObjectiveRelation::Replace,
                 None,
             ),
@@ -682,7 +737,6 @@ mod tests {
         astra_turn_types::mark_user_turn_semantics(
             &mut result.final_messages[2],
             astra_turn_types::UserTurnSemantics::new(
-                2,
                 astra_turn_types::ObjectiveRelation::Continue,
                 None,
             ),
@@ -696,6 +750,43 @@ mod tests {
             vec!["objective: repair session lifecycle"]
         );
         assert_eq!(anchor.recent_user_input.as_deref(), Some("继续"));
+    }
+
+    #[test]
+    fn resumed_anchor_rebuild_keeps_canonical_objective_not_trivial_tail() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "repair session lifecycle"}),
+            serde_json::json!({"role": "assistant", "content": "I will inspect it."}),
+            serde_json::json!({"role": "user", "content": "继续"}),
+            serde_json::json!({"role": "assistant", "content": "Continuing."}),
+        ];
+        astra_turn_types::mark_user_turn_semantics(
+            &mut messages[0],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
+        astra_turn_types::mark_user_turn_semantics(
+            &mut messages[2],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Continue,
+                None,
+            ),
+        );
+        let mut state = SessionState::default();
+        state.history.push(("继续".into(), "Continuing.".into()));
+
+        seed_continuation_objective_from_messages(&mut state, &messages);
+        rebuild_continuation_anchor_from_state_with_active_task_items(&mut state, Vec::new());
+
+        let anchor = state.continuation_anchor.expect("resumed anchor");
+        assert_eq!(
+            anchor.objective_context,
+            vec!["objective: repair session lifecycle"]
+        );
+        assert!(anchor.contains("objective: repair session lifecycle"));
+        assert!(anchor.contains("Recent user input: 继续"));
     }
 
     #[tokio::test]

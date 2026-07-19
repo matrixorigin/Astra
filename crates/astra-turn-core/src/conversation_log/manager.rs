@@ -36,6 +36,7 @@ pub struct CslManager {
     config: CslManagerConfig,
     last_seq: u64,
     last_turn: u32,
+    last_canonical_messages: Vec<serde_json::Value>,
     last_canonical_message_hashes: Vec<CanonicalMessageHash>,
     trace_id: Option<String>,
     last_session_state: SessionStateCompact,
@@ -58,6 +59,7 @@ impl CslManager {
             config,
             last_seq: 0,
             last_turn: 0,
+            last_canonical_messages: Vec::new(),
             last_canonical_message_hashes: Vec::new(),
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
@@ -103,6 +105,7 @@ impl CslManager {
         mat.session_state = mat.session_state.for_csl_continuity();
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
+        self.last_canonical_messages = mat.messages.clone();
         self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
         Ok(Some(mat))
@@ -133,7 +136,8 @@ impl CslManager {
             self.load().await?;
         }
         let session_state = session_state.for_csl_continuity();
-        let canonical_messages = messages.to_vec();
+        let mut canonical_messages = messages.to_vec();
+        carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
         let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
             trace_id: self.trace_id.clone(),
@@ -153,6 +157,7 @@ impl CslManager {
                 .await?;
             self.last_seq = 1;
             self.last_turn = turn;
+            self.last_canonical_messages = canonical_messages;
             self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             return Ok(());
@@ -176,6 +181,7 @@ impl CslManager {
                 .await?;
             self.last_seq = next_seq;
             self.last_turn = turn;
+            self.last_canonical_messages = canonical_messages;
             self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             self.gc().await?;
@@ -194,6 +200,7 @@ impl CslManager {
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
+        self.last_canonical_messages = canonical_messages.clone();
         self.last_canonical_message_hashes = canonical_message_hashes.clone();
         self.last_session_state = session_state.clone();
 
@@ -253,6 +260,7 @@ impl CslManager {
             .await?;
         self.last_seq = 0;
         self.last_turn = 0;
+        self.last_canonical_messages.clear();
         self.last_canonical_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
         self.loaded = true;
@@ -296,6 +304,41 @@ fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
         canonical.to_string().into_bytes()
     });
     Sha256::digest(bytes).into()
+}
+
+fn canonical_message_identity_hash(message: &serde_json::Value) -> CanonicalMessageHash {
+    let mut identity = message.clone();
+    if let Some(object) = identity.as_object_mut() {
+        object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
+    }
+    canonical_message_hash(&identity)
+}
+
+/// A prompt/display projection may omit producer-owned turn semantics while
+/// retaining the same canonical message prefix. Carry validated current-schema
+/// metadata forward at this persistence boundary so a later snapshot cannot
+/// silently erase it. Changed messages and non-prefix rewrites receive no
+/// inferred metadata.
+fn carry_forward_user_turn_semantics(
+    previous: &[serde_json::Value],
+    incoming: &mut [serde_json::Value],
+) {
+    let shared_prefix = previous
+        .iter()
+        .zip(incoming.iter())
+        .take_while(|(previous, incoming)| {
+            canonical_message_identity_hash(previous) == canonical_message_identity_hash(incoming)
+        })
+        .count();
+
+    for (previous, incoming) in previous.iter().zip(incoming.iter_mut()).take(shared_prefix) {
+        if incoming.as_object().is_some_and(|message| {
+            !message.contains_key(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+        }) && let Some(semantics) = astra_turn_types::user_turn_semantics(previous)
+        {
+            astra_turn_types::mark_user_turn_semantics(incoming, semantics);
+        }
+    }
 }
 
 /// Recursively sort all object keys in a JSON value to guarantee
@@ -478,6 +521,67 @@ mod tests {
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(mat.messages.len(), 4);
         assert_eq!(mat.messages[3]["content"], "r2");
+    }
+
+    #[tokio::test]
+    async fn later_prompt_projection_cannot_erase_producer_turn_semantics() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = test_manager_with_config(
+            &tmp,
+            "typed-semantics",
+            CslManagerConfig {
+                snapshot_interval: 2,
+                gc_retain_snapshots: 2,
+            },
+        );
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = user_msg("repair lifecycle");
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        mgr.persist_turn(1, &[objective, assistant_msg("working")], &default_state())
+            .await
+            .unwrap();
+
+        // CLI display history intentionally has no internal metadata. The
+        // unchanged canonical prefix must retain producer-owned semantics when
+        // the second turn produces both a delta and a periodic snapshot.
+        mgr.persist_turn(
+            2,
+            &[
+                user_msg("repair lifecycle"),
+                assistant_msg("working"),
+                user_msg("continue"),
+                assistant_msg("done"),
+            ],
+            &default_state(),
+        )
+        .await
+        .unwrap();
+
+        let mut loader =
+            test_manager_with_config(&tmp, "typed-semantics", CslManagerConfig::default());
+        let materialized = loader.load().await.unwrap().unwrap();
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&materialized.messages[0]),
+            Some(semantics)
+        );
+    }
+
+    #[test]
+    fn semantic_carry_forward_never_claims_a_changed_message() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = user_msg("repair lifecycle");
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        let mut rewritten = vec![user_msg("repair a different subsystem")];
+
+        carry_forward_user_turn_semantics(&[objective], &mut rewritten);
+
+        assert!(astra_turn_types::user_turn_semantics(&rewritten[0]).is_none());
     }
 
     #[tokio::test]

@@ -323,11 +323,11 @@ mod tests {
         ];
         astra_turn_types::mark_user_turn_semantics(
             &mut messages[0],
-            astra_turn_types::UserTurnSemantics::new(1, ObjectiveRelation::Replace, None),
+            astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Replace, None),
         );
         astra_turn_types::mark_user_turn_semantics(
             &mut messages[4],
-            astra_turn_types::UserTurnSemantics::new(2, ObjectiveRelation::Continue, None),
+            astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Continue, None),
         );
 
         let hint = build_resume_hydration_hint_from_messages(&messages).expect("hint");
@@ -353,11 +353,11 @@ mod tests {
         ];
         astra_turn_types::mark_user_turn_semantics(
             &mut messages[0],
-            astra_turn_types::UserTurnSemantics::new(1, ObjectiveRelation::Replace, None),
+            astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Replace, None),
         );
         astra_turn_types::mark_user_turn_semantics(
             &mut messages[3],
-            astra_turn_types::UserTurnSemantics::new(2, ObjectiveRelation::Continue, None),
+            astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Continue, None),
         );
 
         let prompt_tail = crate::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
@@ -395,7 +395,7 @@ mod tests {
             let message_index = index * 2;
             astra_turn_types::mark_user_turn_semantics(
                 &mut messages[message_index],
-                astra_turn_types::UserTurnSemantics::new(index as u32 + 1, relation, None),
+                astra_turn_types::UserTurnSemantics::new(relation, None),
             );
         }
 
