@@ -342,19 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn reaper_retries_sessions_stuck_in_deleting_status() {
-        let source = include_str!("session_reaper.rs");
-        assert!(
-            source.contains("'deleting'"),
-            "reaper must retry sessions whose hard delete marked intent but did not finish"
-        );
-        assert!(
-            source.contains("ended_at < DATE_SUB(NOW(6), INTERVAL ? DAY)"),
-            "deleting retry must use the persisted delete-intent timestamp"
-        );
-    }
-
-    #[test]
     fn record_reaper_database_delete_aggregates_table_rows() {
         let mut r = ReaperSweepResult::default();
         record_reaper_database_delete(

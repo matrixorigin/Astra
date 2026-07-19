@@ -5,7 +5,7 @@ use astra_services::session_journal::{self, JournalEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub const SCHEMA_VERSION: &str = "astra-journal-digest-v1";
+pub const SCHEMA_VERSION: &str = "astra-journal-digest-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestFocus {
@@ -70,6 +70,10 @@ pub struct JournalDigest {
     pub aggregates: Aggregates,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub turns: Vec<TurnRow>,
+    /// LLM telemetry produced by child runs. These rounds have their own local
+    /// counter and must never be merged into root turns by numeric equality.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subruns: Vec<SubrunRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compaction_events: Vec<SideEvent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -199,6 +203,8 @@ pub struct LlmRoundRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls_returned: Option<u32>,
@@ -208,6 +214,16 @@ pub struct LlmRoundRow {
     pub tokens_out: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct SubrunRow {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub llm_round_details: Vec<LlmRoundRow>,
 }
 
 #[derive(Serialize)]
@@ -473,6 +489,7 @@ fn classify_tool_error(error: &str) -> ErrorCategory {
 
 fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     let meta = ev.metadata.as_ref();
+    let scope = ev.producer_scope.as_ref();
     LlmRoundRow {
         round: ev.round,
         agentic_step: ev.agentic_step,
@@ -480,10 +497,12 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
             .and_then(|m| m.get("source"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        run_id: meta
-            .and_then(|m| m.get("run_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        run_id: scope.map(|scope| scope.run_id.clone()).or_else(|| {
+            meta.and_then(|m| m.get("run_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }),
+        local_turn: scope.and_then(|scope| scope.local_turn),
         finish_reason: meta
             .and_then(|m| m.get("finish_reason"))
             .and_then(|v| v.as_str())
@@ -493,6 +512,36 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
         tokens_out: ev.tokens_out,
         duration_ms: ev.duration_ms,
     }
+}
+
+fn legacy_metadata_string(ev: &session_journal::JournalEvent, key: &str) -> Option<String> {
+    ev.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+        .map(String::from)
+}
+
+fn subrun_identity(
+    ev: &session_journal::JournalEvent,
+) -> Option<(String, Option<String>, Option<String>, Option<u32>)> {
+    if let Some(scope) = ev.producer_scope.as_ref()
+        && scope.agent_id.is_some()
+    {
+        return Some((
+            scope.run_id.clone(),
+            scope.parent_run_id.clone(),
+            scope.agent_id.clone(),
+            scope.local_turn,
+        ));
+    }
+
+    // Read compatibility for journals written before producer_scope existed.
+    // Legacy child rounds used metadata.agent_id and incorrectly placed their
+    // producer-local counter in event.turn. Keep that number local here.
+    let agent_id = legacy_metadata_string(ev, "agent_id")?;
+    let run_id = legacy_metadata_string(ev, "run_id")?;
+    Some((run_id, None, Some(agent_id), ev.turn))
 }
 
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
@@ -552,6 +601,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut session_start_count = 0usize;
     let mut session_end_count = 0usize;
     let mut failed_tool_calls: Vec<FailedToolCall> = Vec::new();
+    let mut subruns_by_run: std::collections::BTreeMap<String, SubrunRow> =
+        std::collections::BTreeMap::new();
 
     // Buffer llm_rounds until the current turn attempt terminates. A TurnError
     // closes the current attempt, so later successful Turn rows for the same
@@ -803,13 +854,27 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             JournalEventType::SessionEnd => session_end_count += 1,
             JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
-                if matches!(focus, DigestFocus::All)
-                    && let Some(turn) = ev.turn
-                {
-                    llm_rounds_by_turn
-                        .entry(turn)
-                        .or_default()
-                        .push(llm_round_row(ev));
+                if matches!(focus, DigestFocus::All) {
+                    if let Some((run_id, parent_run_id, agent_id, local_turn)) = subrun_identity(ev)
+                    {
+                        let mut round = llm_round_row(ev);
+                        round.local_turn = local_turn;
+                        subruns_by_run
+                            .entry(run_id.clone())
+                            .or_insert_with(|| SubrunRow {
+                                run_id,
+                                parent_run_id,
+                                agent_id,
+                                llm_round_details: Vec::new(),
+                            })
+                            .llm_round_details
+                            .push(round);
+                    } else if let Some(turn) = ev.turn {
+                        llm_rounds_by_turn
+                            .entry(turn)
+                            .or_default()
+                            .push(llm_round_row(ev));
+                    }
                 }
             }
             _ => {}
@@ -873,6 +938,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             },
         },
         turns: turns_out,
+        subruns: subruns_by_run.into_values().collect(),
         compaction_events,
         stalls,
         interruptions,
@@ -1009,6 +1075,18 @@ pub fn print_text(d: &JournalDigest) {
                     stats.join(" · ").dim()
                 );
             }
+        }
+    }
+    if !d.subruns.is_empty() {
+        println!("\n  {}", "Subruns".bold().magenta());
+        for subrun in &d.subruns {
+            let agent = subrun.agent_id.as_deref().unwrap_or("unknown agent");
+            println!(
+                "  {} · {} · {} rounds",
+                agent,
+                subrun.run_id.as_str().dim(),
+                subrun.llm_round_details.len()
+            );
         }
     }
     if !d.compaction_events.is_empty() {
@@ -1257,6 +1335,54 @@ mod tests {
         assert_eq!(round.source.as_deref(), Some("bridge_inprocess"));
         assert_eq!(round.run_id.as_deref(), Some("run-1"));
         assert_eq!(round.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn digest_never_joins_child_local_turns_to_root_session_turns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "test-digest-producer-scope-00000000-0000-0000-0000-000000000012";
+        fs::write(
+            journal_path_for_test(sid),
+            concat!(
+                // Legacy child event: local turn was incorrectly serialized as `turn`.
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":2,"round":0,"metadata":{"source":"child_agent","run_id":"child-legacy","agent_id":"agent-legacy"}}"#,
+                "\n",
+                // Canonical child event: root turn absent and local turn typed in producer_scope.
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"S","producer_scope":{"run_id":"child-new","parent_run_id":"root-run","agent_id":"agent-new","local_turn":3},"round":1,"metadata":{"source":"child_agent"}}"#,
+                "\n",
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":2,"round":0,"producer_scope":{"run_id":"root-run"},"metadata":{"source":"agentic_loop"}}"#,
+                "\n",
+                r#"{"type":"turn","ts":"2026-01-01T00:00:03Z","session_id":"S","turn":2,"user_input":"continue","tool_calls":[],"llm_rounds":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write journal");
+
+        let digest = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(digest.turns.len(), 1);
+        assert_eq!(digest.turns[0].llm_round_details.len(), 1);
+        assert_eq!(
+            digest.turns[0].llm_round_details[0].run_id.as_deref(),
+            Some("root-run")
+        );
+        assert_eq!(digest.subruns.len(), 2);
+        assert_eq!(
+            digest
+                .subruns
+                .iter()
+                .find(|subrun| subrun.run_id == "child-legacy")
+                .and_then(|subrun| subrun.llm_round_details[0].local_turn),
+            Some(2)
+        );
+        assert_eq!(
+            digest
+                .subruns
+                .iter()
+                .find(|subrun| subrun.run_id == "child-new")
+                .and_then(|subrun| subrun.llm_round_details[0].local_turn),
+            Some(3)
+        );
     }
 
     #[test]

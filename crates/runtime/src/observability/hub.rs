@@ -386,19 +386,6 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
         let behavior = session.observe_query_behavior(query);
         let attribution = session_signal_attribution(&session);
 
-        if let Some(correction_signal) = behavior.correction_signal {
-            let signal_type = match correction_signal {
-                astra_turn_types::UserCorrectionSignalKind::Correction => SignalType::Correction,
-                astra_turn_types::UserCorrectionSignalKind::Reanchor => SignalType::Reanchor,
-            };
-            let mut signal =
-                with_signal_attribution(FeedbackSignal::new(signal_type), Some(&attribution));
-            if let Some(delay_ms) = behavior.delay_since_last_query_ms {
-                signal = signal.with_context("query_delay_ms", serde_json::json!(delay_ms));
-            }
-            hub.record_feedback(signal);
-        }
-
         if let Some(delay_ms) = behavior.delay_since_last_query_ms {
             let signal = if delay_ms <= QUICK_FOLLOW_UP_MAX_DELAY_MS {
                 Some(FeedbackSignal::new(SignalType::QuickFollowUp { delay_ms }))
@@ -547,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_turn_records_reanchor_without_correction_pressure() {
+    fn query_observation_does_not_classify_natural_language_as_reanchor() {
         let hub = ObservabilityHub::new();
         let session = hub.start_session("user-1", "session-1");
 
@@ -559,8 +546,7 @@ mod tests {
         );
 
         let signals = hub.recent_feedback_signals();
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].signal_type, SignalType::Reanchor);
+        assert!(signals.is_empty());
         let session = astra_core::sync_poison::recover_rwlock_read(&session);
         assert!(session.user_corrections.is_empty());
     }

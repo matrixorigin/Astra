@@ -14,9 +14,7 @@
 pub mod evaluation;
 
 // Re-export from astra-pipeline for public API compatibility
-pub use astra_pipeline::{
-    event, feedback_extraction, feedback_store, step_checkpoint, step_restore,
-};
+pub use astra_pipeline::{event, step_checkpoint, step_restore};
 pub use astra_pipeline::{step_protocol, step_recorder};
 pub use astra_turn_core::routing_engine as routing;
 pub use astra_turn_core::tool_health_persistence as persistence;

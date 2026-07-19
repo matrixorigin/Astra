@@ -337,36 +337,6 @@ where
     Some(snapshot)
 }
 
-async fn record_session_local_heuristic_feedback(
-    feedback_store: &astra_pipeline::feedback_store::FeedbackStore,
-    session_id: &str,
-    user_text: &str,
-    signal: &astra_turn_types::ImplicitSignal,
-) -> bool {
-    if session_id.is_empty()
-        || !matches!(
-            signal.signal_type.as_str(),
-            "correction" | "frustration" | "rephrasing"
-        )
-    {
-        return false;
-    }
-    let Some(feedback) = astra_pipeline::feedback_extraction::heuristic_extract(
-        user_text,
-        &signal.signal_type,
-        signal.confidence,
-    ) else {
-        return false;
-    };
-
-    // Heuristic feedback is an unverified observation. This function
-    // deliberately has access only to the session-scoped store: promotion to
-    // cross-session memory requires a separate durable learning workflow with
-    // consent, evaluation, activation, rollback, and deletion lineage.
-    feedback_store.add(session_id, feedback).await;
-    true
-}
-
 /// Build a prompt section for the CLI-injected skill listing.
 ///
 /// Returns `None` when the CLI didn't include a listing (no skills loaded
@@ -1379,15 +1349,6 @@ fn bridge_pipeline_event_turn(trace_turn: u32) -> u32 {
     trace_turn.max(1)
 }
 
-fn latest_assistant_message_text(messages: &[Value]) -> Option<&str> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .and_then(|m| m.get("content").and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-}
-
 #[cfg(test)]
 fn turn_count_from_messages(messages: &[Value]) -> i64 {
     messages
@@ -1544,9 +1505,6 @@ pub struct InProcessChatTurnBridge {
     pub shared_pool: Option<SharedPool>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    /// Session-scoped structured feedback store — accumulates correction rules
-    /// and injects them into subsequent turn system prompts.
-    pub feedback_store: Arc<astra_pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
     pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     /// First-turn session-start memory snapshot, latched per session so repeated
@@ -1570,7 +1528,6 @@ impl InProcessChatTurnBridge {
             encryptor,
             shared_pool: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env(),
             session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -1781,7 +1738,6 @@ impl InProcessChatTurnBridge {
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
         let bridge_e2e_stream_blocks_capture = bridge_e2e_stream_blocks_for_stream.clone();
         let client_cancel_capture = client_cancel.clone();
-        let feedback_store_capture = self.feedback_store.clone();
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
@@ -2250,15 +2206,6 @@ impl InProcessChatTurnBridge {
                     active_skill_names.join(", ")
                 )
             };
-            // ── Extract user query for signal detection ──
-            let user_content_for_signal = messages
-                .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .and_then(|m| m.get("content").and_then(Value::as_str))
-                .unwrap_or("");
-
-            let task_type = prompts::detect_task_type(user_content_for_signal);
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
@@ -2290,52 +2237,6 @@ impl InProcessChatTurnBridge {
             let skill_listing_section =
                 skill_listing_section_for_edge_profile(skill_listing_hint_text.as_deref());
 
-            // Memory storage decisions are now fully LLM-driven via system
-            // prompt rules. detect_store_signal keyword matching was removed.
-
-            // ── Implicit feedback detection: inject correction/frustration context ──
-            // When user expresses dissatisfaction (correction, frustration, rephrasing),
-            // inject a directive so the model adjusts its approach immediately.
-            let feedback_store = feedback_store_capture.clone();
-
-            // ── Learned feedback rules: inject accumulated correction rules ──
-            // Build injection BEFORE storing the new rule so the current turn's
-            // correction isn't redundantly injected (it's already in implicit_feedback_hint).
-            let feedback_rules_hint = {
-                if session_id.is_empty() {
-                    String::new()
-                } else {
-                    let injection = feedback_store.build_injection_filtered(&session_id, Some(user_content_for_signal)).await;
-                    if injection.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n{injection}")
-                    }
-                }
-            };
-
-            let (implicit_feedback_hint, is_correction_turn) = {
-                let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
-                    user_content_for_signal,
-                    latest_assistant_message_text(&messages),
-                );
-                let is_correction_like = matches!(
-                    signal.signal_type.as_str(),
-                    "correction" | "frustration" | "rephrasing"
-                );
-                record_session_local_heuristic_feedback(
-                    feedback_store.as_ref(),
-                    &session_id,
-                    user_content_for_signal,
-                    &signal,
-                )
-                .await;
-                let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
-                    .map(|s| format!("\n\n{s}"))
-                    .unwrap_or_default();
-                (hint, is_correction_like)
-            };
-
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_for_turn.clone();
 
@@ -2351,13 +2252,10 @@ impl InProcessChatTurnBridge {
             //
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
-            //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool surface),
             //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval, routed through the
             //     Memory section),
-            //   implicit_feedback_hint (per-turn correction signal based on
-            //     user message content),
             //   recent_arg_hints_hint (per-turn tool args),
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
@@ -2385,38 +2283,6 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !implicit_feedback_hint.is_empty() {
-                // Per-turn correction signal — depends on current user
-                // message content, so it's volatile.
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        implicit_feedback_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            implicit_feedback: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !feedback_rules_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        feedback_rules_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_feedback_rules: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -3166,8 +3032,6 @@ impl InProcessChatTurnBridge {
                         bridge_channel("lessons", ""),
                         // Bridge-internal channels: only visible here.
                         bridge_channel("memoria_prefetch", &memoria_prefetch_canonical),
-                        bridge_channel("feedback_rules", &feedback_rules_hint),
-                        bridge_channel("implicit_feedback", &implicit_feedback_hint),
                         bridge_channel("tool_round_guidance", &tool_round_guidance),
                         bridge_channel(
                             "volatile_pending",
@@ -4589,7 +4453,7 @@ impl InProcessChatTurnBridge {
 
             // Hook side effects: decision audit, skill selection, reflection
             {
-                let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
+                let hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
                     &user_id,
                     &session_id,
                     &messages,
@@ -4606,21 +4470,6 @@ impl InProcessChatTurnBridge {
                     false, // run_observer = false → triggers observer
                     false, // run_reflection_learning = false → triggers reflection
                 );
-                if is_correction_turn {
-                    hook_payload.insert(
-                        "is_correction".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-                if let Some(tt) = task_type {
-                    if let Some(m) = hook_payload
-                        .entry("routing_meta".to_string())
-                        .or_insert_with(|| json!({}))
-                        .as_object_mut()
-                    {
-                        m.insert("task_type".to_string(), json!(tt));
-                    }
-                }
                 crate::bridge::side_effects::run_bridge_hook_side_effects(
                     Some(Value::Object(hook_payload)),
                     turn_hook_db_writer.clone(),
@@ -5217,54 +5066,6 @@ mod tests {
         .expect("provider model gateway invocation");
 
         assert_eq!(invocation.model, "qwen3.5-flash");
-    }
-
-    #[tokio::test]
-    async fn heuristic_feedback_remains_session_local_and_requires_a_concrete_rule() {
-        let store = astra_pipeline::feedback_store::FeedbackStore::new();
-        let correction = astra_turn_types::detect_implicit_feedback_signal(
-            "wrong, don't use mocks in integration tests",
-            Some("I'll mock the database"),
-        );
-
-        assert!(
-            record_session_local_heuristic_feedback(
-                &store,
-                "session-a",
-                "wrong, don't use mocks in integration tests",
-                &correction,
-            )
-            .await
-        );
-        assert_eq!(store.len("session-a").await, 1);
-        assert!(
-            store.is_empty("session-b").await,
-            "heuristic feedback must not cross session ownership boundaries"
-        );
-
-        assert!(
-            !record_session_local_heuristic_feedback(
-                &store,
-                "",
-                "wrong, don't use mocks in integration tests",
-                &correction,
-            )
-            .await,
-            "feedback without a session owner must be rejected"
-        );
-
-        let neutral = astra_turn_types::detect_implicit_feedback_signal("tell me about Rust", None);
-        assert!(
-            !record_session_local_heuristic_feedback(
-                &store,
-                "session-a",
-                "tell me about Rust",
-                &neutral,
-            )
-            .await,
-            "non-correction observations must not become learned rules"
-        );
-        assert_eq!(store.len("session-a").await, 1);
     }
 
     #[test]
@@ -5912,9 +5713,6 @@ mod tests {
     fn pipeline_assembly_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         // memory_signal_hint removed — LLM-driven via system prompt rules
-        let implicit_feedback_hint =
-            "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
-        let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
         let self_awareness_hint =
             "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
         let dynamic_sections = vec![
@@ -5945,34 +5743,6 @@ mod tests {
                     context_signals:
                         astra_turn_core::context_assembly_trace::PromptContextSignals {
                             memory_signal_detected: false,
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
-                "implicit feedback payload".to_string(),
-                prompts::PromptTokenBucket::Environment,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            implicit_feedback: !implicit_feedback_hint.is_empty(),
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
-                "feedback rules payload".to_string(),
-                prompts::PromptTokenBucket::Environment,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_feedback_rules: !feedback_rules_hint.is_empty(),
                             ..Default::default()
                         },
                     ..Default::default()
@@ -6012,8 +5782,6 @@ mod tests {
             "memory signal detection removed — LLM-driven"
         );
         assert!(breakdown.context_signals.self_awareness);
-        assert!(breakdown.context_signals.implicit_feedback);
-        assert!(breakdown.context_signals.learned_feedback_rules);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
         assert!(!breakdown.context_signals.agent_type_hint);
@@ -7115,11 +6883,15 @@ mod tests {
     }
 
     #[test]
-    fn normalize_bridge_prompt_messages_routes_runtime_affix_out_of_user_content() {
-        let messages = vec![json!({
-            "role": "user",
-            "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"
-        })];
+    fn normalize_bridge_prompt_messages_routes_typed_runtime_context() {
+        let messages = vec![
+            json!({"role": "user", "content": "我说过的所有话"}),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "Hydrated previous session context",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
+        ];
 
         let (messages, required_runtime_texts) = normalize_bridge_prompt_messages(messages);
 
@@ -7129,7 +6901,7 @@ mod tests {
         );
         assert_eq!(
             required_runtime_texts,
-            vec!["[session-resume:v1]\nHydrated previous session context"]
+            vec!["Hydrated previous session context"]
         );
     }
 

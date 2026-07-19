@@ -120,7 +120,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                         .as_ref()
                         .and_then(|event| event.error.as_ref())
                         .is_some(),
-                    had_user_correction: false,
+                    reanchors_current_objective: false,
                     turn_number: state.turn,
                 });
         }

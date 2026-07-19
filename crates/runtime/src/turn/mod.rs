@@ -12,13 +12,6 @@ pub use cloud::compaction_engine::{CompactionEngine, PipelineOutcome, TokenBudge
 pub(crate) mod context_pipeline_adapter;
 pub mod harness_adapter;
 pub mod headless_tool_pipeline;
-/// Re-exported from astra-turn-types
-pub mod implicit_feedback {
-    pub use astra_turn_types::{
-        ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,
-        implicit_feedback_context_injection, implicit_feedback_rating,
-    };
-}
 pub mod inspection_service;
 pub(crate) mod llm;
 pub mod local_provider;

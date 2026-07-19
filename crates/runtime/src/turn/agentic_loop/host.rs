@@ -289,10 +289,9 @@ pub trait AgenticLoopHost: Send {
 
     /// The user-facing interaction mode for this turn.
     ///
-    /// Used by the execution phase to decide whether to inject the
-    /// interruption-style nudges (execution escalation, parallel-batching
-    /// force, circuit breaker corrections, etc.). See
-    /// [`TurnInteractionMode::suppresses_loop_nudges`] for the policy.
+    /// Used by the execution phase to decide whether model-facing policy
+    /// feedback should also be rendered as status text. It never disables the
+    /// policy-to-model feedback lane.
     ///
     /// Defaults to [`TurnInteractionMode::NonInteractive`] which preserves
     /// the pre-existing behaviour (nudges enabled) for any host that
@@ -2500,7 +2499,7 @@ impl AgenticLoopState {
         } else {
             self.user_intent.as_str()
         };
-        astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(input)
+        input.trim().to_string()
     }
 
     /// Refresh the cached active task-board snapshot from the shared
@@ -3742,6 +3741,7 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) final_output_ready: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
+        pub(crate) executed_volatile: Vec<Vec<VolatileInjection>>,
         pub(crate) text_only_turns: Vec<bool>,
         pub(crate) turn_intent: Option<TurnIntent>,
         pub(crate) skill_auto_route_decision: Option<String>,
@@ -3769,6 +3769,7 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 final_output_ready: Vec::new(),
                 executed_messages: Vec::new(),
+                executed_volatile: Vec::new(),
                 text_only_turns: Vec::new(),
                 turn_intent: None,
                 skill_auto_route_decision: None,
@@ -3845,6 +3846,7 @@ pub(crate) mod tests {
                 ));
             }
             self.executed_messages.push(state.messages.clone());
+            self.executed_volatile.push(state.volatile_pending.clone());
             self.text_only_turns
                 .push(state.hooks.completion_settlement.text_only);
             let result = self.turn_results.remove(0);
@@ -5456,7 +5458,6 @@ pub(crate) mod tests {
                 advisory_threshold_reached: false,
                 nudge_count: 1,
                 interaction_mode: "prompt".into(),
-                suppressed_loop_nudges: false,
                 recent_error_pressure: 0,
                 recent_timeout_pressure: 0,
                 total_errors: 0,

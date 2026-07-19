@@ -46,7 +46,6 @@ pub(crate) enum GuardOutcome {
 /// Shared configuration for all guards in a turn.
 #[derive(Clone)]
 pub(crate) struct GuardConfig {
-    pub suppress_nudges: bool,
     pub parallel_batching_force_streak: usize,
     pub redundant_reads_threshold: usize,
     pub cache_waste_threshold: usize,
@@ -70,17 +69,14 @@ pub(crate) fn default_guards() -> Vec<(&'static str, GuardFn)> {
     ]
 }
 
-/// Run all registered guards. Returns collected operator-facing hints, each carrying
-/// an optional stderr hint.
-/// All guards are skipped when `cfg.suppress_nudges` is true.
+/// Run all registered guards. Model-facing advisory evidence is independent
+/// from presentation mode; the caller decides whether returned status hints
+/// should be shown to the user.
 pub(crate) fn evaluate_guards(
     guards: &[(&str, GuardFn)],
     state: &mut AgenticLoopState,
     cfg: &GuardConfig,
 ) -> Vec<(HeadlessStderrStyle, String)> {
-    if cfg.suppress_nudges {
-        return Vec::new();
-    }
     let mut hints = Vec::new();
     for (name, guard_fn) in guards {
         match guard_fn(state, cfg) {

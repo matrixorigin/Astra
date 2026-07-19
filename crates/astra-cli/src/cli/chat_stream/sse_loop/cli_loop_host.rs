@@ -862,9 +862,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         //      knows (lessons from session_lessons_snapshot, self_awareness
         //      from build_self_model_snapshot). These fingerprint with a
         //      full preview so introspect can render the first 80 chars.
-        //   2. Bridge-supplied opaque fingerprints for the 5 bridge-internal
-        //      channels (memoria_prefetch, feedback_rules, implicit_feedback,
-        //      tool_round_guidance, volatile_pending) and the 3 CLI-visible
+        //   2. Bridge-supplied opaque fingerprints for the bridge-internal
+        //      channels (memoria_prefetch, tool_round_guidance,
+        //      volatile_pending) and the CLI-visible
         //      channels the bridge echoes (recent_arg_hints,
         //      skill_listing) whose source strings the CLI doesn't have
         //      trivial post-turn access to. Wire carries only
@@ -1644,21 +1644,10 @@ mod tests {
 
     // ── Auto mode preservation under non-interactive contexts ─────────
     //
-    // The user's Auto-mode intent is "suppress ordinary interaction
-    // nudges and ask_user prompts". This must NOT be silently demoted
-    // to NonInteractive just because the turn is happening in a
-    // piped-stdin / silent-render / approval-channel context — those
-    // only matter for Prompt mode (no stdin to prompt on → fall back
-    // to NonInteractive so nothing blocks on a human). Hard permission
-    // gates remain the permission engine's job, not this interaction
-    // classifier's job.
-    //
-    // Regression for session c6e18730: Auto-mode user saw `## ⚠
-    // Sequential Tool Calls Detected` nudges injected into message
-    // history because `suppresses_loop_nudges` in agentic_loop_execution_phase
-    // gates on `TurnInteractionMode::Auto`, but derive_turn_interaction_mode
-    // was collapsing Auto → NonInteractive for any structural reason,
-    // so `suppress_nudges` evaluated false and nudges fired.
+    // Auto is the permission/presentation mode selected for the root turn.
+    // Piped stdin, silent rendering, and approval-channel availability only
+    // affect whether Prompt mode can pause; they must not silently rewrite
+    // Auto semantics. Policy feedback remains model-visible in every mode.
 
     #[test]
     fn derive_turn_interaction_mode_preserves_auto_without_tty() {

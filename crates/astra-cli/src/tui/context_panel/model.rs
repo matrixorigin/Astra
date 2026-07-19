@@ -1181,16 +1181,6 @@ fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
             "self_awareness",
             "Self-awareness nudge (remind model of its own constraints)",
         ),
-        ctx(
-            cs.implicit_feedback,
-            "implicit_feedback",
-            "Implicit-feedback block injected (recent turn outcomes)",
-        ),
-        ctx(
-            cs.learned_feedback_rules,
-            "learned_feedback_rules",
-            "Learned corrections from prior sessions are active",
-        ),
         guide(
             gs.parallel_feedback,
             "parallel_feedback",

@@ -297,7 +297,7 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     }
 
     // Bridge stable escape hatch: session-stable pre-composed fragments
-    // (skill_hint, feedback_rules, self_awareness, etc.). Binder appends
+    // (skill_hint, self_awareness, etc.). Binder appends
     // them here so they inherit RuntimeIdentity's Session scope → cached
     // behind the 2nd marker like the typed fragments above.
     for section in &ext.extra_stable_sections {

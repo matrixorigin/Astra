@@ -1965,6 +1965,10 @@ pub(crate) fn consolidate_system_messages_for_provider(
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     for message in messages {
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+        if let Some(object) = message.as_object_mut() {
+            object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
+            object.remove("_compact_boundary");
+        }
     }
 }
 
@@ -7712,6 +7716,26 @@ mod tests {
         let out = consolidate_system_messages(&msgs);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn provider_projection_strips_runtime_ownership_and_boundary_metadata() {
+        let mut runtime = astra_turn_types::runtime_owned_message(
+            "user",
+            "model-visible required context",
+            astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+        );
+        runtime["_compact_boundary"] = Value::Bool(true);
+
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai");
+
+        assert_eq!(out[0]["content"], "model-visible required context");
+        assert!(
+            out[0]
+                .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        );
+        assert!(out[0].get("_compact_boundary").is_none());
     }
 
     #[test]

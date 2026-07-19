@@ -18,7 +18,6 @@ pub struct AgenticVerdictAuditEvent {
     pub advisory_threshold_reached: bool,
     pub nudge_count: usize,
     pub interaction_mode: String,
-    pub suppressed_loop_nudges: bool,
     /// Current recovery-aware error pressure used by TurnGuard escalation.
     pub recent_error_pressure: usize,
     /// Current timeout-only subset of `recent_error_pressure`.

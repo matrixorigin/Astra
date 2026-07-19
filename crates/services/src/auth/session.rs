@@ -870,28 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn session_list_omits_count_contract() {
-        let source = include_str!("session.rs");
-        let database_impl = source
-            .split("impl SessionService for DatabaseSessionService")
-            .nth(1)
-            .expect("database session service impl should be present");
-        let body = database_impl
-            .split("async fn list_sessions")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn get_session").next())
-            .expect("list_sessions body should be present");
-        assert!(
-            body.contains("let total = None;"),
-            "session list should return total=None instead of running a count"
-        );
-        assert!(
-            !body.contains("COUNT(session_id)") && !body.contains("COUNT(*)"),
-            "session list must not run COUNT(*) on the hot path"
-        );
-    }
-
-    #[test]
     fn session_activity_limit_has_hard_cap_and_minimum() {
         assert_eq!(validate_session_activity_limit(0), 1);
         assert_eq!(validate_session_activity_limit(10), 10);

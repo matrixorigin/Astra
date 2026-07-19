@@ -91,7 +91,7 @@ impl Default for TaskExecutionProfile {
 
 #[must_use]
 pub fn active_user_task_text(input: &str) -> String {
-    crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(input)
+    input.trim().to_string()
 }
 
 impl TaskExecutionProfile {

@@ -2664,7 +2664,7 @@ mod tests {
         let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
         t.system_prompt.context_signals = PromptContextSignals {
             memory_signal_detected: true,
-            learned_feedback_rules: true,
+            self_awareness: true,
             ..PromptContextSignals::default()
         };
         t.system_prompt.guidance_signals = PromptGuidanceSignals {

@@ -147,7 +147,6 @@ pub fn apply_agentic_post_tool_policy(
                 advisory_threshold_reached: verdict.advisory_threshold_reached,
                 nudge_count: turn_guard.nudge_count,
                 interaction_mode: interaction_mode.label().to_string(),
-                suppressed_loop_nudges: interaction_mode.suppresses_loop_nudges(),
                 recent_error_pressure: turn_guard.errors.recent_error_pressure(),
                 recent_timeout_pressure: turn_guard
                     .errors

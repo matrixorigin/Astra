@@ -31,9 +31,9 @@ pub use system::{
     build_skill_listing_section_with_caps,
     build_skill_listing_section_with_context_window_and_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
-    detect_task_type, load_overrides, parallel_batching_nudge_directive,
-    parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
-    tool_round_guidance, tool_round_guidance_trace, trailing_single_tool_round_streak,
+    load_overrides, parallel_batching_nudge_directive, parallel_execution_feedback,
+    sections_to_string, self_awareness_prompt_section, tool_round_guidance,
+    tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
 pub(crate) use system::{self_model_section, tool_conditional_section};
 
@@ -213,64 +213,6 @@ mod tests {
     fn budget_for_model_none_uses_default() {
         let b = budget_for_model(None);
         assert_eq!(b.model_limit, 200_000);
-    }
-
-    // ── Task type detection tests ──
-
-    #[test]
-    fn detect_task_type_code_review_english() {
-        assert_eq!(detect_task_type("review this PR"), Some("code_review"));
-        assert_eq!(detect_task_type("code review please"), Some("code_review"));
-        assert_eq!(
-            detect_task_type("check the pull request"),
-            Some("code_review")
-        );
-        assert_eq!(detect_task_type("show me the diff"), Some("code_review"));
-    }
-
-    #[test]
-    fn detect_task_type_code_review_chinese() {
-        assert_eq!(detect_task_type("评审一下这个PR"), Some("code_review"));
-        assert_eq!(detect_task_type("代码审查"), Some("code_review"));
-    }
-
-    #[test]
-    fn detect_task_type_debugging_english() {
-        assert_eq!(detect_task_type("debug this error"), Some("debugging"));
-        assert_eq!(
-            detect_task_type("there's a bug in the code"),
-            Some("debugging")
-        );
-        assert_eq!(detect_task_type("exception on line 42"), Some("debugging"));
-        assert_eq!(detect_task_type("the server crashed"), Some("debugging"));
-    }
-
-    #[test]
-    fn detect_task_type_debugging_chinese() {
-        assert_eq!(detect_task_type("帮我调试一下"), Some("debugging"));
-        assert_eq!(detect_task_type("代码报错了"), Some("debugging"));
-    }
-
-    #[test]
-    fn detect_task_type_general_returns_none() {
-        assert_eq!(
-            detect_task_type("how does this function work?"),
-            Some("exploration")
-        );
-        assert_eq!(
-            detect_task_type("explain the architecture"),
-            Some("exploration")
-        );
-        assert_eq!(detect_task_type("write a new feature"), None);
-        assert_eq!(detect_task_type(""), None);
-        assert_eq!(detect_task_type("hello there"), None);
-        assert_eq!(detect_task_type("thanks"), None);
-    }
-
-    #[test]
-    fn detect_task_type_disambiguates_best_match() {
-        assert_eq!(detect_task_type("review"), Some("code_review"));
-        assert_eq!(detect_task_type("got an error"), Some("debugging"));
     }
 
     // ── Task-type specific prompt content tests ──

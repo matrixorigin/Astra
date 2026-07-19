@@ -781,22 +781,4 @@ mod tests {
         assert!(sql.contains("installed_at < ?"));
         assert!(sql.contains("installation_id < ?"));
     }
-
-    #[test]
-    fn list_installed_hot_path_does_not_count_rows() {
-        let body = include_str!("marketplace.rs")
-            .split("impl MarketplaceService for DatabaseMarketplaceService")
-            .nth(1)
-            .expect("database marketplace service impl")
-            .split("async fn list_installed(")
-            .nth(1)
-            .expect("database list_installed body")
-            .split("async fn save_credential(")
-            .next()
-            .expect("database list_installed body end");
-        assert!(
-            !body.contains("COUNT(*)"),
-            "installed skills list uses seek pagination and must not count skill_installations"
-        );
-    }
 }

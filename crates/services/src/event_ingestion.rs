@@ -1914,6 +1914,7 @@ mod tests {
             event_type: crate::session_journal::JournalEventType::Turn,
             ts: "2025-01-15T10:30:00Z".into(),
             session_id: Some("sess-abc".into()),
+            producer_scope: None,
             turn: Some(3),
             agentic_step: None,
             model: Some("gpt-4".into()),

@@ -37,7 +37,7 @@ use astra_services::session_journal::{
     SessionMemoryExtractionSource,
 };
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
-use astra_turn_types::{is_runtime_scaffolding_message, is_transient_runtime_status_text};
+use astra_turn_types::is_runtime_owned_message;
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaPort;
@@ -470,8 +470,6 @@ impl MemoryExtractionService {
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip(reason)
-            } else if request_has_low_incremental_information(&req) {
-                Admission::Skip(SessionMemoryExtractionSkipReason::LowInformation)
             } else {
                 match self.memoria_health.admit() {
                     MemoriaAdmit::CoolingDown => {
@@ -575,7 +573,7 @@ impl MemoryExtractionService {
             .as_ref()
             .and_then(|loaded| loaded.updated_turn)
             .is_some_and(|updated_turn| updated_turn >= turn)
-            && !req.had_user_correction
+            && !req.reanchors_current_objective
         {
             self.mark_session_extracted(&session_id, content_fingerprint, turn);
             let breadcrumbs = SessionMemoryExtractionBreadcrumbs {
@@ -928,15 +926,12 @@ impl Drop for SessionWorkGuard {
     }
 }
 
-const LOW_INFORMATION_RECENT_MESSAGE_LIMIT: usize = 6;
-const LOW_INFORMATION_CHAR_THRESHOLD: usize = 160;
-
 fn extraction_input_fingerprint(req: &ExtractionRequest) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     req.had_error.hash(&mut hasher);
-    req.had_user_correction.hash(&mut hasher);
+    req.reanchors_current_objective.hash(&mut hasher);
 
     for file in &req.session_facts.active_files {
         file.path.hash(&mut hasher);
@@ -960,13 +955,7 @@ fn extraction_input_fingerprint(req: &ExtractionRequest) -> u64 {
         .messages
         .iter()
         .rev()
-        .filter(|message| !is_runtime_scaffolding_message(message))
-        .filter(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_none_or(|text| !is_transient_runtime_status_text(text))
-        })
+        .filter(|message| !is_runtime_owned_message(message))
         .take(64)
         .collect::<Vec<_>>();
     for message in recent.into_iter().rev() {
@@ -987,50 +976,6 @@ fn extraction_input_fingerprint(req: &ExtractionRequest) -> u64 {
             .hash(&mut hasher);
     }
     hasher.finish()
-}
-
-fn request_has_low_incremental_information(req: &ExtractionRequest) -> bool {
-    if req.session_id.is_empty()
-        || req.had_error
-        || req.had_user_correction
-        || req.messages.is_empty()
-    {
-        return false;
-    }
-
-    let mut chars = 0usize;
-    let mut prompt_facing_messages = 0usize;
-    for msg in req
-        .messages
-        .iter()
-        .rev()
-        .take(LOW_INFORMATION_RECENT_MESSAGE_LIMIT)
-    {
-        if is_runtime_scaffolding_message(msg) {
-            continue;
-        }
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
-        if role == "tool" || msg.get("tool_calls").is_some() {
-            return false;
-        }
-        if !matches!(role, "user" | "assistant") {
-            continue;
-        }
-        let Some(text) = msg.get("content").and_then(Value::as_str) else {
-            continue;
-        };
-        let text = text.trim();
-        if text.is_empty() || is_transient_runtime_status_text(text) {
-            continue;
-        }
-        prompt_facing_messages += 1;
-        chars = chars.saturating_add(text.chars().count().min(2_000));
-        if prompt_facing_messages >= 2 {
-            break;
-        }
-    }
-
-    prompt_facing_messages > 0 && chars < LOW_INFORMATION_CHAR_THRESHOLD
 }
 
 impl MemoryExtractionService {
@@ -1436,7 +1381,7 @@ mod tests {
             ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error,
-            had_user_correction: false,
+            reanchors_current_objective: false,
             turn_number: 1,
         }
     }
@@ -1472,12 +1417,12 @@ mod tests {
             ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
-            had_user_correction: false,
+            reanchors_current_objective: false,
             turn_number: 1,
         }
     }
 
-    fn low_information_req(session_id: &str, _tokens: usize) -> ExtractionRequest {
+    fn short_conversation_req(session_id: &str) -> ExtractionRequest {
         ExtractionRequest {
             session_id: session_id.to_string(),
             messages: vec![
@@ -1486,7 +1431,7 @@ mod tests {
             ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
-            had_user_correction: false,
+            reanchors_current_objective: false,
             turn_number: 1,
         }
     }
@@ -1520,7 +1465,11 @@ mod tests {
         let mut with_runtime = base.clone();
         with_runtime
             .messages
-            .push(json!({"role": "system", "content": serde_json::Value::Null}));
+            .push(astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ));
         assert_eq!(
             extraction_input_fingerprint(&base),
             extraction_input_fingerprint(&with_runtime),
@@ -1564,44 +1513,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_spawn_skips_low_information_turn_even_when_cached_context_is_large() {
-        let TestCtx {
-            svc,
-            mut rx,
-            memoria,
-        } = build_ctx(None);
-        let sid = format!("low-info-{}", nanos());
-
-        assert_eq!(
-            svc.maybe_spawn(low_information_req(&sid, 50_000)),
-            SpawnDecision::Skipped
-        );
-        assert!(
-            memoria.stored.lock().unwrap().is_empty(),
-            "low-information turns must not enqueue extraction work"
-        );
-
-        let events = collect_extraction_events(&mut rx);
-        assert!(
-            events.iter().any(|evt| {
-                evt.metadata.as_ref().is_some_and(|meta| {
-                    meta["outcome"] == "skipped" && meta["reason"] == "low_information"
-                })
-            }),
-            "expected a typed low_information skip event, got {events:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn maybe_spawn_does_not_treat_recent_tool_use_as_low_information() {
+    async fn short_conversation_is_admitted_by_structured_freshness() {
         let TestCtx { svc, .. } = build_ctx(None);
-        let sid = format!("tool-info-{}", nanos());
-        let mut req = low_information_req(&sid, 50_000);
-        req.messages.push(json!({
-            "role": "assistant",
-            "content": serde_json::Value::Null,
-            "tool_calls": [{"function": {"name": "list_dir"}}],
-        }));
+        let sid = format!("short-conversation-{}", nanos());
+        let req = short_conversation_req(&sid);
 
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
     }
@@ -1610,7 +1525,7 @@ mod tests {
     async fn shutdown_flush_uses_the_same_structured_gate_as_turn_end() {
         let TestCtx { svc, .. } = build_ctx(None);
         let sid = format!("shutdown-tool-info-{}", nanos());
-        let mut req = low_information_req(&sid, 100);
+        let mut req = short_conversation_req(&sid);
         req.messages.push(json!({
             "role": "assistant",
             "content": serde_json::Value::Null,
@@ -1808,7 +1723,7 @@ mod tests {
             ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
-            had_user_correction: false,
+            reanchors_current_objective: false,
             turn_number: 1,
         };
         assert_eq!(
@@ -2658,7 +2573,7 @@ mod tests {
             messages: vec![json!({"role": "user", "content": "x"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
-            had_user_correction: false,
+            reanchors_current_objective: false,
             turn_number: 1,
         };
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);

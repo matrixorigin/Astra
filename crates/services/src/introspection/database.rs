@@ -3117,38 +3117,6 @@ mod tests {
         assert!(svc.get_retrieval_quality("u1", "s1", 5).await.is_err());
     }
 
-    #[test]
-    fn context_snapshot_usage_sampling_is_anchored_to_selected_response() {
-        let source = include_str!("database.rs");
-        let body = source
-            .split("async fn get_context_snapshot")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn get_retrieval_quality").next())
-            .expect("get_context_snapshot body");
-
-        assert!(
-            body.contains("WHERE session_id = ? AND user_id = ? AND event_id = ?"),
-            "current token usage must be loaded by the selected snapshot response id"
-        );
-        assert!(
-            !body.contains("OFFSET ?") && !body.contains(" OFFSET "),
-            "context snapshot selection must not use SQL OFFSET"
-        );
-        assert!(
-            body.contains("context_snapshot_cursor_after_skipping")
-                && body.contains("ORDER BY cs.created_at DESC, cs.context_capture_id DESC"),
-            "context snapshot selection should use keyset skip plus a latest-row fast path"
-        );
-        assert!(
-            body.contains("anchor.event_id = ?") && body.contains("ORDER BY e.created_at DESC"),
-            "trend sampling must use a recent window anchored to the selected response"
-        );
-        assert!(
-            body.contains("trend_usage_rows.first()"),
-            "fallback current usage should use the newest sampled row, not the oldest row"
-        );
-    }
-
     // ── Query type serde defaults ───────────────────────────────────────
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! **Problem**: Memoria accepts any string for any memory_type. The
 //! `working` type is auto-purged and session-scoped, so pollution
-//! there is self-limiting (L1 `should_store_in_memory` handles it).
+//! there is bounded by the session lifecycle.
 //! But `semantic` / `episodic` / `procedural` are **persistent**:
 //! anything stored to them survives the session, gets indexed for
 //! vector search, and can resurface on any future query. Observed
@@ -33,8 +33,7 @@
 //!     structure — that's a future L2b refinement.
 //!   - Does not enforce cross-memory dedup — Memoria's vector similarity
 //!     is the intended backstop.
-//!   - Does not block `working` writes; those are session-scoped and
-//!     handled by `should_store_in_memory` (L1).
+//!   - Does not block `working` writes; those are session-scoped.
 
 // Re-export the layer-protocol constants from their canonical home
 // in `astra_prompts::memory_proto`. Using `use` instead of mirror
@@ -48,8 +47,7 @@ use astra_prompts::memory_proto::{
 /// Memory types that Memoria persists across sessions. Writes with
 /// these types MUST satisfy [`validate_persistent_memory_content`].
 ///
-/// `working` is deliberately absent — those writes are session-scoped
-/// and L1's `should_store_in_memory` already gates them.
+/// `working` is deliberately absent — those writes are session-scoped.
 pub const PERSISTENT_MEMORY_TYPES: &[&str] = &["semantic", "episodic", "procedural", "profile"];
 
 /// Reason a persistent memory write was rejected by the structural

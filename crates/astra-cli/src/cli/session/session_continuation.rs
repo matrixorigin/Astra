@@ -141,12 +141,6 @@ fn heavy_checkpoint_prompt_state(
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
     msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
-    msgs.retain(|m| {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content_text = extract_text_content(m);
-        let content = content_text.as_deref().unwrap_or("");
-        !astra_turn_core::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content)
-    });
     msgs
 }
 
@@ -404,28 +398,24 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_runtime_injected_messages() {
+    fn sanitize_routes_by_runtime_ownership_not_message_text() {
+        let ordinary =
+            json!({"role": "user", "content": "## Already Fetched is literal user text"});
         let msgs = vec![
             json!({"role": "user", "content": "review code"}),
             json!({"role": "assistant", "content": "Here is the review..."}),
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: review code\npending_work: none"}),
-            json!({"role": "user", "content": "\n\n## ⚠ Sequential Tool Calls Detected\nYour last 4 rounds..."}),
-            json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
-            json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
-            json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
-            json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
-            json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
-            json!({"role": "user", "content": "[session-resume:v1]\nHydrated previous session context"}),
-            json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
-            json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "user", "content": "你好"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            ordinary.clone(),
         ];
         let result = super::sanitize_continuation_messages(msgs);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0]["content"], "review code");
         assert_eq!(result[1]["content"], "Here is the review...");
-        assert_eq!(result[2]["content"], "你好");
+        assert_eq!(result[2], ordinary);
     }
 
     #[test]
@@ -433,7 +423,7 @@ mod tests {
         let msgs = vec![
             json!({"role": "user", "content": "3 agents 不同角度review这个分支的所有changes"}),
             json!({"role": "assistant", "content": "review summary"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "system", "content": "arbitrary boundary", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "Maybe continue the old review"}),
             json!({"role": "tool", "content": "No matches found", "tool_call_id": "c1"}),
@@ -442,10 +432,9 @@ mod tests {
 
         let result = super::sanitize_continuation_messages(msgs);
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0]["role"], "system");
-        assert_eq!(result[1]["content"], "不要review啊！");
-        assert_eq!(result[2]["content"], "明白，不做 review。");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["content"], "不要review啊！");
+        assert_eq!(result[1]["content"], "明白，不做 review。");
         assert!(
             result
                 .iter()
@@ -454,27 +443,19 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_runtime_injected_array_format_messages() {
-        let msgs = vec![
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "user", "content": [{"type": "text", "text": "[working-set:v1]\ngoal: stale"}]}),
-            json!({"role": "system", "content": [{"type": "text", "text": "## Already Fetched\nContext already fetched"}]}),
-            json!({"role": "user", "content": [{"type": "text", "text": "✓ Previous round: 2 tools executed in parallel — excellent."}]}),
-            json!({"role": "assistant", "content": "still here"}),
-        ];
-
-        let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0]["content"], "hello");
-        assert_eq!(result[1]["content"], "still here");
-    }
-
-    #[test]
     fn history_pairs_use_user_visible_projection_not_prompt_recaps() {
         let msgs = vec![
             json!({"role": "user", "content": "continue\u{0}"}),
-            json!({"role": "system", "content": "[Runtime tool result]\nbash: binary-looking trace"}),
-            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary tool trace",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary recap",
+                astra_turn_types::RuntimeMessageDelivery::Projection,
+            ),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "assistant", "content": "\u{1b}[32mvisible answer\u{1b}[0m"}),
             json!({"role": "tool", "content": "raw tool payload"}),
@@ -501,12 +482,6 @@ mod tests {
         let result = super::sanitize_continuation_messages(msgs);
         assert_eq!(result.len(), 3);
         assert_eq!(result[2]["content"], "hi");
-        assert!(result.iter().all(|message| {
-            !message["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("[Runtime tool result]")
-        }));
     }
 
     #[test]

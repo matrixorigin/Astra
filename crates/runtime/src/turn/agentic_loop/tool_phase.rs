@@ -1763,28 +1763,22 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 state.error_recovery.last_error_category = dominant;
             }
             if state.error_recovery.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
-                // In Auto mode the user opted to let the model drive —
-                // drop the error-budget nudge (it's another "stop doing
-                // that" message that breaks cache + interrupts flow).
-                // The counter still resets so other paths remain sane.
-                if !host.turn_interaction_mode().suppresses_loop_nudges() {
-                    let cat_name = state
-                        .error_recovery
-                        .last_error_category
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "Unknown".into());
-                    let n = state.error_recovery.consecutive_same_error;
-                    state.push_volatile_payload(
-                        super::host::VolatileKind::BehaviorAdvisory,
-                        serde_json::json!({
-                            "signal": "repeated_error_category",
-                            "category": cat_name,
-                            "consecutive_rounds": n,
-                            "assessment": "The current approach may be repeating a failing strategy.",
-                            "recommendation": "Consider a different tool, file, or method when supported by the task evidence; otherwise explain the blocker."
-                        }),
-                    );
-                }
+                let cat_name = state
+                    .error_recovery
+                    .last_error_category
+                    .map(|c| format!("{c:?}"))
+                    .unwrap_or_else(|| "Unknown".into());
+                let n = state.error_recovery.consecutive_same_error;
+                state.push_volatile_payload(
+                    super::host::VolatileKind::BehaviorAdvisory,
+                    serde_json::json!({
+                        "signal": "repeated_error_category",
+                        "category": cat_name,
+                        "consecutive_rounds": n,
+                        "assessment": "The current approach may be repeating a failing strategy.",
+                        "recommendation": "Consider a different tool, file, or method when supported by the task evidence; otherwise explain the blocker."
+                    }),
+                );
                 state.error_recovery.consecutive_same_error = 0;
             }
         } else {

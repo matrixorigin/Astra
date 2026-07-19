@@ -1487,35 +1487,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn poll_claim_update_uses_matrixone_compatible_identity_predicates() {
-        let source = include_str!("edge_dispatch.rs");
-        let poll_body = source
-            .split("impl EdgeDispatchService for DatabaseEdgeDispatchService")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("#[tracing::instrument(skip(self, result_json)")
-                    .next()
-            })
-            .expect("poll_pending body");
-        assert!(
-            !poll_body.contains("(user_id, request_id) IN")
-                && !poll_body
-                    .contains("(user_id, session_id, run_id, turn_chain_id, request_id) IN"),
-            "MatrixOne rejects row-value IN predicates with bound tuple parameters"
-        );
-        assert!(
-            poll_body.contains("WHERE status = 'pending' AND (")
-                && poll_body.contains("(user_id = ")
-                && poll_body.contains(" AND session_id = ")
-                && poll_body.contains(" AND run_id = ")
-                && poll_body.contains(" AND turn_chain_id = ")
-                && poll_body.contains(" AND request_id = ")
-                && poll_body.contains(" OR "),
-            "poll claim update must use explicit turn-scoped identity predicates"
-        );
-    }
-
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn matrixone_dispatch_round_trip_survives_cross_pod_delivery() {

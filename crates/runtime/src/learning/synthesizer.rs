@@ -1,10 +1,7 @@
-//! Session-end knowledge backflow — convert feedback rules into
-//! durable storage records for Memoria's L3 layer.
+//! Session-end knowledge backflow for durable Memoria L3 records.
 //!
 //! This module is pure extraction — it does NOT call Memoria. The caller
 //! (session_cleanup) does the HTTP call.
-
-use astra_turn_types::StructuredFeedback;
 
 /// A single reusable learning extracted from the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,30 +61,6 @@ pub fn build_synthesis_user_prompt(ctx: &LessonContext) -> String {
     }
     prompt.push_str("\nLesson (one sentence):");
     prompt
-}
-
-/// Convert a single feedback rule into an extractable lesson.
-/// Returns `None` if the rule text is empty/whitespace.
-pub fn feedback_rule_to_lesson(rule: &StructuredFeedback) -> Option<ExtractedLesson> {
-    let trimmed = rule.rule.trim();
-    if trimmed.is_empty() || !is_synthesized_lesson_acceptable(trimmed) {
-        return None;
-    }
-    let content = if rule.reason.trim().is_empty() {
-        format!("💡 RULE: {trimmed}")
-    } else {
-        format!("💡 RULE: {trimmed} (reason: {})", rule.reason.trim())
-    };
-    Some(ExtractedLesson {
-        memory_type: "semantic",
-        content,
-        trust_tier: "T3",
-    })
-}
-
-/// Batch convert feedback rules into lessons, filtering empty rules.
-pub fn feedback_rules_to_lessons(rules: &[StructuredFeedback]) -> Vec<ExtractedLesson> {
-    rules.iter().filter_map(feedback_rule_to_lesson).collect()
 }
 
 /// Quality gate for LLM-synthesized lessons. Stricter than the template
@@ -208,56 +181,6 @@ mod tests {
         assert!(!is_synthesized_lesson_acceptable(
             "Maybe use rg instead of grep in this repo"
         ));
-    }
-
-    fn make_feedback(rule: &str, reason: &str) -> StructuredFeedback {
-        StructuredFeedback {
-            rule: rule.to_string(),
-            reason: reason.to_string(),
-            apply_when: "general".to_string(),
-            source_signal: "user_correction".to_string(),
-            confidence: 0.9,
-        }
-    }
-
-    #[test]
-    fn feedback_rules_become_semantic_t3_lessons() {
-        let rules = vec![make_feedback(
-            "Always run cargo test before committing",
-            "broke CI twice",
-        )];
-        let lessons = feedback_rules_to_lessons(&rules);
-        assert_eq!(lessons.len(), 1);
-        assert_eq!(lessons[0].memory_type, "semantic");
-        assert_eq!(lessons[0].trust_tier, "T3");
-        assert!(lessons[0].content.contains("RULE:"));
-        assert!(lessons[0].content.contains("broke CI twice"));
-    }
-
-    #[test]
-    fn feedback_empty_reason_omits_parenthetical() {
-        let rules = vec![make_feedback("Use rg instead of grep", "")];
-        let lessons = feedback_rules_to_lessons(&rules);
-        assert_eq!(lessons.len(), 1);
-        assert!(!lessons[0].content.contains("(reason:"));
-        assert!(lessons[0].content.contains("Use rg instead of grep"));
-    }
-
-    #[test]
-    fn feedback_filters_low_quality_rules() {
-        let rules = vec![
-            make_feedback("ok", ""),                          // too short
-            make_feedback("maybe try something else", "idk"), // hedging
-            make_feedback("Use targeted reads for large files", "avoids token waste"), // good
-        ];
-        let lessons = feedback_rules_to_lessons(&rules);
-        assert_eq!(lessons.len(), 1);
-        assert!(lessons[0].content.contains("targeted reads"));
-    }
-
-    #[test]
-    fn feedback_empty_input_returns_empty() {
-        assert!(feedback_rules_to_lessons(&[]).is_empty());
     }
 
     #[test]

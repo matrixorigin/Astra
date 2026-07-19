@@ -32,25 +32,15 @@ impl TurnInteractionMode {
         matches!(self, Self::Prompt)
     }
 
-    /// True when the runtime should suppress its own *interruption-style*
-    /// nudges (execution-escalation, parallel-batching force, cache-waste,
-    /// redundant-reads, exploration-family lockout, tool-round hard-stop,
-    /// circuit-breaker finalization).
+    /// Whether advisory policy feedback should also be rendered as a
+    /// user-facing status line.
     ///
-    /// Motivation: when the user explicitly chose `Auto` they are
-    /// signalling "trust the model to finish the task end-to-end — don't
-    /// pepper it with corrections". Every nudge we inject costs tokens,
-    /// tanks cache (it changes the message tail), and is visible to the
-    /// user as "being interrupted". Observed in session `3b7ac18f`:
-    /// 10+ nudge injections in Auto mode across 15 turns, many with
-    /// overlapping guidance.
-    ///
-    /// Safety critical corrections (sandbox denial, hard tool failures,
-    /// ask-user protocol) go through separate paths and are NOT gated by
-    /// this predicate.
+    /// Auto mode keeps the policy-to-model feedback lane active, but avoids
+    /// turning each advisory into visible UI chatter. Permission automation
+    /// and feedback delivery are independent concerns.
     #[must_use]
-    pub fn suppresses_loop_nudges(self) -> bool {
-        matches!(self, Self::Auto)
+    pub fn shows_policy_feedback_status(self) -> bool {
+        !matches!(self, Self::Auto)
     }
 
     #[must_use]
@@ -187,58 +177,17 @@ pub fn tool_counts_as_external_observation(tool_name: &str) -> bool {
 mod tests {
     use super::*;
 
-    // ── suppresses_loop_nudges: the gate that closes the session 3b7ac18f
-    //    complaint "不停的被打断，不一气呵成"
-    //
-    // The user explicitly chose Auto mode. We interpret that as a
-    // signal to *stop* injecting the whole family of interruption
-    // nudges (parallel-batching force, execution escalation, cache
-    // waste, etc.) which the model otherwise has to acknowledge
-    // round-by-round. Pinning the mapping here so the gate stays one
-    // line in each call site.
-
     #[test]
-    fn auto_suppresses_loop_nudges() {
-        assert!(TurnInteractionMode::Auto.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn prompt_mode_keeps_nudges() {
-        // Prompt mode is "I want to see / approve each step" — keep
-        // the nudges so the user sees when the runtime thinks the
-        // model is wandering.
-        assert!(!TurnInteractionMode::Prompt.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn noninteractive_keeps_nudges() {
-        // Sub-runs, plan subtasks, piped stdin — these paths should
-        // still be course-corrected automatically because no human is
-        // watching.
-        assert!(!TurnInteractionMode::NonInteractive.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn headless_keeps_nudges() {
-        // Harness / eval runs — we want the model to be nudged into
-        // convergence for reproducibility.
-        assert!(!TurnInteractionMode::Headless.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn deny_keeps_nudges() {
-        // Deny mode blocks tool execution — the nudges are irrelevant
-        // (tools are already blocked), but we still report them so the
-        // user sees WHY nothing is progressing. No reason to silence.
-        assert!(!TurnInteractionMode::Deny.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn default_mode_keeps_nudges() {
-        // Safety: whatever the default is (NonInteractive), it must
-        // NOT be the silencing mode. Silencing is opt-in via explicit
-        // Auto.
-        assert!(!TurnInteractionMode::default().suppresses_loop_nudges());
+    fn auto_changes_advisory_presentation_not_policy_delivery() {
+        assert!(!TurnInteractionMode::Auto.shows_policy_feedback_status());
+        for mode in [
+            TurnInteractionMode::Prompt,
+            TurnInteractionMode::NonInteractive,
+            TurnInteractionMode::Headless,
+            TurnInteractionMode::Deny,
+        ] {
+            assert!(mode.shows_policy_feedback_status(), "mode={mode:?}");
+        }
     }
 
     #[test]

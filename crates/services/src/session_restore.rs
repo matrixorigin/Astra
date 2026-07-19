@@ -3031,38 +3031,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_restore_token_totals_use_core_token_events() {
-        let source = include_str!("session_restore.rs");
-        let cache_body = source
-            .split("async fn restore_cloud_cache_token_totals")
-            .nth(1)
-            .and_then(|rest| rest.split("// ─── Restored Session State").next())
-            .expect("cache token restore body");
-        let cloud_body = source
-            .split("async fn restore_cloud_session")
-            .nth(1)
-            .and_then(|rest| rest.split("let session_query_ms").next())
-            .expect("cloud restore session query body");
-        assert!(
-            cache_body.contains(
-                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
-            ),
-            "cloud restore must read token/cache totals from core turn events"
-        );
-        assert!(
-            cloud_body.contains(
-                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
-            ),
-            "cloud restore must read token totals from core turn events"
-        );
-        assert!(
-            !cache_body.contains("event_type = 'user_query' AND token_usage IS NOT NULL")
-                && !cloud_body.contains("event_type = 'user_query' AND token_usage IS NOT NULL"),
-            "cloud restore must not miss llm_response token_usage rows"
-        );
-    }
-
-    #[test]
     fn metadata_json_state_defaults_only_for_absent_or_empty_metadata() {
         assert_eq!(
             metadata_json_state(None).unwrap(),

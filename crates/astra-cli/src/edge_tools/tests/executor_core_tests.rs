@@ -1370,6 +1370,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
             event_type: JournalEventType::TurnError,
             ts: Utc::now().to_rfc3339(),
             session_id: Some(session_id.to_string()),
+            producer_scope: None,
             turn: Some(3),
             agentic_step: None,
             model: Some("gpt-5.4".to_string()),

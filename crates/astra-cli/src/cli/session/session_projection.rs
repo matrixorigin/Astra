@@ -244,31 +244,32 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
         return anchor;
     };
     if anchor
-        .as_deref()
-        .is_some_and(|existing| existing.contains("[Session memory recap]"))
+        .as_ref()
+        .is_some_and(|existing| existing.has_session_memory_recap)
     {
         return anchor;
     }
     let merged = match anchor {
         Some(anchor) if !anchor.trim().is_empty() => {
-            return Some(ContinuationAnchor::from_parts(
-                truncate_str(
-                    &format!("{}\n\n[Session memory recap]\n{recap}", anchor.text),
-                    900,
-                ),
-                anchor.latest_user_task,
-                anchor.assistant_direction,
-                anchor.active_task_board,
-            ));
+            return Some(
+                ContinuationAnchor::from_parts(
+                    truncate_str(
+                        &format!("{}\n\n[Session memory recap]\n{recap}", anchor.text),
+                        900,
+                    ),
+                    anchor.latest_user_input,
+                    anchor.assistant_direction,
+                    anchor.active_task_board,
+                )
+                .with_session_memory_recap(),
+            );
         }
         _ => format!("[Session memory recap]\n{recap}"),
     };
-    Some(ContinuationAnchor::from_parts(
-        truncate_str(&merged, 900),
-        None,
-        None,
-        Vec::new(),
-    ))
+    Some(
+        ContinuationAnchor::from_parts(truncate_str(&merged, 900), None, None, Vec::new())
+            .with_session_memory_recap(),
+    )
 }
 
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Result<Vec<SessionTask>, String> {
@@ -290,18 +291,18 @@ fn build_continuation_anchor_with_active_tasks(
         return state.continuation_anchor.clone();
     }
 
-    let latest_user_task = anchor_worthy_user_input(user_line)
+    let latest_user_input = anchor_worthy_user_input(user_line)
         .then(|| truncate_str(user_line, 220).to_string())
         .or_else(|| {
             state
                 .continuation_anchor
-                .as_ref()
-                .and_then(|anchor| anchor.latest_user_task.clone())
-                .filter(|task| anchor_worthy_user_input(task))
+                .as_ref()?
+                .latest_user_input
+                .clone()
         });
     let mut sections = Vec::new();
-    if let Some(user_summary) = latest_user_task.as_deref() {
-        sections.push(format!("Latest user task: {user_summary}"));
+    if let Some(user_summary) = latest_user_input.as_deref() {
+        sections.push(format!("Latest user input: {user_summary}"));
     }
     let active_task_board = active_task_anchor_items(active_tasks);
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
@@ -326,7 +327,7 @@ fn build_continuation_anchor_with_active_tasks(
     } else {
         Some(ContinuationAnchor::from_parts(
             sections.join("\n"),
-            latest_user_task,
+            latest_user_input,
             assistant_direction,
             active_task_board,
         ))
@@ -366,18 +367,18 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
         return;
     }
 
-    let latest_user_task = anchor_worthy_user_input(user_line)
+    let latest_user_input = anchor_worthy_user_input(user_line)
         .then(|| truncate_str(user_line, 220).to_string())
         .or_else(|| {
             state
                 .continuation_anchor
-                .as_ref()
-                .and_then(|anchor| anchor.latest_user_task.clone())
-                .filter(|task| anchor_worthy_user_input(task))
+                .as_ref()?
+                .latest_user_input
+                .clone()
         });
     let mut sections = Vec::new();
-    if let Some(user_summary) = latest_user_task.as_deref() {
-        sections.push(format!("Latest user task: {user_summary}"));
+    if let Some(user_summary) = latest_user_input.as_deref() {
+        sections.push(format!("Latest user input: {user_summary}"));
     }
     if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
         sections.push(task_section);
@@ -396,16 +397,14 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
     ));
     state.continuation_anchor = Some(ContinuationAnchor::from_parts(
         sections.join("\n"),
-        latest_user_task,
+        latest_user_input,
         assistant_direction,
         active_task_board,
     ));
 }
 
 fn anchor_worthy_user_input(user_line: &str) -> bool {
-    astra_turn_types::should_store_in_memory(
-        &serde_json::json!({"role": "user", "content": user_line}),
-    )
+    !user_line.trim().is_empty()
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
@@ -552,9 +551,9 @@ mod tests {
         let anchor = build_continuation_anchor(&state, &long_user_input, &result)
             .expect("should produce anchor");
 
-        assert!(anchor.contains("Latest user task: "));
+        assert!(anchor.contains("Latest user input: "));
         let user_part = anchor
-            .split("Latest user task: ")
+            .split("Latest user input: ")
             .nth(1)
             .unwrap()
             .split('\n')
@@ -585,10 +584,10 @@ mod tests {
     }
 
     #[test]
-    fn continuation_anchor_does_not_replace_task_with_low_information_followup() {
+    fn continuation_anchor_tracks_the_latest_nonempty_user_input_without_classification() {
         let state = SessionState {
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: fix tool closure telemetry",
+                "Latest user input: fix tool closure telemetry",
                 Some("fix tool closure telemetry".into()),
                 None,
                 Vec::new(),
@@ -599,13 +598,9 @@ mod tests {
 
         let anchor = build_continuation_anchor(&state, "继续", &result).expect("anchor");
 
-        assert!(anchor.contains("Latest user task: fix tool closure telemetry"));
-        assert!(!anchor.contains("Latest user task: 继续"), "{anchor}");
+        assert!(anchor.contains("Latest user input: 继续"));
         assert!(anchor.contains("Updated telemetry to use final edge_tools."));
-        assert_eq!(
-            anchor.latest_user_task.as_deref(),
-            Some("fix tool closure telemetry")
-        );
+        assert_eq!(anchor.latest_user_input.as_deref(), Some("继续"));
     }
 
     #[tokio::test]
@@ -752,7 +747,7 @@ mod tests {
                 std::sync::Arc::new(LoadFailsTaskStore),
             )),
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
+                "Latest user input: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
                 Some("继续".into()),
                 None,
                 vec!["[in_progress] task-1: Preserve me".into()],
@@ -815,7 +810,7 @@ mod tests {
                 std::sync::Arc::new(StalledTaskStore),
             )),
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
+                "Latest user input: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
                 Some("finish durable transcript loading".into()),
                 None,
                 vec!["[in_progress] task-1: Preserve live work".into()],
@@ -866,14 +861,14 @@ mod tests {
 ";
         let merged = merge_continuation_anchor_with_session_memory(
             Some(
-                "Latest user task: tighten session memory"
+                "Latest user input: tighten session memory"
                     .to_string()
                     .into(),
             ),
             Some(memory),
         )
         .expect("merged anchor");
-        assert!(merged.contains("Latest user task: tighten session memory"));
+        assert!(merged.contains("Latest user input: tighten session memory"));
         assert!(merged.contains("[Session memory recap]"));
         assert!(merged.contains("Session pending"));
         assert!(merged.contains("Add shutdown flush"));
@@ -889,7 +884,7 @@ mod tests {
         ));
         state.turn = 1;
         state.continuation_anchor = Some(
-            "Latest user task: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
+            "Latest user input: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
                 .to_string()
                 .into(),
         );
@@ -910,7 +905,7 @@ mod tests {
         assert_eq!(messages[2]["content"], "now explain borrowing");
 
         state.continuation_anchor = Some(
-            "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
+            "Latest user input: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string()
                 .into(),
         );

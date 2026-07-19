@@ -9,8 +9,6 @@
 
 pub mod crash_recovery;
 pub mod event;
-pub mod feedback_extraction;
-pub mod feedback_store;
 pub mod output_stream;
 pub mod routing;
 pub mod skill_checkpoint;

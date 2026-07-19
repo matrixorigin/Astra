@@ -2257,6 +2257,7 @@ mod tests {
                 event_type: JournalEventType::Turn,
                 ts: Utc::now().to_rfc3339(),
                 session_id: Some(session_id.to_string()),
+                producer_scope: None,
                 turn: Some(2),
                 agentic_step: None,
                 model: Some("gpt-5.4".to_string()),

@@ -92,18 +92,28 @@ fn apply_judged_turn_intent_to_observability_session(
         return;
     };
 
-    let mut session = astra_core::sync_poison::recover_rwlock_write(session);
-    if let Some(scenario) = intent.requested_scenario {
-        if !intent.prohibited_scenarios.contains(&scenario) {
-            session.profile.set_scenario(scenario);
-        }
-    } else if session
-        .profile
-        .current_scenario
-        .is_some_and(|scenario| intent.prohibited_scenarios.contains(&scenario))
     {
-        session.profile.current_scenario = None;
-        session.profile.touch();
+        let mut session = astra_core::sync_poison::recover_rwlock_write(session);
+        if let Some(scenario) = intent.requested_scenario {
+            if !intent.prohibited_scenarios.contains(&scenario) {
+                session.profile.set_scenario(scenario);
+            }
+        } else if session
+            .profile
+            .current_scenario
+            .is_some_and(|scenario| intent.prohibited_scenarios.contains(&scenario))
+        {
+            session.profile.current_scenario = None;
+            session.profile.touch();
+        }
+    }
+
+    if intent.reanchors_current_objective()
+        && let Some(hub) = &state.telemetry.observability_hub
+    {
+        hub.record_feedback(astra_core::feedback::FeedbackSignal::new(
+            astra_core::feedback::SignalType::Reanchor,
+        ));
     }
 }
 
@@ -218,7 +228,7 @@ fn skill_auto_route_attempt_key(query: &str, skill_name: &str) -> String {
 
 #[cfg(test)]
 fn pure_user_intent_for_runtime_decision(message: &str) -> String {
-    astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(message)
+    message.trim().to_string()
 }
 
 async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
@@ -1713,7 +1723,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // Inventory snapshots go through the structured volatile lane so
         // they stay out of `state.messages[]` — the wire layer drains
         // them into volatile_preamble for each LLM call.
-        const INVENTORY_HEADER: &str = astra_turn_core::runtime_scaffolding::ALREADY_FETCHED_PREFIX;
+        const INVENTORY_HEADER: &str = "## Already Fetched";
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
             state.push_volatile(
@@ -1948,12 +1958,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_decision_intent_strips_runtime_scaffolding_without_heuristics() {
-        let message = "review changes on current branch\n\n<system-reminder>\n[session-resume:v1]\nResume interrupted work. Mention prompt optimization here.\n</system-reminder>";
+    fn runtime_decision_intent_does_not_reinterpret_user_text() {
+        let message = "review literal <system-reminder> syntax";
 
         assert_eq!(
             pure_user_intent_for_runtime_decision(message),
-            "review changes on current branch"
+            "review literal <system-reminder> syntax"
         );
     }
 
@@ -2155,6 +2165,9 @@ mod tests {
         state.message = "3 agents review这个分支的changes. 第一性原则，不考虑兼容".to_string();
         state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+        state.telemetry.observability_session = Some(make_session());
 
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
@@ -3789,6 +3802,9 @@ mod tests {
         let intent = TurnIntent::default().with_reanchors_current_objective(true);
         let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+        state.telemetry.observability_session = Some(make_session());
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
@@ -3815,6 +3831,11 @@ mod tests {
         assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
         assert!(state.boosted_tools.is_empty());
         assert!(state.widen_selection_pending);
+        assert!(
+            hub.recent_feedback_signals()
+                .iter()
+                .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Reanchor })
+        );
         let rendered = state
             .pipeline_session
             .as_ref()

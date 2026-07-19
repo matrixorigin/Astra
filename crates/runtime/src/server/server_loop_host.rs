@@ -11375,7 +11375,7 @@ mod tests {
         .build();
 
         assert_eq!(host.turn_interaction_mode(), TurnInteractionMode::Auto);
-        assert!(host.turn_interaction_mode().suppresses_loop_nudges());
+        assert!(!host.turn_interaction_mode().shows_policy_feedback_status());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use astra_turn_types::{is_runtime_scaffolding_message, is_transient_runtime_status_text};
+use astra_turn_types::is_runtime_owned_message;
 
 // ---------------------------------------------------------------------------
 // State
@@ -200,11 +200,7 @@ fn clip_extraction_message(text: &str, max_chars: usize) -> String {
 }
 
 fn is_ephemeral_for_memory_extraction(message: &Value) -> bool {
-    is_runtime_scaffolding_message(message)
-        || message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(is_transient_runtime_status_text)
+    is_runtime_owned_message(message)
 }
 
 // ---------------------------------------------------------------------------

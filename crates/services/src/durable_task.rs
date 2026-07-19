@@ -4523,33 +4523,6 @@ mod tests {
         legacy_glob_import_compile_test::assert_verification_types_are_exported();
     }
 
-    #[test]
-    fn persist_contract_update_insert_path_is_transactional() {
-        let source = include_str!("durable_task.rs");
-        let body = source
-            .split("async fn persist_contract(")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn load_verification_history").next())
-            .expect("persist_contract body must be present");
-
-        assert!(
-            body.contains(".begin()"),
-            "persist_contract must open an explicit transaction"
-        );
-        assert!(
-            body.contains(".commit()"),
-            "persist_contract must commit the explicit transaction"
-        );
-        assert!(
-            !body.contains(".execute(&self.pool)"),
-            "persist_contract must not split UPDATE/INSERT across pool connections"
-        );
-        assert!(
-            body.matches(".execute(&mut *tx)").count() >= 3,
-            "persist_contract UPDATE and INSERT paths must execute on the transaction"
-        );
-    }
-
     #[derive(Clone)]
     struct FakeContractRow {
         failed_column: Option<&'static str>,

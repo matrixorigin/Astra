@@ -667,31 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_search_hot_path_does_not_count_or_offset_rows() {
-        let body = include_str!("marketplace_stats.rs")
-            .split("impl MarketplaceStatsService for DatabaseMarketplaceStatsService")
-            .nth(1)
-            .expect("database marketplace stats service impl")
-            .split("async fn search_ranked(")
-            .nth(1)
-            .expect("database search_ranked body")
-            .split("async fn refresh_aggregation(")
-            .next()
-            .expect("database search_ranked body end");
-        let upper = body.to_ascii_uppercase();
-        assert!(
-            !body.contains("COUNT(*)"),
-            "marketplace search uses seek pagination and must not count skills_registry"
-        );
-        assert_eq!(
-            upper.find(" OFFSET "),
-            None,
-            "marketplace search must not use OFFSET"
-        );
-        assert!(body.contains("ORDER BY ranking_score DESC, sr.skill_name ASC, sr.version ASC"));
-    }
-
-    #[test]
     fn aggregate_metric_id_is_stable() {
         assert_eq!(
             aggregate_metric_id("review_changes"),

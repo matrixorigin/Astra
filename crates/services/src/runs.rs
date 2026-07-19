@@ -7058,9 +7058,6 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(interaction_mode) = data.get("interaction_mode").cloned() {
                     obj.insert("interaction_mode".to_string(), interaction_mode);
                 }
-                if let Some(suppressed_loop_nudges) = data.get("suppressed_loop_nudges").cloned() {
-                    obj.insert("suppressed_loop_nudges".to_string(), suppressed_loop_nudges);
-                }
                 if let Some(interactive_client) = data.get("interactive_client").cloned() {
                     obj.insert("interactive_client".to_string(), interactive_client);
                 }
@@ -9899,7 +9896,7 @@ mod tests {
                     "run_started",
                     json!({
                         "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
-                        "suppressed_loop_nudges": true, "interactive_client": true,
+                        "interactive_client": true,
                         "turn_intent_policy": "fixed_default",
                         "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                         "executor": {"kind": "server_local", "status": "online"},

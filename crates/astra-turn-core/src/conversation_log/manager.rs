@@ -958,8 +958,11 @@ mod tests {
         .unwrap();
 
         let t1 = vec![
-            user_msg(
-                "review changes\n\n<system-reminder>\n[session-resume:v1]\nresume hint\n</system-reminder>",
+            user_msg("review changes"),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "resume hint",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
             ),
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "function": {"name": "skill", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "<skill-loaded name=\"review-changes\"/>"}),
@@ -972,7 +975,13 @@ mod tests {
             t1[1].clone(),
             t1[2].clone(),
             t1[3].clone(),
-            user_msg("next step\n\n<system-reminder>\nbackground update\n</system-reminder>"),
+            t1[4].clone(),
+            user_msg("next step"),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "background update",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c2", "function": {"name": "bash", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "c2", "content": "raw command output"}),
             assistant_msg("next done"),
@@ -982,18 +991,13 @@ mod tests {
         let entries = store.load_after("manager-canonical", 0).await.unwrap();
         assert_eq!(entries.len(), 2);
         if let CslEntry::TurnDelta { appended, .. } = &entries[1] {
-            assert_eq!(appended.len(), 4);
+            assert_eq!(appended.len(), 5);
             assert_eq!(appended[0]["role"], "user");
-            assert!(
-                appended[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("<system-reminder>")
-            );
-            assert!(appended[1].get("tool_calls").is_some());
-            assert_eq!(appended[2]["role"], "tool");
-            assert_eq!(appended[2]["content"], "raw command output");
-            assert_eq!(appended[3]["content"], "next done");
+            assert!(astra_turn_types::is_runtime_owned_message(&appended[1]));
+            assert!(appended[2].get("tool_calls").is_some());
+            assert_eq!(appended[3]["role"], "tool");
+            assert_eq!(appended[3]["content"], "raw command output");
+            assert_eq!(appended[4]["content"], "next done");
         } else {
             panic!("entry[1] should be TurnDelta");
         }
@@ -1005,16 +1009,14 @@ mod tests {
         )
         .unwrap();
         let mat = loader.load().await.unwrap().unwrap();
-        assert_eq!(mat.messages.len(), 8);
-        let joined = mat
-            .messages
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("<system-reminder>"));
-        assert!(joined.contains("[session-resume:v1]"));
-        assert!(joined.contains("<skill-loaded"));
+        assert_eq!(mat.messages.len(), 10);
+        assert_eq!(
+            mat.messages
+                .iter()
+                .filter(|message| astra_turn_types::is_runtime_owned_message(message))
+                .count(),
+            2
+        );
         assert!(mat.messages.iter().any(|msg| msg["role"] == "tool"));
         assert!(
             mat.messages

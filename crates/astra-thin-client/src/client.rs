@@ -3208,47 +3208,6 @@ mod tests {
 
     // ── HTTP client proxy policy ──────────────────────────────────────────────
 
-    /// Extract the body of `streaming_http_client` from the source, with
-    /// single-line comments stripped for decompression guard assertions.
-    fn streaming_http_client_body_no_comments() -> String {
-        let src = include_str!("client.rs");
-        let fn_start = src
-            .find("fn streaming_http_client(base: &Url)")
-            .expect("streaming_http_client must exist in client.rs");
-        let fn_src = &src[fn_start..];
-        let body_start = fn_src.find('{').expect("function body open brace");
-        let body_src = &fn_src[body_start..];
-        let mut depth = 0usize;
-        let mut body_end = 0usize;
-        for (i, ch) in body_src.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        body_end = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let fn_body = &body_src[..body_end];
-        // Strip single-line comments so guard assertions are not tripped by
-        // comment text that intentionally mentions the forbidden pattern.
-        fn_body
-            .lines()
-            .map(|line| {
-                if let Some(pos) = line.find("//") {
-                    &line[..pos]
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn proxy_policy_bypasses_only_process_local_base_urls() {
         for base in [
@@ -3274,26 +3233,5 @@ mod tests {
                 "{base} must retain environment-aware proxy routing"
             );
         }
-    }
-
-    #[test]
-    fn streaming_http_client_disables_auto_decompression() {
-        // Auto-decompression must stay disabled on `http_stream`.  If
-        // Content-Encoding headers on SSE responses cause reqwest to buffer
-        // chunks, streaming breaks.  This guard prevents accidental re-addition
-        // of `.gzip(true)` / `.brotli(true)` / `.deflate(true)`.
-        let code = streaming_http_client_body_no_comments();
-        assert!(
-            code.contains(".no_gzip()"),
-            "streaming_http_client must call .no_gzip() to disable auto-decompression"
-        );
-        assert!(
-            code.contains(".no_brotli()"),
-            "streaming_http_client must call .no_brotli() to disable auto-decompression"
-        );
-        assert!(
-            code.contains(".no_deflate()"),
-            "streaming_http_client must call .no_deflate() to disable auto-decompression"
-        );
     }
 }

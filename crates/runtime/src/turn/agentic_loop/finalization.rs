@@ -1072,15 +1072,15 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // Total context size the model actually sees — uncached prompt +
     // cache reads + cache creation. Using `total_prompt` alone here
     // was a semantic bug: on prompt-cache-heavy sessions 90% of the
-    let runtime_decision_user_intent = state.runtime_decision_user_intent();
     let req = crate::session_memory::ExtractionRequest {
         session_id,
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),
         had_error,
-        had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
-            &runtime_decision_user_intent,
-        ),
+        reanchors_current_objective: state
+            .turn_intent
+            .as_ref()
+            .is_some_and(|intent| intent.reanchors_current_objective()),
         turn_number,
     };
 
@@ -1545,7 +1545,12 @@ mod tests {
         state.session_turn = 10;
         state.step_recorder.begin_turn(0);
         state.messages = vec![
-            serde_json::json!({"role": "user", "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            serde_json::json!({"role": "user", "content": "我说过的所有话"}),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "arbitrary resume context",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
             serde_json::json!({
                 "role": "assistant",
                 "content": null,
@@ -2344,7 +2349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_skips_low_information_turn_and_emits_typed_reason() {
+    async fn finalize_and_render_does_not_classify_short_user_text() {
         let sid = format!(
             "finalize-skips-{}",
             std::time::SystemTime::now()
@@ -2361,30 +2366,20 @@ mod tests {
         state
             .messages
             .push(serde_json::json!({"role": "user", "content": "clean turn"}));
-        let (mut rx, memoria) = attach_memory_extraction_service(&mut state);
+        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
 
         finalize_and_render(&mut host, &mut state).await;
 
-        // No Memoria store happened.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pending = state
+            .memory_extraction_service
+            .as_ref()
+            .expect("memory extraction service")
+            .wait_for_pending(std::time::Duration::from_secs(2))
+            .await;
+        assert_eq!(pending, 0);
         assert!(
-            memoria.stored.lock().unwrap().is_empty(),
-            "a low-information turn should not create session memory"
-        );
-
-        let mut saw_low_information = false;
-        while let Ok(evt) = rx.try_recv() {
-            if evt.event_type != "session_memory_extraction" {
-                continue;
-            }
-            let meta = evt.metadata.as_ref().unwrap();
-            if meta["outcome"] == "skipped" && meta["reason"] == "low_information" {
-                saw_low_information = true;
-            }
-        }
-        assert!(
-            saw_low_information,
-            "expected a typed skipped{{low_information}} event"
+            !memoria.stored.lock().unwrap().is_empty(),
+            "structured freshness, not message length, admits extraction"
         );
     }
 

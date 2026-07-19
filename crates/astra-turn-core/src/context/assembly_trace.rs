@@ -156,8 +156,6 @@ pub struct PromptContextSignals {
     pub effort_hint: bool,
     pub agent_type_hint: bool,
     pub self_awareness: bool,
-    pub implicit_feedback: bool,
-    pub learned_feedback_rules: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

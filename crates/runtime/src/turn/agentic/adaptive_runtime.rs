@@ -73,44 +73,17 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     (tool_calls, unique_tools.len() as u32)
 }
 
-/// Decide whether the current user message implicitly accepts the previous
-/// assistant turn. Acceptance fires when:
-///
-/// - the message is non-empty (whitespace stripped), AND
-/// - it is not a direct correction, reanchor, or explicit interruption.
-///
-/// Acceptance is intentionally conservative: a non-empty user message is not
-/// enough. If the message redirects the task or pauses the agent, recording
-/// `Acceptance` would contradict the user's latest control signal.
+/// Decide whether typed turn intent supports an implicit acceptance signal.
+/// Natural-language content is not classified at this boundary.
 #[must_use]
-pub(crate) fn should_emit_acceptance(message: &str) -> bool {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if astra_turn_core::input_classifier::is_reanchor_signal(trimmed) {
-        return false;
-    }
-    !is_explicit_interruption(trimmed)
-}
-
-fn is_explicit_interruption(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    starts_with_control_word(&lower, "wait")
-        || starts_with_control_word(&lower, "stop")
-        || lower.contains("hold on")
-        || lower.contains("等等")
-        || lower.contains("先停")
-}
-
-fn starts_with_control_word(text: &str, word: &str) -> bool {
-    let trimmed = text.trim_start();
-    let Some(rest) = trimmed.strip_prefix(word) else {
-        return false;
-    };
-    rest.chars()
-        .next()
-        .is_none_or(|ch| ch.is_whitespace() || matches!(ch, ',' | '.' | ':' | ';' | '!' | '?'))
+pub(crate) fn should_emit_acceptance(
+    message: &str,
+    intent: Option<&astra_config::user_profile::TurnIntent>,
+) -> bool {
+    !message.trim().is_empty()
+        && intent.is_some_and(|intent| {
+            intent.continues_current_objective() && !intent.reanchors_current_objective()
+        })
 }
 
 /// Record feedback signals based on the loop's outcome and accumulated state.
@@ -318,7 +291,8 @@ pub(crate) fn record_loop_completion_feedback(
             .iter()
             .rev()
             .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-        if has_prior_assistant && should_emit_acceptance(&state.message) {
+        if has_prior_assistant && should_emit_acceptance(&state.message, state.turn_intent.as_ref())
+        {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
             ));
@@ -401,49 +375,18 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_skipped_for_explicit_corrections() {
-        for s in [
-            "no, that's not what i meant",
-            "actually, i wanted X",
-            "wait, can you show the logs first?",
-            "wait, hold on",
-            "i meant the other one",
-            "to clarify, i need Y",
-            "不对，我的意思是改这里",
-            "不是修修补补，要系统性解决",
-            "等等，先停一下",
-        ] {
-            assert!(
-                !should_emit_acceptance(s),
-                "{s:?} is a correction; acceptance must not fire"
-            );
-        }
-    }
+    fn acceptance_uses_structured_continuation_evidence() {
+        let continued = astra_config::user_profile::TurnIntent::default().with_continuation_mode(
+            astra_config::user_profile::TurnContinuationMode::ContinueCurrentObjective,
+        );
+        let reanchored = continued.clone().with_reanchors_current_objective(true);
 
-    #[test]
-    fn acceptance_fires_for_neutral_or_accepting_messages() {
-        for s in [
-            "please continue",
-            "thanks, looks good",
-            "next step",
-            "继续",
-            "ok run it",
-        ] {
-            assert!(should_emit_acceptance(s), "{s:?} must emit acceptance");
-        }
-    }
-
-    #[test]
-    fn acceptance_skipped_for_empty_or_whitespace_message() {
-        assert!(!should_emit_acceptance(""));
-        assert!(!should_emit_acceptance("   \n\t"));
-    }
-
-    #[test]
-    fn acceptance_does_not_fire_on_drifted_inline_keyword_set() {
-        assert!(should_emit_acceptance("the answer is not 5"));
-        assert!(should_emit_acceptance(
-            "this looks wrong-shaped, fix the layout"
+        assert!(should_emit_acceptance("arbitrary input", Some(&continued)));
+        assert!(!should_emit_acceptance(
+            "arbitrary input",
+            Some(&reanchored)
         ));
+        assert!(!should_emit_acceptance("arbitrary input", None));
+        assert!(!should_emit_acceptance("", Some(&continued)));
     }
 }

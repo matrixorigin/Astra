@@ -17,7 +17,7 @@ use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 /// text. wip-7 migrated away from the previous raw-text payload because
 /// the external `transform_run_event_for_client` transform passed the
 /// event through verbatim, leaking learned feedback rules, memoria recall
-/// digests, self-awareness summaries, and user-correction excerpts to
+/// digests and self-awareness summaries to
 /// any authenticated `/chat/turn` client.
 ///
 /// The fingerprint is enough for `ObservabilitySession` to detect
@@ -25,8 +25,7 @@ use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 /// derived CLI-side from channels the CLI already owns
 /// (`lessons`, `self_awareness`,
 /// `recent_arg_hints`, `skill_listing`). Bridge-internal channels
-/// (`memoria_prefetch`, `feedback_rules`, `implicit_feedback`,
-/// `tool_round_guidance`, `volatile`) carry an empty preview in the
+/// (`memoria_prefetch`, `tool_round_guidance`, `volatile`) carry an empty preview in the
 /// CLI history — introspect still sees tag + hash + bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BridgeChannelFingerprint {

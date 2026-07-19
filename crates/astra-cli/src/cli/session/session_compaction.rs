@@ -129,7 +129,7 @@ mod tests {
 
         let state = SessionState {
             continuation_anchor: Some(
-                "Latest user task: debug lifetime in tokio::spawn\n\
+                "Latest user input: debug lifetime in tokio::spawn\n\
                  Latest assistant direction: add 'static bound to closure"
                     .to_string()
                     .into(),

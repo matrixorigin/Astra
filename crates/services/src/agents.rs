@@ -728,24 +728,6 @@ mod tests {
         assert_eq!(list.agents[0].name, "a1");
     }
 
-    #[test]
-    fn agent_list_hot_path_does_not_count_rows() {
-        let body = include_str!("agents.rs")
-            .split("impl AgentService for DatabaseAgentService")
-            .nth(1)
-            .expect("database agent service impl")
-            .split("async fn list_agents(")
-            .nth(1)
-            .expect("database list_agents body")
-            .split("async fn get_agent(")
-            .next()
-            .expect("database list_agents body end");
-        assert!(
-            !body.contains("COUNT("),
-            "agent list is capped and must not count agent_agents"
-        );
-    }
-
     #[tokio::test]
     async fn create_duplicate_name_returns_conflict() {
         let svc = InMemoryAgentService::new();

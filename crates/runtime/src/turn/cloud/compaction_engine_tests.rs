@@ -123,11 +123,10 @@ fn make_session_with_duplicate_reads() -> Vec<Value> {
 
 /// Wrapper that converts Vec<Value> ↔ Vec<Message> around a layer's compress() call.
 ///
-/// NOTE: boundary markers (`_compact_boundary`, `_messages_removed`,
-/// `_turns_removed`, `_reactive`) live in `Message.extra` and are INTENTIONALLY
-/// stripped by `From<Message> for Value` (they must not cross the provider
-/// wire — see compression_types.rs). Tests that assert on these markers
-/// should use `compress_layer_typed` instead so they inspect the typed form.
+/// NOTE: this helper exercises a layer's provider-wire conversion directly,
+/// so internal metadata is stripped. End-to-end compaction-engine tests use
+/// the engine's canonical projection, which preserves typed ownership and the
+/// boundary marker until provider assembly.
 fn compress_layer_values<L: CompressionLayer>(
     layer: &L,
     msgs: &mut Vec<serde_json::Value>,
@@ -1334,7 +1333,7 @@ fn tiered_boundary_records_dropped_turn_count() {
 }
 
 #[test]
-fn tiered_handles_existing_boundary_marker() {
+fn canonical_compaction_roundtrip_preserves_existing_boundary_marker() {
     let mut msgs = vec![
         json!({"role": "system", "content": "System"}),
         json!({"role": "user", "content": "Turn 1"}),
@@ -1348,12 +1347,12 @@ fn tiered_handles_existing_boundary_marker() {
     let budget = budget(64000, 100000);
     let engine = CompactionEngine::default_pipeline_for(64000);
     engine.compress_if_needed(&mut msgs, &budget);
-    // Existing boundary must not cause panics or corruption.
-    assert!(
+    assert_eq!(
         msgs.iter()
             .filter(|m| m["_compact_boundary"].as_bool() == Some(true))
-            .count()
-            <= 1
+            .count(),
+        1,
+        "canonical projection must retain the producer-owned boundary"
     );
 }
 

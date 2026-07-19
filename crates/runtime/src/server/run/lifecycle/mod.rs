@@ -5741,18 +5741,14 @@ impl AgenticRunLifecycleService {
         };
         use astra_turn_core::turn_guard::TurnGuard;
 
-        let prompt_user_message =
-            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
-                &request.message,
-            );
-        let prompt_user_intent =
-            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
-                request
-                    .user_intent
-                    .as_deref()
-                    .filter(|intent| !intent.trim().is_empty())
-                    .unwrap_or(request.message.as_str()),
-            );
+        let prompt_user_message = request.message.trim().to_string();
+        let prompt_user_intent = request
+            .user_intent
+            .as_deref()
+            .filter(|intent| !intent.trim().is_empty())
+            .unwrap_or(request.message.as_str())
+            .trim()
+            .to_string();
         let user_message = json!({
             "role": "user",
             "content": prompt_user_message,
@@ -6549,7 +6545,6 @@ fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
     state.context_manifest_user_id.as_ref()?;
-    let runtime_decision_user_intent = state.runtime_decision_user_intent();
     state
         .current_session_id
         .as_ref()
@@ -6558,9 +6553,10 @@ fn build_shutdown_extraction_request(
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
             had_error: state.error_recovery.consecutive_same_error > 0,
-            had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
-                &runtime_decision_user_intent,
-            ),
+            reanchors_current_objective: state
+                .turn_intent
+                .as_ref()
+                .is_some_and(|intent| intent.reanchors_current_objective()),
             turn_number: state.current_session_turn_number(),
         })
 }

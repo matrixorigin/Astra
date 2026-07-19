@@ -714,6 +714,7 @@ mod tests {
                 event_type: JournalEventType::Turn,
                 ts: "2026-01-15T10:31:00Z".to_string(),
                 session_id: Some(session_id.to_string()),
+                producer_scope: None,
                 turn: Some(3),
                 agentic_step: None,
                 model: Some("gpt-5.4".to_string()),

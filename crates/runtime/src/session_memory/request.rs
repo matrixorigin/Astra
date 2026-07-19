@@ -12,7 +12,7 @@ pub struct ExtractionRequest {
     pub messages: Vec<Value>,
     pub session_facts: SessionFacts,
     pub had_error: bool,
-    pub had_user_correction: bool,
+    pub reanchors_current_objective: bool,
     pub turn_number: u32,
 }
 

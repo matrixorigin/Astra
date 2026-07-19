@@ -93,10 +93,15 @@ fn resolve_worktree_path(
 /// The child task itself is captured separately at the run boundary. System
 /// instructions and inherited parent context are provider input, not
 /// child-authored transcript history.
-fn initial_delegate_transcript_identity(session_id: &str, run_id: &str) -> SubRunJournalIdentity {
+fn initial_delegate_transcript_identity(
+    session_id: &str,
+    run_id: &str,
+    parent_run_id: &str,
+) -> SubRunJournalIdentity {
     SubRunJournalIdentity {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
+        parent_run_id: Some(parent_run_id.to_string()),
         next_item_seq: 1,
         last_assistant_source_event_id: None,
         persistence_blocked: false,
@@ -431,6 +436,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             host.journal_identity = Some(initial_delegate_transcript_identity(
                 &config.session_id,
                 &config.run_id,
+                &config.parent_run_id,
             ));
         }
 
@@ -927,10 +933,11 @@ mod tests {
 
     #[test]
     fn delegated_transcript_identity_is_owned_by_the_parent_session_run() {
-        let identity = initial_delegate_transcript_identity("session-1", "run-1");
+        let identity = initial_delegate_transcript_identity("session-1", "run-1", "parent-run-1");
 
         assert_eq!(identity.session_id, "session-1");
         assert_eq!(identity.run_id, "run-1");
+        assert_eq!(identity.parent_run_id.as_deref(), Some("parent-run-1"));
         assert_eq!(identity.next_item_seq, 1);
     }
 

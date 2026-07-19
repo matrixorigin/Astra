@@ -11,7 +11,7 @@ pub const SESSION_RESUME_PREFIX: &str = "[session-resume:v1]";
 
 const MAX_RECENT_MESSAGES: usize = 8;
 const MAX_SUMMARY_ITEMS: usize = 6;
-const MAX_OBJECTIVE_CHARS: usize = 260;
+const MAX_USER_INPUT_CHARS: usize = 260;
 const MAX_ASSISTANT_CHARS: usize = 360;
 const MAX_MESSAGE_CHARS: usize = 220;
 const MAX_HINT_CHARS: usize = 2_400;
@@ -36,24 +36,24 @@ pub fn build_resume_hydration_hint_from_prompt_messages(messages: &[Value]) -> O
         return None;
     }
 
-    let active_objective = latest_substantive_user(&entries);
+    let latest_user_input = latest_user_input(&entries);
     let last_assistant_state = latest_assistant(&entries);
     let mut lines = vec![
         SESSION_RESUME_PREFIX.to_string(),
         "Hydrated previous session context from stored prompt-facing history.".to_string(),
         "Treat this as the same session, not a new session.".to_string(),
-        "If the user asks to continue, resume from the active worklog unless they explicitly change topic.".to_string(),
+        "Use separately supplied task and active-work evidence as the authority for what remains in progress.".to_string(),
         "Do not claim that no prior conversation exists when this block is present.".to_string(),
         String::new(),
-        "Active worklog:".to_string(),
+        "Observed conversation tail:".to_string(),
     ];
 
-    match active_objective {
-        Some(objective) => lines.push(format!(
-            "- active_objective: {}",
-            truncate_chars(objective, MAX_OBJECTIVE_CHARS)
+    match latest_user_input {
+        Some(input) => lines.push(format!(
+            "- latest_user_input: {}",
+            truncate_chars(input, MAX_USER_INPUT_CHARS)
         )),
-        None => lines.push("- active_objective: unavailable from restored history".to_string()),
+        None => lines.push("- latest_user_input: unavailable from restored history".to_string()),
     }
     match last_assistant_state {
         Some(state) => lines.push(format!(
@@ -111,32 +111,11 @@ If the user asks what happened, state that the stored session context was unavai
     )
 }
 
-pub fn build_resume_hydration_failure_hint_for_error(error: &str) -> String {
-    build_resume_hydration_failure_hint(sanitize_resume_restore_error(error))
-}
-
-fn sanitize_resume_restore_error(error: &str) -> &'static str {
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("timeout")
-        || normalized.contains("timed out")
-        || normalized.contains("deadline")
-    {
-        "storage timeout while restoring session"
-    } else if normalized.contains("permission")
-        || normalized.contains("forbidden")
-        || normalized.contains("denied")
-        || normalized.contains("unauthorized")
-    {
-        "insufficient storage permissions while restoring session"
-    } else if normalized.contains("connect")
-        || normalized.contains("connection")
-        || normalized.contains("unreachable")
-        || normalized.contains("refused")
-    {
-        "session storage connectivity issue during restore"
-    } else {
-        "session restore infrastructure issue"
-    }
+pub fn build_resume_hydration_failure_hint_for_error(_error: &str) -> String {
+    // This boundary receives an untyped storage error string. Do not infer a
+    // failure category from wording; typed callers should supply one through
+    // `build_resume_hydration_failure_hint` when it is available.
+    build_resume_hydration_failure_hint("session restore infrastructure issue")
 }
 
 pub fn merge_resume_hints(first: Option<String>, second: Option<String>) -> Option<String> {
@@ -183,13 +162,12 @@ fn prompt_entries(messages: &[Value]) -> Vec<PromptEntry> {
         .collect()
 }
 
-fn latest_substantive_user(entries: &[PromptEntry]) -> Option<&str> {
+fn latest_user_input(entries: &[PromptEntry]) -> Option<&str> {
     entries
         .iter()
         .rev()
-        .filter(|entry| entry.role == "user")
+        .find(|entry| entry.role == "user")
         .map(|entry| entry.text.as_str())
-        .find(|text| !is_generic_continuation(text))
 }
 
 fn latest_assistant(entries: &[PromptEntry]) -> Option<&str> {
@@ -198,33 +176,6 @@ fn latest_assistant(entries: &[PromptEntry]) -> Option<&str> {
         .rev()
         .find(|entry| entry.role == "assistant")
         .map(|entry| entry.text.as_str())
-}
-
-fn is_generic_continuation(text: &str) -> bool {
-    let normalized = text
-        .trim()
-        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "continue"
-            | "go on"
-            | "keep going"
-            | "next"
-            | "more"
-            | "yes"
-            | "ok"
-            | "okay"
-            | "y"
-            | "继续"
-            | "继续啊"
-            | "继续吧"
-            | "接着"
-            | "接着说"
-            | "然后呢"
-            | "好的"
-            | "可以"
-    )
 }
 
 fn normalize_ws(text: &str) -> String {
@@ -260,7 +211,7 @@ mod tests {
 
         assert!(hint.starts_with(SESSION_RESUME_PREFIX));
         assert!(hint.contains("Treat this as the same session"));
-        assert!(hint.contains("active_objective: 3agents review current branch changes"));
+        assert!(hint.contains("latest_user_input: 继续"));
         assert!(hint.contains("last_assistant_state: Continuing the branch review"));
         assert!(!hint.contains("[Runtime tool result]"));
         assert!(!hint.contains("202 files changed"));

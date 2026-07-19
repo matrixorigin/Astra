@@ -320,7 +320,7 @@ fn should_preserve_prior_final_after_runtime_scaffolding_retry(
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content) {
+        if astra_turn_types::is_runtime_owned_message(msg) {
             saw_runtime_scaffolding = true;
             continue;
         }
@@ -925,14 +925,16 @@ mod tests {
             "role": "assistant",
             "content": prior_answer,
         }));
-        pack.messages.push(json!({
-            "role": "user",
-            "content": "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks",
-        }));
-        pack.messages.push(json!({
-            "role": "user",
-            "content": "## ⚡ Self-Status\nTurn 9/299 | Token pressure: 5% | Cache: 86%",
-        }));
+        pack.messages.push(astra_turn_types::runtime_owned_message(
+            "user",
+            "first arbitrary runtime follow-up",
+            astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+        ));
+        pack.messages.push(astra_turn_types::runtime_owned_message(
+            "user",
+            "second arbitrary runtime follow-up",
+            astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+        ));
 
         let out = ingest_agentic_turn_stream(
             &snap,

@@ -1043,9 +1043,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             // Injection-freshness observation is deferred to after the
             // turn's SSE stream finishes (see `post_turn_observe_bridge_injections`
             // in `cli_loop_host.rs`). Observing here would fire before
-            // the bridge has actually composed its 5 bridge-generated
-            // channels (implicit_feedback, feedback_rules,
-            // memoria_prefetch, tool_round_guidance, volatile) and leave
+            // the bridge has actually composed its bridge-generated
+            // channels (memoria_prefetch, tool_round_guidance, volatile) and leave
             // them permanently `Untracked` in introspect's freshness
             // report.
         }
@@ -1967,7 +1966,12 @@ mod tests {
     #[tokio::test]
     async fn prepare_chat_turn_payload_normalizes_cli_server_prompt_boundary() {
         let messages = vec![
-            json!({"role": "user", "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({"role": "user", "content": "我说过的所有话"}),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "Hydrated previous session context",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
             json!({
                 "role": "assistant",
                 "content": null,
@@ -1996,14 +2000,12 @@ mod tests {
         assert!(payload_messages.contains("我说过的所有话"));
         assert!(payload_messages.contains("你问过我总结这段会话。"));
         assert!(payload_messages.contains("继续"));
-        assert!(!payload_messages.contains("<system-reminder>"));
-        assert!(!payload_messages.contains("[session-resume:v1]"));
         assert!(!payload_messages.contains("skill-auto-route"));
         assert!(!payload_messages.contains("<skill-loaded"));
         assert_eq!(
             payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
             json!([
-                "[session-resume:v1]\nHydrated previous session context",
+                "Hydrated previous session context",
                 "structured resume lane"
             ])
         );

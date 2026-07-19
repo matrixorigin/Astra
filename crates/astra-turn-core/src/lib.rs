@@ -56,7 +56,6 @@ pub mod headless;
 pub mod history;
 pub mod hook_plans;
 pub mod injection_tracking;
-pub mod input_classifier;
 pub mod interaction_types;
 pub mod interruption;
 pub mod introspect;

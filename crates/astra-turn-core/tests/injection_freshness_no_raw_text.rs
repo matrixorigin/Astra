@@ -3,8 +3,7 @@
 //! Raw channel text never crosses the HTTP boundary.
 //!
 //! Motivation: wip-5's event emitted full text for every channel
-//! (`self_awareness`, `memoria_prefetch`, `feedback_rules`,
-//! `implicit_feedback`, etc.). Any external client hitting `/chat/turn`
+//! (`self_awareness`, `memoria_prefetch`, etc.). Any external client hitting `/chat/turn`
 //! saw that plaintext via the pass-through behaviour of
 //! `services::runs::transform_run_event_for_client`. Learned feedback
 //! rules, memoria recall digests, and user-correction excerpts are
@@ -36,8 +35,6 @@ fn injection_freshness_event_carries_no_raw_text_keys() {
         "recent_arg_hints",
         "skill_listing",
         "lessons",
-        "feedback_rules",
-        "implicit_feedback",
         "tool_round_guidance",
         "volatile",
         "text",

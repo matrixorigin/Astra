@@ -36,24 +36,6 @@ fn injection_freshness_is_dropped() {
 }
 
 #[test]
-fn injection_freshness_with_legacy_texts_shape_also_dropped() {
-    // Regression guard: if something (mis-)emits the wip-5 shape with
-    // `texts:` carrying raw strings, the transform must still drop it.
-    let event = json!({
-        "type": "injection_freshness",
-        "texts": {
-            "self_awareness": "I just failed three bash calls in a row",
-            "feedback_rules": "[Learned] user always wants verbose output"
-        }
-    });
-    let out = transform_run_event_for_client(event);
-    assert!(
-        out.is_null(),
-        "legacy-shaped injection_freshness must still be dropped, got: {out}"
-    );
-}
-
-#[test]
 fn unknown_event_type_is_dropped() {
     // Allowlist semantics: anything not in the known set is stripped.
     // This catches future internal events that someone forgets to

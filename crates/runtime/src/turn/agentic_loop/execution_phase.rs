@@ -742,15 +742,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     inject_polled_user_intents(host, state).await?;
 
-    // ── Nudge suppression gate ──────────────────────────────────────────
-    // In PermissionMode::Auto the user has explicitly asked to let the
-    // model run to completion without interruption. Skip optional behavioral
-    // advisory evidence in that case. True safety, permission, capability, and
-    // budget boundaries remain enforced independently.
-    //
-    // Observed in session 3b7ac18f: ~10 nudge injections across 15
-    // turns in Auto mode, user complaint "不停的被打断,不一气呵成".
-    let suppress_nudges = host.turn_interaction_mode().suppresses_loop_nudges();
+    // Policy evidence always reaches the model. Interaction mode controls only
+    // whether the same evidence is also rendered as user-facing status text.
+    // Auto permission is not a request to disable the feedback loop.
+    let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
     state.refresh_task_board_snapshot().await;
 
     // Inject round budget guidance so the model knows to batch or synthesize.
@@ -808,19 +803,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             }
         }
 
-        if !suppress_nudges {
-            let guidance =
-                crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
-            if !guidance.is_empty() {
-                state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
-            }
+        let guidance =
+            crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
+        if !guidance.is_empty() {
+            state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
         }
     }
 
     // If a mutating task has accumulated only read-only observations, surface
     // that fact before the next LLM call. It remains advisory because further
     // investigation may still be justified by a concrete unknown.
-    if !suppress_nudges && should_emit_execution_escalation_advisory(state) {
+    if should_emit_execution_escalation_advisory(state) {
         let read_only_calls = state
             .stall
             .tool_call_records
@@ -837,7 +830,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             round = state.llm_rounds_completed,
             "execution-pattern advisory observed"
         );
-        if !prep.quiet {
+        if show_policy_feedback_status && !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
@@ -871,14 +864,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // advisory evidence when a stronger signal was already emitted.
     {
         let guard_cfg = super::guards::GuardConfig {
-            suppress_nudges,
             parallel_batching_force_streak: parallel_batching_force_threshold,
             redundant_reads_threshold,
             cache_waste_threshold,
         };
         let guards = super::guards::default_guards();
         for (hint_style, hint_text) in super::guards::evaluate_guards(&guards, state, &guard_cfg) {
-            if !prep.quiet {
+            if show_policy_feedback_status && !prep.quiet {
                 host.emit_headless_line(hint_style, hint_text);
             }
         }
@@ -958,15 +950,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // latest observation rides the wire, avoiding prompt cache bloat.
     //
     // Runs after the guard pipeline so it sees the most recent tool calls
-    // in `state.stall.intent_tool_turns`. Skipped when `suppress_nudges`
-    // is true (Auto mode) to avoid interrupting the flow.
+    // in `state.stall.intent_tool_turns`. Auto mode keeps this model feedback
+    // but omits its corresponding status line.
     //
     // One-shot per turn: once intent_drift_advisory_emitted is set, no further
     // repeated advisories are not injected this turn, preserving prompt-cache prefix.
-    if !suppress_nudges
-        && !state.stall.intent_drift_advisory_emitted
-        && state.llm_rounds_completed > 0
-    {
+    if !state.stall.intent_drift_advisory_emitted && state.llm_rounds_completed > 0 {
         let drift = host
             .detect_intent_drift(&state.message, &state.stall.intent_tool_turns)
             .await;
@@ -985,7 +974,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 drift_nudge_count = state.stall.drift_nudge_count,
                 "intent drift evidence recorded"
             );
-            if !prep.quiet {
+            if show_policy_feedback_status && !prep.quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
                     format!(
@@ -1008,16 +997,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let action = state.stall.circuit_breaker.observe(signal);
         match action {
             astra_turn_core::loop_circuit_breaker::BreakerAction::PatternObserved => {
-                if !suppress_nudges {
-                    state.push_volatile_payload(
-                        super::host::VolatileKind::CircuitBreaker,
-                        serde_json::json!({
-                            "signal": "repeated_behavior_pattern",
-                            "round": state.llm_rounds_completed,
-                            "assessment": "The recent tool pattern may be repetitive. Treat this as evidence when choosing the next action; continue if the repetition is justified by the task."
-                        }),
-                    );
-                }
+                state.push_volatile_payload(
+                    super::host::VolatileKind::CircuitBreaker,
+                    serde_json::json!({
+                        "signal": "repeated_behavior_pattern",
+                        "round": state.llm_rounds_completed,
+                        "assessment": "The recent tool pattern may be repetitive. Treat this as evidence when choosing the next action; continue if the repetition is justified by the task."
+                    }),
+                );
                 state
                     .stall
                     .circuit_breaker
@@ -1026,30 +1013,27 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_advisory",
                     round = state.llm_rounds_completed,
-                    suppressed = suppress_nudges,
-                    "circuit breaker observed a repeated pattern; no advisory message injected"
+                    "circuit breaker observation delivered as advisory evidence"
                 );
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::AdvisoryThresholdReached => {
                 let diagnosis = interruption_diagnosis_summary(state);
-                if !suppress_nudges {
-                    state.push_volatile_payload(
-                        super::host::VolatileKind::CircuitBreaker,
-                        serde_json::json!({
-                            "signal": "repetition_threshold_reached",
-                            "round": state.llm_rounds_completed,
-                            "diagnosis": diagnosis,
-                            "assessment": "A behavior-pattern detector reached its configured threshold. This is advisory evidence, not a budget or safety boundary; decide whether to change approach or continue with the current evidence."
-                        }),
-                    );
-                }
+                state.push_volatile_payload(
+                    super::host::VolatileKind::CircuitBreaker,
+                    serde_json::json!({
+                        "signal": "repetition_threshold_reached",
+                        "round": state.llm_rounds_completed,
+                        "diagnosis": diagnosis,
+                        "assessment": "A behavior-pattern detector reached its configured threshold. This is advisory evidence, not a budget or safety boundary; decide whether to change approach or continue with the current evidence."
+                    }),
+                );
                 tracing::warn!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_threshold_advisory",
                     round = state.llm_rounds_completed,
                     "circuit breaker threshold recorded as advisory evidence"
                 );
-                if !prep.quiet {
+                if show_policy_feedback_status && !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
                         format!(
@@ -1080,11 +1064,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect { .. }
-                if suppress_nudges =>
-            {
-                // Auto mode: advisory signal only.
-            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
                 consecutive_read_only,
             } => {
@@ -1105,11 +1084,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     round = state.llm_rounds_completed,
                     consecutive_read_only,
                     emission = emission_index,
-                    "circuit breaker introspection signal recorded; no prompt injected"
+                    "circuit breaker introspection signal delivered as advisory evidence"
                 );
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::CompletionObserved
-                if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::CompletionObserved => {
                 state.push_volatile_payload(
                     super::host::VolatileKind::CircuitBreaker,
@@ -1121,7 +1098,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     round = state.llm_rounds_completed,
                     "completion observation injected"
                 );
-                if !prep.quiet {
+                if show_policy_feedback_status && !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
                         format!(
@@ -1138,8 +1115,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    if !suppress_nudges
-        && !state.stall.stronger_advisory_emitted()
+    if !state.stall.stronger_advisory_emitted()
         && let Some((family, retry_cautioned_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.stronger_exploration_family_advisory_emitted = true;
@@ -1154,7 +1130,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             retry_cautioned_tools = ?retry_cautioned_tools,
             "loop guard fired"
         );
-        if !prep.quiet {
+        if show_policy_feedback_status && !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
@@ -1169,8 +1145,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // composable guard pipeline above (`default_guards()`). They were
     // previously inlined here as ~30-line blocks; the pipeline version also
     // carries their stderr hints so the host doesn't need to re-render them.
-    if !suppress_nudges
-        && !state.stall.stronger_advisory_emitted()
+    if !state.stall.stronger_advisory_emitted()
         && !state.stall.redundant_reads_advisory_emitted
         && !state.stall.cache_waste_advisory_emitted
         && should_emit_search_fanout_advisory(state, search_fanout_threshold)
@@ -1188,7 +1163,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             threshold = search_fanout_threshold,
             "loop guard fired"
         );
-        if !prep.quiet {
+        if show_policy_feedback_status && !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
@@ -1197,8 +1172,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
-    if !suppress_nudges
-        && !state.stall.stronger_advisory_emitted()
+    if !state.stall.stronger_advisory_emitted()
         && !state.stall.redundant_reads_advisory_emitted
         && !state.stall.cache_waste_advisory_emitted
         && !state.stall.search_fanout_advisory_emitted
@@ -1219,7 +1193,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             retry_cautioned = ?retry_cautioned,
             "loop guard fired"
         );
-        if !prep.quiet {
+        if show_policy_feedback_status && !prep.quiet {
             let retry_cautioned_display = retry_cautioned.join(", ");
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
@@ -4154,25 +4128,11 @@ mod tests {
     // The circuit breaker is integration-tested via the full agentic loop
     // E2E tests.
 
-    // ── Auto-mode nudge suppression ────────────────────────────────────
-    // In PermissionMode::Auto (→ TurnInteractionMode::Auto) the user
-    // opted into uninterrupted execution. Every advisory nudge we
-    // would otherwise inject must be dropped. Regression coverage for
-    // the "不停被打断" complaint in session 3b7ac18f.
-
     fn prep(quiet: bool) -> TurnIterationPrep {
         TurnIterationPrep {
             quiet,
             turn_start_time: Instant::now(),
         }
-    }
-
-    fn has_message_starting_with(state: &AgenticLoopState, prefix: &str) -> bool {
-        state.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with(prefix))
-        })
     }
 
     #[tokio::test]
@@ -4792,124 +4752,71 @@ mod tests {
         assert!(rendered.contains("Use the release checklist."));
     }
 
-    #[tokio::test]
-    async fn auto_mode_suppresses_parallel_batching_force_injection() {
-        // Set up a state that DEFINITELY would inject the
-        // parallel-batching-force nudge in non-auto mode: long enough
-        // single-tool streak past threshold.
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        state.user_intent = state.message.clone();
-        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
-            push_single_tool_round(&mut state);
-        }
-
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
-            .with_interaction_mode(TurnInteractionMode::Auto);
-        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
-            .await
-            .unwrap();
-
-        assert!(
-            !has_message_starting_with(&state, PARALLEL_BATCHING_FORCE_MARKER),
-            "Auto mode must not inject parallel-batching-force nudge"
-        );
-        assert!(
-            !state.stall.parallel_batching_advisory_emitted,
-            "Auto mode must not set parallel_batching_advisory_emitted flag"
-        );
-    }
-
-    // Non-auto positive control is covered by the existing unit tests
-    // `parallel_batching_force_fires_at_streak_threshold` etc. — those
-    // test the predicate directly without the RuntimeConfig-dependent
-    // loading code path that `execute_turn_and_ingest_phase` runs. The
-    // Auto-mode suppression tests below target the new gate, which is
-    // the only behaviour that changed.
-
-    #[tokio::test]
-    async fn auto_mode_suppresses_execution_escalation_injection() {
-        // Build a state that would trigger execution escalation: many
-        // read-only successful tool calls on a mutating-sounding task.
+    fn execution_escalation_state() -> AgenticLoopState {
         let mut state = make_state();
         state.message = "fix the broken auth middleware".into();
         state.user_intent = state.message.clone();
-        // Accumulate EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD successful
-        // read-only records with no write. `ok: true` + non-synthetic is
-        // the shape `should_emit_execution_escalation_advisory` counts.
+        mark_must_mutate(&mut state);
         for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
             state.stall.tool_call_records.push(ToolCallRecord {
-                tool_call_id: None,
                 name: "read_file".to_string(),
                 ok: true,
                 ms: 10,
-                error: None,
-                input_bytes: None,
-                output_bytes: None,
                 args_preview: Some(format!("path: src/{i}.rs")),
-                result_preview: None,
                 file_path: Some(format!("src/{i}.rs")),
-                surgically_removed: None,
-                original_tool_name: None,
-                start_offset_ms: None,
-                batch_id: None,
-                parallel: None,
-                round: None,
-                args_full: None,
-                result_full: None,
-                ask_user: None,
-                skill_reentry_count: None,
-                skill_locked_out: None,
-                exit_semantics: None,
-                result_class: None,
-                error_kind: None,
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
             });
         }
-
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
-            .with_interaction_mode(TurnInteractionMode::Auto);
-        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
-            .await
-            .unwrap();
-
-        assert!(
-            !has_message_starting_with(&state, EXECUTION_ESCALATION_MARKER),
-            "Auto mode must not inject execution-escalation nudge"
-        );
-        assert!(!state.stall.execution_escalation_advisory_emitted);
+        state
     }
 
     #[tokio::test]
-    async fn auto_mode_suppresses_round_budget_guidance_injection() {
-        // The prompt-side tool_round_guidance (parallel-batching soft
-        // nudge at streak=4, before the higher-threshold advisory at streak=5) also
-        // must stay silent in Auto.
-        let mut state = make_state();
-        state.message = "keep going".into();
-        state.user_intent = state.message.clone();
-        // Below the force threshold but at/above the soft-nudge
-        // threshold (=4). This should emit a user message in non-auto.
-        for _ in 0..crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD {
-            push_single_tool_round(&mut state);
-        }
-
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+    async fn auto_delivers_policy_feedback_to_model_without_status_chatter() {
+        let mut auto_state = execution_escalation_state();
+        let history_before = auto_state.messages.clone();
+        let mut auto_host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
             .with_interaction_mode(TurnInteractionMode::Auto);
-        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
-            .await
-            .unwrap();
 
-        // Neither the soft "Sequential Tool Calls Detected" nudge nor
-        // the positive "Previous round: N tools" feedback should be
-        // re-injected in Auto mode — both ride `tool_round_guidance`.
+        execute_turn_and_ingest_phase(&mut auto_host, &mut auto_state, 0, prep(false))
+            .await
+            .expect("auto turn");
+
+        let delivered = auto_host
+            .executed_volatile
+            .first()
+            .expect("volatile model boundary");
         assert!(
-            !has_message_starting_with(&state, "## ⚠ Sequential Tool Calls Detected")
-                && !state.messages.iter().any(|m| m
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("## ⚠ Sequential Tool Calls Detected"))),
-            "Auto mode must not inject round-budget/tool guidance nudges"
+            delivered
+                .iter()
+                .any(|injection| injection.kind == VolatileKind::ExecutionEscalation),
+            "Auto must preserve policy feedback at the model boundary"
+        );
+        assert_eq!(
+            auto_host.executed_messages.first(),
+            Some(&history_before),
+            "runtime feedback must not impersonate conversational history"
+        );
+        assert!(
+            auto_host
+                .emitted_lines
+                .iter()
+                .all(|line| !line.contains("Mutating task accumulated")),
+            "Auto should not turn model feedback into repeated UI status lines"
+        );
+
+        let mut prompt_state = execution_escalation_state();
+        let mut prompt_host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Prompt);
+        execute_turn_and_ingest_phase(&mut prompt_host, &mut prompt_state, 0, prep(false))
+            .await
+            .expect("prompt turn");
+        assert!(
+            prompt_host
+                .emitted_lines
+                .iter()
+                .any(|line| line.contains("Mutating task accumulated")),
+            "Prompt mode may mirror the same policy evidence as status text"
         );
     }
 
@@ -4950,7 +4857,6 @@ mod tests {
             &crate::turn::agentic_loop::guards::default_guards(),
             &mut state,
             &crate::turn::agentic_loop::guards::GuardConfig {
-                suppress_nudges: false,
                 parallel_batching_force_streak: usize::MAX,
                 redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
                 cache_waste_threshold: usize::MAX,
@@ -4974,7 +4880,6 @@ mod tests {
             &crate::turn::agentic_loop::guards::default_guards(),
             &mut state,
             &crate::turn::agentic_loop::guards::GuardConfig {
-                suppress_nudges: false,
                 parallel_batching_force_streak: usize::MAX,
                 redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
                 cache_waste_threshold: usize::MAX,
@@ -4994,7 +4899,6 @@ mod tests {
             push_redundant_sed_read(&mut state, r as u32);
         }
         let cfg = crate::turn::agentic_loop::guards::GuardConfig {
-            suppress_nudges: false,
             parallel_batching_force_streak: usize::MAX,
             redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
             cache_waste_threshold: usize::MAX,

@@ -489,12 +489,7 @@ fn show_injected(view: Option<&TurnMessagesView>) {
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        // Detect runtime-injected messages by known markers.
-        let is_injected = content.contains("VERIFICATION REQUIRED")
-            || content.contains("strategy change")
-            || content.contains("FACTUAL RETRY")
-            || content.contains("⚠️");
-        if is_injected {
+        if astra_turn_types::is_runtime_owned_message(m) {
             found = true;
             eprintln!(
                 "  {} {}",

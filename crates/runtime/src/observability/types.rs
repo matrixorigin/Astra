@@ -14,7 +14,6 @@ use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, User
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::DecisionExplanation;
-use astra_turn_types::UserCorrectionSignalKind;
 
 pub struct ObservabilitySession {
     /// User ID for this session.
@@ -181,7 +180,6 @@ pub struct ObservabilitySessionRollbackSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryBehavior {
     pub delay_since_last_query_ms: Option<u64>,
-    pub correction_signal: Option<UserCorrectionSignalKind>,
 }
 
 /// Raw per-turn text for the CLI-owned subset of
@@ -191,8 +189,8 @@ pub struct QueryBehavior {
 /// executor) so it fingerprints them client-side with a full preview
 /// — wip-7 keeps raw channel text off the HTTP wire.
 ///
-/// Bridge-internal channels (`memoria_prefetch`, `feedback_rules`,
-/// `implicit_feedback`, `tool_round_guidance`, `volatile_pending`)
+/// Bridge-internal channels (`memoria_prefetch`, `tool_round_guidance`,
+/// `volatile_pending`)
 /// are not in this struct — the CLI receives opaque fingerprints for
 /// those via [`astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints`]
 /// and observes them with an empty preview (introspect still shows
@@ -212,8 +210,6 @@ pub struct BridgeInjectionPreviews<'a> {
     pub volatile: &'a str,
     pub memoria_prefetch: &'a str,
     pub self_awareness: &'a str,
-    pub feedback_rules: &'a str,
-    pub implicit_feedback: &'a str,
     pub recent_arg_hints: &'a str,
     pub skill_listing: &'a str,
     pub tool_round_guidance: &'a str,
@@ -225,8 +221,6 @@ impl BridgeInjectionPreviews<'_> {
         volatile: "",
         memoria_prefetch: "",
         self_awareness: "",
-        feedback_rules: "",
-        implicit_feedback: "",
         recent_arg_hints: "",
         skill_listing: "",
         tool_round_guidance: "",

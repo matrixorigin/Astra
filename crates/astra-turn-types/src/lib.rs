@@ -8,11 +8,8 @@ mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod context_identity;
 mod context_window;
-mod correction_signal;
-mod implicit_feedback;
 mod memory_ranking;
 mod memory_structure;
-mod memory_writability;
 mod provider_contract;
 mod result_quality;
 mod runtime_scaffolding;
@@ -35,14 +32,6 @@ pub use context_identity::{
     PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
-pub use correction_signal::{
-    UserCorrectionSignalKind, classify_user_correction_signal, has_durable_correction_directive,
-    is_user_correction_signal,
-};
-pub use implicit_feedback::{
-    ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,
-    implicit_feedback_context_injection, implicit_feedback_rating,
-};
 pub use memory_ranking::{
     PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
     is_persistent_type, partition_by_scope, sort_by_retrieval_score,
@@ -51,7 +40,6 @@ pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
 };
-pub use memory_writability::{is_transient_runtime_status_text, should_store_in_memory};
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
     ProviderClaim, ProviderClaimSource, ProviderClaimTrust, ProviderContractError,
@@ -66,8 +54,8 @@ pub use provider_contract::{
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use runtime_scaffolding::{
-    SCAFFOLDING_BODY_PREFIXES, is_runtime_scaffolding_message,
-    scaffolding_body_prefixes_for_filtering,
+    RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,
+    mark_runtime_owned_message, runtime_message_delivery, runtime_owned_message,
 };
 pub use semantic_read_cache::{
     SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,

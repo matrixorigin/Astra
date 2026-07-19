@@ -378,7 +378,7 @@ async fn persist_history_edit_state(
             messages: crate::cli::session::session_projection::history_as_messages(&state.history),
             session_facts: crate::cli::session::session_cleanup::shutdown_session_facts(state),
             had_error,
-            had_user_correction: matches!(action, "/undo" | "/redo"),
+            reanchors_current_objective: matches!(action, "/undo" | "/redo"),
             turn_number: state.turn,
         });
     }

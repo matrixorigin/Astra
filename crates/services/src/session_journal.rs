@@ -1298,6 +1298,22 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Identity owned by the runtime that produced an event.
+///
+/// `JournalEvent::turn` is reserved for the root session turn. Child-local
+/// counters live here so consumers cannot join independent turn namespaces by
+/// comparing bare integers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalProducerScope {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_turn: Option<u32>,
+}
+
 /// A single journal event (one line in the JSONL file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEvent {
@@ -1309,6 +1325,9 @@ pub struct JournalEvent {
     /// Session ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Run-scoped producer identity, independent from the root session turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_scope: Option<JournalProducerScope>,
     /// Turn number (1-based, for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
@@ -1585,7 +1604,6 @@ pub enum SessionMemoryExtractionSkipReason {
     /// A durable snapshot already covers this turn. This closes the
     /// cross-process/restart gap that an in-memory debounce cannot observe.
     AlreadyCurrent,
-    LowInformation,
     InFlight,
     SelectorCooldown,
     /// Memoria endpoint tripped the circuit breaker after consecutive
@@ -1833,10 +1851,12 @@ pub struct LlmRoundRecord {
     pub agentic_step: Option<u32>,
     pub source: Option<String>,
     pub run_id: Option<String>,
+    /// Durable parent run for a child producer. Root rounds leave this unset.
+    pub parent_run_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCallRecord>>,
     /// When set, this round belongs to a child agent (not the parent).
-    /// Written into journal metadata so the unified timeline can
-    /// interleave child rounds with parent rounds.
+    /// Written into the typed producer scope so consumers cannot confuse the
+    /// child's local loop counter with a root session turn.
     pub agent_id: Option<String>,
 }
 
@@ -1854,7 +1874,12 @@ pub struct TurnEventBuffer {
     dropped_events: u64,
     turn_start: std::time::Instant,
     session_id: Option<String>,
-    turn: u32,
+    /// Canonical user-visible session turn. Child producers deliberately have
+    /// no session turn; their local turn belongs in `producer_turn` instead.
+    session_turn: Option<u32>,
+    /// Producer-local turn for child/sub-run telemetry. This must never be
+    /// joined to a root turn without an explicit run lineage relation.
+    producer_turn: Option<u32>,
     round: u32,
     batch_counter: u32,
 }
@@ -1872,8 +1897,27 @@ impl TurnEventBuffer {
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
             session_id: session_id.map(ToString::to_string),
-            turn,
+            session_turn: Some(turn),
+            producer_turn: None,
             round,
+            batch_counter: 0,
+        }
+    }
+
+    /// Start a buffer for a child/sub-run producer.
+    ///
+    /// Unlike [`Self::begin_turn`], this constructor does not fabricate a
+    /// session turn from the child's local loop index. The producer-local turn
+    /// is retained in metadata while `JournalEvent::turn` remains unset.
+    pub fn begin_producer_turn(session_id: Option<&str>, producer_turn: u32) -> Self {
+        Self {
+            events: std::collections::VecDeque::new(),
+            dropped_events: 0,
+            turn_start: std::time::Instant::now(),
+            session_id: session_id.map(ToString::to_string),
+            session_turn: None,
+            producer_turn: Some(producer_turn),
+            round: 0,
             batch_counter: 0,
         }
     }
@@ -1946,7 +1990,15 @@ impl TurnEventBuffer {
     /// Record an LLM round completion (one LLM→tools cycle).
     pub fn record_llm_round(&mut self, r: LlmRoundRecord) {
         let mut evt = JournalEvent::base(JournalEventType::LlmRound, self.session_id.as_deref());
-        evt.turn = Some(self.turn);
+        evt.turn = self.session_turn;
+        if let Some(run_id) = r.run_id.as_ref().filter(|run_id| !run_id.trim().is_empty()) {
+            evt.producer_scope = Some(JournalProducerScope {
+                run_id: run_id.clone(),
+                parent_run_id: r.parent_run_id.clone(),
+                agent_id: r.agent_id.clone(),
+                local_turn: self.producer_turn,
+            });
+        }
         evt.agentic_step = r.agentic_step;
         evt.round = Some(self.round);
         evt.offset_ms = Some(self.offset_ms().saturating_sub(r.duration_ms));
@@ -1964,12 +2016,7 @@ impl TurnEventBuffer {
         if let Some(tool_calls) = r.tool_calls {
             evt = evt.with_tool_calls(tool_calls);
         }
-        if !r.tool_call_names.is_empty()
-            || r.finish_reason.is_some()
-            || r.source.is_some()
-            || r.run_id.is_some()
-            || r.agent_id.is_some()
-        {
+        if !r.tool_call_names.is_empty() || r.finish_reason.is_some() || r.source.is_some() {
             let mut meta = serde_json::Map::new();
             meta.insert(
                 "tool_call_names".into(),
@@ -1978,12 +2025,6 @@ impl TurnEventBuffer {
             meta.insert("finish_reason".into(), serde_json::json!(r.finish_reason));
             if let Some(source) = r.source {
                 meta.insert("source".into(), serde_json::json!(source));
-            }
-            if let Some(run_id) = r.run_id {
-                meta.insert("run_id".into(), serde_json::json!(run_id));
-            }
-            if let Some(ref agent_id) = r.agent_id {
-                meta.insert("agent_id".into(), serde_json::json!(agent_id));
             }
             evt.metadata = Some(serde_json::Value::Object(meta));
         }
@@ -2001,11 +2042,11 @@ impl TurnEventBuffer {
     pub fn record_trace_span_v2(&mut self, builder: TraceSpanBuilder) {
         let mut evt = builder
             .session_id(self.session_id.as_deref())
-            .turn(Some(self.turn))
+            .turn(self.session_turn)
             .build();
         // base() may have already set session_id; let the builder override win
         evt.session_id = self.session_id.clone();
-        evt.turn = Some(self.turn);
+        evt.turn = self.session_turn;
         self.push_event(evt);
     }
 
@@ -3546,6 +3587,7 @@ impl JournalEvent {
             event_type,
             ts: chrono::Utc::now().to_rfc3339(),
             session_id: session_id.map(|s| s.to_string()),
+            producer_scope: None,
             turn: None,
             agentic_step: None,
             model: None,
@@ -6148,8 +6190,6 @@ mod tests {
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
-    const REAL_SESSION_1D21375_FIXTURE: &str =
-        include_str!("../fixtures/real_session_1d21375_min.jsonl");
 
     fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
@@ -6228,88 +6268,6 @@ mod tests {
             repeat_tools,
             std::collections::BTreeSet::from(["git", "read_file"])
         );
-    }
-
-    #[test]
-    fn real_session_followup_fixture_preserves_low_information_repair_pathology() {
-        let tmp = tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = "1d21375d-18f5-4e53-9145-1fa197b564dd";
-        let path = journal_file_path(sid);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, REAL_SESSION_1D21375_FIXTURE).unwrap();
-
-        let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(non_empty_lines, 31);
-        assert_eq!(malformed_lines, 0);
-        assert_eq!(events.len(), 31);
-
-        let llm_rounds = events
-            .iter()
-            .filter(|event| event.event_type == JournalEventType::LlmRound)
-            .count();
-        assert_eq!(
-            llm_rounds, 19,
-            "fixture should preserve the 19-round session"
-        );
-
-        let turn = events
-            .iter()
-            .rev()
-            .find(|event| event.event_type == JournalEventType::Turn)
-            .expect("turn event");
-        assert_eq!(turn.turn, Some(3));
-        assert_eq!(turn.user_input.as_deref(), Some("修复?"));
-        assert_eq!(turn.tool_count, Some(16));
-        assert_eq!(turn.llm_rounds, Some(17));
-        assert_eq!(turn.tokens_in, Some(285_235));
-        assert_eq!(turn.tokens_out, Some(4_624));
-        assert_eq!(
-            turn.tool_calls.as_ref().map(Vec::len),
-            Some(16),
-            "fixture should preserve the serial repair spiral"
-        );
-
-        let context = events
-            .iter()
-            .find(|event| {
-                event.event_type == JournalEventType::ContextAssemblyRecorded
-                    && event.turn == Some(3)
-            })
-            .expect("turn 3 context record");
-        let token_budget = &context
-            .context_assembly_trace
-            .as_ref()
-            .expect("context trace")["token_budget"];
-        assert_eq!(token_budget["user_message_tokens"], 3);
-        assert_eq!(token_budget["tool_schema_tokens"], 4_663);
-        assert_eq!(token_budget["system_prompt_tokens"], 3_829);
-        assert_eq!(token_budget["compression_triggered"], false);
-
-        let stall_count = events
-            .iter()
-            .filter(|event| event.event_type == JournalEventType::StallDetected)
-            .count();
-        let verdict_count = events
-            .iter()
-            .filter(|event| event.event_type == JournalEventType::TurnGuardVerdict)
-            .count();
-        assert_eq!(stall_count, 1);
-        assert_eq!(verdict_count, 1);
-
-        let eval = events
-            .iter()
-            .find(|event| {
-                event.event_type == JournalEventType::TurnEvaluation && event.turn == Some(3)
-            })
-            .expect("turn 3 evaluation");
-        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
-        assert_eq!(metadata["quality"], 0.2);
-        assert_eq!(metadata["confidence"], 0.7);
-        assert_eq!(metadata["stall_count"], 1);
-        assert_eq!(metadata["success"], false);
-        assert_eq!(metadata["tool_call_count"], 16);
-        assert_eq!(metadata["verdict_warning"], true);
     }
 
     #[test]
@@ -9258,7 +9216,13 @@ mod turn_event_buffer_tests {
         let meta = ev.metadata.as_ref().unwrap();
         assert_eq!(meta["tool_call_names"].as_array().unwrap().len(), 3);
         assert_eq!(meta["source"], "agentic_loop");
-        assert_eq!(meta["run_id"], "run-42");
+        assert_eq!(
+            ev.producer_scope
+                .as_ref()
+                .map(|scope| scope.run_id.as_str()),
+            Some("run-42")
+        );
+        assert!(meta.get("run_id").is_none());
     }
 
     #[test]
@@ -9388,9 +9352,8 @@ mod turn_event_buffer_tests {
     }
 
     /// Regression: sub-call LLM rounds (e.g. headless/sub-run) must record
-    /// their finish_reason + source + run_id in the journal metadata so the
-    /// per-round token breakdown can be attributed back to the originating
-    /// sub-call.
+    /// their finish_reason + source and typed producer identity so the
+    /// per-round token breakdown can be attributed to its originating run.
     #[test]
     fn llm_round_preserves_finish_reason_and_source_metadata() {
         let mut buf = TurnEventBuffer::begin_turn(Some("sess-refl"), 2);
@@ -9436,7 +9399,39 @@ mod turn_event_buffer_tests {
         assert_eq!(refl.tokens_in, Some(54000));
         let refl_meta = refl.metadata.as_ref().unwrap();
         assert_eq!(refl_meta["source"], "sub_call");
-        assert_eq!(refl_meta["run_id"], "run-subcall");
+        assert_eq!(
+            refl.producer_scope
+                .as_ref()
+                .map(|scope| scope.run_id.as_str()),
+            Some("run-subcall")
+        );
+        assert!(refl_meta.get("run_id").is_none());
+    }
+
+    #[test]
+    fn producer_turn_keeps_child_counter_out_of_root_turn_namespace() {
+        let mut buf = TurnEventBuffer::begin_producer_turn(Some("sess-child"), 7);
+        buf.record_llm_round(LlmRoundRecord {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            source: Some("child_agent".into()),
+            run_id: Some("child-run".into()),
+            parent_run_id: Some("root-run".into()),
+            agent_id: Some("agent-1".into()),
+            ..Default::default()
+        });
+
+        let event = buf.drain().pop().expect("child llm round");
+        assert_eq!(event.turn, None, "child counter is not a session turn");
+        let scope = event.producer_scope.expect("typed producer scope");
+        assert_eq!(scope.run_id, "child-run");
+        assert_eq!(scope.parent_run_id.as_deref(), Some("root-run"));
+        assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(scope.local_turn, Some(7));
+        let metadata = event.metadata.expect("source metadata");
+        assert_eq!(metadata["source"], "child_agent");
+        assert!(metadata.get("run_id").is_none());
+        assert!(metadata.get("agent_id").is_none());
     }
 
     /// Regression: rate-limited early exit must record an llm_round with

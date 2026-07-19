@@ -114,6 +114,7 @@ pub(crate) struct SubRunHost {
 pub(crate) struct SubRunJournalIdentity {
     pub(crate) session_id: String,
     pub(crate) run_id: String,
+    pub(crate) parent_run_id: Option<String>,
     pub(crate) next_item_seq: u64,
     /// Latest successfully appended conversational assistant item. Tool-call
     /// envelopes also use the assistant role, so only visible model content
@@ -608,7 +609,7 @@ impl AgenticLoopHost for SubRunHost {
                     .journal_identity
                     .as_ref()
                     .map(|identity| identity.session_id.as_str());
-                let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
+                let mut buf = astra_services::session_journal::TurnEventBuffer::begin_producer_turn(
                     journal_session_id,
                     state.current_round_index.saturating_add(1),
                 );
@@ -626,6 +627,10 @@ impl AgenticLoopHost for SubRunHost {
                         .journal_identity
                         .as_ref()
                         .map(|identity| identity.run_id.clone()),
+                    parent_run_id: self
+                        .journal_identity
+                        .as_ref()
+                        .and_then(|identity| identity.parent_run_id.clone()),
                     agent_id: Some(self.agent_id.clone()),
                     ..Default::default()
                 });
@@ -1191,6 +1196,7 @@ mod tests {
             journal_identity: Some(SubRunJournalIdentity {
                 session_id,
                 run_id: "child-run".into(),
+                parent_run_id: Some("parent-run".into()),
                 next_item_seq,
                 last_assistant_source_event_id,
                 persistence_blocked: false,

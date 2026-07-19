@@ -1188,24 +1188,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_list_hot_path_does_not_count_rows() {
-        let body = include_str!("skills.rs")
-            .split("impl SkillService for DatabaseSkillService")
-            .nth(1)
-            .expect("database skill service impl")
-            .split("async fn list_skills(")
-            .nth(1)
-            .expect("database list_skills body")
-            .split("async fn get_skill(")
-            .next()
-            .expect("database list_skills body end");
-        assert!(
-            !body.contains("COUNT(*)"),
-            "skill list uses seek pagination and must not count skills_registry"
-        );
-    }
-
-    #[test]
     fn skill_status_query_default() {
         let q: SkillStatusQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.per_group, 50);

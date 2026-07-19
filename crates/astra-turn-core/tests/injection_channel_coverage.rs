@@ -1,8 +1,7 @@
 //! wip-4 TDD contract: `InjectionChannel` covers every live injection
 //! channel, not just the 4 legacy ones. Motivated by the session
-//! 895536bf diagnostic where typed Memoria prefetch, self-awareness, feedback
-//! rules, recent-arg hints, skill listing, memoria-prefetch, implicit
-//! feedback, and tool-round guidance all flow into the system prompt
+//! 895536bf diagnostic where typed Memoria prefetch, self-awareness,
+//! recent-arg hints, skill listing, and tool-round guidance flow into the system prompt
 //! every turn but have no freshness / staleness tracking —
 //! `introspect facet=noise` silently omits them.
 //!
@@ -25,8 +24,6 @@ const EXPECTED_CHANNELS: &[InjectionChannel] = &[
     // wip-4 additions — covering all live bridge_inprocess injections:
     InjectionChannel::MemoriaPrefetch,
     InjectionChannel::SelfAwareness,
-    InjectionChannel::FeedbackRules,
-    InjectionChannel::ImplicitFeedback,
     InjectionChannel::RecentArgHints,
     InjectionChannel::SkillListing,
     InjectionChannel::ToolRoundGuidance,
@@ -63,8 +60,6 @@ fn each_channel_has_stable_tag() {
         (InjectionChannel::VolatilePending, "volatile_pending"),
         (InjectionChannel::MemoriaPrefetch, "memoria_prefetch"),
         (InjectionChannel::SelfAwareness, "self_awareness"),
-        (InjectionChannel::FeedbackRules, "feedback_rules"),
-        (InjectionChannel::ImplicitFeedback, "implicit_feedback"),
         (InjectionChannel::RecentArgHints, "recent_arg_hints"),
         (InjectionChannel::SkillListing, "skill_listing"),
         (InjectionChannel::ToolRoundGuidance, "tool_round_guidance"),

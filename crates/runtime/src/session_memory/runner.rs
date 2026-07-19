@@ -12,9 +12,7 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::{
-    is_runtime_scaffolding_message, is_transient_runtime_status_text, session_facts::SessionFacts,
-};
+use astra_turn_types::{is_runtime_owned_message, session_facts::SessionFacts};
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
@@ -544,8 +542,7 @@ fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
 }
 
 fn is_ephemeral_message_for_session_memory(msg: &Value) -> bool {
-    is_runtime_scaffolding_message(msg)
-        || message_text(msg).is_some_and(is_transient_runtime_status_text)
+    is_runtime_owned_message(msg)
 }
 
 pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
@@ -1368,7 +1365,6 @@ fn build_rule_fallback_memory(
     turn_number: usize,
 ) -> String {
     let first_user = first_user_message(messages).unwrap_or("Current session");
-    let last_user = last_user_message(messages).unwrap_or(first_user);
     let errors = collect_error_lines(messages);
     let mut snapshot = SessionMemorySnapshot::from_markdown(
         "__fallback__",
@@ -1382,12 +1378,15 @@ fn build_rule_fallback_memory(
     if snapshot.narrative.task_spec.is_empty() {
         snapshot.narrative.task_spec = truncate(first_user, 400).to_string();
     }
-    // A deterministic fallback cannot reliably infer goal closure, decisions,
-    // or durable learnings. Preserve the existing canonical narrative and
-    // update only the directly observed latest user focus plus structured
-    // errors. The next successful selector can make semantic changes.
-    snapshot.narrative.current_state =
-        vec![format!("Latest user focus: {}", truncate(last_user, 300))];
+    // A deterministic fallback has no semantic authority to reinterpret later
+    // user text as a goal, correction, acknowledgement, or status change.
+    // Preserve the canonical state selected previously; initialize it from the
+    // original task only when no canonical state exists yet. A later successful
+    // selector can advance it from typed evidence.
+    if snapshot.narrative.current_state.is_empty() {
+        snapshot.narrative.current_state =
+            vec![format!("Active task: {}", truncate(first_user, 300))];
+    }
     snapshot.narrative.corrections.extend(errors);
     normalize_narrative(&mut snapshot.narrative);
     snapshot.to_markdown()
@@ -1395,15 +1394,6 @@ fn build_rule_fallback_memory(
 
 fn first_user_message(messages: &[Value]) -> Option<&str> {
     messages.iter().find_map(|msg| {
-        (msg.get("role").and_then(Value::as_str) == Some("user")
-            && !is_ephemeral_message_for_session_memory(msg))
-        .then(|| message_text(msg))
-        .flatten()
-    })
-}
-
-fn last_user_message(messages: &[Value]) -> Option<&str> {
-    messages.iter().rev().find_map(|msg| {
         (msg.get("role").and_then(Value::as_str) == Some("user")
             && !is_ephemeral_message_for_session_memory(msg))
         .then(|| message_text(msg))
@@ -1821,9 +1811,7 @@ mod tests {
     fn rule_fallback_records_only_live_resumable_state() {
         let content = build_rule_fallback_memory("", &sample_messages(), 3);
 
-        assert!(
-            content.contains("Latest user focus: Fix crates/runtime/src/session_memory/runner.rs")
-        );
+        assert!(content.contains("Active task: Fix crates/runtime/src/session_memory/runner.rs"));
         assert!(
             !content.contains("Persisted a deterministic session-memory fallback snapshot"),
             "fallback Completed must not claim an implementation detail as user-visible progress: {content}"
@@ -1837,62 +1825,33 @@ mod tests {
     }
 
     #[test]
-    fn rule_fallback_preserves_latest_user_evidence_without_wording_classification() {
+    fn rule_fallback_preserves_canonical_state_without_classifying_later_text() {
         let messages = vec![
             json!({"role": "user", "content": "Implement durable session memory refresh"}),
-            json!({"role": "assistant", "content": "I will patch the immediate case."}),
-            json!({"role": "user", "content": "我要的是长久健康运行，不是临时补丁"}),
+            json!({"role": "assistant", "content": "Working on it."}),
+            json!({"role": "user", "content": "This later message may be a correction, a new goal, or an acknowledgement."}),
         ];
+        let existing = "# Session Memory\n\n## Task Specification\nImplement durable session memory refresh\n\n## Current State\n- Canonical producer state\n";
 
-        let content = build_rule_fallback_memory("", &messages, 4);
+        let content = build_rule_fallback_memory(existing, &messages, 4);
 
-        assert!(
-            content.contains("Implement durable session memory refresh"),
-            "original task focus should remain: {content}"
-        );
-        assert!(
-            content.contains("我要的是长久健康运行，不是临时补丁"),
-            "latest user evidence should become current state without a phrase classifier: {content}"
-        );
+        assert!(content.contains("Canonical producer state"));
+        assert!(!content.contains("This later message may be"));
     }
 
     #[test]
-    fn rule_fallback_skips_runtime_scaffolding_messages() {
-        let messages = vec![
-            json!({"role": "user", "content": "Improve stable long-running sessions"}),
-            json!({"role": "assistant", "content": "I am updating the memory path."}),
-            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
-            json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\ncrates/runtime/src/session_memory/runner.rs"}),
-            json!({"role": "user", "content": "Continue with the memory cleanup"}),
-        ];
-
-        let content = build_rule_fallback_memory("", &messages, 5);
-
-        assert!(content.contains("Improve stable long-running sessions"));
-        assert!(content.contains("Continue with the memory cleanup"));
-        assert!(!content.contains("Previous round"));
-        assert!(!content.contains("Already Fetched"));
-        assert!(!content.contains("do NOT re-read"));
-    }
-
-    #[test]
-    fn rule_fallback_skips_transient_runtime_status_messages() {
+    fn rule_fallback_records_only_structured_error_evidence() {
         let messages = vec![
             json!({"role": "user", "content": "Keep long-running sessions healthy"}),
-            json!({"role": "assistant", "content": "Read failed before returning output: Reading: .../tool-results/call.txt"}),
-            json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
-            json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
-            json!({"role": "user", "content": "Preserve explicit durable session goals"}),
+            json!({"role": "assistant", "content": "Ordinary prose that happens to describe a failure"}),
+            json!({"role": "tool", "is_error": true, "content": "typed failure evidence"}),
         ];
 
         let content = build_rule_fallback_memory("", &messages, 6);
 
         assert!(content.contains("Keep long-running sessions healthy"));
-        assert!(content.contains("Preserve explicit durable session goals"));
-        assert!(!content.contains("Read failed before returning output"));
-        assert!(!content.contains("web_search timed out"));
-        assert!(!content.contains("Sensitive path requires explicit opt-in"));
-        assert!(!content.contains("tool-results/call.txt"));
+        assert!(content.contains("typed failure evidence"));
+        assert!(!content.contains("Ordinary prose that happens to describe a failure"));
     }
 
     #[tokio::test]
@@ -2091,16 +2050,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_selector_prompt_filters_runtime_scaffolding() {
+    async fn run_extraction_selector_prompt_excludes_typed_runtime_messages() {
         let (server_url, server_handle) = spawn_json_server(
             Arc::new(|request: &str| {
                 assert!(
-                    !request.contains("Already Fetched"),
-                    "already-fetched inventory must not reach selector prompt: {request}"
-                );
-                assert!(
-                    !request.contains("Previous round"),
-                    "parallel feedback scaffolding must not reach selector prompt: {request}"
+                    !request.contains("owned-selector-only"),
+                    "runtime-owned content must not reach selector prompt: {request}"
                 );
                 assert!(
                     request.contains("Improve long-running memory hygiene"),
@@ -2119,8 +2074,16 @@ mod tests {
 
         let messages = vec![
             json!({"role": "user", "content": "Improve long-running memory hygiene"}),
-            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
-            json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\ncrates/runtime/src/session_memory/runner.rs"}),
+            astra_turn_types::runtime_owned_message(
+                "assistant",
+                "owned-selector-only one",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "owned-selector-only two",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
@@ -2159,20 +2122,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_selector_prompt_filters_transient_runtime_status() {
+    async fn run_extraction_selector_prompt_preserves_unowned_conversation_text() {
         let (server_url, server_handle) = spawn_json_server(
             Arc::new(|request: &str| {
                 assert!(
-                    !request.contains("Read failed before returning output"),
-                    "tool-result read failure must not reach selector prompt: {request}"
+                    request.contains("Read failed before returning output"),
+                    "unowned assistant text must remain available to the selector: {request}"
                 );
                 assert!(
-                    !request.contains("web_search timed out"),
-                    "transient search timeout must not reach selector prompt: {request}"
+                    request.contains("web_search timed out"),
+                    "runtime must not classify prose by keywords: {request}"
                 );
                 assert!(
-                    !request.contains("Sensitive path requires explicit opt-in"),
-                    "permission-status text must not reach selector prompt: {request}"
+                    request.contains("Sensitive path requires explicit opt-in"),
+                    "runtime must not classify prose by keywords: {request}"
                 );
                 assert!(
                     request.contains("Improve session cleanup nudges"),
@@ -2182,7 +2145,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "{\"session_title\":\"Transient Filtered\"}"
+                        "content": "{\"session_title\":\"Unowned Preserved\"}"
                     }
                 }]
             }),
@@ -2224,7 +2187,7 @@ mod tests {
                 source, content, ..
             } => {
                 assert_eq!(source, SessionMemoryExtractionSource::Llm);
-                assert!(content.contains("Transient Filtered"));
+                assert!(content.contains("Unowned Preserved"));
             }
             _ => panic!("expected llm persistence"),
         }
@@ -3186,7 +3149,12 @@ review uncommitted changes
     #[test]
     fn session_memory_extraction_uses_prompt_facing_history_boundary() {
         let messages = vec![
-            json!({"role": "user", "content": "我说过的所有话，还有回复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({"role": "user", "content": "我说过的所有话，还有回复"}),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "arbitrary resume context",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
             json!({
                 "role": "assistant",
                 "content": serde_json::Value::Null,
@@ -3200,12 +3168,6 @@ review uncommitted changes
         ];
 
         let filtered = session_memory_extraction_messages(&messages);
-        let joined = filtered
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-
         assert_eq!(
             filtered,
             vec![
@@ -3213,9 +3175,5 @@ review uncommitted changes
                 json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
             ]
         );
-        assert!(!joined.contains("<system-reminder>"));
-        assert!(!joined.contains("[session-resume:v1]"));
-        assert!(!joined.contains("<skill-loaded"));
-        assert!(!joined.contains("skill-auto-route"));
     }
 }

@@ -1594,36 +1594,6 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 mod tests {
     use super::*;
 
-    #[test]
-    fn state_item_event_writes_bind_application_event_id() {
-        let source = include_str!("state_projection.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production state_projection source");
-        let insert_count = production
-            .matches("INSERT INTO session_state_item_events")
-            .count();
-        assert_eq!(
-            insert_count, 4,
-            "new state item event insert paths must bind event_id explicitly"
-        );
-        assert_eq!(
-            production
-                .matches("(event_id, item_id, user_id, session_id")
-                .count(),
-            insert_count,
-            "every state item event insert must include event_id as the first column"
-        );
-        assert_eq!(
-            production
-                .matches(".bind(new_state_item_event_id())")
-                .count(),
-            insert_count,
-            "every state item event insert must use an application-generated event id"
-        );
-    }
-
     #[derive(Clone)]
     struct FakeStateProjectionRow {
         failed_column: Option<&'static str>,

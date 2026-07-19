@@ -189,8 +189,6 @@ impl ObservabilitySession {
             volatile,
             memoria_prefetch,
             self_awareness,
-            feedback_rules,
-            implicit_feedback,
             recent_arg_hints,
             skill_listing,
             tool_round_guidance,
@@ -246,8 +244,6 @@ impl ObservabilitySession {
         let cli_bridge_echo: &[(InjectionChannel, &str)] = &[
             (InjectionChannel::VolatilePending, volatile),
             (InjectionChannel::MemoriaPrefetch, memoria_prefetch),
-            (InjectionChannel::FeedbackRules, feedback_rules),
-            (InjectionChannel::ImplicitFeedback, implicit_feedback),
             (InjectionChannel::ToolRoundGuidance, tool_round_guidance),
         ];
         for (channel, text) in cli_bridge_echo {
@@ -391,28 +387,6 @@ impl ObservabilitySession {
         }
     }
 
-    /// Classify correction-like input without collapsing all reanchors into
-    /// user-correction pressure.
-    pub fn detect_correction_signal(
-        &mut self,
-        query: &str,
-    ) -> Option<astra_turn_types::UserCorrectionSignalKind> {
-        let signal = astra_turn_core::input_classifier::classify_correction_signal(query);
-
-        if matches!(
-            signal,
-            Some(astra_turn_types::UserCorrectionSignalKind::Correction)
-        ) {
-            self.record_user_correction();
-            // Gap 5: capture a short excerpt of the corrective utterance so
-            // the SelfModel can tell the agent *what* is being corrected,
-            // not just that a correction happened.
-            self.record_correction_excerpt(query);
-        }
-
-        signal
-    }
-
     /// Gap 5: push a compact excerpt of the most recent user-correction
     /// utterance. Keeps at most the latest 5 so prompt surface stays bounded.
     pub fn record_correction_excerpt(&mut self, query: &str) {
@@ -503,11 +477,9 @@ impl ObservabilitySession {
         let delay_since_last_query_ms = self
             .last_query_at
             .map(|previous| query_time.duration_since(previous).as_millis() as u64);
-        let correction_signal = self.detect_correction_signal(query);
         self.record_query_at(query, query_time);
         QueryBehavior {
             delay_since_last_query_ms,
-            correction_signal,
         }
     }
 
@@ -551,33 +523,13 @@ impl ObservabilitySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_turn_types::UserCorrectionSignalKind;
-
     #[test]
-    fn observe_query_behavior_does_not_count_reanchors_as_corrections() {
-        let mut session = ObservabilitySession::new_simple("s-reanchor");
-
-        let behavior = session.observe_query_behavior("我要的是长久健康运行，不是临时补丁");
-
-        assert_eq!(
-            behavior.correction_signal,
-            Some(UserCorrectionSignalKind::Reanchor)
-        );
-        assert!(session.user_corrections.is_empty());
-        assert!(session.recent_correction_excerpts.is_empty());
-    }
-
-    #[test]
-    fn observe_query_behavior_counts_direct_corrections() {
+    fn observe_query_behavior_records_timing_without_classifying_text() {
         let mut session = ObservabilitySession::new_simple("s-correction");
 
-        let behavior = session.observe_query_behavior("不对，我的意思是改这里");
+        let behavior = session.observe_query_behavior("arbitrary user input");
 
-        assert_eq!(
-            behavior.correction_signal,
-            Some(UserCorrectionSignalKind::Correction)
-        );
-        assert_eq!(session.user_corrections, vec![0]);
-        assert_eq!(session.recent_correction_excerpts.len(), 1);
+        assert_eq!(behavior.delay_since_last_query_ms, None);
+        assert!(session.user_corrections.is_empty());
     }
 }

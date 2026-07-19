@@ -769,6 +769,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 host.journal_identity = Some(SubRunJournalIdentity {
                     session_id: session_id.clone(),
                     run_id: config.run_id.clone(),
+                    parent_run_id: config
+                        .parent_address
+                        .as_ref()
+                        .map(|address| address.run_id.clone()),
                     next_item_seq: 1,
                     last_assistant_source_event_id: None,
                     persistence_blocked: false,

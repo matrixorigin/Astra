@@ -331,10 +331,6 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
             "interaction_mode".to_string(),
             serde_json::Value::String(mode_label.to_string()),
         );
-        data.insert(
-            "suppressed_loop_nudges".to_string(),
-            serde_json::Value::Bool(mode_label == "auto"),
-        );
     }
     if let Some(interactive_client) = context.interactive_client {
         data.insert(
@@ -2984,7 +2980,6 @@ mod tests {
         let run = engine.load_run("user-1", "run-ctx").await.unwrap().unwrap();
         assert_eq!(run.events[0]["event_type"], "run_started");
         assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
-        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], true);
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
     }
@@ -3084,7 +3079,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run.events[0]["data"]["interaction_mode"], "prompt");
-        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], false);
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
     }
 
@@ -3111,7 +3105,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run.events[0]["data"]["interaction_mode"], "non_interactive");
-        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], false);
     }
 
     #[tokio::test]

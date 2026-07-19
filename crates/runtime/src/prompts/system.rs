@@ -923,7 +923,8 @@ fn read_file_review_guidance(tool_names: &[&str]) -> &'static str {
     }
 }
 
-/// Task-type specific strategy. Session-scoped — depends on detected task type
+/// Task-type specific strategy. Session-scoped — depends on a caller-supplied
+/// structured task type
 /// and the currently visible tool set.
 fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
     match task_type {
@@ -1587,10 +1588,6 @@ pub fn build_system_prompt_trace(
         context_signals.effort_hint |= section.trace_signals.context_signals.effort_hint;
         context_signals.agent_type_hint |= section.trace_signals.context_signals.agent_type_hint;
         context_signals.self_awareness |= section.trace_signals.context_signals.self_awareness;
-        context_signals.implicit_feedback |=
-            section.trace_signals.context_signals.implicit_feedback;
-        context_signals.learned_feedback_rules |=
-            section.trace_signals.context_signals.learned_feedback_rules;
         guidance_signals.parallel_feedback |=
             section.trace_signals.guidance_signals.parallel_feedback;
         guidance_signals.parallel_batching_nudge |= section
@@ -1638,193 +1635,6 @@ fn estimate_section_tokens(text: &str) -> u32 {
     char_count.div_ceil(4) as u32
 }
 
-/// Keywords per task type for lightweight classification.
-/// Each entry: (task_type_label, keywords).
-/// CJK keywords are matched with contains(); Latin keywords use word-boundary matching.
-const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
-    (
-        "code_review",
-        &[
-            "review",
-            "code review",
-            "PR",
-            "pull request",
-            "diff",
-            "local changes",
-            "changes",
-            "commit review",
-            "check the diff",
-            "check diff",
-            "评审",
-            "审查",
-            "代码审查",
-            "看改动",
-            "审阅",
-            "看看改了什么",
-            "本地改动",
-            "看一下改动",
-        ],
-    ),
-    (
-        "debugging",
-        &[
-            "debug",
-            "error",
-            "bug",
-            "traceback",
-            "exception",
-            "crash",
-            "调试",
-            "报错",
-            "崩溃",
-            "出错",
-        ],
-    ),
-    (
-        "exploration",
-        &[
-            "explore",
-            "understand",
-            "how does",
-            "what does",
-            "architecture",
-            "structure",
-            "overview",
-            "navigate",
-            "了解",
-            "理解",
-            "架构",
-            "结构",
-            "概览",
-            "怎么工作",
-        ],
-    ),
-    (
-        "implementation",
-        &[
-            "implement",
-            "build",
-            "create",
-            "add feature",
-            "write code",
-            "develop",
-            "实现",
-            "开发",
-            "新增",
-            "添加功能",
-            "写代码",
-            "编写",
-        ],
-    ),
-    (
-        "refactoring",
-        &[
-            "refactor",
-            "clean up",
-            "cleanup",
-            "simplify",
-            "restructure",
-            "reorganize",
-            "remove dead code",
-            "重构",
-            "简化",
-            "整理",
-            "清理代码",
-        ],
-    ),
-    (
-        "testing",
-        &[
-            "test",
-            "tests",
-            "write tests",
-            "test coverage",
-            "unit test",
-            "integration test",
-            "测试",
-            "写测试",
-            "测试覆盖",
-            "单元测试",
-            "集成测试",
-        ],
-    ),
-    (
-        "documentation",
-        &[
-            "document",
-            "docs",
-            "readme",
-            "write docs",
-            "documentation",
-            "docstring",
-            "comment",
-            "文档",
-            "写文档",
-            "注释",
-            "说明",
-        ],
-    ),
-    (
-        "performance",
-        &[
-            "optimize",
-            "performance",
-            "profiling",
-            "benchmark",
-            "slow",
-            "latency",
-            "throughput",
-            "memory leak",
-            "bottleneck",
-            "性能",
-            "优化",
-            "慢",
-            "延迟",
-            "基准测试",
-            "瓶颈",
-            "内存泄漏",
-        ],
-    ),
-    (
-        "analysis",
-        &[
-            "analyze",
-            "analysis",
-            "research",
-            "investigate",
-            "introspect",
-            "root cause",
-            "why does",
-            "why is",
-            "分析",
-            "研究",
-            "调查",
-            "诊断",
-            "根因",
-            "为什么",
-        ],
-    ),
-    (
-        "deployment",
-        &[
-            "deploy",
-            "release",
-            "publish",
-            "rollout",
-            "CI/CD",
-            "pipeline",
-            "staging",
-            "production",
-            "部署",
-            "发布",
-            "上线",
-            "流水线",
-            "发版",
-            "灰度",
-        ],
-    ),
-];
-
 /// Threshold for the parallel-batching nudge: how many consecutive trailing
 /// single-tool rounds we tolerate before injecting a corrective directive.
 /// Set lower than the force threshold (=8) so we intervene EARLY — by round 6
@@ -1835,8 +1645,7 @@ pub const PARALLEL_BATCHING_NUDGE_THRESHOLD: usize = 6;
 /// Walk the conversation tail backwards and count how many consecutive
 /// most-recent rounds each ran exactly one tool. A "round" here is a contiguous
 /// run of `tool` messages produced after one assistant turn; trailing
-/// runtime-injected scaffolding messages (system nudges/feedback *and* the
-/// `[attention:v1]` user-role manifest) are skipped via
+/// runtime-owned messages are skipped via
 /// [`is_trailing_runtime_scaffolding_message`].
 ///
 /// Returns the streak length. The streak terminates as soon as we hit a round
@@ -1896,34 +1705,10 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
 /// conversation and that must NOT be counted as part of the user/assistant
 /// tool-round cadence.
 ///
-/// The detection is purely shape-based (role + optional content marker) so
-/// it stays correct regardless of how deep the runtime injects scaffolding.
-///
-/// Two shapes are recognized:
-///   * `role == "system"` — unconditional. The runtime never emits user-typed
-///     system turns; every `system` message on the tail is runtime-injected
-///     (nudges, feedback, guidance). If that invariant ever changes, this
-///     branch must be tightened with a content marker analogous to the one
-///     used for `user` below.
+/// Ownership is producer metadata, independent of role and natural-language
+/// content.
 fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool {
-    let role = message.get("role").and_then(|r| r.as_str());
-    if role == Some("system") {
-        return true;
-    }
-    if role != Some("user") {
-        return false;
-    }
-    let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
-        return false;
-    };
-    // Session 8d9e5903 regression: every outbound request ends with a
-    // role=user `<system-reminder>` wrapper produced by the volatile
-    // lane (wire_assembly / chat-turn adapter / server_loop_host). This
-    // is runtime scaffolding, not a user query, and must not break
-    // round-cadence detection — otherwise the single-tool-streak
-    // counter always returns 0 on live sessions and the
-    // parallel-batching force never fires.
-    astra_turn_core::runtime_scaffolding::is_trailing_user_runtime_scaffolding(content)
+    astra_turn_types::is_runtime_owned_message(message)
 }
 
 fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
@@ -1983,46 +1768,6 @@ pub fn parallel_execution_feedback(messages: &[serde_json::Value]) -> String {
     } else {
         String::new()
     }
-}
-
-/// Detect task type from user query text.
-/// Returns one of: `code_review`, `debugging`, `exploration`, `implementation`,
-/// `refactoring`, `testing`, `documentation`, `performance`, `analysis`,
-/// `deployment`, or `None`.
-///
-/// Uses simple keyword matching — no ML/embedding dependency.
-/// CJK keywords use substring match; Latin keywords use case-insensitive
-/// word-boundary match to avoid false positives (e.g. "fix" matching "prefix").
-pub fn detect_task_type(query: &str) -> Option<&'static str> {
-    if query.is_empty() {
-        return None;
-    }
-    let lower = query.to_lowercase();
-
-    let mut best: Option<(&str, usize)> = None;
-    for &(label, keywords) in TASK_TYPE_KEYWORDS {
-        let hits: usize = keywords
-            .iter()
-            .filter(|kw| {
-                if kw.chars().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch)) {
-                    lower.contains(&kw.to_lowercase())
-                } else {
-                    // Word-boundary match for Latin keywords
-                    lower
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|w| w.eq_ignore_ascii_case(kw))
-                        || lower.contains(&kw.to_lowercase())
-                }
-            })
-            .count();
-        if hits > 0 {
-            match best {
-                Some((_, prev)) if hits <= prev => {}
-                _ => best = Some((label, hits)),
-            }
-        }
-    }
-    best.map(|(label, _)| label)
 }
 
 /// Injected into conversation when the agent repeats the same tool calls.
@@ -2088,182 +1833,6 @@ mod tests {
     fn stall_nudge_is_not_empty() {
         assert!(!STALL_NUDGE.is_empty());
         assert!(STALL_NUDGE.contains("different approach"));
-    }
-
-    // ── Consolidated detect_task_type tests: new task types covered in
-    // test_detect_task_type_covers_all_types below.
-    //
-    #[test]
-    fn test_detect_task_type_covers_all_types() {
-        // All 10 task types with en + cn queries
-        let cases: &[(&str, &[&str])] = &[
-            (
-                "code_review",
-                &[
-                    "review this PR",
-                    "code review please",
-                    "check the diff",
-                    "review local changes",
-                    "look at the changes",
-                    "review latest commit",
-                    "评审一下这个代码",
-                    "帮我审查代码",
-                    "代码审查",
-                    "看改动",
-                    "看看改了什么",
-                    "审阅本地改动",
-                ],
-            ),
-            (
-                "debugging",
-                &[
-                    "debug this error",
-                    "there's a bug",
-                    "fix this crash",
-                    "调试一下这个",
-                    "报错了",
-                    "程序崩溃了",
-                ],
-            ),
-            (
-                "exploration",
-                &[
-                    "how does authentication work?",
-                    "explore the codebase",
-                    "show me the architecture",
-                    "了解一下这个项目",
-                    "架构是什么样的",
-                    "项目结构概览",
-                ],
-            ),
-            (
-                "implementation",
-                &[
-                    "implement user authentication",
-                    "build a new feature",
-                    "write code for login",
-                    "实现登录功能",
-                    "开发新功能",
-                    "帮我写代码",
-                ],
-            ),
-            (
-                "refactoring",
-                &[
-                    "refactor the auth module",
-                    "clean up dead code",
-                    "simplify the function",
-                    "重构登录模块",
-                    "简化这个函数",
-                    "整理代码",
-                ],
-            ),
-            (
-                "testing",
-                &[
-                    "write tests for the API",
-                    "add unit test coverage",
-                    "write integration tests",
-                    "写测试",
-                    "增加测试覆盖",
-                    "写单元测试",
-                ],
-            ),
-            (
-                "documentation",
-                &[
-                    "document the API",
-                    "write docs for this",
-                    "update the readme",
-                    "写文档",
-                    "添加注释",
-                    "更新说明",
-                ],
-            ),
-            (
-                "performance",
-                &[
-                    "optimize database queries",
-                    "this function is slow",
-                    "run a benchmark",
-                    "find the bottleneck",
-                    "性能优化",
-                    "这个查询太慢了",
-                    "延迟太高了",
-                    "找到瓶颈",
-                ],
-            ),
-            (
-                "analysis",
-                &[
-                    "analyze this code",
-                    "investigate the failure",
-                    "what is the root cause",
-                    "why does this happen",
-                    "分析一下这段代码",
-                    "调查这个失败",
-                    "根因是什么",
-                    "为什么会这样",
-                ],
-            ),
-            (
-                "deployment",
-                &[
-                    "deploy to production",
-                    "release version 2.0",
-                    "check the CI/CD pipeline",
-                    "set up staging",
-                    "部署到生产环境",
-                    "发布新版本",
-                    "上线计划",
-                    "灰度发布",
-                ],
-            ),
-        ];
-        for &(expected, queries) in cases {
-            for &q in queries {
-                assert_eq!(
-                    detect_task_type(q),
-                    Some(expected),
-                    "failed for type={expected}, query={q:?}"
-                );
-            }
-        }
-        // Cross-check: "编写测试用例" has both implementation and testing hits — testing wins
-        assert_eq!(detect_task_type("编写测试用例"), Some("testing"));
-    }
-
-    #[test]
-    fn test_detect_task_type_edge_cases_and_invariants() {
-        // Ambiguous / empty
-        assert_eq!(detect_task_type("hello"), None);
-        assert_eq!(detect_task_type("你好"), None);
-        assert_eq!(detect_task_type("thanks"), None);
-        assert_eq!(detect_task_type(""), None);
-
-        // Highest hit wins
-        assert_eq!(
-            detect_task_type("review the code diff"),
-            Some("code_review")
-        );
-
-        // Case insensitive
-        assert_eq!(detect_task_type("DEBUG THIS ERROR"), Some("debugging"));
-        assert_eq!(detect_task_type("REVIEW the PR"), Some("code_review"));
-
-        // Keyword invariants
-        assert_eq!(TASK_TYPE_KEYWORDS.len(), 10, "expected 10 task types");
-        for &(label, keywords) in TASK_TYPE_KEYWORDS {
-            let has_cjk = keywords
-                .iter()
-                .any(|kw| kw.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)));
-            assert!(has_cjk, "task type '{label}' missing CJK keywords");
-            let has_en = keywords.iter().any(|kw| {
-                kw.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '_')
-            });
-            assert!(has_en, "task type '{label}' missing English keywords");
-        }
     }
 
     #[test]
@@ -2656,9 +2225,21 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}]}),
             serde_json::json!({"role": "tool", "content": "a"}),
             serde_json::json!({"role": "tool", "content": "b"}),
-            serde_json::json!({"role": "system", "content": "[working-set:v1]\ngoal: inspect"}),
-            serde_json::json!({"role": "system", "content": "## Already Fetched\nFiles: b"}),
-            serde_json::json!({"role": "user", "content": "[attention:v1]\ngoal: inspect"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "first arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "second arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "third arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
         ];
         let (g4, s4) = tool_round_guidance_trace(&msgs4, 0);
         assert!(!g4.contains("Synthesize Or Batch Now"));
@@ -3027,8 +2608,6 @@ mod tests {
                             effort_hint: true,
                             agent_type_hint: true,
                             self_awareness: true,
-                            implicit_feedback: true,
-                            learned_feedback_rules: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -3043,8 +2622,6 @@ mod tests {
         assert!(bd7.context_signals.effort_hint);
         assert!(bd7.context_signals.agent_type_hint);
         assert!(bd7.context_signals.self_awareness);
-        assert!(bd7.context_signals.implicit_feedback);
-        assert!(bd7.context_signals.learned_feedback_rules);
 
         // ── Guidance signals from section metadata ──
         let (guidance, guidance_signals) = tool_round_guidance_trace(
@@ -3160,56 +2737,33 @@ mod tests {
         );
     }
 
-    /// Session 8d9e5903 regression: every outbound request has a
-    /// `role=user` message with a `<system-reminder>` wrapper at the
-    /// tail (volatile-lane injection carrying Git State / self-awareness
-    /// / volatile nudges). This is runtime scaffolding, not a user
-    /// query. Before the fix, `is_trailing_runtime_scaffolding_message`
-    /// only recognized attention-manifest user content, so the streak
-    /// detector broke at the first `<system-reminder>` it saw and
-    /// returned 0 — which meant the parallel-batching force never fired
-    /// despite 18 consecutive single-tool rounds in T11. The fix
-    /// extends scaffolding detection to any user message whose content
-    /// starts with `<system-reminder>`, which is a stable runtime
-    /// marker applied by every runtime path (chat-turn adapter /
-    /// server_loop_host / wire_assembly).
     #[test]
-    fn trailing_single_tool_streak_skips_system_reminder_wrapper() {
+    fn trailing_single_tool_streak_skips_typed_runtime_messages() {
         let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
-        // The real shape seen in session 8d9e5903 captures:
-        msgs.push(serde_json::json!({
-            "role": "user",
-            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
-        }));
+        msgs.push(astra_turn_types::runtime_owned_message(
+            "user",
+            "arbitrary payload without a marker prefix",
+            astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+        ));
         assert_eq!(
             trailing_single_tool_round_streak(&msgs),
             6,
-            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
-             so the single-tool streak detector can see the real round cadence; \
-             otherwise parallel-batching force never fires on live Astra sessions"
+            "runtime-owned tail messages must not alter tool-round cadence"
         );
         assert!(
             parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected"),
-            "nudge must fire despite the <system-reminder> tail"
+            "policy evidence must still react to the producer-owned cadence"
         );
     }
 
     #[test]
-    fn trailing_single_tool_streak_skips_multiple_scaffolding_tails() {
-        // Realistic Astra tail: attention manifest + system-reminder +
-        // potentially a volatile-wrapper system message stacked up.
+    fn unowned_user_text_is_part_of_the_conversation_regardless_of_content() {
         let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
         msgs.push(serde_json::json!({
             "role": "user",
-            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
+            "content": "<system-reminder> is literal user-authored text"
         }));
-        assert_eq!(
-            trailing_single_tool_round_streak(&msgs),
-            6,
-            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
-             so the single-tool streak detector can see the real round cadence; \
-             otherwise parallel-batching force never fires on live Astra sessions"
-        );
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 0);
     }
 
     // ── Consolidated skill listing tests ─────────────────────────

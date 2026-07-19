@@ -96,7 +96,33 @@ impl CompactionEngine {
 
         // Only now — after every layer succeeded — overwrite the caller's
         // messages. If any layer panicked, the original Vec<Value> is intact.
-        *messages = typed.into_iter().map(Value::from).collect();
+        *messages = typed
+            .into_iter()
+            .map(|message| {
+                // `Value::from(Message)` is also the provider-wire serializer
+                // and therefore removes `_` fields. The compaction result is
+                // still canonical runtime state, so retain only the typed
+                // ownership/boundary markers needed by later projections.
+                let compact_boundary = message.extra.get("_compact_boundary").cloned();
+                let runtime_provenance = message
+                    .extra
+                    .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+                    .cloned();
+                let mut value = Value::from(message);
+                if let Some(object) = value.as_object_mut() {
+                    if let Some(marker) = compact_boundary {
+                        object.insert("_compact_boundary".to_string(), marker);
+                    }
+                    if let Some(provenance) = runtime_provenance {
+                        object.insert(
+                            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD.to_string(),
+                            provenance,
+                        );
+                    }
+                }
+                value
+            })
+            .collect();
 
         // Re-sanitize after every typed round-trip: Message::from may filter
         // malformed tool_calls even when no layer ultimately frees tokens, and
@@ -107,12 +133,9 @@ impl CompactionEngine {
     }
 
     /// Run the layer pipeline on typed `Vec<Message>` without the Value
-    /// round-trip. Tests use this to inspect `_`-prefixed boundary markers
-    /// (`_compact_boundary`, `_messages_removed`, ...) that the wire
-    /// serializer (`From<Message> for Value`) intentionally strips to keep
-    /// prompt-cache prefixes stable. Production callers use
-    /// `compress_if_needed`, which delegates here after the Value→Message
-    /// conversion.
+    /// round-trip. Tests use this to inspect the complete internal compaction
+    /// metadata. Production projection preserves only canonical ownership and
+    /// boundary markers; provider assembly removes them before the wire.
     pub(crate) fn compress_typed(
         &self,
         typed: &mut Vec<Message>,

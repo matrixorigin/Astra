@@ -206,10 +206,11 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
         }
     };
 
-    Some(serde_json::json!({
-        "role": "user",
-        "content": content
-    }))
+    Some(astra_turn_types::runtime_owned_message(
+        "user",
+        content,
+        astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+    ))
 }
 
 /// Same as [`build_stop_hook_prompt`], but framed for post-delegation / teammate rounds.
@@ -227,16 +228,17 @@ pub fn build_teammate_idle_hook_prompt(hooks: &[StopHook]) -> Option<serde_json:
             }
         })
         .collect();
-    Some(serde_json::json!({
-        "role": "user",
-        "content": format!(
+    Some(astra_turn_types::runtime_owned_message(
+        "user",
+        format!(
             "⚠️ TEAMMATE ROUND COMPLETE: Delegated agents have returned. Before continuing, run these checks using the bash tool:\n\
              {}\n\n\
              If any check fails, fix the issues and re-run the failing check. \
              Then proceed with your plan.",
             commands.join("\n")
-        )
-    }))
+        ),
+        astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+    ))
 }
 
 #[cfg(test)]

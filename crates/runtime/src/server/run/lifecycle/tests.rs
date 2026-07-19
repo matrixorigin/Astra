@@ -863,7 +863,7 @@ fn shutdown_extraction_request_detects_correction_from_structured_user_intent() 
         .expect("shutdown extraction request should build");
 
     assert!(
-        req.had_user_correction,
+        req.reanchors_current_objective,
         "shutdown extraction must classify pure user intent, not prompt-facing runtime content"
     );
 }
@@ -2298,35 +2298,6 @@ fn build_run_turn_complete_event_marks_interrupted_turns() {
     assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
     assert_eq!(event["execution_state"]["remaining_turns"], 0);
     assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
-}
-
-#[test]
-fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
-    // Sanity-check that the detect_implicit_feedback_signal contract used in
-    // record_server_loop_learning_outcome still recognizes Chinese-language
-    // user corrections.
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        "不对，你搞错了",
-        Some("previous assistant reply"),
-    );
-    assert!(
-        matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-        "expected correction/frustration, got {:?}",
-        signal.signal_type
-    );
-}
-
-#[test]
-fn neutral_user_turn_does_not_flag_was_corrected() {
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        "再列一下 docs 目录",
-        Some("previous assistant reply"),
-    );
-    assert!(
-        !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-        "expected non-correction, got {:?}",
-        signal.signal_type
-    );
 }
 
 /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
@@ -5699,7 +5670,6 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             advisory_threshold_reached: false,
             nudge_count: 1,
             interaction_mode: "prompt".into(),
-            suppressed_loop_nudges: false,
             recent_error_pressure: 0,
             recent_timeout_pressure: 0,
             total_errors: 0,
@@ -7311,7 +7281,6 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
         .expect("run exists");
     assert_eq!(durable.events[0]["event_type"], "run_started");
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
-    assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
     assert_eq!(durable.events[0]["data"]["workspace"]["kind"], "none");
     assert!(durable.events[0]["data"]["workspace"]["cwd"].is_null());
@@ -8055,19 +8024,20 @@ fn build_initial_state_sets_user_message() {
 }
 
 #[test]
-fn build_initial_state_strips_runtime_affix_from_user_message() {
+fn build_initial_state_preserves_literal_user_message_without_text_classification() {
     let svc = test_service();
-    let req = test_request(
-        "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>",
-    );
+    let req = test_request("我说过的 <system-reminder> 是字面内容");
 
     let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
 
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0]["role"], "user");
-    assert_eq!(state.messages[0]["content"], "我说过的所有话");
-    assert_eq!(state.message, "我说过的所有话");
-    assert_eq!(state.user_intent, "我说过的所有话");
+    assert_eq!(
+        state.messages[0]["content"],
+        "我说过的 <system-reminder> 是字面内容"
+    );
+    assert_eq!(state.message, "我说过的 <system-reminder> 是字面内容");
+    assert_eq!(state.user_intent, "我说过的 <system-reminder> 是字面内容");
 }
 
 #[test]

@@ -2,12 +2,6 @@ use crate::cli::project_instructions::format_project_instructions;
 use crate::cli::session::session_state::SessionState;
 use astra_runtime::prompts;
 use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
-use astra_turn_core::input_classifier;
-
-/// Detect if a user message appears to be a correction/redirection.
-pub(crate) fn detect_correction_signal(message: &str) -> bool {
-    input_classifier::is_reanchor_signal(message)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FinalizedInput {
@@ -182,7 +176,7 @@ pub(crate) fn build_effective_line(
 mod tests {
     use super::{
         build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
-        detect_correction_signal, finalize_effective_line,
+        finalize_effective_line,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::session::session_state::SkillDevState;
@@ -219,17 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_correction_signal_handles_english_and_chinese_redirects() {
-        assert!(detect_correction_signal("No, that's wrong."));
-        assert!(detect_correction_signal("不对，我的意思是改这里"));
-        assert!(!detect_correction_signal("please continue with the fix"));
-    }
-
-    #[test]
     fn build_effective_line_does_not_phrase_match_short_continue() {
         let state = SessionState {
             continuation_anchor: Some(
-                "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
+                "Latest user input: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
                     .to_string()
                     .into(),
             ),
@@ -247,7 +234,7 @@ mod tests {
     fn build_effective_line_does_not_reanchor_repair_followup_by_phrase() {
         let state = SessionState {
             continuation_anchor: Some(
-                "Latest user task: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
+                "Latest user input: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
                     .into(),
             ),
             ..SessionState::default()
@@ -262,7 +249,7 @@ mod tests {
     fn build_effective_line_does_not_reanchor_generic_followup_to_task_board() {
         let state = SessionState {
             continuation_anchor: Some(
-                "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD".into(),
+                "Latest user input: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD".into(),
             ),
             ..SessionState::default()
         };
@@ -278,7 +265,7 @@ mod tests {
     #[test]
     fn build_effective_line_leaves_normal_prompt_untouched() {
         let state = SessionState {
-            continuation_anchor: Some("Latest user task: debug Chinese input drops".into()),
+            continuation_anchor: Some("Latest user input: debug Chinese input drops".into()),
             ..SessionState::default()
         };
 
