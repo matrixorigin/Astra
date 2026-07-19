@@ -10,7 +10,6 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, query};
 
-use crate::cost_ledger::{CostLedger, CostLedgerEntry};
 use crate::db_row::RowExt as RuntimePromotionAuditRow;
 use crate::db_row::RowExt as SessionAuditRow;
 use crate::models::PricingData;
@@ -1507,53 +1506,64 @@ fn parse_turn_token_usage(raw: &str, context: &str) -> AuditResult<ParsedTurnTok
 
 #[derive(Debug, Clone)]
 struct TurnCostSample {
-    turn_id: String,
-    agent_id: String,
     model: String,
     usage: ParsedTurnTokenUsage,
 }
 
-fn summarize_session_cost(
-    session_id: &str,
-    turns: impl IntoIterator<Item = TurnCostSample>,
-    pricing_by_model: &HashMap<String, PricingData>,
-) -> SessionCostSummary {
-    let mut ledger = CostLedger::new(session_id);
-    let mut priced_turn_count = 0;
-    let mut unpriced_turn_count = 0;
+const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
-    for turn in turns {
-        let Some(pricing) = pricing_by_model.get(&turn.model) else {
-            unpriced_turn_count += 1;
-            continue;
-        };
-        match CostLedgerEntry::priced(
-            session_id,
-            turn.turn_id,
-            turn.agent_id,
-            None,
-            turn.model,
-            turn.usage.input_tokens,
-            turn.usage.output_tokens,
-            turn.usage.cached_input_tokens,
-            turn.usage.cache_creation_tokens,
-            pricing,
-        ) {
-            Ok(entry) => {
-                if ledger.append(entry).is_ok() {
-                    priced_turn_count += 1;
-                } else {
-                    unpriced_turn_count += 1;
-                }
-            }
-            Err(_) => unpriced_turn_count += 1,
+fn priced_turn_cost(usage: ParsedTurnTokenUsage, pricing: &PricingData) -> Option<f64> {
+    fn valid_rate(rate: f64) -> Option<f64> {
+        (rate.is_finite() && rate >= 0.0).then_some(rate)
+    }
+
+    fn optional_rate(tokens: u64, rate: Option<f64>) -> Option<f64> {
+        if tokens == 0 {
+            Some(0.0)
+        } else {
+            valid_rate(rate?)
         }
     }
 
-    let summary = ledger.summary();
+    let prompt = valid_rate(pricing.prompt)?;
+    let completion = valid_rate(pricing.completion)?;
+    let cache_read = optional_rate(usage.cached_input_tokens, pricing.cache_read)?;
+    let cache_write = optional_rate(usage.cache_creation_tokens, pricing.cache_write)?;
+    Some(
+        (usage.input_tokens as f64 * prompt
+            + usage.output_tokens as f64 * completion
+            + usage.cached_input_tokens as f64 * cache_read
+            + usage.cache_creation_tokens as f64 * cache_write)
+            / TOKENS_PER_MILLION,
+    )
+}
+
+fn summarize_session_cost(
+    turns: impl IntoIterator<Item = TurnCostSample>,
+    pricing_by_model: &HashMap<String, PricingData>,
+) -> SessionCostSummary {
+    let mut total_cost_usd = 0.0;
+    let mut per_model_cost_usd = BTreeMap::new();
+    let mut priced_turn_count = 0_u32;
+    let mut unpriced_turn_count = 0_u32;
+
+    for turn in turns {
+        let Some(pricing) = pricing_by_model.get(&turn.model) else {
+            unpriced_turn_count = unpriced_turn_count.saturating_add(1);
+            continue;
+        };
+        if let Some(cost_usd) = priced_turn_cost(turn.usage, pricing) {
+            total_cost_usd += cost_usd;
+            *per_model_cost_usd.entry(turn.model).or_insert(0.0) += cost_usd;
+            priced_turn_count = priced_turn_count.saturating_add(1);
+        } else {
+            unpriced_turn_count = unpriced_turn_count.saturating_add(1);
+        }
+    }
+
     SessionCostSummary {
-        estimated_cost_usd: (priced_turn_count > 0).then_some(summary.total_cost_usd),
-        per_model_cost_usd: summary.per_model_cost_usd,
+        estimated_cost_usd: (priced_turn_count > 0).then_some(total_cost_usd),
+        per_model_cost_usd,
         priced_turn_count,
         unpriced_turn_count,
     }
@@ -1674,8 +1684,6 @@ fn session_turn_cost_sample_from_row(row: &impl SessionAuditRow) -> AuditResult<
     }
     let token_usage = audit_row_string(row, context, "token_usage")?;
     Ok(TurnCostSample {
-        turn_id: audit_row_string(row, context, "event_id")?,
-        agent_id: "root".to_string(),
         model,
         usage: parse_turn_token_usage(&token_usage, context)?,
     })
@@ -1687,7 +1695,7 @@ async fn load_session_turn_cost_samples(
     session_id: &str,
 ) -> AuditResult<Vec<TurnCostSample>> {
     let rows = query(
-        "SELECT event_id, llm_model_used, CAST(token_usage AS CHAR) AS token_usage \
+        "SELECT llm_model_used, CAST(token_usage AS CHAR) AS token_usage \
          FROM agent_events \
          WHERE session_id = ? AND user_id = ? \
            AND event_type IN ('user_query', 'llm_response') \
@@ -2282,7 +2290,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let turn_costs = load_session_turn_cost_samples(&pool, user_id, session_id).await?;
         let pricing_by_model = load_active_model_pricing_map(&pool, &metrics.models_used).await?;
-        let cost = summarize_session_cost(session_id, turn_costs, &pricing_by_model);
+        let cost = summarize_session_cost(turn_costs, &pricing_by_model);
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
@@ -4275,18 +4283,12 @@ mod tests {
     fn session_turn_cost_sample_row_decode_preserves_values_and_fails_loudly() {
         let sample = session_turn_cost_sample_from_row(&FakeSessionAuditRow::complete())
             .expect("cost sample row decodes");
-        assert_eq!(sample.turn_id, "event-1");
-        assert_eq!(sample.agent_id, "root");
         assert_eq!(sample.model, "gpt-5");
         assert_eq!(sample.usage.input_tokens, 10);
         assert_eq!(sample.usage.cached_input_tokens, 2);
         assert_eq!(sample.usage.output_tokens, 5);
         assert_eq!(sample.usage.total_tokens, 17);
 
-        assert_audit_internal_error_mentions(
-            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("event_id")),
-            "event_id",
-        );
         assert_audit_internal_error_mentions(
             session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("llm_model_used")),
             "llm_model_used",
@@ -4315,8 +4317,6 @@ mod tests {
     fn summarize_session_cost_aggregates_priced_turns_and_flags_unpriced_ones() {
         let turns = vec![
             TurnCostSample {
-                turn_id: "t1".into(),
-                agent_id: "root".into(),
                 model: "claude".into(),
                 usage: ParsedTurnTokenUsage {
                     input_tokens: 1_000_000,
@@ -4327,8 +4327,6 @@ mod tests {
                 },
             },
             TurnCostSample {
-                turn_id: "t2".into(),
-                agent_id: "root".into(),
                 model: "unknown".into(),
                 usage: ParsedTurnTokenUsage {
                     input_tokens: 100,
@@ -4349,7 +4347,7 @@ mod tests {
             },
         )]);
 
-        let summary = summarize_session_cost("s1", turns, &pricing_by_model);
+        let summary = summarize_session_cost(turns, &pricing_by_model);
         assert_eq!(summary.priced_turn_count, 1);
         assert_eq!(summary.unpriced_turn_count, 1);
         assert_eq!(summary.estimated_cost_usd, Some(6.0));
@@ -4359,8 +4357,6 @@ mod tests {
     #[test]
     fn summarize_session_cost_marks_missing_cache_pricing_as_unpriced() {
         let turns = vec![TurnCostSample {
-            turn_id: "t1".into(),
-            agent_id: "root".into(),
             model: "claude".into(),
             usage: ParsedTurnTokenUsage {
                 input_tokens: 100,
@@ -4380,11 +4376,38 @@ mod tests {
             },
         )]);
 
-        let summary = summarize_session_cost("s1", turns, &pricing_by_model);
+        let summary = summarize_session_cost(turns, &pricing_by_model);
         assert_eq!(summary.priced_turn_count, 0);
         assert_eq!(summary.unpriced_turn_count, 1);
         assert_eq!(summary.estimated_cost_usd, None);
         assert!(summary.per_model_cost_usd.is_empty());
+    }
+
+    #[test]
+    fn summarize_session_cost_marks_invalid_required_rate_as_unpriced() {
+        let turns = vec![TurnCostSample {
+            model: "claude".into(),
+            usage: ParsedTurnTokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+                ..ParsedTurnTokenUsage::default()
+            },
+        }];
+        let pricing_by_model = HashMap::from([(
+            "claude".to_string(),
+            PricingData {
+                prompt: f64::NAN,
+                completion: 8.0,
+                cache_read: None,
+                cache_write: None,
+            },
+        )]);
+
+        let summary = summarize_session_cost(turns, &pricing_by_model);
+        assert_eq!(summary.priced_turn_count, 0);
+        assert_eq!(summary.unpriced_turn_count, 1);
+        assert_eq!(summary.estimated_cost_usd, None);
     }
 
     #[test]

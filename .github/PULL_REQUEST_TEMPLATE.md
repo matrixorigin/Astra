@@ -15,3 +15,17 @@
 Fixes #
 
 ## What this PR does / why we need it
+
+## Architecture and complexity delta
+
+- Canonical owner changed or extended:
+- Existing implementations/callers searched:
+- Superseded code, states, tables, shims, and self-only tests removed:
+- Net code/state/table delta:
+- If parallel implementations remain, the external boundary and retirement condition:
+
+## Production wiring and verification
+
+- Public product entrypoint exercised:
+- Unhappy paths exercised:
+- Database schema/query/transaction/migration verified against a real database, or `N/A` with reason:

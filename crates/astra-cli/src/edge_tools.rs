@@ -648,74 +648,7 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 }
 
 /// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BgTaskOutputStatus {
-    Pending,
-    Running,
-    WaitingForInput,
-    Stopping,
-    Completed,
-    Failed,
-    Interrupted,
-    Killed,
-    Unavailable,
-}
-
-impl BgTaskOutputStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::WaitingForInput => "waiting_for_input",
-            Self::Stopping => "stopping",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-            Self::Killed => "killed",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
-    pub fn from_protocol(value: &str) -> Option<Self> {
-        match value {
-            "pending" => Some(Self::Pending),
-            "running" => Some(Self::Running),
-            "waiting_for_input" => Some(Self::WaitingForInput),
-            "stopping" => Some(Self::Stopping),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "interrupted" => Some(Self::Interrupted),
-            "killed" => Some(Self::Killed),
-            "unavailable" => Some(Self::Unavailable),
-            _ => None,
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Interrupted | Self::Killed | Self::Unavailable
-        )
-    }
-
-    fn should_wake_waiter(self) -> bool {
-        self.is_terminal() || self == Self::WaitingForInput
-    }
-
-    fn work_unit_status(self) -> WorkUnitStatus {
-        match self {
-            Self::Pending => WorkUnitStatus::Pending,
-            Self::Running => WorkUnitStatus::Running,
-            Self::WaitingForInput => WorkUnitStatus::WaitingForInput,
-            Self::Stopping => WorkUnitStatus::Stopping,
-            Self::Completed => WorkUnitStatus::Completed,
-            Self::Failed => WorkUnitStatus::Failed,
-            Self::Interrupted => WorkUnitStatus::Interrupted,
-            Self::Killed => WorkUnitStatus::Cancelled,
-            Self::Unavailable => WorkUnitStatus::Unavailable,
-        }
-    }
-}
+pub type BgTaskOutputStatus = WorkUnitStatus;
 
 #[derive(Debug, Clone)]
 pub struct BgTaskOutputSnapshot {
@@ -1057,9 +990,10 @@ fn format_background_task_output(
         BgTaskOutputStatus::WaitingForInput => "needs input",
         BgTaskOutputStatus::Stopping => "stopping",
         BgTaskOutputStatus::Completed => "completed",
+        BgTaskOutputStatus::CompletedWithIssues => "completed with issues",
         BgTaskOutputStatus::Failed => "failed",
         BgTaskOutputStatus::Interrupted => "interrupted",
-        BgTaskOutputStatus::Killed => "killed",
+        BgTaskOutputStatus::Cancelled => "stopped",
         BgTaskOutputStatus::Unavailable => "unavailable",
     };
     let mut metadata_parts = vec![
@@ -1120,11 +1054,14 @@ fn format_background_task_output(
             ("local agent", BgTaskOutputStatus::Completed) => {
                 "Local agent completed with no result"
             }
+            ("local agent", BgTaskOutputStatus::CompletedWithIssues) => {
+                "Local agent completed with issues and no result"
+            }
             ("local agent", BgTaskOutputStatus::Failed) => "Local agent failed with no output",
             ("local agent", BgTaskOutputStatus::Interrupted) => {
                 "Local agent interrupted with no result"
             }
-            ("local agent", BgTaskOutputStatus::Killed) => "Local agent stopped with no result",
+            ("local agent", BgTaskOutputStatus::Cancelled) => "Local agent stopped with no result",
             ("local agent", BgTaskOutputStatus::Unavailable) => {
                 "Local agent unavailable · stale handle or unsupported runner"
             }
@@ -1133,9 +1070,10 @@ fn format_background_task_output(
             (_, BgTaskOutputStatus::WaitingForInput) => "Waiting for input · no new output",
             (_, BgTaskOutputStatus::Stopping) => "Stopping · no new output",
             (_, BgTaskOutputStatus::Completed) => "Completed with no output",
+            (_, BgTaskOutputStatus::CompletedWithIssues) => "Completed with issues and no output",
             (_, BgTaskOutputStatus::Failed) => "Failed with no output",
             (_, BgTaskOutputStatus::Interrupted) => "Interrupted with no output",
-            (_, BgTaskOutputStatus::Killed) => "Stopped with no output",
+            (_, BgTaskOutputStatus::Cancelled) => "Stopped with no output",
             (_, BgTaskOutputStatus::Unavailable) => {
                 "Unavailable · stale handle or unsupported runner"
             }
@@ -1171,7 +1109,7 @@ fn format_background_task_output_search(
         "waiting_for_input" => "needs input",
         "completed" => "completed",
         "failed" => "failed",
-        "killed" => "killed",
+        "cancelled" => "stopped",
         other => other,
     };
     let title = snapshot
@@ -1253,7 +1191,7 @@ fn background_task_output_result_fields(
     WorkUnitObservation::new(
         task_id,
         snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
-        snapshot.status.work_unit_status(),
+        snapshot.status,
         format!("{}:{}", snapshot.status.as_str(), snapshot.total_bytes),
         match observation_mode {
             "wait" => WorkUnitObservationMode::Wait,
@@ -1288,7 +1226,7 @@ fn background_task_output_search_result_fields(
     WorkUnitObservation::new(
         task_id,
         snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
-        snapshot.status.work_unit_status(),
+        snapshot.status,
         format!(
             "diagnostic:{}:{}:{}",
             snapshot.status.as_str(),
@@ -4017,7 +3955,7 @@ impl ToolExecutor {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            if latest.status.should_wake_waiter() {
+            if latest.status.requires_attention_or_terminal_wake() {
                 return match background_task_output_view(
                     bg_commands,
                     &task_id,
@@ -4052,7 +3990,7 @@ impl ToolExecutor {
                         *tool_result_fields = Some(background_task_output_result_fields(
                             &task_id, &snapshot, read_mode, true,
                         ));
-                        if snapshot.status.should_wake_waiter() {
+                        if snapshot.status.requires_attention_or_terminal_wake() {
                             format_background_task_output(&task_id, offset, &snapshot, read_mode)
                         } else {
                             format_background_task_output_wait_timeout(
@@ -4110,7 +4048,7 @@ impl ToolExecutor {
                 let observation = WorkUnitObservation::new(
                     &projection.group_id,
                     "agent_fanout",
-                    projection.snapshot.status.work_unit_status(),
+                    projection.snapshot.status,
                     projection.revision.to_string(),
                     observation_mode,
                 )
@@ -7929,7 +7867,7 @@ mod tests {
             end_offset,
             total_bytes,
             total_lines,
-            status: BgTaskOutputStatus::from_protocol(status).expect("test status must be known"),
+            status: BgTaskOutputStatus::parse(status).expect("test status must be known"),
             output_ref: "stdout: /tmp/bg-shell-1.stdout · stderr: /tmp/bg-shell-1.stderr"
                 .to_string(),
         }
@@ -7938,13 +7876,13 @@ mod tests {
     #[test]
     fn background_task_output_status_has_one_wait_and_terminal_policy() {
         assert!(BgTaskOutputStatus::Interrupted.is_terminal());
-        assert!(BgTaskOutputStatus::Interrupted.should_wake_waiter());
+        assert!(BgTaskOutputStatus::Interrupted.requires_attention_or_terminal_wake());
         assert!(BgTaskOutputStatus::Unavailable.is_terminal());
-        assert!(BgTaskOutputStatus::Unavailable.should_wake_waiter());
+        assert!(BgTaskOutputStatus::Unavailable.requires_attention_or_terminal_wake());
         assert!(!BgTaskOutputStatus::WaitingForInput.is_terminal());
-        assert!(BgTaskOutputStatus::WaitingForInput.should_wake_waiter());
-        assert!(!BgTaskOutputStatus::Running.should_wake_waiter());
-        assert_eq!(BgTaskOutputStatus::from_protocol("unexpected"), None);
+        assert!(BgTaskOutputStatus::WaitingForInput.requires_attention_or_terminal_wake());
+        assert!(!BgTaskOutputStatus::Running.requires_attention_or_terminal_wake());
+        assert_eq!(BgTaskOutputStatus::parse("unexpected"), None);
     }
 
     #[test]

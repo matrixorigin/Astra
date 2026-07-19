@@ -18,7 +18,7 @@ pub(crate) use types::{
 };
 
 use list_render::background_task_list_entries;
-use types::{PAGE_STEP, sort_rows};
+use types::{BackgroundTaskStatusExt, PAGE_STEP, sort_rows};
 
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ViewActionDisposition,

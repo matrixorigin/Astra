@@ -46,9 +46,11 @@ pub(crate) fn compute_fanout_header(
             | BackgroundTaskStatus::Running
             | BackgroundTaskStatus::WaitingForInput => header.running += 1,
             BackgroundTaskStatus::Stopping => header.stopping += 1,
-            BackgroundTaskStatus::Completed => header.done += 1,
+            BackgroundTaskStatus::Completed | BackgroundTaskStatus::CompletedWithIssues => {
+                header.done += 1
+            }
             BackgroundTaskStatus::Interrupted | BackgroundTaskStatus::Failed => header.failed += 1,
-            BackgroundTaskStatus::Killed => header.stopped += 1,
+            BackgroundTaskStatus::Cancelled => header.stopped += 1,
             BackgroundTaskStatus::Unavailable => header.unavailable += 1,
         }
     }

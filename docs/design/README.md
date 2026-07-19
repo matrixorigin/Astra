@@ -18,8 +18,7 @@ These documents describe target contracts. They should not be read as proof that
 | Durable runs | [durable-agent-runs.md](durable-agent-runs.md) | Lease, checkpoint, resume, terminal outcome, crash recovery details. |
 | Capabilities | [capability-system.md](capability-system.md) | Tools, skills, MCP, provider decisions, admission, fallback. |
 | Capability provider runtime | [capability-provider-runtime.md](capability-provider-runtime.md) | Provider adapters, discovery snapshots, internal tool identity, invocation and typed outcome contracts. |
-| Skill evolution | [skill-capability-evolution.md](skill-capability-evolution.md) | Skill maturity, packaging, evaluation, rollout, and compatibility. |
-| Skills and tools | [skills-and-tools.md](skills-and-tools.md) | Skill package semantics, lifecycle, compatibility, and discovery. |
+| Skills and tools | [skills-and-tools.md](skills-and-tools.md) | Skill maturity, packaging, lifecycle, compatibility, discovery, evaluation, and rollout. |
 | Context/prompt | [context-and-prompt.md](context-and-prompt.md) | Context assembly, prompt cache, compaction, dynamic state, memory injection. |
 | Prompt lifecycle | [prompt-lifecycle.md](prompt-lifecycle.md) | Prompt assembly, versioning, stable prefix, cache and evolution boundary. |
 | Context window | [context-window-management.md](context-window-management.md) | Token budgets, compaction, eviction, and context preservation. |

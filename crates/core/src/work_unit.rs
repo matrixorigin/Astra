@@ -25,6 +25,37 @@ pub enum WorkUnitStatus {
 }
 
 impl WorkUnitStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingForInput => "waiting_for_input",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::CompletedWithIssues => "completed_with_issues",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Cancelled => "cancelled",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "waiting_for_input" => Some(Self::WaitingForInput),
+            "stopping" => Some(Self::Stopping),
+            "completed" => Some(Self::Completed),
+            "completed_with_issues" => Some(Self::CompletedWithIssues),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            "cancelled" | "killed" => Some(Self::Cancelled),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -35,6 +66,10 @@ impl WorkUnitStatus {
                 | Self::Cancelled
                 | Self::Unavailable
         )
+    }
+
+    pub fn requires_attention_or_terminal_wake(self) -> bool {
+        self.is_terminal() || self == Self::WaitingForInput
     }
 }
 
@@ -305,6 +340,30 @@ impl WorkUnitObservationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_status_protocol_accepts_legacy_killed_without_reemitting_it() {
+        for status in [
+            WorkUnitStatus::Pending,
+            WorkUnitStatus::Running,
+            WorkUnitStatus::WaitingForInput,
+            WorkUnitStatus::Stopping,
+            WorkUnitStatus::Completed,
+            WorkUnitStatus::CompletedWithIssues,
+            WorkUnitStatus::Failed,
+            WorkUnitStatus::Interrupted,
+            WorkUnitStatus::Cancelled,
+            WorkUnitStatus::Unavailable,
+        ] {
+            assert_eq!(WorkUnitStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(
+            WorkUnitStatus::parse("killed"),
+            Some(WorkUnitStatus::Cancelled)
+        );
+        assert_eq!(WorkUnitStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(WorkUnitStatus::parse("unknown"), None);
+    }
 
     fn observation(
         version: &str,

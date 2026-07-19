@@ -143,7 +143,9 @@ impl BackgroundTaskCounts {
                     BackgroundTaskKind::MainSession => counts.unavailable_main_sessions += 1,
                     BackgroundTaskKind::Monitor => counts.unavailable_monitors += 1,
                 },
-                BackgroundTaskStatus::Killed | BackgroundTaskStatus::Completed => {}
+                BackgroundTaskStatus::Cancelled
+                | BackgroundTaskStatus::Completed
+                | BackgroundTaskStatus::CompletedWithIssues => {}
             }
         }
         counts

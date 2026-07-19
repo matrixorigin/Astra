@@ -18,6 +18,8 @@ pub fn build_skill_dev_prefix(skill_name: &str, skill_path: &str, skill_src: &st
          - `when_to_use` must start with \"Use when...\" and include trigger phrases.\n\
          - `allowed_tools` should be minimal — list only what the skill actually needs.\n\
          - If the skill takes parameters, define `arguments` in frontmatter and use `$ARG_NAME` in the body.\n\
+         - Before adding a loader, parser, registry, provider, or tool binding, find and reuse the canonical shared implementation; do not create a skill-local parallel system.\n\
+         - Validate the real discovery → activation → tool/resource path. A parser unit test or exported type alone does not prove the skill is usable.\n\
          - Prefer built-in tools (`read_file`, `write_file`) over `bash` where possible.\n\n"
     )
 }
@@ -102,6 +104,8 @@ mod tests {
         assert!(r.contains("Do stuff"));
         assert!(r.contains("SKILL DEV"));
         assert!(r.contains("/project/.astra/skills/my-skill/SKILL.md"));
+        assert!(r.contains("canonical shared implementation"));
+        assert!(r.contains("discovery → activation"));
     }
 
     #[test]

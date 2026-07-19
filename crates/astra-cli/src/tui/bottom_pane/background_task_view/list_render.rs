@@ -10,7 +10,10 @@ use ratatui::{
 use super::fanout_header::{
     FanoutHeader, compute_fanout_header, fanout_header_line, fanout_slot_title,
 };
-use super::types::{BackgroundTaskRow, BackgroundTaskStatus, format_elapsed, pluralize_with_count};
+use super::types::{
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStatusExt, format_elapsed,
+    pluralize_with_count,
+};
 use crate::cli::effects::truncate_label;
 
 pub(crate) enum BackgroundTaskListEntry<'a> {

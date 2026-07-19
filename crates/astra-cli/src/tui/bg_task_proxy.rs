@@ -101,7 +101,7 @@ pub(crate) fn local_agent_status_projection(
             finish_reason.clone().or_else(|| Some(error.clone())),
         ),
         AgentStatus::Cancelled { reason, .. } => (
-            "killed",
+            "cancelled",
             Some(reason.clone()).filter(|reason| !reason.trim().is_empty()),
             Some(if reason.trim().is_empty() {
                 "cancelled".to_string()
@@ -462,7 +462,7 @@ fn shell_output_status(
             crate::edge_tools::BgTaskOutputStatus::Failed
         }
         super::background_tasks::BgTaskStatus::Killed => {
-            crate::edge_tools::BgTaskOutputStatus::Killed
+            crate::edge_tools::BgTaskOutputStatus::Cancelled
         }
     }
 }
@@ -586,7 +586,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             (crate::edge_tools::BgTaskOutputStatus::Failed, error.clone())
         }
         AgentStatus::Cancelled { reason, .. } => (
-            crate::edge_tools::BgTaskOutputStatus::Killed,
+            crate::edge_tools::BgTaskOutputStatus::Cancelled,
             reason.clone(),
         ),
     };
@@ -616,7 +616,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
-    let status = match crate::edge_tools::BgTaskOutputStatus::from_protocol(&projection.status) {
+    let status = match crate::edge_tools::BgTaskOutputStatus::parse(&projection.status) {
         Some(status) if status.is_terminal() => status,
         Some(_) => {
             // A workspace projection is last-observed evidence, not a live
@@ -729,7 +729,7 @@ pub(crate) fn background_task_empty_output_state(status: &str) -> &'static str {
         "interrupted" => "Interrupted with no output",
         "completed" => "Completed with no output",
         "failed" => "Failed with no output",
-        "killed" => "Stopped with no output",
+        "cancelled" | "killed" => "Stopped with no output",
         "unavailable" => "Unavailable · stale handle or unsupported runner",
         _ => "No output yet",
     }
@@ -744,7 +744,7 @@ pub(crate) fn background_task_status_label(status: &str) -> &'static str {
         "interrupted" => "interrupted",
         "completed" => "completed",
         "failed" => "failed",
-        "killed" => "stopped",
+        "cancelled" | "killed" => "stopped",
         "unavailable" => "unavailable",
         _ => "unknown",
     }
@@ -899,7 +899,7 @@ mod tests {
             BgTaskOutputStatus::Completed,
             BgTaskOutputStatus::Failed,
             BgTaskOutputStatus::Interrupted,
-            BgTaskOutputStatus::Killed,
+            BgTaskOutputStatus::Cancelled,
             BgTaskOutputStatus::Unavailable,
         ] {
             assert!(status.is_terminal(), "{status:?}");

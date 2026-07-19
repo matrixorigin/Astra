@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use super::types::{
-    BackgroundTaskKind, BackgroundTaskRow, DETAIL_TAIL_LINES, detail_actions_label, format_elapsed,
-    format_timestamp_ms, pluralize_with_count,
+    BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatusExt, DETAIL_TAIL_LINES,
+    detail_actions_label, format_elapsed, format_timestamp_ms, pluralize_with_count,
 };
 
 pub(crate) fn render_detail(

@@ -3577,6 +3577,96 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    let model_id = Uuid::new_v4().to_string();
+    let model_name = format!("audit-cost-{}", Uuid::new_v4().simple());
+
+    sqlx::query(
+        "INSERT INTO infra_llm_models \
+         (model_id, model_name, provider, is_active, context_window, input_modalities, \
+          output_modalities, supported_parameters, pricing, tags, quirks) \
+         VALUES (?, ?, 'mock', 1, 128000, CAST(? AS JSON), CAST(? AS JSON), \
+          CAST(? AS JSON), CAST(? AS JSON), CAST(? AS JSON), CAST(? AS JSON))",
+    )
+    .bind(&model_id)
+    .bind(&model_name)
+    .bind(r#"["text"]"#)
+    .bind(r#"["text"]"#)
+    .bind("[]")
+    .bind(r#"{"prompt":2.0,"completion":8.0,"cache_read":0.5,"cache_write":1.5}"#)
+    .bind("[]")
+    .bind("{}")
+    .execute(&pool)
+    .await
+    .expect("insert priced model");
+
+    sqlx::query(
+        "INSERT INTO agent_sessions \
+         (session_id, user_id, title, status, event_count, created_at, updated_at, last_active_at) \
+         VALUES (?, ?, 'audit-cost-it', 'active', 1, NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert audit session");
+
+    let usage = serde_json::json!({
+        "input_tokens": 1_000_000,
+        "cached_input_tokens": 2_000_000,
+        "cache_creation_tokens": 1_000_000,
+        "output_tokens": 500_000,
+        "total_tokens": 4_500_000,
+    });
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, event_type, content, token_usage, llm_model_used, \
+          token_input, token_output, token_total, turn_seq, created_at) \
+         VALUES (?, ?, ?, 'user_query', '{}', CAST(? AS JSON), ?, 3000000, 1500000, \
+          4500000, 1, NOW(6))",
+    )
+    .bind(&event_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(usage.to_string())
+    .bind(&model_name)
+    .execute(&pool)
+    .await
+    .expect("insert priced audit event");
+
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    let summary = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get priced session summary");
+    assert_eq!(summary.cost.priced_turn_count, 1);
+    assert_eq!(summary.cost.unpriced_turn_count, 0);
+    assert_eq!(summary.cost.estimated_cost_usd, Some(8.5));
+    assert_eq!(summary.cost.per_model_cost_usd.get(&model_name), Some(&8.5));
+
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &user_id,
+        std::slice::from_ref(&session_id),
+        std::slice::from_ref(&event_id),
+        &[],
+    )
+    .await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .expect("delete priced model");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn durable_task_resume_loads_verification_history_from_db() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();

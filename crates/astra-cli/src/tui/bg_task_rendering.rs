@@ -263,7 +263,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
             finish_reason.clone().or_else(|| Some(error.clone())),
         ),
         AgentStatus::Cancelled { reason, .. } => (
-            BackgroundTaskStatus::Killed,
+            BackgroundTaskStatus::Cancelled,
             Some(reason.clone()).filter(|reason| !reason.trim().is_empty()),
             Some(if reason.trim().is_empty() {
                 "cancelled".to_string()
@@ -896,7 +896,7 @@ pub(crate) fn render_background_task_rows_xml(
                 matches!(
                     row.status,
                     BackgroundTaskStatus::Interrupted
-                        | BackgroundTaskStatus::Killed
+                        | BackgroundTaskStatus::Cancelled
                         | BackgroundTaskStatus::Unavailable
                 )
             })

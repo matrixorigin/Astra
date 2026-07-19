@@ -1064,11 +1064,13 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
                     "\n## Implementation Strategy\n\
                       1. **Understand structure**: {layout}, grep for names{read_suffix}.{symbols}\n\
                       2. **Find location**: {find_location}.\n\
-                      3. **Check impact**: grep callers/imports and read the relevant call sites.\n\
-                      4. **Implement surgically**: {edit_guidance}.\n\
-                      5. **Wire it up**: add imports, register modules, update exports.\n\
-                      6. **Verify**: {verify_guidance}.\n\
-                      7. **Commit**: {commit_guidance}.\n",
+                      3. **Find the owner**: before adding a type, service, registry, state machine, table, or parser, identify the existing canonical owner and extend it when possible.\n\
+                      4. **Check impact**: grep callers/imports and read the relevant call sites.\n\
+                      5. **Implement surgically**: {edit_guidance}.\n\
+                      6. **Replace completely**: if a new path supersedes an old one, migrate callers and remove the old implementation and its self-only tests in the same change.\n\
+                      7. **Wire the product path**: add the real entrypoint/import/registration; a public export or unit test is not proof of use.\n\
+                      8. **Verify behavior**: {verify_guidance}; persistence changes require the real database path, schema, query, and failure behavior.\n\
+                      9. **Commit**: {commit_guidance}.\n",
                     commit_guidance = if tool_visible(tool_names, "git") {
                         "git(action=\"commit\") with a clear message"
                     } else if tool_visible(tool_names, "bash") {
@@ -1082,11 +1084,13 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
                     "\n## Implementation Strategy\n\
                       1. **Understand structure**: use visible layout/file tools and targeted reads.{symbols}\n\
                       2. **Find location**: {} before using any deferred search tool.\n\
-                      3. **Check impact**: find callers/imports with visible search/read tools; do not call hidden structured tools.\n\
-                      4. **Implement surgically**: {edit_guidance}.\n\
-                      5. **Wire it up**: add imports, register modules, update exports.\n\
-                      6. **Verify**: {verify_guidance}.\n\
-                      7. **Commit**: {}.\n",
+                      3. **Find the owner**: before adding a type, service, registry, state machine, table, or parser, identify the existing canonical owner and extend it when possible.\n\
+                      4. **Check impact**: find callers/imports with visible search/read tools; do not call hidden structured tools.\n\
+                      5. **Implement surgically**: {edit_guidance}.\n\
+                      6. **Replace completely**: if a new path supersedes an old one, migrate callers and remove the old implementation and its self-only tests in the same change.\n\
+                      7. **Wire the product path**: add the real entrypoint/import/registration; a public export or unit test is not proof of use.\n\
+                      8. **Verify behavior**: {verify_guidance}; persistence changes require the real database path, schema, query, and failure behavior.\n\
+                      9. **Commit**: {}.\n",
                     deferred_search_guidance(tool_names),
                     if tool_visible(tool_names, "git") {
                         "git(action=\"commit\") with a clear message"
@@ -1102,10 +1106,12 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
             "\n## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
              2. Use {} to find callers before changing a signature.{}\n\
-             3. For renames: preview with visible search/read tools, then apply a targeted edit.\n\
-             4. Make one logical change at a time — verify after each.\n\
-             5. Preserve external behavior; focus on clarity and maintainability.\n\
-             6. Run tests AFTER to confirm nothing regressed.\n",
+             3. Inventory competing owners and production callers before introducing any new abstraction.\n\
+             4. Choose one canonical owner per fact; projections are derived and must not become writable truth.\n\
+             5. Migrate callers and delete superseded code, compatibility shims, and self-only tests in the same change; do not leave parallel systems without an explicit external boundary.\n\
+             6. Record the complexity delta (implementations, states, tables, and net code), not only added functionality.\n\
+             7. Verify through the public product entrypoint and unhappy paths; use the real database for persistence contracts.\n\
+             8. Run tests AFTER to confirm nothing regressed.\n",
             if tool_visible(tool_names, "grep") && tool_visible(tool_names, "read_file") {
                 "grep/read_file"
             } else if tool_visible(tool_names, "grep") {
@@ -1121,8 +1127,10 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
              1. Read the module under test to understand its behavior and edge cases.\n\
              2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
              3. Cover: happy path → edge cases → error conditions → boundary values.\n\
-             4. Each test verifies ONE behavior with a clear, descriptive name.\n\
-             5. Run the new tests to confirm they pass — fix failures before reporting.\n"
+             4. Prove wiring through a public entrypoint; tests that only construct an otherwise-unused abstraction are not coverage.\n\
+             5. For persistence behavior, exercise the real schema, query, transaction, and concurrency/failure path instead of a mock store alone.\n\
+             6. Each test verifies ONE behavior with a clear, descriptive name.\n\
+             7. Run the new tests to confirm they pass — fix failures before reporting.\n"
             .to_string(),
         Some("documentation") => "\n## Documentation Strategy\n\
              - Read the code first — document actual behavior, not assumptions.\n\
@@ -2305,6 +2313,18 @@ mod tests {
             build_main_system_prompt(&["glob", "grep", "read_file"], "", Some("implementation"));
         assert!(p.contains("glob"), "implementation should mention glob");
         assert!(p.contains("grep"), "implementation should mention grep");
+        assert!(p.contains("Find the owner"));
+        assert!(p.contains("public export or unit test is not proof of use"));
+        assert!(p.contains("real database path, schema, query"));
+
+        let p = build_main_system_prompt(&["bash"], "", Some("refactoring"));
+        assert!(p.contains("one canonical owner per fact"));
+        assert!(p.contains("delete superseded code"));
+        assert!(p.contains("complexity delta"));
+
+        let p = build_main_system_prompt(&["bash"], "", Some("testing"));
+        assert!(p.contains("public entrypoint"));
+        assert!(p.contains("real schema, query, transaction"));
 
         // Unknown task type produces no strategy sections
         let p = build_main_system_prompt(&["bash"], "", Some("nonexistent_type"));

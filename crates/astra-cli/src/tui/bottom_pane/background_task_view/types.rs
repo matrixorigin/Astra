@@ -1,5 +1,6 @@
 //! Core types and data structures for the background task view.
 
+use astra_core::work_unit::WorkUnitStatus;
 use ratatui::style::Color;
 
 pub(crate) const PAGE_STEP: usize = 8;
@@ -26,50 +27,17 @@ impl BackgroundTaskKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BackgroundTaskStatus {
-    Pending,
-    WaitingForInput,
-    Interrupted,
-    Failed,
-    Running,
-    Stopping,
-    Killed,
-    Completed,
-    Unavailable,
+pub(crate) type BackgroundTaskStatus = WorkUnitStatus;
+
+pub(crate) trait BackgroundTaskStatusExt {
+    fn label(self) -> &'static str;
+    fn color(self) -> Color;
+    fn is_killable(self) -> bool;
+    fn empty_output_state(self) -> &'static str;
 }
 
-impl BackgroundTaskStatus {
-    pub(crate) fn from_str(value: &str) -> Self {
-        match value {
-            "pending" => Self::Pending,
-            "waiting_for_input" => Self::WaitingForInput,
-            "interrupted" => Self::Interrupted,
-            "failed" => Self::Failed,
-            "running" => Self::Running,
-            "stopping" => Self::Stopping,
-            "killed" => Self::Killed,
-            "completed" => Self::Completed,
-            "unavailable" => Self::Unavailable,
-            _ => Self::Unavailable,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::WaitingForInput => "waiting_for_input",
-            Self::Interrupted => "interrupted",
-            Self::Failed => "failed",
-            Self::Running => "running",
-            Self::Stopping => "stopping",
-            Self::Killed => "killed",
-            Self::Completed => "completed",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
+impl BackgroundTaskStatusExt for WorkUnitStatus {
+    fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::WaitingForInput => "needs input",
@@ -77,13 +45,14 @@ impl BackgroundTaskStatus {
             Self::Failed => "failed",
             Self::Running => "running",
             Self::Stopping => "stopping",
-            Self::Killed => "stopped",
+            Self::Cancelled => "stopped",
             Self::Completed => "completed",
+            Self::CompletedWithIssues => "completed with issues",
             Self::Unavailable => "unavailable",
         }
     }
 
-    pub(crate) fn color(self) -> Color {
+    fn color(self) -> Color {
         let theme = crate::tui::theme::current();
         match self {
             Self::Pending => theme.accent,
@@ -92,16 +61,16 @@ impl BackgroundTaskStatus {
             Self::Failed => theme.error,
             Self::Running => theme.gutter,
             Self::Stopping => theme.accent,
-            Self::Completed => theme.success,
-            Self::Killed | Self::Unavailable => theme.dim,
+            Self::Completed | Self::CompletedWithIssues => theme.success,
+            Self::Cancelled | Self::Unavailable => theme.dim,
         }
     }
 
-    pub(crate) fn is_killable(self) -> bool {
+    fn is_killable(self) -> bool {
         matches!(self, Self::Running | Self::WaitingForInput)
     }
 
-    pub(crate) fn empty_output_state(self) -> &'static str {
+    fn empty_output_state(self) -> &'static str {
         match self {
             Self::Pending => "Pending · no output yet",
             Self::WaitingForInput => "Waiting for input · no output yet",
@@ -109,8 +78,9 @@ impl BackgroundTaskStatus {
             Self::Running => "No output yet · still running",
             Self::Stopping => "Stopping · no output captured yet",
             Self::Completed => "Completed with no output",
+            Self::CompletedWithIssues => "Completed with issues and no output",
             Self::Failed => "Failed with no output",
-            Self::Killed => "Stopped with no output",
+            Self::Cancelled => "Stopped with no output",
             Self::Unavailable => "Unavailable · stale handle or unsupported runner",
         }
     }
@@ -202,7 +172,8 @@ impl BackgroundTaskRowInit {
         Self {
             id: id.into(),
             kind,
-            status: BackgroundTaskStatus::from_str(status.as_ref()),
+            status: BackgroundTaskStatus::parse(status.as_ref())
+                .unwrap_or(BackgroundTaskStatus::Unavailable),
             elapsed_ms,
             title: title.into(),
             output_ref: None,
