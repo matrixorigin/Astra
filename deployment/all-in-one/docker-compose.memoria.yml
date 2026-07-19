@@ -126,7 +126,11 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:17001/health"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:17001/health | grep -q '\"status\":\"healthy\"'",
+        ]
       interval: 30s
       timeout: 3s
       retries: 3

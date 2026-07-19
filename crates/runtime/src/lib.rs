@@ -227,7 +227,7 @@ pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
 
 pub use app_state::{
     AppState, DatabaseHealth, HealthChecker, MatrixOneHealthChecker, MemoriaForwarder,
-    NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
+    MemoriaHealth, NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
 };
 
 // ── Re-exports: bridge ───────────────────────────────────────────────────────

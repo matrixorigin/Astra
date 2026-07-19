@@ -524,12 +524,14 @@ fn health_response_serializes() {
     let resp = HealthResponse {
         status: "ok".into(),
         database: "connected".into(),
+        memoria: "connected".into(),
         persist_ok: 42,
         persist_fail: 1,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
     assert_eq!(v["database"], "connected");
+    assert_eq!(v["memoria"], "connected");
     assert_eq!(v["persist_ok"], 42);
     assert_eq!(v["persist_fail"], 1);
 }

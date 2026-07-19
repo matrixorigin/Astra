@@ -310,31 +310,19 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn log_memoria_startup_health(state: &AppState) {
-    let Some(master_key) = state
-        .memoria_master_key
-        .as_ref()
-        .filter(|key| !key.is_empty())
-        .cloned()
-    else {
-        return;
-    };
-
-    let client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
-        state.memoria_base_url.clone(),
-        master_key,
-    );
-    match client.health_check().await {
-        Ok(()) => tracing::info!(
+    match state.memoria_forwarder.health().await {
+        crate::MemoriaHealth::Connected => tracing::info!(
             target: "astra_runtime::serve",
             memoria_base_url = %state.memoria_base_url,
             "Memoria startup health check passed"
         ),
-        Err(error) => tracing::warn!(
+        crate::MemoriaHealth::Unavailable(error) => tracing::warn!(
             target: "astra_runtime::serve",
             memoria_base_url = %state.memoria_base_url,
             error = %error,
             "Memoria startup health check failed; memory features may be degraded"
         ),
+        crate::MemoriaHealth::Disabled => {}
     }
 }
 

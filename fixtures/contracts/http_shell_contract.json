@@ -13,6 +13,7 @@
       "json": {
         "status": "healthy",
         "database": "connected",
+        "memoria": "disabled",
         "persist_ok": 0,
         "persist_fail": 0
       }
@@ -22,6 +23,7 @@
       "json": {
         "status": "unhealthy",
         "database": "unavailable",
+        "memoria": "disabled",
         "persist_ok": 0,
         "persist_fail": 0
       }

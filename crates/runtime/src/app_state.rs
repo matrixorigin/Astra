@@ -35,14 +35,6 @@ impl DatabaseHealth {
         matches!(self, Self::Connected)
     }
 
-    pub fn overall_status(self) -> &'static str {
-        if self.is_healthy() {
-            "healthy"
-        } else {
-            "unhealthy"
-        }
-    }
-
     pub fn database_label(self) -> &'static str {
         match self {
             Self::Connected => "connected",
@@ -62,6 +54,32 @@ pub trait MemoriaForwarder: Send + Sync {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String>;
+
+    /// Return readiness from the same transport that owns Memoria requests.
+    /// Keeping this on the forwarder prevents startup, request, and health
+    /// paths from inventing independent dependency truth.
+    async fn health(&self) -> MemoriaHealth;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoriaHealth {
+    Connected,
+    Unavailable(String),
+    Disabled,
+}
+
+impl MemoriaHealth {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Unavailable(_) => "unavailable",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
 }
 
 #[derive(Clone)]
@@ -806,6 +824,7 @@ pub struct ReqwestMemoriaForwarder {
     pub base_url: String,
     pub master_key: String,
     client: reqwest::Client,
+    health_timeout: std::time::Duration,
 }
 
 impl ReqwestMemoriaForwarder {
@@ -837,6 +856,7 @@ impl ReqwestMemoriaForwarder {
             base_url,
             master_key,
             client,
+            health_timeout: request_timeout.min(std::time::Duration::from_secs(5)),
         }
     }
 
@@ -881,9 +901,30 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         }
         serde_json::from_str(&text).map_err(|e| format!("Memoria parse error: {e}"))
     }
+
+    async fn health(&self) -> MemoriaHealth {
+        let url = format!("{}/v1/health/analyze", self.base_url.trim_end_matches('/'));
+        match self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", self.master_key))
+            .timeout(self.health_timeout)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => MemoriaHealth::Connected,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let bounded_body = body.chars().take(1024).collect::<String>();
+                MemoriaHealth::Unavailable(format!("status={status}, body={bounded_body}"))
+            }
+            Err(error) => MemoriaHealth::Unavailable(error.to_string()),
+        }
+    }
 }
 
-/// No-op: returns empty result. Used when Memoria is not configured.
+/// Disabled transport used when Memoria is not configured.
 pub struct NoopMemoriaForwarder;
 
 #[async_trait]
@@ -895,6 +936,10 @@ impl MemoriaForwarder for NoopMemoriaForwarder {
         _body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err("Memoria not configured on server".to_string())
+    }
+
+    async fn health(&self) -> MemoriaHealth {
+        MemoriaHealth::Disabled
     }
 }
 
@@ -1034,6 +1079,14 @@ mod tests {
             elapsed < std::time::Duration::from_secs(60),
             "should time out well before 60s, took {elapsed:?}"
         );
+
+        let health_started = std::time::Instant::now();
+        let health = forwarder.health().await;
+        assert!(matches!(health, MemoriaHealth::Unavailable(_)));
+        assert!(
+            health_started.elapsed() < std::time::Duration::from_secs(1),
+            "readiness must honor the forwarder's bounded timeout"
+        );
     }
 
     #[test]
@@ -1109,6 +1162,48 @@ mod tests {
             .await
             .expect("forward success");
         assert_eq!(result["method"], "PUT");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memoria_health_uses_authenticated_readiness_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /v1/health/analyze "), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-key"),
+                "{request}"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndatabase absent",
+                )
+                .await
+                .unwrap();
+        });
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        let health = forwarder.health().await;
+
+        assert!(matches!(
+            health,
+            MemoriaHealth::Unavailable(detail)
+                if detail.contains("503") && detail.contains("database absent")
+        ));
         server.await.unwrap();
     }
 

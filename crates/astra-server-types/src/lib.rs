@@ -490,6 +490,7 @@ pub struct RunListResponse {
 pub struct HealthResponse {
     pub status: String,
     pub database: String,
+    pub memoria: String,
     pub persist_ok: u64,
     pub persist_fail: u64,
 }

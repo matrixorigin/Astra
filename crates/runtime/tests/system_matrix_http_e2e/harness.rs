@@ -183,6 +183,15 @@ impl MemoriaForwarder for E2eMemoriaStub {
         }
         Ok(json!({ "memory_id": "e2e-stub-memory" }))
     }
+
+    async fn health(&self) -> astra_runtime::MemoriaHealth {
+        use std::sync::atomic::Ordering;
+        if self.fail_forward.load(Ordering::Relaxed) {
+            astra_runtime::MemoriaHealth::Unavailable("e2e stub unavailable".to_string())
+        } else {
+            astra_runtime::MemoriaHealth::Connected
+        }
+    }
 }
 
 async fn start_mock_memoria_health() -> String {

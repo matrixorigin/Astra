@@ -285,14 +285,22 @@ dev-deps-wait:
 		sleep 2; \
 	done
 	@echo "Waiting for Memoria..."
-	@for i in $$(seq 1 60); do \
-		if curl --noproxy '*' -sf "http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	if [ -z "$${MEMORIA_MASTER_KEY:-}" ]; then \
+		echo "❌ MEMORIA_MASTER_KEY is required for an authenticated readiness check"; \
+		exit 2; \
+	fi; \
+	for i in $$(seq 1 60); do \
+		if curl --noproxy '*' -sf \
+			-H "Authorization: Bearer $$MEMORIA_MASTER_KEY" \
+			"http://127.0.0.1:$${MEMORIA_PORT:-8100}/v1/health/analyze" >/dev/null 2>&1; then \
 			echo "✅ Memoria is healthy"; \
 			echo "✅ Dependency services ready"; \
 			exit 0; \
 		fi; \
 		if [ "$$i" -eq 60 ]; then \
 			echo "❌ Memoria not ready after 120s"; \
+			echo "   The process-only /health endpoint is not sufficient; authenticated storage readiness failed."; \
 			echo "   Tip: Check with 'make dev-deps-status' or 'make dev-deps-logs-once'"; \
 			exit 1; \
 		fi; \
@@ -621,7 +629,7 @@ stack-config: stack-check-env
 .PHONY: stack-up
 stack-up: stack-config
 	@echo "Starting compose stack..."
-	@$(STACK_COMPOSE) up -d
+	@$(STACK_COMPOSE) up -d --wait --wait-timeout 180
 	@echo "✅ Compose stack started"
 	@API_PORT=$$(sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1); \
 	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"

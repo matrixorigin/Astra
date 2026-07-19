@@ -1,8 +1,6 @@
 use super::*;
-use crate::bridge::side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT};
 use astra_services::agents::AgentListResponse;
 use astra_services::events::EventListResponse;
-use std::sync::atomic::Ordering;
 
 /// Aggregated platform snapshot returned by `GET /platform/snapshot`.
 #[derive(Serialize)]
@@ -23,8 +21,8 @@ pub(super) async fn platform_snapshot_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     // Fan out all reads concurrently.
-    let (database_health, agents_res, sessions_res, events_res) = tokio::join!(
-        state.health_checker.database_health(),
+    let (health, agents_res, sessions_res, events_res) = tokio::join!(
+        super::meta_handlers::current_health(&state),
         state.agent_service.list_agents(user.user_id.clone()),
         state.session_service.list_sessions(SessionListFilter {
             user_id: user.user_id.clone(),
@@ -43,13 +41,6 @@ pub(super) async fn platform_snapshot_handler(
             cursor: None,
         }),
     );
-
-    let health = HealthResponse {
-        status: database_health.overall_status().to_string(),
-        database: database_health.database_label().to_string(),
-        persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
-        persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
-    };
 
     Ok(Json(PlatformSnapshotResponse {
         health,

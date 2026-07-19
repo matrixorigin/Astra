@@ -24,6 +24,7 @@ pub async fn run_meta_root_and_health() {
     assert_eq!(st_h, StatusCode::OK, "health: {health}");
     assert_eq!(health["status"].as_str(), Some("healthy"));
     assert_eq!(health["database"].as_str(), Some("connected"));
+    assert_eq!(health["memoria"].as_str(), Some("connected"));
 
     assert!(
         health["persist_ok"].as_u64().is_some(),
@@ -33,6 +34,16 @@ pub async fn run_meta_root_and_health() {
         health["persist_fail"].as_u64().is_some(),
         "persist_fail counter: {health}"
     );
+
+    // Keep the real MatrixOne path healthy while the producer-owned Memoria
+    // transport reports an outage. The public aggregate must distinguish
+    // degraded optional capability from both full health and DB outage.
+    b.ctx.memoria.set_fail_forward(true);
+    let (st_degraded, degraded) = get_json(app, "/health", None, &[]).await;
+    assert_eq!(st_degraded, StatusCode::OK, "degraded health: {degraded}");
+    assert_eq!(degraded["status"].as_str(), Some("degraded"));
+    assert_eq!(degraded["database"].as_str(), Some("connected"));
+    assert_eq!(degraded["memoria"].as_str(), Some("unavailable"));
 
     b.ctx.pool.close().await;
 }

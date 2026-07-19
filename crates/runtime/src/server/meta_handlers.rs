@@ -169,15 +169,31 @@ pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResp
     })
 }
 
-pub(super) async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
-    let database_health = state.health_checker.database_health().await;
+pub(super) async fn current_health(state: &AppState) -> HealthResponse {
+    let (database_health, memoria_health) = tokio::join!(
+        state.health_checker.database_health(),
+        state.memoria_forwarder.health(),
+    );
 
-    Json(HealthResponse {
-        status: database_health.overall_status().to_string(),
+    let status = if !database_health.is_healthy() {
+        "unhealthy"
+    } else if memoria_health.is_degraded() {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    HealthResponse {
+        status: status.to_string(),
         database: database_health.database_label().to_string(),
+        memoria: memoria_health.label().to_string(),
         persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
         persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
-    })
+    }
+}
+
+pub(super) async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(current_health(&state).await)
 }
 
 /// `GET /metrics` — Prometheus text format 0.0.4.
@@ -205,7 +221,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppState, HealthChecker, ServiceInfo};
+    use crate::{AppState, HealthChecker, MemoriaForwarder, MemoriaHealth, ServiceInfo};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -217,6 +233,58 @@ mod tests {
         async fn database_healthy(&self) -> bool {
             true
         }
+    }
+
+    #[derive(Clone)]
+    struct DatabaseUnavailable;
+
+    #[async_trait]
+    impl HealthChecker for DatabaseUnavailable {
+        async fn database_healthy(&self) -> bool {
+            false
+        }
+    }
+
+    struct UnavailableMemoria;
+
+    #[async_trait]
+    impl MemoriaForwarder for UnavailableMemoria {
+        async fn forward(
+            &self,
+            _method: reqwest::Method,
+            _endpoint: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("memoria unavailable".to_string())
+        }
+
+        async fn health(&self) -> MemoriaHealth {
+            MemoriaHealth::Unavailable("shared database unavailable".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_dependency_failure_is_reported_as_degraded() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
+            .with_memoria_forwarder(Arc::new(UnavailableMemoria));
+
+        let health = current_health(&state).await;
+
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.database, "connected");
+        assert_eq!(health.memoria, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn primary_database_failure_remains_unhealthy_when_dependency_also_fails() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(DatabaseUnavailable))
+            .with_memoria_forwarder(Arc::new(UnavailableMemoria));
+
+        let health = current_health(&state).await;
+
+        assert_eq!(health.status, "unhealthy");
+        assert_eq!(health.database, "unavailable");
+        assert_eq!(health.memoria, "unavailable");
     }
 
     #[tokio::test(flavor = "current_thread")]
