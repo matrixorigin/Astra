@@ -532,7 +532,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "tempfile",
  "tokio",
  "tokio-util",

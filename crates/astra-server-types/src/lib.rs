@@ -1,8 +1,4 @@
 #[cfg(feature = "server")]
-pub mod agent_mailbox;
-#[cfg(feature = "server")]
-pub mod agent_mcp;
-#[cfg(feature = "server")]
 mod chat_route;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;

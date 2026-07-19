@@ -35,7 +35,6 @@ pub mod exit_semantics;
 pub mod fs_ops;
 pub mod fuzzy_replacer;
 pub mod git_gix;
-pub mod git_ops;
 pub mod git_tool_contract;
 pub mod github;
 pub mod github_tool_contract;

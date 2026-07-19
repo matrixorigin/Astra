@@ -151,39 +151,6 @@ pub fn shutdown_otel() {
     #[cfg(feature = "otel")]
     otel::shutdown_tracer_provider();
 }
-// ─── Secret<T> newtype (S5 stub) ─────────────────────────────────────────────
-
-/// A wrapper that redacts the inner value in `Debug` and `Display` output.
-///
-/// Use this to store secret values (API keys, passwords, tokens) in structs
-/// where you want to derive `Debug` without leaking the secret in logs or
-/// panic messages.
-///
-/// A full `tracing` subscriber layer for field-level scrubbing is deferred to
-/// a follow-up; this stub only provides the newtype wrapper.
-///
-/// # Example
-/// ```
-/// use astra_logging::Secret;
-/// let s = Secret::new("my-api-key".to_string());
-/// assert_eq!(format!("{s:?}"), "[REDACTED]");
-/// assert_eq!(format!("{s}"), "[REDACTED]");
-/// assert_eq!(s.expose(), "my-api-key");
-/// ```
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret<T: AsRef<str>>(T);
-
-impl<T: AsRef<str>> Secret<T> {
-    pub fn new(value: T) -> Self {
-        Self(value)
-    }
-
-    /// Returns the inner secret value. Avoid logging the result.
-    pub fn expose(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
 /// Redact inline secret values that appear after well-known prefixes.
 ///
 /// Replaces the value following prefixes like `sk-`, `Bearer `, and `key-`
@@ -224,52 +191,9 @@ pub fn redact_known_secret_patterns(s: &str) -> String {
     out
 }
 
-impl<T: AsRef<str>> std::fmt::Debug for Secret<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl<T: AsRef<str>> std::fmt::Display for Secret<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl From<String> for Secret<String> {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for Secret<String> {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
 #[cfg(test)]
-mod secret_tests {
-    use super::{Secret, redact_known_secret_patterns};
-
-    #[test]
-    fn secret_creation_display_and_expose() {
-        // Debug/Display redaction
-        let s = Secret::new("my-api-key-abc123".to_string());
-        assert_eq!(format!("{s:?}"), "[REDACTED]");
-        assert_eq!(format!("{s}"), "[REDACTED]");
-        assert!(!format!("{s:?}").contains("my-api-key-abc123"));
-
-        // expose returns value
-        assert_eq!(s.expose(), "my-api-key-abc123");
-
-        // From impls
-        let a: Secret<String> = "hello".into();
-        let b: Secret<String> = String::from("hello").into();
-        assert_eq!(a.expose(), "hello");
-        assert_eq!(b.expose(), "hello");
-        assert_eq!(format!("{a:?}"), "[REDACTED]");
-    }
+mod redaction_tests {
+    use super::redact_known_secret_patterns;
 
     #[test]
     fn redact_known_secret_patterns_masks_and_passthrough() {
