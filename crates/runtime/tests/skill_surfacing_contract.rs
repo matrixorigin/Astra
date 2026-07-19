@@ -221,11 +221,11 @@ fn skill_listing_nudge_carves_out_parallel_agent_intent() {
          that was being silently routed through skills). Got:\n{body}"
     );
     assert!(
-        body.contains("agent_fanout(action='start'")
-            && body.contains("agent_fanout(action='get_results'"),
-        "nudge must point at `agent_fanout(action='start', ...)` and \
-          `agent_fanout(action='get_results', ...)` so the model has a concrete \
-          atomic path when the user wants parallel fan-out. \
+        body.contains(r#"{"action":"start","target_count":2"#)
+            && body.contains(r#"{"action":"get_results","group_id":"returned-group-id"}"#,)
+            && body.contains("Never write function-call text"),
+        "nudge must use native JSON argument objects without a competing \
+          pseudo-call syntax when the user wants parallel fan-out. \
           Got:\n{body}"
     );
     assert!(

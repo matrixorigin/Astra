@@ -1220,14 +1220,20 @@ fn user_intent_preview(text: &str) -> String {
 /// requests. Local cancellation is visible to the run before any durable
 /// child-task RPCs are attempted, so a service round trip cannot allow another
 /// model round to start before cancellation is visible locally.
-async fn request_active_run_cancel(
+fn request_active_run_cancel(
     chat_widget: &mut chat_widget::ChatWidget,
+    bottom_pane: &mut BottomPane,
+    status_indicator: &mut status_indicator::StatusIndicator,
+    cancel_control_tasks: &mut tokio::task::JoinSet<()>,
     task_service: Option<&Arc<dyn astra_services::TaskService>>,
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     tui_cancel_token: &tokio_util::sync::CancellationToken,
 ) {
     run_control.request_cancel();
     tui_cancel_token.cancel();
+    let now = std::time::Instant::now();
+    bottom_pane.set_task_status(TaskStatus::Cancelling);
+    status_indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: now });
 
     let ids = chat_widget.in_flight_task_ids().to_vec();
     chat_widget.mark_control_tasks_cancelling(&ids);
@@ -1235,28 +1241,33 @@ async fn request_active_run_cancel(
     chat_widget.commit_cancel_banner(cancelled_count);
 
     if !ids.is_empty()
-        && let Some(service) = task_service
+        && let Some(service) = task_service.cloned()
     {
-        let service = service.clone();
-        let user_id = Arc::new(crate::cli::cli_config::cli_utils::cli_user_id());
-        let errors = super::cancel_fanout::fanout(&ids, move |id| {
-            let service = service.clone();
-            let user_id = user_id.clone();
-            async move {
-                service
-                    .update_status(user_id.as_str(), &id, astra_services::TaskStatus::Cancelled)
-                    .await
+        // The local run boundary is already cancelled. Remote child cleanup
+        // must not hold the key handler (and therefore the renderer) hostage
+        // to service latency. Keep the cleanup observable in logs while the
+        // foreground immediately renders `Stopping`.
+        cancel_control_tasks.spawn(async move {
+            let user_id = Arc::new(crate::cli::cli_config::cli_utils::cli_user_id());
+            let errors = super::cancel_fanout::fanout(&ids, move |id| {
+                let service = service.clone();
+                let user_id = user_id.clone();
+                async move {
+                    service
+                        .update_status(user_id.as_str(), &id, astra_services::TaskStatus::Cancelled)
+                        .await
+                }
+            })
+            .await;
+            for (id, error) in errors {
+                tracing::warn!(
+                    target: "astra_cli::tui",
+                    task_id = %id,
+                    error = %error,
+                    "active-run cancel fan-out: cancel rpc failed"
+                );
             }
-        })
-        .await;
-        for (id, error) in errors {
-            tracing::warn!(
-                target: "astra_cli::tui",
-                task_id = %id,
-                error = %error,
-                "active-run cancel fan-out: cancel rpc failed"
-            );
-        }
+        });
     }
 }
 
@@ -4668,6 +4679,7 @@ pub(crate) async fn run_tui_session(
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
+    let mut cancel_control_tasks = tokio::task::JoinSet::new();
     let mut slash_background_read_count = 0usize;
     let mut slash_background_read_generation = 0u64;
     // A single ordered worker owns all derived persistence for completed
@@ -6209,11 +6221,13 @@ pub(crate) async fn run_tui_session(
                                                                                     );
                                                                                     request_active_run_cancel(
                                                                                         &mut chat_widget,
+                                                                                        &mut bottom_pane,
+                                                                                        &mut status_indicator,
+                                                                                        &mut cancel_control_tasks,
                                                                                         task_service_for_cancel.as_ref(),
                                                                                         &preinstalled_run_control,
                                                                                         &tui_cancel_token,
-                                                                                    )
-                                                                                    .await;
+                                                                                    );
                                                                                     interrupt_pending = true;
                                                                                     bottom_pane.interrupt_pending = true;
                                                                                 }
@@ -6457,11 +6471,13 @@ pub(crate) async fn run_tui_session(
                                                                     BottomPaneAction::Interrupt | BottomPaneAction::Quit => {
                                                                         request_active_run_cancel(
                                                                             &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &mut status_indicator,
+                                                                            &mut cancel_control_tasks,
                                                                             task_service_for_cancel.as_ref(),
                                                                             &preinstalled_run_control,
                                                                             &tui_cancel_token,
-                                                                        )
-                                                                        .await;
+                                                                        );
                                                                         // Don't drain the queue here. The run is
                                                                         // being cancelled but may still emit
                                                                         // typed run-input applied events
@@ -8584,6 +8600,8 @@ pub(crate) async fn run_tui_session(
     }
     slash_background_read_tasks.abort_all();
     while slash_background_read_tasks.join_next().await.is_some() {}
+    cancel_control_tasks.abort_all();
+    while cancel_control_tasks.join_next().await.is_some() {}
     // Post-commit projections are recoverable from the canonical journal.
     // Give the ordered worker a short graceful drain on exit, then cancel it
     // rather than trapping terminal teardown behind a slow filesystem/server.
@@ -11813,12 +11831,35 @@ mod tests {
     #[tokio::test]
     async fn active_run_cancel_updates_control_plane_before_returning() {
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let mut bottom_pane = BottomPane::new();
+        let mut status_indicator = status_indicator::StatusIndicator::new();
+        let mut cancel_control_tasks = tokio::task::JoinSet::new();
+        let started_at = std::time::Instant::now();
+        bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at });
+        status_indicator.set_state(status_indicator::IndicatorState::Thinking { started_at });
         let run_control = LocalRunControl::default();
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        request_active_run_cancel(&mut chat_widget, None, &run_control, &cancel_token).await;
+        request_active_run_cancel(
+            &mut chat_widget,
+            &mut bottom_pane,
+            &mut status_indicator,
+            &mut cancel_control_tasks,
+            None,
+            &run_control,
+            &cancel_token,
+        );
 
         assert!(cancel_token.is_cancelled());
+        let rendered = status_indicator
+            .render()
+            .expect("cancellation remains visible until terminal settlement")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Stopping"), "{rendered}");
+        assert!(!rendered.contains("Working"), "{rendered}");
         assert_eq!(
             run_control
                 .control_status("local-user", "run-local")

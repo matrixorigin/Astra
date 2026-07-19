@@ -168,6 +168,9 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             TaskStatus::WaitingModel => {
                 "Queued for current run · applies when model resumes".to_string()
             }
+            TaskStatus::Cancelling => {
+                "Stopping current run · guidance returns to composer".to_string()
+            }
             TaskStatus::Idle | TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
                 "Queued for current run · applies at next model boundary".to_string()
             }
@@ -468,6 +471,15 @@ impl BottomPane {
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
+        // Cancellation is a monotonic foreground projection. Provider/tool
+        // events already queued before Ctrl+C may still arrive, but they do
+        // not revoke the user's stop intent. Only terminal settlement may
+        // return the pane to Idle.
+        if matches!(self.task_status, TaskStatus::Cancelling)
+            && !matches!(status, TaskStatus::Cancelling | TaskStatus::Idle)
+        {
+            return;
+        }
         let was_active = self.task_status.is_active();
         self.task_status = status;
         let now_active = self.task_status.is_active();

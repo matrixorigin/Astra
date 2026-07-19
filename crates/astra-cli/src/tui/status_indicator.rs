@@ -40,6 +40,9 @@ pub(crate) enum IndicatorState {
     /// Accepted by the local UI and being dispatched to the selected action
     /// or run path. No remote/model acknowledgement has arrived yet.
     Dispatching { started_at: Instant },
+    /// A user stop request is visible locally while the run and any child
+    /// control-plane updates converge on a terminal state.
+    Cancelling { started_at: Instant },
     /// Turn is running, model is thinking / producing tokens.
     Thinking { started_at: Instant },
     /// Tool is executing mid-turn.
@@ -55,6 +58,7 @@ impl IndicatorState {
         match self {
             IndicatorState::Idle => None,
             IndicatorState::Dispatching { started_at }
+            | IndicatorState::Cancelling { started_at }
             | IndicatorState::Thinking { started_at }
             | IndicatorState::Tool { started_at, .. }
             | IndicatorState::WaitingModel { started_at }
@@ -109,6 +113,17 @@ impl StatusIndicator {
     }
 
     pub fn set_state(&mut self, state: IndicatorState) {
+        // Stream events queued before Ctrl+C can arrive during shutdown. They
+        // are progress evidence, not authority to revoke the user's cancel
+        // intent, so keep Stopping monotonic until terminal settlement.
+        if matches!(self.state, IndicatorState::Cancelling { .. })
+            && !matches!(
+                state,
+                IndicatorState::Cancelling { .. } | IndicatorState::Idle
+            )
+        {
+            return;
+        }
         // The stream counter resets across state changes only when
         // entering a *brand new turn*. Within a turn, tool ↔ thinking
         // transitions preserve `stream_chars` so `↓ Nk tokens` keeps
@@ -128,6 +143,8 @@ impl StatusIndicator {
             self.stream_chars = 0;
             self.turn_started_at = None;
             self.turn_label = None;
+        } else if matches!(state, IndicatorState::Cancelling { .. }) {
+            self.turn_label = Some("Stopping");
         } else if self.turn_started_at.is_none() {
             // Auto-start a turn when transitioning out of Idle. Lets
             // existing callers that drive `set_state(Thinking{...})`
@@ -239,6 +256,7 @@ fn render_for_with_bash_hint(
 
     let state_label: String = match state {
         IndicatorState::Dispatching { .. } => "Sending".into(),
+        IndicatorState::Cancelling { .. } => "Stopping".into(),
         IndicatorState::Thinking { .. } => "Thinking".into(),
         IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Starting".into(),
@@ -296,6 +314,7 @@ fn label_for_tool(name: &str) -> String {
 fn indicator_state_color(state: &IndicatorState, theme: &crate::tui::theme::Theme) -> Color {
     match state {
         IndicatorState::AwaitingApproval { .. } => theme.warn,
+        IndicatorState::Cancelling { .. } => theme.warn,
         IndicatorState::Dispatching { .. }
         | IndicatorState::Thinking { .. }
         | IndicatorState::Tool { .. }
@@ -336,7 +355,9 @@ fn suffix(
             crate::tui::background_shortcut::ctrl_b_background_shortcut()
         ));
     }
-    parts.push("Ctrl+C to stop".into());
+    if !matches!(state, IndicatorState::Cancelling { .. }) {
+        parts.push("Ctrl+C to stop".into());
+    }
     parts.join(" · ")
 }
 
@@ -909,6 +930,28 @@ mod tests {
         s.set_state(IndicatorState::Idle);
         assert_eq!(s.stream_chars, 0);
         assert!(s.turn_started_at.is_none());
+    }
+
+    #[test]
+    fn cancelling_replaces_working_and_removes_stale_stop_affordance() {
+        let mut indicator = StatusIndicator::new();
+        let started_at = Instant::now();
+        indicator.begin_turn(started_at);
+        indicator.set_state(IndicatorState::Thinking { started_at });
+        indicator.set_state(IndicatorState::Cancelling { started_at });
+        indicator.set_state(IndicatorState::Tool {
+            name: "agent_fanout".into(),
+            started_at: started_at + Duration::from_secs(1),
+        });
+
+        let rendered = text_of(
+            &indicator
+                .render_at(started_at + Duration::from_secs(2))
+                .expect("cancelling remains visible until settlement"),
+        );
+        assert!(rendered.contains("Stopping"), "{rendered}");
+        assert!(!rendered.contains("Working"), "{rendered}");
+        assert!(!rendered.contains("Ctrl+C to stop"), "{rendered}");
     }
 
     // ── formatting ───────────────────────────────────────────────

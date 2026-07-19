@@ -18,6 +18,22 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
+    let mut pane = BottomPane::new();
+    let started_at = Instant::now();
+    pane.set_task_status(TaskStatus::TurnRunning { started_at });
+    pane.set_task_status(TaskStatus::Cancelling);
+    pane.set_task_status(TaskStatus::ToolExecuting {
+        name: "agent_fanout".into(),
+        started_at,
+    });
+
+    assert!(matches!(pane.task_status, TaskStatus::Cancelling));
+    pane.set_task_status(TaskStatus::Idle);
+    assert!(matches!(pane.task_status, TaskStatus::Idle));
+}
+
+#[test]
 fn backtab_opens_permission_picker_when_composer_is_active() {
     let mut pane = BottomPane::new();
 

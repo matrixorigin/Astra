@@ -589,8 +589,11 @@ pub fn render_agent_tool_error_with_kind(
 /// A malformed provider tool-call is not a failed sub-agent run. It is an
 /// unexecuted boundary failure, so preserve that distinction for the model,
 /// transcript, and TUI without echoing the corrupt argument bytes.
-pub fn render_agent_tool_malformed_arguments_error(tool_name: &str) -> String {
-    json!({
+pub fn render_agent_tool_malformed_arguments_error(
+    tool_name: &str,
+    parse_error: Option<&Value>,
+) -> String {
+    let mut body = json!({
         "status": AgentToolResultStatusKind::Failed.as_str(),
         "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
         "error": "Tool arguments were not valid JSON; no agent was started.",
@@ -598,10 +601,33 @@ pub fn render_agent_tool_malformed_arguments_error(tool_name: &str) -> String {
             "kind": "malformed_tool_arguments",
             "tool": tool_name,
             "executed": false,
-            "next_step": "Create one new complete JSON tool call that matches the advertised schema.",
+            "next_step": "Retry the same native tool once with one complete JSON argument object matching the advertised schema; do not write function-call text or markup in the arguments field.",
         },
-    })
-    .to_string()
+    });
+    if let Some(parse_error) = parse_error.and_then(sanitized_parse_error_metadata) {
+        body["advisory"]["parse_error"] = parse_error;
+    }
+    body.to_string()
+}
+
+fn sanitized_parse_error_metadata(parse_error: &Value) -> Option<Value> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(kind @ ("invalid_json" | "truncated")) =
+        parse_error.get("kind").and_then(Value::as_str)
+    {
+        metadata.insert("kind".into(), json!(kind));
+    }
+    if let Some(category @ ("io" | "syntax" | "data" | "eof")) =
+        parse_error.get("category").and_then(Value::as_str)
+    {
+        metadata.insert("category".into(), json!(category));
+    }
+    for field in ["argument_bytes", "line", "column"] {
+        if let Some(value) = parse_error.get(field).and_then(Value::as_u64) {
+            metadata.insert(field.into(), json!(value));
+        }
+    }
+    (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
 fn agent_tool_result_preview(result: &str) -> String {
@@ -922,5 +948,32 @@ mod tests {
             agent_tool_status_summary(&failed).as_deref(),
             Some("child result retrieval failed")
         );
+    }
+
+    #[test]
+    fn malformed_argument_receipt_exposes_only_safe_parse_metadata() {
+        let rendered = render_agent_tool_malformed_arguments_error(
+            "agent_fanout",
+            Some(&json!({
+                "kind": "invalid_json",
+                "category": "eof",
+                "argument_bytes": 2048,
+                "line": 1,
+                "column": 2049,
+                "raw": "do-not-echo"
+            })),
+        );
+        let value: Value = serde_json::from_str(&rendered).expect("structured receipt");
+        assert_eq!(
+            value["advisory"]["parse_error"],
+            json!({
+                "kind": "invalid_json",
+                "category": "eof",
+                "argument_bytes": 2048,
+                "line": 1,
+                "column": 2049
+            })
+        );
+        assert!(!rendered.contains("do-not-echo"));
     }
 }

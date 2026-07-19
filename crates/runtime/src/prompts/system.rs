@@ -246,14 +246,14 @@ fn build_skill_listing_section_with_budget_and_caps(
              route through `agent_fanout` instead of skill execution or an \
              `agents:[...]` payload. If `agent_fanout` is not present in \
              `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
-             to fetch its full schema. Then submit one complete JSON argument \
-             object with `agent_fanout(action='start', ...)`, and later collect \
-             with `agent_fanout(action='get_results', ...)`. JSON-call syntax is still required; these strings name the route. \
-             For example submit an argument \
-             object, for example \
+             to fetch its full schema. Then call the native `agent_fanout` tool \
+             with one complete JSON argument object. Never write function-call \
+             text such as `agent_fanout(...)` into the arguments field. For a \
+             start call, use an argument object such as \
              `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
              Put each child's full brief in that slot's `prompt`, then collect \
-             with `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. Skills usually run sequentially inside the \
+             by calling the same native tool with \
+             `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. Skills usually run sequentially inside the \
              parent turn, which contradicts the user's explicit fan-out intent.",
         );
     } else {

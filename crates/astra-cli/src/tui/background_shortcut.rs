@@ -6,6 +6,10 @@ pub(crate) fn background_task_open_hint() -> &'static str {
     "Shift+↓ manage"
 }
 
+pub(crate) fn agent_workbench_open_hint() -> &'static str {
+    "Ctrl+G agents"
+}
+
 pub(crate) fn ctrl_b_background_shortcut_for_tmux(is_tmux: bool) -> &'static str {
     if is_tmux {
         "Ctrl+B Ctrl+B (twice)"
@@ -34,5 +38,10 @@ mod tests {
     #[test]
     fn background_task_open_hint_uses_navigation_manage_shortcut() {
         assert_eq!(background_task_open_hint(), "Shift+↓ manage");
+    }
+
+    #[test]
+    fn agent_workbench_hint_names_the_agent_surface() {
+        assert_eq!(agent_workbench_open_hint(), "Ctrl+G agents");
     }
 }

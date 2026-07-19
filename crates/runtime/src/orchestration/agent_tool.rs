@@ -391,7 +391,10 @@ pub struct AgentToolContext {
 /// owns spawn/get_result/send_message validation and rendering.
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
     if has_malformed_tool_args(args) {
-        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent");
+        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error(
+            "agent",
+            args.get("_parse_error"),
+        );
     }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
@@ -623,7 +626,10 @@ pub async fn handle_agent_send_message_with_router(
 /// Handle the atomic `agent_fanout` tool.
 pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
     if has_malformed_tool_args(args) {
-        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent_fanout");
+        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error(
+            "agent_fanout",
+            args.get("_parse_error"),
+        );
     }
     let action = match agent_fanout_action_from_args(args) {
         Ok(action) => action,
@@ -4584,7 +4590,14 @@ mod tests {
     #[tokio::test]
     async fn agent_fanout_malformed_args_returns_unexecuted_structured_advisory() {
         let result = handle_agent_fanout_tool(
-            &json!({"_parse_error": {"kind": "invalid_json", "executed": false}}),
+            &json!({"_parse_error": {
+                "kind": "invalid_json",
+                "executed": false,
+                "category": "eof",
+                "argument_bytes": 512,
+                "line": 1,
+                "column": 513
+            }}),
             None,
         )
         .await;
@@ -4597,6 +4610,8 @@ mod tests {
         assert_eq!(value["advisory"]["kind"], "malformed_tool_arguments");
         assert_eq!(value["advisory"]["tool"], "agent_fanout");
         assert_eq!(value["advisory"]["executed"], false);
+        assert_eq!(value["advisory"]["parse_error"]["category"], "eof");
+        assert_eq!(value["advisory"]["parse_error"]["argument_bytes"], 512);
     }
 
     #[tokio::test]

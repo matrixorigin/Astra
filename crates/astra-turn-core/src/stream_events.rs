@@ -202,8 +202,10 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
             .cloned()
             .unwrap_or_else(|| Value::String("{}".to_string()));
         match raw_arguments {
-            Value::String(text) => serde_json::from_str::<Value>(&text)
-                .unwrap_or_else(|_| invalid_tool_arguments("invalid_json")),
+            Value::String(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(arguments) => arguments,
+                Err(error) => invalid_json_tool_arguments(&text, &error),
+            },
             other => other,
         }
     };
@@ -232,6 +234,26 @@ fn invalid_tool_arguments(kind: &str) -> Value {
         serde_json::json!({
             "kind": kind,
             "executed": false,
+        }),
+    )]))
+}
+
+fn invalid_json_tool_arguments(text: &str, error: &serde_json::Error) -> Value {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    Value::Object(Map::from_iter([(
+        "_parse_error".to_string(),
+        serde_json::json!({
+            "kind": "invalid_json",
+            "executed": false,
+            "category": category,
+            "argument_bytes": text.len(),
+            "line": error.line(),
+            "column": error.column(),
         }),
     )]))
 }
@@ -842,7 +864,28 @@ mod tests {
         let parse_error = &ev["arguments"]["_parse_error"];
         assert_eq!(parse_error["kind"], "invalid_json");
         assert_eq!(parse_error["executed"], false);
+        assert_eq!(parse_error["category"], "syntax");
+        assert_eq!(parse_error["argument_bytes"], raw.len());
+        assert!(parse_error["column"].as_u64().is_some());
         assert_ne!(ev["arguments"], Value::String(raw.to_string()));
+    }
+
+    #[test]
+    fn edge_tool_call_incomplete_json_records_eof_without_raw_arguments() {
+        let raw = r#"{"action":"start","slots":["#;
+        let tc = Map::from_iter([
+            ("id".to_string(), Value::String("c1".into())),
+            (
+                "function".to_string(),
+                json!({"name": "agent_fanout", "arguments": raw}),
+            ),
+        ]);
+
+        let ev = build_edge_tool_call_event(&tc);
+        let parse_error = &ev["arguments"]["_parse_error"];
+        assert_eq!(parse_error["category"], "eof");
+        assert_eq!(parse_error["argument_bytes"], raw.len());
+        assert!(!Value::Object(ev).to_string().contains(raw));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 pub(crate) enum TaskStatus {
     Idle,
     Dispatching,
+    Cancelling,
     TurnRunning { started_at: Instant },
     ToolExecuting { name: String, started_at: Instant },
     WaitingApproval { tool: String },
@@ -27,6 +28,7 @@ impl TaskStatus {
         match self {
             TaskStatus::Idle => "",
             TaskStatus::Dispatching => "Sending",
+            TaskStatus::Cancelling => "Stopping",
             TaskStatus::TurnRunning { .. } => "Thinking",
             TaskStatus::ToolExecuting { .. } => "Running tool",
             TaskStatus::WaitingApproval { .. } => "Awaiting approval",
@@ -38,6 +40,7 @@ impl TaskStatus {
         match self {
             TaskStatus::Idle => None,
             TaskStatus::Dispatching => Some("Sending".to_string()),
+            TaskStatus::Cancelling => Some("Stopping".to_string()),
             TaskStatus::TurnRunning { .. } => Some("Thinking".to_string()),
             TaskStatus::ToolExecuting { name, .. } => Some(format!("Running {name}")),
             TaskStatus::WaitingApproval { tool } => {
@@ -79,5 +82,13 @@ mod tests {
         assert!(status.is_active());
         assert_eq!(status.display_label(), "Sending");
         assert_eq!(status.objective_label().as_deref(), Some("Sending"));
+    }
+
+    #[test]
+    fn cancelling_replaces_the_running_objective() {
+        let status = TaskStatus::Cancelling;
+        assert!(status.is_active());
+        assert_eq!(status.display_label(), "Stopping");
+        assert_eq!(status.objective_label().as_deref(), Some("Stopping"));
     }
 }

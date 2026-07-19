@@ -463,6 +463,23 @@ impl ToolCell {
         }
     }
 
+    /// Whether the runtime supplied a typed receipt proving that execution
+    /// never began. Tool failures normally represent attempted execution, but
+    /// malformed provider arguments fail before that boundary and must not be
+    /// described as `Ran ...`.
+    fn execution_was_rejected(&self) -> bool {
+        [self.output_summary.as_deref(), self.output.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(structured_tool_result)
+            .any(|value| {
+                value
+                    .pointer("/advisory/executed")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            })
+    }
+
     /// Transcript-only projection with optional full arguments/result. The
     /// canonical Tool event remains unchanged.
     pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
@@ -547,7 +564,9 @@ impl ToolCell {
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
         } else {
-            let title = if let Some(task_header) = background_task_tool_header(&self.name) {
+            let title = if self.execution_was_rejected() {
+                format!("Did not run {label}")
+            } else if let Some(task_header) = background_task_tool_header(&self.name) {
                 task_header.to_string()
             } else {
                 format!("Ran {label}")
@@ -932,6 +951,15 @@ fn non_empty_tool_text(value: Option<String>) -> Option<String> {
     value.filter(|text| !text.trim().is_empty())
 }
 
+fn structured_tool_result(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(text).ok().or_else(|| {
+        // The model-facing recovery hint may follow the canonical JSON receipt
+        // on a separate line. Parse only the complete first record; never
+        // infer lifecycle state from human-readable recovery prose.
+        serde_json::from_str(text.lines().next()?).ok()
+    })
+}
+
 fn failure_detail_fallback(name: &str, description: &str) -> String {
     let label = friendly_tool_display_name_for_context(name, description);
     if name == "agent_fanout" {
@@ -1257,6 +1285,22 @@ mod tests {
         let out = render(&t, 80, 3);
         assert!(out.contains("● Ran Bash · 10ms"));
         assert!(!out.contains("· failed"), "{out}");
+    }
+
+    #[test]
+    fn pre_execution_rejection_is_not_rendered_as_ran() {
+        let mut t = err_tool("agent_fanout", "agent_fanout", 10);
+        t.output = Some(
+            serde_json::json!({
+                "status": "failed",
+                "error_kind": "tool_invalid_args",
+                "advisory": {"executed": false}
+            })
+            .to_string(),
+        );
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Did not run Agent Fanout · 10ms"), "{out}");
+        assert!(!out.contains("Ran Agent Fanout"), "{out}");
     }
 
     #[test]

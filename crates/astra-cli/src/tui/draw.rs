@@ -83,9 +83,10 @@ pub(crate) struct MultiAgentEntry {
 /// cancellation is an intent, not an alarm — surfacing it as a separate
 /// bucket avoids confusing a user-requested stop with an agent failure.
 ///
-/// The one visible management hint is shared with the status line and opens
-/// the canonical background-work surface. Individual rows belong there, not
-/// in a second list that competes with the conversation.
+/// Both canonical routes stay discoverable: Ctrl+G opens retained agent
+/// conversations, while Shift+Down opens the typed background-task surface.
+/// Individual rows belong on those surfaces, not in a second list that
+/// competes with the conversation.
 pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     let total = cells.len();
     let uncertain = cells
@@ -188,8 +189,9 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
 
     let noun = if total == 1 { "agent" } else { "agents" };
     format!(
-        "{} {total} {noun}{breakdown} · {}",
+        "{} {total} {noun}{breakdown} · {} · {}",
         crate::tui::glyphs::current().agent_fanout,
+        crate::tui::background_shortcut::agent_workbench_open_hint(),
         crate::tui::background_shortcut::background_task_open_hint(),
     )
 }
@@ -1818,6 +1820,7 @@ mod multi_agent_strip_tests {
         assert!(!header.contains("failed"));
         assert!(!header.contains("done"));
         assert!(header.contains("Shift+↓ manage"));
+        assert!(header.contains("Ctrl+G agents"));
         assert!(!header.contains("X stop"));
     }
 

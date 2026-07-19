@@ -387,6 +387,32 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::Slow,
+    )
+    .await
+    .expect("start scripted slow LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"hold this turn open\r");
+    astra.wait_for("Working", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x03]); // Ctrl+C through the real raw-mode input boundary.
+
+    astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);
+    assert!(
+        !astra.current_screen().contains("Working"),
+        "the accepted stop intent must replace the prior activity projection\n{}",
+        astra.screen_diagnostic()
+    );
+    astra.wait_for("Enter send", Duration::from_secs(15));
+}
+
 fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
     request
         .get("agent_type")
