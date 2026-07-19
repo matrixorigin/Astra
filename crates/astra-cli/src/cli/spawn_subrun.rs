@@ -872,7 +872,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,

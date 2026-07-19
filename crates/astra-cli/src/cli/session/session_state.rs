@@ -380,9 +380,9 @@ pub(crate) struct SessionState {
     /// recorded this session to prevent double-recording.
     pub lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer,
 
-    /// Resolved memory model connection parameters (cached at first use).
-    /// Used for memory relevance filtering with the cheapest model from the registry.
-    pub memory_model_params: Option<astra_runtime::memory_hooks::relevance::LlmConnParams>,
+    /// Resolved memory model identity cached at first use. Credentials remain
+    /// turn-scoped and are never retained in session state.
+    pub memory_model_name: Option<String>,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
     pub session_memory_extractor:
@@ -634,7 +634,7 @@ impl Default for SessionState {
             session_lessons: Vec::new(),
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
-            memory_model_params: None,
+            memory_model_name: None,
             session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
@@ -786,7 +786,7 @@ impl SessionState {
         self.session_lessons.clear();
         self.session_lessons_loaded = false;
         self.lesson_checkpointer = Default::default();
-        self.memory_model_params = None;
+        self.memory_model_name = None;
         self.latest_skill_diagnosis = None;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;

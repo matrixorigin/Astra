@@ -1483,19 +1483,6 @@ pub async fn resolve_memory_models(
         .collect()
 }
 
-/// Resolve the best memory-model candidate.
-pub async fn resolve_memory_model(
-    matrixone: &MatrixOneSettings,
-    encryptor: &FernetTokenEncryptor,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
-    resolve_memory_models(matrixone, encryptor, pool)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No active LLM model configured.".to_string())
-}
-
 /// Return the index of the cheapest entry by `pricing.completion`.
 ///
 /// * Missing / unparseable pricing and `completion <= 0` are treated as `+infinity`,
@@ -4222,11 +4209,11 @@ mod tests {
         assert!(msg.contains("Invalid base_url"), "got: {msg}");
     }
 
-    // ── resolve_memory_model: selector tag preference ──────────────────
+    // ── memory model ranking: selector tag preference ──────────────────
 
     #[test]
     fn selector_tag_detected_in_tags_json() {
-        // Simulates the tag matching logic from resolve_memory_model.
+        // Simulates the tag matching logic from memory model ranking.
         let with_selector = r#"["chat", "selector"]"#;
         let without_selector = r#"["chat", "reasoning"]"#;
         let empty = "[]";

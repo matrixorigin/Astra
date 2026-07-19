@@ -7,6 +7,7 @@ pub mod session_diagnosis;
 pub mod session_guard;
 pub mod session_input;
 pub mod session_lessons;
+pub mod session_memory_inference;
 pub mod session_projection;
 pub mod session_recovery;
 pub mod session_restore_client;

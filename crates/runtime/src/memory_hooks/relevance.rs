@@ -3,16 +3,15 @@
 //! Filters retrieved memories/lessons to only those clearly relevant
 //! to the current task, reducing prompt noise and token waste.
 //! Uses the cheapest `selector`-tagged model from the registry
-//! (resolved via `resolve_memory_model` from the model DB).
+//! (resolved via `resolve_memory_models` from the model DB).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use astra_text_utils::text_tokenize::tokenize;
-use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_types::InferencePurpose;
 
-use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, call_llm_nonstream, global_llm_client};
+use super::inference::{MemoryInferencePort, MemoryInferenceRequest};
 
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "\
@@ -204,75 +203,6 @@ fn is_meaningful_term(term: &str) -> bool {
     true
 }
 
-/// Connection parameters for an OpenAI-compatible LLM endpoint.
-/// Resolved from the model registry via `resolve_memory_model`.
-#[derive(Clone)]
-pub struct LlmConnParams {
-    pub base_url: String,
-    pub api_key: String,
-    pub model_name: String,
-    pub wire_model_name: Option<String>,
-    pub provider: String,
-    pub header_overrides: HashMap<String, String>,
-    pub request_body_overrides: Option<serde_json::Map<String, serde_json::Value>>,
-    pub completions_url_override: Option<String>,
-    pub request_timeout: Option<Duration>,
-}
-
-impl LlmConnParams {
-    pub fn from_resolved(
-        model: astra_services::models::ResolvedActiveLlmModel,
-    ) -> Result<Self, String> {
-        let header_overrides = model.execution_header_overrides()?;
-        Ok(Self {
-            base_url: model.base_url,
-            api_key: model.api_key,
-            model_name: model.model_name,
-            wire_model_name: model.wire_model_name,
-            provider: model.provider,
-            header_overrides,
-            request_body_overrides: model.request_body_overrides,
-            completions_url_override: None,
-            request_timeout: None,
-        })
-    }
-
-    pub(crate) fn execution_route(&self) -> LlmExecutionRoute<'_> {
-        LlmExecutionRoute {
-            model_name: &self.model_name,
-            wire_model_name: self.wire_model_name.as_deref(),
-            api_key: &self.api_key,
-            base_url: &self.base_url,
-            provider: &self.provider,
-            header_overrides: (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
-            request_body_overrides: self.request_body_overrides.as_ref(),
-            completions_url_override: self.completions_url_override.as_deref(),
-            request_timeout: self.request_timeout,
-        }
-    }
-}
-
-impl std::fmt::Debug for LlmConnParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmConnParams")
-            .field("model_name", &self.model_name)
-            .field("wire_model_name", &self.wire_model_name)
-            .field("provider", &self.provider)
-            .field("credential_present", &!self.api_key.is_empty())
-            .field("header_count", &self.header_overrides.len())
-            .field(
-                "request_body_overrides_present",
-                &self.request_body_overrides.is_some(),
-            )
-            .field(
-                "completions_url_override_present",
-                &self.completions_url_override.is_some(),
-            )
-            .field("request_timeout", &self.request_timeout)
-            .finish()
-    }
-}
-
 /// Filter a list of text items through the selector model.
 /// Returns only items deemed relevant to `user_message`.
 ///
@@ -280,7 +210,7 @@ impl std::fmt::Debug for LlmConnParams {
 /// If the selector explicitly returns no relevant indices, returns an empty
 /// list. Prompt noise is more harmful than a missed memory.
 pub async fn filter_memories(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
     user_message: &str,
     items: &[String],
 ) -> Vec<String> {
@@ -289,7 +219,7 @@ pub async fn filter_memories(
     }
     let query = build_relevance_query(user_message, items);
     let text = match run_selector_prompt(
-        params,
+        client,
         InferencePurpose::MemoryRetrievalRerank,
         RELEVANCE_FILTER_PROMPT,
         query,
@@ -305,7 +235,7 @@ pub async fn filter_memories(
         Err(error) => {
             tracing::debug!(
                 target: "astra_runtime::memory_relevance",
-                model_name = %params.model_name,
+                model_name = %client.model_name(),
                 purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
                 %error,
                 "memory selector returned an invalid response"
@@ -324,7 +254,7 @@ pub async fn filter_memories(
 /// user is explicitly rejecting. On any failure, returns an empty set rather
 /// than guessing from surface words.
 pub async fn select_dismissed_memory_indices(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
     user_message: &str,
     items: &[String],
 ) -> Vec<usize> {
@@ -333,7 +263,7 @@ pub async fn select_dismissed_memory_indices(
     }
     let query = build_memory_feedback_query(user_message, items);
     let text = match run_selector_prompt(
-        params,
+        client,
         InferencePurpose::MemoryRetrievalRerank,
         MEMORY_FEEDBACK_FILTER_PROMPT,
         query,
@@ -348,7 +278,7 @@ pub async fn select_dismissed_memory_indices(
         Err(error) => {
             tracing::debug!(
                 target: "astra_runtime::memory_relevance",
-                model_name = %params.model_name,
+                model_name = %client.model_name(),
                 purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
                 %error,
                 "memory feedback selector returned an invalid response"
@@ -359,7 +289,7 @@ pub async fn select_dismissed_memory_indices(
 }
 
 async fn run_selector_prompt(
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
     purpose: InferencePurpose,
     system_prompt: &str,
     user_content: String,
@@ -368,28 +298,22 @@ async fn run_selector_prompt(
         serde_json::json!({"role": "system", "content": system_prompt}),
         serde_json::json!({"role": "user", "content": user_content}),
     ];
-    let result = call_llm_nonstream(
-        global_llm_client(),
-        LlmCall {
+    let result = client
+        .complete(MemoryInferenceRequest {
             purpose,
             messages: &messages,
-            tools: &[],
-            route: params.execution_route(),
-            max_output_tokens: Some(50),
-            temperature: Some(0.0),
-            has_fallback: false,
-            thinking: &ThinkingConfig::Off,
-        },
-        Duration::from_secs(3),
-    )
-    .await;
+            max_output_tokens: 50,
+            temperature: 0.0,
+            deadline: Duration::from_secs(3),
+        })
+        .await;
     let text = match result {
-        Ok(result) if !result.full_text.trim().is_empty() => result.full_text,
+        Ok(result) if !result.trim().is_empty() => result,
         Ok(_) => return None,
         Err(error) => {
             tracing::debug!(
                 target: "astra_runtime::memory_relevance",
-                model_name = %params.model_name,
+                model_name = %client.model_name(),
                 purpose = purpose.as_str(),
                 error_kind = %error.kind,
                 "memory selector model call unavailable"
@@ -422,6 +346,28 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_hooks::DirectMemoryInferenceClient;
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct CapturingInference {
+        purposes: Arc<std::sync::Mutex<Vec<InferencePurpose>>>,
+    }
+
+    #[async_trait]
+    impl MemoryInferencePort for CapturingInference {
+        fn model_name(&self) -> &str {
+            "capturing-reranker"
+        }
+
+        async fn complete(
+            &self,
+            request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.purposes.lock().unwrap().push(request.purpose);
+            Ok("[0]".to_string())
+        }
+    }
 
     #[test]
     fn relevance_response_requires_a_json_index_array() {
@@ -472,6 +418,23 @@ mod tests {
         assert_eq!(result, vec!["不要用bash执行git命令".to_string()]);
     }
 
+    #[tokio::test]
+    async fn relevance_filter_attributes_the_call_as_memory_rerank() {
+        let purposes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = CapturingInference {
+            purposes: Arc::clone(&purposes),
+        };
+        let items = vec!["Prefer cargo test for Rust changes".to_string()];
+
+        let filtered = filter_memories(&client, "review Rust", &items).await;
+
+        assert_eq!(filtered, items);
+        assert_eq!(
+            *purposes.lock().unwrap(),
+            vec![InferencePurpose::MemoryRetrievalRerank]
+        );
+    }
+
     #[test]
     fn build_query_includes_all_memories() {
         let query = build_relevance_query(
@@ -503,52 +466,11 @@ mod tests {
         assert!(query.len() < 500 + 200); // truncated message + memory
     }
 
-    // ── LlmConnParams tests ──
-
-    #[test]
-    fn llm_conn_params_clone() {
-        let params = LlmConnParams {
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "sk-test".into(),
-            model_name: "qwen-flash".into(),
-            wire_model_name: None,
-            provider: "openai".into(),
-            request_body_overrides: None,
-            header_overrides: std::collections::HashMap::new(),
-            completions_url_override: None,
-            request_timeout: None,
-        };
-        let cloned = params.clone();
-        assert_eq!(cloned.base_url, "https://api.example.com/v1");
-        assert_eq!(cloned.api_key, "sk-test");
-        assert_eq!(cloned.model_name, "qwen-flash");
-    }
-
-    #[test]
-    fn llm_conn_params_debug_format() {
-        let params = LlmConnParams {
-            base_url: "http://localhost:8080".into(),
-            api_key: "key".into(),
-            model_name: "model".into(),
-            wire_model_name: None,
-            provider: "openai".into(),
-            request_body_overrides: None,
-            header_overrides: std::collections::HashMap::new(),
-            completions_url_override: None,
-            request_timeout: None,
-        };
-        let debug = format!("{params:?}");
-        assert!(debug.contains("LlmConnParams"));
-        assert!(debug.contains("model"));
-        assert!(!debug.contains("key"));
-        assert!(!debug.contains("localhost"));
-    }
-
     // ── filter_memories tests ──
 
     #[tokio::test]
     async fn filter_memories_empty_input_returns_empty() {
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: "http://nonexistent:9999".into(),
             api_key: "key".into(),
             model_name: "model".into(),
@@ -565,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn filter_memories_unreachable_server_uses_lexical_fallback() {
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
             model_name: "model".into(),
@@ -622,7 +544,7 @@ mod tests {
     async fn filter_memories_native_thinker_sends_suppression() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "qwen3.5-flash".into(),
@@ -647,7 +569,7 @@ mod tests {
     async fn filter_memories_non_native_does_not_send_suppression() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "gpt-4o-mini".into(),
@@ -672,7 +594,7 @@ mod tests {
     async fn filter_memories_strips_think_tags_from_response() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>reasoning</think>[0, 2]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -692,7 +614,7 @@ mod tests {
     async fn filter_memories_malformed_selector_output_uses_lexical_fallback() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -718,7 +640,7 @@ mod tests {
     async fn filter_memories_successful_filtering() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[1]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -738,7 +660,7 @@ mod tests {
     async fn filter_memories_selector_empty_means_no_injection() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -761,7 +683,7 @@ mod tests {
     async fn select_dismissed_memory_indices_uses_selector_output() {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),

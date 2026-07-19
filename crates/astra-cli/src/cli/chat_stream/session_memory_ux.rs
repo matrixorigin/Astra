@@ -220,7 +220,7 @@ mod tests {
     use super::SessionMemoryUxBridge;
     use crate::cli::chat_stream::params::{StreamEvent, StreamEventRx, stream_event_channel};
     use astra_runtime::session_memory::{
-        BackgroundActivity, BackgroundActivityBroker, ConstSelectorResolver,
+        BackgroundActivity, BackgroundActivityBroker, ConstMemoryInferenceResolver,
         MemoryExtractionService,
     };
     use astra_runtime::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
@@ -266,7 +266,7 @@ mod tests {
         let broker = Arc::new(BackgroundActivityBroker::new());
         let memoria: Arc<dyn MemoriaPort> = Arc::new(NullMemoria);
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             memoria,
             ingestion,
             "ux-test",
@@ -461,7 +461,7 @@ mod tests {
         let broker = Arc::new(BackgroundActivityBroker::with_capacity(2));
         let (ingestion, _ing_rx) = IngestionSender::for_tests(16);
         let svc = Arc::new(MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(ConstMemoryInferenceResolver(None)),
             memoria,
             ingestion,
             "lagged-test",

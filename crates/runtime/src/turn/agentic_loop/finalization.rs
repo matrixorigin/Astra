@@ -2228,7 +2228,7 @@ mod tests {
         let memoria = Arc::new(CapturingMemoriaForFinalize::default());
         let svc = Arc::new(
             crate::session_memory::MemoryExtractionService::new(
-                Arc::new(crate::session_memory::ConstSelectorResolver(None)),
+                Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
                 Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>,
                 ingestion,
                 "test-user",

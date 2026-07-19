@@ -899,7 +899,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: None,
             current_run_id: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,

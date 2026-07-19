@@ -43,30 +43,26 @@ pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
 /// from the `infra_llm_models` registry. Used to feed
 /// [`crate::session_memory::MemoryExtractionService`] without pulling
 /// the full MatrixCloudRuntime into every caller.
-pub struct PoolSelectorResolver {
+pub struct PoolMemoryInferenceResolver {
     pool: SharedPool,
     encryptor: Arc<astra_services::FernetTokenEncryptor>,
 }
 
-impl PoolSelectorResolver {
+impl PoolMemoryInferenceResolver {
     pub fn new(pool: SharedPool, encryptor: Arc<astra_services::FernetTokenEncryptor>) -> Self {
         Self { pool, encryptor }
     }
 }
 
-impl std::fmt::Debug for PoolSelectorResolver {
+impl std::fmt::Debug for PoolMemoryInferenceResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PoolSelectorResolver").finish()
+        f.debug_struct("PoolMemoryInferenceResolver").finish()
     }
 }
 
 #[async_trait::async_trait]
-impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
-    async fn resolve(&self) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
-        self.resolve_candidates().await.into_iter().next()
-    }
-
-    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
+impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResolver {
+    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::MemoryInferenceClient> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
         let resolved = match astra_services::models::resolve_memory_models(
@@ -90,8 +86,11 @@ impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
             .into_iter()
             .filter_map(|model| {
                 let model_name = model.model_name.clone();
-                match crate::memory_hooks::relevance::LlmConnParams::from_resolved(model) {
-                    Ok(params) => Some(params),
+                match crate::memory_hooks::DirectMemoryInferenceClient::from_resolved(model) {
+                    Ok(client) => {
+                        Some(std::sync::Arc::new(client)
+                            as crate::memory_hooks::MemoryInferenceClient)
+                    }
                     Err(error) => {
                         tracing::warn!(
                             target: "astra_runtime::memory_model",
@@ -203,8 +202,8 @@ impl MatrixCloudRuntime {
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
         let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env();
         if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
-            let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
-                Arc::new(PoolSelectorResolver {
+            let resolver: Arc<dyn crate::session_memory::MemoryInferenceResolver> =
+                Arc::new(PoolMemoryInferenceResolver {
                     pool: self.shared_pool.clone(),
                     encryptor: Arc::clone(&enc),
                 });
@@ -231,39 +230,6 @@ impl MatrixCloudRuntime {
         &self,
     ) -> Option<Arc<crate::session_memory::MemoryExtractionService>> {
         self.memory_extraction_service.clone()
-    }
-
-    /// Resolve the cheapest memory-tagged model from the registry.
-    /// Returns `None` if no encryptor is configured or no valid model can be
-    /// resolved. Registry and execution-configuration failures are logged at
-    /// the boundary instead of being misreported as an empty registry.
-    pub async fn resolve_memory_model(
-        &self,
-    ) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
-        let enc = self.encryptor.as_ref()?;
-        let settings = self.shared_pool.settings();
-        let pool = self.shared_pool.get();
-        let resolved =
-            match astra_services::models::resolve_memory_model(settings, enc, Some(pool)).await {
-                Ok(model) => model,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_runtime::memory_model",
-                        %error,
-                        "memory model resolution failed"
-                    );
-                    return None;
-                }
-            };
-        crate::memory_hooks::relevance::LlmConnParams::from_resolved(resolved)
-            .map_err(|error| {
-                tracing::warn!(
-                    target: "astra_runtime::memory_model",
-                    %error,
-                    "memory model execution configuration is invalid"
-                );
-            })
-            .ok()
     }
 
     pub fn edge_agent_id(&self) -> &str {

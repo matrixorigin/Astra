@@ -289,20 +289,14 @@ async fn prune_stale_pending_recovery(
 }
 
 #[derive(Debug)]
-struct CliSessionMemorySelectorResolver {
+struct CliSessionMemoryInferenceResolver {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
 }
 
 #[async_trait::async_trait]
-impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
-    async fn resolve(&self) -> Option<astra_runtime::memory_hooks::relevance::LlmConnParams> {
-        self.resolve_candidates().await.into_iter().next()
-    }
-
-    async fn resolve_candidates(
-        &self,
-    ) -> Vec<astra_runtime::memory_hooks::relevance::LlmConnParams> {
+impl astra_runtime::session_memory::MemoryInferenceResolver for CliSessionMemoryInferenceResolver {
+    async fn resolve_candidates(&self) -> Vec<astra_runtime::memory_hooks::MemoryInferenceClient> {
         #[derive(serde::Deserialize)]
         struct MemoryModelWire {
             model_name: String,
@@ -313,40 +307,59 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
         let Some(token) =
             session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
         else {
+            tracing::debug!(
+                target: "astra_cli::session_memory",
+                "memory inference resolution skipped because no access token is available"
+            );
             return Vec::new();
         };
-        let body = self
+        let body = match self
             .api
             .get_authed_path_text(&token, astra_thin_client::paths::model_memory())
             .await
-            .ok();
-        let Some(body) = body else {
-            return Vec::new();
+        {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(
+                    target: "astra_cli::session_memory",
+                    %error,
+                    "memory inference model resolution is unavailable"
+                );
+                return Vec::new();
+            }
         };
-        let response = serde_json::from_str::<MemoryModelWire>(&body).ok();
-        let Some(response) = response else {
-            return Vec::new();
+        let response = match serde_json::from_str::<MemoryModelWire>(&body) {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::session_memory",
+                    %error,
+                    "memory inference model response is malformed"
+                );
+                return Vec::new();
+            }
         };
         let model_names = if response.candidate_model_names.is_empty() {
             vec![response.model_name]
         } else {
             response.candidate_model_names
         };
+        let mut seen = std::collections::HashSet::new();
         model_names
             .into_iter()
-            .map(
-                |model_name| astra_runtime::memory_hooks::relevance::LlmConnParams {
-                    base_url: format!("{}/v1", self.api.api_origin()),
-                    api_key: token.clone(),
-                    model_name,
-                    wire_model_name: None,
-                    provider: "openai".to_string(),
-                    header_overrides: Default::default(),
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-            )
+            .filter_map(|model_name| {
+                let model_name = model_name.trim().to_string();
+                (!model_name.is_empty() && seen.insert(model_name.clone())).then_some(model_name)
+            })
+            .map(|model_name| {
+                std::sync::Arc::new(
+                    crate::cli::session::session_memory_inference::CliServerMemoryInferenceClient::new(
+                        self.api.clone(),
+                        token.clone(),
+                        model_name,
+                    ),
+                ) as astra_runtime::memory_hooks::MemoryInferenceClient
+            })
             .collect()
     }
 }
@@ -631,7 +644,7 @@ async fn build_cli_session_memory_extractor(
     let token = session_runtime::fresh_access_token(api, profile).await?;
     let me_body = api.get_auth_me_text(&token).await.ok()?;
     let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
-    let selector = std::sync::Arc::new(CliSessionMemorySelectorResolver {
+    let inference_resolver = std::sync::Arc::new(CliSessionMemoryInferenceResolver {
         api: api.clone(),
         profile: profile.map(str::to_string),
     });
@@ -645,7 +658,11 @@ async fn build_cli_session_memory_extractor(
     let broker =
         std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());
     let service = astra_runtime::session_memory::MemoryExtractionService::new(
-        selector, memoria, ingestion, me.user_id, broker,
+        inference_resolver,
+        memoria,
+        ingestion,
+        me.user_id,
+        broker,
     )
     .with_local_current_snapshot()
     .with_local_event_sink(build_cli_session_memory_event_sink());

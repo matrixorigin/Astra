@@ -62,11 +62,11 @@ pub(crate) fn should_bootstrap_lessons(state: &SessionState) -> bool {
 async fn filter_lessons_by_relevance(
     user_message: &str,
     lessons: Vec<astra_services::LessonHint>,
-    params: Option<&astra_runtime::memory_hooks::relevance::LlmConnParams>,
+    client: Option<&dyn astra_runtime::memory_hooks::MemoryInferencePort>,
 ) -> Vec<astra_services::LessonHint> {
     let texts: Vec<String> = lessons.iter().map(|lesson| lesson.action.clone()).collect();
-    let filtered = if let Some(params) = params {
-        astra_runtime::memory_hooks::relevance::filter_memories(params, user_message, &texts).await
+    let filtered = if let Some(client) = client {
+        astra_runtime::memory_hooks::relevance::filter_memories(client, user_message, &texts).await
     } else {
         astra_runtime::memory_hooks::relevance::lexical_filter_memories(user_message, &texts)
     };
@@ -82,7 +82,7 @@ async fn filter_lessons_by_relevance(
         .collect()
 }
 
-async fn maybe_load_memory_model_params(
+async fn maybe_load_memory_model_name(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -92,7 +92,7 @@ async fn maybe_load_memory_model_params(
         model_name: String,
     }
 
-    if state.memory_model_params.is_some() {
+    if state.memory_model_name.is_some() {
         return;
     }
     let body = match api
@@ -106,19 +106,14 @@ async fn maybe_load_memory_model_params(
         }
     };
     match serde_json::from_str::<MemoryModelWire>(&body) {
-        Ok(response) => {
-            state.memory_model_params =
-                Some(astra_runtime::memory_hooks::relevance::LlmConnParams {
-                    base_url: format!("{}/v1", api.api_origin()),
-                    api_key: token.to_string(),
-                    model_name: response.model_name,
-                    wire_model_name: None,
-                    provider: "openai".to_string(),
-                    header_overrides: Default::default(),
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                });
+        Ok(response) if !response.model_name.trim().is_empty() => {
+            state.memory_model_name = Some(response.model_name.trim().to_string());
+        }
+        Ok(_) => {
+            tracing::warn!(
+                target: "astra_cli::session_memory",
+                "memory model response did not contain a usable model identity"
+            );
         }
         Err(error) => {
             tracing::warn!("memory model decode failed: {error}");
@@ -133,8 +128,13 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     user_message: &str,
 ) {
     if !state.session_lessons.is_empty() {
-        maybe_load_memory_model_params(state, api, token).await;
-        if let Some(params) = state.memory_model_params.as_ref() {
+        maybe_load_memory_model_name(state, api, token).await;
+        if let Some(model_name) = state.memory_model_name.as_deref() {
+            let client = super::session_memory_inference::CliServerMemoryInferenceClient::new(
+                api.clone(),
+                token,
+                model_name,
+            );
             let texts: Vec<String> = state
                 .session_lessons
                 .iter()
@@ -142,7 +142,7 @@ pub(crate) async fn ensure_bootstrapped_lessons(
                 .collect();
             let dismissed =
                 astra_runtime::memory_hooks::relevance::select_dismissed_memory_indices(
-                    params,
+                    &client,
                     user_message,
                     &texts,
                 )
@@ -163,7 +163,7 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         return;
     }
 
-    maybe_load_memory_model_params(state, api, token).await;
+    maybe_load_memory_model_name(state, api, token).await;
 
     let lessons = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -172,9 +172,21 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     .await
     .unwrap_or_default();
 
-    state.session_lessons =
-        filter_lessons_by_relevance(user_message, lessons, state.memory_model_params.as_ref())
-            .await;
+    let client = state.memory_model_name.as_deref().map(|model_name| {
+        super::session_memory_inference::CliServerMemoryInferenceClient::new(
+            api.clone(),
+            token,
+            model_name,
+        )
+    });
+    state.session_lessons = filter_lessons_by_relevance(
+        user_message,
+        lessons,
+        client
+            .as_ref()
+            .map(|client| client as &dyn astra_runtime::memory_hooks::MemoryInferencePort),
+    )
+    .await;
     state.session_lessons_loaded = true;
 }
 
@@ -213,7 +225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_lessons_without_model_params_uses_local_relevance() {
+    async fn filter_lessons_without_inference_client_uses_local_relevance() {
         let lessons = vec![
             lesson("Do not treat curl checks as browser verification"),
             lesson("Prefer cargo test for Rust executor changes"),
@@ -230,11 +242,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_model_params_cached_in_session_state() {
+    fn memory_model_identity_is_cached_without_credentials() {
         let state = SessionState::default();
         assert!(
-            state.memory_model_params.is_none(),
-            "memory_model_params should start as None"
+            state.memory_model_name.is_none(),
+            "memory model identity should start unresolved"
         );
     }
 }

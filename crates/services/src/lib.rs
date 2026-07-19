@@ -242,8 +242,7 @@ pub use models::{
     PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
     PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
     UnconfiguredModelService, prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
-    resolve_active_llm_offering, resolve_memory_model, resolve_reasoning_model,
-    validate_model_offering_id,
+    resolve_active_llm_offering, resolve_reasoning_model, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,

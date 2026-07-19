@@ -21,6 +21,6 @@ pub mod service;
 pub use activity::{BackgroundActivity, BackgroundActivityBroker};
 pub use request::{ExtractionRequest, SpawnDecision};
 pub use service::{
-    ConstSelectorResolver, EXTRACTION_MAX_OUTPUT_TOKENS, LLM_TIMEOUT, MemoryExtractionService,
-    SelectorParamsResolver,
+    ConstMemoryInferenceResolver, EXTRACTION_MAX_OUTPUT_TOKENS, LLM_TIMEOUT,
+    MemoryExtractionService, MemoryInferenceResolver,
 };

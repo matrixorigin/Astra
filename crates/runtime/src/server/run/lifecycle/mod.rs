@@ -5916,7 +5916,6 @@ impl AgenticRunLifecycleService {
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
             ),
@@ -11685,7 +11684,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),

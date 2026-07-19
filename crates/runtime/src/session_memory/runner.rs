@@ -16,11 +16,9 @@ use astra_turn_types::{
     InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts,
 };
 
-use crate::memory_hooks::relevance::LlmConnParams;
+use crate::memory_hooks::{MemoryInferencePort, MemoryInferenceRequest};
 use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
-use crate::turn::llm::client::{
-    LlmCall, call_llm_nonstream, global_llm_client, redact_provider_secrets,
-};
+use crate::turn::llm::client::redact_provider_secrets;
 
 pub const SESSION_MEMORY_PREFIX: &str = "[@session/active]";
 pub const SESSION_MEMORY_MEMORIA_TYPE: &str = "working";
@@ -386,14 +384,14 @@ pub(crate) struct LlmCandidateFailure {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_extraction(
+pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     messages: &[Value],
     turn_number: usize,
     current_memory: &str,
     session_facts: &SessionFacts,
-    memory_model_params: &[LlmConnParams],
+    memory_clients: &[C],
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
@@ -406,7 +404,7 @@ pub(crate) async fn run_extraction(
     };
     let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number);
 
-    if memory_model_params.is_empty() {
+    if memory_clients.is_empty() {
         let fallback = canonicalize_session_memory_markdown(
             session_id,
             &fallback,
@@ -442,11 +440,11 @@ pub(crate) async fn run_extraction(
     }
 
     let mut failed_candidates = Vec::new();
-    for params in memory_model_params {
+    for client in memory_clients {
         match update_memory_with_llm(
             &base_memory,
             messages,
-            params,
+            client,
             llm_timeout,
             max_output_tokens,
         )
@@ -474,7 +472,7 @@ pub(crate) async fn run_extraction(
                             bytes_written,
                             store_attempt,
                             content: updated,
-                            selector_model: Some(params.model_name.clone()),
+                            selector_model: Some(client.model_name().to_string()),
                             failed_candidates,
                         };
                     }
@@ -484,14 +482,14 @@ pub(crate) async fn run_extraction(
                             persist_error_detail: error.detail,
                             llm_error_reason: None,
                             llm_error_detail: None,
-                            selector_model: Some(params.model_name.clone()),
+                            selector_model: Some(client.model_name().to_string()),
                             failed_candidates,
                         };
                     }
                 }
             }
             Err(error) => failed_candidates.push(LlmCandidateFailure {
-                model_name: params.model_name.clone(),
+                model_name: client.model_name().to_string(),
                 reason: error.reason,
                 detail: error.detail,
             }),
@@ -929,25 +927,18 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 async fn update_memory_with_llm(
     current_memory: &str,
     messages: &[Value],
-    params: &LlmConnParams,
+    client: &dyn MemoryInferencePort,
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> Result<String, LlmExtractionFailure> {
     let prompt = build_extraction_prompt(current_memory, messages);
-    let call = call_llm_nonstream(
-        global_llm_client(),
-        LlmCall {
-            purpose: InferencePurpose::MemoryExtraction,
-            messages: &prompt,
-            tools: &[],
-            route: params.execution_route(),
-            max_output_tokens: Some(max_output_tokens),
-            temperature: Some(0.0),
-            has_fallback: false,
-            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-        },
-        llm_timeout.saturating_add(Duration::from_secs(1)),
-    );
+    let call = client.complete(MemoryInferenceRequest {
+        purpose: InferencePurpose::MemoryExtraction,
+        messages: &prompt,
+        max_output_tokens,
+        temperature: 0.0,
+        deadline: llm_timeout.saturating_add(Duration::from_secs(1)),
+    });
     let parsed = match tokio::time::timeout(llm_timeout, call).await {
         Err(_) => {
             return Err(LlmExtractionFailure {
@@ -965,7 +956,7 @@ async fn update_memory_with_llm(
         }
         Ok(Ok(result)) => result,
     };
-    let content = parsed.full_text.trim();
+    let content = parsed.trim();
     if content.is_empty() {
         return Err(LlmExtractionFailure {
             reason: SessionMemoryExtractionErrorReason::EmptyResponse,
@@ -982,7 +973,7 @@ async fn update_memory_with_llm(
     if !normalized_scalar_lists.is_empty() {
         tracing::warn!(
             target: "astra_runtime::session_memory",
-            selector_model = %params.model_name,
+            selector_model = %client.model_name(),
             fields = %normalized_scalar_lists.join(","),
             "normalized scalar session-memory fields to singleton lists"
         );
@@ -1439,6 +1430,7 @@ fn truncate(text: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_hooks::DirectMemoryInferenceClient;
     use std::sync::{Arc, Mutex};
 
     use crate::turn::cloud::memoria_compact::MemoriaMemory;
@@ -1736,6 +1728,26 @@ mod tests {
         ]
     }
 
+    #[derive(Debug)]
+    struct CapturingMemoryInference {
+        purposes: Arc<Mutex<Vec<InferencePurpose>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for CapturingMemoryInference {
+        fn model_name(&self) -> &str {
+            "capturing-memory-model"
+        }
+
+        async fn complete(
+            &self,
+            request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.purposes.lock().unwrap().push(request.purpose);
+            Ok(r#"{"session_title":"Captured purpose"}"#.to_string())
+        }
+    }
+
     #[test]
     fn rule_fallback_records_only_live_resumable_state() {
         let content = build_rule_fallback_memory("", &sample_messages(), 3);
@@ -1793,7 +1805,7 @@ mod tests {
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -1808,6 +1820,40 @@ mod tests {
             }
             _ => panic!("expected fallback persistence"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_extraction_attributes_the_call_as_memory_extraction() {
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingMemoryInference {
+            purposes: Arc::clone(&purposes),
+        };
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-purpose",
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[client],
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::Persisted {
+                source: SessionMemoryExtractionSource::Llm,
+                ..
+            }
+        ));
+        assert_eq!(
+            *purposes.lock().unwrap(),
+            vec![InferencePurpose::MemoryExtraction]
+        );
     }
 
     #[tokio::test]
@@ -1828,7 +1874,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -1881,7 +1927,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -1947,7 +1993,7 @@ mod tests {
             json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2021,7 +2067,7 @@ mod tests {
             ),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2096,7 +2142,7 @@ mod tests {
             json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
         ];
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2151,7 +2197,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: server_url,
             api_key: "anthropic-key".to_string(),
             model_name: "deepseek-v4-flash-anthropic".to_string(),
@@ -2204,7 +2250,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: server_url,
             api_key: "bedrock-key".to_string(),
             model_name: "anthropic.claude".to_string(),
@@ -2254,7 +2300,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2301,7 +2347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_captures_http_error_detail_on_fallback() {
+    async fn run_extraction_persists_fallback_and_redacts_provider_failure_detail() {
         let (server_url, server_handle) = spawn_json_server_with_status(
             Arc::new(|request: &str| {
                 assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
@@ -2310,14 +2356,14 @@ mod tests {
             "Bad Gateway",
             json!({
                 "error": {
-                    "message": "upstream model gateway timed out"
+                    "message": "upstream model gateway rejected sk-secret-value"
                 }
             }),
         )
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let params = LlmConnParams {
+        let params = DirectMemoryInferenceClient {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
@@ -2348,10 +2394,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(error_reason, SessionMemoryExtractionErrorReason::LlmError);
-                assert_eq!(
-                    error_detail,
-                    Some("http 502: upstream model gateway timed out".to_string())
-                );
+                let detail = error_detail.expect("classified provider failure detail");
+                assert!(!detail.trim().is_empty());
+                assert!(!detail.contains("sk-secret-value"));
             }
             _ => panic!("expected llm-failed fallback persistence"),
         }
@@ -2388,7 +2433,7 @@ mod tests {
         .await;
 
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
-        let first = LlmConnParams {
+        let first = DirectMemoryInferenceClient {
             base_url: format!("{failing_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-1".to_string(),
@@ -2399,7 +2444,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
         };
-        let second = LlmConnParams {
+        let second = DirectMemoryInferenceClient {
             base_url: format!("{success_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai-2".to_string(),
@@ -2475,7 +2520,7 @@ mod tests {
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2608,7 +2653,7 @@ mod tests {
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2632,7 +2677,7 @@ mod tests {
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )
@@ -2658,7 +2703,7 @@ mod tests {
             3,
             "",
             &SessionFacts::default(),
-            &[],
+            &[] as &[DirectMemoryInferenceClient],
             Duration::from_secs(3),
             256,
         )

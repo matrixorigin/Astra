@@ -469,7 +469,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,

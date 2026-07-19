@@ -2339,14 +2339,6 @@ pub struct AgenticLoopState {
         std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
     >,
 
-    /// Resolved selector-model params used by the background memory
-    /// extraction runner (see `turn::memory_extraction_runner`). Shared
-    /// with `memory_relevance` and lesson synthesis — same "cheap
-    /// background LLM" resolved once per session via
-    /// `resolve_memory_model`. `None` → extraction falls back to the
-    /// rule-based L1 builder.
-    pub session_memory_llm_params: Option<crate::memory_hooks::relevance::LlmConnParams>,
-
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
 
@@ -3616,7 +3608,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         session_facts: Default::default(),
         memory_extraction_service: None,
         session_memory_state: Default::default(),
-        session_memory_llm_params: None,
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -4358,7 +4349,6 @@ pub(crate) mod tests {
             session_facts: Default::default(),
             memory_extraction_service: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

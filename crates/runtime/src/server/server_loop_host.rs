@@ -10463,7 +10463,6 @@ mod tests {
             session_facts: Default::default(),
             memory_extraction_service: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

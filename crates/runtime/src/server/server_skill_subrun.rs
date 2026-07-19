@@ -544,7 +544,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
-            session_memory_llm_params: None,
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),

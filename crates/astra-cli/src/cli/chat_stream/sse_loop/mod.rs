@@ -793,7 +793,6 @@ pub(crate) async fn stream_chat_sse(
         recent_rounds: Vec::new(),
         tool_results: Vec::new(),
         session_memory_state: Default::default(),
-        session_memory_llm_params: None,
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
