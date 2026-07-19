@@ -26,7 +26,6 @@ pub mod edge_lifecycle;
 pub mod effects;
 pub mod execution_state_summary;
 pub(crate) mod exit_code;
-pub mod file_history;
 pub mod followup_suggestion;
 pub mod http_task_service;
 pub mod http_team_store;

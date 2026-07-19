@@ -440,7 +440,6 @@ pub mod confidence;
 pub mod config;
 pub mod delegation;
 pub mod drift;
-pub mod durable_task_store;
 pub mod error_kind;
 pub mod feedback;
 pub mod log;

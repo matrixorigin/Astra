@@ -19,7 +19,6 @@ pub mod delegated_findings;
 pub mod durable_task;
 pub mod edge_context;
 pub mod evaluation;
-pub mod event_coordinator;
 pub mod event_ingestion;
 pub mod events;
 pub mod harness;

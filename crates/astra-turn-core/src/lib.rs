@@ -99,7 +99,6 @@ pub use sync_utils::{
 };
 pub mod tail_persist;
 pub mod task;
-pub mod task_context;
 pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;
@@ -130,7 +129,6 @@ pub mod persist;
 pub mod retrieval;
 pub mod trace_event;
 pub mod turn_trace_collector;
-pub mod unified_timeline;
 pub mod view;
 
 // Re-exports: old flat module names → new directory paths
@@ -207,7 +205,6 @@ pub use approval::batch_group as approval_batch_group;
 pub use approval::fingerprint as approval_fingerprint;
 pub use approval::request_key as approval_request_key;
 pub use approval::sink as approval_sink;
-pub use approval::ux_layer as approval_ux_layer;
 
 // Re-exports: permission_* → permission::*
 pub use permission::types as permission_types;

@@ -434,16 +434,15 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
 
 /// Best-effort skill loading from standard locations.
 ///
-/// Uses [`skill_instructions::skill_search_paths()`] for consistent directory
-/// resolution across the CLI. That wrapper delegates to the shared
-/// `astra-skills` loader, so manifest tools and MCP configs see the same
+/// Uses the shared `astra-skills` loader directly, so manifest tools and MCP
+/// configs see the same
 /// `.astra/skills`, Agent Skills-compatible `.claude/skills`,
 /// Agent-compatible `.agent/skills`, and HOME global paths as the runtime
 /// skill registry.
 ///
 /// Silently skips if no skills directory exists.
 pub fn load_skills_directory(registry: &mut PluginRegistry) {
-    for path in &crate::skill_instructions::skill_search_paths() {
+    for path in &astra_skills::loader::skill_search_paths() {
         if path.is_dir() {
             register_manifest_tools(path, registry);
         }
@@ -470,7 +469,7 @@ pub fn collect_mcp_server_configs() -> Vec<crate::mcp_client::McpServerConfig> {
     }
 
     // 2. Skill manifest mcp_servers: sections
-    for dir in &crate::skill_instructions::skill_search_paths() {
+    for dir in &astra_skills::loader::skill_search_paths() {
         if !dir.is_dir() {
             continue;
         }
@@ -1300,7 +1299,7 @@ Combined instructions.
         assert!(names.contains(&"manifest-only"));
         assert!(names.contains(&"both"));
         // Note: skill-md-only doesn't have manifest.yaml, so discover_skills won't find it
-        // (it would need to be discovered via skill_instructions::discover_and_register_metadata)
+        // (it would need to be discovered through the shared skill registry)
     }
 
     #[test]

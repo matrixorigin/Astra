@@ -725,7 +725,7 @@ Follow these steps:
             }
             // Search all shared loader paths: project .astra/.claude/.agent
             // skills and matching user-level skill roots.
-            let search_paths = crate::skill_instructions::skill_search_paths();
+            let search_paths = astra_skills::loader::skill_search_paths();
             let found = search_paths.iter().find_map(|base| {
                 let dir = base.join(name);
                 if dir.join("SKILL.md").exists() {
@@ -1325,7 +1325,7 @@ fn parse_skill_info_args(sub_arg: &str) -> (String, bool) {
 /// Same resolution order as `/skill dev`: shared loader paths for project and
 /// user-level skills.
 fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
-    crate::skill_instructions::skill_search_paths()
+    astra_skills::loader::skill_search_paths()
         .into_iter()
         .find_map(|base| {
             let dir = base.join(name);
@@ -2682,7 +2682,7 @@ async fn publish_skill_to_marketplace(
     };
 
     // Find skill directory to pack
-    let search_paths = crate::skill_instructions::skill_search_paths();
+    let search_paths = astra_skills::loader::skill_search_paths();
     let mut skill_dir: Option<std::path::PathBuf> = None;
     for base in &search_paths {
         let candidate = base.join(name);
@@ -2802,7 +2802,7 @@ async fn uninstall_local_skill(name: &str, state: &mut SessionState) {
     }
 
     // Search for the skill in local paths
-    let search_paths = crate::skill_instructions::skill_search_paths();
+    let search_paths = astra_skills::loader::skill_search_paths();
     let mut found_dir: Option<std::path::PathBuf> = None;
 
     for base in &search_paths {
@@ -2885,7 +2885,7 @@ fn pack_skill_bundle(name: &str) {
     }
 
     // Find the skill directory
-    let search_paths = crate::skill_instructions::skill_search_paths();
+    let search_paths = astra_skills::loader::skill_search_paths();
     let mut skill_dir: Option<std::path::PathBuf> = None;
 
     for base in &search_paths {
@@ -3034,7 +3034,7 @@ fn format_bytes(bytes: u64) -> String {
 fn read_local_skill_version(
     skill_name: &str,
 ) -> Option<(std::path::PathBuf, astra_skills::version::Version)> {
-    let search_paths = crate::skill_instructions::skill_search_paths();
+    let search_paths = astra_skills::loader::skill_search_paths();
     for base in &search_paths {
         let skill_md = base.join(skill_name).join("SKILL.md");
         if skill_md.exists() {
@@ -3096,7 +3096,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
     // Collect skills to check
     let skills_to_check: Vec<String> = if name.is_empty() {
         // Check all locally installed skills
-        let search_paths = crate::skill_instructions::skill_search_paths();
+        let search_paths = astra_skills::loader::skill_search_paths();
         let mut names = Vec::new();
         for base in &search_paths {
             if let Ok(entries) = std::fs::read_dir(base) {
@@ -3467,7 +3467,7 @@ async fn rollback_skill(
     );
 
     // Remove local copy and re-install the specific version
-    let search_paths = crate::skill_instructions::skill_search_paths();
+    let search_paths = astra_skills::loader::skill_search_paths();
     for base in &search_paths {
         let skill_dir = base.join(name);
         if skill_dir.exists() {

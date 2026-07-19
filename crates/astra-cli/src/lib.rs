@@ -38,7 +38,6 @@ pub mod lock_recovery;
 pub mod manifest_loader;
 pub mod mcp_client;
 pub mod sandbox_retry;
-pub(crate) mod skill_instructions;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub mod tool_safety_guard;

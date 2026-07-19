@@ -8,8 +8,6 @@ pub mod agent_tool;
 pub mod agent_trace_status;
 mod fork_cache_probe;
 pub(crate) mod spawner;
-pub mod worktree_registry;
-pub mod worktree_sweep;
 
 pub use agent_result_status::{
     AgentToolBudgetRecordProjection, AgentToolRecordActionKind, AgentToolRecordProjection,
