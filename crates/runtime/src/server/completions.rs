@@ -7,11 +7,14 @@
 
 use super::*;
 use serde::Deserialize;
-use std::time::Instant;
+use std::time::Duration;
 
 /// OpenAI-compatible chat completion request (subset).
 #[derive(Debug, Deserialize)]
 pub(super) struct CompletionRequest {
+    /// Semantic reason for this inference. The server uses this typed value
+    /// for attribution and policy; it is never inferred from prompt text.
+    pub purpose: astra_turn_types::InferencePurpose,
     /// Optional model name override; falls back to the server's active model.
     #[serde(default)]
     pub model: Option<String>,
@@ -29,11 +32,8 @@ fn default_temperature() -> f64 {
     0.1
 }
 
-fn completion_response_id(upstream: &serde_json::Value) -> String {
-    upstream["id"]
-        .as_str()
-        .unwrap_or("chatcmpl-proxy")
-        .to_string()
+fn completion_response_id(response_id: Option<&str>) -> String {
+    response_id.unwrap_or("chatcmpl-proxy").to_string()
 }
 
 /// OpenAI-compatible chat completion response (subset).
@@ -113,73 +113,53 @@ pub(super) async fn completions_handler(
         )
     })?;
 
-    // 3. Build upstream request
+    // 3. Execute through the same typed provider boundary as agent turns.
     let mut messages = request.messages;
     crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
-    let upstream_name = resolved.upstream_model_name();
-    let body = crate::turn::llm::client::build_provider_request_body_with_overrides(
-        &messages,
-        &[],
-        upstream_name,
-        &resolved.provider,
-        Some(request.max_tokens as usize),
-        Some(request.temperature),
-        false,
-        &astra_turn_core::thinking_config::ThinkingConfig::Off,
-        resolved.request_body_overrides.as_ref(),
-    );
-
-    let url = crate::turn::llm::client::llm_request_url_for_provider(
-        &resolved.base_url,
-        &resolved.provider,
-        upstream_name,
-        false,
-    );
-
-    let client = &state.http_client;
-
-    // 4. Forward to upstream LLM provider
-    let mut req = client.post(&url).header("content-type", "application/json");
-    req = crate::turn::llm::client::apply_provider_auth(
-        req,
-        &resolved.provider,
-        &resolved.api_key,
-        None,
-    );
-    if crate::turn::llm::client::provider_uses_anthropic_messages(&resolved.provider) {
-        req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
-    }
-
-    let resp: reqwest::Response =
-        req.json(&body).send().await.map_err(|e| {
-            error_response(StatusCode::BAD_GATEWAY, format!("Upstream LLM error: {e}"))
-        })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let truncated = astra_text_utils::str_preview::truncate_str(&text, 500);
-        return Err(error_response(
-            StatusCode::BAD_GATEWAY,
-            format!("Upstream LLM HTTP {status}: {truncated}"),
-        ));
-    }
-
-    let upstream: serde_json::Value = resp.json().await.map_err(|e| {
+    let header_overrides = resolved.execution_header_overrides().map_err(|error| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Model execution configuration invalid: {error}"),
+        )
+    })?;
+    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+    let parsed = crate::turn::llm::client::call_llm_nonstream(
+        &state.http_client,
+        crate::turn::llm::client::LlmCall {
+            purpose: request.purpose,
+            messages: &messages,
+            tools: &[],
+            route: crate::turn::llm::client::LlmExecutionRoute {
+                model_name: &resolved.model_name,
+                wire_model_name: resolved.wire_model_name.as_deref(),
+                api_key: &resolved.api_key,
+                base_url: &resolved.base_url,
+                provider: &resolved.provider,
+                header_overrides: Some(&header_overrides),
+                request_body_overrides: resolved.request_body_overrides.as_ref(),
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: Some(request.max_tokens as usize),
+            temperature: Some(request.temperature),
+            has_fallback: false,
+            thinking: &thinking,
+        },
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|error| {
+        let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
+        let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
         error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to parse upstream response: {e}"),
+            format!("Upstream LLM request failed ({}): {detail}", error.kind),
         )
     })?;
 
-    // 5. Extract response and build OpenAI-compatible output
-    let parsed = crate::turn::llm::client::parse_nonstream_response_for_provider(
-        &upstream,
-        &resolved.provider,
-        &resolved.model_name,
-        Instant::now(),
-    );
+    // 4. Build the stable OpenAI-compatible response surface.
 
+    let response_id = completion_response_id(parsed.response_id.as_deref());
     let content = parsed.full_text;
     let finish_reason = parsed.finish_reason.unwrap_or_else(|| "stop".to_string());
     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&parsed.usage);
@@ -190,7 +170,7 @@ pub(super) async fn completions_handler(
     let completion_tokens = usage.output_tokens;
 
     Ok(Json(CompletionResponse {
-        id: completion_response_id(&upstream),
+        id: response_id,
         object: "chat.completion".to_string(),
         model: resolved.model_name,
         choices: vec![CompletionChoice {
@@ -215,8 +195,15 @@ mod tests {
 
     #[test]
     fn completion_request_defaults() {
-        let json = r#"{"messages": [{"role": "user", "content": "hello"}]}"#;
+        let json = r#"{
+            "purpose": "verification_judge",
+            "messages": [{"role": "user", "content": "hello"}]
+        }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.purpose,
+            astra_turn_types::InferencePurpose::VerificationJudge
+        );
         assert_eq!(req.max_tokens, 512);
         assert!((req.temperature - 0.1).abs() < f64::EPSILON);
         assert!(req.model.is_none());
@@ -260,11 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_response_id_defaults_for_non_object_upstream_payloads() {
-        let upstream = serde_json::json!(["not-an-object"]);
-        assert!(
-            completion_response_id(&upstream) == "chatcmpl-proxy",
-            "non-object upstream payloads should fall back to the proxy completion id"
-        );
+    fn completion_request_requires_a_known_inference_purpose() {
+        let missing = r#"{"messages": []}"#;
+        let unknown = r#"{"purpose": "other", "messages": []}"#;
+        assert!(serde_json::from_str::<CompletionRequest>(missing).is_err());
+        assert!(serde_json::from_str::<CompletionRequest>(unknown).is_err());
     }
 }

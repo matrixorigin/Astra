@@ -18,6 +18,7 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub user_intent: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
+    pub inference_purpose: astra_turn_types::InferencePurpose,
     pub model_id: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
@@ -40,6 +41,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         user_intent,
         session_id,
         agent_id,
+        inference_purpose,
         model_id,
         interaction_mode,
         explain_verbose,
@@ -55,6 +57,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "user_intent": user_intent,
         "session_id": session_id,
         "agent_id": agent_id,
+        "inference_purpose": inference_purpose,
         "interaction_mode": interaction_mode,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
@@ -172,6 +175,7 @@ mod tests {
             user_intent: Some("hi"),
             session_id: None,
             agent_id: Some("test-agent"),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             model_id: Some("model-gpt-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
@@ -186,6 +190,7 @@ mod tests {
         assert_eq!(p["user_intent"], "hi");
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
+        assert_eq!(p["inference_purpose"], "sub_agent");
         assert!(p.get("model").is_none());
         assert_eq!(p["model_selection"]["offering_id"], "model-gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
@@ -210,6 +215,7 @@ mod tests {
             user_intent: None,
             session_id: Some("sess-1"),
             agent_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             model_id: None,
             interaction_mode: None,
             explain_verbose: true,
@@ -233,6 +239,7 @@ mod tests {
             user_intent: None,
             session_id: None,
             agent_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             model_id: None,
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
@@ -256,6 +263,7 @@ mod tests {
             user_intent: None,
             session_id: None,
             agent_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             model_id: None,
             interaction_mode: None,
             explain_verbose: false,

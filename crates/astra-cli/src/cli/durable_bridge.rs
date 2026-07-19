@@ -850,6 +850,7 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
         });
 
         let mut body = serde_json::json!({
+            "purpose": astra_turn_types::InferencePurpose::VerificationJudge,
             "messages": [system_msg, user_msg],
             "max_tokens": 2000,
             "temperature": 0.1,
@@ -903,6 +904,7 @@ impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
         ctx: &astra_services::TurnIntentJudgeContext,
     ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
         let mut body = serde_json::json!({
+            "purpose": astra_turn_types::InferencePurpose::Introspection,
             "messages": astra_services::turn_intent_judge_messages(ctx),
             // Keep judge replies tight — the schema is fixed and small.
             "max_tokens": 256,
@@ -2622,11 +2624,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_proxy_judge_includes_model_override() {
+    async fn server_proxy_judge_sends_model_override_and_typed_purpose() {
         use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
 
-        let captured = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::new(Mutex::new(None));
         let captured_clone = captured.clone();
 
         let app = Router::new().route(
@@ -2634,10 +2636,7 @@ mod tests {
             post(move |Json(body): Json<serde_json::Value>| {
                 let cap = captured_clone.clone();
                 async move {
-                    // Capture the model field from the request
-                    if let Some(m) = body["model"].as_str() {
-                        *cap.lock_recover() = m.to_string();
-                    }
+                    *cap.lock_recover() = Some(body);
                     Json(serde_json::json!({
                         "id": "mock-1",
                         "choices": [{
@@ -2662,7 +2661,12 @@ mod tests {
             ServerProxyLlmJudge::new(api, "fake-token".into(), Some("custom-model-v2".into()));
 
         let _score = judge.evaluate("test", "test context").await.unwrap();
-        assert_eq!(*captured.lock_recover(), "custom-model-v2");
+        let body = captured
+            .lock_recover()
+            .take()
+            .expect("completion request captured");
+        assert_eq!(body["model"], "custom-model-v2");
+        assert_eq!(body["purpose"], "verification_judge");
         server.abort();
     }
 

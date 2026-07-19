@@ -1828,6 +1828,7 @@ mod tests {
     impl astra_turn_core::cloud_summary::SummaryLlmClient for MockSummaryClient {
         async fn summarize(
             &self,
+            _purpose: astra_turn_types::InferencePurpose,
             _messages: &[Value],
         ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
             match self.response.lock().unwrap().as_ref() {

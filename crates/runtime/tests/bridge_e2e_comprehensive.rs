@@ -545,6 +545,8 @@ fn bridge_payload(mut payload: Value) -> Value {
     if let Some(obj) = payload.as_object_mut() {
         obj.entry("model_selection")
             .or_insert_with(|| json!({ "offering_id": "model-mock-model" }));
+        obj.entry("inference_purpose")
+            .or_insert_with(|| json!(astra_turn_types::InferencePurpose::PrimaryAgent));
     }
     payload
 }
@@ -1337,6 +1339,7 @@ async fn client_cancellation_does_not_panic() {
 
     let payload = json!({
         "agent_id": "cancel-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "messages": [{ "role": "user", "content": "long task" }],
         "edge_tools": [tool_schema("read_file")],
         "test_llm_rounds": [{

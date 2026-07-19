@@ -29,6 +29,8 @@ pub(super) struct ChatTurnRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_selection: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    inference_purpose: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_turn: Option<serde_json::Value>,
@@ -250,6 +252,26 @@ fn validate_model_selection_shape(
     Ok(())
 }
 
+fn validate_inference_purpose_shape(
+    request: &ChatTurnRequestBody,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = request.inference_purpose.as_ref() else {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "inference_purpose is required",
+            "missing_inference_purpose",
+        ));
+    };
+    serde_json::from_value::<astra_turn_types::InferencePurpose>(value.clone()).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "inference_purpose must be a supported inference purpose",
+            "inference_purpose_invalid",
+        )
+    })?;
+    Ok(())
+}
+
 fn validate_bridge_payload_fields(
     payload: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -351,6 +373,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_model_selection_shape(&request)?;
+    validate_inference_purpose_shape(&request)?;
     validate_session_id_shape(&request)?;
     let explicit_turn_identity = validate_explicit_turn_identity(&request)?;
 
@@ -1145,6 +1168,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [{"role": "user", "content": "hello"}]
             }))
             .expect("body should serialize"),
@@ -1169,6 +1193,7 @@ mod tests {
             payload["model_selection"]["offering_id"],
             "offer-deepseek-v4-pro"
         );
+        assert_eq!(payload["inference_purpose"], "primary_agent");
         assert!(payload.get("model").is_none());
     }
 
@@ -1232,13 +1257,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_body_rejects_missing_or_invalid_inference_purpose_before_session_access() {
+        for (purpose, expected_code) in [
+            (None, "missing_inference_purpose"),
+            (Some(json!("unknown")), "inference_purpose_invalid"),
+            (Some(json!(42)), "inference_purpose_invalid"),
+        ] {
+            let session_service = CountingSessionService::default();
+            let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_session_service(Arc::new(session_service.clone()));
+            let mut payload = json!({
+                "model_selection": model_selection(),
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            if let Some(purpose) = purpose {
+                payload["inference_purpose"] = purpose;
+            }
+            let body = Bytes::from(serde_json::to_vec(&payload).expect("serialize request"));
+
+            let (status, error) =
+                match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                    Ok(_) => panic!("invalid inference purpose must fail admission"),
+                    Err(error) => error,
+                };
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.0.error_code.as_deref(), Some(expected_code));
+            assert_eq!(session_service.create_calls(), 0);
+            assert_eq!(session_service.get_calls(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_body_allows_missing_messages_as_empty_without_session_side_effects() {
         let session_service = CountingSessionService::default();
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_session_service(Arc::new(session_service.clone()));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
-                "model_selection": model_selection()
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent
             }))
             .expect("body should serialize"),
         );
@@ -1267,6 +1325,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_id": "existing-session",
                 "messages": [{"role": "user", "content": "hello"}],
                 "edge_tools": {"name": "bash"}
@@ -1304,6 +1363,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1338,6 +1398,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1374,6 +1435,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -1412,6 +1474,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 10,
                 "turn_chain_id": "root-chain",
                 "user_query_event_id": "root-query",
@@ -1445,6 +1508,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 1,
                 "turn_chain_id": "new-chain",
                 "user_query_event_id": "new-query",
@@ -1489,6 +1553,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_turn": 2,
                 "messages": [{"role": "user", "content": "review local changes"}]
             }))
@@ -1512,6 +1577,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "session_id": "capture-session",
                 "messages": [{"role": "user", "content": "hello"}]
             }))

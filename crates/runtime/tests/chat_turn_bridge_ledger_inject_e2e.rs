@@ -251,6 +251,7 @@ async fn canonical_tool_result_continuation_consumes_callback_receipt() {
     // the tool or proceed to round 2.  The tool_calls appear in turn_complete.
     let payload = json!({
         "agent_id": "ledger-e2e-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": "s-ledger-e2e",
         "session_turn": 1,
         "turn_chain_id": "chain-ledger-e2e",
@@ -341,6 +342,7 @@ async fn canonical_tool_result_continuation_consumes_callback_receipt() {
     // the second model round starts.
     let continuation = json!({
         "agent_id": "ledger-e2e-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": "s-ledger-e2e",
         "session_turn": 1,
         "turn_chain_id": "chain-ledger-e2e",

@@ -17,6 +17,7 @@ use astra_services::session_journal::{
     JournalDirGuard, JournalEvent, JournalEventType, JournalWriter, LlmRoundRecord,
     TurnEventBuffer, journal_file_path, read_journal,
 };
+use astra_turn_types::InferencePurpose;
 use tempfile::tempdir;
 
 /// Write some valid JSONL lines then append an incomplete (torn) line without
@@ -173,7 +174,7 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
         source: None,
         run_id: None,
         tool_calls: None,
-        ..Default::default()
+        ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
     });
     buf.flush_interrupted(&writer).unwrap();
     assert!(buf.is_empty());
@@ -194,7 +195,7 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
         source: None,
         run_id: None,
         tool_calls: None,
-        ..Default::default()
+        ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
     });
     buf2.flush(&writer).unwrap();
 
@@ -298,7 +299,7 @@ fn append_after_flush_interrupted_still_produces_readable_journal() {
         source: None,
         run_id: None,
         tool_calls: None,
-        ..Default::default()
+        ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
     });
     buf.flush_interrupted(&writer).unwrap();
 

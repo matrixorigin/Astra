@@ -421,25 +421,7 @@ pub struct AdmittedModelExecution {
 
 impl AdmittedModelExecution {
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
-        let header_overrides = offering
-            .model
-            .request_headers
-            .as_ref()
-            .map(|headers| {
-                headers
-                    .iter()
-                    .map(|(name, value)| {
-                        value
-                            .as_str()
-                            .map(|value| (name.clone(), value.to_string()))
-                            .ok_or_else(|| {
-                                format!("model request header '{name}' must contain a string value")
-                            })
-                    })
-                    .collect::<Result<HashMap<_, _>, _>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
             offering_id: offering.offering_id,
             model_name: offering.model.model_name,
@@ -570,6 +552,29 @@ impl ResolvedActiveLlmModel {
     #[must_use]
     pub fn upstream_model_name(&self) -> &str {
         self.wire_model_name.as_deref().unwrap_or(&self.model_name)
+    }
+
+    /// Validate and normalize configured request headers for execution.
+    /// Header values are intentionally required to be strings at the
+    /// admission boundary; executors never reinterpret arbitrary JSON.
+    pub fn execution_header_overrides(&self) -> Result<HashMap<String, String>, String> {
+        self.request_headers
+            .as_ref()
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                            .ok_or_else(|| {
+                                format!("model request header '{name}' must contain a string value")
+                            })
+                    })
+                    .collect()
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 }
 

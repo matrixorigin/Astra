@@ -1991,6 +1991,7 @@ fn build_llm_round_trace_events(
             event.token_usage = llm_round_token_usage_json(round);
             event.parent_event_id = Some(root_event_id.clone());
             event.metadata = json!({
+                "purpose": round.purpose,
                 "finish_reason": round.finish_reason,
                 "tool_calls_returned": round.tool_calls_returned,
                 "tool_call_names": round.tool_call_names,
@@ -3418,14 +3419,19 @@ mod tests {
             Some("root-agent"),
             Some("fallback-model"),
             &[crate::turn::agentic_loop::host::RecentRoundSummary {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                turn: 1,
                 round: 2,
+                provider: "openai".to_string(),
                 model: "model-1".to_string(),
                 prompt_tokens: 10,
                 cache_read_tokens: 4,
                 cache_creation_tokens: 3,
                 completion_tokens: 5,
+                tool_calls_returned: 0,
+                tool_call_names: Vec::new(),
                 duration_ms: 123,
-                ..Default::default()
+                finish_reason: Some("stop".to_string()),
             }],
         );
 
@@ -3434,6 +3440,7 @@ mod tests {
         assert_eq!(event.event_type, "llm_round_completed");
         assert_eq!(event.trace_kind, "llm_round");
         assert_eq!(event.round_index, Some(2));
+        assert_eq!(event.metadata["purpose"], "primary_agent");
         let token_usage = event.token_usage.as_ref().expect("token usage");
         assert_eq!(token_usage["input_tokens"], 10);
         assert_eq!(token_usage["cached_input_tokens"], 4);

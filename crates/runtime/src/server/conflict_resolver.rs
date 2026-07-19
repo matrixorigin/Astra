@@ -101,20 +101,27 @@ impl LlmConflictResolver {
         let messages = Self::build_prompt(task_context, agent_id, conflict);
 
         let result = crate::turn::llm::client::call_llm_and_collect(
-            &messages,
-            &[], // no tools
-            &self.model,
-            // Conflict resolver does not currently support wire_model_name
-            // aliases — the single-model constructor takes a plain string.
-            // When the alias feature reaches this path, plumb a new field.
-            None,
-            &self.api_key,
-            &self.base_url,
-            &self.provider,
-            Some(8192),
-            false,
+            crate::turn::llm::client::LlmCall {
+                purpose: astra_turn_types::InferencePurpose::VerificationJudge,
+                messages: &messages,
+                tools: &[],
+                route: crate::turn::llm::client::LlmExecutionRoute {
+                    model_name: &self.model,
+                    wire_model_name: None,
+                    api_key: &self.api_key,
+                    base_url: &self.base_url,
+                    provider: &self.provider,
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(8192),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             crate::turn::llm::client::LlmCancel::None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .map_err(|e| format!("LLM call failed for {}: {e}", conflict.path))?;

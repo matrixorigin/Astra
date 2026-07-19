@@ -447,6 +447,7 @@ impl AgenticLoopHost for SubRunHost {
             user_intent: Some(runtime_decision_user_intent.as_str()),
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
+            inference_purpose: state.inference_purpose,
             model_id: Some(effective_model_id.as_str()),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
@@ -655,6 +656,7 @@ impl AgenticLoopHost for SubRunHost {
                     state.current_round_index.saturating_add(1),
                 );
                 buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+                    purpose: round_summary.purpose,
                     duration_ms: round_summary.duration_ms,
                     prompt_tokens: round_summary.prompt_tokens,
                     completion_tokens: round_summary.completion_tokens,
@@ -673,7 +675,9 @@ impl AgenticLoopHost for SubRunHost {
                         .as_ref()
                         .and_then(|identity| identity.parent_run_id.clone()),
                     agent_id: Some(self.agent_id.clone()),
-                    ..Default::default()
+                    ttft_ms: None,
+                    agentic_step: None,
+                    tool_calls: None,
                 });
                 let events = buf.drain();
                 crate::cli::cli_config::cli_utils::append_bulk_journal_events_no_sync_or_warn(
@@ -898,6 +902,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             session_memory_llm_params: None,
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),

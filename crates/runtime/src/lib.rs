@@ -296,7 +296,7 @@ pub use astra_turn_core::{
         SESSION_MEMORY_TEMPLATE, SessionMemoryState, build_extraction_prompt, extract_section,
         should_extract as should_extract_session_memory,
     },
-    cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
+    cloud_summary::{SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
     execution_state::normalize_execution_state,
     explain::build_explain_event,

@@ -52,11 +52,10 @@ use crate::turn::agentic_loop::host::{
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge::llm_stream::rate_limit_cooldown;
 use crate::turn::llm::client::{
-    LlmCallResult, LlmCancel, LlmStreamUpdate, call_llm_and_collect_with_request_overrides,
-    call_llm_and_collect_with_request_overrides_and_stream_callback,
-    call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
-    sleep_ms_or_llm_cancel,
+    LlmCall, LlmCallResult, LlmCancel, LlmExecutionRoute, LlmStreamUpdate, OwnedLlmExecutionRoute,
+    call_llm_and_collect_with_stream_callback, sleep_ms_or_llm_cancel,
 };
+use crate::turn::llm::summary_client::RuntimeSummaryClient;
 use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
@@ -284,21 +283,6 @@ impl RunScopedAgentProgressFilter {
             return vec![event];
         }
         Vec::new()
-    }
-}
-
-fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    match CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(llm_connect_timeout())
-            .timeout(llm_fallback_timeout())
-            .build()
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(client) => Ok(client.clone()),
-        Err(error) => Err(error.clone()),
     }
 }
 
@@ -541,80 +525,27 @@ struct ResolvedTurnLlmConfig {
     context_window: Option<u32>,
 }
 
+impl ResolvedTurnLlmConfig {
+    fn execution_route(&self) -> OwnedLlmExecutionRoute {
+        OwnedLlmExecutionRoute {
+            model_name: self.model_name.clone(),
+            wire_model_name: self.wire_model_name.clone(),
+            api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+            provider: self.provider.clone(),
+            header_overrides: self.header_overrides.clone(),
+            request_body_overrides: self.request_body_overrides.clone(),
+            completions_url_override: self.completions_url_override.clone(),
+            request_timeout: self.request_timeout,
+        }
+    }
+
+    fn summary_client(&self, max_output_tokens: usize) -> RuntimeSummaryClient {
+        RuntimeSummaryClient::new(self.execution_route(), max_output_tokens)
+    }
+}
+
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
-
-#[derive(Clone)]
-struct RequestAwareSummaryClient {
-    model_name: String,
-    wire_model_name: Option<String>,
-    api_key: String,
-    base_url: String,
-    provider: String,
-    max_output_tokens: usize,
-    header_overrides: HashMap<String, String>,
-    request_body_overrides: Option<Map<String, Value>>,
-    completions_url_override: Option<String>,
-    request_timeout: Option<Duration>,
-}
-
-#[async_trait]
-impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryClient {
-    async fn summarize(
-        &self,
-        messages: &[Value],
-    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        let client = request_aware_summary_http_client()?;
-
-        match call_llm_nonstream_fallback_with_request_overrides(
-            &client,
-            messages,
-            &[],
-            &self.model_name,
-            &self.api_key,
-            &self.base_url,
-            &self.provider,
-            Some(self.max_output_tokens),
-            llm_fallback_timeout(),
-            self.wire_model_name.as_deref(),
-            (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
-            self.request_body_overrides.as_ref(),
-            self.completions_url_override.as_deref(),
-            self.request_timeout,
-            &ThinkingConfig::Off,
-        )
-        .await
-        {
-            Ok(result) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
-                text: result.full_text,
-                is_ptl_error: false,
-            }),
-            Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
-                Ok(astra_turn_core::cloud_summary::SummaryResponse {
-                    text: String::new(),
-                    is_ptl_error: true,
-                })
-            }
-            Err(error) => Err(error.to_string()),
-        }
-    }
-}
-
-impl RequestAwareSummaryClient {
-    fn from_resolved_config(llm_cfg: &ResolvedTurnLlmConfig, max_output_tokens: usize) -> Self {
-        Self {
-            model_name: llm_cfg.model_name.clone(),
-            wire_model_name: llm_cfg.wire_model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens,
-            header_overrides: llm_cfg.header_overrides.clone(),
-            request_body_overrides: llm_cfg.request_body_overrides.clone(),
-            completions_url_override: llm_cfg.completions_url_override.clone(),
-            request_timeout: llm_cfg.request_timeout,
-        }
-    }
-}
 
 struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
@@ -635,7 +566,7 @@ impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
         let messages = astra_services::turn_intent_judge_messages(ctx);
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(astra_services::TurnIntentJudgeError::Transport)?;
         astra_services::parse_turn_intent_response(response.text.as_str())
@@ -656,7 +587,7 @@ impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
             .collect::<Vec<_>>();
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(SkillAutoRouteJudgeError::Transport)?;
         astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
@@ -1054,13 +985,8 @@ pub struct ServerAgenticLoopHost {
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
-    /// Cached LLM connection params from the last successful model resolution.
-    /// Used by `summary_client()` to construct the compact-summary client
-    /// without re-resolving (model resolution requires async DB call).
-    resolved_llm_params: Option<astra_turn_core::cloud_summary::LlmConnParams>,
     /// Full resolved config from the last successful model resolution.
-    /// Summary-classifier calls need completion overrides and forwarded
-    /// headers, which `LlmConnParams` intentionally does not carry.
+    /// Auxiliary inference must use this same admitted execution route.
     resolved_llm_config: Option<ResolvedTurnLlmConfig>,
     resolved_llm_config_at: Option<Instant>,
 
@@ -1756,7 +1682,6 @@ impl ServerAgenticLoopHostBuilder {
             admitted_model_execution: self.admitted_model_execution,
             resolved_model_name: None,
             resolved_context_window: None,
-            resolved_llm_params: None,
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             tool_schemas,
@@ -2120,7 +2045,6 @@ impl ServerAgenticLoopHost {
     fn clear_resolved_llm_config(&mut self) {
         self.resolved_model_name = None;
         self.resolved_context_window = None;
-        self.resolved_llm_params = None;
         self.resolved_llm_config = None;
         self.resolved_llm_config_at = None;
     }
@@ -2128,13 +2052,6 @@ impl ServerAgenticLoopHost {
     fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
         self.resolved_context_window = llm_cfg.context_window;
-        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: llm_cfg.model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens: 4096,
-        });
         self.resolved_llm_config = Some(llm_cfg.clone());
         self.resolved_llm_config_at = Some(Instant::now());
     }
@@ -2147,30 +2064,22 @@ impl ServerAgenticLoopHost {
             self.clear_resolved_llm_config();
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                config, 256,
-            )));
+            return Some(Box::new(config.summary_client(256)));
         }
 
-        if self.resolved_llm_params.is_none() {
-            let llm_cfg = match self.resolve_llm_config_for_state(state).await {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "astra::turn_intent",
-                        error = %error,
-                        "turn intent judge skipped because model resolution is unavailable"
-                    );
-                    return None;
-                }
-            };
-            self.remember_resolved_llm_config(&llm_cfg);
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                &llm_cfg, 256,
-            )));
-        }
-
-        self.summary_client()
+        let llm_cfg = match self.resolve_llm_config_for_state(state).await {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::debug!(
+                    target: "astra::turn_intent",
+                    error = %error,
+                    "turn intent judge skipped because model resolution is unavailable"
+                );
+                return None;
+            }
+        };
+        self.remember_resolved_llm_config(&llm_cfg);
+        Some(Box::new(llm_cfg.summary_client(256)))
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -4788,18 +4697,7 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = RequestAwareSummaryClient {
-            model_name: llm_cfg.model_name.clone(),
-            wire_model_name: llm_cfg.wire_model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens: compact_config.summary_token_budget,
-            header_overrides: llm_cfg.header_overrides.clone(),
-            request_body_overrides: llm_cfg.request_body_overrides.clone(),
-            completions_url_override: llm_cfg.completions_url_override.clone(),
-            request_timeout: llm_cfg.request_timeout,
-        };
+        let summary_client = llm_cfg.summary_client(compact_config.summary_token_budget);
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
@@ -4959,11 +4857,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .resolved_llm_config
             .as_ref()
             .map(|config| (config.model_name.clone(), config.provider.clone()))
-            .or_else(|| {
-                self.resolved_llm_params
-                    .as_ref()
-                    .map(|params| (params.model_name.clone(), params.provider.clone()))
-            })
             .unwrap_or_default();
         let judge = SummaryClientTurnIntentJudge { client };
         let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
@@ -5551,7 +5444,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     prompt_request_plan.clone(),
                 );
             }
-            state.step_recorder.begin_llm_round(&llm_cfg.model_name);
+            state
+                .step_recorder
+                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
             let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
             let mut attempt_first_stream_update_ms: Option<u64> = None;
@@ -5670,22 +5565,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                 };
-                call_llm_and_collect_with_request_overrides_and_stream_callback(
-                    &llm_messages,
-                    &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.wire_model_name.as_deref(),
-                    &llm_cfg.api_key,
-                    &llm_cfg.base_url,
-                    &llm_cfg.provider,
-                    Some(effective_max_output),
-                    has_fallback,
+                call_llm_and_collect_with_stream_callback(
+                    LlmCall {
+                        purpose: state.inference_purpose,
+                        messages: &llm_messages,
+                        tools: &final_tools,
+                        route: LlmExecutionRoute {
+                            model_name: &llm_cfg.model_name,
+                            wire_model_name: llm_cfg.wire_model_name.as_deref(),
+                            api_key: &llm_cfg.api_key,
+                            base_url: &llm_cfg.base_url,
+                            provider: &llm_cfg.provider,
+                            header_overrides: (!llm_cfg.header_overrides.is_empty())
+                                .then_some(&llm_cfg.header_overrides),
+                            request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
+                            completions_url_override: llm_cfg.completions_url_override.as_deref(),
+                            request_timeout: llm_cfg.request_timeout,
+                        },
+                        max_output_tokens: Some(effective_max_output),
+                        temperature: None,
+                        has_fallback,
+                        thinking: &state.thinking,
+                    },
                     llm_cancel,
-                    (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
-                    llm_cfg.request_body_overrides.as_ref(),
-                    llm_cfg.completions_url_override.as_deref(),
-                    llm_cfg.request_timeout,
-                    &state.thinking,
                     Some(&mut on_stream_update),
                 )
                 .await
@@ -5863,6 +5765,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 state.step_recorder.end_llm_round(
                     &llm_cfg.model_name,
+                    state.inference_purpose,
                     u.input_tokens,
                     u.output_tokens,
                     u.cached_input_tokens,
@@ -6105,7 +6008,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return;
         }
-        let Some(params) = self.resolved_llm_params.clone() else {
+        let Some(config) = self.resolved_llm_config.clone() else {
             return;
         };
 
@@ -6125,8 +6028,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let system_messages = match self.run_turn_pipeline(
             state,
             &visible_tools,
-            &params.provider,
-            &params.model_name,
+            &config.provider,
+            &config.model_name,
             &user_content,
         ) {
             Ok(outcome) => outcome.system_messages,
@@ -6206,20 +6109,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
-        // LLM config is resolved per-turn inside execute_turn. Prefer the full
-        // config because gateway completion overrides and forwarded auth
-        // headers are part of the runtime contract for all auxiliary LLM calls.
-        if let Some(config) = self.resolved_llm_config.as_ref() {
-            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
-                config, 4096,
-            )));
-        }
-
-        // Older tests can still seed the minimal params directly.
-        let params = self.resolved_llm_params.as_ref()?;
-        Some(Box::new(
-            astra_turn_core::cloud_summary::HttpSummaryClient::new(params.clone()),
-        ))
+        self.resolved_llm_config
+            .as_ref()
+            .map(|config| Box::new(config.summary_client(4096)) as Box<_>)
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -6955,6 +6847,23 @@ mod tests {
             "Bearer forwarded-token".to_string(),
             timeout_ms,
         )
+    }
+
+    fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
+        ResolvedTurnLlmConfig {
+            model_name: "gpt-4o-mini".to_string(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url,
+            provider: "openai".to_string(),
+            cache_capability: None,
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+            context_window: None,
+        }
     }
 
     #[derive(Default)]
@@ -9100,6 +9009,7 @@ mod tests {
     #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
+            response_id: None,
             full_text: "Hello world".to_string(),
             reasoning: "thinking...".to_string(),
             reasoning_signature: String::new(),
@@ -10455,6 +10365,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
@@ -12660,24 +12571,29 @@ mod tests {
         let mut forwarded = HashMap::new();
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        let client = RequestAwareSummaryClient {
-            model_name: "gpt-4o-mini".to_string(),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-            header_overrides: forwarded,
-            request_body_overrides: None,
-            completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
-            request_timeout: Some(Duration::from_secs(2)),
-        };
+        let client = RuntimeSummaryClient::new(
+            OwnedLlmExecutionRoute {
+                model_name: "gpt-4o-mini".to_string(),
+                wire_model_name: None,
+                api_key: String::new(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                provider: "openai".to_string(),
+                header_overrides: forwarded,
+                request_body_overrides: None,
+                completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
+                request_timeout: Some(Duration::from_secs(2)),
+            },
+            128,
+        );
 
         let response = client
-            .summarize(&[
-                json!({"role": "system", "content": "summarize"}),
-                json!({"role": "user", "content": "payload"}),
-            ])
+            .summarize(
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+                &[
+                    json!({"role": "system", "content": "summarize"}),
+                    json!({"role": "user", "content": "payload"}),
+                ],
+            )
             .await
             .expect("summary should succeed");
         assert_eq!(response.text, "gateway summary");
@@ -12751,13 +12667,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
+        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
@@ -12883,13 +12793,7 @@ mod tests {
             "session-inline".to_string(),
         )
         .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
+        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;

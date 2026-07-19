@@ -12,7 +12,7 @@ use astra_services::{
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
 
-use crate::turn::llm::client::{LlmCancel, call_llm_and_collect};
+use crate::turn::llm::client::{LlmCall, LlmCancel, LlmExecutionRoute, call_llm_and_collect};
 
 const SKILLIFY_EXTRACTION_OUTPUT_TOKENS: usize = 5000;
 const SKILLIFY_SYNTHESIS_OUTPUT_TOKENS: usize = 7000;
@@ -62,17 +62,27 @@ impl RuntimeSkillifyAgentExecutor {
             json!({"role": "user", "content": user_prompt}),
         ];
         let result = call_llm_and_collect(
-            &messages,
-            &[],
-            &resolved.model_name,
-            resolved.wire_model_name.as_deref(),
-            &resolved.api_key,
-            &resolved.base_url,
-            &resolved.provider,
-            Some(max_output_tokens),
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: &resolved.model_name,
+                    wire_model_name: resolved.wire_model_name.as_deref(),
+                    api_key: &resolved.api_key,
+                    base_url: &resolved.base_url,
+                    provider: &resolved.provider,
+                    header_overrides: None,
+                    request_body_overrides: resolved.request_body_overrides.as_ref(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(max_output_tokens),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .map_err(|error| format!("LLM call failed: {error}"))?;

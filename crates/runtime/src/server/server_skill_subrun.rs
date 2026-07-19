@@ -418,6 +418,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),

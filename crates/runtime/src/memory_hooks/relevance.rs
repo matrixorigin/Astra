@@ -5,9 +5,14 @@
 //! Uses the cheapest `selector`-tagged model from the registry
 //! (resolved via `resolve_memory_model` from the model DB).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use astra_text_utils::text_tokenize::tokenize;
+use astra_turn_core::thinking_config::ThinkingConfig;
+use astra_turn_types::InferencePurpose;
+
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, call_llm_nonstream, global_llm_client};
 
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "\
@@ -50,31 +55,18 @@ pub fn build_memory_feedback_query(user_message: &str, memories: &[String]) -> S
     prompt
 }
 
-/// Parse the selector model's response into a list of indices.
-/// Handles: `[0, 2]`, `[0,2]`, bare `0, 2`, and markdown-wrapped responses.
-#[must_use]
-pub fn parse_relevance_response(response: &str, memory_count: usize) -> Vec<usize> {
-    let trimmed = response.trim();
-
-    // Strip markdown code fences if present
-    let clean = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(trimmed)
-        .trim();
-
-    // Try JSON array parse
-    if let Ok(indices) = serde_json::from_str::<Vec<usize>>(clean) {
-        return indices.into_iter().filter(|&i| i < memory_count).collect();
-    }
-
-    // Fallback: extract numbers from the string
-    clean
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|s| s.parse::<usize>().ok())
-        .filter(|&i| i < memory_count)
-        .collect()
+/// Parse the selector's strict JSON response, dropping out-of-range and
+/// duplicate indices while preserving the model's order.
+fn parse_relevance_response(
+    response: &str,
+    memory_count: usize,
+) -> Result<Vec<usize>, serde_json::Error> {
+    let indices = serde_json::from_str::<Vec<usize>>(response.trim())?;
+    let mut seen = HashSet::new();
+    Ok(indices
+        .into_iter()
+        .filter(|index| *index < memory_count && seen.insert(*index))
+        .collect())
 }
 
 /// Filter memories by the indices returned from the selector model.
@@ -214,15 +206,71 @@ fn is_meaningful_term(term: &str) -> bool {
 
 /// Connection parameters for an OpenAI-compatible LLM endpoint.
 /// Resolved from the model registry via `resolve_memory_model`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmConnParams {
     pub base_url: String,
     pub api_key: String,
     pub model_name: String,
     pub wire_model_name: Option<String>,
     pub provider: String,
+    pub header_overrides: HashMap<String, String>,
     pub request_body_overrides: Option<serde_json::Map<String, serde_json::Value>>,
-    pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout: Option<Duration>,
+}
+
+impl LlmConnParams {
+    pub fn from_resolved(
+        model: astra_services::models::ResolvedActiveLlmModel,
+    ) -> Result<Self, String> {
+        let header_overrides = model.execution_header_overrides()?;
+        Ok(Self {
+            base_url: model.base_url,
+            api_key: model.api_key,
+            model_name: model.model_name,
+            wire_model_name: model.wire_model_name,
+            provider: model.provider,
+            header_overrides,
+            request_body_overrides: model.request_body_overrides,
+            completions_url_override: None,
+            request_timeout: None,
+        })
+    }
+
+    pub(crate) fn execution_route(&self) -> LlmExecutionRoute<'_> {
+        LlmExecutionRoute {
+            model_name: &self.model_name,
+            wire_model_name: self.wire_model_name.as_deref(),
+            api_key: &self.api_key,
+            base_url: &self.base_url,
+            provider: &self.provider,
+            header_overrides: (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
+            request_body_overrides: self.request_body_overrides.as_ref(),
+            completions_url_override: self.completions_url_override.as_deref(),
+            request_timeout: self.request_timeout,
+        }
+    }
+}
+
+impl std::fmt::Debug for LlmConnParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConnParams")
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("provider", &self.provider)
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_count", &self.header_overrides.len())
+            .field(
+                "request_body_overrides_present",
+                &self.request_body_overrides.is_some(),
+            )
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 /// Filter a list of text items through the selector model.
@@ -240,71 +288,31 @@ pub async fn filter_memories(
         return Vec::new();
     }
     let query = build_relevance_query(user_message, items);
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
+    let text = match run_selector_prompt(
+        params,
+        InferencePurpose::MemoryRetrievalRerank,
+        RELEVANCE_FILTER_PROMPT,
+        query,
+    )
+    .await
     {
-        Ok(c) => c,
-        Err(_) => return lexical_filter_memories(user_message, items),
+        Some(text) => text,
+        None => return lexical_filter_memories(user_message, items),
     };
 
-    let mut req_body = serde_json::json!({
-        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
-        "messages": [
-            {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
-            {"role": "user", "content": query},
-        ],
-        "max_tokens": 50,
-        "temperature": 0.0,
-    });
-    // Always suppress thinking for selector/memory calls — no point
-    // spending tokens on reasoning for simple JSON tasks.
-    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
-        &mut req_body,
-        &params.provider,
-        &params.base_url,
-    );
-
-    let resp = match client
-        .post(format!("{}/chat/completions", params.base_url))
-        .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&req_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return lexical_filter_memories(user_message, items),
+    let indices = match parse_relevance_response(&text, items.len()) {
+        Ok(indices) => indices,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %params.model_name,
+                purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
+                %error,
+                "memory selector returned an invalid response"
+            );
+            return lexical_filter_memories(user_message, items);
+        }
     };
-
-    let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })
-        .unwrap_or_default();
-
-    if text.is_empty() {
-        return lexical_filter_memories(user_message, items);
-    }
-
-    // Safety net: strip <think> tags that native thinkers may emit despite suppression.
-    // If stripping empties the text, fall back to the original.
-    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
-    let text = if stripped.trim().is_empty() {
-        text
-    } else {
-        stripped
-    };
-
-    let indices = parse_relevance_response(&text, items.len());
     if indices.is_empty() {
         return Vec::new();
     }
@@ -324,58 +332,71 @@ pub async fn select_dismissed_memory_indices(
         return Vec::new();
     }
     let query = build_memory_feedback_query(user_message, items);
-    let text = match run_selector_prompt(params, MEMORY_FEEDBACK_FILTER_PROMPT, query).await {
+    let text = match run_selector_prompt(
+        params,
+        InferencePurpose::MemoryRetrievalRerank,
+        MEMORY_FEEDBACK_FILTER_PROMPT,
+        query,
+    )
+    .await
+    {
         Some(text) => text,
         None => return Vec::new(),
     };
-    parse_relevance_response(&text, items.len())
+    match parse_relevance_response(&text, items.len()) {
+        Ok(indices) => indices,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %params.model_name,
+                purpose = InferencePurpose::MemoryRetrievalRerank.as_str(),
+                %error,
+                "memory feedback selector returned an invalid response"
+            );
+            Vec::new()
+        }
+    }
 }
 
 async fn run_selector_prompt(
     params: &LlmConnParams,
+    purpose: InferencePurpose,
     system_prompt: &str,
     user_content: String,
 ) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .ok()?;
-
-    let mut req_body = serde_json::json!({
-        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": 50,
-        "temperature": 0.0,
-    });
-    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
-        &mut req_body,
-        &params.provider,
-        &params.base_url,
-    );
-
-    let resp = client
-        .post(format!("{}/chat/completions", params.base_url))
-        .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&req_body)
-        .send()
-        .await
-        .ok()?;
-
-    let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })?;
+    let messages = [
+        serde_json::json!({"role": "system", "content": system_prompt}),
+        serde_json::json!({"role": "user", "content": user_content}),
+    ];
+    let result = call_llm_nonstream(
+        global_llm_client(),
+        LlmCall {
+            purpose,
+            messages: &messages,
+            tools: &[],
+            route: params.execution_route(),
+            max_output_tokens: Some(50),
+            temperature: Some(0.0),
+            has_fallback: false,
+            thinking: &ThinkingConfig::Off,
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    let text = match result {
+        Ok(result) if !result.full_text.trim().is_empty() => result.full_text,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!(
+                target: "astra_runtime::memory_relevance",
+                model_name = %params.model_name,
+                purpose = purpose.as_str(),
+                error_kind = %error.kind,
+                "memory selector model call unavailable"
+            );
+            return None;
+        }
+    };
     if text.trim().is_empty() {
         return None;
     }
@@ -403,27 +424,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_relevance_response() {
-        // (input, max_items) → expected
+    fn relevance_response_requires_a_json_index_array() {
         let cases: &[(&str, usize, &[usize])] = &[
             ("[0, 2, 4]", 5, &[0, 2, 4]),
             ("[0, 2, 10]", 3, &[0, 2]),
-            ("```json\n[1, 3]\n```", 5, &[1, 3]),
-            ("0, 2", 5, &[0, 2]),
+            ("[1, 1, 3]", 5, &[1, 3]),
             ("[]", 5, &[]),
-            ("no relevant memories", 5, &[]),
             ("[10, 20, 30]", 5, &[]),
             ("[0, 99, 2, 150]", 5, &[0, 2]),
         ];
         for (input, max, expected) in cases {
             assert_eq!(
-                parse_relevance_response(input, *max),
+                parse_relevance_response(input, *max).unwrap(),
                 *expected,
                 "input={input:?}, max={max}"
             );
         }
-        // Negative indices: JSON parse fails, fallback digit extraction yields [1,0,2]
-        assert_eq!(parse_relevance_response("[-1, 0, 2]", 5), vec![1, 0, 2]);
+        for invalid in ["0, 2", "```json\n[1, 3]\n```", "[-1, 0, 2]"] {
+            assert!(parse_relevance_response(invalid, 5).is_err());
+        }
     }
 
     #[test]
@@ -484,11 +503,6 @@ mod tests {
         assert!(query.len() < 500 + 200); // truncated message + memory
     }
 
-    // ── parse_relevance_response edge cases (negatives) ──
-    // Negative in JSON: JSON parse fails (usize can't be negative),
-    // fallback digit extraction: "-1" splits on '-' → "1", so [1,0,2].
-    // This case is included in test_parse_relevance_response above.
-
     // ── LlmConnParams tests ──
 
     #[test]
@@ -500,7 +514,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let cloned = params.clone();
         assert_eq!(cloned.base_url, "https://api.example.com/v1");
@@ -517,11 +533,15 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let debug = format!("{params:?}");
         assert!(debug.contains("LlmConnParams"));
-        assert!(debug.contains("localhost"));
+        assert!(debug.contains("model"));
+        assert!(!debug.contains("key"));
+        assert!(!debug.contains("localhost"));
     }
 
     // ── filter_memories tests ──
@@ -535,7 +555,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let result = filter_memories(&params, "query", &[]).await;
         assert!(result.is_empty());
@@ -550,7 +572,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec![
             "browser verification for html pages".into(),
@@ -591,7 +615,6 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         format!("http://{addr}")
     }
 
@@ -606,7 +629,9 @@ mod tests {
             wire_model_name: None,
             provider: "dashscope".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["mem-a".into(), "mem-b".into()];
         let _ = filter_memories(&params, "test query", &items).await;
@@ -629,7 +654,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["mem-a".into()];
         let _ = filter_memories(&params, "test", &items).await;
@@ -652,7 +679,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
         let result = filter_memories(&params, "query", &items).await;
@@ -660,9 +689,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_memories_think_wrapping_json_falls_back_to_original() {
+    async fn filter_memories_malformed_selector_output_uses_lexical_fallback() {
         let captured = Arc::new(Mutex::new(None));
-        // Model wraps JSON inside think tags — strip would empty it
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
         let params = LlmConnParams {
             base_url: base,
@@ -671,13 +699,19 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
-        let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
-        let result = filter_memories(&params, "query", &items).await;
-        // Fallback to original text which contains the think-wrapped JSON
-        // parse_relevance_response will extract digits from "<think>[0, 1]</think>"
-        assert!(!result.is_empty(), "should fall back and parse something");
+        let items = vec![
+            "cargo test for rust executor changes".to_string(),
+            "browser verification for html pages".to_string(),
+        ];
+        let result = filter_memories(&params, "rust executor review", &items).await;
+        assert_eq!(
+            result,
+            vec!["cargo test for rust executor changes".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -691,7 +725,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
         let result = filter_memories(&params, "query", &items).await;
@@ -709,7 +745,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec!["cargo test for rust executor changes".into()];
         let result = filter_memories(&params, "rust executor review", &items).await;
@@ -730,7 +768,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".into(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let items = vec![
             "candidate about browser verification".into(),

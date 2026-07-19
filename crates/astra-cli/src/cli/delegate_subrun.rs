@@ -472,6 +472,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             session_memory_llm_params: None,
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
+            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),

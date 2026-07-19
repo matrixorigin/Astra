@@ -37,6 +37,7 @@ async fn run_tool_backed_chat_turn(
     });
     let payload = json!({
         "agent_id": agent_id,
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "read README through a tool" }],
         "model_selection": seeded_model_selection(ctx),
@@ -1073,6 +1074,7 @@ pub async fn run_product_matrix_full_journey(
     const LLM_TEXT: &str = "product-matrix-e2e-reply";
     let chat_body = json!({
         "agent_id": agent_id,
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "matrix journey ping" }],
         "model_selection": seeded_model_selection(ctx),

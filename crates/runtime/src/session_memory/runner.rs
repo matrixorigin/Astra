@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,13 +12,14 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::{is_runtime_owned_message, session_facts::SessionFacts};
+use astra_turn_types::{
+    InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts,
+};
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
 use crate::turn::llm::client::{
-    apply_provider_auth, build_provider_request_body_with_overrides, global_llm_client,
-    llm_request_url_for_provider, parse_nonstream_response_for_provider,
+    LlmCall, call_llm_nonstream, global_llm_client, redact_provider_secrets,
 };
 
 pub const SESSION_MEMORY_PREFIX: &str = "[@session/active]";
@@ -932,37 +933,23 @@ async fn update_memory_with_llm(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> Result<String, LlmExtractionFailure> {
-    let upstream_model_name = params
-        .wire_model_name
-        .as_deref()
-        .unwrap_or(&params.model_name);
     let prompt = build_extraction_prompt(current_memory, messages);
-    let body = build_provider_request_body_with_overrides(
-        &prompt,
-        &[],
-        upstream_model_name,
-        &params.provider,
-        Some(max_output_tokens),
-        Some(0.0),
-        false,
-        &astra_turn_core::thinking_config::ThinkingConfig::Off,
-        params.request_body_overrides.as_ref(),
+    let call = call_llm_nonstream(
+        global_llm_client(),
+        LlmCall {
+            purpose: InferencePurpose::MemoryExtraction,
+            messages: &prompt,
+            tools: &[],
+            route: params.execution_route(),
+            max_output_tokens: Some(max_output_tokens),
+            temperature: Some(0.0),
+            has_fallback: false,
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        },
+        llm_timeout.saturating_add(Duration::from_secs(1)),
     );
-    let url = llm_request_url_for_provider(
-        &params.base_url,
-        &params.provider,
-        upstream_model_name,
-        false,
-    );
-    let request = global_llm_client()
-        .post(url)
-        .timeout(llm_timeout)
-        .header("content-type", "application/json");
-    let request = apply_provider_auth(request, &params.provider, &params.api_key, None).json(&body);
-
-    let response = match tokio::time::timeout(llm_timeout, request.send()).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(error)) if error.is_timeout() => {
+    let parsed = match tokio::time::timeout(llm_timeout, call).await {
+        Err(_) => {
             return Err(LlmExtractionFailure {
                 reason: SessionMemoryExtractionErrorReason::LlmTimeout,
                 detail: None,
@@ -971,54 +958,13 @@ async fn update_memory_with_llm(
         Ok(Err(error)) => {
             return Err(LlmExtractionFailure {
                 reason: SessionMemoryExtractionErrorReason::LlmError,
-                detail: Some(summarize_llm_detail(&error.to_string())),
+                detail: Some(summarize_llm_detail(&redact_provider_secrets(
+                    &error.message,
+                ))),
             });
         }
-        Err(_) => {
-            return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
-                detail: None,
-            });
-        }
+        Ok(Ok(result)) => result,
     };
-
-    let status = response.status();
-    let body_text = response
-        .text()
-        .await
-        .map_err(|error| LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: failed to read body: {error}",
-                status.as_u16()
-            ))),
-        })?;
-    let payload: Value =
-        serde_json::from_str(&body_text).map_err(|error| LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: invalid json body ({error}): {}",
-                status.as_u16(),
-                extract_llm_error_detail(&body_text)
-            ))),
-        })?;
-    if !status.is_success() {
-        return Err(LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&format!(
-                "http {}: {}",
-                status.as_u16(),
-                extract_llm_error_detail_from_json(&payload)
-            ))),
-        });
-    }
-
-    let parsed = parse_nonstream_response_for_provider(
-        &payload,
-        &params.provider,
-        &params.model_name,
-        Instant::now(),
-    );
     let content = parsed.full_text.trim();
     if content.is_empty() {
         return Err(LlmExtractionFailure {
@@ -1090,23 +1036,6 @@ fn parse_session_narrative_patch(
 
 fn summarize_llm_detail(text: &str) -> String {
     truncate_chars(&text.split_whitespace().collect::<Vec<_>>().join(" "), 220)
-}
-
-fn extract_llm_error_detail(body_text: &str) -> String {
-    match serde_json::from_str::<Value>(body_text) {
-        Ok(payload) => extract_llm_error_detail_from_json(&payload),
-        Err(_) => summarize_llm_detail(body_text),
-    }
-}
-
-fn extract_llm_error_detail_from_json(payload: &Value) -> String {
-    payload
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/message").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/error/type").and_then(Value::as_str))
-        .map(summarize_llm_detail)
-        .unwrap_or_else(|| summarize_llm_detail(&payload.to_string()))
 }
 
 async fn store_session_memory(
@@ -1906,7 +1835,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -1957,7 +1888,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -2021,7 +1954,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
@@ -2093,7 +2028,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
@@ -2166,7 +2103,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
 
         let artifacts = run_extraction(
@@ -2219,7 +2158,9 @@ mod tests {
             wire_model_name: Some("deepseek-v4-flash".to_string()),
             provider: "anthropic".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -2270,7 +2211,9 @@ mod tests {
             wire_model_name: None,
             provider: "bedrock".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -2318,7 +2261,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -2379,7 +2324,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -2448,7 +2395,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let second = LlmConnParams {
             base_url: format!("{success_url}/v1"),
@@ -2457,7 +2406,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let artifacts = run_extraction(
             &memoria,

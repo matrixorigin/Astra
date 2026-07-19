@@ -504,6 +504,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         user_intent: Some(ctx.user_intent),
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
+        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         model_id: ctx.model_id,
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,

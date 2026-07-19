@@ -424,6 +424,7 @@ fn record_early_exit_llm_round(
     let run_id = state.current_run_id.clone();
     let duration_ms = turn_start.elapsed().as_millis() as u64;
     state.push_recent_round(super::host::RecentRoundSummary {
+        purpose: state.inference_purpose,
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
@@ -439,6 +440,7 @@ fn record_early_exit_llm_round(
     });
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            purpose: state.inference_purpose,
             ttft_ms: turn_result.ttft_ms,
             duration_ms,
             prompt_tokens: turn_result.accum.prompt_tokens,
@@ -452,7 +454,7 @@ fn record_early_exit_llm_round(
             source: Some("agentic_loop".into()),
             run_id,
             tool_calls: None,
-            ..Default::default()
+            agent_id: None,
         });
     }
 }

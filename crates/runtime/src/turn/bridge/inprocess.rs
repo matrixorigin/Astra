@@ -5,7 +5,7 @@
 /// | Behavior | Implementation |
 /// |------------------------|------|
 /// | Long-lived stream "stall" / no chunks | [`super::llm::client::stream_idle_timeout`] on SSE `next()` (5 min default; shortened only by the `bridge-e2e-hooks` test hook) |
-/// | Recover via one-shot completion | [`super::llm::client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
+/// | Recover via one-shot completion | [`super::llm::client::call_llm_nonstream`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm::client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm::client::wait_until_cancelled_or_pending) in the bridge stream |
 /// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. "resolve once" matches ledger single-shot semantics |
@@ -1153,8 +1153,10 @@ fn flush_turn_event_buffer_or_warn(
 use super::observability::{build_context_trace_signal, persist_legacy_bridge_trace_and_quality};
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
-use super::llm_stream::call_llm_stream_with_request_overrides;
+use super::llm_stream::call_llm_stream;
 use super::llm_stream::rate_limit_cooldown;
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, OwnedLlmExecutionRoute};
+use crate::turn::llm::summary_client::RuntimeSummaryClient;
 use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 
 #[cfg(test)]
@@ -1530,6 +1532,23 @@ impl InProcessChatTurnBridge {
             .get("agent_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let inference_purpose = payload
+            .get("inference_purpose")
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "inference_purpose is required".to_string(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<astra_turn_types::InferencePurpose>(value).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "inference_purpose is invalid".to_string(),
+                    )
+                })
+            })?;
         let (messages, recovered_required_runtime_texts) =
             normalize_bridge_prompt_messages(optional_payload_array(&payload, "messages")?);
         let tool_results = optional_payload_array(&payload, "tool_results")?;
@@ -1557,10 +1576,6 @@ impl InProcessChatTurnBridge {
         let model_offering_id = Some(admitted_model_execution.offering_id.clone());
         let round_index = bridge_round_index(&payload)?;
 
-        let _agent_id = payload
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
         let thinking_config = payload
             .get("thinking")
             .map(astra_turn_core::thinking_config::ThinkingConfig::from_payload_value)
@@ -1773,12 +1788,34 @@ impl InProcessChatTurnBridge {
                     admitted_model_execution.context_window,
                 )
             };
-            let llm_header_overrides = (!admitted_model_execution.header_overrides.is_empty())
-                .then(|| admitted_model_execution.header_overrides.clone());
-            let completions_url_override = admitted_model_execution.completions_url_override.clone();
-            let request_timeout = admitted_model_execution
-                .request_timeout_ms
-                .map(std::time::Duration::from_millis);
+            let (llm_header_overrides, completions_url_override, request_timeout) = if use_e2e_llm
+            {
+                (None, None, None)
+            } else {
+                (
+                    (!admitted_model_execution.header_overrides.is_empty())
+                        .then(|| admitted_model_execution.header_overrides.clone()),
+                    admitted_model_execution.completions_url_override.clone(),
+                    admitted_model_execution
+                        .request_timeout_ms
+                        .map(std::time::Duration::from_millis),
+                )
+            };
+            let compact_config = crate::prompts::CompactConfig::from_env();
+            let summary_client = RuntimeSummaryClient::new(
+                OwnedLlmExecutionRoute {
+                    model_name: model_name.clone(),
+                    wire_model_name: wire_model_name.clone(),
+                    api_key: api_key.clone(),
+                    base_url: base_url.clone(),
+                    provider: provider.clone(),
+                    header_overrides: llm_header_overrides.clone().unwrap_or_default(),
+                    request_body_overrides: request_body_overrides.clone(),
+                    completions_url_override: completions_url_override.clone(),
+                    request_timeout,
+                },
+                compact_config.summary_token_budget,
+            );
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
@@ -2294,21 +2331,11 @@ impl InProcessChatTurnBridge {
             //
             // Phase 3/Convergence: both the bridge and `ServerAgenticLoopHost`
             // now route through the shared `wire_assembly::MemoriaContext`.
-            // The summary client still constructs here (it captures the
-            // current request's auth headers + overrides) and is injected.
+            // The summary adapter uses the same admitted route as the main
+            // request, including forwarded headers and endpoint overrides.
             let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
 
-                let compact_config = crate::prompts::CompactConfig::from_env();
-                let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
-                    astra_turn_core::cloud_summary::LlmConnParams {
-                        model_name: model_name.clone(),
-                        api_key: api_key.clone(),
-                        base_url: base_url.clone(),
-                        provider: provider.clone(),
-                        max_output_tokens: compact_config.summary_token_budget,
-                    },
-                );
                 let memoria_client = memoria_client_shared.clone();
 
                 let ctx = crate::turn::wire_assembly::MemoriaContext {
@@ -2856,22 +2883,28 @@ impl InProcessChatTurnBridge {
                     {
                         futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
                     } else {
-                        match call_llm_stream_with_request_overrides(
-                            &llm_messages,
-                            &pruned_tools,
-                            &model_name,
-                            wire_model_name.as_deref(),
-                            &api_key,
-                            &base_url,
-                            &provider,
-                            Some(max_output_tokens),
-                            false,
+                        match call_llm_stream(
+                            LlmCall {
+                                purpose: inference_purpose,
+                                messages: &llm_messages,
+                                tools: &pruned_tools,
+                                route: LlmExecutionRoute {
+                                    model_name: &model_name,
+                                    wire_model_name: wire_model_name.as_deref(),
+                                    api_key: &api_key,
+                                    base_url: &base_url,
+                                    provider: &provider,
+                                    header_overrides: llm_header_overrides.as_ref(),
+                                    request_body_overrides: request_body_overrides.as_ref(),
+                                    completions_url_override: completions_url_override.as_deref(),
+                                    request_timeout,
+                                },
+                                max_output_tokens: Some(max_output_tokens),
+                                temperature: None,
+                                has_fallback: false,
+                                thinking: &thinking_config,
+                            },
                             cc.clone(),
-                            &thinking_config,
-                            request_body_overrides.as_ref(),
-                            llm_header_overrides.as_ref(),
-                            completions_url_override.as_deref(),
-                            request_timeout,
                         )
                         .await
                         {
@@ -2905,16 +2938,6 @@ impl InProcessChatTurnBridge {
                             let budget = crate::prompts::budget_for_model_with_override(
                                 Some(&model_name),
                                 model_context_window,
-                            );
-                            let compact_config = crate::prompts::CompactConfig::from_env();
-                            let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
-                                astra_turn_core::cloud_summary::LlmConnParams {
-                                    model_name: model_name.clone(),
-                                    api_key: api_key.clone(),
-                                    base_url: base_url.clone(),
-                                    provider: provider.clone(),
-                                    max_output_tokens: compact_config.summary_token_budget,
-                                },
                             );
                             let memoria_client = memoria_client_owned.clone();
 
@@ -3056,22 +3079,28 @@ impl InProcessChatTurnBridge {
                             }
 
                             // Retry LLM call
-                            match call_llm_stream_with_request_overrides(
-                                &llm_messages,
-                                &pruned_tools,
-                                &model_name,
-                                wire_model_name.as_deref(),
-                                &api_key,
-                                &base_url,
-                                &provider,
-                                Some(max_output_tokens / 2), // reduce output budget too
-                                false,
+                            match call_llm_stream(
+                                LlmCall {
+                                    purpose: inference_purpose,
+                                    messages: &llm_messages,
+                                    tools: &pruned_tools,
+                                    route: LlmExecutionRoute {
+                                        model_name: &model_name,
+                                        wire_model_name: wire_model_name.as_deref(),
+                                        api_key: &api_key,
+                                        base_url: &base_url,
+                                        provider: &provider,
+                                        header_overrides: llm_header_overrides.as_ref(),
+                                        request_body_overrides: request_body_overrides.as_ref(),
+                                        completions_url_override: completions_url_override.as_deref(),
+                                        request_timeout,
+                                    },
+                                    max_output_tokens: Some(max_output_tokens / 2),
+                                    temperature: None,
+                                    has_fallback: false,
+                                    thinking: &thinking_config,
+                                },
                                 cc.clone(),
-                                &thinking_config,
-                                request_body_overrides.as_ref(),
-                                llm_header_overrides.as_ref(),
-                                completions_url_override.as_deref(),
-                                request_timeout,
                             )
                             .await
                             {
@@ -3814,6 +3843,7 @@ impl InProcessChatTurnBridge {
                     && let Some(buf) = turn_event_buffer.as_mut()
                 {
                     buf.record_llm_round(LlmRoundRecord {
+                        purpose: inference_purpose,
                         ttft_ms: None,
                         duration_ms: round_ms as u64,
                         prompt_tokens: usage_snapshot.input_tokens,
@@ -3835,7 +3865,7 @@ impl InProcessChatTurnBridge {
                         source: Some("bridge_inprocess".to_string()),
                         run_id: Some(run_id.clone()),
                         tool_calls: None,
-                        ..Default::default()
+                        agent_id: agent_id.clone(),
                     });
                 }
 
@@ -4258,7 +4288,7 @@ impl InProcessChatTurnBridge {
                     &all_round_tool_calls,
                     None, // context_capture_id
                     Some(&resolved_model),
-                    _agent_id.as_deref(),
+                    agent_id.as_deref(),
                     Some(&user_query_event_id),
                     trace_turn as i64,
                     None, // session_start
@@ -7358,6 +7388,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal success"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -7449,6 +7480,15 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        let round = journal
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("llm_round"))
+            .expect("bridge LLM round event");
+        let purpose = serde_json::from_value::<astra_turn_types::InferencePurpose>(
+            round["metadata"]["purpose"].clone(),
+        )
+        .expect("typed round purpose");
+        assert_eq!(purpose, astra_turn_types::InferencePurpose::PrimaryAgent);
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -7463,6 +7503,7 @@ mod tests {
         let mut headers = bridge_test_headers(session_id, true);
         headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "root_turn_journal_owned": true,
             "messages": [{"role": "user", "content": "root-owned bridge capture"}],
             "edge_tools": [],
@@ -7536,6 +7577,7 @@ mod tests {
 
         for (round_index, reply) in [(0_u32, "bridge round zero"), (1_u32, "bridge round one")] {
             let payload = json!({
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
                 "messages": [{"role": "user", "content": format!("bridge round {round_index}")}],
                 "edge_tools": [],
                 "round_index": round_index,
@@ -7625,6 +7667,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal partial error"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -7697,6 +7740,7 @@ mod tests {
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, false);
         let payload = json!({
+            "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
             "messages": [{"role": "user", "content": "bridge journal disabled"}],
             "edge_tools": [],
             "test_llm_stream_blocks": [
@@ -8023,6 +8067,7 @@ mod tests {
             && let Some(buf) = turn_event_buffer.as_mut()
         {
             buf.record_llm_round(LlmRoundRecord {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 cache_read_tokens: 0,
@@ -8036,7 +8081,7 @@ mod tests {
                 source: Some("bridge_inprocess".to_string()),
                 run_id: None,
                 tool_calls: None,
-                ..Default::default()
+                agent_id: None,
             });
         }
         record_full_llm_response_event(

@@ -2130,7 +2130,9 @@ mod tests {
             wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_memoria(
@@ -2208,7 +2210,9 @@ mod tests {
             wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let second = LlmConnParams {
             base_url: format!("{failing_url}/v1"),
@@ -2467,7 +2471,9 @@ mod tests {
             wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
-            thinking_capability: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
         };
         let (ingestion, _rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());

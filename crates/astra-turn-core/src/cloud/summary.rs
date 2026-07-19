@@ -66,35 +66,17 @@ pub struct SummaryResponse {
     pub is_ptl_error: bool,
 }
 
-/// Connection parameters for the LLM API.
-#[derive(Clone)]
-pub struct LlmConnParams {
-    pub model_name: String,
-    pub api_key: String,
-    pub base_url: String,
-    pub provider: String,
-    /// Maximum tokens to generate for the summary.
-    pub max_output_tokens: usize,
-}
-
-impl std::fmt::Debug for LlmConnParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmConnParams")
-            .field("model_name", &self.model_name)
-            .field("api_key", &"[REDACTED]")
-            .field("base_url", &self.base_url)
-            .field("provider", &self.provider)
-            .field("max_output_tokens", &self.max_output_tokens)
-            .finish()
-    }
-}
-
 /// Abstraction over the LLM API for summary generation.
-/// Implemented by the real HTTP client and by mocks in tests.
+/// Provider execution belongs to the runtime; this crate only owns summary
+/// behavior and the test seam.
 #[async_trait]
 pub trait SummaryLlmClient: Send + Sync {
     /// Send a summary request. Returns the response or an error.
-    async fn summarize(&self, messages: &[Value]) -> Result<SummaryResponse, String>;
+    async fn summarize(
+        &self,
+        purpose: astra_turn_types::InferencePurpose,
+        messages: &[Value],
+    ) -> Result<SummaryResponse, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +105,13 @@ pub async fn generate_compact_summary(
         let rendered = render_messages_for_summary(&msgs_for_summary);
         let prompt_messages = build_summary_messages(&rendered);
 
-        match client.summarize(&prompt_messages).await {
+        match client
+            .summarize(
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+                &prompt_messages,
+            )
+            .await
+        {
             Ok(resp) if !resp.is_ptl_error => {
                 return Some(crate::cloud::compact_prompt::format_structured_summary(
                     &resp.text,
@@ -233,7 +221,13 @@ pub async fn generate_inline_summary(
             "content": INLINE_COMPACT_INSTRUCTION,
         }));
 
-        match client.summarize(&messages).await {
+        match client
+            .summarize(
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+                &messages,
+            )
+            .await
+        {
             Ok(resp) if !resp.is_ptl_error => {
                 return Some(crate::cloud::compact_prompt::format_structured_summary(
                     &resp.text,
@@ -272,182 +266,6 @@ pub async fn generate_inline_summary(
     None
 }
 
-fn build_bedrock_summary_body(messages: &[Value], max_output_tokens: usize) -> Value {
-    let system = messages
-        .iter()
-        .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
-        .filter_map(|msg| msg.get("content").and_then(Value::as_str))
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| json!({ "text": text }))
-        .collect::<Vec<_>>();
-    let bedrock_messages = messages
-        .iter()
-        .filter(|msg| msg.get("role").and_then(Value::as_str) != Some("system"))
-        .filter_map(|msg| {
-            let role = msg.get("role").and_then(Value::as_str)?;
-            let content = msg.get("content").and_then(Value::as_str)?;
-            Some(json!({
-                "role": if role == "assistant" { "assistant" } else { "user" },
-                "content": [{ "text": content }],
-            }))
-        })
-        .collect::<Vec<_>>();
-    let mut body = json!({
-        "messages": bedrock_messages,
-        "inferenceConfig": {
-            "maxTokens": max_output_tokens,
-        }
-    });
-    if !system.is_empty() {
-        body["system"] = Value::Array(system);
-    }
-    body
-}
-
-fn build_summary_request_url(params: &LlmConnParams) -> Result<String, String> {
-    if params.provider == "bedrock" {
-        let mut url = reqwest::Url::parse(params.base_url.trim_end_matches('/'))
-            .map_err(|e| e.to_string())?;
-        {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| "invalid Bedrock base_url".to_string())?;
-            segments.pop_if_empty();
-            segments.push("model");
-            segments.push(&params.model_name);
-            segments.push("converse");
-        }
-        Ok(url.to_string())
-    } else if params.provider == "anthropic" {
-        let base = params.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            Ok(format!("{base}/messages"))
-        } else {
-            Ok(format!("{base}/v1/messages"))
-        }
-    } else {
-        Ok(format!(
-            "{}/chat/completions",
-            params.base_url.trim_end_matches('/')
-        ))
-    }
-}
-
-fn parse_summary_response_text(provider: &str, json: &Value) -> String {
-    if provider == "bedrock" {
-        json.get("output")
-            .and_then(|output| output.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .collect::<String>()
-            })
-            .unwrap_or_default()
-    } else {
-        json.get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP implementation
-// ---------------------------------------------------------------------------
-
-/// Real HTTP-based summary client using the runtime's LLM gateway.
-pub struct HttpSummaryClient {
-    params: LlmConnParams,
-}
-
-impl HttpSummaryClient {
-    pub fn new(params: LlmConnParams) -> Self {
-        Self { params }
-    }
-}
-
-#[async_trait]
-impl SummaryLlmClient for HttpSummaryClient {
-    async fn summarize(&self, messages: &[Value]) -> Result<SummaryResponse, String> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let body = if self.params.provider == "bedrock" {
-            build_bedrock_summary_body(messages, self.params.max_output_tokens)
-        } else if self.params.provider == "anthropic" {
-            json!({
-                "model": self.params.model_name,
-                "messages": messages,
-                "stream": false,
-                "max_tokens": self.params.max_output_tokens,
-            })
-        } else {
-            json!({
-                "model": self.params.model_name,
-                "messages": messages,
-                "stream": false,
-                "max_completion_tokens": self.params.max_output_tokens,
-            })
-        };
-
-        let url = build_summary_request_url(&self.params)?;
-
-        let mut req = client.post(&url).header("content-type", "application/json");
-        if self.params.provider == "anthropic" {
-            req = req
-                .header("x-api-key", &self.params.api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("authorization", format!("Bearer {}", self.params.api_key));
-        }
-
-        let resp = req.json(&body).send().await.map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-
-        if status == 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            if is_ptl_error(&body_text) {
-                return Ok(SummaryResponse {
-                    text: String::new(),
-                    is_ptl_error: true,
-                });
-            }
-            return Err(format!("LLM 400 error: {body_text}"));
-        }
-
-        if !resp.status().is_success() {
-            return Err(format!("LLM error status: {status}"));
-        }
-
-        let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = parse_summary_response_text(&self.params.provider, &json);
-
-        Ok(SummaryResponse {
-            text,
-            is_ptl_error: false,
-        })
-    }
-}
-
-/// Detect if an error response body indicates a context-too-long error.
-fn is_ptl_error(body: &str) -> bool {
-    let lower = body.to_lowercase();
-    lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
-        || lower.contains("input is too long")
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -455,14 +273,15 @@ fn is_ptl_error(body: &str) -> bool {
 /// Test helpers exposed for cross-crate testing (e.g. runtime's compaction tests).
 pub mod test_support {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Mock LLM client for testing.
     pub struct MockSummaryClient {
         /// Responses to return in order. If fewer than calls, last is repeated.
         pub responses: Vec<Result<SummaryResponse, String>>,
         pub call_count: Arc<AtomicUsize>,
+        purposes: Arc<Mutex<Vec<astra_turn_types::InferencePurpose>>>,
     }
 
     impl MockSummaryClient {
@@ -473,6 +292,7 @@ pub mod test_support {
                     is_ptl_error: false,
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
+                purposes: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -489,6 +309,7 @@ pub mod test_support {
                     }),
                 ],
                 call_count: Arc::new(AtomicUsize::new(0)),
+                purposes: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -499,6 +320,7 @@ pub mod test_support {
                     is_ptl_error: true,
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
+                purposes: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -506,13 +328,29 @@ pub mod test_support {
             Self {
                 responses: vec![Err(msg.to_string())],
                 call_count: Arc::new(AtomicUsize::new(0)),
+                purposes: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        pub fn recorded_purposes(&self) -> Vec<astra_turn_types::InferencePurpose> {
+            self.purposes
+                .lock()
+                .expect("mock summary purpose lock")
+                .clone()
         }
     }
 
     #[async_trait]
     impl SummaryLlmClient for MockSummaryClient {
-        async fn summarize(&self, _messages: &[Value]) -> Result<SummaryResponse, String> {
+        async fn summarize(
+            &self,
+            purpose: astra_turn_types::InferencePurpose,
+            _messages: &[Value],
+        ) -> Result<SummaryResponse, String> {
+            self.purposes
+                .lock()
+                .expect("mock summary purpose lock")
+                .push(purpose);
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             let idx = count.min(self.responses.len() - 1);
             self.responses[idx].clone()
@@ -546,6 +384,10 @@ mod tests {
         let result = generate_compact_summary(&msgs, &client).await;
         assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.recorded_purposes(),
+            [astra_turn_types::InferencePurpose::RequiredCompaction]
+        );
     }
 
     #[tokio::test]
@@ -556,6 +398,13 @@ mod tests {
         let result = generate_compact_summary(&msgs, &client).await;
         assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.recorded_purposes(),
+            [
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+                astra_turn_types::InferencePurpose::RequiredCompaction,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -576,16 +425,6 @@ mod tests {
         let msgs = make_messages(2);
         let result = generate_compact_summary(&msgs, &client).await;
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn is_ptl_error_detects_known_patterns() {
-        assert!(is_ptl_error("context_length_exceeded"));
-        assert!(is_ptl_error("maximum context length is 128000"));
-        assert!(is_ptl_error("Prompt is too long for this model"));
-        assert!(is_ptl_error("too many tokens in input"));
-        assert!(!is_ptl_error("some other error"));
-        assert!(!is_ptl_error(""));
     }
 
     #[test]
@@ -618,62 +457,6 @@ mod tests {
         assert!(
             !INLINE_COMPACT_INSTRUCTION.contains("**Goals**"),
             "inline compaction must not use a parallel summary schema"
-        );
-    }
-
-    #[test]
-    fn build_bedrock_summary_body_and_parse_response() {
-        let messages = build_summary_messages("some conversation");
-        let body = build_bedrock_summary_body(&messages, 321);
-        assert_eq!(body["system"][0]["text"], COMPACT_SYSTEM_PROMPT);
-        assert_eq!(body["messages"][0]["role"], "user");
-        assert!(
-            body["messages"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("some conversation")
-        );
-        assert_eq!(body["inferenceConfig"]["maxTokens"], 321);
-
-        let response = json!({
-            "output": {
-                "message": {
-                    "content": [
-                        {"text": "summary line 1"},
-                        {"text": "\nsummary line 2"}
-                    ]
-                }
-            }
-        });
-        assert_eq!(
-            parse_summary_response_text("bedrock", &response),
-            "summary line 1\nsummary line 2"
-        );
-    }
-
-    #[test]
-    fn build_bedrock_summary_body_omits_blank_system() {
-        let messages = vec![
-            json!({"role": "system", "content": "   \n\t"}),
-            json!({"role": "user", "content": "some conversation"}),
-        ];
-        let body = build_bedrock_summary_body(&messages, 321);
-        assert!(body.get("system").is_none());
-        assert_eq!(body["messages"][0]["role"], "user");
-    }
-
-    #[test]
-    fn build_summary_request_url_supports_bedrock() {
-        let params = LlmConnParams {
-            model_name: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
-            api_key: "redacted".to_string(),
-            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
-            provider: "bedrock".to_string(),
-            max_output_tokens: 128,
-        };
-        assert_eq!(
-            build_summary_request_url(&params).unwrap(),
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
         );
     }
 

@@ -79,8 +79,8 @@ const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
 const TPM_MAX_RETRIES: u32 = 5;
 /// TCP connect timeout for LLM API requests (seconds). Override: `ASTRA_LLM_CONNECT_TIMEOUT_S`.
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
-/// Non-stream fallback hard timeout (seconds). Override: `ASTRA_LLM_FALLBACK_TIMEOUT_S`.
-const LLM_FALLBACK_TIMEOUT_S: u64 = 120;
+/// Non-stream request hard timeout (seconds). Override: `ASTRA_LLM_NONSTREAM_TIMEOUT_S`.
+const LLM_NONSTREAM_TIMEOUT_S: u64 = 120;
 /// Total budget across all retries + fallback for a single LLM call (seconds).
 /// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
@@ -328,6 +328,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallResult {
+    /// Provider response identity when available on non-stream responses.
+    pub response_id: Option<String>,
     pub full_text: String,
     pub reasoning: String,
     /// Bedrock reasoning signature — must be passed back unmodified in multi-turn.
@@ -350,6 +352,98 @@ pub(crate) enum LlmStreamUpdate {
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
+
+/// Short-lived provider route material for one model call.
+///
+/// This is deliberately neither serializable nor cloneable. It may borrow a
+/// credential and request headers, so its custom `Debug` only exposes
+/// non-secret routing facts.
+pub(crate) struct LlmExecutionRoute<'a> {
+    pub model_name: &'a str,
+    pub wire_model_name: Option<&'a str>,
+    pub api_key: &'a str,
+    pub base_url: &'a str,
+    pub provider: &'a str,
+    pub header_overrides: Option<&'a HashMap<String, String>>,
+    pub request_body_overrides: Option<&'a Map<String, Value>>,
+    pub completions_url_override: Option<&'a str>,
+    pub request_timeout: Option<std::time::Duration>,
+}
+
+/// Owned execution route for adapters that must outlive one stack frame.
+/// Like the borrowed route, it is deliberately non-serializable and redacts
+/// credentials, endpoint URLs, and header values from `Debug`.
+#[derive(Clone)]
+pub(crate) struct OwnedLlmExecutionRoute {
+    pub model_name: String,
+    pub wire_model_name: Option<String>,
+    pub api_key: String,
+    pub base_url: String,
+    pub provider: String,
+    pub header_overrides: HashMap<String, String>,
+    pub request_body_overrides: Option<Map<String, Value>>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout: Option<std::time::Duration>,
+}
+
+impl OwnedLlmExecutionRoute {
+    #[must_use]
+    pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
+        LlmExecutionRoute {
+            model_name: &self.model_name,
+            wire_model_name: self.wire_model_name.as_deref(),
+            api_key: &self.api_key,
+            base_url: &self.base_url,
+            provider: &self.provider,
+            header_overrides: (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
+            request_body_overrides: self.request_body_overrides.as_ref(),
+            completions_url_override: self.completions_url_override.as_deref(),
+            request_timeout: self.request_timeout,
+        }
+    }
+}
+
+impl std::fmt::Debug for OwnedLlmExecutionRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.borrowed().fmt(f)
+    }
+}
+
+impl std::fmt::Debug for LlmExecutionRoute<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self
+            .header_overrides
+            .into_iter()
+            .flat_map(HashMap::keys)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("LlmExecutionRoute")
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("provider", &self.provider)
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_names", &header_names)
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
+/// Canonical runtime input for one logical model call.
+pub(crate) struct LlmCall<'a> {
+    pub purpose: astra_turn_types::InferencePurpose,
+    pub messages: &'a [Value],
+    pub tools: &'a [Value],
+    pub route: LlmExecutionRoute<'a>,
+    pub max_output_tokens: Option<usize>,
+    pub temperature: Option<f64>,
+    pub has_fallback: bool,
+    pub thinking: &'a ThinkingConfig,
+}
 
 fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
     !result.full_text.is_empty()
@@ -602,7 +696,7 @@ pub(crate) use astra_core::net::apply_env_proxy;
 
 /// Resolve an LLM duration-in-seconds constant, consulting its env-var
 /// override and falling back to the compile-time default. Used by
-/// `LLM_CONNECT_TIMEOUT_S`, `LLM_FALLBACK_TIMEOUT_S`, and
+/// `LLM_CONNECT_TIMEOUT_S`, `LLM_NONSTREAM_TIMEOUT_S`, and
 /// `LLM_TOTAL_BUDGET_S`. Operators set these to lower values in
 /// degraded conditions (tight SLOs) or raise them for slow providers;
 /// the const defaults are the production baseline.
@@ -622,11 +716,11 @@ pub(crate) fn llm_connect_timeout() -> std::time::Duration {
     ))
 }
 
-/// Hard timeout for the non-stream fallback request. Override: `ASTRA_LLM_FALLBACK_TIMEOUT_S`.
-pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
+/// Hard timeout for a non-stream request. Override: `ASTRA_LLM_NONSTREAM_TIMEOUT_S`.
+pub(crate) fn llm_nonstream_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(llm_secs_from_env(
-        "ASTRA_LLM_FALLBACK_TIMEOUT_S",
-        LLM_FALLBACK_TIMEOUT_S,
+        "ASTRA_LLM_NONSTREAM_TIMEOUT_S",
+        LLM_NONSTREAM_TIMEOUT_S,
     ))
 }
 
@@ -2660,98 +2754,39 @@ fn has_llm_auth_override(
 /// **Note**: Caller must check rate-limit cooldown state and handle fallback model
 /// resolution BEFORE calling this function. This function only records errors
 /// for cooldown tracking, not pre-checks.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_and_collect(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
+    call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
-    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_request_overrides(
-        messages,
-        tools,
-        model_name,
-        wire_model_name,
-        api_key,
-        base_url,
-        provider,
-        max_output_tokens,
-        has_fallback,
-        cancel,
-        None,
-        None,
-        None,
-        None,
-        thinking,
-    )
-    .await
+    call_llm_and_collect_with_stream_callback(call, cancel, None).await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_and_collect_with_request_overrides(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
+pub(crate) async fn call_llm_and_collect_with_stream_callback(
+    call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
-    header_overrides: Option<&HashMap<String, String>>,
-    request_body_overrides: Option<&Map<String, Value>>,
-    completions_url_override: Option<&str>,
-    request_timeout: Option<std::time::Duration>,
-    thinking: &ThinkingConfig,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_request_overrides_and_stream_callback(
+    let LlmCall {
+        purpose,
         messages,
         tools,
+        route,
+        max_output_tokens,
+        temperature,
+        has_fallback,
+        thinking,
+    } = call;
+    let LlmExecutionRoute {
         model_name,
         wire_model_name,
         api_key,
         base_url,
         provider,
-        max_output_tokens,
-        has_fallback,
-        cancel,
         header_overrides,
         request_body_overrides,
         completions_url_override,
         request_timeout,
-        thinking,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callback(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
-    cancel: LlmCancel<'_>,
-    header_overrides: Option<&HashMap<String, String>>,
-    request_body_overrides: Option<&Map<String, Value>>,
-    completions_url_override: Option<&str>,
-    request_timeout: Option<std::time::Duration>,
-    thinking: &ThinkingConfig,
-    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    } = route;
     let cooldown = rate_limit_cooldown();
     // `model_key` indexes rate-limit state on the local row name.
     let model_key = model_name;
@@ -2776,7 +2811,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         upstream_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         true,
         thinking,
         request_body_overrides,
@@ -2877,6 +2912,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
             target: "astra_runtime::llm_client",
             url = %url,
             attempt,
+            purpose = purpose.as_str(),
             provider,
             model_name,
             "LLM request sending"
@@ -3011,29 +3047,36 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                             .with_details_json(details_json));
                         }
                         let remaining = total_budget.saturating_sub(elapsed);
-                        let fb_timeout = llm_fallback_timeout().min(remaining);
+                        let fb_timeout = llm_nonstream_timeout().min(remaining);
                         astra_core::agent_warn!(
                             "llm",
                             "stream transport error after partial output — attempting non-stream fallback (timeout {}s)",
                             fb_timeout.as_secs()
                         );
-                        return call_llm_nonstream_fallback_with_request_overrides_for_trigger(
+                        return call_llm_nonstream_fallback_for_trigger(
                             NonstreamFallbackTrigger::StreamTransport,
                             client,
-                            &messages,
-                            tools,
-                            model_name,
-                            api_key,
-                            base_url,
-                            provider,
-                            max_output_tokens,
+                            LlmCall {
+                                purpose,
+                                messages: &messages,
+                                tools,
+                                route: LlmExecutionRoute {
+                                    model_name,
+                                    wire_model_name,
+                                    api_key,
+                                    base_url,
+                                    provider,
+                                    header_overrides,
+                                    request_body_overrides,
+                                    completions_url_override,
+                                    request_timeout,
+                                },
+                                max_output_tokens,
+                                temperature,
+                                has_fallback,
+                                thinking,
+                            },
                             fb_timeout,
-                            wire_model_name,
-                            header_overrides,
-                            request_body_overrides,
-                            completions_url_override,
-                            request_timeout,
-                            thinking,
                         )
                         .await
                         .map_err(|error| error.with_details_json(details_json));
@@ -3089,7 +3132,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                     // Mid-stream stall, or second idle timeout — fall back to a non-stream request.
                     // Cap the fallback timeout at min(fallback_timeout, remaining budget).
                     let remaining = total_budget.saturating_sub(elapsed);
-                    let fb_timeout = llm_fallback_timeout().min(remaining);
+                    let fb_timeout = llm_nonstream_timeout().min(remaining);
                     astra_core::agent_warn!(
                         "llm",
                         "stream idle timeout #{} after {}ms (made_progress={}) — attempting non-stream fallback (timeout {}s)",
@@ -3098,23 +3141,30 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                         made_progress,
                         fb_timeout.as_secs()
                     );
-                    return call_llm_nonstream_fallback_with_request_overrides_for_trigger(
+                    return call_llm_nonstream_fallback_for_trigger(
                         NonstreamFallbackTrigger::StreamIdle,
                         client,
-                        &messages,
-                        tools,
-                        model_name,
-                        api_key,
-                        base_url,
-                        provider,
-                        max_output_tokens,
+                        LlmCall {
+                            purpose,
+                            messages: &messages,
+                            tools,
+                            route: LlmExecutionRoute {
+                                model_name,
+                                wire_model_name,
+                                api_key,
+                                base_url,
+                                provider,
+                                header_overrides,
+                                request_body_overrides,
+                                completions_url_override,
+                                request_timeout,
+                            },
+                            max_output_tokens,
+                            temperature,
+                            has_fallback,
+                            thinking,
+                        },
                         fb_timeout,
-                        wire_model_name,
-                        header_overrides,
-                        request_body_overrides,
-                        completions_url_override,
-                        request_timeout,
-                        thinking,
                     )
                     .await
                     .map_err(|error| attach_partial_details(error, &partial));
@@ -3279,6 +3329,7 @@ async fn collect_llm_stream(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            response_id: None,
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
             reasoning_signature: String::new(),
@@ -3554,6 +3605,7 @@ async fn collect_llm_stream(
     }
 
     Ok(LlmCallResult {
+        response_id: None,
         full_text,
         reasoning,
         reasoning_signature: String::new(),
@@ -3602,6 +3654,7 @@ async fn collect_anthropic_llm_stream(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            response_id: None,
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
             reasoning_signature: reasoning_signature.clone(),
@@ -3894,6 +3947,7 @@ async fn collect_anthropic_llm_stream(
         .map(|(_, v)| Value::Object(v))
         .collect();
     Ok(LlmCallResult {
+        response_id: None,
         full_text,
         reasoning,
         reasoning_signature,
@@ -3947,98 +4001,32 @@ impl Drop for CancelOnClientDisconnect {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // only used in #[cfg(test)]
-pub(crate) async fn call_llm_nonstream_fallback(
+pub(crate) async fn call_llm_nonstream(
     client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
+    call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_fallback_with_request_overrides(
-        client,
+    let LlmCall {
+        purpose,
         messages,
         tools,
-        model_name,
-        api_key,
-        base_url,
-        provider,
+        route,
         max_output_tokens,
-        timeout,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &ThinkingConfig::Off,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn call_llm_nonstream_fallback_with_request_overrides_for_trigger(
-    trigger: NonstreamFallbackTrigger,
-    client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    timeout: std::time::Duration,
-    wire_model_name: Option<&str>,
-    header_overrides: Option<&HashMap<String, String>>,
-    request_body_overrides: Option<&Map<String, Value>>,
-    completions_url_override: Option<&str>,
-    request_timeout: Option<std::time::Duration>,
-    thinking: &ThinkingConfig,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let result = call_llm_nonstream_fallback_with_request_overrides(
-        client,
-        messages,
-        tools,
+        temperature,
+        has_fallback: _,
+        thinking,
+    } = call;
+    let LlmExecutionRoute {
         model_name,
-        api_key,
-        base_url,
-        provider,
-        max_output_tokens,
-        timeout,
         wire_model_name,
+        api_key,
+        base_url,
+        provider,
         header_overrides,
         request_body_overrides,
         completions_url_override,
         request_timeout,
-        thinking,
-    )
-    .await;
-    record_llm_nonstream_fallback_outcome(trigger, &result);
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
-    client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    timeout: std::time::Duration,
-    wire_model_name: Option<&str>,
-    header_overrides: Option<&HashMap<String, String>>,
-    request_body_overrides: Option<&Map<String, Value>>,
-    completions_url_override: Option<&str>,
-    request_timeout: Option<std::time::Duration>,
-    thinking: &ThinkingConfig,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    } = route;
     let started = Instant::now();
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
@@ -4050,7 +4038,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         upstream_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         false,
         thinking,
         request_body_overrides,
@@ -4076,7 +4064,10 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     tracing::debug!(
         target: "astra_runtime::llm_client",
         url = %url,
-        "LLM non-stream fallback sending"
+        purpose = purpose.as_str(),
+        provider,
+        model_name,
+        "LLM non-stream request sending"
     );
     let resp = req
         .timeout(effective_timeout)
@@ -4091,11 +4082,11 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
                 elapsed_ms = elapsed.as_millis() as u64,
                 configured_timeout_s = effective_timeout.as_secs(),
                 error = %e,
-                "LLM non-stream fallback send failed"
+                "LLM non-stream request send failed"
             );
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Network,
-                fallback_send_error_message(&e, effective_timeout, elapsed),
+                nonstream_send_error_message(&e, effective_timeout, elapsed),
             )
         })?;
     if !resp.status().is_success() {
@@ -4116,7 +4107,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         };
         return Err(astra_core::ClassifiedError::new(
             kind,
-            format!("LLM fallback error {status}: {text}"),
+            format!("LLM non-stream request error {status}: {text}"),
         ));
     }
     let v: Value = resp.json().await.map_err(|e| {
@@ -4127,7 +4118,18 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     ))
 }
 
-fn fallback_send_error_message(
+async fn call_llm_nonstream_fallback_for_trigger(
+    trigger: NonstreamFallbackTrigger,
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let result = call_llm_nonstream(client, call, timeout).await;
+    record_llm_nonstream_fallback_outcome(trigger, &result);
+    result
+}
+
+fn nonstream_send_error_message(
     error: &reqwest::Error,
     effective_timeout: std::time::Duration,
     elapsed: std::time::Duration,
@@ -4138,7 +4140,7 @@ fn fallback_send_error_message(
         "failed"
     };
     format!(
-        "LLM fallback request {action} after {}ms (configured timeout {}s): {error}",
+        "LLM non-stream request {action} after {}ms (configured timeout {}s): {error}",
         elapsed.as_millis(),
         effective_timeout.as_secs()
     )
@@ -4217,6 +4219,7 @@ fn parse_bedrock_nonstream_response(
     }
 
     LlmCallResult {
+        response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,
         reasoning_signature,
@@ -4300,6 +4303,7 @@ fn parse_openai_compatible_nonstream_response(
     }
 
     LlmCallResult {
+        response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,
         reasoning_signature: String::new(),
@@ -4376,6 +4380,7 @@ fn parse_anthropic_nonstream_response(
         .unwrap_or_default();
 
     LlmCallResult {
+        response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
         reasoning,
         reasoning_signature,
@@ -4632,6 +4637,41 @@ mod tests {
         assert!(LlmCancel::FlagAndToken(flag3.as_ref(), &token3).is_triggered());
     }
 
+    #[test]
+    fn execution_route_debug_exposes_routing_facts_without_credentials() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        );
+        headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
+        let route = LlmExecutionRoute {
+            model_name: "model-a",
+            wire_model_name: Some("wire-model-a"),
+            api_key: "api-key-secret",
+            base_url: "https://models.example.test/v1",
+            provider: "openai",
+            header_overrides: Some(&headers),
+            request_body_overrides: None,
+            completions_url_override: Some("https://gateway.example.test/inference"),
+            request_timeout: Some(std::time::Duration::from_secs(30)),
+        };
+
+        let debug = format!("{route:?}");
+        assert!(debug.contains("model-a"));
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("x-workspace-id"));
+        for secret in [
+            "api-key-secret",
+            "header-secret",
+            "workspace-secret",
+            "models.example.test",
+            "gateway.example.test",
+        ] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+    }
+
     // ── Timeout configuration tests ─────────────────────────────────────────
 
     #[test]
@@ -4643,9 +4683,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_timeout_default_is_120s() {
-        let dur = llm_fallback_timeout();
-        assert_eq!(dur, std::time::Duration::from_secs(LLM_FALLBACK_TIMEOUT_S));
+    fn nonstream_timeout_default_is_120s() {
+        let dur = llm_nonstream_timeout();
+        assert_eq!(dur, std::time::Duration::from_secs(LLM_NONSTREAM_TIMEOUT_S));
     }
 
     #[test]
@@ -4668,8 +4708,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonstream_fallback_respects_timeout() {
-        // Create a mock server that delays longer than the fallback timeout.
+    async fn nonstream_request_respects_timeout() {
+        // Create a mock server that delays longer than the request timeout.
         let app = Router::new().route(
             "/chat/completions",
             post(|| async {
@@ -4689,15 +4729,28 @@ mod tests {
             .expect("build client");
         // Use a very short timeout — should fail before the 5s delay completes.
         let timeout = std::time::Duration::from_millis(100);
-        let result = call_llm_nonstream_fallback(
+        let result = call_llm_nonstream(
             &client,
-            &[json!({"role":"user","content":"x"})],
-            &[],
-            "m",
-            "k",
-            &base,
-            "openai",
-            None,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"x"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             timeout,
         )
         .await;
@@ -4755,22 +4808,28 @@ mod tests {
         overrides.insert("x-workspace-id".to_string(), "ws-001".to_string());
         overrides.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
-        let result = call_llm_and_collect_with_request_overrides(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "gpt-5-mini",
-            None,
-            "",
-            "https://api.openai.com/v1",
-            "openai",
-            None,
-            false,
+        let result = call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "",
+                    base_url: "https://api.openai.com/v1",
+                    provider: "openai",
+                    header_overrides: Some(&overrides),
+                    request_body_overrides: None,
+                    completions_url_override: Some(&gateway_url),
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            Some(&overrides),
-            None,
-            Some(&gateway_url),
-            None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("gateway llm call");
@@ -4820,17 +4879,27 @@ mod tests {
         ];
 
         let result = call_llm_and_collect(
-            &messages,
-            &[],
-            "gpt-5-mini",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -6946,17 +7015,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -6978,17 +7057,27 @@ mod tests {
         let base_clone = base.clone();
         let handle = tokio::spawn(async move {
             call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                None,
-                "k",
-                &base_clone,
-                "openai",
-                None,
-                false,
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    route: LlmExecutionRoute {
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base_clone,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                },
                 LlmCancel::Token(&token_for_call),
-                &ThinkingConfig::Off,
             )
             .await
         });
@@ -7010,17 +7099,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -7039,17 +7138,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -7071,17 +7180,27 @@ mod tests {
         let base_clone = base.clone();
         let handle = tokio::spawn(async move {
             call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                None,
-                "k",
-                &base_clone,
-                "openai",
-                None,
-                false,
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    route: LlmExecutionRoute {
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base_clone,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                },
                 LlmCancel::Token(&token_for_call),
-                &ThinkingConfig::Off,
             )
             .await
         });
@@ -7133,17 +7252,27 @@ mod tests {
 
         // First call: finish_reason=length
         let res1 = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            Some(1000),
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(1000),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -7152,17 +7281,27 @@ mod tests {
 
         // Second call (escalated): finish_reason=stop
         let res2 = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            Some(4000),
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(4000),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -7192,17 +7331,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            Some(1000),
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(1000),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -7250,17 +7399,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("fallback succeeds");
@@ -7301,17 +7460,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect_err("fallback should fail");
@@ -7353,17 +7522,27 @@ mod tests {
         .await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("transport fallback succeeds");
@@ -7393,17 +7572,27 @@ mod tests {
         let messages = vec![json!({"role":"user","content":"x"})];
 
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "deepseek-v4-pro-official",
-            Some("deepseek-v4-pro"),
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "deepseek-v4-pro-official",
+                    wire_model_name: Some("deepseek-v4-pro"),
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("fallback succeeds");
@@ -7446,17 +7635,27 @@ mod tests {
         .await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect_err("transport fallback should fail");
@@ -7484,7 +7683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_llm_and_collect_reports_fallback_send_failure_without_timeout_label() {
+    async fn call_llm_and_collect_classifies_disconnected_fallback_as_network_failure() {
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
             fallback_hits: Arc::new(AtomicU32::new(0)),
@@ -7492,36 +7691,32 @@ mod tests {
         let base = spawn_raw_partial_transport_server_with_fallback_disconnect(state.clone()).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect_err("transport fallback should fail");
 
-        assert!(
-            error.message.contains("LLM fallback request failed after"),
-            "{}",
-            error.message
-        );
-        assert!(
-            error.message.contains("configured timeout"),
-            "{}",
-            error.message
-        );
-        assert!(
-            !error.message.contains("failed (timeout"),
-            "{}",
-            error.message
-        );
+        assert_eq!(error.kind, astra_core::ErrorKind::Network);
         assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
     }
@@ -7540,17 +7735,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect("stream retry succeeds");
@@ -7574,17 +7779,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let err = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect_err("should fail with context window");
@@ -7607,17 +7822,27 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let err = call_llm_and_collect(
-            &messages,
-            &[],
-            "m",
-            None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
             LlmCancel::None,
-            &ThinkingConfig::Off,
         )
         .await
         .expect_err("should fail with auth");

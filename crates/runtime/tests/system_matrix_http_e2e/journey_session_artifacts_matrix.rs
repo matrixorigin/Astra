@@ -99,8 +99,13 @@ async fn stream_chat_full_nonbridge(
 async fn chat_turn_full(
     app: &axum::Router,
     auth: &str,
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
 ) -> (StatusCode, String) {
+    payload
+        .as_object_mut()
+        .expect("bridge test payload object")
+        .entry("inference_purpose")
+        .or_insert_with(|| json!(astra_turn_types::InferencePurpose::PrimaryAgent));
     let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
@@ -3338,6 +3343,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
         .expect("connect live http socket");
     let request_body = json!({
         "agent_id": "system-matrix-bridge-client-disconnect",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger a bridge client disconnect after partial output" }]

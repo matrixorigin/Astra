@@ -704,6 +704,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
 
     let payload = json!({
         "agent_id": "saas-edge-callback-agent",
+        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
         "model_selection": seeded_model_selection(ctx),
         "messages": [{ "role": "user", "content": "read saas probe file" }],

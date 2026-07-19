@@ -31,6 +31,7 @@
 use crate::event::clip_output_preview;
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
+use astra_turn_types::InferencePurpose;
 use std::collections::HashMap;
 
 /// Redact common credential patterns from tool output before persisting to disk.
@@ -463,10 +464,13 @@ impl StepRecorder {
 
     /// Transition to ACT phase (before LLM call).
     /// Record the start of an LLM API call. Pairs with [`Self::end_llm_round`].
-    pub fn begin_llm_round(&mut self, model: &str) {
+    pub fn begin_llm_round(&mut self, model: &str, purpose: InferencePurpose) {
         self.emit_with_payload(
             StepEventType::LlmRoundStarted,
-            serde_json::json!({ "model": model }),
+            serde_json::json!({
+                "model": model,
+                "purpose": purpose,
+            }),
         );
     }
 
@@ -474,6 +478,7 @@ impl StepRecorder {
     pub fn end_llm_round(
         &mut self,
         model: &str,
+        purpose: InferencePurpose,
         input_tokens: u64,
         output_tokens: u64,
         cache_read: u64,
@@ -484,6 +489,7 @@ impl StepRecorder {
             StepEventType::LlmRoundCompleted,
             serde_json::json!({
                 "model": model,
+                "purpose": purpose,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read,
@@ -1593,6 +1599,32 @@ mod tests {
         assert!(rec.current_step().is_some());
         assert_eq!(rec.current_step().unwrap().action(), StepAction::Perceive);
         assert_eq!(rec.events().len(), 1); // StepCreated
+    }
+
+    #[test]
+    fn llm_round_events_preserve_inference_purpose() {
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-purpose", "task-1");
+        rec.begin_llm_round("model-a", InferencePurpose::SubAgent);
+        rec.end_llm_round("model-a", InferencePurpose::SubAgent, 10, 4, 3, 2, 25);
+
+        let round_events = rec
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    StepEventType::LlmRoundStarted | StepEventType::LlmRoundCompleted
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(round_events.len(), 2);
+        for event in round_events {
+            let purpose = serde_json::from_value::<InferencePurpose>(
+                event.payload.as_ref().expect("round payload")["purpose"].clone(),
+            )
+            .expect("typed inference purpose");
+            assert_eq!(purpose, InferencePurpose::SubAgent);
+        }
     }
 
     #[test]

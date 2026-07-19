@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use astra_logging::redact_known_secret_patterns;
+use astra_turn_types::InferencePurpose;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,20 +27,13 @@ pub use crate::verification::{
     SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
 };
 
-/// Build a reqwest client for durable-task HTTP callbacks.
-///
-/// All durable-bridge traffic is local/intranet; only `turn/llm_client.rs`
-/// honours env proxy vars. Every other reqwest client in the runtime calls
-/// `.no_proxy()`.
-fn build_client_for_url(_url: &str) -> reqwest::Client {
-    // Local/intranet traffic only — never inherit env proxy.
-    // 30s request timeout prevents leaked requests from a hung callback server.
-    reqwest::Client::builder()
-        .no_proxy()
+/// Build the provider-facing client used by the cloud judge.
+fn build_cloud_llm_client() -> reqwest::Client {
+    astra_core::net::apply_env_proxy(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .expect("durable-task HTTP client config must be valid")
+        .expect("cloud LLM HTTP client config must be valid")
 }
 
 /// Maximum `verification_results` rows loaded per contract (unbounded `fetch_all` guard).
@@ -175,7 +169,7 @@ impl CloudLlmConfig {
 impl CloudLlmJudge {
     /// Create a cloud judge with optional database persistence.
     pub fn new(config: CloudLlmConfig, pool: Option<sqlx::Pool<sqlx::MySql>>) -> Self {
-        let client = build_client_for_url(&config.base_url);
+        let client = build_cloud_llm_client();
         Self {
             client,
             api_key: config.api_key,
@@ -311,9 +305,6 @@ impl CloudLlmJudge {
         }
     }
 
-    /// Generic chat-completion helper shared by the judge scoring path and
-    /// by out-of-crate skill-improvement LLM rewrites.
-    ///
     /// Security invariants enforced here (do NOT remove without justification):
     /// - **URL scheme allow-list** — only `http://` and `https://` schemes are
     ///   accepted, blocking accidental `file://` / `data://` / ssh-url use.
@@ -324,18 +315,20 @@ impl CloudLlmJudge {
     /// - **Error-body truncation** (≤200 chars) — limits how much upstream
     ///   content bleeds into surfaced error strings / logs.
     ///
-    /// NOTE: The `pub` visibility is required because consumers live in other
-    /// crates (e.g. astra-cli's skill-improvement adapter). Treat this as an
-    /// internal seam — prefer wrapping new callers in a purpose-built trait
-    /// (e.g. `SkillImproveLlm`) rather than widening direct usage.
-    #[doc(hidden)]
-    pub async fn chat_completion(
+    async fn chat_completion(
         &self,
+        purpose: InferencePurpose,
         system: &str,
         user: &str,
         max_tokens: u32,
         temperature: f32,
     ) -> Result<String, String> {
+        tracing::debug!(
+            target: "astra_services::durable_task",
+            purpose = purpose.as_str(),
+            model_name = %self.model,
+            "cloud LLM request started"
+        );
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -421,7 +414,9 @@ impl CloudLlmJudge {
             "Criterion: {prompt}\n\nContext:\n{context}\n\n\
              Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
         );
-        let content = self.chat_completion(system, &user, 200, 0.1).await?;
+        let content = self
+            .chat_completion(InferencePurpose::VerificationJudge, system, &user, 200, 0.1)
+            .await?;
         parse_judge_score(&content)
     }
 }

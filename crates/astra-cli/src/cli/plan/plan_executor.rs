@@ -3685,7 +3685,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -3734,7 +3734,7 @@ All acceptance checks pass:
                 source: None,
                 run_id: None,
                 tool_calls: None,
-                ..Default::default()
+                ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
             });
         }
         // Emit observability events first (mirrors Ok(result) branch).
@@ -3801,7 +3801,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(astra_turn_types::InferencePurpose::SubAgent)
         });
 
         // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.

@@ -8,6 +8,7 @@ mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod context_identity;
 mod context_window;
+mod inference;
 mod memory_ranking;
 mod memory_structure;
 mod provider_contract;
@@ -32,6 +33,7 @@ pub use context_identity::{
     PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
+pub use inference::InferencePurpose;
 pub use memory_ranking::{
     PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
     is_persistent_type, partition_by_scope, sort_by_retrieval_score,

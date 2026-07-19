@@ -24,7 +24,7 @@ use std::sync::{
 };
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
-use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+use astra_turn_types::{InferencePurpose, UserIntentDelivery, UserIntentStatus};
 
 use crate::interaction_contract::{
     InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
@@ -1836,8 +1836,8 @@ impl JournalWriter {
 // ─── Turn Event Buffer ───────────────────────────────────────────────────────
 
 /// Data for one LLM→tools round within a turn.
-#[derive(Default)]
 pub struct LlmRoundRecord {
+    pub purpose: InferencePurpose,
     pub ttft_ms: Option<u64>,
     pub duration_ms: u64,
     /// Fresh input tokens for this provider call. Cache buckets are disjoint.
@@ -1858,6 +1858,32 @@ pub struct LlmRoundRecord {
     /// Written into the typed producer scope so consumers cannot confuse the
     /// child's local loop counter with a root session turn.
     pub agent_id: Option<String>,
+}
+
+impl LlmRoundRecord {
+    /// Start an LLM-round record with an explicit policy/usage purpose.
+    /// Optional observability fields may be filled by the caller, but purpose
+    /// can never be inherited from a default or guessed from source text.
+    pub fn new(purpose: InferencePurpose) -> Self {
+        Self {
+            purpose,
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: Vec::new(),
+            finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
+            parent_run_id: None,
+            tool_calls: None,
+            agent_id: None,
+        }
+    }
 }
 
 /// In-memory collector for fine-grained turn events.
@@ -2016,18 +2042,21 @@ impl TurnEventBuffer {
         if let Some(tool_calls) = r.tool_calls {
             evt = evt.with_tool_calls(tool_calls);
         }
-        if !r.tool_call_names.is_empty() || r.finish_reason.is_some() || r.source.is_some() {
-            let mut meta = serde_json::Map::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert("purpose".into(), serde_json::json!(r.purpose));
+        if !r.tool_call_names.is_empty() {
             meta.insert(
                 "tool_call_names".into(),
                 serde_json::json!(r.tool_call_names),
             );
-            meta.insert("finish_reason".into(), serde_json::json!(r.finish_reason));
-            if let Some(source) = r.source {
-                meta.insert("source".into(), serde_json::json!(source));
-            }
-            evt.metadata = Some(serde_json::Value::Object(meta));
         }
+        if let Some(finish_reason) = r.finish_reason {
+            meta.insert("finish_reason".into(), serde_json::json!(finish_reason));
+        }
+        if let Some(source) = r.source {
+            meta.insert("source".into(), serde_json::json!(source));
+        }
+        evt.metadata = Some(serde_json::Value::Object(meta));
         self.push_event(evt);
         self.round += 1;
         self.batch_counter = 0;
@@ -9112,7 +9141,7 @@ mod turn_event_buffer_tests {
             duration_ms: 20,
             prompt_tokens: 100,
             completion_tokens: 10,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         buf.record(JournalEvent::base_public(JournalEventType::TraceSpan, None));
 
@@ -9157,7 +9186,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         assert_eq!(buf.current_round(), 1);
         assert_eq!(buf.len(), 1);
@@ -9176,7 +9205,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         assert_eq!(buf.current_round(), 2);
         assert_eq!(buf.len(), 2);
@@ -9199,7 +9228,7 @@ mod turn_event_buffer_tests {
             source: Some("agentic_loop".into()),
             run_id: Some("run-42".into()),
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::SubAgent)
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -9223,6 +9252,23 @@ mod turn_event_buffer_tests {
             Some("run-42")
         );
         assert!(meta.get("run_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<InferencePurpose>(meta["purpose"].clone())
+                .expect("typed inference purpose"),
+            InferencePurpose::SubAgent
+        );
+    }
+
+    #[test]
+    fn recorded_llm_round_omits_absent_optional_metadata() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 1);
+        buf.record_llm_round(LlmRoundRecord::new(InferencePurpose::MemoryExtraction));
+
+        let events = buf.drain();
+        assert_eq!(
+            events[0].metadata,
+            Some(serde_json::json!({"purpose": "memory_extraction"}))
+        );
     }
 
     #[test]
@@ -9250,7 +9296,7 @@ mod turn_event_buffer_tests {
                 round: Some(0),
                 ..Default::default()
             }]),
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let events = buf.drain();
         let ev = &events[0];
@@ -9283,7 +9329,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         assert_eq!(buf.next_batch_id(), "b-1-0");
     }
@@ -9308,7 +9354,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let events = buf.drain();
         assert_eq!(
@@ -9338,7 +9384,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         assert_eq!(
             buf.current_round(),
@@ -9372,7 +9418,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         // Tagged sub-call round
         buf.record_llm_round(LlmRoundRecord {
@@ -9389,7 +9435,7 @@ mod turn_event_buffer_tests {
             source: Some("sub_call".into()),
             run_id: Some("run-subcall".into()),
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         assert_eq!(buf.current_round(), 2);
         let events = buf.drain();
@@ -9453,7 +9499,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -9480,7 +9526,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -9511,7 +9557,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         buf.record(JournalEvent::base_public(
             JournalEventType::Turn,
@@ -9555,7 +9601,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
 
         buf.flush_interrupted(&writer).unwrap();
@@ -9732,7 +9778,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let obs1 = buf1.drain();
         writer.append_bulk(&obs1).unwrap();
@@ -9765,7 +9811,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         buf2.record_llm_round(LlmRoundRecord {
             ttft_ms: Some(1200),
@@ -9781,7 +9827,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let obs2 = buf2.drain();
         writer.append_bulk(&obs2).unwrap();
@@ -9814,7 +9860,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::PrimaryAgent)
         });
         let obs3 = buf3.drain();
         writer.append_bulk(&obs3).unwrap();

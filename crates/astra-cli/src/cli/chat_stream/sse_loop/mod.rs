@@ -796,6 +796,7 @@ pub(crate) async fn stream_chat_sse(
         session_memory_llm_params: None,
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
+        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
         context_manifest_model_name: model_id_for_policy.map(str::to_string),

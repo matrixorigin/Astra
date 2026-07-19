@@ -69,20 +69,39 @@ impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
     async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
-        let resolved =
-            astra_services::models::resolve_memory_models(settings, &self.encryptor, Some(pool))
-                .await
-                .unwrap_or_default();
+        let resolved = match astra_services::models::resolve_memory_models(
+            settings,
+            &self.encryptor,
+            Some(pool),
+        )
+        .await
+        {
+            Ok(models) => models,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::memory_model",
+                    %error,
+                    "memory model resolution failed"
+                );
+                return Vec::new();
+            }
+        };
         resolved
             .into_iter()
-            .map(|model| crate::memory_hooks::relevance::LlmConnParams {
-                base_url: model.base_url,
-                api_key: model.api_key,
-                model_name: model.model_name,
-                wire_model_name: model.wire_model_name,
-                provider: model.provider,
-                request_body_overrides: model.request_body_overrides,
-                thinking_capability: model.thinking_capability,
+            .filter_map(|model| {
+                let model_name = model.model_name.clone();
+                match crate::memory_hooks::relevance::LlmConnParams::from_resolved(model) {
+                    Ok(params) => Some(params),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::memory_model",
+                            %model_name,
+                            %error,
+                            "memory model execution configuration is invalid"
+                        );
+                        None
+                    }
+                }
             })
             .collect()
     }
@@ -215,25 +234,36 @@ impl MatrixCloudRuntime {
     }
 
     /// Resolve the cheapest memory-tagged model from the registry.
-    /// Returns `None` if no encryptor is configured or resolution fails.
+    /// Returns `None` if no encryptor is configured or no valid model can be
+    /// resolved. Registry and execution-configuration failures are logged at
+    /// the boundary instead of being misreported as an empty registry.
     pub async fn resolve_memory_model(
         &self,
     ) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
         let enc = self.encryptor.as_ref()?;
         let settings = self.shared_pool.settings();
         let pool = self.shared_pool.get();
-        let resolved = astra_services::models::resolve_memory_model(settings, enc, Some(pool))
-            .await
-            .ok()?;
-        Some(crate::memory_hooks::relevance::LlmConnParams {
-            base_url: resolved.base_url,
-            api_key: resolved.api_key,
-            model_name: resolved.model_name,
-            wire_model_name: resolved.wire_model_name,
-            provider: resolved.provider,
-            request_body_overrides: resolved.request_body_overrides,
-            thinking_capability: resolved.thinking_capability,
-        })
+        let resolved =
+            match astra_services::models::resolve_memory_model(settings, enc, Some(pool)).await {
+                Ok(model) => model,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::memory_model",
+                        %error,
+                        "memory model resolution failed"
+                    );
+                    return None;
+                }
+            };
+        crate::memory_hooks::relevance::LlmConnParams::from_resolved(resolved)
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "astra_runtime::memory_model",
+                    %error,
+                    "memory model execution configuration is invalid"
+                );
+            })
+            .ok()
     }
 
     pub fn edge_agent_id(&self) -> &str {

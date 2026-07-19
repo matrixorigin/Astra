@@ -58,9 +58,11 @@ struct CliServerProxySummaryClient {
 impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryClient {
     async fn summarize(
         &self,
+        purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
         let mut body = serde_json::json!({
+            "purpose": purpose,
             "messages": messages,
             "max_tokens": 256,
             "temperature": 0.0,
@@ -102,7 +104,7 @@ impl astra_services::SkillAutoRouteJudge for CliSummaryClientSkillAutoRouteJudge
             .collect::<Vec<_>>();
         let response = self
             .client
-            .summarize(&messages)
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(astra_services::SkillAutoRouteJudgeError::Transport)?;
         astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
@@ -1514,6 +1516,7 @@ mod tests {
     impl astra_turn_core::cloud_summary::SummaryLlmClient for ScriptedSummaryClient {
         async fn summarize(
             &self,
+            _purpose: astra_turn_types::InferencePurpose,
             _messages: &[serde_json::Value],
         ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
             Ok(astra_turn_core::cloud_summary::SummaryResponse {

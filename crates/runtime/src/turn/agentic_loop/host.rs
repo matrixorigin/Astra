@@ -1738,8 +1738,9 @@ pub struct VolatileInjection {
 /// requiring `full_llm_capture=true` and on-disk I/O. Capped to a
 /// small ring (latest [`RECENT_ROUNDS_RING_CAPACITY`] entries) to keep
 /// state size bounded.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RecentRoundSummary {
+    pub purpose: astra_turn_types::InferencePurpose,
     pub turn: u32,
     pub round: u32,
     pub provider: String,
@@ -1996,6 +1997,10 @@ pub struct AgenticLoopState {
     pub tool_results: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
+    /// Why this loop is allowed to consume model capacity. This is set by the
+    /// run owner before execution and remains stable for the lifetime of the
+    /// loop; provider, access source, and model selection are separate facts.
+    pub inference_purpose: astra_turn_types::InferencePurpose,
     pub context_manifest_pool: Option<astra_core::SharedPool>,
     pub context_manifest_user_id: Option<String>,
     pub context_manifest_model_name: Option<String>,
@@ -3513,6 +3518,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         tool_results: Vec::new(),
         current_session_id: None,
         current_run_id: None,
+        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: None,
         context_manifest_model_name: None,
@@ -4252,6 +4258,7 @@ pub(crate) mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::turn::bridge::sse_helpers::render_sse;
 use crate::turn::llm::client::{
-    LLM_MAX_RETRIES, LlmCancel, apply_llm_header_overrides, apply_provider_auth,
-    build_provider_request_body_with_overrides, llm_request_url, llm_request_url_for_provider,
+    LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, apply_llm_header_overrides,
+    apply_provider_auth, build_provider_request_body_with_overrides, llm_request_url,
     llm_retry_base_ms, parse_openai_sse_json_stream, provider_uses_anthropic_messages,
     provider_uses_bedrock_converse, sleep_ms_or_llm_cancel, split_think_chunks,
 };
@@ -226,22 +226,32 @@ fn classify_non_success_and_record_cooldown(
 /// - On the first 2xx response, hand the body to
 ///   [`bedrock_transport::bedrock_stream_response_bytes`] and return the
 ///   canonical internal SSE stream.
-#[allow(clippy::too_many_arguments)]
 async fn bedrock_stream_with_retry(
     client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
+    call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    let LlmCall {
+        purpose,
+        messages,
+        tools,
+        route,
+        max_output_tokens,
+        temperature,
+        has_fallback,
+        thinking,
+    } = call;
+    let LlmExecutionRoute {
+        model_name,
+        wire_model_name,
+        api_key,
+        base_url,
+        provider,
+        header_overrides,
+        request_body_overrides,
+        completions_url_override,
+        request_timeout,
+    } = route;
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
     let upstream_name = wire_model_name.unwrap_or(model_name);
@@ -252,12 +262,18 @@ async fn bedrock_stream_with_retry(
         upstream_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         true,
         thinking,
         request_body_overrides,
     );
-    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
+    let url = llm_request_url(
+        base_url,
+        completions_url_override,
+        provider,
+        upstream_name,
+        true,
+    );
 
     let total_budget = crate::turn::llm::client::llm_total_budget();
     let started = std::time::Instant::now();
@@ -278,7 +294,11 @@ async fn bedrock_stream_with_retry(
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, None);
+        req = apply_provider_auth(req, provider, api_key, header_overrides);
+        req = apply_llm_header_overrides(req, header_overrides);
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
 
         if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
             let ts = std::time::SystemTime::now()
@@ -292,6 +312,14 @@ async fn bedrock_stream_with_retry(
         }
 
         let request_started = std::time::Instant::now();
+        tracing::debug!(
+            target: "astra_runtime::bridge_llm_stream",
+            purpose = purpose.as_str(),
+            provider,
+            model_name,
+            attempt,
+            "sending Bedrock inference request"
+        );
         let response = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -378,22 +406,32 @@ async fn bedrock_stream_with_retry(
 /// `tool_call_start`, `usage`), so downstream consumers
 /// (`apply_forward_llm_sse_event` in `bridge_sse_helpers.rs`) work
 /// unchanged.
-#[allow(clippy::too_many_arguments)]
 async fn anthropic_stream_with_retry(
     client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
+    call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    let LlmCall {
+        purpose,
+        messages,
+        tools,
+        route,
+        max_output_tokens,
+        temperature,
+        has_fallback,
+        thinking,
+    } = call;
+    let LlmExecutionRoute {
+        model_name,
+        wire_model_name,
+        api_key,
+        base_url,
+        provider,
+        header_overrides,
+        request_body_overrides,
+        completions_url_override,
+        request_timeout,
+    } = route;
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
     let upstream_name = wire_model_name.unwrap_or(model_name);
@@ -404,12 +442,18 @@ async fn anthropic_stream_with_retry(
         upstream_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         true,
         thinking,
         request_body_overrides,
     );
-    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
+    let url = llm_request_url(
+        base_url,
+        completions_url_override,
+        provider,
+        upstream_name,
+        true,
+    );
 
     let total_budget = crate::turn::llm::client::llm_total_budget();
     let started = std::time::Instant::now();
@@ -430,8 +474,20 @@ async fn anthropic_stream_with_retry(
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, None);
+        req = apply_provider_auth(req, provider, api_key, header_overrides);
+        req = apply_llm_header_overrides(req, header_overrides);
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
 
+        tracing::debug!(
+            target: "astra_runtime::bridge_llm_stream",
+            purpose = purpose.as_str(),
+            provider,
+            model_name,
+            attempt,
+            "sending Anthropic inference request"
+        );
         let response = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -455,8 +511,12 @@ async fn anthropic_stream_with_retry(
             let api_key_for_fallback = api_key.to_string();
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
+            let header_overrides_for_fallback = header_overrides.cloned();
             let max_out_for_fallback = max_output_tokens;
             let request_body_overrides_for_fallback = request_body_overrides.cloned();
+            let completions_url_override_for_fallback =
+                completions_url_override.map(str::to_string);
+            let request_timeout_for_fallback = request_timeout;
             let thinking_for_fallback = thinking.clone();
             let out = stream! {
                 let sse = parse_openai_sse_json_stream(byte_stream);
@@ -494,23 +554,30 @@ async fn anthropic_stream_with_retry(
                                     let streamed_text = full_text.clone();
                                     let streamed_reasoning = reasoning.clone();
                                     let existing_tool_calls = tool_calls_map.clone();
-                                    let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                    match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                    let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
+                                    match crate::turn::llm::client::call_llm_nonstream(
                                         &client_for_fallback,
-                                        &messages_for_fallback,
-                                        &tools_for_fallback,
-                                        &model_for_fallback,
-                                        &api_key_for_fallback,
-                                        &base_url_for_fallback,
-                                        &provider_for_fallback,
-                                        max_out_for_fallback,
+                                        LlmCall {
+                                            purpose,
+                                            messages: &messages_for_fallback,
+                                            tools: &tools_for_fallback,
+                                            route: LlmExecutionRoute {
+                                                model_name: &model_for_fallback,
+                                                wire_model_name: wire_model_for_fallback.as_deref(),
+                                                api_key: &api_key_for_fallback,
+                                                base_url: &base_url_for_fallback,
+                                                provider: &provider_for_fallback,
+                                                header_overrides: header_overrides_for_fallback.as_ref(),
+                                                request_body_overrides: request_body_overrides_for_fallback.as_ref(),
+                                                completions_url_override: completions_url_override_for_fallback.as_deref(),
+                                                request_timeout: request_timeout_for_fallback,
+                                            },
+                                            max_output_tokens: max_out_for_fallback,
+                                            temperature,
+                                            has_fallback,
+                                            thinking: &thinking_for_fallback,
+                                        },
                                         fb_timeout,
-                                        wire_model_for_fallback.as_deref(),
-                                        None,
-                                        request_body_overrides_for_fallback.as_ref(),
-                                        None,
-                                        None,
-                                        &thinking_for_fallback,
                                     )
                                     .await
                                     {
@@ -593,23 +660,30 @@ async fn anthropic_stream_with_retry(
                                         let streamed_text = full_text.clone();
                                         let streamed_reasoning = reasoning.clone();
                                         let existing_tool_calls = tool_calls_map.clone();
-                                        let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                        match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                        let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
+                                        match crate::turn::llm::client::call_llm_nonstream(
                                             &client_for_fallback,
-                                            &messages_for_fallback,
-                                            &tools_for_fallback,
-                                            &model_for_fallback,
-                                            &api_key_for_fallback,
-                                            &base_url_for_fallback,
-                                            &provider_for_fallback,
-                                            max_out_for_fallback,
+                                            LlmCall {
+                                                purpose,
+                                                messages: &messages_for_fallback,
+                                                tools: &tools_for_fallback,
+                                                route: LlmExecutionRoute {
+                                                    model_name: &model_for_fallback,
+                                                    wire_model_name: wire_model_for_fallback.as_deref(),
+                                                    api_key: &api_key_for_fallback,
+                                                    base_url: &base_url_for_fallback,
+                                                    provider: &provider_for_fallback,
+                                                    header_overrides: header_overrides_for_fallback.as_ref(),
+                                                    request_body_overrides: request_body_overrides_for_fallback.as_ref(),
+                                                    completions_url_override: completions_url_override_for_fallback.as_deref(),
+                                                    request_timeout: request_timeout_for_fallback,
+                                                },
+                                                max_output_tokens: max_out_for_fallback,
+                                                temperature,
+                                                has_fallback,
+                                                thinking: &thinking_for_fallback,
+                                            },
                                             fb_timeout,
-                                            wire_model_for_fallback.as_deref(),
-                                            None,
-                                            request_body_overrides_for_fallback.as_ref(),
-                                            None,
-                                            None,
-                                            &thinking_for_fallback,
                                         )
                                         .await
                                         {
@@ -952,59 +1026,32 @@ fn apply_anthropic_event(
 /// **Note**: Caller must check rate-limit cooldown state and handle fallback model
 /// resolution BEFORE calling this function. This function only handles retries for
 /// transient errors within a single model.
-#[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn call_llm_stream(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
+    call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
-    call_llm_stream_with_request_overrides(
+    let LlmCall {
+        purpose,
         messages,
         tools,
+        route,
+        max_output_tokens,
+        temperature,
+        has_fallback,
+        thinking,
+    } = call;
+    let LlmExecutionRoute {
         model_name,
         wire_model_name,
         api_key,
         base_url,
         provider,
-        max_output_tokens,
-        has_fallback,
-        client_cancel,
-        thinking,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_stream_with_request_overrides(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    wire_model_name: Option<&str>,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
-    client_cancel: Option<Arc<CancellationToken>>,
-    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    request_body_overrides: Option<&Map<String, Value>>,
-    header_overrides: Option<&HashMap<String, String>>,
-    completions_url_override: Option<&str>,
-    request_timeout: Option<Duration>,
-) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+        header_overrides,
+        request_body_overrides,
+        completions_url_override,
+        request_timeout,
+    } = route;
     let cooldown = rate_limit_cooldown();
     // `model_key` addresses the per-local-row rate-limit state. Two local
     // rows that share an upstream wire name (via `wire_model_name` alias)
@@ -1027,36 +1074,54 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
     if provider_uses_bedrock_converse(provider) {
         return bedrock_stream_with_retry(
             &client,
-            &messages,
-            tools,
-            model_name,
-            wire_model_name,
-            api_key,
-            base_url,
-            provider,
-            max_output_tokens,
-            has_fallback,
+            LlmCall {
+                purpose,
+                messages: &messages,
+                tools,
+                route: LlmExecutionRoute {
+                    model_name,
+                    wire_model_name,
+                    api_key,
+                    base_url,
+                    provider,
+                    header_overrides,
+                    request_body_overrides,
+                    completions_url_override,
+                    request_timeout,
+                },
+                max_output_tokens,
+                temperature,
+                has_fallback,
+                thinking,
+            },
             client_cancel,
-            thinking,
-            request_body_overrides,
         )
         .await;
     }
     if provider_uses_anthropic_messages(provider) {
         return anthropic_stream_with_retry(
             &client,
-            &messages,
-            tools,
-            model_name,
-            wire_model_name,
-            api_key,
-            base_url,
-            provider,
-            max_output_tokens,
-            has_fallback,
+            LlmCall {
+                purpose,
+                messages: &messages,
+                tools,
+                route: LlmExecutionRoute {
+                    model_name,
+                    wire_model_name,
+                    api_key,
+                    base_url,
+                    provider,
+                    header_overrides,
+                    request_body_overrides,
+                    completions_url_override,
+                    request_timeout,
+                },
+                max_output_tokens,
+                temperature,
+                has_fallback,
+                thinking,
+            },
             client_cancel,
-            thinking,
-            request_body_overrides,
         )
         .await;
     }
@@ -1067,7 +1132,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
         upstream_name,
         provider,
         max_output_tokens,
-        None,
+        temperature,
         true,
         thinking,
         request_body_overrides,
@@ -1112,6 +1177,14 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
         }
 
         let request_start = std::time::Instant::now();
+        tracing::debug!(
+            target: "astra_runtime::bridge_llm_stream",
+            purpose = purpose.as_str(),
+            provider,
+            model_name,
+            attempt,
+            "sending inference request"
+        );
         let response = match req.json(&body).send().await {
             Ok(r) => {
                 astra_core::agent_info!(
@@ -1159,6 +1232,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                 completions_url_override.map(str::to_string);
             let request_timeout_for_fallback = request_timeout;
             let max_out_for_fallback = max_output_tokens;
+            let thinking_for_fallback = thinking.clone();
             let idle_pre = crate::turn::llm::client::stream_idle_timeout();
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
 
@@ -1204,23 +1278,30 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                     let streamed_text = full_text.clone();
                                     let streamed_reasoning = reasoning.clone();
                                     let existing_tool_calls = tool_calls_map.clone();
-                                    let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                    match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                    let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
+                                    match crate::turn::llm::client::call_llm_nonstream(
                                         &client_for_fallback,
-                                        &messages_for_fallback,
-                                        &tools_for_fallback,
-                                        &model_name,
-                                        &api_key_for_fallback,
-                                        &base_url_for_fallback,
-                                        &provider_for_fallback,
-                                        max_out_for_fallback,
+                                        LlmCall {
+                                            purpose,
+                                            messages: &messages_for_fallback,
+                                            tools: &tools_for_fallback,
+                                            route: LlmExecutionRoute {
+                                                model_name: &model_name,
+                                                wire_model_name: wire_model_for_fallback.as_deref(),
+                                                api_key: &api_key_for_fallback,
+                                                base_url: &base_url_for_fallback,
+                                                provider: &provider_for_fallback,
+                                                header_overrides: header_overrides_for_fallback.as_ref(),
+                                                request_body_overrides: request_body_overrides_for_fallback.as_ref(),
+                                                completions_url_override: completions_url_override_for_fallback.as_deref(),
+                                                request_timeout: request_timeout_for_fallback,
+                                            },
+                                            max_output_tokens: max_out_for_fallback,
+                                            temperature,
+                                            has_fallback,
+                                            thinking: &thinking_for_fallback,
+                                        },
                                         fb_timeout,
-                                        wire_model_for_fallback.as_deref(),
-                                        header_overrides_for_fallback.as_ref(),
-                                        request_body_overrides_for_fallback.as_ref(),
-                                        completions_url_override_for_fallback.as_deref(),
-                                        request_timeout_for_fallback,
-                                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                     )
                                     .await
                                     {
@@ -1300,23 +1381,30 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                         let streamed_text = full_text.clone();
                                         let streamed_reasoning = reasoning.clone();
                                         let existing_tool_calls = tool_calls_map.clone();
-                                        let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
-                                        match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                        let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
+                                        match crate::turn::llm::client::call_llm_nonstream(
                                             &client_for_fallback,
-                                            &messages_for_fallback,
-                                            &tools_for_fallback,
-                                            &model_name,
-                                            &api_key_for_fallback,
-                                            &base_url_for_fallback,
-                                            &provider_for_fallback,
-                                            max_out_for_fallback,
+                                            LlmCall {
+                                                purpose,
+                                                messages: &messages_for_fallback,
+                                                tools: &tools_for_fallback,
+                                                route: LlmExecutionRoute {
+                                                    model_name: &model_name,
+                                                    wire_model_name: wire_model_for_fallback.as_deref(),
+                                                    api_key: &api_key_for_fallback,
+                                                    base_url: &base_url_for_fallback,
+                                                    provider: &provider_for_fallback,
+                                                    header_overrides: header_overrides_for_fallback.as_ref(),
+                                                    request_body_overrides: request_body_overrides_for_fallback.as_ref(),
+                                                    completions_url_override: completions_url_override_for_fallback.as_deref(),
+                                                    request_timeout: request_timeout_for_fallback,
+                                                },
+                                                max_output_tokens: max_out_for_fallback,
+                                                temperature,
+                                                has_fallback,
+                                                thinking: &thinking_for_fallback,
+                                            },
                                             fb_timeout,
-                                            wire_model_for_fallback.as_deref(),
-                                            header_overrides_for_fallback.as_ref(),
-                                            request_body_overrides_for_fallback.as_ref(),
-                                            completions_url_override_for_fallback.as_deref(),
-                                            request_timeout_for_fallback,
-                                            &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                         )
                                         .await
                                         {
@@ -1705,17 +1793,27 @@ mod tests {
         let base = format!("http://{addr}");
 
         let stream = call_llm_stream(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-v4-pro-anthropic",
-            Some("deepseek-v4-pro"),
-            "k",
-            &base,
-            "openai",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role": "user", "content": "hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "deepseek-v4-pro-anthropic",
+                    wire_model_name: Some("deepseek-v4-pro"),
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream");
@@ -1773,17 +1871,27 @@ mod tests {
         let base = format!("http://{addr}");
 
         let stream = call_llm_stream(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role": "user", "content": "hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream");
@@ -1865,17 +1973,27 @@ mod tests {
         let base = format!("http://{addr}");
 
         let stream = call_llm_stream(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "claude-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role": "user", "content": "hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "claude-test",
+                    wire_model_name: None,
+                    api_key: "test-key",
+                    base_url: &base,
+                    provider: "anthropic",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(50),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "test-key",
-            &base,
-            "anthropic",
-            Some(50),
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream started");
@@ -2030,17 +2148,27 @@ mod tests {
         let base = format!("http://{addr}");
 
         let stream = call_llm_stream(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "claude-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role": "user", "content": "hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "claude-test",
+                    wire_model_name: None,
+                    api_key: "test-key",
+                    base_url: &base,
+                    provider: "anthropic",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(50),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "test-key",
-            &base,
-            "anthropic",
-            Some(50),
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream started");
@@ -2136,17 +2264,27 @@ mod tests {
         ];
 
         let stream = call_llm_stream(
-            &messages,
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream");
@@ -2313,17 +2451,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -2358,17 +2506,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "claude-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "claude-test",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "anthropic",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "anthropic",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("anthropic bridge stream");
@@ -2415,17 +2573,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "claude-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "claude-test",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "anthropic",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "anthropic",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("anthropic bridge stream");
@@ -2464,17 +2632,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -2514,17 +2692,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -2564,17 +2752,27 @@ mod tests {
         )
         .await;
         let stream = call_llm_stream(
-            &[json!({"role":"user","content":"hi"})],
-            &[],
-            "gpt-5-mini",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role":"user","content":"hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "k",
-            &base,
-            "openai",
-            None,
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -2790,17 +2988,27 @@ mod tests {
 
         let messages = vec![json!({"role":"user","content":"say hi"})];
         let stream = call_llm_stream(
-            &messages,
-            &[],
-            "anthropic.claude-sonnet-4-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "anthropic.claude-sonnet-4-test",
+                    wire_model_name: None,
+                    api_key: "dummy-key",
+                    base_url: &base_url,
+                    provider: "bedrock",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(32),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "dummy-key",
-            &base_url,
-            "bedrock",
-            Some(32),
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream should succeed after retry");
@@ -2910,17 +3118,27 @@ mod tests {
         let base_url = spawn_bedrock_split_meta_server().await;
         let messages = vec![json!({"role":"user","content":"hi"})];
         let stream = call_llm_stream(
-            &messages,
-            &[],
-            "anthropic.claude-sonnet-4-test",
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "anthropic.claude-sonnet-4-test",
+                    wire_model_name: None,
+                    api_key: "dummy-key",
+                    base_url: &base_url,
+                    provider: "bedrock",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(32),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
             None,
-            "dummy-key",
-            &base_url,
-            "bedrock",
-            Some(32),
-            false,
-            None,
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream should succeed");

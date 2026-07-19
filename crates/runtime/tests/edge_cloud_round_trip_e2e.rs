@@ -234,6 +234,8 @@ fn bridge_payload(mut payload: Value) -> Value {
     if let Some(obj) = payload.as_object_mut() {
         obj.entry("model_selection")
             .or_insert_with(|| json!({"offering_id": "offer-mock-model"}));
+        obj.entry("inference_purpose")
+            .or_insert_with(|| json!(astra_turn_types::InferencePurpose::PrimaryAgent));
     }
     payload
 }

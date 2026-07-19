@@ -1384,6 +1384,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
     let model = state.current_model_identity().unwrap_or("").to_string();
     let recent_summary = super::host::RecentRoundSummary {
+        purpose: state.inference_purpose,
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
@@ -1503,6 +1504,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            purpose: state.inference_purpose,
             ttft_ms: turn_result.ttft_ms,
             duration_ms: prep.turn_start_time.elapsed().as_millis() as u64,
             prompt_tokens: turn_result.accum.prompt_tokens,
@@ -1529,7 +1531,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             source: Some("agentic_loop".into()),
             run_id,
             tool_calls: Some(round_tool_calls.clone()),
-            ..Default::default()
+            agent_id: None,
         });
     }
 

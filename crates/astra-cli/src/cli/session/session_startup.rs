@@ -308,8 +308,6 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
             model_name: String,
             #[serde(default)]
             candidate_model_names: Vec<String>,
-            #[serde(default)]
-            candidate_thinking_capabilities: Vec<Option<String>>,
         }
 
         let Some(token) =
@@ -334,27 +332,21 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
         } else {
             response.candidate_model_names
         };
-        let thinking_caps = if response.candidate_thinking_capabilities.is_empty() {
-            vec![None]
-        } else {
-            response.candidate_thinking_capabilities
-        };
         model_names
             .into_iter()
-            .zip(thinking_caps.into_iter().chain(std::iter::repeat(None)))
-            .map(|(model_name, thinking_cap_str)| {
-                astra_runtime::memory_hooks::relevance::LlmConnParams {
+            .map(
+                |model_name| astra_runtime::memory_hooks::relevance::LlmConnParams {
                     base_url: format!("{}/v1", self.api.api_origin()),
                     api_key: token.clone(),
                     model_name,
                     wire_model_name: None,
                     provider: "openai".to_string(),
+                    header_overrides: Default::default(),
                     request_body_overrides: None,
-                    thinking_capability: thinking_cap_str
-                        .as_deref()
-                        .and_then(|s| astra_services::models::ThinkingCapability::from_db(Some(s))),
-                }
-            })
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+            )
             .collect()
     }
 }

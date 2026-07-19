@@ -24,7 +24,12 @@ const RECONCILIATION_ENVELOPE: &str =
     astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE;
 const RECONCILED_REPLY: &str = "All three durable review results are now reconciled.";
 
-async fn post_mock_bridge_payload(app: &axum::Router, auth: &str, payload: Value) -> String {
+async fn post_mock_bridge_payload(app: &axum::Router, auth: &str, mut payload: Value) -> String {
+    payload
+        .as_object_mut()
+        .expect("bridge test payload object")
+        .entry("inference_purpose")
+        .or_insert_with(|| json!(astra_turn_types::InferencePurpose::PrimaryAgent));
     let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let request = Request::builder()
         .method("POST")
