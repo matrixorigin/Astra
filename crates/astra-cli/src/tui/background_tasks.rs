@@ -18,6 +18,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use astra_core::work_unit::{
+    ActiveWorkRegistry, WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus,
+    WorkUnitWakePolicy,
+};
 use astra_pipeline::output_stream::OutputStream;
 use astra_services::session_workspace::BackgroundShellTaskProjection;
 use astra_text_utils::str_preview::truncate_line;
@@ -186,6 +190,7 @@ pub(crate) struct BackgroundTaskHandle {
     last_tail_probe_at: Option<Instant>,
     no_recent_output_reported: bool,
     cancel_reason: Arc<AtomicU8>,
+    work_revision: u64,
 }
 
 impl BackgroundTaskHandle {
@@ -336,6 +341,7 @@ pub(crate) struct BackgroundTaskRegistry {
     output_probe_rx: mpsc::UnboundedReceiver<Vec<ShellOutputObservation>>,
     output_probe_in_flight: bool,
     last_output_probe_started: Option<Instant>,
+    active_work_registry: Option<Arc<ActiveWorkRegistry>>,
 }
 
 impl BackgroundTaskRegistry {
@@ -350,7 +356,42 @@ impl BackgroundTaskRegistry {
             output_probe_rx,
             output_probe_in_flight: false,
             last_output_probe_started: None,
+            active_work_registry: None,
         }
+    }
+
+    pub fn with_active_work_registry(mut self, registry: Arc<ActiveWorkRegistry>) -> Self {
+        self.active_work_registry = Some(registry);
+        let task_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
+        for task_id in task_ids {
+            self.publish_task(&task_id);
+        }
+        self
+    }
+
+    fn publish_task(&self, task_id: &str) {
+        let (Some(registry), Some(handle)) =
+            (self.active_work_registry.as_ref(), self.tasks.get(task_id))
+        else {
+            return;
+        };
+        let status = match handle.status() {
+            BgTaskStatus::Running => WorkUnitStatus::Running,
+            BgTaskStatus::Stopping => WorkUnitStatus::Stopping,
+            BgTaskStatus::Completed => WorkUnitStatus::Completed,
+            BgTaskStatus::Failed => WorkUnitStatus::Failed,
+            BgTaskStatus::Killed => WorkUnitStatus::Cancelled,
+        };
+        let observation = WorkUnitObservation::new(
+            &handle.id,
+            "shell",
+            status,
+            handle.work_revision.max(1),
+            WorkUnitObservationMode::Current,
+        )
+        .expect("background shell task identities and revisions are canonical")
+        .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal);
+        registry.observe(&observation);
     }
 
     /// Re-scope output created by tasks spawned after the initial server
@@ -399,8 +440,10 @@ impl BackgroundTaskRegistry {
             last_tail_probe_at: None,
             no_recent_output_reported: false,
             cancel_reason: cancel_reason.clone(),
+            work_revision: 1,
         };
         self.tasks.insert(id.clone(), handle);
+        self.publish_task(&id);
 
         // Enqueue Started BEFORE spawning the JoinSet future. A fast-
         // resolving runner can otherwise emit Completed before the
@@ -496,8 +539,10 @@ impl BackgroundTaskRegistry {
             last_tail_probe_at: None,
             no_recent_output_reported: false,
             cancel_reason: cancel_reason.clone(),
+            work_revision: 1,
         };
         self.tasks.insert(id.clone(), handle);
+        self.publish_task(&id);
 
         self.pending_completions.push(BgTaskEvent::Started {
             id: id.clone(),
@@ -576,8 +621,10 @@ impl BackgroundTaskRegistry {
             last_tail_probe_at: None,
             no_recent_output_reported: false,
             cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
+            work_revision: if status.is_terminal() { 2 } else { 1 },
         };
         self.tasks.insert(id.to_string(), handle);
+        self.publish_task(id);
         Ok(())
     }
 
@@ -600,7 +647,7 @@ impl BackgroundTaskRegistry {
         self.drain_join_set();
         let handle = self
             .tasks
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         if !handle.live_control.is_available() {
             return Err(BackgroundTaskError::StaleHandle {
@@ -629,6 +676,8 @@ impl BackgroundTaskRegistry {
         // `poll_completions` replaces it with Killed or Failed exactly once.
         handle.set_cancel_reason_if_empty(BgTaskCancelReason::User);
         handle.cancel_token.cancel();
+        handle.work_revision = handle.work_revision.saturating_add(1);
+        self.publish_task(id);
         Ok(())
     }
 
@@ -663,6 +712,7 @@ impl BackgroundTaskRegistry {
                 return;
             }
         };
+        let completion_id = completion.id.clone();
         let mut title = completion.id.clone();
         if let Some(handle) = self.tasks.get_mut(&completion.id) {
             title = handle.description.clone();
@@ -684,7 +734,9 @@ impl BackgroundTaskRegistry {
                     BgTaskStatus::Killed => Some("stopped by user".to_string()),
                     _ => None,
                 });
+            handle.work_revision = handle.work_revision.saturating_add(1);
         }
+        self.publish_task(&completion_id);
         let event = match completion.status {
             BgTaskStatus::Completed => BgTaskEvent::Completed {
                 id: completion.id,
@@ -813,8 +865,10 @@ impl BackgroundTaskRegistry {
                 handle.set_status(BgTaskStatus::Killed);
                 handle.ended_at_ms = Some(unix_epoch_millis());
                 handle.terminal_reason = Some("stopped during registry shutdown".to_string());
+                handle.work_revision = handle.work_revision.saturating_add(1);
                 handle.description.clone()
             };
+            self.publish_task(&id);
             self.pending_completions
                 .push(BgTaskEvent::Killed { id, title });
         }
@@ -2368,6 +2422,7 @@ mod tests {
             last_tail_probe_at: None,
             no_recent_output_reported: false,
             cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
+            work_revision: 1,
         };
         (handle, dir)
     }

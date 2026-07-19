@@ -622,6 +622,8 @@ pub struct SpawnedAgentState {
     pub agent_type: String,
     pub description: String,
     pub status: AgentStatus,
+    /// Producer-owned monotonic lifecycle revision for this agent work unit.
+    pub work_revision: u64,
     pub messaging_address: Option<AgentAddress>,
     pub worktree_path: Option<PathBuf>,
     pub started_at: SystemTime,
@@ -983,7 +985,7 @@ pub struct DynamicAgentSpawner {
     /// are sequential, so an identical second control read reuses this result
     /// instead of repeating child-result collection and durable reads.
     fanout_terminal_result_cache: Arc<RwLock<HashMap<String, String>>>,
-    /// Cached count of active fanout slots (Running status). Derived from
+    /// Cached count of active fanout slots (running or waiting for input). Derived from
     /// `fanout_groups`; state-transition paths update it for cheap telemetry.
     ///
     /// Updated atomically on every state transition for cheap fanout
@@ -997,6 +999,9 @@ pub struct DynamicAgentSpawner {
     /// Only these states may be replaced by durable reconciliation.
     durable_observed_agent_ids: Arc<RwLock<HashSet<String>>>,
     durable_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Session-scoped typed work authority shared by CLI and Server model
+    /// boundaries. Fanout mutations publish here at the producer seam.
+    active_work_registry: Option<Arc<astra_core::work_unit::ActiveWorkRegistry>>,
 }
 
 impl DynamicAgentSpawner {
@@ -1031,6 +1036,7 @@ impl DynamicAgentSpawner {
             durable_reconciler: Arc::new(RwLock::new(None)),
             durable_observed_agent_ids: Arc::new(RwLock::new(HashSet::new())),
             durable_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            active_work_registry: None,
         }
     }
 
@@ -1077,6 +1083,7 @@ impl DynamicAgentSpawner {
                     continue;
                 }
                 state.status = status;
+                state.work_revision = state.work_revision.saturating_add(1);
                 state.ended_at = durable_run_is_terminal(&run.status).then(SystemTime::now);
                 state.metrics.tool_calls = run.total_tool_calls;
                 state.metrics.prompt_tokens = run.total_prompt_tokens;
@@ -1085,6 +1092,7 @@ impl DynamicAgentSpawner {
             }
         }
         for state in &changed {
+            self.publish_background_agent(state);
             if agent_status_is_terminal(&state.status) {
                 self.record_fanout_terminal_state(state).await;
                 self.notify_completion(&state.agent_id).await;
@@ -1137,6 +1145,7 @@ impl DynamicAgentSpawner {
                 agent_type: "restored".into(),
                 description: projection.title.clone(),
                 status,
+                work_revision: 2,
                 messaging_address: None,
                 worktree_path: None,
                 started_at,
@@ -1177,6 +1186,7 @@ impl DynamicAgentSpawner {
                     self.record_fanout_terminal_state(&state).await;
                 }
             }
+            self.publish_background_agent(&state);
             self.archive_state(state).await;
             restored += 1;
         }
@@ -1221,6 +1231,7 @@ impl DynamicAgentSpawner {
                     .or_else(|| run.agent_binding_name.clone())
                     .unwrap_or_else(|| agent_id.to_string()),
                 status,
+                work_revision: run.run_generation.max(1),
                 messaging_address: None,
                 worktree_path: None,
                 started_at: SystemTime::now(),
@@ -1262,6 +1273,7 @@ impl DynamicAgentSpawner {
                 .write()
                 .await
                 .insert(state.agent_id.clone());
+            self.publish_background_agent(&state);
             self.archive_state(state).await;
             restored += 1;
         }
@@ -1299,6 +1311,14 @@ impl DynamicAgentSpawner {
             executor.bind_parent_session(&session_id);
         }
         self.executor = Some(executor);
+        self
+    }
+
+    pub fn with_active_work_registry(
+        mut self,
+        registry: Arc<astra_core::work_unit::ActiveWorkRegistry>,
+    ) -> Self {
+        self.active_work_registry = Some(registry);
         self
     }
 
@@ -1385,6 +1405,48 @@ impl DynamicAgentSpawner {
             .collect()
     }
 
+    fn publish_fanout_group(&self, group: &AgentFanoutGroupProjection) {
+        let Some(registry) = self.active_work_registry.as_ref() else {
+            return;
+        };
+        if let Some(observation) = group.work_unit_observation() {
+            registry.observe(&observation);
+        }
+    }
+
+    fn publish_background_agent(&self, state: &SpawnedAgentState) {
+        use astra_core::work_unit::{
+            WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+        };
+
+        let Some(registry) = self.active_work_registry.as_ref() else {
+            return;
+        };
+        // Fanout children are represented by exactly one group work unit.
+        if !state.run_in_background || state.fanout_slot.is_some() {
+            return;
+        }
+        let status = match &state.status {
+            AgentStatus::Initializing => WorkUnitStatus::Pending,
+            AgentStatus::Running { .. } | AgentStatus::Idle => WorkUnitStatus::Running,
+            AgentStatus::Waiting { .. } => WorkUnitStatus::WaitingForInput,
+            AgentStatus::Completed { .. } => WorkUnitStatus::Completed,
+            AgentStatus::Interrupted { .. } => WorkUnitStatus::Interrupted,
+            AgentStatus::Failed { .. } => WorkUnitStatus::Failed,
+            AgentStatus::Cancelled { .. } => WorkUnitStatus::Cancelled,
+        };
+        let Some(observation) = WorkUnitObservation::new(
+            state.agent_id.clone(),
+            "agent",
+            status,
+            state.work_revision.max(1),
+            WorkUnitObservationMode::Current,
+        ) else {
+            return;
+        };
+        registry.observe(&observation.with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal));
+    }
+
     pub async fn declare_fanout_group(
         &self,
         group_id: &str,
@@ -1409,6 +1471,7 @@ impl DynamicAgentSpawner {
         }
         if let Some(group) = groups.get_mut(group_id) {
             group.touch();
+            self.publish_fanout_group(group);
         }
         Ok(())
     }
@@ -1709,6 +1772,7 @@ impl DynamicAgentSpawner {
             .remove(&identity.group_id);
         self.adjust_cached_active_fanout_slots(active_before, active_after);
         index.insert(agent_id.to_string(), identity.group_id.clone());
+        self.publish_fanout_group(group);
         Ok(())
     }
 
@@ -1757,6 +1821,7 @@ impl DynamicAgentSpawner {
         let active_after = group.summary().active;
         group.touch();
         self.adjust_cached_active_fanout_slots(active_before, active_after);
+        self.publish_fanout_group(group);
         Ok(())
     }
 
@@ -1812,18 +1877,19 @@ impl DynamicAgentSpawner {
             return;
         };
         let active_before = group.summary().active;
-        if let Err(error) = group.record_terminal_by_agent(&state.agent_id, status, reason) {
+        if let Err(error) = group.record_status_by_agent(&state.agent_id, status, reason) {
             tracing::warn!(
                 target: "fanout",
                 agent_id = %state.agent_id,
                 group_id = %identity.group_id,
                 error = %error,
-                "record fanout terminal failed; skipping touch/budget adjust",
+                "record fanout lifecycle state failed; skipping touch/budget adjust",
             );
             return;
         }
         let active_after = group.summary().active;
         group.touch();
+        self.publish_fanout_group(group);
         self.fanout_terminal_result_cache
             .write()
             .await
@@ -1917,7 +1983,7 @@ impl DynamicAgentSpawner {
         }
     }
 
-    /// Authoritative count: number of slots in Running status across
+    /// Authoritative count: number of non-terminal accepted slots across
     /// all non-terminal fanout groups.  This is the single source of
     /// truth — `cached_active_fanout_slots` is just a performance
     /// optimization derived from this computation.
@@ -1927,7 +1993,12 @@ impl DynamicAgentSpawner {
             .values()
             .filter(|g| !g.is_terminal())
             .flat_map(|g| g.slots.iter())
-            .filter(|s| matches!(s.status, AgentFanoutSlotStatus::Running))
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    AgentFanoutSlotStatus::Running | AgentFanoutSlotStatus::WaitingForInput
+                )
+            })
             .count()
     }
 
@@ -1939,6 +2010,7 @@ impl DynamicAgentSpawner {
         if let Some(group) = groups.get_mut(&identity.group_id) {
             group.mark_result_collected(&state.agent_id);
             group.touch();
+            self.publish_fanout_group(group);
         }
     }
 
@@ -2372,6 +2444,7 @@ impl DynamicAgentSpawner {
             agent_type: input.agent_type.clone(),
             description: input.description.clone(),
             status: AgentStatus::Initializing,
+            work_revision: 1,
             messaging_address: None,
             worktree_path: None,
             started_at: SystemTime::now(),
@@ -2552,6 +2625,7 @@ impl DynamicAgentSpawner {
         }
         self.emit_agent_spawned_trace(&spawned_state_for_trace)
             .await;
+        self.publish_background_agent(&spawned_state_for_trace);
 
         // 6b. Reconstruct the inherited prefix payload for the
         // executor BEFORE moving resolve_outcome into the outcomes
@@ -3043,10 +3117,12 @@ impl DynamicAgentSpawner {
             },
         };
         state.status = status;
+        state.work_revision = state.work_revision.saturating_add(1);
         state.ended_at = Some(SystemTime::now());
         let messaging_address = state.messaging_address.take();
 
         self.record_fanout_terminal_state(state).await;
+        self.publish_background_agent(state);
         self.emit_agent_terminal_trace(state, "cancelled", Some(reason), Some(reason), None)
             .await;
         self.persist_agent_terminated_state(state, "cancelled", Some(reason))
@@ -3117,12 +3193,14 @@ impl DynamicAgentSpawner {
                 }
             }
             state.status = status;
+            state.work_revision = state.work_revision.saturating_add(1);
             state.ended_at = Some(SystemTime::now());
             let messaging_address = state.messaging_address.take();
             (state, messaging_address)
         };
 
         self.record_fanout_terminal_state(&state).await;
+        self.publish_background_agent(&state);
         self.emit_agent_terminal_trace(&state, journal_status, finish_reason, output, error)
             .await;
         self.persist_agent_terminated_state(&state, journal_status, finish_reason)
@@ -3439,6 +3517,7 @@ impl DynamicAgentSpawner {
             durable_reconciler: Arc::clone(&self.durable_reconciler),
             durable_observed_agent_ids: Arc::clone(&self.durable_observed_agent_ids),
             durable_reconcile_lock: Arc::clone(&self.durable_reconcile_lock),
+            active_work_registry: self.active_work_registry.clone(),
         }
     }
 
@@ -3706,10 +3785,15 @@ impl DynamicAgentSpawner {
     /// Update agent status.
     pub async fn update_status(&self, agent_id: &str, status: AgentStatus) {
         if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
+            if state.status == status {
+                return;
+            }
             state.status = status.clone();
+            state.work_revision = state.work_revision.saturating_add(1);
             if status.is_terminal() {
                 state.ended_at.get_or_insert_with(SystemTime::now);
             }
+            self.publish_background_agent(state);
 
             let Some(event_type) =
                 agent_status_to_progress_event(&status, &state.metrics, state.started_at)
@@ -5638,6 +5722,7 @@ mod tests {
                 result: "ok".to_string(),
                 finish_reason: Some("normal".to_string()),
             },
+            work_revision: 1,
             messaging_address: None,
             worktree_path: None,
             started_at: SystemTime::now(),
@@ -5651,6 +5736,64 @@ mod tests {
             fanout_slot: None,
             execution_metadata: None,
         }
+    }
+
+    #[test]
+    fn background_agent_publishes_one_monotonic_session_work_unit() {
+        use astra_core::work_unit::{ActiveWorkRegistry, WorkUnitStatus, WorkUnitWakePolicy};
+
+        let registry = Arc::new(ActiveWorkRegistry::default());
+        let spawner =
+            DynamicAgentSpawner::new(mock_router()).with_active_work_registry(registry.clone());
+        let mut state = completed_test_state(7);
+        state.status = AgentStatus::Running {
+            activity: "reviewing".into(),
+        };
+        state.ended_at = None;
+        state.work_revision = 1;
+        spawner.publish_background_agent(&state);
+        let running = registry.active_work_observations();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].kind, "agent");
+        assert_eq!(running[0].status, WorkUnitStatus::Running);
+        assert_eq!(
+            running[0].wake_policy,
+            WorkUnitWakePolicy::OnAttentionOrTerminal
+        );
+
+        state.status = AgentStatus::Waiting {
+            reason: "need a contract decision".into(),
+        };
+        state.work_revision = 2;
+        spawner.publish_background_agent(&state);
+        assert_eq!(
+            registry.active_work_observations()[0].status,
+            WorkUnitStatus::WaitingForInput
+        );
+
+        state.status = AgentStatus::Completed {
+            result: "done".into(),
+            finish_reason: Some("normal".into()),
+        };
+        state.work_revision = 3;
+        spawner.publish_background_agent(&state);
+        assert!(registry.active_work_observations().is_empty());
+        assert_eq!(
+            registry
+                .terminal_observation(&state.agent_id, "agent")
+                .unwrap()
+                .revision,
+            3
+        );
+
+        state.fanout_slot = AgentFanoutSlotIdentity::new("group", 1, 0, None).ok();
+        state.agent_id = "fanout-child".into();
+        spawner.publish_background_agent(&state);
+        assert!(
+            registry
+                .canonical_observation("fanout-child", "agent")
+                .is_none()
+        );
     }
 
     #[tokio::test]

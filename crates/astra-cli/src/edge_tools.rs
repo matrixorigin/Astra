@@ -650,6 +650,22 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 /// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
 pub type BgTaskOutputStatus = WorkUnitStatus;
 
+fn shell_work_revision(status: WorkUnitStatus, total_bytes: u64) -> u64 {
+    let phase = match status {
+        WorkUnitStatus::Pending => 1,
+        WorkUnitStatus::Running => 2,
+        WorkUnitStatus::WaitingForInput => 3,
+        WorkUnitStatus::Stopping => 4,
+        WorkUnitStatus::Completed
+        | WorkUnitStatus::CompletedWithIssues
+        | WorkUnitStatus::Failed
+        | WorkUnitStatus::Interrupted
+        | WorkUnitStatus::Cancelled
+        | WorkUnitStatus::Unavailable => 5,
+    };
+    total_bytes.saturating_mul(8).saturating_add(phase)
+}
+
 #[derive(Debug, Clone)]
 pub struct BgTaskOutputSnapshot {
     pub kind: String,
@@ -1192,7 +1208,7 @@ fn background_task_output_result_fields(
         task_id,
         snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
         snapshot.status,
-        format!("{}:{}", snapshot.status.as_str(), snapshot.total_bytes),
+        shell_work_revision(snapshot.status, snapshot.total_bytes),
         match observation_mode {
             "wait" => WorkUnitObservationMode::Wait,
             "historical" => WorkUnitObservationMode::Historical,
@@ -1227,12 +1243,7 @@ fn background_task_output_search_result_fields(
         task_id,
         snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
         snapshot.status,
-        format!(
-            "diagnostic:{}:{}:{}",
-            snapshot.status.as_str(),
-            snapshot.matching_lines,
-            snapshot.truncated
-        ),
+        snapshot.matching_lines.saturating_add(1),
         WorkUnitObservationMode::Diagnostic,
     )
     .expect("background diagnostics have a task id, kind, and version")
@@ -4039,7 +4050,7 @@ impl ToolExecutor {
                     &projection.group_id,
                     "agent_fanout",
                     projection.snapshot.status,
-                    projection.revision.to_string(),
+                    projection.revision,
                     observation_mode,
                 )
                 .expect("fanout task projections have canonical identities and revisions")
@@ -7400,7 +7411,7 @@ mod tests {
         assert_eq!(work.id, "bg-shell-1");
         assert_eq!(work.kind, "shell");
         assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
-        assert_eq!(work.version, "running:1000");
+        assert_eq!(work.revision, 8002);
         assert_eq!(
             work.mode,
             astra_core::work_unit::WorkUnitObservationMode::Current

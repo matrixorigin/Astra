@@ -2089,6 +2089,7 @@ async fn stream_missing_agent_lifecycle_events(
 struct ServerAgentSpawnerEntry {
     spawner: Arc<DynamicAgentSpawner>,
     executor: Arc<ServerSpawnAgentExecutor>,
+    active_work_registry: Arc<astra_core::work_unit::ActiveWorkRegistry>,
     durable_restore: Arc<tokio::sync::OnceCell<()>>,
     last_access: Arc<std::sync::Mutex<Instant>>,
 }
@@ -2799,11 +2800,13 @@ impl AgenticRunLifecycleService {
         }
         let executor = Arc::new(executor);
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
+        let active_work_registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
             Arc::clone(&self.server_agent_mailbox_router),
             self.dynamic_agent_progress_broadcaster(),
         )
         .with_executor(executor_for_spawner)
+        .with_active_work_registry(active_work_registry.clone())
         .with_session(session_id.to_string())
         // Same cap as the CLI side. Web/headless sessions are no less
         // susceptible to the runaway-spawn-on-failure pattern; without
@@ -2826,6 +2829,7 @@ impl AgenticRunLifecycleService {
         let entry = ServerAgentSpawnerEntry {
             spawner: Arc::new(spawner),
             executor,
+            active_work_registry,
             durable_restore: Arc::new(tokio::sync::OnceCell::new()),
             last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
         };
@@ -3060,7 +3064,7 @@ impl AgenticRunLifecycleService {
         pause_flag: Option<Arc<AtomicBool>>,
         cancel_token: Option<Arc<CancellationToken>>,
         #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
-    ) {
+    ) -> Arc<astra_core::work_unit::ActiveWorkRegistry> {
         let entry = self
             .server_agent_spawner_for_session(user_id, session_id)
             .await;
@@ -3089,6 +3093,9 @@ impl AgenticRunLifecycleService {
                 %error,
                 "durable agent registry restore failed; the next turn will retry"
             );
+        }
+        for observation in entry.spawner.active_fanout_work_unit_observations().await {
+            entry.active_work_registry.observe(&observation);
         }
         // Validation already happened up the call chain (see
         // `validate_request_constraints`); this re-parse is safe because the
@@ -3131,6 +3138,7 @@ impl AgenticRunLifecycleService {
             .agent_id
             .clone()
             .unwrap_or_else(|| "root-agent".to_string());
+        let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
             run_id: run_id.to_string(),
             agent_id,
@@ -3160,6 +3168,7 @@ impl AgenticRunLifecycleService {
             execution_metadata,
             transcript_location: AgentTranscriptLocation::DurableServer,
         });
+        active_work_registry
     }
 
     fn build_csl_store(
@@ -7456,22 +7465,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
             host.set_execution_metadata(executor.binding_metadata());
 
-            self.wire_server_dynamic_agent_tools(
-                &mut executor,
-                &user_id,
-                &session_id,
-                &run_id,
-                loop_state.session_turn,
-                &request,
-                agent_working_dir.as_path(),
-                None,
-                None,
-                Some(pause_flag.clone()),
-                Some(llm_cancel_token.clone()),
-                #[cfg(feature = "harness")]
-                loop_state.harness.sink.clone(),
-            )
-            .await;
+            let active_work_registry = self
+                .wire_server_dynamic_agent_tools(
+                    &mut executor,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    loop_state.session_turn,
+                    &request,
+                    agent_working_dir.as_path(),
+                    None,
+                    None,
+                    Some(pause_flag.clone()),
+                    Some(llm_cancel_token.clone()),
+                    #[cfg(feature = "harness")]
+                    loop_state.harness.sink.clone(),
+                )
+                .await;
+            loop_state.attach_active_work_registry(active_work_registry);
 
             if request.interactive_client {
                 // ── Phase E: Wire WebSocket approval and ask_user gates ───
@@ -8645,22 +8656,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
             host.set_execution_metadata(executor.binding_metadata());
             executor.set_work_surface_event_tx(event_tx.clone());
-            self.wire_server_dynamic_agent_tools(
-                &mut executor,
-                &user_id,
-                &session_id,
-                &run_id,
-                state.session_turn,
-                &request,
-                agent_working_dir.as_path(),
-                Some(event_tx.clone()),
-                Some(agent_live_gap_tracker.clone()),
-                Some(pause_flag.clone()),
-                Some(llm_cancel_token.clone()),
-                #[cfg(feature = "harness")]
-                state.harness.sink.clone(),
-            )
-            .await;
+            let active_work_registry = self
+                .wire_server_dynamic_agent_tools(
+                    &mut executor,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    state.session_turn,
+                    &request,
+                    agent_working_dir.as_path(),
+                    Some(event_tx.clone()),
+                    Some(agent_live_gap_tracker.clone()),
+                    Some(pause_flag.clone()),
+                    Some(llm_cancel_token.clone()),
+                    #[cfg(feature = "harness")]
+                    state.harness.sink.clone(),
+                )
+                .await;
+            state.attach_active_work_registry(active_work_registry);
 
             // Match the background-run interaction contract.  The stream is
             // only a delivery surface: Server Only requests still wait on the

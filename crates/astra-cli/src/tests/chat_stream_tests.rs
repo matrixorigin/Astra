@@ -81,7 +81,7 @@ async fn stream_chat_sse_cannot_turn_active_fanout_into_a_completion_claim() {
             "review-group",
             "agent_fanout",
             astra_core::work_unit::WorkUnitStatus::Running,
-            "7",
+            7,
             astra_core::work_unit::WorkUnitObservationMode::Current,
         )
         .unwrap()

@@ -243,6 +243,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
             progress_broadcaster,
         )
         .with_executor(std::sync::Arc::new(spawn_executor))
+        .with_active_work_registry(state.active_work_registry.clone())
         .with_prefix_store(prefix_store)
         .with_max_concurrent_agents(resolved_spawn_concurrency_cap()),
         state.session_id.as_deref(),

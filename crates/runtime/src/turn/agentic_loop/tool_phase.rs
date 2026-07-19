@@ -1565,7 +1565,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 work_unit_id = %observation.id,
                 kind = %observation.kind,
                 status = ?observation.status,
-                version = %observation.version,
+                revision = observation.revision,
                 mode = ?observation.mode,
                 outcome = ?outcome,
                 "recorded producer-owned work-unit observation"
@@ -2117,7 +2117,7 @@ mod tests {
             "work-1",
             "future_background_capability",
             astra_core::work_unit::WorkUnitStatus::Running,
-            "revision-7",
+            7,
             astra_core::work_unit::WorkUnitObservationMode::Current,
         )
         .unwrap();

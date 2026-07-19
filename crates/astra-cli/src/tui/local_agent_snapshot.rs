@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotStatus;
+
 #[derive(Clone, Default)]
 pub(crate) struct LocalAgentSnapshot {
     pub available: bool,
@@ -225,6 +227,18 @@ impl LocalAgentSnapshot {
                     && group.summary().uncollected == 0
             });
         }
+        if value.get("event").and_then(serde_json::Value::as_str)
+            == Some("fanout_group_needs_input")
+        {
+            let Some(group_id) = value.get("group_id").and_then(serde_json::Value::as_str) else {
+                return true;
+            };
+            return self.fanout_groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.work_unit_status()
+                        == astra_core::work_unit::WorkUnitStatus::WaitingForInput
+            });
+        }
         if value.get("event").and_then(serde_json::Value::as_str) != Some("agent_status_changed") {
             return true;
         }
@@ -275,11 +289,11 @@ impl LocalAgentSnapshot {
             // repeated analysis.
             .filter(|agent| agent.run_in_background)
             .filter(|agent| {
-                matches!(
-                    agent.status,
-                    astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
-                ) || (agent.status.is_terminal()
-                    && !fanout_agent_ids.contains(agent.agent_id.as_str()))
+                !fanout_agent_ids.contains(agent.agent_id.as_str())
+                    && (matches!(
+                        agent.status,
+                        astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
+                    ) || agent.status.is_terminal())
             })
             .filter(|agent| {
                 previous_status
@@ -346,6 +360,63 @@ impl LocalAgentSnapshot {
             .iter()
             .map(|group| (group.group_id.as_str(), group))
             .collect::<BTreeMap<_, _>>();
+        updates.extend(
+            self.fanout_groups
+                .iter()
+                .filter(|group| {
+                    group.work_unit_status()
+                        == astra_core::work_unit::WorkUnitStatus::WaitingForInput
+                })
+                .filter(|group| {
+                    previous_groups
+                        .get(group.group_id.as_str())
+                        .is_none_or(|previous| {
+                            previous.work_unit_status()
+                                != astra_core::work_unit::WorkUnitStatus::WaitingForInput
+                        })
+                })
+                .map(|group| {
+                    let title = if group.title.trim().is_empty() {
+                        "Agent group".to_string()
+                    } else {
+                        group.title.trim().chars().take(80).collect::<String>()
+                    };
+                    let waiting_slots = group
+                        .slots
+                        .iter()
+                        .filter(|slot| {
+                            slot.status == AgentFanoutSlotStatus::WaitingForInput
+                        })
+                        .map(|slot| {
+                            serde_json::json!({
+                                "slot_index": slot.slot_index,
+                                "slot_id": slot.slot_id,
+                                "agent_id": slot.agent_id,
+                                "reason": slot.terminal_reason,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    LocalAgentAttentionUpdate {
+                        receipt: format!("{title} needs input · Shift+↓ inspect"),
+                        notification: serde_json::json!({
+                            "schema": "agent_attention_hint.v1",
+                            "event": "fanout_group_needs_input",
+                            "group_id": group.group_id,
+                            "title": group.title,
+                            "parent_run_id": group.parent_run_id,
+                            "status": "waiting_for_input",
+                            "waiting_slots": waiting_slots,
+                            "authoritative_result_call": {
+                                "tool": "agent_fanout",
+                                "action": "get_results",
+                                "group_id": group.group_id,
+                            },
+                            "instruction": "Resolve this fanout's attention boundary once as one work unit; do not start separate analysis for individual child events.",
+                        })
+                        .to_string(),
+                    }
+                }),
+        );
         updates.extend(
             self.fanout_groups
                 .iter()
@@ -496,8 +567,11 @@ mod tests {
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].id, "review");
         assert_eq!(running[0].status, WorkUnitStatus::Running);
-        assert_eq!(running[0].version, running_revision.to_string());
-        assert_eq!(running[0].wake_policy, WorkUnitWakePolicy::OnTerminal);
+        assert_eq!(running[0].revision, running_revision);
+        assert_eq!(
+            running[0].wake_policy,
+            WorkUnitWakePolicy::OnAttentionOrTerminal
+        );
         let receipt = LocalAgentSnapshot {
             available: true,
             fanout_groups: vec![group.clone()],
@@ -518,7 +592,61 @@ mod tests {
         }
         .fanout_work_unit_observations();
         assert_eq!(terminal[0].status, WorkUnitStatus::Completed);
-        assert_ne!(terminal[0].version, running_revision.to_string());
+        assert_ne!(terminal[0].revision, running_revision);
+    }
+
+    #[test]
+    fn fanout_waiting_wakes_once_at_group_boundary() {
+        let mut running = AgentFanoutGroupProjection::new("review", "Three reviews", 2);
+        running.parent_run_id = Some("root-run".into());
+        running
+            .record_spawn_accepted_with_run(0, "reviewer-1", Some("run-1".into()))
+            .unwrap();
+        running
+            .record_spawn_accepted_with_run(1, "reviewer-2", Some("run-2".into()))
+            .unwrap();
+        let before = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![running.clone()],
+            ..LocalAgentSnapshot::default()
+        };
+
+        running
+            .record_status_by_agent(
+                "reviewer-1",
+                AgentFanoutSlotStatus::WaitingForInput,
+                Some("Which API contract?".into()),
+            )
+            .unwrap();
+        let waiting = LocalAgentSnapshot {
+            available: true,
+            agents: vec![agent(
+                "reviewer-1",
+                "run-1",
+                AgentStatus::Waiting {
+                    reason: "Which API contract?".into(),
+                },
+            )],
+            fanout_groups: vec![running.clone()],
+        };
+        let observation = waiting.fanout_work_unit_observations();
+        assert_eq!(observation[0].status, WorkUnitStatus::WaitingForInput);
+        assert_eq!(
+            observation[0].wake_policy,
+            WorkUnitWakePolicy::OnAttentionOrTerminal
+        );
+
+        let updates = waiting.attention_updates_since(&before);
+        assert_eq!(
+            updates.len(),
+            1,
+            "fanout child must not create a second wake"
+        );
+        let value: serde_json::Value = serde_json::from_str(&updates[0].notification).unwrap();
+        assert_eq!(value["event"], "fanout_group_needs_input");
+        assert_eq!(value["group_id"], "review");
+        assert_eq!(value["waiting_slots"].as_array().unwrap().len(), 1);
+        assert!(waiting.attention_updates_since(&waiting).is_empty());
     }
 
     #[test]

@@ -1168,6 +1168,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
     match status {
         AgentFanoutSlotStatus::Planned => "planned",
         AgentFanoutSlotStatus::SpawnAccepted | AgentFanoutSlotStatus::Running => "running",
+        AgentFanoutSlotStatus::WaitingForInput => "needs input",
         AgentFanoutSlotStatus::SpawnRejected => "spawn rejected",
         AgentFanoutSlotStatus::Completed => "completed",
         AgentFanoutSlotStatus::Interrupted => "interrupted",

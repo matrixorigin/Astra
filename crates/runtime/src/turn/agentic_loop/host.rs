@@ -1083,6 +1083,10 @@ pub struct StallTrackingState {
     /// progress is a version change, not a tool name, argument shape, prose
     /// fragment, elapsed timer, or low-level event count.
     pub work_unit_observations: astra_core::work_unit::WorkUnitObservationTracker,
+    /// Session-scoped producer registry. The turn tracker remains an
+    /// ephemeral settlement view, while this registry carries canonical work
+    /// across turns and product entrypoints.
+    pub active_work_registry: Option<std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>>,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<String>>,
     /// Per-turn tool name sets.
@@ -2617,11 +2621,23 @@ impl AgenticLoopState {
         &mut self,
         observation: &astra_core::work_unit::WorkUnitObservation,
     ) -> astra_core::work_unit::WorkUnitObservationOutcome {
-        let outcome = self.stall.work_unit_observations.observe(observation);
+        let canonical = if let Some(registry) = self.stall.active_work_registry.as_ref() {
+            if registry.observe(observation)
+                == astra_core::work_unit::WorkUnitObservationOutcome::Ignored
+            {
+                return astra_core::work_unit::WorkUnitObservationOutcome::Ignored;
+            }
+            registry
+                .canonical_observation(&observation.id, &observation.kind)
+                .unwrap_or_else(|| observation.clone())
+        } else {
+            observation.clone()
+        };
+        let outcome = self.stall.work_unit_observations.observe(&canonical);
         if outcome == astra_core::work_unit::WorkUnitObservationOutcome::Ignored {
             return outcome;
         }
-        let Ok(observation_value) = serde_json::to_value(observation) else {
+        let Ok(observation_value) = serde_json::to_value(&canonical) else {
             return outcome;
         };
         for injection in self
@@ -2649,9 +2665,9 @@ impl AgenticLoopState {
                 let mut replaced = false;
                 for current in observations.iter_mut() {
                     let same_identity = current.get("id").and_then(Value::as_str)
-                        == Some(observation.id.as_str())
+                        == Some(canonical.id.as_str())
                         && current.get("kind").and_then(Value::as_str)
-                            == Some(observation.kind.as_str());
+                            == Some(canonical.kind.as_str());
                     if same_identity && current != &observation_value {
                         *current = observation_value.clone();
                         replaced = true;
@@ -2669,13 +2685,35 @@ impl AgenticLoopState {
         outcome
     }
 
+    pub fn attach_active_work_registry(
+        &mut self,
+        registry: std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>,
+    ) {
+        let observations = registry.active_work_observations();
+        self.stall.active_work_registry = Some(registry);
+        for observation in &observations {
+            self.stall.work_unit_observations.observe(observation);
+        }
+        if !observations.is_empty() {
+            self.push_volatile_payload(
+                VolatileKind::ActiveWorkSnapshot,
+                serde_json::json!({
+                    "schema": "active_work_snapshot.v1",
+                    "work_unit_observations": observations,
+                    "instruction": "This is producer-owned session work state at the current model boundary. Use canonical work-unit IDs and lifecycle state; do not infer completion from individual transport events.",
+                    "authority": "active_work_provider",
+                }),
+            );
+        }
+    }
+
     /// Reconcile a submission-time work snapshot with producer truth already
     /// observed by the turn before the snapshot reached its model boundary.
     ///
     /// Active guidance and foreground tool settlement are independent input
     /// lanes. The guidance lane can therefore deliver an older `running`
-    /// projection after the tool lane has delivered `completed`. Terminal
-    /// producer state is absorbing for the work-unit identity, so replace the
+    /// projection after the tool lane has advanced it. Producer revision is
+    /// authoritative for both non-terminal and terminal state, so replace any
     /// delayed projection and retire its textual cache before prompt assembly.
     pub fn reconcile_active_work_context(&mut self, context: &mut Value) {
         let captured = context
@@ -2694,15 +2732,23 @@ impl AgenticLoopState {
                 continue;
             }
             self.observe_work_unit(&observation);
-            let Some(terminal) = self
+            let canonical = self
                 .stall
-                .work_unit_observations
-                .terminal_observation(&observation.id, &observation.kind)
-            else {
+                .active_work_registry
+                .as_ref()
+                .and_then(|registry| {
+                    registry.canonical_observation(&observation.id, &observation.kind)
+                })
+                .or_else(|| {
+                    self.stall
+                        .work_unit_observations
+                        .canonical_observation(&observation.id, &observation.kind)
+                });
+            let Some(canonical) = canonical else {
                 continue;
             };
-            if terminal != &observation {
-                replacements.push((index, terminal.to_value()));
+            if canonical != observation {
+                replacements.push((index, canonical.to_value()));
             }
         }
         if replacements.is_empty() {
@@ -4038,7 +4084,7 @@ pub(crate) mod tests {
             task_id,
             "shell",
             astra_core::work_unit::WorkUnitStatus::Running,
-            "running:0",
+            1,
             astra_core::work_unit::WorkUnitObservationMode::Transition,
         )
         .unwrap()
@@ -4063,7 +4109,7 @@ pub(crate) mod tests {
             group_id,
             "agent_fanout",
             astra_core::work_unit::WorkUnitStatus::Running,
-            "revision-1",
+            1,
             astra_core::work_unit::WorkUnitObservationMode::Transition,
         )
         .unwrap()
@@ -4147,7 +4193,7 @@ pub(crate) mod tests {
             "completed" => astra_core::work_unit::WorkUnitStatus::Completed,
             "failed" => astra_core::work_unit::WorkUnitStatus::Failed,
             "interrupted" => astra_core::work_unit::WorkUnitStatus::Interrupted,
-            "killed" => astra_core::work_unit::WorkUnitStatus::Cancelled,
+            "cancelled" => astra_core::work_unit::WorkUnitStatus::Cancelled,
             _ => astra_core::work_unit::WorkUnitStatus::Unavailable,
         };
         let observation_mode = match mode {
@@ -4160,7 +4206,7 @@ pub(crate) mod tests {
             task_id,
             "shell",
             work_status,
-            format!("{status}:0"),
+            1,
             observation_mode,
         )
         .unwrap()

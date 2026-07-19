@@ -76,10 +76,7 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
     // Capture producer truth at the actual model boundary. This refreshes on
     // retries and wake turns and avoids feeding the TUI's rendered XML cache
     // back into lifecycle decisions.
-    let input_work_unit_observations = match state.agent_spawner.as_ref() {
-        Some(spawner) => spawner.active_fanout_work_unit_observations().await,
-        None => Vec::new(),
-    };
+    let input_work_unit_observations = state.active_work_registry.active_work_observations();
 
     let run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
@@ -335,9 +332,11 @@ mod tests {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-        let spawner = Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
-            router,
-        ));
+        let active_work_registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        let spawner = Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router)
+                .with_active_work_registry(active_work_registry.clone()),
+        );
         spawner
             .declare_fanout_group(
                 "review-group",
@@ -350,6 +349,7 @@ mod tests {
             .unwrap();
         let state = SessionState {
             agent_spawner: Some(spawner),
+            active_work_registry,
             ..SessionState::default()
         };
 
@@ -365,7 +365,7 @@ mod tests {
         );
         assert_eq!(
             observation.wake_policy,
-            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+            astra_core::work_unit::WorkUnitWakePolicy::OnAttentionOrTerminal
         );
     }
 

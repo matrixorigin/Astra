@@ -401,6 +401,10 @@ pub(crate) struct SessionState {
     pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    /// Session-scoped typed authority for every asynchronous work kind. Model
+    /// boundaries consume this registry instead of querying UI projections or
+    /// one producer-specific cache.
+    pub active_work_registry: std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>,
     /// Persistent top-level mailbox so spawned agents can reply across turns.
     pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
@@ -678,6 +682,9 @@ impl Default for SessionState {
                 astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),
             agent_spawner: None, // Created lazily when agent spawning is first used
+            active_work_registry: std::sync::Arc::new(
+                astra_core::work_unit::ActiveWorkRegistry::default(),
+            ),
             root_mailbox: None,
             redo_stack: Vec::new(),
             resume_guidance: None,

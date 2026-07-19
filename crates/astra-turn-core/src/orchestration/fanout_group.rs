@@ -123,6 +123,7 @@ pub enum AgentFanoutSlotStatus {
     SpawnAccepted,
     SpawnRejected,
     Running,
+    WaitingForInput,
     Completed,
     Interrupted,
     Failed,
@@ -139,6 +140,7 @@ impl AgentFanoutSlotStatus {
             Self::SpawnAccepted => "spawn_accepted",
             Self::SpawnRejected => "spawn_rejected",
             Self::Running => "running",
+            Self::WaitingForInput => "waiting_for_input",
             Self::Completed => "completed",
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
@@ -155,6 +157,7 @@ pub struct AgentFanoutSummary {
     pub planned: usize,
     pub accepted: usize,
     pub active: usize,
+    pub waiting_for_input: usize,
     pub terminal: usize,
     pub completed: usize,
     pub interrupted: usize,
@@ -191,7 +194,7 @@ impl AgentFanoutGroupProjection {
             parent_run_id: None,
             slots,
             status: AgentFanoutStatus::Planned,
-            revision: 0,
+            revision: 1,
             last_touched: SystemTime::now(),
             summary_cache: AgentFanoutSummary {
                 target_count,
@@ -229,7 +232,9 @@ impl AgentFanoutGroupProjection {
     /// this producer-owned projection instead of re-counting slot causes.
     pub fn work_unit_status(&self) -> WorkUnitStatus {
         if !self.is_terminal() {
-            return if self.summary_cache.active > 0 {
+            return if self.summary_cache.waiting_for_input > 0 {
+                WorkUnitStatus::WaitingForInput
+            } else if self.summary_cache.active > 0 {
                 WorkUnitStatus::Running
             } else {
                 WorkUnitStatus::Pending
@@ -247,16 +252,16 @@ impl AgentFanoutGroupProjection {
     /// Consumers must carry this value across model/UI boundaries instead of
     /// rebuilding lifecycle truth from child events, XML projections, or
     /// hand-copied agent IDs. The group revision is the opaque material-state
-    /// version and the runtime owns one update when the group settles.
+    /// revision and the runtime owns attention-required and terminal updates.
     pub fn work_unit_observation(&self) -> Option<WorkUnitObservation> {
         WorkUnitObservation::new(
             &self.group_id,
             "agent_fanout",
             self.work_unit_status(),
-            self.revision.to_string(),
+            self.revision,
             WorkUnitObservationMode::Current,
         )
-        .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal))
+        .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal))
     }
 
     pub fn set_slot_request(
@@ -396,6 +401,42 @@ impl AgentFanoutGroupProjection {
         Ok(())
     }
 
+    /// Apply the producer-owned lifecycle state for an accepted slot. Waiting
+    /// is non-terminal but attention-worthy; terminal states remain absorbing.
+    pub fn record_status_by_agent(
+        &mut self,
+        agent_id: &str,
+        status: AgentFanoutSlotStatus,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        if status.is_terminal() {
+            return self.record_terminal_by_agent(agent_id, status, reason);
+        }
+        let Some(slot_index) = self.agent_slot_index.get(agent_id).copied() else {
+            return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
+        };
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            self.agent_slot_index.remove(agent_id);
+            return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
+        };
+        if slot.status.is_terminal() {
+            return Err(format!(
+                "fanout agent {agent_id} already recorded terminal status {:?}",
+                slot.status
+            ));
+        }
+        if slot.status == status && slot.terminal_reason == reason {
+            return Ok(());
+        }
+        let old_status = slot.status;
+        slot.status = status;
+        slot.terminal_reason = reason;
+        self.apply_slot_status_transition(old_status, status, true, false);
+        self.recompute_status_from_cache();
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
     pub fn summary(&self) -> AgentFanoutSummary {
         self.summary_cache
     }
@@ -406,7 +447,7 @@ impl AgentFanoutGroupProjection {
             "fanout failed to start fully"
         } else if summary.cancelled_by_parent_budget > 0 {
             "fanout interrupted by budget"
-        } else if summary.active > 0 && summary.terminal > 0 {
+        } else if (summary.active > 0 || summary.waiting_for_input > 0) && summary.terminal > 0 {
             "fanout incomplete"
         } else {
             match self.status {
@@ -461,7 +502,10 @@ impl AgentFanoutGroupProjection {
         let summary = self.summary_cache;
         self.status = if summary.terminal == self.target_count {
             AgentFanoutStatus::Finished
-        } else if summary.active > 0 || (summary.terminal > 0 && summary.planned > 0) {
+        } else if summary.active > 0
+            || summary.waiting_for_input > 0
+            || (summary.terminal > 0 && summary.planned > 0)
+        {
             AgentFanoutStatus::Running
         } else if summary.terminal > 0 {
             AgentFanoutStatus::Incomplete
@@ -491,9 +535,14 @@ fn adjust_summary_for_status(
     }
     if matches!(
         status,
-        AgentFanoutSlotStatus::Running | AgentFanoutSlotStatus::SpawnAccepted
+        AgentFanoutSlotStatus::Running
+            | AgentFanoutSlotStatus::WaitingForInput
+            | AgentFanoutSlotStatus::SpawnAccepted
     ) {
         adjust_summary_value(&mut summary.active, delta);
+    }
+    if status == AgentFanoutSlotStatus::WaitingForInput {
+        adjust_summary_value(&mut summary.waiting_for_input, delta);
     }
     if status.is_terminal() {
         adjust_summary_value(&mut summary.terminal, delta);
@@ -519,7 +568,8 @@ fn adjust_summary_for_status(
         }
         AgentFanoutSlotStatus::Planned
         | AgentFanoutSlotStatus::SpawnAccepted
-        | AgentFanoutSlotStatus::Running => {}
+        | AgentFanoutSlotStatus::Running
+        | AgentFanoutSlotStatus::WaitingForInput => {}
     }
 }
 
@@ -610,26 +660,26 @@ mod tests {
     #[test]
     fn revision_changes_only_for_material_projection_mutations() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
-        assert_eq!(group.revision, 0);
+        assert_eq!(group.revision, 1);
 
         group.touch();
-        assert_eq!(group.revision, 0, "reads and LRU touches are not progress");
+        assert_eq!(group.revision, 1, "reads and LRU touches are not progress");
 
         group
             .set_slot_request(0, None, "reviewer", "Review auth")
             .unwrap();
-        assert_eq!(group.revision, 1);
-        group.record_spawn_accepted(0, "reviewer@run-1").unwrap();
         assert_eq!(group.revision, 2);
+        group.record_spawn_accepted(0, "reviewer@run-1").unwrap();
+        assert_eq!(group.revision, 3);
         group
             .record_terminal_by_agent("reviewer@run-1", AgentFanoutSlotStatus::Completed, None)
             .unwrap();
-        assert_eq!(group.revision, 3);
-        assert!(group.mark_result_collected("reviewer@run-1"));
         assert_eq!(group.revision, 4);
         assert!(group.mark_result_collected("reviewer@run-1"));
+        assert_eq!(group.revision, 5);
+        assert!(group.mark_result_collected("reviewer@run-1"));
         assert_eq!(
-            group.revision, 4,
+            group.revision, 5,
             "idempotent collection cannot manufacture progress"
         );
     }
@@ -805,10 +855,10 @@ mod tests {
         assert_eq!(planned_observation.id, "planned");
         assert_eq!(planned_observation.kind, "agent_fanout");
         assert_eq!(planned_observation.status, WorkUnitStatus::Pending);
-        assert_eq!(planned_observation.version, planned.revision.to_string());
+        assert_eq!(planned_observation.revision, planned.revision);
         assert_eq!(
             planned_observation.wake_policy,
-            WorkUnitWakePolicy::OnTerminal
+            WorkUnitWakePolicy::OnAttentionOrTerminal
         );
 
         let mut completed = AgentFanoutGroupProjection::new("completed", "Completed", 1);

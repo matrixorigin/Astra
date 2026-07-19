@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -50,7 +51,7 @@ impl WorkUnitStatus {
             "completed_with_issues" => Some(Self::CompletedWithIssues),
             "failed" => Some(Self::Failed),
             "interrupted" => Some(Self::Interrupted),
-            "cancelled" | "killed" => Some(Self::Cancelled),
+            "cancelled" => Some(Self::Cancelled),
             "unavailable" => Some(Self::Unavailable),
             _ => None,
         }
@@ -119,15 +120,16 @@ impl WorkUnitWakePolicy {
 
 /// Canonical observation of one asynchronously evolving unit of work.
 ///
-/// `version` is an opaque producer-owned token. It must change whenever the
-/// material state represented by this observation changes. Consumers compare
-/// it for equality; they do not parse it or manufacture their own revision.
+/// `revision` is a producer-owned monotonic sequence for this `(kind, id)`.
+/// Consumers reject older observations instead of treating arrival order as
+/// lifecycle order. Producers must increment it whenever material state
+/// changes; equal revisions are idempotent re-observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkUnitObservation {
     pub id: String,
     pub kind: String,
     pub status: WorkUnitStatus,
-    pub version: String,
+    pub revision: u64,
     pub mode: WorkUnitObservationMode,
     /// Delivery contract for the next meaningful boundary. Defaults to
     /// `none` so older or third-party producers cannot accidentally claim an
@@ -141,14 +143,14 @@ impl WorkUnitObservation {
         id: impl Into<String>,
         kind: impl Into<String>,
         status: WorkUnitStatus,
-        version: impl Into<String>,
+        revision: u64,
         mode: WorkUnitObservationMode,
     ) -> Option<Self> {
         let observation = Self {
             id: id.into(),
             kind: kind.into(),
             status,
-            version: version.into(),
+            revision,
             mode,
             wake_policy: WorkUnitWakePolicy::None,
         };
@@ -161,9 +163,7 @@ impl WorkUnitObservation {
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.id.trim().is_empty()
-            && !self.kind.trim().is_empty()
-            && !self.version.trim().is_empty()
+        !self.id.trim().is_empty() && !self.kind.trim().is_empty() && self.revision > 0
     }
 
     pub fn identity(&self) -> String {
@@ -200,7 +200,8 @@ struct WorkUnitCursor {
     kind: String,
     status: WorkUnitStatus,
     wake_policy: WorkUnitWakePolicy,
-    version: String,
+    revision: u64,
+    mode: WorkUnitObservationMode,
     unchanged: u32,
 }
 
@@ -218,7 +219,7 @@ pub struct ActiveWorkUnit {
     pub wake_policy: WorkUnitWakePolicy,
 }
 
-/// Turn-scoped progress tracker shared by every asynchronous work producer.
+/// Progress tracker shared by every asynchronous work producer.
 ///
 /// It deliberately knows nothing about tool names or argument shapes.
 #[derive(Debug, Clone, Default)]
@@ -237,12 +238,27 @@ impl WorkUnitObservationTracker {
             return WorkUnitObservationOutcome::Ignored;
         }
         let identity = observation.identity();
-        if self.terminal.contains_key(&identity) && !observation.status.is_terminal() {
+        if let Some(terminal) = self.terminal.get(&identity)
+            && (!observation.status.is_terminal() || observation.revision <= terminal.revision)
+        {
             return WorkUnitObservationOutcome::Ignored;
         }
         if observation.status.is_terminal() {
+            if self
+                .cursors
+                .get(&identity)
+                .is_some_and(|cursor| observation.revision <= cursor.revision)
+            {
+                return WorkUnitObservationOutcome::Ignored;
+            }
             self.cursors.remove(&identity);
             self.terminal.insert(identity, observation.clone());
+            while self.terminal.len() > 256 {
+                let Some(oldest_identity) = self.terminal.keys().next().cloned() else {
+                    break;
+                };
+                self.terminal.remove(&oldest_identity);
+            }
             return WorkUnitObservationOutcome::Terminal;
         }
         match self.cursors.get_mut(&identity) {
@@ -254,30 +270,33 @@ impl WorkUnitObservationTracker {
                         kind: observation.kind.trim().to_string(),
                         status: observation.status,
                         wake_policy: observation.wake_policy,
-                        version: observation.version.clone(),
+                        revision: observation.revision,
+                        mode: observation.mode,
                         unchanged: 0,
                     },
                 );
                 WorkUnitObservationOutcome::First
             }
-            Some(cursor) if cursor.version == observation.version => {
+            Some(cursor) if cursor.revision == observation.revision => {
                 // Wake ownership is delivery metadata, not lifecycle state.
                 // Honor the latest producer contract even if an adapter adds
                 // it without changing the underlying work revision.
-                cursor.status = observation.status;
                 cursor.wake_policy = observation.wake_policy;
+                cursor.mode = observation.mode;
                 cursor.unchanged = cursor.unchanged.saturating_add(1);
                 WorkUnitObservationOutcome::Unchanged {
                     consecutive: cursor.unchanged,
                 }
             }
-            Some(cursor) => {
-                cursor.version.clone_from(&observation.version);
+            Some(cursor) if observation.revision > cursor.revision => {
+                cursor.revision = observation.revision;
                 cursor.status = observation.status;
                 cursor.wake_policy = observation.wake_policy;
+                cursor.mode = observation.mode;
                 cursor.unchanged = 0;
                 WorkUnitObservationOutcome::Advanced
             }
+            Some(_) => WorkUnitObservationOutcome::Ignored,
         }
     }
 
@@ -317,14 +336,46 @@ impl WorkUnitObservationTracker {
             .collect()
     }
 
+    /// Return the latest canonical producer observations, preserving revision
+    /// so another turn or deployment entrypoint can seed its own tracker
+    /// without reconstructing lifecycle state from display projections.
+    pub fn active_observations(&self) -> Vec<WorkUnitObservation> {
+        self.cursors
+            .values()
+            .map(|cursor| WorkUnitObservation {
+                id: cursor.id.clone(),
+                kind: cursor.kind.clone(),
+                status: cursor.status,
+                revision: cursor.revision,
+                mode: cursor.mode,
+                wake_policy: cursor.wake_policy,
+            })
+            .collect()
+    }
+
     /// Accepted terminal producer observation for an identity, if any.
     ///
-    /// This is intentionally identity-based and does not compare opaque
-    /// versions. Arrival at the producer seam establishes order; terminal is
-    /// absorbing for a work-unit identity within one turn.
+    /// Terminal is absorbing for a work-unit identity; a producer may only
+    /// refine terminal truth with a strictly newer terminal revision.
     pub fn terminal_observation(&self, id: &str, kind: &str) -> Option<&WorkUnitObservation> {
         let identity = format!("{}:{}", kind.trim(), id.trim());
         self.terminal.get(&identity)
+    }
+
+    pub fn canonical_observation(&self, id: &str, kind: &str) -> Option<WorkUnitObservation> {
+        let identity = format!("{}:{}", kind.trim(), id.trim());
+        self.terminal.get(&identity).cloned().or_else(|| {
+            self.cursors
+                .get(&identity)
+                .map(|cursor| WorkUnitObservation {
+                    id: cursor.id.clone(),
+                    kind: cursor.kind.clone(),
+                    status: cursor.status,
+                    revision: cursor.revision,
+                    mode: cursor.mode,
+                    wake_policy: cursor.wake_policy,
+                })
+        })
     }
 
     pub fn clear(&mut self) {
@@ -337,12 +388,52 @@ impl WorkUnitObservationTracker {
     }
 }
 
+/// One session-scoped authority for asynchronous work visible at model
+/// boundaries. Producers publish typed observations here; CLI, Server-only,
+/// and Edge-backed turns consume the same provider contract.
+#[derive(Debug, Default)]
+pub struct ActiveWorkRegistry {
+    tracker: Mutex<WorkUnitObservationTracker>,
+}
+
+impl ActiveWorkRegistry {
+    pub fn observe(&self, observation: &WorkUnitObservation) -> WorkUnitObservationOutcome {
+        crate::sync_poison::recover_mutex_lock(&self.tracker).observe(observation)
+    }
+
+    pub fn active_work_observations(&self) -> Vec<WorkUnitObservation> {
+        crate::sync_poison::recover_mutex_lock(&self.tracker).active_observations()
+    }
+
+    pub fn terminal_observation(&self, id: &str, kind: &str) -> Option<WorkUnitObservation> {
+        crate::sync_poison::recover_mutex_lock(&self.tracker)
+            .terminal_observation(id, kind)
+            .cloned()
+    }
+
+    pub fn canonical_observation(&self, id: &str, kind: &str) -> Option<WorkUnitObservation> {
+        crate::sync_poison::recover_mutex_lock(&self.tracker).canonical_observation(id, kind)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ActiveWorkProvider: Send + Sync {
+    async fn active_work_observations(&self) -> Vec<WorkUnitObservation>;
+}
+
+#[async_trait::async_trait]
+impl ActiveWorkProvider for ActiveWorkRegistry {
+    async fn active_work_observations(&self) -> Vec<WorkUnitObservation> {
+        self.active_work_observations()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn canonical_status_protocol_accepts_legacy_killed_without_reemitting_it() {
+    fn canonical_status_protocol_has_one_spelling_per_state() {
         for status in [
             WorkUnitStatus::Pending,
             WorkUnitStatus::Running,
@@ -357,28 +448,25 @@ mod tests {
         ] {
             assert_eq!(WorkUnitStatus::parse(status.as_str()), Some(status));
         }
-        assert_eq!(
-            WorkUnitStatus::parse("killed"),
-            Some(WorkUnitStatus::Cancelled)
-        );
         assert_eq!(WorkUnitStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(WorkUnitStatus::parse("killed"), None);
         assert_eq!(WorkUnitStatus::parse("unknown"), None);
     }
 
     fn observation(
-        version: &str,
+        revision: u64,
         status: WorkUnitStatus,
         mode: WorkUnitObservationMode,
     ) -> WorkUnitObservation {
-        WorkUnitObservation::new("work-1", "test", status, version, mode).unwrap()
+        WorkUnitObservation::new("work-1", "test", status, revision, mode).unwrap()
     }
 
     #[test]
-    fn tracker_uses_producer_version_instead_of_tool_identity() {
+    fn tracker_uses_monotonic_producer_revision_instead_of_arrival_order() {
         let mut tracker = WorkUnitObservationTracker::default();
         assert_eq!(
             tracker.observe(&observation(
-                "v1",
+                1,
                 WorkUnitStatus::Running,
                 WorkUnitObservationMode::Transition,
             )),
@@ -386,7 +474,7 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(&observation(
-                "v1",
+                1,
                 WorkUnitStatus::Running,
                 WorkUnitObservationMode::Current,
             )),
@@ -394,13 +482,25 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(&observation(
-                "v2",
+                2,
                 WorkUnitStatus::Running,
                 WorkUnitObservationMode::Wait,
             )),
             WorkUnitObservationOutcome::Advanced
         );
         assert!(tracker.repeatedly_unchanged_ids(1).is_empty());
+        assert_eq!(
+            tracker.observe(&observation(
+                1,
+                WorkUnitStatus::WaitingForInput,
+                WorkUnitObservationMode::Current,
+            )),
+            WorkUnitObservationOutcome::Ignored
+        );
+        assert_eq!(
+            tracker.active_work_units()[0].status,
+            WorkUnitStatus::Running
+        );
     }
 
     #[test]
@@ -411,7 +511,7 @@ mod tests {
             WorkUnitObservationMode::Diagnostic,
         ] {
             assert_eq!(
-                tracker.observe(&observation("v1", WorkUnitStatus::Running, mode)),
+                tracker.observe(&observation(1, WorkUnitStatus::Running, mode)),
                 WorkUnitObservationOutcome::Ignored
             );
         }
@@ -422,13 +522,13 @@ mod tests {
     fn terminal_status_is_the_single_source_of_truth() {
         let mut tracker = WorkUnitObservationTracker::default();
         tracker.observe(&observation(
-            "v1",
+            1,
             WorkUnitStatus::Running,
             WorkUnitObservationMode::Current,
         ));
         assert_eq!(
             tracker.observe(&observation(
-                "v2",
+                2,
                 WorkUnitStatus::CompletedWithIssues,
                 WorkUnitObservationMode::Transition,
             )),
@@ -443,7 +543,7 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(&observation(
-                "stale-v1",
+                1,
                 WorkUnitStatus::Running,
                 WorkUnitObservationMode::Current,
             )),
@@ -456,11 +556,7 @@ mod tests {
     #[test]
     fn automatic_wake_is_an_explicit_producer_promise() {
         let mut tracker = WorkUnitObservationTracker::default();
-        let first = observation(
-            "v1",
-            WorkUnitStatus::Running,
-            WorkUnitObservationMode::Current,
-        );
+        let first = observation(1, WorkUnitStatus::Running, WorkUnitObservationMode::Current);
         tracker.observe(&first);
         tracker.observe(&first);
         assert_eq!(tracker.repeatedly_unchanged_without_wake(1), ["work-1"]);
@@ -473,12 +569,8 @@ mod tests {
     #[test]
     fn active_work_snapshot_tracks_latest_nonterminal_truth_and_drops_terminal_units() {
         let mut tracker = WorkUnitObservationTracker::default();
-        let running = observation(
-            "revision-1",
-            WorkUnitStatus::Running,
-            WorkUnitObservationMode::Current,
-        )
-        .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+        let running = observation(1, WorkUnitStatus::Running, WorkUnitObservationMode::Current)
+            .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
         assert_eq!(tracker.observe(&running), WorkUnitObservationOutcome::First);
         assert_eq!(
             tracker.active_work_units(),
@@ -491,7 +583,7 @@ mod tests {
         );
 
         let waiting = observation(
-            "revision-2",
+            2,
             WorkUnitStatus::WaitingForInput,
             WorkUnitObservationMode::Transition,
         )
@@ -506,7 +598,7 @@ mod tests {
         );
 
         let completed = observation(
-            "revision-3",
+            3,
             WorkUnitStatus::Completed,
             WorkUnitObservationMode::Transition,
         );

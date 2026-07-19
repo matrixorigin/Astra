@@ -992,7 +992,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                     task_id,
                     "shell",
                     WorkUnitStatus::Running,
-                    "running:0",
+                    1,
                     WorkUnitObservationMode::Transition,
                 )
                 .expect("detached shell task ids are non-empty")

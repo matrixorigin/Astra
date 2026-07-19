@@ -972,6 +972,11 @@ fn append_interruption_detail(
 
 fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     state.stall.work_unit_observations.clear();
+    if let Some(registry) = state.stall.active_work_registry.as_ref() {
+        for observation in registry.active_work_observations() {
+            state.stall.work_unit_observations.observe(&observation);
+        }
+    }
     state.stall.execution_escalation_advisory_emitted = false;
     state.stall.parallel_batching_advisory_emitted = false;
     state.stall.repetition_advisory_emitted = false;

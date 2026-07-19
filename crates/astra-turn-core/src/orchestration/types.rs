@@ -156,7 +156,10 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
                 (AgentFanoutSlotStatus::CancelledByParentBudget, reason)
             }
         }
-        AgentStatus::Waiting { .. } => (AgentFanoutSlotStatus::Running, None),
+        AgentStatus::Waiting { reason } => (
+            AgentFanoutSlotStatus::WaitingForInput,
+            (!reason.trim().is_empty()).then(|| reason.clone()),
+        ),
         AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
             (AgentFanoutSlotStatus::Running, None)
         }

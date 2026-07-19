@@ -95,7 +95,7 @@ fn render_spawn_agent_output(
         .and_then(Value::as_str)
         .unwrap_or("failed")
         .to_string();
-    if let (Some(agent_id), Some(run_id)) = (
+    if let (Some(agent_id), Some(_run_id)) = (
         object.get("agent_id").and_then(Value::as_str),
         object.get("run_id").and_then(Value::as_str),
     ) {
@@ -111,13 +111,17 @@ fn render_spawn_agent_output(
             agent_id,
             "agent",
             work_status,
-            format!("{run_id}:{status}"),
+            match work_status {
+                WorkUnitStatus::Running => 1,
+                WorkUnitStatus::WaitingForInput => 2,
+                _ => 3,
+            },
             WorkUnitObservationMode::Transition,
         ) {
             let observation = if work_status.is_terminal() {
                 observation
             } else {
-                observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+                observation.with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal)
             };
             object.insert(
                 WORK_UNIT_OBSERVATION_FIELD.to_string(),
@@ -1568,11 +1572,11 @@ async fn render_agent_fanout_results(
         group_id,
         "agent_fanout",
         work_status,
-        updated.revision.to_string(),
+        updated.revision,
         observation_mode,
     )
     .expect("fanout groups have non-empty identities and revisions")
-    .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+    .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal);
     let mut response = json!({
         "status": fanout_get_results_status_label(&updated),
         "group_id": group_id,

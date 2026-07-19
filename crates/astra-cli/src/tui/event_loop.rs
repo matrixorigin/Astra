@@ -4869,7 +4869,8 @@ pub(crate) async fn run_tui_session(
     // Background task registry — owns spawned shell/agent processes.
     let mut background_registry = super::background_tasks::BackgroundTaskRegistry::new(
         background_task_output_dir(state.session_id.as_deref()),
-    );
+    )
+    .with_active_work_registry(state.active_work_registry.clone());
     let mut restored_local_agent_task_projections =
         restore_background_task_projections(&mut background_registry, state.session_id.as_deref())
             .await;
@@ -5919,6 +5920,8 @@ pub(crate) async fn run_tui_session(
                                             state.bg_task_commands.clone();
                                         let bg_task_list_cache_for_turn =
                                             state.bg_task_list_cache.clone();
+                                        let active_work_registry_for_turn =
+                                            state.active_work_registry.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
                                             api,
                                             profile,
@@ -6299,8 +6302,8 @@ pub(crate) async fn run_tui_session(
                                                                                 .await
                                                                                 .clone();
                                                                         let active_work_observations =
-                                                                            local_agent_snapshot
-                                                                                .fanout_work_unit_observations();
+                                                                            active_work_registry_for_turn
+                                                                                .active_work_observations();
                                                                         match submit_active_run_guidance(
                                                                             &active_turn_local_run_control,
                                                                             &queued_text,
@@ -8273,7 +8276,8 @@ pub(crate) async fn run_tui_session(
                         .await;
                         background_registry = super::background_tasks::BackgroundTaskRegistry::new(
                             background_task_output_dir(state.session_id.as_deref()),
-                        );
+                        )
+                        .with_active_work_registry(state.active_work_registry.clone());
                         restored_local_agent_task_projections = restore_background_task_projections(
                             &mut background_registry,
                             state.session_id.as_deref(),

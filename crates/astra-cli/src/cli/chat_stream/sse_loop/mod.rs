@@ -818,6 +818,7 @@ pub(crate) async fn stream_chat_sse(
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
             work_unit_observations: Default::default(),
+            active_work_registry: None,
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),

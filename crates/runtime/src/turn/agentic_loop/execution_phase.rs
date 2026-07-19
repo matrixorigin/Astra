@@ -4251,9 +4251,9 @@ mod tests {
                             "id": "review-group",
                             "kind": "agent_fanout",
                             "status": "running",
-                            "version": "7",
+                            "revision": 7,
                             "mode": "current",
-                            "wake_policy": "on_terminal"
+                            "wake_policy": "on_attention_or_terminal"
                         }],
                     }
                 }),
@@ -4297,11 +4297,11 @@ mod tests {
             "review-group",
             "agent_fanout",
             astra_core::work_unit::WorkUnitStatus::Running,
-            "7",
+            7,
             astra_core::work_unit::WorkUnitObservationMode::Current,
         )
         .unwrap()
-        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal);
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnAttentionOrTerminal);
         assert_eq!(
             state.observe_work_unit(&unchanged),
             astra_core::work_unit::WorkUnitObservationOutcome::Unchanged { consecutive: 1 }
@@ -4326,11 +4326,11 @@ mod tests {
             "review-group",
             "agent_fanout",
             astra_core::work_unit::WorkUnitStatus::Completed,
-            "8",
+            8,
             astra_core::work_unit::WorkUnitObservationMode::Transition,
         )
         .unwrap()
-        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal);
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnAttentionOrTerminal);
         state.observe_work_unit(&completed);
         assert!(state.stall.work_unit_observations.is_empty());
         let refreshed = state
@@ -4347,6 +4347,48 @@ mod tests {
                 .get("background_work_snapshot")
                 .is_none(),
             "newer producer truth must retire the stale submission-time XML"
+        );
+    }
+
+    #[test]
+    fn delayed_nonterminal_snapshot_cannot_overwrite_newer_producer_revision() {
+        let mut state = make_state();
+        let registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        let newer = astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::WaitingForInput,
+            8,
+            astra_core::work_unit::WorkUnitObservationMode::Current,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnAttentionOrTerminal);
+        registry.observe(&newer);
+        state.attach_active_work_registry(registry);
+
+        let mut delayed = serde_json::json!({
+            "schema": "active_work_snapshot.v1",
+            "background_work_snapshot": "stale display projection",
+            "work_unit_observations": [{
+                "id": "review-group",
+                "kind": "agent_fanout",
+                "status": "running",
+                "revision": 7,
+                "mode": "current",
+                "wake_policy": "on_attention_or_terminal"
+            }]
+        });
+        state.reconcile_active_work_context(&mut delayed);
+
+        assert_eq!(
+            delayed["work_unit_observations"][0]["status"],
+            "waiting_for_input"
+        );
+        assert_eq!(delayed["work_unit_observations"][0]["revision"], 8);
+        assert!(delayed.get("background_work_snapshot").is_none());
+        assert_eq!(
+            delayed["projection_state"],
+            "superseded_by_newer_producer_observation"
         );
     }
 
