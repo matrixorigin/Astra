@@ -48,14 +48,16 @@ impl RuntimeSkillifyAgentExecutor {
         user_prompt: &str,
         max_output_tokens: usize,
     ) -> Result<String, String> {
-        let resolved = astra_services::resolve_reasoning_model(
+        let offering = astra_services::resolve_reasoning_offering(
             &self.matrixone,
             &self.encryptor,
             self.admin_config_service.as_ref(),
             Some(self.pool.get()),
         )
         .await
-        .map_err(|error| format!("model resolution failed: {error}"))?;
+        .map_err(|error| format!("Offering resolution failed: {error}"))?;
+        let admitted = astra_services::AdmittedModelExecution::from_offering(offering)
+            .map_err(|error| format!("Offering execution configuration is invalid: {error}"))?;
 
         let messages = vec![
             json!({"role": "system", "content": system_prompt}),
@@ -66,17 +68,7 @@ impl RuntimeSkillifyAgentExecutor {
                 purpose: astra_turn_types::InferencePurpose::SubAgent,
                 messages: &messages,
                 tools: &[],
-                route: LlmExecutionRoute {
-                    model_name: &resolved.model_name,
-                    wire_model_name: resolved.wire_model_name.as_deref(),
-                    api_key: &resolved.api_key,
-                    base_url: &resolved.base_url,
-                    provider: &resolved.provider,
-                    header_overrides: None,
-                    request_body_overrides: resolved.request_body_overrides.as_ref(),
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
+                route: LlmExecutionRoute::from_admitted(&admitted),
                 max_output_tokens: Some(max_output_tokens),
                 temperature: None,
                 has_fallback: false,

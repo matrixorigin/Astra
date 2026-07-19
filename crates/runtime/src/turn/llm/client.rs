@@ -370,6 +370,29 @@ pub(crate) struct LlmExecutionRoute<'a> {
     pub request_timeout: Option<std::time::Duration>,
 }
 
+impl<'a> LlmExecutionRoute<'a> {
+    /// Borrow the single trusted execution-material contract produced by
+    /// model admission. Provider adapters must not rebuild this route from a
+    /// client-selected model name or URL.
+    #[must_use]
+    pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
+        Self {
+            model_name: &execution.model_name,
+            wire_model_name: execution.wire_model_name.as_deref(),
+            api_key: &execution.api_key,
+            base_url: &execution.base_url,
+            provider: &execution.provider,
+            header_overrides: (!execution.header_overrides.is_empty())
+                .then_some(&execution.header_overrides),
+            request_body_overrides: execution.request_body_overrides.as_ref(),
+            completions_url_override: execution.completions_url_override.as_deref(),
+            request_timeout: execution
+                .request_timeout_ms
+                .map(std::time::Duration::from_millis),
+        }
+    }
+}
+
 /// Owned execution route for adapters that must outlive one stack frame.
 /// Like the borrowed route, it is deliberately non-serializable and redacts
 /// credentials, endpoint URLs, and header values from `Debug`.

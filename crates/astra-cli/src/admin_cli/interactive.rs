@@ -50,15 +50,15 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ("config list", "List admin config values"),
     (
         "config get",
-        "Get an admin config value  (e.g. config get reasoning_model_name)",
+        "Get an admin config value  (e.g. config get reasoning_offering_id)",
     ),
     (
         "config set",
-        "Set an admin config value  (e.g. config set reasoning_model_name gpt-4o-mini)",
+        "Set an admin config value  (e.g. config set reasoning_offering_id <offering-id>)",
     ),
     (
         "config unset",
-        "Delete an admin config value  (e.g. config unset reasoning_model_name)",
+        "Delete an admin config value  (e.g. config unset reasoning_offering_id)",
     ),
     ("help", "Show this help"),
     ("exit", "Exit admin REPL"),

@@ -111,7 +111,7 @@ pub use admin::{
     AdminUserRoleRequestData, AuthenticatedUser,
 };
 pub use admin_config::{
-    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
+    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_OFFERING, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
 pub use agent_bindings::{
@@ -242,7 +242,8 @@ pub use models::{
     PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
     PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
     UnconfiguredModelService, prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
-    resolve_active_llm_offering, resolve_reasoning_model, validate_model_offering_id,
+    resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
+    validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,

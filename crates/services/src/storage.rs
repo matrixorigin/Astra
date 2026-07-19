@@ -4291,7 +4291,7 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
-    // via `astra admin config set/get/unset` (first key: `reasoning_model_name`).
+    // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
     query(
         "CREATE TABLE IF NOT EXISTS admin_config (
             config_key VARCHAR(100) PRIMARY KEY,

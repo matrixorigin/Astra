@@ -51,7 +51,6 @@ const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 struct CliServerProxySummaryClient {
     api: astra_thin_client::ThinClient,
     token: String,
-    model: Option<String>,
 }
 
 #[async_trait]
@@ -61,15 +60,12 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryC
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "purpose": purpose,
             "messages": messages,
             "max_tokens": 256,
             "temperature": 0.0,
         });
-        if let Some(model) = self.model.as_deref() {
-            body["model"] = serde_json::json!(model);
-        }
         let response = self
             .api
             .post_completions(&self.token, &body)
@@ -930,7 +926,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     async fn judge_skill_auto_route(
         &mut self,
-        state: &AgenticLoopState,
+        _state: &AgenticLoopState,
         ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
@@ -940,11 +936,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let client = CliServerProxySummaryClient {
             api: self.api.clone(),
             token: self.token.clone(),
-            model: state
-                .skills
-                .model_override
-                .clone()
-                .or_else(|| self.model.map(str::to_string)),
         };
         let judge = CliSummaryClientSkillAutoRouteJudge {
             client: Box::new(client),

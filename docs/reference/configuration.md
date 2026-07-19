@@ -93,10 +93,10 @@ LLM models are **not** configured via env vars. Use the admin CLI:
 astra admin model add <name> <provider> --api-key ... --base-url ...
 astra admin model check <name>                    # probe + activate
 astra admin model list                            # see all configured models
-astra admin config set reasoning_model_name <n>   # optional: pin the judge/summary model
+astra admin config set reasoning_offering_id <id> # optional: pin the judge/summary Offering
 ```
 
-If `reasoning_model_name` is not set, the server falls back to the cheapest active model by `pricing.completion`.
+If `reasoning_offering_id` is not set, the server applies its governed default and currently selects the cheapest active Offering by `pricing.completion`. Obtain Offering IDs from `astra admin model list`; model names do not select execution routes.
 
 ### Memoria
 

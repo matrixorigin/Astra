@@ -65,14 +65,14 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
     async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::MemoryInferenceClient> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
-        let resolved = match astra_services::models::resolve_memory_models(
+        let offerings = match astra_services::models::resolve_memory_offerings(
             settings,
             &self.encryptor,
             Some(pool),
         )
         .await
         {
-            Ok(models) => models,
+            Ok(offerings) => offerings,
             Err(error) => {
                 tracing::warn!(
                     target: "astra_runtime::memory_model",
@@ -82,11 +82,12 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
                 return Vec::new();
             }
         };
-        resolved
+        offerings
             .into_iter()
-            .filter_map(|model| {
-                let model_name = model.model_name.clone();
-                match crate::memory_hooks::DirectMemoryInferenceClient::from_resolved(model) {
+            .filter_map(|offering| {
+                let offering_id = offering.offering_id.clone();
+                let model_name = offering.model.model_name.clone();
+                match crate::memory_hooks::DirectMemoryInferenceClient::from_offering(offering) {
                     Ok(client) => {
                         Some(std::sync::Arc::new(client)
                             as crate::memory_hooks::MemoryInferenceClient)
@@ -94,6 +95,7 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
                     Err(error) => {
                         tracing::warn!(
                             target: "astra_runtime::memory_model",
+                            %offering_id,
                             %model_name,
                             %error,
                             "memory model execution configuration is invalid"

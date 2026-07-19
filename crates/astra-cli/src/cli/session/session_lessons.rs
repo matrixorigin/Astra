@@ -82,41 +82,20 @@ async fn filter_lessons_by_relevance(
         .collect()
 }
 
-async fn maybe_load_memory_model_name(
+async fn maybe_load_memory_inference_offering(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) {
-    #[derive(serde::Deserialize)]
-    struct MemoryModelWire {
-        model_name: String,
-    }
-
-    if state.memory_model_name.is_some() {
+    if state.memory_inference_offering.is_some() {
         return;
     }
-    let body = match api
-        .get_authed_path_text(token, astra_thin_client::paths::model_memory())
-        .await
-    {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::debug!("memory model fetch skipped: {error}");
-            return;
-        }
-    };
-    match serde_json::from_str::<MemoryModelWire>(&body) {
-        Ok(response) if !response.model_name.trim().is_empty() => {
-            state.memory_model_name = Some(response.model_name.trim().to_string());
-        }
-        Ok(_) => {
-            tracing::warn!(
-                target: "astra_cli::session_memory",
-                "memory model response did not contain a usable model identity"
-            );
+    match super::session_memory_inference::fetch_memory_inference_offerings(api, token).await {
+        Ok(offerings) => {
+            state.memory_inference_offering = offerings.into_iter().next();
         }
         Err(error) => {
-            tracing::warn!("memory model decode failed: {error}");
+            tracing::debug!("memory inference Offering fetch skipped: {error}");
         }
     }
 }
@@ -128,12 +107,13 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     user_message: &str,
 ) {
     if !state.session_lessons.is_empty() {
-        maybe_load_memory_model_name(state, api, token).await;
-        if let Some(model_name) = state.memory_model_name.as_deref() {
+        maybe_load_memory_inference_offering(state, api, token).await;
+        if let Some(offering) = state.memory_inference_offering.as_ref() {
             let client = super::session_memory_inference::CliServerMemoryInferenceClient::new(
                 api.clone(),
                 token,
-                model_name,
+                &offering.offering_id,
+                &offering.model_name,
             );
             let texts: Vec<String> = state
                 .session_lessons
@@ -163,7 +143,7 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         return;
     }
 
-    maybe_load_memory_model_name(state, api, token).await;
+    maybe_load_memory_inference_offering(state, api, token).await;
 
     let lessons = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -172,11 +152,12 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     .await
     .unwrap_or_default();
 
-    let client = state.memory_model_name.as_deref().map(|model_name| {
+    let client = state.memory_inference_offering.as_ref().map(|offering| {
         super::session_memory_inference::CliServerMemoryInferenceClient::new(
             api.clone(),
             token,
-            model_name,
+            &offering.offering_id,
+            &offering.model_name,
         )
     });
     state.session_lessons = filter_lessons_by_relevance(
@@ -242,11 +223,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_model_identity_is_cached_without_credentials() {
+    fn memory_offering_starts_unresolved_without_provider_material() {
         let state = SessionState::default();
         assert!(
-            state.memory_model_name.is_none(),
-            "memory model identity should start unresolved"
+            state.memory_inference_offering.is_none(),
+            "memory Offering should start unresolved"
         );
     }
 }

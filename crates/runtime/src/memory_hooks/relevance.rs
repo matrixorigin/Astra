@@ -3,7 +3,7 @@
 //! Filters retrieved memories/lessons to only those clearly relevant
 //! to the current task, reducing prompt noise and token waste.
 //! Uses the cheapest `selector`-tagged model from the registry
-//! (resolved via `resolve_memory_models` from the model DB).
+//! (resolved via `resolve_memory_offerings` from the model DB).
 
 use std::collections::HashSet;
 use std::time::Duration;

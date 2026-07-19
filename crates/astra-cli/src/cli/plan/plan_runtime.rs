@@ -168,13 +168,13 @@ async fn ensure_durable_task_state(
     let session_id = state.session_id.as_deref().unwrap_or("unknown");
     let work_dir = std::env::current_dir().unwrap_or_default();
 
-    // Judge uses the server's reasoning model (via admin_config.reasoning_model_name →
+    // Judge uses the Server-governed reasoning Offering (via reasoning_offering_id →
     // cheapest active fallback). Do NOT pass state.model: the chat model may be expensive,
     // while the judge should use the cheap reasoning model.
     let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
         if let (Some(a), Some(t)) = (api, token) {
             Some(std::sync::Arc::new(
-                durable_bridge::ServerProxyLlmJudge::new(a.clone(), t.to_string(), None),
+                durable_bridge::ServerProxyLlmJudge::new(a.clone(), t.to_string()),
             ))
         } else {
             None

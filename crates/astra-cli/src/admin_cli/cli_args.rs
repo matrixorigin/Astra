@@ -51,9 +51,9 @@ pub enum Command {
 pub enum ConfigCmd {
     /// List all admin config keys and values.
     List,
-    /// Read a single admin config value (e.g. `get reasoning_model`).
+    /// Read a single admin config value (e.g. `get reasoning_offering_id`).
     Get(ConfigKeyArgs),
-    /// Set an admin config value (e.g. `set reasoning_model gpt-4o-mini`).
+    /// Set an admin config value (e.g. `set reasoning_offering_id <offering-id>`).
     Set(ConfigSetArgs),
     /// Delete an admin config value.
     #[command(visible_alias = "delete")]

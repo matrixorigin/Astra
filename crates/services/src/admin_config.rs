@@ -1,6 +1,6 @@
 //! Server-wide admin configuration KV store.
 //!
-//! Persists admin-controlled settings such as `reasoning_model_name` in the `admin_config`
+//! Persists admin-controlled settings such as `reasoning_offering_id` in the `admin_config`
 //! table. Only keys in [`ADMIN_CONFIG_ALLOWED_KEYS`] may be stored.
 
 use async_trait::async_trait;
@@ -8,12 +8,15 @@ use sqlx::{Row, query};
 
 use astra_core::{MatrixOneSettings, SharedPool};
 
-/// Admin-configurable key: the preferred reasoning/judge/summary model name. Must reference
-/// an active row in `infra_llm_models`.
-pub const ADMIN_CONFIG_KEY_REASONING_MODEL: &str = "reasoning_model_name";
+/// Admin-configurable key: the preferred reasoning/judge/summary Offering.
+///
+/// The value is an exact active `infra_llm_models.model_id` during the Phase 0
+/// catalog. Model names and aliases are display facts and cannot select a
+/// route.
+pub const ADMIN_CONFIG_KEY_REASONING_OFFERING: &str = "reasoning_offering_id";
 
 /// Whitelist of admin config keys the server will accept.
-pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[ADMIN_CONFIG_KEY_REASONING_MODEL];
+pub const ADMIN_CONFIG_ALLOWED_KEYS: &[&str] = &[ADMIN_CONFIG_KEY_REASONING_OFFERING];
 
 #[async_trait]
 pub trait AdminConfigService: Send + Sync {
@@ -38,6 +41,16 @@ fn validate_key(key: &str) -> Result<(), String> {
             "unknown admin config key '{key}'. Allowed keys: {}",
             ADMIN_CONFIG_ALLOWED_KEYS.join(", ")
         ))
+    }
+}
+
+fn validate_value(key: &str, value: &str) -> Result<(), String> {
+    validate_key(key)?;
+    match key {
+        ADMIN_CONFIG_KEY_REASONING_OFFERING => crate::models::validate_model_offering_id(value)
+            .map(|_| ())
+            .map_err(|_| "reasoning_offering_id must be an exact Offering ID".to_string()),
+        _ => Err(format!("admin config key '{key}' has no value contract")),
     }
 }
 
@@ -105,7 +118,7 @@ impl AdminConfigService for DatabaseAdminConfigService {
     }
 
     async fn set(&self, key: &str, value: &str, updated_by: Option<&str>) -> Result<(), String> {
-        validate_key(key)?;
+        validate_value(key, value)?;
         let pool = self.get_pool().await?;
         query(
             "INSERT INTO admin_config (config_key, config_value, updated_by, updated_at) \
@@ -164,13 +177,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowed_keys_includes_reasoning_model() {
-        assert!(ADMIN_CONFIG_ALLOWED_KEYS.contains(&ADMIN_CONFIG_KEY_REASONING_MODEL));
+    fn allowed_keys_includes_reasoning_offering() {
+        assert!(ADMIN_CONFIG_ALLOWED_KEYS.contains(&ADMIN_CONFIG_KEY_REASONING_OFFERING));
     }
 
     #[test]
     fn validate_key_accepts_allowed() {
-        assert!(validate_key(ADMIN_CONFIG_KEY_REASONING_MODEL).is_ok());
+        assert!(validate_key(ADMIN_CONFIG_KEY_REASONING_OFFERING).is_ok());
     }
 
     #[test]
@@ -178,7 +191,14 @@ mod tests {
         let err = validate_key("arbitrary_key").unwrap_err();
         assert!(err.contains("unknown admin config key"));
         assert!(err.contains("arbitrary_key"));
-        assert!(err.contains(ADMIN_CONFIG_KEY_REASONING_MODEL));
+        assert!(err.contains(ADMIN_CONFIG_KEY_REASONING_OFFERING));
+    }
+
+    #[test]
+    fn reasoning_offering_value_rejects_empty_or_normalized_identity() {
+        assert!(validate_value(ADMIN_CONFIG_KEY_REASONING_OFFERING, "").is_err());
+        assert!(validate_value(ADMIN_CONFIG_KEY_REASONING_OFFERING, " offer-1").is_err());
+        assert!(validate_value(ADMIN_CONFIG_KEY_REASONING_OFFERING, "offer-1").is_ok());
     }
 
     // get() must reject unknown keys — callers should not silently read
@@ -199,7 +219,7 @@ mod tests {
     async fn get_known_key_does_not_err_on_unconfigured() {
         let svc = UnconfiguredAdminConfigService;
         // Known key on an unconfigured service returns Ok(None), not Err.
-        let result = svc.get(ADMIN_CONFIG_KEY_REASONING_MODEL).await;
+        let result = svc.get(ADMIN_CONFIG_KEY_REASONING_OFFERING).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
     }

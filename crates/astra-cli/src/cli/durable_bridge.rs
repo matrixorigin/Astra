@@ -822,12 +822,11 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 pub struct ServerProxyLlmJudge {
     api: astra_thin_client::ThinClient,
     token: String,
-    model: Option<String>,
 }
 
 impl ServerProxyLlmJudge {
-    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
-        Self { api, token, model }
+    pub fn new(api: astra_thin_client::ThinClient, token: String) -> Self {
+        Self { api, token }
     }
 }
 
@@ -849,16 +848,12 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
             )
         });
 
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "purpose": astra_turn_types::InferencePurpose::VerificationJudge,
             "messages": [system_msg, user_msg],
             "max_tokens": 2000,
             "temperature": 0.1,
         });
-        if let Some(ref m) = self.model {
-            body["model"] = serde_json::json!(m);
-        }
-
         let resp = self
             .api
             .post_completions(&self.token, &body)
@@ -888,12 +883,11 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 pub struct ServerProxyTurnIntentJudge {
     api: astra_thin_client::ThinClient,
     token: String,
-    model: Option<String>,
 }
 
 impl ServerProxyTurnIntentJudge {
-    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
-        Self { api, token, model }
+    pub fn new(api: astra_thin_client::ThinClient, token: String) -> Self {
+        Self { api, token }
     }
 }
 
@@ -903,7 +897,7 @@ impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
         &self,
         ctx: &astra_services::TurnIntentJudgeContext,
     ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "purpose": astra_turn_types::InferencePurpose::Introspection,
             "messages": astra_services::turn_intent_judge_messages(ctx),
             // Keep judge replies tight — the schema is fixed and small.
@@ -911,10 +905,6 @@ impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
             // Low temperature for deterministic classification.
             "temperature": 0.0,
         });
-        if let Some(ref m) = self.model {
-            body["model"] = serde_json::json!(m);
-        }
-
         let resp = self
             .api
             .post_completions(&self.token, &body)
@@ -2591,7 +2581,7 @@ mod tests {
     async fn server_proxy_judge_returns_high_score_on_positive() {
         let (base_url, server) = mock_completions_server(0.95, "criterion fully met").await;
         let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into());
 
         let score = judge
             .evaluate(
@@ -2609,7 +2599,7 @@ mod tests {
     async fn server_proxy_judge_returns_low_score_on_negative() {
         let (base_url, server) = mock_completions_server(0.1, "no error handling").await;
         let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into());
 
         let score = judge
             .evaluate(
@@ -2624,7 +2614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_proxy_judge_sends_model_override_and_typed_purpose() {
+    async fn server_proxy_judge_uses_governed_default_and_typed_purpose() {
         use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
 
@@ -2657,15 +2647,15 @@ mod tests {
         });
 
         let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
-        let judge =
-            ServerProxyLlmJudge::new(api, "fake-token".into(), Some("custom-model-v2".into()));
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into());
 
         let _score = judge.evaluate("test", "test context").await.unwrap();
         let body = captured
             .lock_recover()
             .take()
             .expect("completion request captured");
-        assert_eq!(body["model"], "custom-model-v2");
+        assert!(body.get("model").is_none());
+        assert!(body.get("model_selection").is_none());
         assert_eq!(body["purpose"], "verification_judge");
         server.abort();
     }
@@ -2674,7 +2664,7 @@ mod tests {
     async fn server_proxy_judge_handles_connection_error() {
         // Point to a port nothing is listening on
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:19999", None).unwrap();
-        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into());
 
         let result: Result<f64, String> = judge.evaluate("test criterion", "test context").await;
         assert!(result.is_err(), "should fail on connection error");

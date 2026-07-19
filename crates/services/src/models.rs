@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
-    classify_model_resolution_error_message, error_response, internal_error,
+    classify_model_resolution_error_message, error_response, error_response_coded, internal_error,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -500,6 +500,26 @@ impl ModelOfferingResolutionError {
     fn allows_stale_cache(&self) -> bool {
         matches!(self, Self::Backend(_))
     }
+}
+
+fn model_offering_resolution_error_response(
+    error: ModelOfferingResolutionError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let (status, code) = match &error {
+        ModelOfferingResolutionError::InvalidOfferingId => {
+            (StatusCode::BAD_REQUEST, "model_selection_invalid")
+        }
+        ModelOfferingResolutionError::NotFound { .. } => {
+            (StatusCode::NOT_FOUND, "model_offering_not_found")
+        }
+        ModelOfferingResolutionError::Inactive { .. } => {
+            (StatusCode::NOT_FOUND, "model_offering_unavailable")
+        }
+        ModelOfferingResolutionError::Backend(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
+        }
+    };
+    error_response_coded(status, error.to_string(), code)
 }
 
 impl std::fmt::Display for ModelOfferingResolutionError {
@@ -1299,29 +1319,28 @@ async fn resolve_active_llm_model_uncached(
     build_resolved_active_llm_from_row(&row, encryptor)
 }
 
-/// Resolve the model used for reasoning / judge / summary tasks.
+/// Resolve the governed Offering used for reasoning / judge / summary tasks.
 ///
 /// Resolution order:
-/// 1. If `admin_config.reasoning_model_name` is set, resolve that model (strict — errors
-///    if the named model is missing or inactive).
+/// 1. If `admin_config.reasoning_offering_id` is set, resolve that exact
+///    Offering (strict — errors if it is invalid, missing, or inactive).
 /// 2. Otherwise, pick the cheapest active model by `pricing.completion` (falls back to
 ///    lexicographic `model_name` ordering among rows with equal or missing pricing).
 /// 3. Otherwise, returns `Err`.
-pub async fn resolve_reasoning_model(
+pub async fn resolve_reasoning_offering(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     admin_config: &dyn crate::admin_config::AdminConfigService,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
+) -> Result<ResolvedModelOffering, String> {
     // 1. Admin override
-    if let Some(name) = admin_config
-        .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_MODEL)
+    if let Some(offering_id) = admin_config
+        .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_OFFERING)
         .await?
     {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return resolve_active_llm_model(matrixone, encryptor, Some(trimmed), pool).await;
-        }
+        return resolve_active_llm_offering(matrixone, encryptor, &offering_id, pool)
+            .await
+            .map_err(|error| error.to_string());
     }
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
@@ -1329,7 +1348,7 @@ pub async fn resolve_reasoning_model(
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
     ))
     .fetch_all(&pool)
     .await
@@ -1338,7 +1357,7 @@ pub async fn resolve_reasoning_model(
     if rows.is_empty() {
         return Err(
             "No active LLM model configured. Run `astra admin model add` then \
-             `astra admin model check`, or `astra admin config set reasoning_model <name>`."
+             `astra admin model check`, or set `reasoning_offering_id` to an active Offering."
                 .to_string(),
         );
     }
@@ -1357,7 +1376,13 @@ pub async fn resolve_reasoning_model(
         .collect::<Result<_, String>>()?;
     // Pick the row with the lowest completion price. See [`rank_cheapest_index`].
     let best_idx = rank_cheapest_index(&entries);
-    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+    let offering_id: String = rows[best_idx]
+        .try_get("model_id")
+        .map_err(|error| format!("invalid infra_llm_models.model_id: {error}"))?;
+    Ok(ResolvedModelOffering {
+        offering_id,
+        model: build_resolved_active_llm_from_row(&rows[best_idx], encryptor)?,
+    })
 }
 
 fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> Result<bool, String> {
@@ -1459,15 +1484,15 @@ fn rank_memory_model_candidate_indices(
 /// 5. thinking-only models as a last resort
 ///
 /// Within each bucket, cheaper completion pricing wins.
-pub async fn resolve_memory_models(
+pub async fn resolve_memory_offerings(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<Vec<ResolvedActiveLlmModel>, String> {
+) -> Result<Vec<ResolvedModelOffering>, String> {
     let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+        "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
     ))
     .fetch_all(&pool)
     .await
@@ -1479,7 +1504,15 @@ pub async fn resolve_memory_models(
 
     rank_memory_model_candidate_indices(&rows)?
         .into_iter()
-        .map(|index| build_resolved_active_llm_from_row(&rows[index], encryptor))
+        .map(|index| {
+            let offering_id: String = rows[index]
+                .try_get("model_id")
+                .map_err(|error| format!("invalid infra_llm_models.model_id: {error}"))?;
+            Ok(ResolvedModelOffering {
+                offering_id,
+                model: build_resolved_active_llm_from_row(&rows[index], encryptor)?,
+            })
+        })
         .collect()
 }
 
@@ -1944,15 +1977,7 @@ impl ModelService for DatabaseModelService {
             self.pool.as_ref().map(SharedPool::get),
         )
         .await
-        .map_err(|error| {
-            let status = match error {
-                ModelOfferingResolutionError::InvalidOfferingId => StatusCode::BAD_REQUEST,
-                ModelOfferingResolutionError::NotFound { .. }
-                | ModelOfferingResolutionError::Inactive { .. } => StatusCode::NOT_FOUND,
-                ModelOfferingResolutionError::Backend(_) => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            error_response(status, error.to_string())
-        })
+        .map_err(model_offering_resolution_error_response)
     }
 
     async fn update_model(
@@ -3003,6 +3028,43 @@ mod tests {
             validate_model_offering_id(&too_long),
             Err(ModelOfferingResolutionError::InvalidOfferingId)
         );
+    }
+
+    #[test]
+    fn offering_resolution_failures_have_stable_machine_codes() {
+        let cases = [
+            (
+                ModelOfferingResolutionError::InvalidOfferingId,
+                StatusCode::BAD_REQUEST,
+                "model_selection_invalid",
+            ),
+            (
+                ModelOfferingResolutionError::NotFound {
+                    offering_id: "offer-missing".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "model_offering_not_found",
+            ),
+            (
+                ModelOfferingResolutionError::Inactive {
+                    offering_id: "offer-offline".into(),
+                    model_name: "display-model".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "model_offering_unavailable",
+            ),
+            (
+                ModelOfferingResolutionError::Backend("database unavailable".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_catalog_unavailable",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let (status, body) = model_offering_resolution_error_response(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body.error_code.as_deref(), Some(expected_code));
+        }
     }
 
     #[test]

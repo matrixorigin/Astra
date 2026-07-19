@@ -78,9 +78,10 @@ pub(crate) struct DirectMemoryInferenceClient {
 }
 
 impl DirectMemoryInferenceClient {
-    pub(crate) fn from_resolved(
-        model: astra_services::models::ResolvedActiveLlmModel,
+    pub(crate) fn from_offering(
+        offering: astra_services::ResolvedModelOffering,
     ) -> Result<Self, String> {
+        let model = offering.model;
         let header_overrides = model.execution_header_overrides()?;
         Ok(Self {
             base_url: model.base_url,

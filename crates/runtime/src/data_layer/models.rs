@@ -87,7 +87,7 @@ pub async fn get_model_handler(
 pub async fn get_memory_model_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<MemoryModelResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(
@@ -96,7 +96,7 @@ pub async fn get_memory_model_handler(
         )
     })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
-    let resolved = resolve_memory_models(&matrixone, &state.fernet_encryptor, pool_ref)
+    let resolved = resolve_memory_offerings(&matrixone, &state.fernet_encryptor, pool_ref)
         .await
         .map_err(|e| {
             error_response(
@@ -104,34 +104,39 @@ pub async fn get_memory_model_handler(
                 format!("Memory model resolution failed: {e}"),
             )
         })?;
-    let candidate_model_names: Vec<String> = resolved
-        .iter()
-        .map(|model| model.model_name.clone())
-        .collect();
-    let candidate_thinking_capabilities: Vec<Option<String>> = resolved
-        .iter()
-        .map(|model| model.thinking_capability.map(|c| c.as_db_str().to_string()))
-        .collect();
-    let model_name = candidate_model_names.first().cloned().ok_or_else(|| {
-        error_response(
+    let offerings = resolved
+        .into_iter()
+        .map(|offering| MemoryInferenceOfferingResponse {
+            offering_id: offering.offering_id,
+            model_name: offering.model.model_name,
+            thinking_capability: offering.model.thinking_capability,
+        })
+        .collect::<Vec<_>>();
+    if offerings.is_empty() {
+        return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "No active LLM model configured.",
-        )
-    })?;
-    Ok(Json(MemoryModelResponse {
-        model_name,
-        candidate_model_names,
-        candidate_thinking_capabilities,
-    }))
+        ));
+    }
+    Ok(Json(MemoryInferenceOfferingsResponse { offerings }))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryModelResponse {
+#[serde(deny_unknown_fields)]
+pub struct MemoryInferenceOfferingsResponse {
+    /// Ordered candidates. The first entry is the current governed default;
+    /// later entries are explicit failover candidates for optional memory
+    /// inference only.
+    pub offerings: Vec<MemoryInferenceOfferingResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryInferenceOfferingResponse {
+    pub offering_id: String,
+    /// Display/diagnostic fact; clients must never use it to select a route.
     pub model_name: String,
-    #[serde(default)]
-    pub candidate_model_names: Vec<String>,
-    #[serde(default)]
-    pub candidate_thinking_capabilities: Vec<Option<String>>,
+    pub thinking_capability: Option<ThinkingCapability>,
 }
 
 pub async fn update_model_handler(

@@ -297,13 +297,6 @@ struct CliSessionMemoryInferenceResolver {
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::MemoryInferenceResolver for CliSessionMemoryInferenceResolver {
     async fn resolve_candidates(&self) -> Vec<astra_runtime::memory_hooks::MemoryInferenceClient> {
-        #[derive(serde::Deserialize)]
-        struct MemoryModelWire {
-            model_name: String,
-            #[serde(default)]
-            candidate_model_names: Vec<String>,
-        }
-
         let Some(token) =
             session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
         else {
@@ -313,50 +306,31 @@ impl astra_runtime::session_memory::MemoryInferenceResolver for CliSessionMemory
             );
             return Vec::new();
         };
-        let body = match self
-            .api
-            .get_authed_path_text(&token, astra_thin_client::paths::model_memory())
+        let offerings =
+            match crate::cli::session::session_memory_inference::fetch_memory_inference_offerings(
+                &self.api, &token,
+            )
             .await
-        {
-            Ok(body) => body,
-            Err(error) => {
-                tracing::debug!(
-                    target: "astra_cli::session_memory",
-                    %error,
-                    "memory inference model resolution is unavailable"
-                );
-                return Vec::new();
-            }
-        };
-        let response = match serde_json::from_str::<MemoryModelWire>(&body) {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_cli::session_memory",
-                    %error,
-                    "memory inference model response is malformed"
-                );
-                return Vec::new();
-            }
-        };
-        let model_names = if response.candidate_model_names.is_empty() {
-            vec![response.model_name]
-        } else {
-            response.candidate_model_names
-        };
-        let mut seen = std::collections::HashSet::new();
-        model_names
+            {
+                Ok(offerings) => offerings,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "astra_cli::session_memory",
+                        %error,
+                        "memory inference model resolution is unavailable"
+                    );
+                    return Vec::new();
+                }
+            };
+        offerings
             .into_iter()
-            .filter_map(|model_name| {
-                let model_name = model_name.trim().to_string();
-                (!model_name.is_empty() && seen.insert(model_name.clone())).then_some(model_name)
-            })
-            .map(|model_name| {
+            .map(|offering| {
                 std::sync::Arc::new(
                     crate::cli::session::session_memory_inference::CliServerMemoryInferenceClient::new(
                         self.api.clone(),
                         token.clone(),
-                        model_name,
+                        offering.offering_id,
+                        offering.model_name,
                     ),
                 ) as astra_runtime::memory_hooks::MemoryInferenceClient
             })

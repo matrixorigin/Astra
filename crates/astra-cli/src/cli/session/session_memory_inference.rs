@@ -8,9 +8,67 @@ use astra_core::{ClassifiedError, ErrorKind};
 use astra_runtime::memory_hooks::{MemoryInferencePort, MemoryInferenceRequest};
 use astra_thin_client::ThinClientError;
 
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryInferenceOffering {
+    pub offering_id: String,
+    pub model_name: String,
+    pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryInferenceOfferingsEnvelope {
+    offerings: Vec<MemoryInferenceOffering>,
+}
+
+pub(crate) async fn fetch_memory_inference_offerings(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<Vec<MemoryInferenceOffering>, String> {
+    let body = api
+        .get_authed_path_text(token, astra_thin_client::paths::model_memory())
+        .await
+        .map_err(|error| format!("memory inference catalog is unavailable: {error}"))?;
+    let envelope = serde_json::from_str::<MemoryInferenceOfferingsEnvelope>(&body)
+        .map_err(|error| format!("memory inference catalog is malformed: {error}"))?;
+    validate_memory_inference_offerings(envelope.offerings)
+}
+
+fn validate_memory_inference_offerings(
+    offerings: Vec<MemoryInferenceOffering>,
+) -> Result<Vec<MemoryInferenceOffering>, String> {
+    if offerings.is_empty() {
+        return Err("memory inference catalog contains no usable Offering".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for offering in &offerings {
+        astra_services::validate_model_offering_id(&offering.offering_id).map_err(|_| {
+            format!(
+                "memory inference catalog contains invalid Offering ID {:?}",
+                offering.offering_id
+            )
+        })?;
+        if offering.model_name.trim().is_empty() {
+            return Err(format!(
+                "memory inference Offering {:?} has no display model name",
+                offering.offering_id
+            ));
+        }
+        if !seen.insert(offering.offering_id.as_str()) {
+            return Err(format!(
+                "memory inference catalog repeats Offering {:?}",
+                offering.offering_id
+            ));
+        }
+    }
+    Ok(offerings)
+}
+
 pub(crate) struct CliServerMemoryInferenceClient {
     api: astra_thin_client::ThinClient,
     token: String,
+    offering_id: String,
     model_name: String,
 }
 
@@ -18,11 +76,13 @@ impl CliServerMemoryInferenceClient {
     pub(crate) fn new(
         api: astra_thin_client::ThinClient,
         token: impl Into<String>,
+        offering_id: impl Into<String>,
         model_name: impl Into<String>,
     ) -> Self {
         Self {
             api,
             token: token.into(),
+            offering_id: offering_id.into(),
             model_name: model_name.into(),
         }
     }
@@ -31,6 +91,7 @@ impl CliServerMemoryInferenceClient {
 impl std::fmt::Debug for CliServerMemoryInferenceClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CliServerMemoryInferenceClient")
+            .field("offering_id", &self.offering_id)
             .field("model_name", &self.model_name)
             .field("credential_present", &!self.token.is_empty())
             .finish()
@@ -64,7 +125,9 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
     ) -> Result<String, ClassifiedError> {
         let body = serde_json::json!({
             "purpose": request.purpose,
-            "model": self.model_name,
+            "model_selection": {
+                "offering_id": self.offering_id,
+            },
             "messages": request.messages,
             "max_tokens": request.max_output_tokens,
             "temperature": request.temperature,
@@ -192,7 +255,8 @@ mod tests {
         });
         let origin = format!("http://{address}");
         let api = astra_thin_client::ThinClient::new(&origin, None).expect("test client");
-        let client = CliServerMemoryInferenceClient::new(api, "token", "memory-offering");
+        let client =
+            CliServerMemoryInferenceClient::new(api, "token", "memory-offering", "memory-model");
         let messages = [serde_json::json!({"role": "user", "content": "rank"})];
 
         let output = client
@@ -209,7 +273,11 @@ mod tests {
 
         assert_eq!(output, "[0]");
         assert_eq!(body["purpose"], "memory_retrieval_rerank");
-        assert_eq!(body["model"], "memory-offering");
+        assert_eq!(
+            body["model_selection"],
+            serde_json::json!({"offering_id": "memory-offering"})
+        );
+        assert!(body.get("model").is_none());
         assert_eq!(body["messages"], serde_json::json!(messages));
         server.abort();
         assert!(
@@ -228,5 +296,100 @@ mod tests {
         });
         assert_eq!(error.kind, ErrorKind::RateLimit);
         assert!(!error.message.contains("arbitrary provider prose"));
+    }
+
+    #[test]
+    fn memory_catalog_rejects_the_legacy_parallel_array_shape() {
+        let legacy = serde_json::json!({
+            "model_name": "display-model",
+            "candidate_model_names": ["display-model"],
+            "candidate_thinking_capabilities": [null]
+        });
+        assert!(
+            serde_json::from_value::<MemoryInferenceOfferingsEnvelope>(legacy).is_err(),
+            "parallel model-name arrays must not remain a second routing contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_catalog_preserves_ordered_typed_offerings() {
+        let app = Router::new().route(
+            "/models/memory",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "offerings": [
+                        {
+                            "offering_id": "offer-first",
+                            "model_name": "first-display",
+                            "thinking_capability": null
+                        },
+                        {
+                            "offering_id": "offer-second",
+                            "model_name": "second-display",
+                            "thinking_capability": "both"
+                        }
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalog server");
+        let address = listener.local_addr().expect("catalog server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve catalog request");
+        });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None)
+            .expect("catalog client");
+
+        let offerings = fetch_memory_inference_offerings(&api, "token")
+            .await
+            .expect("valid catalog");
+
+        assert_eq!(
+            offerings
+                .iter()
+                .map(|offering| offering.offering_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["offer-first", "offer-second"]
+        );
+        assert_eq!(offerings[1].model_name, "second-display");
+        assert_eq!(
+            offerings[1].thinking_capability,
+            Some(astra_services::models::ThinkingCapability::Both)
+        );
+        server.abort();
+        assert!(
+            server
+                .await
+                .expect_err("catalog server should be cancelled")
+                .is_cancelled()
+        );
+    }
+
+    #[test]
+    fn memory_catalog_rejects_invalid_or_duplicate_offerings_as_a_whole() {
+        let invalid = vec![MemoryInferenceOffering {
+            offering_id: " bad-id".into(),
+            model_name: "display".into(),
+            thinking_capability: None,
+        }];
+        assert!(validate_memory_inference_offerings(invalid).is_err());
+
+        let duplicate = vec![
+            MemoryInferenceOffering {
+                offering_id: "offer-same".into(),
+                model_name: "first".into(),
+                thinking_capability: None,
+            },
+            MemoryInferenceOffering {
+                offering_id: "offer-same".into(),
+                model_name: "second".into(),
+                thinking_capability: None,
+            },
+        ];
+        assert!(validate_memory_inference_offerings(duplicate).is_err());
     }
 }

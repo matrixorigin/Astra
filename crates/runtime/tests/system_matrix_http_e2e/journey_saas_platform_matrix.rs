@@ -17,7 +17,7 @@ use super::harness::{
     revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
-use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
+use astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING;
 
 struct E2eUserAuth {
     auth_header: String,
@@ -311,8 +311,8 @@ pub async fn run_saas_admin_config_crud_rbac() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let key = ADMIN_CONFIG_KEY_REASONING_MODEL;
-    let model_value = format!("mock-saas-{}", ctx.suffix);
+    let key = ADMIN_CONFIG_KEY_REASONING_OFFERING;
+    let model_value = ctx.model_offering_id.clone();
 
     revoke_astra_admin_role(pool, user_id).await;
 
@@ -344,7 +344,7 @@ pub async fn run_saas_admin_config_crud_rbac() {
     let entries = list_j["entries"].as_array().expect("entries array");
     assert!(
         entries.iter().any(|e| e["key"].as_str() == Some(key)),
-        "list contains reasoning_model_name: {list_j}"
+        "list contains reasoning_offering_id: {list_j}"
     );
 
     let (st_del, del_j) = delete_json(app, &format!("/admin/config/{key}"), Some(auth)).await;

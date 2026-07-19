@@ -151,7 +151,8 @@ impl std::fmt::Debug for CloudLlmConfig {
 }
 
 impl CloudLlmConfig {
-    /// Build from an already-resolved active model (see [`resolve_reasoning_model`]).
+    /// Build from an already-resolved active model (for example, the model
+    /// inside [`crate::models::resolve_reasoning_offering`]'s result).
     ///
     /// Uses `ResolvedActiveLlmModel::upstream_model_name` so alias rows
     /// (see `wire_model_name`) send their upstream name in the outbound

@@ -447,7 +447,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="active/preferred model resolution by model_name, provider, and is_active; admin model list/update/delete by model_id and model_name",
         retention_policy="retain while a model can be selected for runtime LLM calls; delete/deactivate only through model admin APIs so active-model cache invalidation and encrypted credential lifecycle remain coherent",
         rebuildability="not rebuildable after encrypted API key, provider endpoint, pricing, quirks, tags, and thinking probe state are lost",
-        merge_guidance="do not merge into admin_config; this is the structured model registry, while admin_config stores small named overrides such as reasoning_model_name",
+        merge_guidance="do not merge into admin_config; this is the structured model registry, while admin_config stores small named overrides such as reasoning_offering_id",
         migration_owner="astra_services::storage / models",
         product_owner="model registry, model resolution, LLM credential administration",
     ),
@@ -754,7 +754,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "admin_config": TableMetadata(
         semantic_owner="astra_services::admin_config",
         state_class="durable server admin configuration fact",
-        primary_query="configuration lookup and list by config_key, including reasoning_model_name model selection override",
+        primary_query="configuration lookup and list by config_key, including reasoning_offering_id selection override",
         retention_policy="retain until the admin explicitly unsets the key; delete means fall back to code/default behavior",
         rebuildability="rebuildable only from external admin configuration or operator intent if recorded elsewhere",
         merge_guidance="keep separate from infra_llm_models; admin_config stores named control-plane overrides, not the model registry itself",

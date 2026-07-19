@@ -88,6 +88,15 @@ pub async fn set_admin_config_handler(
     Json(request): Json<AdminConfigSetRequest>,
 ) -> Result<Json<AdminConfigEntry>, (StatusCode, Json<ErrorResponse>)> {
     let admin = state.admin.authorizer.require_admin(&headers).await?;
+    if key == astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING {
+        // Fail at configuration time, while the operator still has the
+        // relevant context, instead of breaking every later background
+        // inference with a stale or misspelled identity.
+        state
+            .model_service
+            .resolve_model_offering(request.value.clone())
+            .await?;
+    }
     state
         .admin
         .config_service
@@ -118,7 +127,7 @@ pub async fn delete_admin_config_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::{ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService};
+    use astra_services::{ADMIN_CONFIG_KEY_REASONING_OFFERING, AdminConfigService};
     use async_trait::async_trait;
     use axum::Router;
     use axum::body::Body;
@@ -228,7 +237,7 @@ mod tests {
         let req = Request::builder()
             .uri(format!(
                 "/admin/config/{}",
-                ADMIN_CONFIG_KEY_REASONING_MODEL
+                ADMIN_CONFIG_KEY_REASONING_OFFERING
             ))
             .header("authorization", "Bearer stub-admin-token")
             .body(Body::empty())
@@ -245,13 +254,13 @@ mod tests {
     #[tokio::test]
     async fn get_existing_key_returns_200() {
         let app = app_with_service(StubAdminConfigService::with_entry(
-            ADMIN_CONFIG_KEY_REASONING_MODEL,
-            "gpt-4o-mini",
+            ADMIN_CONFIG_KEY_REASONING_OFFERING,
+            "offer-reasoning",
         ));
         let req = Request::builder()
             .uri(format!(
                 "/admin/config/{}",
-                ADMIN_CONFIG_KEY_REASONING_MODEL
+                ADMIN_CONFIG_KEY_REASONING_OFFERING
             ))
             .header("authorization", "Bearer stub-admin-token")
             .body(Body::empty())
@@ -262,7 +271,7 @@ mod tests {
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["value"], "gpt-4o-mini");
+        assert_eq!(parsed["value"], "offer-reasoning");
     }
 
     // GET /admin/config/{key} for an unknown key must return 400, not 500.
