@@ -144,6 +144,7 @@ const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
+const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
 
 fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
     matches!(
@@ -151,6 +152,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
         Some(
             "approval_required"
                 | "approval_batch_required"
+                | "tool_request"
                 | "ask_user_prompted"
                 | "user_prompt_required"
                 | "stream_gap"
@@ -300,8 +302,15 @@ fn canonical_edge_approval_requests(event: &Value) -> Vec<Value> {
                     Value::String("edge_ledger".to_string()),
                 ),
             ]);
-            for field in ["path", "detail", "display_label"] {
-                if let Some(value) = request.get(field).cloned() {
+            for field in [
+                "path",
+                "detail",
+                "display_label",
+                "run_id",
+                "session_id",
+                "agent_id",
+            ] {
+                if let Some(value) = request.get(field).or_else(|| event.get(field)).cloned() {
                     data.insert(field.to_string(), value);
                 }
             }
@@ -314,8 +323,83 @@ fn canonical_edge_approval_requests(event: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn incrementally_persisted_edge_approval_event(event: &Value) -> bool {
-    !canonical_edge_approval_requests(event).is_empty()
+fn canonical_edge_tool_request(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_request") {
+        return None;
+    }
+    let request_id = event.get("request_id")?.as_str()?.trim();
+    let tool = event.get("tool")?.as_str()?.trim();
+    if request_id.is_empty() || tool.is_empty() {
+        return None;
+    }
+    let mut data = event.as_object()?.clone();
+    data.remove("type");
+    data.remove(HOST_INTERACTION_COMMITTED_FIELD);
+    Some(json!({
+        "event_type": "tool_request",
+        "idempotency_key": format!("edge-tool-request:{request_id}"),
+        "data": data,
+    }))
+}
+
+fn canonical_edge_interaction_events(event: &Value) -> Vec<Value> {
+    let mut interactions = canonical_edge_approval_requests(event);
+    interactions.extend(canonical_edge_tool_request(event));
+    interactions
+}
+
+fn incrementally_persisted_edge_interaction_event(event: &Value) -> bool {
+    !canonical_edge_interaction_events(event).is_empty()
+}
+
+struct DurableHostInteractionSink {
+    run_engine: RunEngine,
+    user_id: String,
+    run_id: String,
+    session_id: String,
+    agent_id: Option<String>,
+    event_tx: mpsc::Sender<Value>,
+}
+
+#[async_trait]
+impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
+    async fn commit_and_deliver(&self, mut event: Value) -> Result<(), String> {
+        let event_object = event
+            .as_object_mut()
+            .ok_or_else(|| "interaction event must be an object".to_string())?;
+        event_object
+            .entry("run_id".to_string())
+            .or_insert_with(|| Value::String(self.run_id.clone()));
+        event_object
+            .entry("session_id".to_string())
+            .or_insert_with(|| Value::String(self.session_id.clone()));
+        if let Some(agent_id) = &self.agent_id {
+            event_object
+                .entry("agent_id".to_string())
+                .or_insert_with(|| Value::String(agent_id.clone()));
+        }
+
+        let durable_events = canonical_edge_interaction_events(&event);
+        if durable_events.is_empty() {
+            return Err("interaction event has no durable canonical form".to_string());
+        }
+        self.run_engine
+            .append_events_batch(&self.user_id, &self.run_id, &durable_events)
+            .await
+            .map_err(|error| format!("interaction persistence failed: {error}"))?;
+
+        event
+            .as_object_mut()
+            .expect("validated interaction object")
+            .insert(
+                HOST_INTERACTION_COMMITTED_FIELD.to_string(),
+                Value::Bool(true),
+            );
+        self.event_tx
+            .send(event)
+            .await
+            .map_err(|_| "run interaction fanout is closed".to_string())
+    }
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -8168,7 +8252,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 loop {
                     tokio::select! {
                         event = fanout_rx.recv() => {
-                            let Some(event) = event else {
+                            let Some(mut event) = event else {
                                 for gap in fanout_gap_tracker.drain() {
                                     let event = agent_live_gap_to_work_surface_sse(gap);
                                     let _ = live_tx_for_fanout.send(event.clone());
@@ -8181,6 +8265,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                                 break;
                             };
+                            let interaction_already_committed = event
+                                .as_object_mut()
+                                .and_then(|event| event.remove(HOST_INTERACTION_COMMITTED_FIELD))
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false);
                             let approval_requests = canonical_edge_approval_requests(&event);
                             let approval_run_id = event
                                 .get("run_id")
@@ -8189,7 +8278,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .filter(|run_id| !run_id.is_empty())
                                 .unwrap_or(&fanout_run_id)
                                 .to_string();
-                            if !approval_requests.is_empty()
+                            if !interaction_already_committed
+                                && !approval_requests.is_empty()
                                 && let Err(error) = fanout_run_engine
                                     .append_events_batch(
                                         &fanout_user_id,
@@ -8384,21 +8474,40 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let host_event_bridge_tx = event_tx.clone();
         let host_event_bridge_run_id = run_id.clone();
         let mut host_event_bridge = tokio::spawn(async move {
-            while let Some(event) = host_event_rx.recv().await {
-                let dropped = bridge_gap.take();
-                if dropped > 0
-                    && host_event_bridge_tx
-                        .send(stream_delivery_gap_event(
-                            &host_event_bridge_run_id,
-                            dropped,
-                        ))
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
-                if host_event_bridge_tx.send(event).await.is_err() {
-                    return;
+            loop {
+                tokio::select! {
+                    event = host_event_rx.recv() => {
+                        let Some(event) = event else { break; };
+                        let dropped = bridge_gap.take();
+                        if dropped > 0
+                            && host_event_bridge_tx
+                                .send(stream_delivery_gap_event(
+                                    &host_event_bridge_run_id,
+                                    dropped,
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        if host_event_bridge_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = bridge_gap.notified() => {
+                        let dropped = bridge_gap.take();
+                        if dropped > 0
+                            && host_event_bridge_tx
+                                .send(stream_delivery_gap_event(
+                                    &host_event_bridge_run_id,
+                                    dropped,
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
             let dropped = bridge_gap.take();
@@ -8412,6 +8521,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         });
         host.set_event_tx_with_gap(host_event_tx, host_event_gap);
+        host.set_interaction_sink(Arc::new(DurableHostInteractionSink {
+            run_engine: self.run_engine.clone(),
+            user_id: user_id.clone(),
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            agent_id: None,
+            event_tx: event_tx.clone(),
+        }));
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
@@ -9030,7 +9147,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &archived_lifecycle_events,
                 )
                 .into_iter()
-                .filter(|event| !incrementally_persisted_edge_approval_event(event))
+                .filter(|event| !incrementally_persisted_edge_interaction_event(event))
                 .collect();
                 let streaming_events_for_durable =
                     enforce_durable_run_event_batch_budget(terminal_persistence_events);
@@ -10880,10 +10997,6 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     }
 }
 
-struct ChildClientToolDeliveryBridge {
-    join: tokio::task::JoinHandle<()>,
-}
-
 fn child_uses_client_tool_delivery(
     parent_delivery_available: bool,
     bindings: Option<&ExecutionBindingSnapshot>,
@@ -10892,72 +11005,6 @@ fn child_uses_client_tool_delivery(
         && bindings.is_some_and(|snapshot| {
             matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
         })
-}
-
-impl Drop for ChildClientToolDeliveryBridge {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
-}
-
-fn is_client_tool_delivery_event(event: &Value) -> bool {
-    matches!(
-        event.get("type").and_then(Value::as_str),
-        Some("approval_required" | "approval_batch_required" | "tool_request")
-    )
-}
-
-fn start_child_client_tool_delivery_bridge(
-    parent_tx: mpsc::Sender<Value>,
-    child_run_id: String,
-    child_agent_id: String,
-    session_id: String,
-    mut child_rx: mpsc::Receiver<Value>,
-    gap: server_loop_host::HostEventGapTracker,
-) -> ChildClientToolDeliveryBridge {
-    let join = tokio::spawn(async move {
-        while let Some(mut event) = child_rx.recv().await {
-            let dropped = gap.take();
-            if dropped > 0
-                && parent_tx
-                    .send(stream_delivery_gap_event(&child_run_id, dropped))
-                    .await
-                    .is_err()
-            {
-                break;
-            }
-            if !is_client_tool_delivery_event(&event) {
-                continue;
-            }
-            let Some(event) = event.as_object_mut() else {
-                continue;
-            };
-            event
-                .entry("run_id".to_string())
-                .or_insert_with(|| Value::String(child_run_id.clone()));
-            event
-                .entry("agent_id".to_string())
-                .or_insert_with(|| Value::String(child_agent_id.clone()));
-            event
-                .entry("session_id".to_string())
-                .or_insert_with(|| Value::String(session_id.clone()));
-            if parent_tx.send(Value::Object(event.clone())).await.is_err() {
-                tracing::debug!(
-                    run_id = %child_run_id,
-                    agent_id = %child_agent_id,
-                    "parent client tool-delivery lane closed"
-                );
-                break;
-            }
-        }
-        let dropped = gap.take();
-        if dropped > 0 {
-            let _ = parent_tx
-                .send(stream_delivery_gap_event(&child_run_id, dropped))
-                .await;
-        }
-    });
-    ChildClientToolDeliveryBridge { join }
 }
 
 /// Production sub-run executor backed by [`ServerAgenticLoopHost`].
@@ -11439,25 +11486,23 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 sink,
             );
         }
-        let _client_tool_delivery_bridge = if client_tool_delivery_available {
-            const CHILD_CLIENT_EVENT_CHANNEL_CAPACITY: usize = 64;
-            let (child_tx, child_rx) = mpsc::channel(CHILD_CLIENT_EVENT_CHANNEL_CAPACITY);
-            let child_event_gap = server_loop_host::HostEventGapTracker::default();
-            host.set_event_tx_with_gap(child_tx, child_event_gap.clone());
-            host.prefer_client_tool_delivery();
-            Some(start_child_client_tool_delivery_bridge(
-                self.client_tool_delivery_tx
+        if client_tool_delivery_available {
+            let run_engine = self.run_engine.clone().ok_or_else(|| {
+                "thin-client child interaction delivery requires a durable run engine".to_string()
+            })?;
+            host.set_interaction_sink(Arc::new(DurableHostInteractionSink {
+                run_engine,
+                user_id: config.user_id.clone(),
+                run_id: config.run_id.clone(),
+                session_id: config.session_id.clone(),
+                agent_id: Some(config.agent_profile.agent_id.clone()),
+                event_tx: self
+                    .client_tool_delivery_tx
                     .clone()
                     .expect("availability checked above"),
-                config.run_id.clone(),
-                config.agent_profile.agent_id.clone(),
-                config.session_id.clone(),
-                child_rx,
-                child_event_gap,
-            ))
-        } else {
-            None
-        };
+            }));
+            host.prefer_client_tool_delivery();
+        }
 
         // Build the task prompt, incorporating previous output if pipeline.
         let full_task = if let Some(prev) = &config.previous_output {

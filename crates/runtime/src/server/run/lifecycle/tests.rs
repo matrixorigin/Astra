@@ -12596,8 +12596,8 @@ fn edge_approval_persistence_normalizes_single_and_batch_requests() {
     assert_eq!(batch_facts[1]["data"]["request_id"], "approval-b");
     assert_eq!(batch_facts[0]["data"]["path"], "/tmp/a");
     assert_eq!(batch_facts[1]["data"]["path"], "/tmp/b");
-    assert!(incrementally_persisted_edge_approval_event(&single));
-    assert!(incrementally_persisted_edge_approval_event(&batch));
+    assert!(incrementally_persisted_edge_interaction_event(&single));
+    assert!(incrementally_persisted_edge_interaction_event(&batch));
 }
 
 #[test]
@@ -12619,93 +12619,91 @@ fn edge_approval_persistence_rejects_unaddressable_items() {
         "delivery": "durable",
     });
     assert!(canonical_edge_approval_requests(&already_durable).is_empty());
-    assert!(!incrementally_persisted_edge_approval_event(
+    assert!(!incrementally_persisted_edge_interaction_event(
         &already_durable
     ));
-    assert!(!incrementally_persisted_edge_approval_event(&json!({
-        "type": "tool_request"
+    assert!(!incrementally_persisted_edge_interaction_event(&json!({
+        "type": "tool_request",
+        "request_id": "missing-tool"
     })));
 }
 
-#[tokio::test]
-async fn child_client_tool_delivery_forwards_requests_without_leaking_child_transcript() {
-    let (parent_tx, mut parent_rx) = mpsc::channel(8);
-    let (child_tx, child_rx) = mpsc::channel(8);
-    let _bridge = start_child_client_tool_delivery_bridge(
-        parent_tx,
-        "child-run".to_string(),
-        "researcher".to_string(),
-        "session-1".to_string(),
-        child_rx,
-        server_loop_host::HostEventGapTracker::default(),
-    );
+#[test]
+fn edge_tool_request_has_a_replayable_canonical_fact() {
+    let request = json!({
+        "type": "tool_request",
+        "run_id": "child-run",
+        "session_id": "session-1",
+        "request_id": "tool-1",
+        "tool": "bash",
+        "args": {"cmd": "printf ok"}
+    });
 
-    child_tx
-        .send(json!({"type": "text_delta", "content": "private child output"}))
-        .await
-        .unwrap();
-    child_tx
-        .send(json!({"type": "tool_request", "request_id": "tool-1"}))
-        .await
-        .unwrap();
-    child_tx
-        .send(json!({
-            "type": "approval_required",
-            "request_id": "approval-1",
-            "tool": "bash"
-        }))
-        .await
-        .unwrap();
-
-    let tool_request = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let approval = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(tool_request["type"], "tool_request");
-    assert_eq!(approval["type"], "approval_required");
-    for event in [&tool_request, &approval] {
-        assert_eq!(event["run_id"], "child-run");
-        assert_eq!(event["agent_id"], "researcher");
-        assert_eq!(event["session_id"], "session-1");
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), parent_rx.recv())
-            .await
-            .is_err(),
-        "child text must remain on the typed agent-live transcript lane"
-    );
+    let durable = canonical_edge_tool_request(&request).expect("canonical tool request");
+    assert_eq!(durable["event_type"], "tool_request");
+    assert_eq!(durable["idempotency_key"], "edge-tool-request:tool-1");
+    assert_eq!(durable["data"]["run_id"], "child-run");
+    assert_eq!(durable["data"]["request_id"], "tool-1");
+    assert_eq!(durable["data"]["tool"], "bash");
+    assert!(incrementally_persisted_edge_interaction_event(&request));
 }
 
 #[tokio::test]
-async fn child_client_tool_delivery_surfaces_coalesced_gap_before_next_request() {
-    let (parent_tx, mut parent_rx) = mpsc::channel(8);
-    let (child_tx, child_rx) = mpsc::channel(1);
-    let gap = server_loop_host::HostEventGapTracker::default();
-    gap.record_drop();
-    gap.record_drop();
-    let _bridge = start_child_client_tool_delivery_bridge(
-        parent_tx,
-        "child-run".to_string(),
-        "researcher".to_string(),
-        "session-1".to_string(),
-        child_rx,
-        gap,
-    );
-    child_tx
-        .send(json!({"type": "tool_request", "request_id": "tool-1"}))
+async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    engine
+        .start_run("run-approval", "user-1", "session-1")
         .await
         .unwrap();
+    let (event_tx, mut event_rx) = mpsc::channel(1);
+    event_tx
+        .send(json!({"type": "text_delta", "content": "queue is full"}))
+        .await
+        .unwrap();
+    let sink = DurableHostInteractionSink {
+        run_engine: engine.clone(),
+        user_id: "user-1".to_string(),
+        run_id: "run-approval".to_string(),
+        session_id: "session-1".to_string(),
+        agent_id: None,
+        event_tx,
+    };
+    let delivery = server_loop_host::HostInteractionSink::commit_and_deliver(
+        &sink,
+        json!({
+            "type": "approval_required",
+            "request_id": "approval-1",
+            "tool": "bash",
+            "approval_kind": "standard"
+        }),
+    );
+    tokio::pin!(delivery);
 
-    let repair = parent_rx.recv().await.unwrap();
-    let request = parent_rx.recv().await.unwrap();
-    assert_eq!(repair["type"], "stream_gap");
-    assert_eq!(repair["run_id"], "child-run");
-    assert_eq!(repair["dropped_event_count"], 2);
-    assert_eq!(request["type"], "tool_request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut delivery)
+            .await
+            .is_err(),
+        "a full live queue should backpressure delivery"
+    );
+    let durable = engine
+        .load_run("user-1", "run-approval")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        durable.events.iter().any(|event| {
+            event["event_type"] == "approval_required"
+                && event["data"]["request_id"] == "approval-1"
+        }),
+        "approval replay truth must exist before any executor can wait for a callback"
+    );
+
+    let progress = event_rx.recv().await.unwrap();
+    assert_eq!(progress["type"], "text_delta");
+    delivery.await.unwrap();
+    let approval = event_rx.recv().await.unwrap();
+    assert_eq!(approval["type"], "approval_required");
+    assert_eq!(approval[HOST_INTERACTION_COMMITTED_FIELD], true);
 }
 
 #[test]

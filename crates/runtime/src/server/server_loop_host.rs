@@ -1163,6 +1163,10 @@ pub struct ServerAgenticLoopHost {
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
     event_tx: Option<ServerEventSender>,
+    /// Durable, bounded owner of human-input and executable-client
+    /// boundaries. Unlike progress SSE, these events may never be dropped or
+    /// exposed before their replay fact is committed.
+    interaction_sink: Option<Arc<dyn HostInteractionSink>>,
     /// A server-side child may share its parent's client tool-delivery lane
     /// while retaining a separate transcript stream. Only edge-bound tool
     /// requests use that lane; ordinary child output stays on the typed live
@@ -1262,17 +1266,35 @@ struct AgentLiveMirror {
     sink: SharedAgentLiveEventSink,
 }
 
+#[derive(Default)]
+struct HostEventGapState {
+    dropped: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct HostEventGapTracker(Arc<AtomicU64>);
+pub(crate) struct HostEventGapTracker(Arc<HostEventGapState>);
 
 impl HostEventGapTracker {
     pub(crate) fn record_drop(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        self.0.notify.notify_one();
     }
 
     pub(crate) fn take(&self) -> u64 {
-        self.0.swap(0, Ordering::AcqRel)
+        self.0.dropped.swap(0, Ordering::AcqRel)
     }
+
+    pub(crate) async fn notified(&self) {
+        self.0.notify.notified().await;
+    }
+}
+
+#[async_trait]
+pub(crate) trait HostInteractionSink: Send + Sync {
+    /// Commit durable replay truth before exposing an interaction. Success is
+    /// the producer's permission to begin waiting for its callback.
+    async fn commit_and_deliver(&self, event: Value) -> Result<(), String>;
 }
 
 struct ServerEventSender {
@@ -1765,6 +1787,7 @@ impl ServerAgenticLoopHostBuilder {
             ),
             emitted_events: Vec::new(),
             event_tx: None,
+            interaction_sink: None,
             prefer_client_tool_delivery: false,
             client_cancel_flag: None,
             client_cancel_token: None,
@@ -2485,21 +2508,39 @@ impl ServerAgenticLoopHost {
             })
     }
 
-    /// Push an SSE event to both the internal buffer and the streaming channel.
-    /// The internal host → fanout lane is bounded. When progress outruns its
-    /// consumer, the producer records a coalesced gap instead of accumulating
-    /// unbounded memory; the bridge emits a durable-snapshot repair boundary
-    /// before the next event. A closed receiver detaches delivery.
+    fn interaction_event_requires_commit(event: &Value) -> bool {
+        matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("approval_required" | "approval_batch_required" | "tool_request")
+        )
+    }
+
+    fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
+        self.emitted_events.push(event);
+        if streaming_turn && self.emitted_events.len() > MAX_STREAMED_TURN_EVENT_BUFFER {
+            let overflow = self
+                .emitted_events
+                .len()
+                .saturating_sub(MAX_STREAMED_TURN_EVENT_BUFFER);
+            self.emitted_events.drain(0..overflow);
+        }
+    }
+
+    /// Push ordinary progress to both the bounded live lane and terminal
+    /// buffer. Progress may be coalesced behind an explicit repair boundary;
+    /// interactions that can block execution must use
+    /// [`Self::emit_committed_interaction`] instead.
     fn emit_event(&mut self, mut event: Value) {
+        debug_assert!(
+            !Self::interaction_event_requires_commit(&event),
+            "blocking interactions require durable commit acknowledgement"
+        );
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
         let streaming_turn = self.event_tx.is_some();
-        let uses_attached_lane = !self.prefer_client_tool_delivery
-            || matches!(
-                event.get("type").and_then(Value::as_str),
-                Some("approval_required" | "approval_batch_required" | "tool_request")
-            );
-        if uses_attached_lane && let Some(sender) = &self.event_tx {
+        if !self.prefer_client_tool_delivery
+            && let Some(sender) = &self.event_tx
+        {
             let disconnected = match sender.tx.try_send(event.clone()) {
                 Ok(()) => false,
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
@@ -2514,14 +2555,31 @@ impl ServerAgenticLoopHost {
                 self.event_tx = None;
             }
         }
-        self.emitted_events.push(event);
-        if streaming_turn && self.emitted_events.len() > MAX_STREAMED_TURN_EVENT_BUFFER {
-            let overflow = self
-                .emitted_events
-                .len()
-                .saturating_sub(MAX_STREAMED_TURN_EVENT_BUFFER);
-            self.emitted_events.drain(0..overflow);
+        self.retain_emitted_event(event, streaming_turn);
+    }
+
+    /// Commit and deliver an interaction before allowing the executor to wait
+    /// for its callback. Production installs a durable sink; direct host tests
+    /// fall back to bounded channel send, which is still lossless.
+    async fn emit_committed_interaction(&mut self, mut event: Value) -> Result<(), String> {
+        debug_assert!(Self::interaction_event_requires_commit(&event));
+        self.attach_execution_metadata_to_tool_event(&mut event);
+        let streaming_turn = self.event_tx.is_some() || self.interaction_sink.is_some();
+
+        if let Some(sink) = self.interaction_sink.clone() {
+            sink.commit_and_deliver(event.clone()).await?;
+        } else if let Some(sender) = self.event_tx.as_ref().map(|sender| sender.tx.clone()) {
+            sender
+                .send(event.clone())
+                .await
+                .map_err(|_| "interaction delivery lane is closed".to_string())?;
+        } else {
+            return Err("interactive event has no durable delivery owner".to_string());
         }
+
+        self.mirror_agent_live_event(&event);
+        self.retain_emitted_event(event, streaming_turn);
+        Ok(())
     }
 
     fn attach_execution_metadata_to_tool_event(&self, event: &mut Value) {
@@ -2700,6 +2758,10 @@ impl ServerAgenticLoopHost {
         self.progress_rx = None;
         self.progress_filter = None;
         self.event_tx = Some(ServerEventSender { tx, gap });
+    }
+
+    pub(crate) fn set_interaction_sink(&mut self, sink: Arc<dyn HostInteractionSink>) {
+        self.interaction_sink = Some(sink);
     }
 
     pub(crate) fn detach_event_tx(&mut self) {
@@ -3557,16 +3619,16 @@ impl ServerAgenticLoopHost {
         }
 
         for batch in collect_approval_batches(&tool_calls) {
-            if batch.items.len() == 1 {
+            let event = if batch.items.len() == 1 {
                 let item = &batch.items[0];
-                self.emit_event(Value::Object(build_approval_required_event(
+                Value::Object(build_approval_required_event(
                     &item.request_id,
                     &item.tool_name,
                     item.approval_kind,
                     item.path.as_deref(),
                     item.detail.as_deref(),
                     item.display_label.as_deref(),
-                )));
+                ))
             } else {
                 let requests = batch
                     .items
@@ -3580,9 +3642,35 @@ impl ServerAgenticLoopHost {
                         display_label: item.display_label.as_deref(),
                     })
                     .collect::<Vec<_>>();
-                self.emit_event(Value::Object(build_approval_batch_required_event(
-                    &requests,
-                )));
+                Value::Object(build_approval_batch_required_event(&requests))
+            };
+            if let Err(error) = self.emit_committed_interaction(event).await {
+                tracing::error!(
+                    target: "astra_runtime::server_loop_host",
+                    run_id,
+                    error = %error,
+                    "approval interaction could not be committed and delivered"
+                );
+                for item in &batch.items {
+                    let (_, _, args) = parse_flat_tool_call_event(&item.tool_call);
+                    results_by_id.insert(
+                        item.request_id.clone(),
+                        EdgeToolExecResult {
+                            request_id: item.request_id.clone(),
+                            tool: item.tool_name.clone(),
+                            args: args.clone(),
+                            output: format!("Approval request delivery failed: {error}"),
+                            tool_result_fields: Some(self.edge_result_fields_with_runtime(
+                                &item.request_id,
+                                &item.tool_name,
+                                &args,
+                                None,
+                            )),
+                            status: "error".to_string(),
+                            duration_ms: 0,
+                        },
+                    );
+                }
             }
         }
 
@@ -3606,6 +3694,9 @@ impl ServerAgenticLoopHost {
                         continue;
                     }
                     let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
+                    if results_by_id.contains_key(&request_id) {
+                        continue;
+                    }
                     if let Err(denied) = wait_approval_ledger_for_tool(
                         &self.edge_callback_ledger,
                         &self.user_id,
@@ -3694,7 +3785,8 @@ impl ServerAgenticLoopHost {
             // Register every callback before its SSE request is visible. This
             // makes the exact emitted identity—not session ownership alone—
             // the authorization boundary for same-process delivery.
-            for (tc, _) in &pending_calls {
+            let mut delivered_calls = Vec::with_capacity(pending_calls.len());
+            for (tc, sig) in pending_calls {
                 let request_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -3703,7 +3795,9 @@ impl ServerAgenticLoopHost {
                     turn_chain_id,
                     request_id,
                 );
-                expect_ledger_entry(&self.edge_callback_ledger, &tool_callback_key(&identity));
+                let callback_key = tool_callback_key(&identity);
+                expect_ledger_entry(&self.edge_callback_ledger, &callback_key);
+                let mut delivery_error = None;
                 for m in sse_maps_through_tool_request(tc, &identity) {
                     // L1094 (execute_mock_turn mock-LLM-response path) is the
                     // SINGLE owner of `tool_call` events per skill invocation.
@@ -3720,11 +3814,42 @@ impl ServerAgenticLoopHost {
                             continue;
                         }
                     }
-                    self.emit_event(Value::Object(m));
+                    let event = Value::Object(m);
+                    if Self::interaction_event_requires_commit(&event) {
+                        if let Err(error) = self.emit_committed_interaction(event).await {
+                            delivery_error = Some(error);
+                            break;
+                        }
+                    } else {
+                        self.emit_event(event);
+                    }
+                }
+                if let Some(error) = delivery_error {
+                    astra_turn_core::edge_ledger::cancel_expected_ledger_entry(
+                        &self.edge_callback_ledger,
+                        &callback_key,
+                    );
+                    let (id, tool_name, args) = parse_flat_tool_call_event(tc);
+                    results_by_id.insert(
+                        id.clone(),
+                        EdgeToolExecResult {
+                            request_id: id.clone(),
+                            tool: tool_name.clone(),
+                            args: args.clone(),
+                            output: format!("Tool request delivery failed: {error}"),
+                            tool_result_fields: Some(
+                                self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
+                            ),
+                            status: "error".to_string(),
+                            duration_ms: 0,
+                        },
+                    );
+                } else {
+                    delivered_calls.push((tc, sig));
                 }
             }
 
-            for (tc, sig) in pending_calls {
+            for (tc, sig) in delivered_calls {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -12648,8 +12773,8 @@ mod tests {
         assert!(host.progress_filter.is_none());
     }
 
-    #[test]
-    fn bounded_internal_stream_coalesces_overflow_without_permanent_detach() {
+    #[tokio::test]
+    async fn full_progress_queue_backpressures_instead_of_dropping_interaction() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -12667,14 +12792,26 @@ mod tests {
         for sequence in 0..8 {
             host.emit_event(json!({"type": "text_delta", "sequence": sequence}));
         }
-        for expected_sequence in 0..4 {
-            let event = rx.try_recv().expect("bounded prefix remains ordered");
-            assert_eq!(event["sequence"], expected_sequence);
+        {
+            let interaction = host.emit_committed_interaction(json!({
+                "type": "approval_required",
+                "request_id": "approval-after-burst",
+                "tool": "bash",
+            }));
+            tokio::pin!(interaction);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut interaction)
+                    .await
+                    .is_err(),
+                "a full bounded queue must apply backpressure, not report false delivery"
+            );
+
+            let first = rx.try_recv().expect("bounded prefix remains available");
+            assert_eq!(first["sequence"], 0);
+            interaction
+                .await
+                .expect("capacity release delivers the interaction exactly once");
         }
-        host.emit_event(json!({
-            "type": "approval_required",
-            "request_id": "approval-after-burst",
-        }));
 
         assert!(
             !cancel_flag.load(Ordering::SeqCst),
@@ -12685,11 +12822,28 @@ mod tests {
             "LLM cancellation token must remain active on channel backpressure"
         );
         assert!(host.event_tx.is_some());
-        let approval = rx.try_recv().expect("approval survives the progress burst");
+        for expected_sequence in 1..4 {
+            let event = rx.try_recv().expect("bounded prefix remains ordered");
+            assert_eq!(event["sequence"], expected_sequence);
+        }
+        let approval = rx
+            .try_recv()
+            .expect("approval follows the accepted progress prefix");
         assert_eq!(approval["type"], "approval_required");
         assert_eq!(approval["request_id"], "approval-after-burst");
         assert_eq!(gap.take(), 4, "overflow is one coalesced repair boundary");
         assert_eq!(host.emitted_events.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn overflow_gap_notifies_without_waiting_for_another_event() {
+        let gap = HostEventGapTracker::default();
+        gap.record_drop();
+
+        tokio::time::timeout(Duration::from_millis(25), gap.notified())
+            .await
+            .expect("a terminal progress drop must wake the bridge immediately");
+        assert_eq!(gap.take(), 1);
     }
 
     #[test]

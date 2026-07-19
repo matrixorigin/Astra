@@ -320,6 +320,19 @@ pub fn expect_ledger_entry(ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value
     }
 }
 
+/// Withdraw an expectation when its request could not be committed and
+/// delivered. Callers must do this before returning an execution error so a
+/// request that was never visible cannot authorize a late/spoofed callback.
+pub fn cancel_expected_ledger_entry(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    key: &str,
+) {
+    clear_ledger_expectation(ledger, key);
+    if let Ok(mut meta) = ledger_meta().lock() {
+        meta.remove(key);
+    }
+}
+
 /// Whether this process has an active waiter or an unconsumed entry for `key`.
 pub fn ledger_entry_is_expected(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
@@ -1192,6 +1205,17 @@ mod tests {
             !ledger_entry_is_expected(&ledger, &key),
             "a timed-out waiter must stop authorizing future callbacks"
         );
+    }
+
+    #[test]
+    fn undelivered_request_withdraws_callback_authority_immediately() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", &Uuid::now_v7().to_string());
+
+        expect_ledger_entry(&ledger, &key);
+        assert!(ledger_entry_is_expected(&ledger, &key));
+        cancel_expected_ledger_entry(&ledger, &key);
+        assert!(!ledger_entry_is_expected(&ledger, &key));
     }
 
     #[test]

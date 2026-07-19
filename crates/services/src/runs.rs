@@ -7168,6 +7168,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "tool_request" => {
+            let mut out = serde_json::json!({ "type": "tool_request" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "ask_user_prompted" | "user_prompt_required" => {
             let mut out = serde_json::json!({ "type": "user_prompt_required" });
             if let Some(obj) = out.as_object_mut() {
@@ -9998,6 +10007,18 @@ mod tests {
                 &|o| {
                     assert_eq!(o["type"], "approval_required");
                     assert_eq!(o["approval_id"], "a-2");
+                },
+            ),
+            (
+                "tool_request canonical",
+                make_event(
+                    "tool_request",
+                    json!({"request_id": "call-1", "tool": "bash", "args": {"cmd": "pwd"}}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "tool_request");
+                    assert_eq!(o["request_id"], "call-1");
+                    assert_eq!(o["tool"], "bash");
                 },
             ),
             (
