@@ -7381,6 +7381,8 @@ mod tests {
 
     #[test]
     fn stall_and_checkpoint_events() {
+        let journal_root = tempfile::TempDir::new().unwrap();
+        let _journal_guard = JournalDirGuard::new(journal_root.path());
         // --- stall_detected field correctness ---
         {
             let evt = JournalEvent::stall_detected(
