@@ -614,6 +614,7 @@ pub async fn wait_for_run_status(
 /// Shared Matrix E2E context after app build + user registration + session creation.
 pub struct MatrixE2eCtx {
     pub app: Router,
+    pub app_state: astra_runtime::AppState,
     pub pool: sqlx::MySqlPool,
     pub shared_pool: SharedPool,
     /// Logical MatrixOne database (includes `ASTRA_DATABASE_PREFIX` + `ASTRA_DATABASE`).
@@ -808,6 +809,14 @@ pub async fn bootstrap() -> BootstrapResult {
             ),
     ));
 
+    // `build_app` is used in-process here, so the real server startup hook that
+    // primes capability health does not run. Mirror that production boundary
+    // once; request handlers must continue to consume the cache without remote
+    // dependency I/O.
+    let _ = state
+        .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
+        .await;
+    let app_state = state.clone();
     let app = build_app(state);
 
     let suffix = Uuid::new_v4().simple().to_string();
@@ -921,6 +930,7 @@ pub async fn bootstrap() -> BootstrapResult {
     BootstrapResult {
         ctx: MatrixE2eCtx {
             app,
+            app_state,
             pool,
             shared_pool: session_lifecycle_pool,
             matrixone_database,

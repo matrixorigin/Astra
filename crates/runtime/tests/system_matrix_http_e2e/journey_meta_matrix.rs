@@ -39,6 +39,11 @@ pub async fn run_meta_root_and_health() {
     // transport reports an outage. The public aggregate must distinguish
     // degraded optional capability from both full health and DB outage.
     b.ctx.memoria.set_fail_forward(true);
+    let _ = b
+        .ctx
+        .app_state
+        .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
+        .await;
     let (st_degraded, degraded) = get_json(app, "/health", None, &[]).await;
     assert_eq!(st_degraded, StatusCode::OK, "degraded health: {degraded}");
     assert_eq!(degraded["status"].as_str(), Some("degraded"));
