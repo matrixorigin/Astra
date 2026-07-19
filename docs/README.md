@@ -24,6 +24,7 @@ Docs here should describe durable design, target behavior, public contracts, run
 | [Introspect and reflect](design/introspect-and-reflect.md) | Agent self-observation, reflection boundaries, and introspection dimensions. |
 | [Session observability](design/session-observability.md) | User/support visible status, stream projection, stuck diagnosis, reconnect. |
 | [Edge-cloud execution](design/edge-cloud-execution.md) | Edge/CLI local capacity and server-safe cloud fallback. |
+| [Model access and inference](design/model-access-and-inference.md) | Astra Cloud/Workspace/Device model access, TaaS bindings, inference placement, billing, invocation, and usage. |
 | [Cloud-edge sync](architecture/edge-cloud-sync-architecture.md) | Durable outbox, event facts, retention, repair, and sync status. |
 | [Safety and permissions](design/safety-and-permissions.md) | Permission, sandbox, side-effect, policy, and trust boundaries. |
 | [Permission sync](design/permission-sync.md) | Cross-surface scoped approvals, revocation, expiration, and audit. |

@@ -1,9 +1,11 @@
 # Model routing
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-07-19.
 
 Model routing defines how Astra selects models under quality, latency, cost, safety, context, and provider constraints.
+
+Eligibility, account binding, credential placement, billing ownership, and inference execution are owned by [model-access-and-inference.md](model-access-and-inference.md). Routing may choose only among the effective Offerings produced by that contract.
 
 ## Principles
 
@@ -28,8 +30,8 @@ Model routing defines how Astra selects models under quality, latency, cost, saf
 ## Routing outcome
 
 ```text
-model_id
-provider
+effective_offering_id
+resolved_route_id
 reason
 fallback_chain
 budget
@@ -38,6 +40,8 @@ safety_tier
 context_strategy
 trace_event_id
 ```
+
+Provider, endpoint, credential, execution placement, and billing owner are resolved Server-side from the selected Offering. A routing policy cannot invent or override them.
 
 ## Escalation
 

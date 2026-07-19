@@ -1,7 +1,7 @@
 # Design documentation index
 
 > Status: canonical documentation map.
-> Last updated: 2026-07-15.
+> Last updated: 2026-07-19.
 
 The design docs are organized by orthogonal ownership boundaries. If a topic appears to belong in multiple places, write the invariant in the owning domain and reference it elsewhere instead of duplicating it.
 
@@ -30,6 +30,7 @@ These documents describe target contracts. They should not be read as proof that
 | Edge/cloud execution | [edge-cloud-execution.md](edge-cloud-execution.md) | Edge local capacity and server-safe fallback. |
 | Cloud-edge sync | [../architecture/edge-cloud-sync-architecture.md](../architecture/edge-cloud-sync-architecture.md) | Durable outbox, sync facts, repair, retention. |
 | Orchestration | [orchestration.md](orchestration.md) | Multi-agent delegation, model selection per agent, coordination. |
+| Model access and inference | [model-access-and-inference.md](model-access-and-inference.md) | Cloud/Workspace/Device model access, TaaS bindings, Offerings, connections, inference placement, invocation, usage, and billing boundaries. |
 | Model routing | [model-routing.md](model-routing.md) | Model/provider selection, escalation, fallback chains, and traceability. |
 | Multi-agent runtime | [multi-agent-runtime.md](multi-agent-runtime.md) | Durable child runs, fanout/fanin, delegation lineage, and bounded parallelism. |
 | Memory | [memory.md](memory.md) | Cross-session and in-session memory semantics. |
@@ -53,6 +54,7 @@ These documents describe target contracts. They should not be read as proof that
 - Plan mode belongs to runtime lifecycle, not a separate agent architecture.
 - Introspection and reflection belong to observation plane, not context pipeline.
 - Prompt cache belongs to context/prompt, not provider routing.
+- Model eligibility, account binding, credential placement, and billing ownership belong to model access and inference; routing only chooses among eligible Offerings.
 - Edge local filesystem and shell authority belong to edge-cloud execution and safety, not Web Agent docs.
 - Sync durability belongs to cloud-edge sync, not session lifecycle.
 - Learning data belongs to evaluation/learning, not raw debug or audit docs.
