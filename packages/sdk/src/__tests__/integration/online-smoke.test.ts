@@ -109,7 +109,7 @@ describeLocal('integration / online (Mode A: local HTTP harness)', () => {
         sessionId: session.sessionId,
         message: 'turn one',
         context: { memory: ['prefer PKCE'], turn: 1 },
-        selectedModel: { model: 'harness-model' },
+        modelSelection: { offeringId: 'harness-model' },
       },
       { onEvent: (event) => firstEvents.push(event) },
     );
@@ -131,7 +131,7 @@ describeLocal('integration / online (Mode A: local HTTP harness)', () => {
         sessionId: session.sessionId,
         message: 'turn two',
         context: { memory: ['prefer PKCE', 'schema changed'], turn: 2 },
-        selectedModel: { model: 'harness-model' },
+        modelSelection: { offeringId: 'harness-model' },
       },
       { onEvent: (event) => secondEvents.push(event) },
     );
@@ -167,7 +167,7 @@ describeLocal('integration / online (Mode A: local HTTP harness)', () => {
       {
         sessionId: session.sessionId,
         message: 'should fail',
-        selectedModel: { model: 'harness-model' },
+        modelSelection: { offeringId: 'harness-model' },
       },
       { onEvent: (event) => events.push(event) },
     );

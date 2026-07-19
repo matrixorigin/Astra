@@ -1,41 +1,33 @@
-export type SelectedModelInput = {
-  id?: string;
-  model: string;
-  gateway?: string;
+export type ModelSelectionInput = {
+  offeringId: string;
 };
 
-export type SelectedModelWire = {
-  id?: string;
-  model: string;
-  gateway?: string;
+export type ModelSelectionWire = {
+  offering_id: string;
 };
 
-export function selectedModelToWire(
-  selectedModel: SelectedModelInput | undefined,
-): SelectedModelWire {
+export function modelSelectionToWire(
+  selection: ModelSelectionInput | undefined,
+): ModelSelectionWire {
   if (
-    !selectedModel ||
-    typeof selectedModel.model !== "string" ||
-    selectedModel.model.length === 0
+    !selection ||
+    typeof selection.offeringId !== "string" ||
+    selection.offeringId.length === 0
   ) {
-    throw new Error("selectedModel.model is required");
+    throw new Error("modelSelection.offeringId is required");
   }
-  const wire: SelectedModelWire = {
-    model: selectedModel.model,
-  };
-  if (selectedModel.id !== undefined) {
-    if (typeof selectedModel.id !== "string" || selectedModel.id.length === 0) {
-      throw new Error(
-        "selectedModel.id must be a non-empty string when provided",
-      );
-    }
-    wire.id = selectedModel.id;
+  const unknown = Object.keys(selection).filter((key) => key !== "offeringId");
+  if (unknown.length > 0) {
+    throw new Error(`modelSelection contains unsupported field '${unknown[0]}'`);
   }
-  if (selectedModel.gateway !== undefined) {
-    if (typeof selectedModel.gateway !== "string") {
-      throw new Error("selectedModel.gateway must be a string when provided");
-    }
-    wire.gateway = selectedModel.gateway;
+  if (
+    selection.offeringId.trim() !== selection.offeringId ||
+    /[\u0000-\u001f\u007f]/u.test(selection.offeringId)
+  ) {
+    throw new Error("modelSelection.offeringId must be an exact identifier");
   }
-  return wire;
+  if (new TextEncoder().encode(selection.offeringId).length > 64) {
+    throw new Error("modelSelection.offeringId must be at most 64 bytes");
+  }
+  return { offering_id: selection.offeringId };
 }

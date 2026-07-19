@@ -59,7 +59,7 @@ function mockStreamEvents(streamChatMock: ReturnType<typeof vi.fn>, events: Stre
 describe("useAstraChat", () => {
   test("initial state is idle with empty arrays", () => {
     const { client } = createMockClient();
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     expect(result.current.sessionId).toBeNull();
     expect(result.current.runId).toBeNull();
@@ -84,7 +84,7 @@ describe("useAstraChat", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, []);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hello");
@@ -110,7 +110,7 @@ describe("useAstraChat", () => {
     const { result } = renderHook(() =>
       useAstraChat({
         client,
-        model: "test-model",
+        offeringId: "offer-test-model",
         allowSkills: ["s1"],
         allowTools: ["bash"],
         enabledTools: ["web_search", "web_fetch"],
@@ -145,7 +145,7 @@ describe("useAstraChat", () => {
       allowTools?: string[];
       enabledTools?: string[];
       skillSearch?: typeof skillSearch;
-      selectedModel?: { model: string };
+      modelSelection?: { offeringId: string };
       agentBinding?: {
         id: string;
         capabilityServerRefs: { mcp: string; skills: string };
@@ -158,7 +158,7 @@ describe("useAstraChat", () => {
       workspaceBinding?: { kind: string };
       executorBinding?: { kind: string };
     };
-    expect(req.selectedModel).toEqual({ model: "test-model" });
+    expect(req.modelSelection).toEqual({ offeringId: "offer-test-model" });
     expect(req.allowSkills).toEqual(["s1"]);
     expect(req.allowTools).toEqual(["bash"]);
     expect(req.enabledTools).toEqual(["web_search", "web_fetch"]);
@@ -189,7 +189,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -235,7 +235,7 @@ describe("useAstraChat", () => {
     ]);
 
     const { result } = renderHook(() =>
-      useAstraChat({ client, model: "test-model" }),
+      useAstraChat({ client, offeringId: "offer-test-model" }),
     );
     act(() => {
       result.current.sendMessage("Review");
@@ -268,7 +268,7 @@ describe("useAstraChat", () => {
       { type: "text_delta", content: "World" } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -296,7 +296,7 @@ describe("useAstraChat", () => {
       },
     );
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("first");
@@ -333,7 +333,7 @@ describe("useAstraChat", () => {
       { type: "turn_complete" } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Go");
@@ -365,7 +365,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("list files");
@@ -396,7 +396,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("read twice");
@@ -454,7 +454,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("pwd");
@@ -524,7 +524,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("review");
@@ -567,7 +567,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("review");
@@ -611,7 +611,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("review");
@@ -675,7 +675,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("review");
@@ -708,7 +708,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -727,7 +727,7 @@ describe("useAstraChat", () => {
       { type: "error", message: "Server error" } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -743,7 +743,7 @@ describe("useAstraChat", () => {
       { type: "run_finished", run_id: "r1" } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -768,7 +768,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -796,7 +796,7 @@ describe("useAstraChat", () => {
       { type: "text_delta", content: "text" } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -831,7 +831,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -915,7 +915,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("review");
@@ -964,7 +964,7 @@ describe("useAstraChat", () => {
       } as StreamEvent,
     ]);
 
-    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
     act(() => {
       result.current.sendMessage("Hi");
@@ -997,7 +997,7 @@ describe("useAstraChat", () => {
     ]);
 
     const { result } = renderHook(() =>
-      useAstraChat({ client, model: "test-model" }),
+      useAstraChat({ client, offeringId: "offer-test-model" }),
     );
 
     act(() => {

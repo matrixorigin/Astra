@@ -8,7 +8,7 @@ vi.mock("@/lib/api/web-store", () => ({
   beginStreamingMessage: vi.fn(),
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
-  resolveBackendModelName: vi.fn(),
+  resolveModelOfferingSelection: vi.fn(),
   selectedWebModel: vi.fn((model?: string | null) => {
     const normalized = model?.trim();
     return normalized || "sonnet-4.6-adaptive";
@@ -49,7 +49,7 @@ import {
   beginStreamingMessage,
   ensureChatBackendSession,
   getChat,
-  resolveBackendModelName,
+  resolveModelOfferingSelection,
   setChatActiveRun,
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
@@ -59,7 +59,7 @@ import { PATH_EDGES_STATUS } from "@astra/sdk";
 
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
-const mockResolveBackendModelName = vi.mocked(resolveBackendModelName);
+const mockResolveModelOfferingSelection = vi.mocked(resolveModelOfferingSelection);
 const mockBeginStreamingMessage = vi.mocked(beginStreamingMessage);
 const mockEnsureChatBackendSession = vi.mocked(ensureChatBackendSession);
 const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
@@ -183,10 +183,7 @@ describe("chat stream route proxy cancellation", () => {
       },
       messages: [],
     });
-    mockResolveBackendModelName.mockResolvedValue({
-      id: "model-backend",
-      model: "backend-model",
-    });
+    mockResolveModelOfferingSelection.mockResolvedValue({ offeringId: "model-backend" });
     mockEnsureChatBackendSession.mockResolvedValue("chat-1");
     mockUpdateChatWorkspaceSelection.mockResolvedValue({
       chat: {
@@ -921,7 +918,7 @@ describe("chat stream route proxy cancellation", () => {
       expect.objectContaining({
         parts: [],
         attachments: [],
-        selected_model: { id: "model-backend", model: "backend-model" },
+        model_selection: { offering_id: "model-backend" },
         enabled_tools: ["github", "web_fetch", "web_search"],
         workspace_binding: {
           kind: "edge_workspace",
@@ -1012,7 +1009,7 @@ describe("chat stream route proxy cancellation", () => {
     mockEnsureChatBackendSession.mockImplementation(
       () => new Promise(() => {}),
     );
-    mockResolveBackendModelName.mockImplementation(() => new Promise(() => {}));
+    mockResolveModelOfferingSelection.mockImplementation(() => new Promise(() => {}));
     const runtime = {
       sdk: {
         listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -1219,7 +1216,7 @@ describe("chat stream route proxy cancellation", () => {
       expect.objectContaining({
         parts: [],
         attachments: [],
-        selected_model: { id: "model-backend", model: "backend-model" },
+        model_selection: { offering_id: "model-backend" },
         workspace_binding: expect.objectContaining({
           kind: "edge_workspace",
           cwd: "/Users/test/astra",
@@ -1350,10 +1347,7 @@ describe("chat stream route artifact fetch optimization", () => {
       user: { user_id: "user-a" },
       response: null,
     } as never);
-    mockResolveBackendModelName.mockResolvedValue({
-      id: "model-backend",
-      model: "backend-model",
-    });
+    mockResolveModelOfferingSelection.mockResolvedValue({ offeringId: "model-backend" });
     mockEnsureChatBackendSession.mockResolvedValue("chat-1");
     mockBeginStreamingMessage.mockReturnValue({
       userMessage: {
@@ -1577,12 +1571,12 @@ describe("chat stream route artifact fetch optimization", () => {
       return "chat-1";
     });
 
-    // Override resolveBackendModelName to track timing
-    mockResolveBackendModelName.mockImplementation(async () => {
+    // Track Offering admission independently from session resolution.
+    mockResolveModelOfferingSelection.mockImplementation(async () => {
       callOrder.push("model-start");
       await new Promise((r) => setTimeout(r, 10));
       callOrder.push("model-end");
-      return { id: "model-backend", model: "backend-model" };
+      return { offeringId: "model-backend" };
     });
 
     const runtime = {
@@ -1619,7 +1613,7 @@ describe("chat stream route artifact fetch optimization", () => {
 
     // Both calls should have been made
     expect(mockEnsureChatBackendSession).toHaveBeenCalledTimes(1);
-    expect(mockResolveBackendModelName).toHaveBeenCalledTimes(1);
+    expect(mockResolveModelOfferingSelection).toHaveBeenCalledTimes(1);
 
     // They started concurrently: both "start" before either "end"
     const sessionStartIdx = callOrder.indexOf("session-start");

@@ -268,6 +268,19 @@ impl astra_services::ModelService for StubModelService {
         ))
     }
 
+    async fn get_model_by_offering_id(
+        &self,
+        offering_id: String,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        if offering_id == "model-mock-model" {
+            return Ok(bridge_test_model_record("mock-model".to_string()));
+        }
+        Err((
+            StatusCode::NOT_FOUND,
+            axum::Json(ErrorResponse::new("offering not found")),
+        ))
+    }
+
     async fn update_model(
         &self,
         _: String,

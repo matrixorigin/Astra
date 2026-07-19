@@ -43,7 +43,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       message: 'continue from the last failed migration',
       sessionId: 'sess-multi-1',
       agentId: 'agent-planner',
-      selectedModel: { model: 'claude-sonnet-4.6' },
+      modelSelection: { offeringId: 'offer-claude-sonnet-4.6' },
       context: {
         previousTurns: [
           { role: 'user', content: 'migrate auth table' },
@@ -66,7 +66,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       message: 'continue from the last failed migration',
       session_id: 'sess-multi-1',
       agent_id: 'agent-planner',
-      selected_model: { model: 'claude-sonnet-4.6' },
+      model_selection: { offering_id: 'offer-claude-sonnet-4.6' },
       context: {
         previousTurns: [
           { role: 'user', content: 'migrate auth table' },
@@ -100,7 +100,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       {
         message: 'turn 1: inspect the cache regression',
         sessionId: 'sess-ctx',
-        selectedModel: { model: 'claude-sonnet-4.6' },
+        modelSelection: { offeringId: 'offer-claude-sonnet-4.6' },
         context: { turn: 1, facts: ['cache_read_tokens unexpectedly zero'] },
         executionBudget: { initialTurns: 1, hardTurnLimit: 4 },
       },
@@ -113,7 +113,7 @@ describe('scenarios / multi-turn context wire contract', () => {
       {
         message: 'turn 2: apply the fix',
         sessionId: 'sess-ctx',
-        selectedModel: { model: 'claude-sonnet-4.6' },
+        modelSelection: { offeringId: 'offer-claude-sonnet-4.6' },
         context: {
           turn: 2,
           facts: ['cache_read_tokens unexpectedly zero', 'tool schema changed mid-session'],

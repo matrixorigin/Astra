@@ -821,8 +821,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
   const sendMessage = useCallback(
     (content: string) => {
-      if (!config.model) {
-        dispatch({ type: "SET_ERROR", error: "selectedModel.model is required" });
+      if (!config.offeringId) {
+        dispatch({ type: "SET_ERROR", error: "modelSelection.offeringId is required" });
         dispatch({ type: "SET_RUN_STATUS", status: null, waitingFor: null });
         dispatch({ type: "SET_STREAMING", isStreaming: false });
         return;
@@ -868,7 +868,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           message: content,
           sessionId: sessionId ?? undefined,
           agentId: config.agentId,
-          selectedModel: { model: config.model },
+          modelSelection: { offeringId: config.offeringId },
           agentBinding: config.agentBinding,
           runtimeProfile: config.runtimeProfile,
           executionBudget: config.executionBudget,
@@ -899,7 +899,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     [
       config.client,
       config.agentId,
-      config.model,
+      config.offeringId,
       config.agentBinding,
       config.runtimeProfile,
       config.executionBudget,

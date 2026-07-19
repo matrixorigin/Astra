@@ -452,12 +452,19 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SelectedModelRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway: Option<String>,
+pub struct ModelSelectionRequest {
+    pub offering_id: String,
+}
+
+/// Server-resolved model identity for one admitted Offering selection.
+///
+/// This is internal runtime context, not a client wire shape. The model name
+/// is derived from the catalog row selected by `offering_id` or from an
+/// authenticated external provider context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelSelection {
+    pub offering_id: String,
+    pub model_name: String,
 }
 
 pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
@@ -566,7 +573,8 @@ pub struct ChatRequestData {
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
-    pub selected_model: Option<SelectedModelRequest>,
+    pub model_selection: Option<ModelSelectionRequest>,
+    pub resolved_model_selection: Option<ResolvedModelSelection>,
     pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     pub provider_runtime_authorized: bool,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
@@ -633,7 +641,8 @@ impl std::fmt::Debug for ChatRequestData {
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
-            .field("selected_model", &self.selected_model)
+            .field("model_selection", &self.model_selection)
+            .field("resolved_model_selection", &self.resolved_model_selection)
             .field("capability_descriptors", &self.capability_descriptors)
             .field(
                 "provider_runtime_authorized",
@@ -10419,7 +10428,8 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
-            selected_model: None,
+            model_selection: None,
+            resolved_model_selection: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
@@ -10483,11 +10493,13 @@ mod tests {
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
-            model: None,
-            selected_model: Some(SelectedModelRequest {
-                id: None,
-                model: "gpt-4".to_string(),
-                gateway: Some("primary-gateway".to_string()),
+            model: Some("gpt-4".to_string()),
+            model_selection: Some(ModelSelectionRequest {
+                offering_id: "offer-gpt-4".to_string(),
+            }),
+            resolved_model_selection: Some(ResolvedModelSelection {
+                offering_id: "offer-gpt-4".to_string(),
+                model_name: "gpt-4".to_string(),
             }),
             capability_descriptors: None,
             provider_runtime_authorized: false,
@@ -10574,7 +10586,8 @@ mod tests {
                     session_id: None,
                     agent_id: None,
                     model: None,
-                    selected_model: None,
+                    model_selection: None,
+                    resolved_model_selection: None,
                     capability_descriptors: None,
                     provider_runtime_authorized: false,
                     agent_binding: None,

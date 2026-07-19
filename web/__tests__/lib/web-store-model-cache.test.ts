@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { WebRuntimeClient } from "@/lib/runtime-client/server";
-import { resolveBackendModelName } from "@/lib/api/web-store";
+import { resolveModelOfferingSelection } from "@/lib/api/web-store";
 import { resetModelCacheForTests } from "@/lib/api/model-cache";
 
 vi.mock("@/lib/runtime-client/server", async (importOriginal) => {
@@ -38,19 +38,19 @@ function makeRuntime(overrides: Partial<{ accessToken: string | null }> = {}) {
   return { client, mockListModels };
 }
 
-describe("resolveBackendModelName", () => {
+describe("resolveModelOfferingSelection", () => {
   beforeEach(() => {
     resetModelCacheForTests();
   });
 
-  it("resolves model name on first call via listModels", async () => {
+  it("admits an exact active Offering id on first call", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([
       { model_id: "sonnet-4.6-adaptive", name: "Sonnet 4.6" },
     ]);
 
-    const result = await resolveBackendModelName(client, "sonnet-4.6-adaptive");
-    expect(result).toEqual({ id: "sonnet-4.6-adaptive", model: "Sonnet 4.6" });
+    const result = await resolveModelOfferingSelection(client, "sonnet-4.6-adaptive");
+    expect(result).toEqual({ offeringId: "sonnet-4.6-adaptive" });
     expect(mockListModels).toHaveBeenCalledTimes(1);
   });
 
@@ -60,27 +60,28 @@ describe("resolveBackendModelName", () => {
       { model_id: "sonnet-4.6-adaptive", name: "Sonnet 4.6" },
     ]);
 
-    await resolveBackendModelName(client, "sonnet-4.6-adaptive");
-    await resolveBackendModelName(client, "sonnet-4.6-adaptive");
+    await resolveModelOfferingSelection(client, "sonnet-4.6-adaptive");
+    await resolveModelOfferingSelection(client, "sonnet-4.6-adaptive");
     // With cache: only 1 call
     expect(mockListModels).toHaveBeenCalledTimes(1);
   });
 
-  it("returns original model string when listModels does not match", async () => {
+  it("rejects a forged or stale Offering instead of falling back to a model name", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([
       { model_id: "opus-4.7", name: "Opus 4.7" },
     ]);
 
-    const result = await resolveBackendModelName(client, "unknown-model-xyz");
-    expect(result).toEqual({ model: "unknown-model-xyz" });
+    await expect(
+      resolveModelOfferingSelection(client, "unknown-model-xyz"),
+    ).rejects.toThrow("Model Offering 'unknown-model-xyz' is not available");
   });
 
   it("rejects missing model before listModels lookup", async () => {
     const { client, mockListModels } = makeRuntime();
 
-    await expect(resolveBackendModelName(client, "")).rejects.toThrow(
-      "model is required",
+    await expect(resolveModelOfferingSelection(client, "")).rejects.toThrow(
+      "offeringId must be an exact non-empty identifier",
     );
     expect(mockListModels).not.toHaveBeenCalled();
   });
@@ -90,15 +91,16 @@ describe("resolveBackendModelName", () => {
     mockListModels.mockRejectedValue(new Error("Network error"));
 
     await expect(
-      resolveBackendModelName(client, "sonnet-4.6-adaptive"),
-    ).rejects.toThrow("resolve backend model failed: Network error");
+      resolveModelOfferingSelection(client, "sonnet-4.6-adaptive"),
+    ).rejects.toThrow("resolve model Offering failed: Network error");
   });
 
-  it("skips listModels when no accessToken", async () => {
+  it("rejects unauthenticated selection without querying the catalog", async () => {
     const { client, mockListModels } = makeRuntime({ accessToken: null });
 
-    const result = await resolveBackendModelName(client, "sonnet-4.6-adaptive");
-    expect(result).toEqual({ model: "sonnet-4.6-adaptive" });
+    await expect(
+      resolveModelOfferingSelection(client, "sonnet-4.6-adaptive"),
+    ).rejects.toThrow("authenticated model access is required");
     expect(mockListModels).not.toHaveBeenCalled();
   });
 });

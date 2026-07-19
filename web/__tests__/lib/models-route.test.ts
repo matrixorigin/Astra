@@ -4,16 +4,10 @@ vi.mock("@/lib/runtime-client", () => ({
   requireRuntimeClient: vi.fn(),
 }));
 
-vi.mock("@/lib/api/web-store", () => ({
-  listModelSummaries: vi.fn(),
-}));
-
 import { GET } from "@/app/api/models/route";
-import { listModelSummaries } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
-const mockListModelSummaries = vi.mocked(listModelSummaries);
 
 function runtimeClient(
   accessToken: string | undefined,
@@ -62,6 +56,7 @@ describe("/api/models", () => {
     const payload = await response.json();
 
     expect(payload.source).toBe("astra");
+    expect(payload.status).toBe("ready");
     expect(payload.items).toHaveLength(2);
     expect(payload.items[0]).toMatchObject({
       id: "row-flash",
@@ -78,21 +73,17 @@ describe("/api/models", () => {
     expect(payload.items[1].subtitle).toContain("openai");
   });
 
-  it("uses static fallback models only when runtime listing is unavailable", async () => {
-    const fallbackModels = [
-      {
-        id: "sonnet-4.6-adaptive",
-        name: "Sonnet 4.6",
-        subtitle: "Responsive everyday work",
-        tier: "included" as const,
-      },
-    ];
+  it("surfaces Model Access failure instead of inventing static Offerings", async () => {
     mockRequireRuntimeClient.mockRejectedValue(new Error("not configured"));
-    mockListModelSummaries.mockReturnValue(fallbackModels);
 
     const response = await GET();
     const payload = await response.json();
 
-    expect(payload).toEqual({ items: fallbackModels, source: "fallback" });
+    expect(response.status).toBe(503);
+    expect(payload).toEqual({
+      error: "model_access_unavailable",
+      detail: "not configured",
+      action: "sign_in_or_retry",
+    });
   });
 });

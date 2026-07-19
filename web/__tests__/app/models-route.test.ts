@@ -1,26 +1,13 @@
 // @vitest-environment node
 
-vi.mock("@/lib/api/web-store", () => ({
-  listModelSummaries: vi.fn(() => [
-    {
-      id: "static-model",
-      name: "Static Model",
-      subtitle: "Static fallback",
-      tier: "included",
-    },
-  ]),
-}));
-
 vi.mock("@/lib/runtime-client", () => ({
   requireRuntimeClient: vi.fn(),
 }));
 
-import { listModelSummaries } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { GET } from "@/app/api/models/route";
 
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
-const mockListModelSummaries = vi.mocked(listModelSummaries);
 
 function runtimeClient(
   accessToken: string | undefined,
@@ -48,12 +35,12 @@ describe("/api/models route", () => {
     const response = await GET();
     const body = await response.json();
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(503);
     expect(body).toEqual({
-      error: "runtime_models_unavailable",
+      error: "model_access_unavailable",
       detail: "provider catalog down",
+      action: "sign_in_or_retry",
     });
-    expect(mockListModelSummaries).not.toHaveBeenCalled();
   });
 
   it("does not return fallback models when authenticated listModels is empty", async () => {
@@ -64,37 +51,26 @@ describe("/api/models route", () => {
     const response = await GET();
     const body = await response.json();
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
     expect(body).toEqual({
-      error: "runtime_models_unavailable",
-      detail: "Runtime returned no active models for the authenticated user.",
+      items: [],
+      source: "astra",
+      status: "unavailable",
+      action: "contact_admin",
     });
-    expect(mockListModelSummaries).not.toHaveBeenCalled();
   });
 
-  it("keeps static models for unauthenticated listModels failures", async () => {
-    mockRequireRuntimeClient.mockResolvedValue(
-      runtimeClient(
-        undefined,
-        vi.fn().mockRejectedValue(new Error("runtime unavailable")),
-      ) as never,
-    );
+  it("does not advertise fake models when authentication is unavailable", async () => {
+    mockRequireRuntimeClient.mockRejectedValue(new Error("sign in required"));
 
     const response = await GET();
     const body = await response.json();
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(503);
     expect(body).toEqual({
-      items: [
-        {
-          id: "static-model",
-          name: "Static Model",
-          subtitle: "Static fallback",
-          tier: "included",
-        },
-      ],
-      source: "fallback",
+      error: "model_access_unavailable",
+      detail: "sign in required",
+      action: "sign_in_or_retry",
     });
-    expect(mockListModelSummaries).toHaveBeenCalledTimes(1);
   });
 });

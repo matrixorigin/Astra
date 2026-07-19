@@ -112,7 +112,7 @@ describe('AstraWebSocket', () => {
 
     ws.sendMessage('hello', {
       sessionId: 's1',
-      selectedModel: { model: 'gpt-4' },
+      modelSelection: { offeringId: 'offer-gpt-4' },
     });
 
     const raw = (ws as any).ws as MockWebSocket;
@@ -121,34 +121,29 @@ describe('AstraWebSocket', () => {
       type: 'message',
       content: 'hello',
       session_id: 's1',
-      selected_model: { model: 'gpt-4' },
+      model_selection: { offering_id: 'offer-gpt-4' },
     });
   });
 
-  test('sendMessage preserves empty selectedModel.gateway for server-side validation', async () => {
+  test('sendMessage rejects client route authority', async () => {
     const ws = new AstraWebSocket({ url: 'ws://localhost/ws' });
     await ws.connect();
 
-    ws.sendMessage('hello', {
-      selectedModel: { model: 'kimi', gateway: '' },
-    });
-
-    const raw = (ws as any).ws as MockWebSocket;
-    const sent = JSON.parse(raw.sent[0]);
-    expect(sent).toEqual({
-      type: 'message',
-      content: 'hello',
-      selected_model: { model: 'kimi', gateway: '' },
-    });
+    expect(() => ws.sendMessage('hello', {
+      modelSelection: { offeringId: 'offer-kimi', gateway: 'primary' } as any,
+    })).toThrow("modelSelection contains unsupported field 'gateway'");
   });
 
-  test('sendMessage requires selectedModel.model', async () => {
+  test('sendMessage requires an exact Offering id', async () => {
     const ws = new AstraWebSocket({ url: 'ws://localhost/ws' });
     await ws.connect();
 
-    expect(() => ws.sendMessage('hello', {} as any)).toThrow('selectedModel.model is required');
-    expect(() => ws.sendMessage('hello', { selectedModel: { model: '' } })).toThrow(
-      'selectedModel.model is required',
+    expect(() => ws.sendMessage('hello', {} as any)).toThrow('modelSelection.offeringId is required');
+    expect(() => ws.sendMessage('hello', { modelSelection: { offeringId: '' } })).toThrow(
+      'modelSelection.offeringId is required',
+    );
+    expect(() => ws.sendMessage('hello', { modelSelection: { offeringId: ' offer-kimi' } })).toThrow(
+      'modelSelection.offeringId must be an exact identifier',
     );
   });
 

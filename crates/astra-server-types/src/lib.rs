@@ -99,7 +99,7 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     #[serde(default)]
-    pub selected_model: Option<astra_services::runs::SelectedModelRequest>,
+    pub model_selection: Option<astra_services::runs::ModelSelectionRequest>,
     #[serde(default)]
     pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
@@ -108,8 +108,6 @@ pub struct ChatRequest {
     pub runtime_auth: Option<astra_services::runs::RuntimeAuthRequest>,
     #[serde(default)]
     pub runtime_profile: Option<astra_services::runs::RuntimeProfileRequest>,
-    #[serde(default)]
-    pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
     #[serde(default)]
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
@@ -709,7 +707,7 @@ pub enum WsClientMessage {
         session_id: Option<String>,
         #[serde(default)]
         agent_id: Option<String>,
-        selected_model: astra_services::runs::SelectedModelRequest,
+        model_selection: astra_services::runs::ModelSelectionRequest,
         #[serde(default)]
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
@@ -1224,18 +1222,16 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         full_llm_capture: false,
         agent_id: request.agent_id,
-        model: request
-            .selected_model
-            .as_ref()
-            .map(|selected| selected.model.clone()),
-        selected_model: request.selected_model,
+        model: None,
+        model_selection: request.model_selection,
+        resolved_model_selection: None,
         capability_descriptors: request.capability_descriptors,
         provider_runtime_authorized: false,
         agent_binding: request.agent_binding,
         runtime_auth: request.runtime_auth,
         runtime_skill_binding: None,
         runtime_profile: request.runtime_profile,
-        llm_token_service: request.llm_token_service.map(Into::into),
+        llm_token_service: None,
         skill_search: request.skill_search,
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,

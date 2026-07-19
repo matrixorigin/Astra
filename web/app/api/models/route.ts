@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import type { RuntimeModelListItem } from "@astra/sdk";
 import type { ModelSummary } from "@/lib/api/types";
-import { listModelSummaries } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 
 export const dynamic = "force-dynamic";
@@ -28,7 +27,7 @@ function formatThinking(value: RuntimeModelListItem["thinking_capability"]) {
 }
 
 function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
-  const id = model.model_id ?? model.name;
+  const id = model.model_id;
   if (!id) {
     return null;
   }
@@ -50,54 +49,36 @@ function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
 }
 
 export async function GET() {
-  let runtime: Awaited<ReturnType<typeof requireRuntimeClient>>;
   try {
-    runtime = await requireRuntimeClient({
-      auth: "optional",
+    const runtime = await requireRuntimeClient({
+      auth: "required",
       operation: "list runtime models",
     });
-  } catch {
-    return NextResponse.json({
-      items: listModelSummaries(),
-      source: "fallback",
-    });
-  }
-
-  const authenticated = Boolean(runtime.config.accessToken);
-  try {
     const items = (await runtime.sdk.listModels())
       .filter((model) => model.is_active !== false)
       .map(toModelSummary)
       .filter((model): model is ModelSummary => model !== null);
 
-    if (items.length > 0) {
-      return NextResponse.json({ items, source: "astra" });
+    if (items.length === 0) {
+      return NextResponse.json({
+        items: [],
+        source: "astra",
+        status: "unavailable",
+        action: "contact_admin",
+      });
     }
-
-    if (authenticated) {
-      return NextResponse.json(
-        {
-          error: "runtime_models_unavailable",
-          detail:
-            "Runtime returned no active models for the authenticated user.",
-        },
-        { status: 502 },
-      );
-    }
+    return NextResponse.json({ items, source: "astra", status: "ready" });
   } catch (error) {
-    if (authenticated) {
-      return NextResponse.json(
-        {
-          error: "runtime_models_unavailable",
-          detail:
-            error instanceof Error
-              ? error.message
-              : "Failed to list runtime models.",
-        },
-        { status: 502 },
-      );
-    }
+    return NextResponse.json(
+      {
+        error: "model_access_unavailable",
+        detail:
+          error instanceof Error
+            ? error.message
+            : "Failed to load Model Access.",
+        action: "sign_in_or_retry",
+      },
+      { status: 503 },
+    );
   }
-
-  return NextResponse.json({ items: listModelSummaries(), source: "fallback" });
 }

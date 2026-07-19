@@ -49,7 +49,7 @@ describe('AstraClient — streamChat', () => {
       accessToken: 'tok-1',
     });
     const sse: SSEClient = client.streamChat(
-      { message: 'hello', selectedModel: { model: 'gpt' } },
+      { message: 'hello', modelSelection: { offeringId: 'offer-gpt' } },
       {
         onEvent: (e) => {
           if (e.type === 'session_info' || e.type === 'text_delta') events.push(e.type);
@@ -69,7 +69,7 @@ describe('AstraClient — streamChat', () => {
       JSON.stringify(
         chatRequestToWire({
           message: 'hello',
-          selectedModel: { model: 'gpt' },
+          modelSelection: { offeringId: 'offer-gpt' },
         }),
       ),
     );
@@ -90,7 +90,7 @@ describe('AstraClient — streamChat', () => {
       accessToken: 'x',
     });
     const sse = client.streamChat(
-      { message: 'a', selectedModel: { model: 'gpt' } },
+      { message: 'a', modelSelection: { offeringId: 'offer-gpt' } },
       { onEvent: () => {} },
     );
     await new Promise((r) => setTimeout(r, 30));

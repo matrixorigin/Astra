@@ -42,7 +42,6 @@ mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
 mod model_gateway_handlers;
-pub(crate) mod model_gateway_runtime;
 mod plan_handlers;
 mod platform_handlers;
 mod preferences_handlers;

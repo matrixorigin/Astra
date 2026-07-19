@@ -125,7 +125,7 @@ import {
 } from "./paths";
 import { SSEClient, parseSseDataEvents } from "./sse-client";
 import { headersInitToRecord, readAstraErrorDetail } from "./http";
-import { selectedModelToWire } from "./wire";
+import { modelSelectionToWire } from "./wire";
 
 type SessionWire = RuntimeSessionResponse;
 type SessionListWire = RuntimeSessionListResponse;
@@ -284,7 +284,7 @@ function normalizeReflectReport(
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
-    selected_model: selectedModelToWire(req.selectedModel),
+    model_selection: modelSelectionToWire(req.modelSelection),
   };
   if (req.parts) body.parts = req.parts;
   if (req.attachments) body.attachments = req.attachments;

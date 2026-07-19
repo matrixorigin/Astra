@@ -16,9 +16,9 @@ use serde_json::{Map, Value};
 
 use crate::models::ModelListItem;
 use crate::runs::{
-    RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
+    ModelSelectionRequest, ResolvedModelSelection, RuntimeAuthRequest,
+    RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
     RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
-    SelectedModelRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,11 +433,16 @@ pub struct ExternalSelectedModelResponse {
 }
 
 impl ExternalSelectedModelResponse {
-    pub fn to_selected_model_request(&self) -> SelectedModelRequest {
-        SelectedModelRequest {
-            id: Some(self.id.clone()),
-            model: self.model.clone(),
-            gateway: None,
+    pub fn to_model_selection_request(&self) -> ModelSelectionRequest {
+        ModelSelectionRequest {
+            offering_id: self.id.clone(),
+        }
+    }
+
+    pub fn to_resolved_model_selection(&self) -> ResolvedModelSelection {
+        ResolvedModelSelection {
+            offering_id: self.id.clone(),
+            model_name: self.model.clone(),
         }
     }
 }

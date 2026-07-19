@@ -348,6 +348,20 @@ impl astra_services::ModelService for ActiveTestModelService {
         ))
     }
 
+    async fn get_model_by_offering_id(
+        &self,
+        offering_id: String,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id == "model-test-model" {
+            return Ok(test_model_record("test-model".to_string()));
+        }
+        Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "offering not found",
+            "offering_not_found",
+        ))
+    }
+
     async fn update_model(
         &self,
         _model_name: String,
@@ -3431,10 +3445,12 @@ fn test_request(message: &str) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
-        selected_model: Some(SelectedModelRequest {
-            id: None,
-            model: "test-model".to_string(),
-            gateway: None,
+        model_selection: Some(ModelSelectionRequest {
+            offering_id: "model-test-model".to_string(),
+        }),
+        resolved_model_selection: Some(ResolvedModelSelection {
+            offering_id: "model-test-model".to_string(),
+            model_name: "test-model".to_string(),
         }),
         capability_descriptors: None,
         provider_runtime_authorized: false,
@@ -5043,40 +5059,49 @@ async fn validate_request_constraints_allows_explicit_request_scoped_runtime_mcp
 }
 
 #[tokio::test]
-async fn validate_request_constraints_requires_selected_model() {
+async fn validate_request_constraints_requires_model_selection() {
     let service = test_service();
     let mut request = test_request("hello");
     request.model = None;
-    request.selected_model = None;
+    request.model_selection = None;
+    request.resolved_model_selection = None;
 
     let err = service
         .validate_request_constraints("u1", &request)
         .await
-        .expect_err("selected_model is required for every chat stream request");
+        .expect_err("model selection is required for every chat stream request");
 
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("selected_model_missing")
+        Some("model_selection_missing")
     );
 }
 
-#[test]
-fn prepare_chat_request_rejects_empty_effective_user_input() {
+#[tokio::test]
+async fn prepare_chat_request_rejects_empty_effective_user_input() {
+    let service = test_service();
     let request = test_request("   ");
-    let err = AgenticRunLifecycleService::prepare_chat_request(request)
+    let err = service
+        .prepare_chat_request(request)
+        .await
         .expect_err("empty message and missing user_intent must be rejected");
 
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert_eq!(err.1.0.error_code.as_deref(), Some("chat_input_empty"));
 }
 
-#[test]
-fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message_is_empty() {
+#[tokio::test]
+async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message_is_empty() {
+    let service = test_service();
     let mut request = test_request("   ");
     request.user_intent = Some("continue the approved plan".to_string());
+    request.model = None;
+    request.resolved_model_selection = None;
 
-    let prepared = AgenticRunLifecycleService::prepare_chat_request(request)
+    let prepared = service
+        .prepare_chat_request(request)
+        .await
         .expect("non-empty user_intent is valid effective input");
 
     assert_eq!(prepared.model.as_deref(), Some("test-model"));
@@ -5094,120 +5119,25 @@ async fn validate_request_constraints_allows_native_model_without_gateway_auth()
     service
         .validate_request_constraints("u1", &request)
         .await
-        .expect("native selected_model.model should not require runtime_auth");
+        .expect("catalog-resolved Offering should not require runtime_auth");
 }
 
 #[tokio::test]
-async fn validate_request_constraints_rejects_unknown_native_model_without_gateway() {
+async fn prepare_chat_request_rejects_unknown_offering_without_name_fallback() {
     let service = test_service();
     let mut request = test_request("hello");
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "missing-model".to_string(),
-        gateway: None,
+    request.model = None;
+    request.resolved_model_selection = None;
+    request.model_selection = Some(ModelSelectionRequest {
+        offering_id: "missing-model".to_string(),
     });
 
     let err = service
-        .validate_request_constraints("u1", &request)
+        .prepare_chat_request(request)
         .await
-        .expect_err("unknown native model should fail without gateway");
+        .expect_err("unknown Offering must not fall back to a model name");
 
     assert_eq!(err.0, StatusCode::NOT_FOUND);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("selected_model_not_configured")
-    );
-}
-
-#[tokio::test]
-async fn validate_request_constraints_requires_runtime_auth_for_gateway() {
-    let service = test_service();
-    let mut request = test_request("hello");
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "external-model".to_string(),
-        gateway: Some("primary-gateway".to_string()),
-    });
-
-    let err = service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect_err("gateway selected_model must require runtime_auth");
-
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("agent_binding_runtime_auth_missing")
-    );
-}
-
-#[tokio::test]
-async fn validate_request_constraints_rejects_unknown_selected_model_gateway() {
-    let service = test_service()
-        .with_model_gateway_service(Arc::new(astra_services::InMemoryModelGatewayService::new()));
-    let mut request = test_request("hello");
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "external-model".to_string(),
-        gateway: Some("primary-gateway".to_string()),
-    });
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-
-    let err = service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect_err("unknown selected_model.gateway should fail before loop start");
-
-    assert_eq!(err.0, StatusCode::NOT_FOUND);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("model_gateway_not_found")
-    );
-}
-
-#[tokio::test]
-async fn validate_request_constraints_rejects_disabled_selected_model_gateway() {
-    let gateway_service = astra_services::InMemoryModelGatewayService::new();
-    astra_services::ModelGatewayService::create_gateway(
-        &gateway_service,
-        astra_services::ModelGatewayCreateRequestData {
-            id: "primary-gateway".to_string(),
-            resolve_url: "https://models.example.com/resolve".to_string(),
-            model_protocol: astra_services::ModelProtocol::OpenAiChatCompletions,
-            metadata: None,
-        },
-    )
-    .await
-    .expect("gateway create");
-    astra_services::ModelGatewayService::disable_gateway(
-        &gateway_service,
-        "primary-gateway".to_string(),
-    )
-    .await
-    .expect("gateway disable");
-    let service = test_service().with_model_gateway_service(Arc::new(gateway_service));
-    let mut request = test_request("hello");
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "external-model".to_string(),
-        gateway: Some("primary-gateway".to_string()),
-    });
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-
-    let err = service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect_err("disabled selected_model.gateway should fail before loop start");
-
-    assert_eq!(err.0, StatusCode::CONFLICT);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("model_gateway_disabled")
-    );
 }
 
 fn test_runtime_descriptor(
@@ -5231,11 +5161,6 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
     let service = test_service();
     let mut request = test_request("hello");
     request.provider_runtime_authorized = true;
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "qwen3.7-max".to_string(),
-        gateway: None,
-    });
     request.runtime_auth = Some(RuntimeAuthRequest {
         authorization: "Bearer runtime-grant".to_string(),
     });
@@ -5269,50 +5194,9 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
 }
 
 #[tokio::test]
-async fn validate_request_constraints_rejects_provider_descriptor_with_selected_model_gateway() {
-    let service = test_service();
-    let mut request = test_request("hello");
-    request.provider_runtime_authorized = true;
-    request.selected_model = Some(SelectedModelRequest {
-        id: None,
-        model: "qwen3.7-max".to_string(),
-        gateway: Some("primary-gateway".to_string()),
-    });
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-    request.capability_descriptors =
-        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-            model_gateway: Some(test_runtime_descriptor(
-                "moi-model-gateway",
-                "model_gateway",
-                "http://127.0.0.1/model-gateway",
-            )),
-            mcp: None,
-            skills: None,
-            edge_agent: None,
-        });
-
-    let err = service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect_err("provider descriptor path must not accept selected_model.gateway");
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("selected_model_invalid")
-    );
-}
-
-#[tokio::test]
 async fn validate_request_constraints_rejects_descriptor_without_provider_authorization() {
     let service = test_service();
     let mut request = test_request("hello");
-    request.selected_model = Some(SelectedModelRequest {
-        id: Some("model-qwen".to_string()),
-        model: "qwen3.7-max".to_string(),
-        gateway: None,
-    });
     request.runtime_auth = Some(RuntimeAuthRequest {
         authorization: "Bearer runtime-grant".to_string(),
     });
@@ -7853,7 +7737,8 @@ fn extract_edge_tools_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
-        selected_model: None,
+        model_selection: None,
+        resolved_model_selection: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
@@ -8025,7 +7910,8 @@ fn extract_edge_profile_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
-        selected_model: None,
+        model_selection: None,
+        resolved_model_selection: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
@@ -8829,9 +8715,11 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
     );
     let manifest =
         AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
-            .expect("selected_model should produce a runtime manifest");
-    assert_eq!(manifest["selected_model"]["model"], "test-model");
-    assert!(manifest["selected_model"].get("gateway").is_none());
+            .expect("model selection should produce a runtime manifest");
+    assert_eq!(
+        manifest["model_selection"]["offering_id"],
+        "model-test-model"
+    );
     assert_eq!(
         manifest["model_resolution"]["source"],
         "provider_descriptor"
@@ -8868,12 +8756,16 @@ fn runtime_manifest_preserves_server_only_backbone_without_workspace_executor() 
         &PreparedRuntimeCapabilities::default(),
         false,
     )
-    .expect("selected_model should produce a server-only runtime manifest");
+    .expect("model selection should produce a server-only runtime manifest");
 
     assert_eq!(manifest["schema_version"], "astra_runtime_manifest.v1");
     assert_eq!(manifest["runtime_profile"], "astra_native");
-    assert_eq!(manifest["selected_model"]["model"], "test-model");
-    assert_eq!(manifest["model_resolution"]["source"], "astra_native");
+    assert_eq!(
+        manifest["model_selection"]["offering_id"],
+        "model-test-model"
+    );
+    assert_eq!(manifest["model_resolution"]["source"], "catalog_offering");
+    assert_eq!(manifest["model_resolution"]["model"], "test-model");
     assert_eq!(manifest["model_resolution"]["resolved"], true);
     assert_eq!(
         manifest["turn"]["message"],
@@ -8972,10 +8864,12 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
 
     let manifest =
         AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
-            .expect("selected_model should produce a runtime manifest");
+            .expect("model selection should produce a runtime manifest");
 
-    assert_eq!(manifest["selected_model"]["model"], "test-model");
-    assert!(manifest["selected_model"].get("gateway").is_none());
+    assert_eq!(
+        manifest["model_selection"]["offering_id"],
+        "model-test-model"
+    );
     assert_eq!(manifest["runtime_profile"], "agent_binding_registry");
     assert_eq!(manifest["turn"]["message"], "use binding tools");
     assert_eq!(manifest["turn"]["parts"][0]["type"], "text");

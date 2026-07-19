@@ -113,7 +113,7 @@ fn chat_request_all_fields() {
         "message": "hello",
         "session_id": "s1",
         "agent_id": "a1",
-        "selected_model": {"id": "model-gpt-4", "model": "gpt-4"},
+        "model_selection": {"offering_id": "model-gpt-4"},
         "capability_descriptors": {
             "model_gateway": {
                 "id": "moi-model-gateway",
@@ -123,10 +123,6 @@ fn chat_request_all_fields() {
                 "protocol": "openai_responses",
                 "metadata": {}
             }
-        },
-        "llm_token_service": {
-            "url": "http://catalog:8081/api/v1/llm-token",
-            "timeout_ms": 2500
         },
         "runtime_mcp_bindings": [
             {
@@ -146,15 +142,9 @@ fn chat_request_all_fields() {
     assert_eq!(req.session_id.as_deref(), Some("s1"));
     assert_eq!(req.agent_id.as_deref(), Some("a1"));
     assert_eq!(
-        req.selected_model
+        req.model_selection
             .as_ref()
-            .map(|selected| selected.model.as_str()),
-        Some("gpt-4")
-    );
-    assert_eq!(
-        req.selected_model
-            .as_ref()
-            .and_then(|selected| selected.id.as_deref()),
+            .map(|selection| selection.offering_id.as_str()),
         Some("model-gpt-4")
     );
     assert_eq!(
@@ -163,14 +153,6 @@ fn chat_request_all_fields() {
             .and_then(|descriptors| descriptors.model_gateway.as_ref())
             .map(|descriptor| descriptor.endpoint_url.as_str()),
         Some("http://catalog:8081/api/v1/model-gateway")
-    );
-    assert_eq!(
-        req.llm_token_service.as_ref().map(|v| v.url.as_str()),
-        Some("http://catalog:8081/api/v1/llm-token")
-    );
-    assert_eq!(
-        req.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
-        Some(2500)
     );
     assert_eq!(req.runtime_mcp_bindings.len(), 1);
     assert_eq!(req.runtime_mcp_bindings[0].id, "external_nl2sql");
@@ -200,7 +182,7 @@ fn chat_request_all_fields() {
 #[test]
 fn chat_request_rejects_legacy_top_level_model_field() {
     let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"model":"gpt-4"}"#,
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"model":"gpt-4"}"#,
     );
     assert!(result.is_err(), "legacy top-level model must be rejected");
     let err = result.err().unwrap();
@@ -211,43 +193,57 @@ fn chat_request_rejects_legacy_top_level_model_field() {
 }
 
 #[test]
-fn chat_request_rejects_selected_model_string_form() {
+fn chat_request_rejects_model_selection_string_form() {
     let result =
-        serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":"gpt-4"}"#);
+        serde_json::from_str::<ChatRequest>(r#"{"message":"hello","model_selection":"gpt-4"}"#);
     assert!(
         result.is_err(),
-        "selected_model must be an object, not a string"
+        "model_selection must be an object, not a string"
     );
 }
 
 #[test]
-fn chat_request_rejects_selected_model_missing_model() {
-    let result = serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":{}}"#);
-    assert!(result.is_err(), "selected_model.model is required");
+fn chat_request_rejects_model_selection_missing_offering_id() {
+    let result = serde_json::from_str::<ChatRequest>(r#"{"message":"hello","model_selection":{}}"#);
+    assert!(result.is_err(), "model_selection.offering_id is required");
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("missing field `model`"),
+        err.to_string().contains("missing field `offering_id`"),
         "unexpected error: {err}"
     );
 }
 
 #[test]
-fn chat_request_rejects_selected_model_unknown_field() {
+fn chat_request_rejects_model_selection_route_fields() {
     let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4","provider":"openai"}}"#,
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4","gateway":"primary"}}"#,
     );
-    assert!(result.is_err(), "selected_model must reject unknown fields");
+    assert!(
+        result.is_err(),
+        "model_selection must reject route authority"
+    );
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("unknown field `provider`"),
+        err.to_string().contains("unknown field `gateway`"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn chat_request_rejects_client_supplied_llm_token_service() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"llm_token_service":{"url":"https://attacker.invalid"}}"#,
+    );
+    assert!(
+        result.is_err(),
+        "clients must not choose an inference endpoint"
     );
 }
 
 #[test]
 fn chat_request_rejects_runtime_auth_credentials_map() {
     let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"runtime_auth":{"credentials":{"token":"secret"}}}"#,
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"runtime_auth":{"credentials":{"token":"secret"}}}"#,
     );
     assert!(
         result.is_err(),
@@ -258,7 +254,7 @@ fn chat_request_rejects_runtime_auth_credentials_map() {
 #[test]
 fn chat_request_rejects_agent_binding_model_capability_ref() {
     let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
     );
     assert!(
         result.is_err(),
@@ -1197,10 +1193,8 @@ fn chat_request_into_data_maps_all_fields() {
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
-        selected_model: Some(astra_services::runs::SelectedModelRequest {
-            id: None,
-            model: "gpt-4".into(),
-            gateway: None,
+        model_selection: Some(astra_services::runs::ModelSelectionRequest {
+            offering_id: "offer-gpt-4".into(),
         }),
         capability_descriptors: None,
         agent_binding: None,
@@ -1208,10 +1202,6 @@ fn chat_request_into_data_maps_all_fields() {
         runtime_profile: None,
         workspace_binding: None,
         executor_binding: None,
-        llm_token_service: Some(astra_services::LlmTokenServiceRequest {
-            url: "http://catalog:8081/api/v1/llm-token".into(),
-            timeout_ms: Some(2500),
-        }),
         skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_skill_sources: None,
@@ -1258,15 +1248,18 @@ fn chat_request_into_data_maps_all_fields() {
     );
     assert_eq!(data.session_id.as_deref(), Some("s1"));
     assert_eq!(data.agent_id.as_deref(), Some("a1"));
-    assert_eq!(data.model.as_deref(), Some("gpt-4"));
-    assert_eq!(
-        data.llm_token_service.as_ref().map(|v| v.url.as_str()),
-        Some("http://catalog:8081/api/v1/llm-token")
+    assert!(
+        data.model.is_none(),
+        "wire conversion must not resolve routes"
     );
     assert_eq!(
-        data.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
-        Some(2500)
+        data.model_selection
+            .as_ref()
+            .map(|selection| selection.offering_id.as_str()),
+        Some("offer-gpt-4")
     );
+    assert!(data.resolved_model_selection.is_none());
+    assert!(data.llm_token_service.is_none());
     assert_eq!(
         data.skill_search,
         Some(astra_core::SkillSearchSettings::default())
@@ -1331,14 +1324,13 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         runtime_system_prompt: None,
         session_id: None,
         agent_id: None,
-        selected_model: None,
+        model_selection: None,
         capability_descriptors: None,
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
         workspace_binding: None,
         executor_binding: None,
-        llm_token_service: None,
         skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,

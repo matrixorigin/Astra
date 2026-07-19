@@ -292,7 +292,7 @@ describe("AstraClient — Runs", () => {
 
     const result = await createClient().createRun({
       message: "hello",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(result.runId).toBe("r1");
     expect(result.sessionId).toBe("s1");
@@ -1218,7 +1218,7 @@ describe("chatRequestToWire", () => {
   test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       allowSkills: ["a", "b"],
       allowTools: ["t1"],
       enabledTools: ["web_search", "web_fetch"],
@@ -1241,7 +1241,7 @@ describe("chatRequestToWire", () => {
   test("omits allow lists when empty", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       allowSkills: [],
       allowTools: [],
     });
@@ -1252,7 +1252,7 @@ describe("chatRequestToWire", () => {
   test("preserves an empty optional-tool set as an explicit disablement", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
       enabledTools: [],
     });
     expect(body.enabled_tools).toEqual([]);
@@ -1261,27 +1261,16 @@ describe("chatRequestToWire", () => {
   test("default request omits execution_budget", () => {
     const body = chatRequestToWire({
       message: "m",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(body.execution_budget).toBeUndefined();
   });
 
-  test("preserves empty selectedModel.gateway for server-side validation", () => {
-    const body = chatRequestToWire({
+  test("rejects route fields instead of forwarding client authority", () => {
+    expect(() => chatRequestToWire({
       message: "m",
-      selectedModel: { model: "kimi", gateway: "" },
-    });
-
-    expect(body.selected_model).toEqual({ model: "kimi", gateway: "" });
-  });
-
-  test("preserves selectedModel.id for external runtime context", () => {
-    const body = chatRequestToWire({
-      message: "m",
-      selectedModel: { id: "model-kimi", model: "kimi" },
-    });
-
-    expect(body.selected_model).toEqual({ id: "model-kimi", model: "kimi" });
+      modelSelection: { offeringId: "offer-kimi", gateway: "primary" } as any,
+    })).toThrow("modelSelection contains unsupported field 'gateway'");
   });
 
   test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
@@ -1295,7 +1284,7 @@ describe("chatRequestToWire", () => {
       },
       sessionId: "sess-1",
       agentId: "ag-1",
-      selectedModel: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
+      modelSelection: { offeringId: "offer-kimi" },
       agentBinding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capabilityServerRefs: {
@@ -1338,7 +1327,7 @@ describe("chatRequestToWire", () => {
       },
       session_id: "sess-1",
       agent_id: "ag-1",
-      selected_model: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
+      model_selection: { offering_id: "offer-kimi" },
       agent_binding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capability_server_refs: {
@@ -1376,10 +1365,10 @@ describe("chatRequestToWire", () => {
   test("omits undefined optional fields", () => {
     const body = chatRequestToWire({
       message: "x",
-      selectedModel: { model: "test-model" },
+      modelSelection: { offeringId: "offer-test-model" },
     });
     expect(Object.keys(body).sort()).toEqual(
-      ["message", "selected_model"].sort(),
+      ["message", "model_selection"].sort(),
     );
   });
 });

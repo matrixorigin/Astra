@@ -784,7 +784,8 @@ export type ChatConfig = {
   apiUrl?: string;
   sessionId?: string;
   agentId?: string;
-  model?: string;
+  /** Effective Offering selected from Astra's model-access projection. */
+  offeringId?: string;
   /** Durable binding for external MCP and skill capability servers. */
   agentBinding?: AgentBindingSelection;
   /** Runtime capability resolution mode used for this chat surface. */
@@ -856,10 +857,8 @@ export type ChatRequest = {
   attachments?: unknown[];
   sessionId?: string;
   agentId?: string;
-  selectedModel: {
-    id?: string;
-    model: string;
-    gateway?: string;
+  modelSelection: {
+    offeringId: string;
   };
   agentBinding?: AgentBindingSelection;
   runtimeAuth?: {

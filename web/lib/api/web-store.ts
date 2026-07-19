@@ -2455,10 +2455,10 @@ async function callBackendAgent(params: {
 
   try {
     const client = await requireRuntimeClient({
-      auth: "optional",
+      auth: "required",
       operation: "start web chat turn",
     });
-    const selectedModel = await resolveBackendModelName(client, params.model);
+    const modelSelection = await resolveModelOfferingSelection(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
     const activeTools = normalizedActiveTools(
       params.activeTools,
@@ -2469,7 +2469,7 @@ async function callBackendAgent(params: {
       {
         message: params.text,
         sessionId: params.sessionId,
-        selectedModel,
+        modelSelection,
         allowSkills: activeSkills.length ? activeSkills : undefined,
         enabledTools: activeTools,
         context: {
@@ -2656,13 +2656,12 @@ function parseRunSseText(text: string): StreamResult {
   };
 }
 
-export async function resolveBackendModelName(
+export async function resolveModelOfferingSelection(
   runtime: RuntimeConfig | WebRuntimeClient,
-  model: string,
-): Promise<{ id?: string; model: string }> {
-  const requestedModel = model.trim();
-  if (!requestedModel) {
-    throw new Error("model is required");
+  offeringId: string,
+): Promise<{ offeringId: string }> {
+  if (!offeringId || offeringId.trim() !== offeringId) {
+    throw new Error("offeringId must be an exact non-empty identifier");
   }
 
   try {
@@ -2672,12 +2671,16 @@ export async function resolveBackendModelName(
         : new WebRuntimeClient(runtime);
     const accessToken = client.config.accessToken;
     if (!accessToken) {
-      return { model: requestedModel };
+      throw new Error("authenticated model access is required");
     }
 
     const cached = modelCache.get(accessToken);
     let modelsPromise: Promise<
-      Array<{ model_id?: string | null; name?: string | null }>
+      Array<{
+        model_id?: string | null;
+        name?: string | null;
+        is_active?: boolean | null;
+      }>
     >;
     if (cached) {
       modelsPromise = cached;
@@ -2691,24 +2694,15 @@ export async function resolveBackendModelName(
       throw err;
     });
     const matched = models.find(
-      (item) =>
-        item.model_id === requestedModel || item.name === requestedModel,
+      (item) => item.model_id === offeringId && item.is_active !== false,
     );
-    return matched
-      ? {
-          id:
-            typeof matched.model_id === "string" ? matched.model_id : undefined,
-          model:
-            typeof matched.name === "string"
-              ? matched.name
-              : typeof matched.model_id === "string"
-                ? matched.model_id
-                : requestedModel,
-        }
-      : { model: requestedModel };
+    if (!matched) {
+      throw new Error(`Model Offering '${offeringId}' is not available`);
+    }
+    return { offeringId };
   } catch (error) {
     throw new Error(
-      `resolve backend model failed: ${error instanceof Error ? error.message : String(error)}`,
+      `resolve model Offering failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }

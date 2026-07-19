@@ -64,7 +64,7 @@ describe('scenarios / multi-agent delegation', () => {
       {
         message: 'coordinate agents',
         sessionId: 'sess-agents',
-        selectedModel: { model: 'gpt' },
+        modelSelection: { offeringId: 'offer-gpt' },
       },
       {
         onEvent: (event) => events.push(event),

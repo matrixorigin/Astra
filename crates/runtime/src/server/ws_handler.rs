@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "selected_model": {"model": "..."}, "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model_selection": {"offering_id": "..."}, "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -143,7 +143,7 @@ pub(super) struct WsChatMessage {
     session_id: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
-    selected_model: astra_services::runs::SelectedModelRequest,
+    model_selection: astra_services::runs::ModelSelectionRequest,
     #[serde(default)]
     skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
@@ -589,7 +589,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     user_intent,
                                     session_id,
                                     agent_id,
-                                    selected_model,
+                                    model_selection,
                                     skill_search,
                                     allow_skills,
                                     allow_skill_sources,
@@ -610,7 +610,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     user_intent,
                                     session_id,
                                     agent_id,
-                                    selected_model,
+                                    model_selection,
                                     skill_search,
                                     allow_skills,
                                     allow_skill_sources,
@@ -726,7 +726,7 @@ async fn handle_chat_message(
     user_intent: Option<String>,
     requested_session_id: Option<String>,
     agent_id: Option<String>,
-    selected_model: astra_services::runs::SelectedModelRequest,
+    model_selection: astra_services::runs::ModelSelectionRequest,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
@@ -752,7 +752,7 @@ async fn handle_chat_message(
         user_intent,
         request_session_id,
         agent_id,
-        selected_model,
+        model_selection,
         skill_search,
         allow_skills,
         allow_skill_sources,
@@ -1213,7 +1213,7 @@ fn build_ws_chat_request(
     user_intent: Option<String>,
     session_id: Option<String>,
     agent_id: Option<String>,
-    selected_model: astra_services::runs::SelectedModelRequest,
+    model_selection: astra_services::runs::ModelSelectionRequest,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
@@ -1226,7 +1226,6 @@ fn build_ws_chat_request(
     plan_subtask_id: Option<String>,
     is_plan_subtask: Option<bool>,
 ) -> astra_services::runs::ChatRequestData {
-    let model = Some(selected_model.model.clone());
     astra_services::runs::ChatRequestData {
         message: content.to_string(),
         user_intent,
@@ -1236,8 +1235,9 @@ fn build_ws_chat_request(
         session_id,
         full_llm_capture: false,
         agent_id,
-        model,
-        selected_model: Some(selected_model),
+        model: None,
+        model_selection: Some(model_selection),
+        resolved_model_selection: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
@@ -2519,7 +2519,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "user_intent": "pure hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "enabled_tools": ["web_search", "web_fetch"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "user_intent": "pure hello", "session_id": "s1", "agent_id": "agent-1", "model_selection": {"offering_id": "offer-gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "enabled_tools": ["web_search", "web_fetch"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
@@ -2528,7 +2528,7 @@ mod tests {
                     user_intent,
                     session_id,
                     agent_id,
-                    selected_model,
+                    model_selection,
                     skill_search,
                     allow_skills,
                     allow_skill_sources,
@@ -2545,7 +2545,7 @@ mod tests {
                 assert_eq!(user_intent.as_deref(), Some("pure hello"));
                 assert_eq!(session_id, Some("s1".into()));
                 assert_eq!(agent_id.as_deref(), Some("agent-1"));
-                assert_eq!(selected_model.model, "gpt-5.4");
+                assert_eq!(model_selection.offering_id, "offer-gpt-5.4");
                 assert_eq!(
                     skill_search,
                     Some(astra_core::SkillSearchSettings {
@@ -2583,14 +2583,13 @@ mod tests {
 
     #[test]
     fn parse_chat_message_minimal() {
-        let json =
-            r#"{"type": "message", "content": "你好", "selected_model": {"model": "gpt-5.4"}}"#;
+        let json = r#"{"type": "message", "content": "你好", "model_selection": {"offering_id": "offer-gpt-5.4"}}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
                     content,
-                    selected_model,
+                    model_selection,
                     agent_id,
                     skill_search,
                     allow_skills,
@@ -2603,7 +2602,7 @@ mod tests {
                     ..
                 } = *message;
                 assert_eq!(content, "你好");
-                assert_eq!(selected_model.model, "gpt-5.4");
+                assert_eq!(model_selection.offering_id, "offer-gpt-5.4");
                 assert!(agent_id.is_none());
                 assert!(skill_search.is_none());
                 assert!(allow_skills.is_none());
@@ -2619,10 +2618,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_chat_message_rejects_missing_selected_model() {
+    fn parse_chat_message_rejects_missing_model_selection() {
         let json = r#"{"type": "message", "content": "你好"}"#;
         serde_json::from_str::<WsClientMessage>(json)
-            .expect_err("selected_model is required for websocket chat messages");
+            .expect_err("model_selection is required for websocket chat messages");
     }
 
     #[test]
@@ -2715,10 +2714,8 @@ mod tests {
             Some("pure hello".into()),
             Some("session-1".into()),
             Some("agent-1".into()),
-            astra_services::runs::SelectedModelRequest {
-                id: None,
-                model: "gpt-5.4".into(),
-                gateway: None,
+            astra_services::runs::ModelSelectionRequest {
+                offering_id: "offer-gpt-5.4".into(),
             },
             Some(astra_core::SkillSearchSettings {
                 dynamic_surface: false,
@@ -2747,14 +2744,15 @@ mod tests {
         assert_eq!(request.user_intent.as_deref(), Some("pure hello"));
         assert_eq!(request.session_id.as_deref(), Some("session-1"));
         assert_eq!(request.agent_id.as_deref(), Some("agent-1"));
-        assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
+        assert!(request.model.is_none());
         assert_eq!(
             request
-                .selected_model
+                .model_selection
                 .as_ref()
-                .map(|selected| selected.model.as_str()),
-            Some("gpt-5.4")
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-gpt-5.4")
         );
+        assert!(request.resolved_model_selection.is_none());
         assert_eq!(
             request.skill_search,
             Some(astra_core::SkillSearchSettings {
@@ -3940,18 +3938,18 @@ mod tests {
             "type": "message",
             "content": "show PRs",
             "session_id": "s1",
-            "selected_model": {"model": "gpt-4"},
+            "model_selection": {"offering_id": "offer-gpt-4"},
             "context": {"cwd": "/home/user/project"}
         }"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
-                    selected_model,
+                    model_selection,
                     context,
                     ..
                 } = *message;
-                assert_eq!(selected_model.model, "gpt-4");
+                assert_eq!(model_selection.offering_id, "offer-gpt-4");
                 assert!(context.is_some());
                 assert_eq!(
                     context.unwrap().get("cwd").unwrap().as_str().unwrap(),
@@ -4143,7 +4141,8 @@ mod tests {
 
     #[test]
     fn chat_message_empty_content() {
-        let json = r#"{"type":"message","content":"","selected_model":{"model":"gpt-5.4"}}"#;
+        let json =
+            r#"{"type":"message","content":"","model_selection":{"offering_id":"offer-gpt-5.4"}}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => assert!(message.content.is_empty()),
@@ -4733,7 +4732,7 @@ mod tests {
     fn all_client_message_variants_parse() {
         let inputs = [
             r#"{"type":"auth","token":"t1"}"#,
-            r#"{"type":"message","content":"hello","selected_model":{"model":"gpt-5.4"}}"#,
+            r#"{"type":"message","content":"hello","model_selection":{"offering_id":"offer-gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
             r#"{"type":"user_prompt","request_id":"req-2","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,

@@ -44,7 +44,7 @@ describe('scenarios / workspace stream', () => {
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 'at' });
     const sse = client.streamChat(
-      { message: 'hi', selectedModel: { model: 'gpt' } },
+      { message: 'hi', modelSelection: { offeringId: 'offer-gpt' } },
       { onEvent: (e: StreamEvent) => order.push(e.type) },
     );
     await new Promise((r) => setTimeout(r, 120));
@@ -83,7 +83,7 @@ describe('scenarios / tool loop', () => {
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     const sse = client.streamChat(
-      { message: 'run tool', selectedModel: { model: 'gpt' } },
+      { message: 'run tool', modelSelection: { offeringId: 'offer-gpt' } },
       { onEvent: (e: StreamEvent) => seq.push(e.type) },
     );
     await new Promise((r) => setTimeout(r, 100));
@@ -266,7 +266,7 @@ describe('scenarios / error ordering (turn_complete then error)', () => {
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     const sse = client.streamChat(
-      { message: 'x', selectedModel: { model: 'gpt' } },
+      { message: 'x', modelSelection: { offeringId: 'offer-gpt' } },
       { onEvent: (e: StreamEvent) => types.push(e.type) },
     );
     await new Promise((r) => setTimeout(r, 80));

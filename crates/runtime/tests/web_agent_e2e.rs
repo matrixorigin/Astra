@@ -501,6 +501,22 @@ impl ModelService for TestModelService {
         Ok(test_model_record(model_name))
     }
 
+    async fn get_model_by_offering_id(
+        &self,
+        offering_id: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let model_name = offering_id
+            .strip_prefix("model-")
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new("offering not found")),
+                )
+            })?
+            .to_string();
+        Ok(test_model_record(model_name))
+    }
+
     async fn update_model(
         &self,
         _: String,

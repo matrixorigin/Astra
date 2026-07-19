@@ -386,6 +386,60 @@ pub struct ResolvedActiveLlmModel {
     pub request_headers: Option<Map<String, Value>>,
 }
 
+/// An effective Offering resolved to the concrete active model used by the
+/// current Server implementation.
+///
+/// Phase 0 intentionally reuses the durable `infra_llm_models.model_id` as the
+/// Offering identity. Callers must select by this identity; model names and
+/// aliases remain internal display/provider facts and cannot choose a route.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedModelOffering {
+    pub offering_id: String,
+    pub model: ResolvedActiveLlmModel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelOfferingResolutionError {
+    InvalidOfferingId,
+    NotFound {
+        offering_id: String,
+    },
+    Inactive {
+        offering_id: String,
+        model_name: String,
+    },
+    Backend(String),
+}
+
+impl ModelOfferingResolutionError {
+    fn allows_stale_cache(&self) -> bool {
+        matches!(self, Self::Backend(_))
+    }
+}
+
+impl std::fmt::Display for ModelOfferingResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOfferingId => {
+                f.write_str("offering_id must be an exact non-empty identifier of at most 64 bytes")
+            }
+            Self::NotFound { offering_id } => {
+                write!(f, "Offering '{offering_id}' is not available")
+            }
+            Self::Inactive {
+                offering_id,
+                model_name,
+            } => write!(
+                f,
+                "Offering '{offering_id}' for model '{model_name}' is disabled"
+            ),
+            Self::Backend(error) => write!(f, "Offering resolution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelOfferingResolutionError {}
+
 impl std::fmt::Debug for ResolvedActiveLlmModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedActiveLlmModel")
@@ -424,17 +478,37 @@ struct ActiveLlmModelCacheKey {
     port: u16,
     user: String,
     database: String,
-    preferred_model: String,
+    selector: ActiveLlmModelSelector,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ActiveLlmModelSelector {
+    ModelName(String),
+    OfferingId(String),
 }
 
 impl ActiveLlmModelCacheKey {
     fn new(matrixone: &MatrixOneSettings, preferred_model: &str) -> Self {
+        Self::for_selector(
+            matrixone,
+            ActiveLlmModelSelector::ModelName(preferred_model.to_string()),
+        )
+    }
+
+    fn for_offering_id(matrixone: &MatrixOneSettings, offering_id: &str) -> Self {
+        Self::for_selector(
+            matrixone,
+            ActiveLlmModelSelector::OfferingId(offering_id.to_string()),
+        )
+    }
+
+    fn for_selector(matrixone: &MatrixOneSettings, selector: ActiveLlmModelSelector) -> Self {
         Self {
             host: matrixone.host.clone(),
             port: matrixone.port,
             user: matrixone.user.clone(),
             database: matrixone.database.clone(),
-            preferred_model: preferred_model.to_string(),
+            selector,
         }
     }
 }
@@ -932,6 +1006,120 @@ pub async fn resolve_active_llm_model(
     }
 }
 
+fn validate_offering_id(offering_id: &str) -> Result<&str, ModelOfferingResolutionError> {
+    if offering_id.is_empty()
+        || offering_id.len() > 64
+        || offering_id.trim() != offering_id
+        || offering_id.chars().any(char::is_control)
+    {
+        return Err(ModelOfferingResolutionError::InvalidOfferingId);
+    }
+    Ok(offering_id)
+}
+
+/// Resolve a client-visible effective Offering by durable ID.
+///
+/// This path is deliberately stricter than [`resolve_active_llm_model`]: it
+/// performs one exact `model_id` lookup and never invokes model-name aliasing
+/// or first-active fallback. Until Offering definitions receive their own
+/// table, `infra_llm_models.model_id` is the canonical Phase 0 Offering ID.
+pub async fn resolve_active_llm_offering(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedModelOffering, ModelOfferingResolutionError> {
+    let offering_id = validate_offering_id(offering_id)?;
+    let pool = require_pool(pool, matrixone)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+
+    if let Some(model) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(ResolvedModelOffering {
+            offering_id: offering_id.to_string(),
+            model,
+        });
+    }
+
+    let singleflight = active_llm_model_resolution_lock(&cache_key);
+    let _singleflight_guard = singleflight.lock().await;
+    if let Some(model) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(ResolvedModelOffering {
+            offering_id: offering_id.to_string(),
+            model,
+        });
+    }
+
+    let resolved = resolve_active_llm_offering_uncached(encryptor, offering_id, &pool).await;
+    match resolved {
+        Ok(model) => {
+            active_llm_model_resolution_cache_store(cache_key.clone(), model.clone());
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Ok(ResolvedModelOffering {
+                offering_id: offering_id.to_string(),
+                model,
+            })
+        }
+        Err(error) => {
+            if error.allows_stale_cache()
+                && let Some(model) = active_llm_model_resolution_cache_stale_lookup(&cache_key)
+            {
+                tracing::warn!(
+                    target: "astra_services::models",
+                    offering_id,
+                    error = %error,
+                    "Offering refresh failed; using stale cached model"
+                );
+                remove_active_llm_model_resolution_lock(&cache_key);
+                return Ok(ResolvedModelOffering {
+                    offering_id: offering_id.to_string(),
+                    model,
+                });
+            }
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Err(error)
+        }
+    }
+}
+
+async fn resolve_active_llm_offering_uncached(
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<ResolvedActiveLlmModel, ModelOfferingResolutionError> {
+    let row = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id = ? LIMIT 1"
+    ))
+    .bind(offering_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+    .ok_or_else(|| ModelOfferingResolutionError::NotFound {
+        offering_id: offering_id.to_string(),
+    })?;
+
+    let is_active: i16 = row.try_get("is_active").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid infra_llm_models.is_active: {error}"
+        ))
+    })?;
+    if is_active == 0 {
+        let model_name: String = row.try_get("model_name").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid infra_llm_models.model_name: {error}"
+            ))
+        })?;
+        return Err(ModelOfferingResolutionError::Inactive {
+            offering_id: offering_id.to_string(),
+            model_name,
+        });
+    }
+
+    build_resolved_active_llm_from_row(&row, encryptor)
+        .map_err(ModelOfferingResolutionError::Backend)
+}
+
 async fn resolve_active_llm_model_uncached(
     encryptor: &FernetTokenEncryptor,
     name: &str,
@@ -1300,6 +1488,15 @@ pub trait ModelService: Send + Sync {
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Load the catalog record behind a client-visible Offering ID.
+    ///
+    /// Phase 0 maps Offering identity directly to the durable model ID. This
+    /// lookup is exact and must not fall back to model names or aliases.
+    async fn get_model_by_offering_id(
+        &self,
+        offering_id: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)>;
+
     async fn update_model(
         &self,
         model_name: String,
@@ -1638,6 +1835,31 @@ impl ModelService for DatabaseModelService {
             error_response(
                 StatusCode::NOT_FOUND,
                 format!("Model '{}' not found", model_name),
+            )
+        })?;
+        Self::model_record_from_row(row)
+    }
+
+    async fn get_model_by_offering_id(
+        &self,
+        offering_id: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        validate_offering_id(&offering_id)
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let sql = format!(
+            "SELECT {} FROM infra_llm_models WHERE model_id = ? LIMIT 1",
+            MODEL_SELECT_COLS
+        );
+        let row = query(&sql)
+            .bind(&offering_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?;
+        let row = row.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                ModelOfferingResolutionError::NotFound { offering_id }.to_string(),
             )
         })?;
         Self::model_record_from_row(row)
@@ -2518,6 +2740,12 @@ impl ModelService for UnconfiguredModelService {
     async fn get_model(&self, _: String) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("model service not configured"))
     }
+    async fn get_model_by_offering_id(
+        &self,
+        _: String,
+    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("model service not configured"))
+    }
     async fn update_model(
         &self,
         _: String,
@@ -2670,6 +2898,31 @@ impl From<ModelListItem> for ModelListItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offering_identity_is_exact_and_bounded() {
+        assert_eq!(validate_offering_id("model-123"), Ok("model-123"));
+        for invalid in ["", " model-123", "model-123 ", "model\n123"] {
+            assert_eq!(
+                validate_offering_id(invalid),
+                Err(ModelOfferingResolutionError::InvalidOfferingId)
+            );
+        }
+        let too_long = "x".repeat(65);
+        assert_eq!(
+            validate_offering_id(&too_long),
+            Err(ModelOfferingResolutionError::InvalidOfferingId)
+        );
+    }
+
+    #[test]
+    fn cache_identity_separates_model_names_from_offering_ids() {
+        let matrixone = MatrixOneSettings::mock();
+        assert_ne!(
+            ActiveLlmModelCacheKey::new(&matrixone, "same-value"),
+            ActiveLlmModelCacheKey::for_offering_id(&matrixone, "same-value")
+        );
+    }
 
     // ── resolve_model_alias ──
     //

@@ -42,11 +42,11 @@ use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, CancelRunRecord, CapabilityServerRefs, ChatRequestData,
-    ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind,
-    RequestedTurnInteractionMode, RunContinuationRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord,
-    RunProjectionRecord, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
-    RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
+    ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind, ModelSelectionRequest,
+    RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
+    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord, RunUserIntentData,
+    RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
     durable_run_status_blocks_session, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
@@ -127,7 +127,6 @@ use crate::server::agent_binding_skill_runtime;
 use crate::server::deployment_tool_policy::{
     apply_deployment_tool_policy, load_deployment_tool_policy,
 };
-use crate::server::model_gateway_runtime;
 use crate::server::run::engine::{RunEngine, RunStartContext, TerminalTransitionOutcome};
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
@@ -2431,7 +2430,7 @@ pub struct AgenticRunLifecycleService {
     workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
-    /// Exact native model registry used by selected_model preflight.
+    /// Exact model catalog used to resolve client-visible Offering IDs.
     model_service: Arc<dyn ModelService>,
     /// Registry-backed MCP bindings available to server-side chat loops.
     mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
@@ -4026,24 +4025,12 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         request: &ChatRequestData,
     ) -> Result<RequestConstraints, (StatusCode, Json<ErrorResponse>)> {
-        let selected_model = Self::validate_selected_model_shape(request.selected_model.as_ref())?;
+        Self::validate_resolved_model_selection(request)?;
         self.validate_runtime_profile_shape(request)?;
-        Self::validate_runtime_auth_shape(request, selected_model)?;
+        Self::validate_runtime_auth_shape(request)?;
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
-        if let Some(gateway_id) = selected_model.gateway.as_deref() {
-            if provider_model_descriptor.is_some() {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "selected_model.gateway must be absent when capability_descriptors.model_gateway is present",
-                    "selected_model_invalid",
-                ));
-            }
-            self.load_active_selected_model_gateway(gateway_id).await?;
-        } else if provider_model_descriptor.is_some() {
+        if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
-        } else {
-            self.validate_selected_native_model(&selected_model.model)
-                .await?;
         }
         if request.capability_descriptors.is_some() && !request.provider_runtime_authorized {
             return Err(error_response_coded(
@@ -4055,8 +4042,8 @@ impl AgenticRunLifecycleService {
         if request.llm_token_service.is_some() {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "llm_token_service is not accepted on /chat/stream; use selected_model.gateway for registered model gateway routing",
-                "selected_model_invalid",
+                "llm_token_service is internal resolved runtime context and is not accepted from clients",
+                "model_selection_invalid",
             ));
         }
         if request
@@ -4147,12 +4134,62 @@ impl AgenticRunLifecycleService {
         ))
     }
 
-    fn prepare_chat_request(
+    async fn prepare_chat_request(
+        &self,
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
         Self::validate_effective_user_input(&request)?;
-        let selected_model = Self::validate_selected_model_shape(request.selected_model.as_ref())?;
-        request.model = Some(selected_model.model.clone());
+        let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
+        if request.provider_runtime_authorized {
+            let resolved = request.resolved_model_selection.as_ref().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "provider-authorized model selection is missing its trusted resolution",
+                    "provider_runtime_context_required",
+                )
+            })?;
+            if resolved.offering_id != selection.offering_id {
+                return Err(error_response_coded(
+                    StatusCode::FORBIDDEN,
+                    "provider-resolved model selection does not match the requested Offering",
+                    "model_offering_mismatch",
+                ));
+            }
+            exact_runtime_string(
+                "resolved_model_selection.model_name",
+                &resolved.model_name,
+                "provider_runtime_context_invalid",
+            )?;
+            request.model = Some(resolved.model_name.clone());
+            return Ok(request);
+        }
+        if request.resolved_model_selection.is_some() {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "resolved_model_selection is trusted Server context and cannot be supplied by clients",
+                "model_selection_invalid",
+            ));
+        }
+        let record = self
+            .model_service
+            .get_model_by_offering_id(selection.offering_id.clone())
+            .await?;
+        if !record.is_active {
+            return Err(error_response_coded(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Model Offering '{}' is not currently available",
+                    selection.offering_id
+                ),
+                "model_offering_unavailable",
+            ));
+        }
+        let resolved = ResolvedModelSelection {
+            offering_id: record.model_id,
+            model_name: record.name,
+        };
+        request.model = Some(resolved.model_name.clone());
+        request.resolved_model_selection = Some(resolved);
         Ok(request)
     }
 
@@ -4176,25 +4213,52 @@ impl AgenticRunLifecycleService {
         ))
     }
 
-    fn validate_selected_model_shape(
-        selected_model: Option<&SelectedModelRequest>,
-    ) -> Result<&SelectedModelRequest, (StatusCode, Json<ErrorResponse>)> {
-        let selected_model = selected_model.ok_or_else(|| {
+    fn validate_model_selection_shape(
+        model_selection: Option<&ModelSelectionRequest>,
+    ) -> Result<&ModelSelectionRequest, (StatusCode, Json<ErrorResponse>)> {
+        let model_selection = model_selection.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "selected_model is required for /chat/stream",
-                "selected_model_missing",
+                "model_selection.offering_id is required",
+                "model_selection_missing",
             )
         })?;
         exact_runtime_string(
-            "selected_model.model",
-            &selected_model.model,
-            "selected_model_invalid",
+            "model_selection.offering_id",
+            &model_selection.offering_id,
+            "model_selection_invalid",
         )?;
-        if let Some(gateway) = selected_model.gateway.as_deref() {
-            exact_runtime_string("selected_model.gateway", gateway, "selected_model_invalid")?;
+        if model_selection.offering_id.len() > 64 {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model_selection.offering_id must be at most 64 bytes",
+                "model_selection_invalid",
+            ));
         }
-        Ok(selected_model)
+        Ok(model_selection)
+    }
+
+    fn validate_resolved_model_selection(
+        request: &ChatRequestData,
+    ) -> Result<&ResolvedModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
+        let resolved = request.resolved_model_selection.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model selection reached execution without Server resolution",
+                "model_resolution_missing",
+            )
+        })?;
+        if resolved.offering_id != selection.offering_id
+            || request.model.as_deref() != Some(resolved.model_name.as_str())
+        {
+            return Err(error_response_coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "resolved model identity is inconsistent with the admitted Offering",
+                "model_resolution_inconsistent",
+            ));
+        }
+        Ok(resolved)
     }
 
     fn validate_runtime_profile_shape(
@@ -4301,10 +4365,8 @@ impl AgenticRunLifecycleService {
 
     fn validate_runtime_auth_shape(
         request: &ChatRequestData,
-        selected_model: &SelectedModelRequest,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let required = request.agent_binding.is_some()
-            || selected_model.gateway.is_some()
             || request
                 .capability_descriptors
                 .as_ref()
@@ -4314,38 +4376,13 @@ impl AgenticRunLifecycleService {
             if required {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    "runtime_auth.authorization is required when agent_binding or selected_model.gateway is present",
+                    "runtime_auth.authorization is required for the resolved provider runtime",
                     "agent_binding_runtime_auth_missing",
                 ));
             }
             return Ok(());
         };
         validate_runtime_authorization(runtime_auth)
-    }
-
-    async fn validate_selected_native_model(
-        &self,
-        model: &str,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let record = self
-            .model_service
-            .get_model(model.to_string())
-            .await
-            .map_err(|_| {
-                error_response_coded(
-                    StatusCode::NOT_FOUND,
-                    format!("selected_model.model '{model}' is not configured"),
-                    "selected_model_not_configured",
-                )
-            })?;
-        if !record.is_active {
-            return Err(error_response_coded(
-                StatusCode::NOT_FOUND,
-                format!("selected_model.model '{model}' is disabled"),
-                "selected_model_not_configured",
-            ));
-        }
-        Ok(())
     }
 
     fn provider_model_descriptor(
@@ -4384,30 +4421,10 @@ impl AgenticRunLifecycleService {
         Ok(())
     }
 
-    async fn load_active_selected_model_gateway(
-        &self,
-        gateway_id: &str,
-    ) -> Result<astra_services::ModelGatewayRecord, (StatusCode, Json<ErrorResponse>)> {
-        let gateway = self
-            .model_gateway_service
-            .get_gateway(gateway_id.to_string())
-            .await?;
-        match gateway.status {
-            astra_services::ModelGatewayStatus::Active => Ok(gateway),
-            astra_services::ModelGatewayStatus::Disabled
-            | astra_services::ModelGatewayStatus::Invalid => Err(error_response_coded(
-                StatusCode::CONFLICT,
-                "selected model gateway is disabled for new turns",
-                "model_gateway_disabled",
-            )),
-        }
-    }
-
     async fn prepare_model_gateway_invocation(
         &self,
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
-        let selected_model = Self::validate_selected_model_shape(request.selected_model.as_ref())?;
         if let Some(model_gateway) = Self::provider_model_descriptor(&request)? {
             let endpoint_url = model_gateway.endpoint_url.clone();
             let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
@@ -4427,28 +4444,6 @@ impl AgenticRunLifecycleService {
             });
             return Ok(request);
         }
-        let Some(gateway_id) = selected_model.gateway.as_deref() else {
-            return Ok(request);
-        };
-        let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
-            error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "runtime_auth.authorization is required when selected_model.gateway is present",
-                "agent_binding_runtime_auth_missing",
-            )
-        })?;
-        let gateway = self.load_active_selected_model_gateway(gateway_id).await?;
-        let llm_token_service = model_gateway_runtime::resolve_model_gateway_invocation(
-            &gateway,
-            selected_model,
-            &runtime_auth.authorization,
-        )
-        .await?;
-        request.forward_headers.insert(
-            "authorization".to_string(),
-            runtime_auth.authorization.clone(),
-        );
-        request.llm_token_service = Some(llm_token_service);
         Ok(request)
     }
 
@@ -4699,16 +4694,8 @@ impl AgenticRunLifecycleService {
         runtime_capabilities: &PreparedRuntimeCapabilities,
         workspace_executor_admitted: bool,
     ) -> Option<Value> {
-        let selected_model = request.selected_model.as_ref()?;
-        let selected_model_json = match selected_model.id.as_ref() {
-            Some(id) => json!({
-                "id": id,
-                "model": &selected_model.model,
-            }),
-            None => json!({
-                "model": &selected_model.model,
-            }),
-        };
+        let model_selection = request.model_selection.as_ref()?;
+        let resolved_model = request.resolved_model_selection.as_ref()?;
         let model_resolution = if let Some(model_gateway) = request
             .capability_descriptors
             .as_ref()
@@ -4722,20 +4709,11 @@ impl AgenticRunLifecycleService {
                     "invoke_url_present": true
                 }
             })
-        } else if selected_model.gateway.is_some() {
-            json!({
-                "source": "model_gateway",
-                "gateway": &selected_model.gateway,
-                "resolved": request.llm_token_service.is_some(),
-                "descriptor": {
-                    "protocol": "openai_chat_completions",
-                    "invoke_url_present": request.llm_token_service.is_some()
-                }
-            })
         } else {
             json!({
-                "source": "astra_native",
-                "model": &selected_model.model,
+                "source": "catalog_offering",
+                "offering_id": &resolved_model.offering_id,
+                "model": &resolved_model.model_name,
                 "resolved": true
             })
         };
@@ -4746,7 +4724,9 @@ impl AgenticRunLifecycleService {
             .unwrap_or(Value::Null);
         let mut manifest = json!({
             "schema_version": "astra_runtime_manifest.v1",
-            "selected_model": selected_model_json,
+            "model_selection": {
+                "offering_id": &model_selection.offering_id,
+            },
             "model_resolution": model_resolution,
             "runtime_profile": Self::runtime_profile_manifest_label(request),
             "turn": {
@@ -7142,7 +7122,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        let request = Self::prepare_chat_request(request)?;
+        let request = self.prepare_chat_request(request).await?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -8174,7 +8154,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        let request = Self::prepare_chat_request(request)?;
+        let request = self.prepare_chat_request(request).await?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;

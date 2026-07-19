@@ -113,7 +113,11 @@ export function createModelCacheService<T = unknown>(opts?: {
 
 /** Singleton model list cache used by requireKnownBackendModelName. */
 export const modelCache = new ModelCacheService<
-  Array<{ model_id?: string | null; name?: string | null }>
+  Array<{
+    model_id?: string | null;
+    name?: string | null;
+    is_active?: boolean | null;
+  }>
 >({ ttlMs: DEFAULT_TTL_MS, maxEntries: MAX_ENTRIES });
 
 export function resetModelCacheForTests() {

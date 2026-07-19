@@ -39,9 +39,9 @@ use astra_services::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
         DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
         DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
-        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
-        RequestedTurnInteractionMode, RunListCursor, RunStateStore, RuntimeProfileRequest,
-        SelectedModelRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
+        GuardedRunStatusTransitionRequest, ModelSelectionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
+        RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
+        RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -151,7 +151,8 @@ pub struct RunStartContext {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
-    pub selected_model: Option<SelectedModelRequest>,
+    pub model_selection: Option<ModelSelectionRequest>,
+    pub resolved_model_selection: Option<ResolvedModelSelection>,
     pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
 }
@@ -361,10 +362,15 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
             serde_json::Value::String(agent_binding_schema_version.clone()),
         );
     }
-    if let Some(selected_model) = context.selected_model.as_ref()
-        && let Ok(value) = serde_json::to_value(selected_model)
+    if let Some(model_selection) = context.model_selection.as_ref()
+        && let Ok(value) = serde_json::to_value(model_selection)
     {
-        data.insert("selected_model".to_string(), value);
+        data.insert("model_selection".to_string(), value);
+    }
+    if let Some(resolved_model_selection) = context.resolved_model_selection.as_ref()
+        && let Ok(value) = serde_json::to_value(resolved_model_selection)
+    {
+        data.insert("resolved_model_selection".to_string(), value);
     }
     if let Some(capability_server_refs) = context.capability_server_refs.as_ref()
         && let Ok(value) = serde_json::to_value(capability_server_refs)
@@ -561,26 +567,23 @@ impl RunEngine {
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
-        let selected_model_json = context.selected_model.as_ref().and_then(|m| {
-            serde_json::to_string(m)
+        let selected_model_json = context.model_selection.as_ref().and_then(|selection| {
+            serde_json::to_string(selection)
                 .inspect_err(|e| {
                     tracing::warn!(
                         target: "astra_runtime::engine",
                         run_id = %run_id,
                         error = %e,
-                        "failed to serialize selected_model for durable run record"
+                        "failed to serialize model_selection for durable run record"
                     );
                 })
                 .ok()
         });
         let selected_model_name = context
-            .selected_model
+            .resolved_model_selection
             .as_ref()
-            .map(|selected_model| selected_model.model.clone());
-        let selected_model_gateway = context
-            .selected_model
-            .as_ref()
-            .and_then(|selected_model| selected_model.gateway.clone());
+            .map(|resolved| resolved.model_name.clone());
+        let selected_model_gateway = None;
         let capability_server_refs_json =
             context.capability_server_refs.as_ref().and_then(|refs| {
                 serde_json::to_string(refs)
@@ -2998,7 +3001,8 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
-            selected_model: None,
+            model_selection: None,
+            resolved_model_selection: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {

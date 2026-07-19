@@ -9,20 +9,14 @@ use crate::server::{
 };
 use axum::Extension;
 
-fn chat_request_json_error_from_body_text(detail: String) -> (StatusCode, Json<ErrorResponse>) {
-    if detail.contains("selected_model") || detail.contains("SelectedModelRequest") {
-        return astra_core::error_response_coded(
-            StatusCode::BAD_REQUEST,
-            detail,
-            "selected_model_invalid",
-        );
-    }
-    error_response(StatusCode::BAD_REQUEST, detail)
-}
-
 fn parse_chat_request_body(body: &Bytes) -> Result<ChatRequest, (StatusCode, Json<ErrorResponse>)> {
-    serde_json::from_slice(body)
-        .map_err(|error| chat_request_json_error_from_body_text(error.to_string()))
+    serde_json::from_slice(body).map_err(|error| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("invalid chat request JSON: {error}"),
+            "chat_request_invalid",
+        )
+    })
 }
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
@@ -1563,7 +1557,7 @@ mod chat_stream_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_selected_model_shape_error_returns_typed_sse_error() {
+    async fn chat_stream_model_selection_shape_error_returns_typed_sse_error() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(StubAuthService))
@@ -1578,7 +1572,9 @@ mod chat_stream_lifecycle_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi","selected_model":"gpt-4"}"#))
+                    .body(Body::from(
+                        r#"{"message":"hi","model_selection":"offer-gpt-4"}"#,
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -1590,7 +1586,7 @@ mod chat_stream_lifecycle_tests {
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("\"error_code\":\"selected_model_invalid\""));
+        assert!(text.contains("\"error_code\":\"chat_request_invalid\""));
         assert!(!text.contains("\"type\":\"session_info\""));
     }
 
@@ -1634,7 +1630,7 @@ mod chat_stream_lifecycle_tests {
                     .body(Body::from(
                         r#"{
                             "message": "hi",
-                            "selected_model": {"model": "gpt-4o-mini"},
+                            "model_selection": {"offering_id": "offer-gpt-4o-mini"},
                             "agent_binding": {
                                 "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
                                 "capability_server_refs": {
@@ -1836,7 +1832,7 @@ mod chat_stream_lifecycle_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","selected_model":{"model":"demo-model"}}"#,
+                        r#"{"message":"hi","session_id":"s1","model_selection":{"offering_id":"offer-demo-model"}}"#,
                     ))
                     .expect("request should build"),
             )

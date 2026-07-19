@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) async fn inject_effective_runtime_context(
-    _state: &AppState,
+    state: &AppState,
     principal: &AuthPrincipal,
     request: &mut astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -14,9 +14,66 @@ pub(crate) async fn inject_effective_runtime_context(
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
             request.provider_workspace_id = Some(ctx.provider_scope_id.clone());
         }
+        if principal.is_edge_registration() {
+            hydrate_edge_registration_runtime_context(state, principal, request).await?;
+        }
         return apply_provider_supplied_runtime_context(request);
     }
     reject_unauthorized_capability_descriptors(request)
+}
+
+async fn hydrate_edge_registration_runtime_context(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    request: &mut astra_services::runs::ChatRequestData,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let requested_model_id = request
+        .model_selection
+        .as_ref()
+        .map(|selection| selection.offering_id.clone())
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model_selection.offering_id is required",
+                "model_selection_missing",
+            )
+        })?;
+    let context = state
+        .auth_service
+        .external_runtime_context_by_scope(
+            principal,
+            astra_services::ExternalRuntimeContextRequestData {
+                requested_model_id,
+                requested_tool_ids: request.allow_tools.clone().unwrap_or_default(),
+                requested_skill_ids: request.allow_skills.clone().unwrap_or_default(),
+                requested_knowledge_base_ids: Vec::new(),
+            },
+        )
+        .await?;
+    let authorization = context.runtime_auth.authorization.clone();
+    request.model_selection = Some(context.selected_model.to_model_selection_request());
+    request.resolved_model_selection = Some(context.selected_model.to_resolved_model_selection());
+    request.runtime_auth = Some(context.runtime_auth.to_runtime_auth_request());
+    request.capability_descriptors = Some(context.capability_descriptors.to_request_descriptors());
+    request.runtime_system_prompt = context.runtime_system_prompt;
+    request.runtime_profile = None;
+    request.runtime_mcp_bindings.clear();
+    request.runtime_skill_binding = None;
+    if let Some(mcp) = context.capability_descriptors.mcp {
+        request.runtime_profile =
+            Some(astra_services::runs::RuntimeProfileRequest::RequestScopedRuntimeMcp);
+        request.runtime_mcp_bindings = vec![mcp.into_runtime_mcp_binding(authorization.clone())];
+    }
+    if !request
+        .allow_skills
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        && let Some(skills) = context.capability_descriptors.skills
+    {
+        request.runtime_skill_binding = Some(skills.into_runtime_skill_binding(authorization));
+    }
+    Ok(())
 }
 
 pub(crate) async fn inject_effective_runtime_context_body(
@@ -65,8 +122,8 @@ async fn inject_edge_registration_runtime_context_body(
     object.remove("runtime_system_prompt");
 
     let requested_model_id = match object
-        .get("selected_model")
-        .and_then(|s| s.get("id"))
+        .get("model_selection")
+        .and_then(|selection| selection.get("offering_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
     {
@@ -74,12 +131,14 @@ async fn inject_edge_registration_runtime_context_body(
         None => {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                "edge chat turn request must specify selected_model.id",
+                "edge chat turn request must specify model_selection.offering_id",
             ));
         }
     };
-    // Replace caller-supplied selected_model wholesale with the provider-issued one below.
-    object.remove("selected_model");
+    // Replace caller-supplied selection wholesale with the provider-issued,
+    // authenticated effective Offering below.
+    object.remove("model_selection");
+    object.remove("resolved_model_selection");
     let requested_tool_ids = string_array_field(object, "allow_tools")?;
     let requested_skill_ids = string_array_field(object, "allow_skills")?;
     let t0 = std::time::Instant::now();
@@ -101,7 +160,8 @@ async fn inject_edge_registration_runtime_context_body(
         "astra_timing: issue_runtime_context completed (edge-jwt path)"
     );
     let authorization = context.runtime_auth.authorization.clone();
-    let selected_model = context.selected_model.to_selected_model_request();
+    let model_selection = context.selected_model.to_model_selection_request();
+    let resolved_model_selection = context.selected_model.to_resolved_model_selection();
     let runtime_auth = context.runtime_auth.to_runtime_auth_request();
     if let Some(runtime_system_prompt) = context.runtime_system_prompt {
         object.insert(
@@ -110,8 +170,12 @@ async fn inject_edge_registration_runtime_context_body(
         );
     }
     object.insert(
-        "selected_model".to_string(),
-        serde_json::to_value(&selected_model).map_err(internal_error)?,
+        "model_selection".to_string(),
+        serde_json::to_value(&model_selection).map_err(internal_error)?,
+    );
+    object.insert(
+        "resolved_model_selection".to_string(),
+        serde_json::to_value(&resolved_model_selection).map_err(internal_error)?,
     );
     object.insert(
         "runtime_auth".to_string(),
@@ -122,14 +186,6 @@ async fn inject_edge_registration_runtime_context_body(
         serde_json::to_value(context.capability_descriptors.to_request_descriptors())
             .map_err(internal_error)?,
     );
-    if let Some(model_gateway) = context.capability_descriptors.model_gateway.as_ref() {
-        object.insert(
-            "llm_token_service".to_string(),
-            serde_json::json!({
-                "url": model_gateway.endpoint_url,
-            }),
-        );
-    }
     if let Some(mcp) = context.capability_descriptors.mcp {
         object.insert(
             "runtime_profile".to_string(),
@@ -200,18 +256,6 @@ fn apply_provider_supplied_runtime_context(
         }
         return Ok(());
     };
-    if request
-        .selected_model
-        .as_ref()
-        .and_then(|selected| selected.gateway.as_ref())
-        .is_some()
-    {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "provider-issued selected_model must not include gateway",
-            "selected_model_invalid",
-        ));
-    }
     let authorization = request
         .runtime_auth
         .as_ref()
@@ -374,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_selected_model_id_returns_400() {
+    async fn missing_offering_id_returns_400() {
         let state = test_state();
         let principal = edge_principal();
         let body = Bytes::from_static(b"{}");
@@ -384,8 +428,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(
-            err.1.0.detail.contains("selected_model.id"),
-            "error message must mention selected_model.id: {:?}",
+            err.1.0.detail.contains("model_selection.offering_id"),
+            "error message must mention model_selection.offering_id: {:?}",
             err.1.0.detail
         );
     }
@@ -394,14 +438,14 @@ mod tests {
     async fn injected_runtime_auth_and_capability_descriptors_are_stripped_before_model_id_check() {
         let state = test_state();
         let principal = edge_principal();
-        // Attacker injects both reserved fields but omits selected_model.id.
+        // Attacker injects both reserved fields but omits the Offering ID.
         // The handler must strip the injected fields without error and then
         // fail on the missing model id — not on unexpected field presence.
         let body = Bytes::from(
             serde_json::json!({
                 "runtime_auth": {"authorization": "attacker-token"},
                 "capability_descriptors": {"mcp": {"id": "evil"}},
-                "selected_model": {}
+                "model_selection": {}
             })
             .to_string(),
         );
@@ -411,8 +455,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(
-            err.1.0.detail.contains("selected_model.id"),
-            "must fail on missing selected_model.id, not on injected fields: {:?}",
+            err.1.0.detail.contains("model_selection.offering_id"),
+            "must fail on missing Offering ID, not on injected fields: {:?}",
             err.1.0.detail
         );
     }

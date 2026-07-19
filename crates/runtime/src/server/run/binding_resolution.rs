@@ -240,7 +240,8 @@ pub(crate) fn run_start_context_from_request(
         agent_binding_name: agent_binding.map(|binding| binding.binding_name.clone()),
         agent_binding_schema_version: agent_binding
             .map(|binding| binding.binding_schema_version.clone()),
-        selected_model: request.selected_model.clone(),
+        model_selection: request.model_selection.clone(),
+        resolved_model_selection: request.resolved_model_selection.clone(),
         capability_server_refs: request
             .agent_binding
             .as_ref()
@@ -566,7 +567,8 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
-            selected_model: None,
+            model_selection: None,
+            resolved_model_selection: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
