@@ -164,21 +164,21 @@ mod tests {
     /// Mutex to serialize tests that modify the sweeper_leases table.
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// SQL DDL shared by all sweeper lease tests.
-    const SWEEPER_LEASES_DDL: &str = r#"CREATE TABLE IF NOT EXISTS sweeper_leases (
-                sweeper_name VARCHAR(128) PRIMARY KEY,
-                owner_pod_id VARCHAR(256) NOT NULL,
-                expires_at DATETIME(6) NOT NULL,
-                version INT UNSIGNED NOT NULL DEFAULT 0,
-                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-            )"#;
-
-    async fn ensure_sweeper_leases_table(pool: &SharedPool) {
-        sqlx::query(SWEEPER_LEASES_DDL)
-            .execute(pool.get())
+    async fn setup_sweeper_test_pool() -> SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        let settings = crate::MatrixOneSettings::from_env();
+        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        astra_services::ensure_core_schema(&settings, &catalog)
             .await
-            .expect("create table");
+            .expect("ensure canonical core schema");
+        SharedPool::new(&settings)
+            .await
+            .expect("connect to MatrixOne")
     }
 
     /// Integration test: validates sweeper lease acquisition and ownership.
@@ -188,18 +188,9 @@ mod tests {
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_is_leader_acquires_and_confirms() {
         let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-        );
-        let settings = crate::MatrixOneSettings::from_env();
-        let pool = SharedPool::new(&settings)
-            .await
-            .expect("connect to MatrixOne");
+        let pool = setup_sweeper_test_pool().await;
 
-        // Ensure table exists and clear stale data from previous runs
-        ensure_sweeper_leases_table(&pool).await;
+        // The production bootstrap owns the table; this test owns only its row.
         let lease_name = "test-leader-acquire";
         sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(lease_name)
@@ -257,17 +248,7 @@ mod tests {
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_expiry_takeover() {
         let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-        );
-        let settings = crate::MatrixOneSettings::from_env();
-        let pool = SharedPool::new(&settings)
-            .await
-            .expect("connect to MatrixOne");
-
-        ensure_sweeper_leases_table(&pool).await;
+        let pool = setup_sweeper_test_pool().await;
         let lease_name = "test-leader-expiry";
         sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(lease_name)
@@ -345,17 +326,7 @@ mod tests {
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_concurrent_cas_single_leader() {
         let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-        );
-        let settings = crate::MatrixOneSettings::from_env();
-        let pool = SharedPool::new(&settings)
-            .await
-            .expect("connect to MatrixOne");
-
-        ensure_sweeper_leases_table(&pool).await;
+        let pool = setup_sweeper_test_pool().await;
         let lease_name = "test-leader-cas";
         sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(lease_name)
@@ -418,15 +389,7 @@ mod tests {
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn sweeper_lease_error_path_returns_unavailable() {
         let _guard = astra_core::sync_poison::recover_mutex_lock(&TEST_SERIAL);
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-        );
-        let settings = crate::MatrixOneSettings::from_env();
-        let pool = SharedPool::new(&settings)
-            .await
-            .expect("connect to MatrixOne");
+        let pool = setup_sweeper_test_pool().await;
 
         // Use a non-existent table name so that check_leader() hits the error path
         // without affecting the shared sweeper_leases table used by other tests.

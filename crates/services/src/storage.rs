@@ -7094,35 +7094,77 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_has_no_duplicate_create_table_declarations() {
-        let source = include_str!("storage.rs");
-        let ddl_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production storage DDL source");
-
-        let marker = "CREATE TABLE IF NOT EXISTS ";
-        let mut counts = std::collections::BTreeMap::<String, usize>::new();
-        for rest in ddl_source.split(marker).skip(1) {
-            let table = rest
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect::<String>();
-            assert!(
-                !table.is_empty(),
-                "CREATE TABLE declaration must include a parseable table name"
-            );
-            *counts.entry(table).or_default() += 1;
+    fn production_tables_have_one_schema_owner_across_the_workspace() {
+        fn rust_sources_under(directory: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
+            let mut entries = std::fs::read_dir(directory)
+                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|error| {
+                    panic!("read entry under {}: {error}", directory.display())
+                });
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "tests") {
+                        continue;
+                    }
+                    rust_sources_under(&path, output);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    output.push(path);
+                }
+            }
         }
 
-        let duplicates: Vec<_> = counts
-            .iter()
-            .filter_map(|(table, count)| (*count > 1).then_some(format!("{table}:{count}")))
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("services crate must live under <workspace>/crates");
+        let crates_root = workspace_root.join("crates");
+        let mut sources = Vec::new();
+        rust_sources_under(&crates_root, &mut sources);
+        let marker = "CREATE TABLE IF NOT EXISTS ";
+        let mut owners = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for path in sources {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            // Production modules keep inline tests behind a terminal cfg(test)
+            // module. Test fixtures must not become competing schema owners.
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let uncommented = production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for rest in uncommented.split(marker).skip(1) {
+                let table = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect::<String>();
+                assert!(
+                    !table.is_empty(),
+                    "{} has a CREATE TABLE declaration without a parseable table name",
+                    path.display()
+                );
+                let owner = path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                owners.entry(table).or_default().push(owner);
+            }
+        }
+
+        let duplicates: Vec<_> = owners
+            .into_iter()
+            .filter_map(|(table, owners)| {
+                (owners.len() > 1).then_some(format!("{table} => {}", owners.join(", ")))
+            })
             .collect();
         assert!(
             duplicates.is_empty(),
-            "duplicate CREATE TABLE declarations are not allowed: {}",
-            duplicates.join(", ")
+            "each production table must have exactly one DDL owner; duplicate owners: {}",
+            duplicates.join("; ")
         );
     }
 

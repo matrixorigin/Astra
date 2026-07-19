@@ -47,7 +47,6 @@ pub(super) async fn build_runtime_wiring(
     let workspace_record_store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(
         shared_pool.clone(),
     ));
-    workspace_record_store.ensure_tables().await?;
     let workspace_record_store: Arc<dyn astra_services::WorkspaceStateStore> =
         workspace_record_store;
 
@@ -109,7 +108,7 @@ pub(super) async fn build_runtime_wiring(
             "llm provider admission schema init failed"
         );
     }
-    let resource_governor = initialize_resource_governor(shared_pool).await;
+    let resource_governor = initialize_resource_governor(shared_pool).await?;
     let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -198,17 +197,11 @@ async fn recover_active_runs(
 
 async fn initialize_resource_governor(
     shared_pool: &SharedPool,
-) -> std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor> {
+) -> Result<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>, sqlx::Error> {
     let resource_governor =
         astra_services::resource_governor::DatabaseResourceGovernor::new(shared_pool.clone());
-    if let Err(error) = resource_governor.ensure_tables().await {
-        tracing::warn!(
-            target: "astra_runtime::state_builder",
-            error = %error,
-            "resource_governor table init failed"
-        );
-    }
-    std::sync::Arc::new(resource_governor)
+    resource_governor.ensure_tables().await?;
+    Ok(std::sync::Arc::new(resource_governor))
 }
 
 fn initialize_team_store(

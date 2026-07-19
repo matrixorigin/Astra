@@ -407,10 +407,6 @@ impl DatabaseWorkspaceRecordStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
     }
-
-    pub async fn ensure_tables(&self) -> Result<(), sqlx::Error> {
-        ensure_workspace_record_tables(self.pool.get()).await
-    }
 }
 
 pub(crate) async fn ensure_workspace_record_tables(
