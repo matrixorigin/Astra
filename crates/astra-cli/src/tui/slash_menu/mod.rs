@@ -8,8 +8,6 @@
 //! for the caller based on that predicate; the menu itself is constructed
 //! when opened and dropped when closed.
 
-#![allow(dead_code)]
-
 pub(crate) mod menu;
 pub(crate) mod popup;
 

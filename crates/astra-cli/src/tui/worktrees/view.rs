@@ -12,8 +12,6 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
-#![allow(dead_code)]
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

@@ -9,8 +9,6 @@
 //! existing slash/skill popups already use BottomPaneView and we want
 //! uniform Esc / completion semantics.
 
-#![allow(dead_code)]
-
 pub(crate) mod discovery;
 pub(crate) mod view;
 

@@ -12,8 +12,6 @@
 //! makes the behaviour easy to unit-test without touching a Ratatui
 //! buffer.
 
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 use crate::cli::session::session_state::ContinuationAnchor;

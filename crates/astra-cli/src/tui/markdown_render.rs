@@ -37,11 +37,6 @@ impl MarkdownStyles {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn render_markdown_text(input: &str) -> Text<'static> {
-    render_markdown_text_with_width(input, None)
-}
-
 pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>) -> Text<'static> {
     let cwd = std::env::current_dir().ok();
     render_markdown_text_with_width_and_cwd(input, width, cwd.as_deref())
@@ -852,7 +847,7 @@ mod polish_tests {
     use std::path::Path;
 
     fn lines(md: &str) -> Vec<String> {
-        render_markdown_text(md)
+        render_markdown_text_with_width(md, None)
             .lines
             .iter()
             .map(|l| {

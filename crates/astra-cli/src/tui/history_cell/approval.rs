@@ -164,38 +164,6 @@ impl ApprovalCell {
         }
     }
 
-    /// Construct with the extended Accept-all / Reject-all buttons
-    /// appended. Call when more than one approval is pending.
-    #[allow(dead_code)]
-    pub fn with_batch(
-        id: u64,
-        tool: String,
-        header: String,
-        detail: Option<String>,
-        reason: String,
-        focused: bool,
-    ) -> Self {
-        Self {
-            id,
-            tool,
-            header,
-            detail,
-            reason,
-            focused,
-            buttons: ButtonRow::primary_with_batch(),
-            risk_tag_labels: Vec::new(),
-            remember_preview: None,
-            source_agent: None,
-            host: None,
-            save_outcome: None,
-            selection_hint: None,
-            workspace_untrusted: false,
-            is_compound_command: false,
-            has_dynamic_eval: false,
-            unsafe_rule_shape: false,
-        }
-    }
-
     /// Issue #326 P3: builder for the approval card's display
     /// metadata. Threading these through positionally would
     /// churn every call site; a builder keeps the API local to
@@ -252,21 +220,6 @@ impl ApprovalCell {
         self.has_dynamic_eval = has_dynamic_eval;
         self.unsafe_rule_shape = unsafe_rule_shape;
         self
-    }
-
-    /// Move button focus — only honoured when this cell itself is focused.
-    #[allow(dead_code)]
-    pub fn move_button_left(&mut self) {
-        if self.focused {
-            self.buttons.move_left();
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn move_button_right(&mut self) {
-        if self.focused {
-            self.buttons.move_right();
-        }
     }
 
     /// Issue #326 P3: returns the human-readable reason the

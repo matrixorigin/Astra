@@ -35,8 +35,6 @@
 //! └────────────────────────────────────────────────────────────────┘
 //! ```
 
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use ratatui::buffer::Buffer;

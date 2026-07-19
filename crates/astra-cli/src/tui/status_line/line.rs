@@ -1,7 +1,5 @@
 //! Pure status-line composition.
 
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use ratatui::buffer::Buffer;

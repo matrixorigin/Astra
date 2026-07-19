@@ -8,8 +8,6 @@
 //! through a separate constructor so the cell widget can render them on
 //! a dedicated row.
 
-#![allow(dead_code)]
-
 use crate::cli::chat_stream::ApprovalResponse;
 
 /// What a single button does when Enter fires.

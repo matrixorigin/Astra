@@ -89,7 +89,6 @@ mod theme;
 mod timeline;
 pub(crate) mod turn_event;
 pub(crate) mod ui_adapter;
-mod view_stack;
 mod worktrees;
 mod wrapping;
 

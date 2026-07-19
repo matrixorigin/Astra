@@ -41,18 +41,7 @@ impl UserCell {
         }
     }
 
-    /// Associate a timestamp at construction time. Callers that
-    /// already have an `Instant` converted to RFC3339 can pass it;
-    /// otherwise leave unset.
-    #[allow(dead_code)]
-    pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
-        self.ts = Some(ts.into());
-        self
-    }
-
-    /// Reconstruct from a persisted event. Used by the resume path
-    /// in Phase 4.
-    #[allow(dead_code)]
+    /// Reconstruct from a persisted event for session resume.
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::User { text, ts } => Some(Self { text, ts }),
@@ -60,7 +49,6 @@ impl UserCell {
         }
     }
 
-    #[allow(dead_code)]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -203,11 +191,14 @@ mod tests {
 
     #[test]
     fn persist_roundtrip_preserves_text_and_ts() {
-        let original = UserCell::new("hello world").with_ts("2026-05-09T12:00:00Z");
-        let persisted = original.to_persist().expect("must persist");
+        let persisted = TurnEvent::User {
+            text: "hello world".to_string(),
+            ts: Some("2026-05-09T12:00:00Z".to_string()),
+        };
         let back = UserCell::from_persist(persisted.clone()).expect("from_persist");
         assert_eq!(back.text, "hello world");
         assert_eq!(back.ts.as_deref(), Some("2026-05-09T12:00:00Z"));
+        assert_eq!(back.to_persist(), Some(persisted));
     }
 
     #[test]

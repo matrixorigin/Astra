@@ -7,8 +7,6 @@
 //! - width-aware `…` truncation when the terminal is narrow,
 //! - empty-menu message in dim style.
 
-#![allow(dead_code)]
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

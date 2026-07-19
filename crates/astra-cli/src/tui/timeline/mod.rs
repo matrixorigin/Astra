@@ -2,11 +2,8 @@
 //!
 //! Uses the MatrixOne-backed session journal to reconstruct each turn
 //! of the current session and surface cumulative metrics (tokens,
-//! tools, duration) per turn. This is the foundational read side of
-//! what will eventually become a time-travel view (restore to the
-//! state at turn N). Phase 3.4 ships the read surface first.
-
-#![allow(dead_code)]
+//! tools, duration) per turn. It is an observational surface and does not own
+//! session restore or lifecycle state.
 
 pub(crate) mod model;
 pub(crate) mod view;

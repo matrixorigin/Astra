@@ -595,17 +595,21 @@ mod tests {
 
     // ─── Session resolver ────────────────────────────────────────
 
-    /// Seed fake owner-bound session journals under a tempdir-backed HOME and
-    /// return the guarded `HomeGuard` alongside the tempdir handle (so the
-    /// tempdir outlives the test).
+    /// Seed fake owner-bound session journals under an explicit journal root.
+    ///
+    /// Redirecting `HOME` is insufficient once the process-wide home directory
+    /// cache has been initialized by another test. The journal override is the
+    /// same boundary production path resolution consumes, and its guard keeps
+    /// the tempdir isolated for the whole test.
     ///
     /// `ids` are written IN ORDER. On filesystems with per-file
     /// mtime granularity (nsec on Linux) this gives ascending
     /// mtimes; the last one written is the "newest". That's
     /// enough to cover the default-latest resolver path.
-    fn seed_sessions_tmp(ids: &[&str]) -> (crate::tests::HomeGuard, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().unwrap();
-        let g = crate::tests::HomeGuard::set(tmp.path());
+    fn seed_sessions_tmp(
+        ids: &[&str],
+    ) -> (crate::test_utils::IsolatedSessionsGuard, tempfile::TempDir) {
+        let (tmp, guard) = crate::tests::isolated_sessions_dir();
         for (i, id) in ids.iter().enumerate() {
             let path = astra_services::session_journal::journal_file_path(id);
             fs::create_dir_all(path.parent().expect("journal parent")).unwrap();
@@ -618,7 +622,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        (g, tmp)
+        (guard, tmp)
     }
 
     #[serial_test::serial]

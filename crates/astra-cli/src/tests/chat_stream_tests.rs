@@ -2,9 +2,8 @@ use super::spawn_mock;
 use crate::cli::chat_stream::{
     BasicCliChatContext, ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse,
 };
-use crate::cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::session::session_state::{ExplainMode, SessionState};
+use crate::cli::session::session_state::ExplainMode;
 use crate::edge_tools;
 use astra_runtime::tool_registry;
 use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
@@ -854,44 +853,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     assert!(
         !router.is_run_registered("persisted-run").await,
         "ephemeral root mailbox should be unregistered after the turn"
-    );
-}
-
-#[tokio::test]
-async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
-    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-    let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-    let root_addr = astra_messaging::AgentAddress::new("root-run", "main");
-    let worker_addr = astra_messaging::AgentAddress::new("worker-run", "worker");
-    let root_mailbox = router.register(root_addr.clone(), None).await.unwrap();
-    let worker_mailbox = router.register(worker_addr.clone(), None).await.unwrap();
-    worker_mailbox
-        .send(astra_messaging::AgentMessage::new(
-            worker_addr,
-            astra_messaging::MessageTarget::Direct { address: root_addr },
-            astra_messaging::MessagePayload::Text {
-                content: "done".to_string(),
-                summary: Some("worker finished".to_string()),
-            },
-        ))
-        .await
-        .unwrap();
-
-    let mut state = SessionState::default();
-    state.root_mailbox = Some(root_mailbox);
-
-    drain_root_mailbox_into_idle_queue(&mut state);
-
-    assert_eq!(state.pending_idle_agent_messages.len(), 1);
-    assert_eq!(state.pending_idle_agent_messages[0].from.agent_id, "worker");
-    assert!(
-        state
-            .root_mailbox
-            .as_mut()
-            .and_then(|mailbox| mailbox.try_recv())
-            .is_none()
     );
 }
 

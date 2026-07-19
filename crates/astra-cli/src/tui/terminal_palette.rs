@@ -56,7 +56,6 @@ pub(crate) fn default_colors() -> Option<DefaultColors> {
     imp::default_colors()
 }
 
-#[allow(dead_code)]
 pub(crate) fn default_fg() -> Option<(u8, u8, u8)> {
     default_colors().map(|c| c.fg)
 }

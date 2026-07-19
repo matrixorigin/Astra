@@ -257,11 +257,11 @@ mod key_routing_tests {
 
 #[cfg(test)]
 mod markdown_tests {
-    use crate::tui::markdown_render::render_markdown_text;
+    use crate::tui::markdown_render::render_markdown_text_with_width;
 
     #[test]
     fn renders_heading() {
-        let text = render_markdown_text("# Hello");
+        let text = render_markdown_text_with_width("# Hello", None);
         assert!(!text.lines.is_empty());
         let first = &text.lines[0];
         let content: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -273,7 +273,7 @@ mod markdown_tests {
         // Use no language tag so we exercise the plain-text code-block path
         // without triggering Oniguruma pattern compilation (which is slow and
         // can disrupt the test environment when run concurrently).
-        let text = render_markdown_text("```\nfn main() {}\n```");
+        let text = render_markdown_text_with_width("```\nfn main() {}\n```", None);
         let all: String = text
             .lines
             .iter()
@@ -293,7 +293,7 @@ mod markdown_tests {
     #[test]
     #[ignore = "compiles Oniguruma patterns on first use; run manually with -- --ignored"]
     fn renders_highlighted_code_block() {
-        let text = render_markdown_text("```rust\nfn main() {}\n```");
+        let text = render_markdown_text_with_width("```rust\nfn main() {}\n```", None);
         let all: String = text
             .lines
             .iter()
@@ -312,7 +312,7 @@ mod markdown_tests {
 
     #[test]
     fn renders_list() {
-        let text = render_markdown_text("- item1\n- item2");
+        let text = render_markdown_text_with_width("- item1\n- item2", None);
         let all: String = text
             .lines
             .iter()

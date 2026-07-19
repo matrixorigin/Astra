@@ -20,9 +20,8 @@
 //! `State, Action -> State`. One readable match beats a reducer that
 //! leaks `Effect`s everywhere.
 //!
-//! All non-trait callers still live in `tui/mod.rs` in Phase 3 —
-//! this module just provides the target API. Wire-up comes in
-//! step 3d.
+//! The event loop owns I/O and forwards typed view events here; this module
+//! owns the resulting conversation projection.
 
 mod agent_control_surface;
 mod bridge;

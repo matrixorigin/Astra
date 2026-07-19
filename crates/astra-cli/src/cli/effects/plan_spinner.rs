@@ -1,7 +1,7 @@
 //! Plan execution activity spinner.
 //!
 //! Shows a braille animation with elapsed time, optional ETA, and a contextual
-//! label during background plan execution. Used by `display_plan_updates_live`
+//! label during background plan execution. Used by the TUI plan event loop
 //! to provide visual feedback between plan update events.
 //!
 //! Format: `  ⬢ [subtask] Label                  3s ⣾`

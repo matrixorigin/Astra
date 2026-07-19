@@ -1,11 +1,8 @@
-//! Translator from the legacy `TuiAppEvent` wire format to the
-//! new `AppEvent` the `ChatWidget` consumes.
+//! Translator from the transport-facing `TuiAppEvent` wire format to the
+//! view-facing `AppEvent` consumed by `ChatWidget`.
 //!
-//! Kept as a pure function so the swap in Phase 3d/3e can be
-//! audited + unit-tested independently of the async loop. Both
-//! formats will coexist during the migration; this module is the
-//! one place where the mapping is declared, so later removal is a
-//! one-file delete.
+//! The pure boundary keeps protocol decoding outside the view model and makes
+//! the mapping independently auditable without introducing a second writer.
 
 use super::{AppEvent, TurnStats, WireEvent};
 use crate::tui::app_event::TuiAppEvent;

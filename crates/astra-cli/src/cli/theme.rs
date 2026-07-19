@@ -5,8 +5,6 @@
 //! - Non-TTY environments can disable colors in one place
 //! - Readline prompts use only ASCII text (ANSI codes are safe for cursor math)
 
-#![allow(dead_code)]
-
 use crossterm::style::Stylize;
 use std::borrow::Cow;
 use std::sync::OnceLock;

@@ -5,8 +5,6 @@
 //! feature-A + feature-B worktrees each running their own astra
 //! session, this panel makes that instantly legible.
 
-#![allow(dead_code)]
-
 pub(crate) mod model;
 pub(crate) mod view;
 

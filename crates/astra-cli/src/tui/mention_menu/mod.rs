@@ -12,8 +12,6 @@
 //!
 //! This module is pure logic; I/O lives behind [`FileProvider`].
 
-#![allow(dead_code)]
-
 pub(crate) mod menu;
 pub(crate) mod popup;
 pub(crate) mod provider;

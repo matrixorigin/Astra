@@ -7,8 +7,6 @@
 //! - Enter: accept and emit the selected session id via `ViewCompletion`
 //! - Esc: cancel without resuming
 
-#![allow(dead_code)]
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

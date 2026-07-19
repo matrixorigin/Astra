@@ -7,8 +7,6 @@
 //! [`ContextBreakdown`] is immutable once built; scrolling is a
 //! pure-view concern.
 
-#![allow(dead_code)]
-
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

@@ -9,8 +9,6 @@
 //! * Per-item `usage_boost` nudges frequently-used commands to the top.
 //! * Returns match positions for highlight rendering.
 
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 use nucleo_matcher::{

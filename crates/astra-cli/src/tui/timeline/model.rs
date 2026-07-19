@@ -1,6 +1,4 @@
-//! Pure `Timeline` model — RED phase stub.
-
-#![allow(dead_code)]
+//! Pure read-only `Timeline` model.
 
 use std::sync::Arc;
 
@@ -227,7 +225,7 @@ mod tests {
     }
 }
 
-// ── Timeline engine — RED stubs ───────────────────────────────────
+// ── Timeline engine ───────────────────────────────────────────────
 
 pub(crate) struct Timeline {
     source: Arc<dyn TurnSource>,

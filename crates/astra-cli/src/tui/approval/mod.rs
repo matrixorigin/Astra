@@ -5,8 +5,6 @@
 //! plumbing; the UI surface (inline tool cell badge + status-line counter)
 //! reads from it and renders, then calls `respond_*` to resolve entries.
 
-#![allow(dead_code)]
-
 pub(crate) mod button_row;
 pub(crate) mod queue;
 

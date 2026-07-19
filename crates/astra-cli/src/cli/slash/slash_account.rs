@@ -35,7 +35,6 @@ async fn clear_auth_runtime(state: &mut SessionState) {
     }
     state.delegation_engine = None;
     state.root_mailbox = None;
-    state.pending_idle_agent_messages.clear();
 }
 
 async fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState) {
@@ -164,28 +163,16 @@ mod tests {
             ),
         ));
         let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
-        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
-        state.pending_idle_agent_messages.push(std::sync::Arc::new(
-            astra_messaging::AgentMessage::new(
-                astra_messaging::AgentAddress::new("run-worker", "worker"),
-                astra_messaging::MessageTarget::Direct { address: root_addr },
-                astra_messaging::MessagePayload::Text {
-                    content: "stale".to_string(),
-                    summary: None,
-                },
-            ),
-        ));
+        state.root_mailbox = Some(router.register(root_addr, None).await.unwrap());
         assert!(state.delegation_engine.is_none());
         assert!(state.agent_spawner.is_none());
         assert!(state.root_mailbox.is_some());
-        assert_eq!(state.pending_idle_agent_messages.len(), 1);
 
         refresh_auth_runtime(&api, None, &mut state).await;
 
         assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
         assert!(state.root_mailbox.is_none());
-        assert!(state.pending_idle_agent_messages.is_empty());
     }
 
     #[tokio::test]
@@ -221,24 +208,13 @@ mod tests {
             ),
         ));
         let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
-        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
-        state.pending_idle_agent_messages.push(std::sync::Arc::new(
-            astra_messaging::AgentMessage::new(
-                astra_messaging::AgentAddress::new("run-worker", "worker"),
-                astra_messaging::MessageTarget::Direct { address: root_addr },
-                astra_messaging::MessagePayload::Text {
-                    content: "queued".to_string(),
-                    summary: None,
-                },
-            ),
-        ));
+        state.root_mailbox = Some(router.register(root_addr, None).await.unwrap());
 
         clear_auth_runtime(&mut state).await;
 
         assert!(state.delegation_engine.is_none());
         assert!(state.agent_spawner.is_none());
         assert!(state.root_mailbox.is_none());
-        assert!(state.pending_idle_agent_messages.is_empty());
 
         let rejected = spawner
             .spawn(

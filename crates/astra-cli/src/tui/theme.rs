@@ -13,8 +13,6 @@
 //! user an explicit escape hatch for a multiplexer or remote terminal whose
 //! capability environment is incomplete.
 
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use ratatui::style::{Color, Style};

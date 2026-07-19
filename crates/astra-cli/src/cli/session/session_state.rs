@@ -404,7 +404,6 @@ pub(crate) struct SessionState {
     /// Persistent top-level mailbox so spawned agents can reply across turns.
     pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
-    pub pending_idle_agent_messages: Vec<std::sync::Arc<astra_messaging::AgentMessage>>,
 
     // ── Drift tracking ──
     /// Redo stack — stores undone turns for `/redo` recovery.
@@ -680,7 +679,6 @@ impl Default for SessionState {
             )),
             agent_spawner: None, // Created lazily when agent spawning is first used
             root_mailbox: None,
-            pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
@@ -828,7 +826,6 @@ impl SessionState {
         self.plan_in_token_stream = false;
         self.plan_md_renderer = None;
         self.plan_thinking_pane = None;
-        self.pending_idle_agent_messages.clear();
         self.redo_stack.clear();
         self.clear_resume_recovery_state();
         self.drift_compressed_turns.clear();

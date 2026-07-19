@@ -29,7 +29,6 @@ pub(crate) mod exit_code;
 pub mod followup_suggestion;
 pub mod http_task_service;
 pub mod http_team_store;
-pub mod idle_agent_messages;
 pub mod interactive_chat;
 pub mod journal_diff;
 pub mod journal_digest;

@@ -43,7 +43,6 @@ impl ReasoningCell {
     }
 
     /// Build from a complete reasoning blob (replay path).
-    #[allow(dead_code)]
     pub fn from_text(text: impl Into<String>, duration_ms: Option<u64>) -> Self {
         Self {
             text: text.into(),
@@ -54,13 +53,6 @@ impl ReasoningCell {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
-        self.ts = Some(ts.into());
-        self
-    }
-
-    #[allow(dead_code)]
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::Thinking {
@@ -83,7 +75,6 @@ impl ReasoningCell {
         self.text.push_str(delta);
     }
 
-    #[allow(dead_code)]
     pub fn text(&self) -> &str {
         &self.text
     }

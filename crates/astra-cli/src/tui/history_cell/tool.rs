@@ -134,18 +134,11 @@ impl ToolCell {
         self.ensure_failure_details();
     }
 
-    #[allow(dead_code)]
-    pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
-        self.ts = Some(ts.into());
-        self
-    }
-
     /// Resume constructor. Duration is restored verbatim; the
     /// `started_at` Instant is meaningless on reload (we can't
     /// reconstruct a past wall clock) so we pin it to `now() -
     /// duration` so any `elapsed()` call still lines up with the
     /// persisted string.
-    #[allow(dead_code)]
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         let TurnEvent::Tool {
             ts,

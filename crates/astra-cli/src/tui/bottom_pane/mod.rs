@@ -2,7 +2,6 @@ pub(crate) mod agent_guide_view;
 pub(crate) mod agent_transcript_view;
 pub(crate) mod ask_user_view;
 pub(crate) mod background_task_view;
-pub(crate) mod busy_view;
 pub(crate) mod chat_composer;
 pub(crate) mod config_edit_view;
 pub(crate) mod context_panel_view;
@@ -707,11 +706,6 @@ impl BottomPane {
     /// old run state.
     pub(crate) fn has_agent_monitor(&self) -> bool {
         self.view_stack.iter().any(|view| view.accepts_agent_rows())
-    }
-
-    #[allow(dead_code)]
-    pub fn pop_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        self.pop_active_view()
     }
 
     pub(crate) fn dismiss_active_agent_monitor(&mut self) -> bool {

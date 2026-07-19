@@ -58,7 +58,6 @@ impl ToolProgressSink {
 /// These are distinct from `PlanUpdate` — they represent raw SSE-level activity
 /// without plan-specific context (subtask IDs, etc.).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants sent through channel and matched on receiver side
 pub enum StreamEvent {
     /// Context occupancy estimated from the request before the runtime has
     /// assembled its system prompt. This is a per-request value, never a

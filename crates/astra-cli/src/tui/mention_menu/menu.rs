@@ -1,7 +1,5 @@
 //! Pure-logic inline `@`-mention menu.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};

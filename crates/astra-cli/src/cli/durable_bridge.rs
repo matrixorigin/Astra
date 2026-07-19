@@ -324,7 +324,7 @@ pub async fn on_subtask_complete(
 
 /// Pretty-print subtask verification results (stderr).
 ///
-/// Single implementation for CLI: the plan monitor (`display_plan_updates_live` in `main.rs`)
+/// Single implementation for CLI: the TUI plan event loop
 /// calls this; do not duplicate the formatting elsewhere.
 pub fn display_verification_report(report: &SubtaskVerificationReport) {
     let passed = report.results.iter().filter(|r| r.passed).count();

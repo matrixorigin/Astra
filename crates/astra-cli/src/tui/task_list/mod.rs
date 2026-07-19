@@ -1392,7 +1392,7 @@ mod snapshot_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_tools::task_mgmt::{SessionSubtask as _S, SessionTask};
+    use astra_tools::task_mgmt::SessionTask;
 
     fn mk_task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {
@@ -1993,10 +1993,6 @@ mod tests {
         assert_eq!(icon_span.style.fg, Some(Theme::light().accent));
         assert_ne!(icon_span.style.fg, Some(Theme::dark().accent));
     }
-
-    // Suppress dead_code on SessionSubtask import noise.
-    #[allow(dead_code)]
-    fn _ensure_session_subtask_import(_: _S) {}
 
     // ── render_multi: cross-session layout ───────────────────────
 

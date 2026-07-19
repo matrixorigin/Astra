@@ -4,8 +4,6 @@
 //! [`FileProvider`] so tests can inject deterministic fixtures and the
 //! real code can scan the working directory via `std::fs`.
 
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

@@ -5,8 +5,6 @@
 //! category legend and nested sub-sections so the user can see at
 //! a glance where their context window is going.
 
-#![allow(dead_code)]
-
 pub(crate) mod model;
 pub(crate) mod view;
 

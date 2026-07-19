@@ -1,6 +1,4 @@
-//! Pure approval queue — RED phase stub.
-
-#![allow(dead_code)]
+//! Canonical TUI approval queue and focus model.
 
 use std::collections::VecDeque;
 use tokio::sync::oneshot;

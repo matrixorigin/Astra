@@ -253,14 +253,6 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// Force a clear+redraw of the viewport. Use after operations that
-    /// modify terminal content outside ratatui's knowledge (e.g. insert_history
-    /// in non-Zellij mode where we rely on ClearToEnd in the diff).
-    #[allow(dead_code)]
-    pub fn force_clear_viewport(&mut self) -> io::Result<()> {
-        self.terminal.clear()
-    }
-
     /// If viewport would extend past screen bottom, add only the missing rows
     /// at the bottom so displaced content enters native terminal scrollback.
     /// Once enough space exists below a shrunken viewport, later growth reuses

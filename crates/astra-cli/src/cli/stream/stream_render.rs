@@ -5169,7 +5169,6 @@ impl StreamRenderState {
     }
 
     /// Account for a full line written via eprintln! (adds 1 line).
-    #[allow(dead_code)]
     pub(crate) fn track_eprintln(&mut self) {
         self.stderr_lines += 1;
         if self.md.is_none() {
@@ -6702,7 +6701,6 @@ pub(crate) async fn consume_turn_sse(
 }
 
 /// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
-#[allow(dead_code)]
 pub(crate) fn dispatch_turn_event_block(
     block: &str,
     result: &mut TurnResult,

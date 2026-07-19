@@ -1,7 +1,5 @@
 //! BottomPaneView wrapper for the session timeline panel.
 
-#![allow(dead_code)]
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

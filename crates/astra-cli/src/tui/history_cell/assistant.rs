@@ -113,7 +113,6 @@ impl AssistantCell {
 
     /// Construct from a complete markdown blob — e.g. replay on
     /// resume, or a non-streaming model reply. Not live.
-    #[allow(dead_code)]
     pub fn from_markdown(markdown: impl Into<String>) -> Self {
         Self {
             source: markdown.into(),
@@ -125,14 +124,7 @@ impl AssistantCell {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_ts(mut self, ts: impl Into<String>) -> Self {
-        self.ts = Some(ts.into());
-        self
-    }
-
     /// Resume constructor.
-    #[allow(dead_code)]
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::Assistant { ts, markdown } => Some(Self {
@@ -157,7 +149,6 @@ impl AssistantCell {
         *astra_core::sync_poison::recover_mutex_lock(&self.render_cache) = None;
     }
 
-    #[allow(dead_code)]
     pub fn source(&self) -> &str {
         &self.source
     }

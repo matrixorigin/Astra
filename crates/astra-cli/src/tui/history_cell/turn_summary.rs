@@ -37,12 +37,6 @@ pub(crate) struct TurnSummaryCell {
 }
 
 impl TurnSummaryCell {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[allow(dead_code)]
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::TurnSummary {
@@ -189,9 +183,8 @@ impl TurnSummaryCell {
 
 // ── Formatting helpers ──────────────────────────────────────────
 //
-// Kept local so the TurnSummaryCell renders deterministically
-// without pulling in the broader `mod.rs` helpers, which will
-// themselves be rewritten in Phase 3.
+// Kept local so the TurnSummaryCell renders deterministically without coupling
+// its persisted projection to unrelated status-line formatting.
 
 /// Elapsed duration in ms. Whole seconds below a minute, `Nm Ss`
 /// above — matches the coarse format we use elsewhere so the

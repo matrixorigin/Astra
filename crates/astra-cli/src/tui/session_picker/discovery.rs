@@ -1,7 +1,5 @@
 //! Pure `SessionDiscovery`.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};
@@ -168,7 +166,7 @@ impl SessionSource for StaticSessionSource {
     }
 }
 
-// ── Discovery engine — RED stubs ──────────────────────────────────
+// ── Discovery engine ──────────────────────────────────────────────
 
 pub(crate) struct SessionDiscovery {
     source: Arc<dyn SessionSource>,

@@ -1,6 +1,4 @@
-//! Pure worktree-list model — RED phase stub.
-
-#![allow(dead_code)]
+//! Pure worktree-list model.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorktreeEntry {
