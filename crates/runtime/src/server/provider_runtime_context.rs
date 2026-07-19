@@ -53,6 +53,7 @@ async fn hydrate_edge_registration_runtime_context(
     let authorization = context.runtime_auth.authorization.clone();
     request.model_selection = Some(context.selected_model.to_model_selection_request());
     request.resolved_model_selection = Some(context.selected_model.to_resolved_model_selection());
+    request.admitted_model_execution = None;
     request.runtime_auth = Some(context.runtime_auth.to_runtime_auth_request());
     request.capability_descriptors = Some(context.capability_descriptors.to_request_descriptors());
     request.runtime_system_prompt = context.runtime_system_prompt;
@@ -115,7 +116,6 @@ async fn inject_edge_registration_runtime_context_body(
     // runtime bindings directly; the provider issues all of these below.
     object.remove("runtime_auth");
     object.remove("capability_descriptors");
-    object.remove("llm_token_service");
     object.remove("runtime_profile");
     object.remove("runtime_mcp_bindings");
     object.remove("runtime_skill_binding");

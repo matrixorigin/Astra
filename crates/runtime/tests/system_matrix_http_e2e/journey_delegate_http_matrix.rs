@@ -3,7 +3,7 @@
 use axum::http::StatusCode;
 use serde_json::json;
 
-use super::harness::{bootstrap, get_json, post_json, seeded_selected_model};
+use super::harness::{bootstrap, get_json, post_json, seeded_model_selection};
 
 pub async fn run_delegate_http_boundaries() {
     let b = bootstrap().await;
@@ -20,7 +20,7 @@ pub async fn run_delegate_http_boundaries() {
         json!({
             "message": "matrix e2e delegation boundary",
             "session_id": session_id,
-            "selected_model": seeded_selected_model(ctx),
+            "model_selection": seeded_model_selection(ctx),
             "execution_budget": {
                 "initial_turns": 1,
                 "hard_turn_limit": 1

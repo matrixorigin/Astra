@@ -7,7 +7,7 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     self, bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers,
-    put_json, seeded_selected_model,
+    put_json, seeded_model_selection,
 };
 
 pub async fn run_tasks_lease_with_db_assertions() {
@@ -228,7 +228,7 @@ pub async fn run_chat_run_pause_resume_http() {
         json!({
             "message": "matrix e2e background run",
             "session_id": session_id,
-            "selected_model": seeded_selected_model(ctx),
+            "model_selection": seeded_model_selection(ctx),
             "context": {
                 "test_llm_rounds": [
                     {

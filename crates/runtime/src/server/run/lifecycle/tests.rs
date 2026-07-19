@@ -293,6 +293,31 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService;
 
+fn test_resolved_model_offering() -> astra_services::ResolvedModelOffering {
+    astra_services::ResolvedModelOffering {
+        offering_id: "model-test-model".to_string(),
+        model: astra_services::ResolvedActiveLlmModel {
+            model_name: "test-model".to_string(),
+            wire_model_name: None,
+            api_key: "test-provider-secret".to_string(),
+            base_url: "https://models.example.com/v1".to_string(),
+            provider: "openai".to_string(),
+            fallback_chain: Vec::new(),
+            tags: Vec::new(),
+            request_body_overrides: None,
+            prompt_cache_capability: None,
+            thinking_capability: None,
+            context_window: Some(128_000),
+            request_headers: None,
+        },
+    }
+}
+
+fn test_admitted_model_execution() -> astra_services::AdmittedModelExecution {
+    astra_services::AdmittedModelExecution::from_offering(test_resolved_model_offering())
+        .expect("valid test model execution")
+}
+
 fn test_model_record(name: String) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
         model_id: format!("model-{name}"),
@@ -348,18 +373,18 @@ impl astra_services::ModelService for ActiveTestModelService {
         ))
     }
 
-    async fn get_model_by_offering_id(
+    async fn resolve_model_offering(
         &self,
         offering_id: String,
-    ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        if offering_id == "model-test-model" {
-            return Ok(test_model_record("test-model".to_string()));
+    ) -> Result<astra_services::ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id != "model-test-model" {
+            return Err(error_response_coded(
+                StatusCode::NOT_FOUND,
+                "offering not found",
+                "offering_not_found",
+            ));
         }
-        Err(error_response_coded(
-            StatusCode::NOT_FOUND,
-            "offering not found",
-            "offering_not_found",
-        ))
+        Ok(test_resolved_model_offering())
     }
 
     async fn update_model(
@@ -1671,7 +1696,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         description: "Test child task".to_string(),
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
-        model: Some("test-model".to_string()),
+        model: None,
         max_turns: 3,
         allowed_tools: allowed_tools.into_iter().map(String::from).collect(),
         read_only,
@@ -1698,7 +1723,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         user_id: user_id.to_string(),
         session_id: "session-1".to_string(),
         forward_headers: HashMap::new(),
-        llm_token_service: None,
+        admitted_model_execution: Some(test_admitted_model_execution()),
         request_constraints: RequestConstraints::default(),
         execution_metadata: None,
         spawner: std::sync::Weak::new(),
@@ -3448,17 +3473,14 @@ fn test_request(message: &str) -> ChatRequestData {
         model_selection: Some(ModelSelectionRequest {
             offering_id: "model-test-model".to_string(),
         }),
-        resolved_model_selection: Some(ResolvedModelSelection {
-            offering_id: "model-test-model".to_string(),
-            model_name: "test-model".to_string(),
-        }),
+        resolved_model_selection: None,
+        admitted_model_execution: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
         runtime_auth: None,
         runtime_skill_binding: None,
         runtime_profile: None,
-        llm_token_service: None,
         skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
@@ -3479,6 +3501,17 @@ fn test_request(message: &str) -> ChatRequestData {
         interactive_client: false,
         provider_workspace_id: None,
     }
+}
+
+fn prepared_test_request(message: &str) -> ChatRequestData {
+    let mut request = test_request(message);
+    request.model = Some("test-model".to_string());
+    request.resolved_model_selection = Some(ResolvedModelSelection {
+        offering_id: "model-test-model".to_string(),
+        model_name: "test-model".to_string(),
+    });
+    request.admitted_model_execution = Some(test_admitted_model_execution());
+    request
 }
 
 fn test_runtime_mcp_binding() -> RuntimeMcpBindingRequest {
@@ -3821,6 +3854,93 @@ fn server_subrun_executor_reuses_the_lifecycle_run_engine() {
     assert!(
         Arc::ptr_eq(run_engine.store(), wired.store()),
         "subruns must retain the lifecycle store identity rather than reconstructing a new owner"
+    );
+}
+
+#[tokio::test]
+async fn server_subrun_execution_material_is_bound_to_durable_offering_identity() {
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    run_engine
+        .start_run_ext_with_context(
+            "parent-run",
+            "user-1",
+            "session-1",
+            None,
+            None,
+            Some("parent-agent"),
+            None,
+            crate::server::run::engine::RunStartContext {
+                model_selection: Some(ModelSelectionRequest {
+                    offering_id: "model-test-model".to_string(),
+                }),
+                resolved_model_selection: Some(ResolvedModelSelection {
+                    offering_id: "model-test-model".to_string(),
+                    model_name: "test-model".to_string(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("durable parent with admitted model identity");
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+    let mut config = SubRunConfig {
+        run_id: "child-run".to_string(),
+        parent_run_id: "parent-run".to_string(),
+        agent_profile: AgentProfile::new("child-agent", "Child", AgentTier::User),
+        task: "verify the durable route".to_string(),
+        session_id: "session-1".to_string(),
+        user_id: "user-1".to_string(),
+        previous_output: None,
+        context: HashMap::new(),
+        forward_headers: HashMap::new(),
+        admitted_model_execution: Some(test_admitted_model_execution()),
+        request_constraints: RequestConstraints::default(),
+        recursion_depth: 1,
+        max_turns: Some(1),
+        pause_flag: None,
+        checkpoint_gate: None,
+        mailbox: None,
+        progress_emitter: None,
+        live_event_sink: None,
+        cancel_token: None,
+        inherited_prefix: None,
+        execution_metadata: None,
+        delegation_chain: Vec::new(),
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+    };
+
+    executor
+        .ensure_durable_subrun_started(&config)
+        .await
+        .expect("child start must persist the admitted Offering identity");
+    let child = run_engine
+        .load_run("user-1", "child-run")
+        .await
+        .expect("load durable child")
+        .expect("durable child");
+    assert_eq!(child.model_offering_id.as_deref(), Some("model-test-model"));
+    assert_eq!(child.resolved_model_name.as_deref(), Some("test-model"));
+
+    config.admitted_model_execution = Some(AdmittedModelExecution::from_endpoint(
+        "model-other".to_string(),
+        "other-model".to_string(),
+        "openai".to_string(),
+        "http://127.0.0.1:1/chat/completions".to_string(),
+        "Bearer test".to_string(),
+        None,
+    ));
+    assert!(
+        executor
+            .materialize_durable_subrun_execution(&config)
+            .await
+            .is_err(),
+        "execution material must not drift from the durable child Offering"
     );
 }
 
@@ -4900,7 +5020,7 @@ fn execution_bindings_from_metadata_rebases_server_sandbox_cwd() {
 #[tokio::test]
 async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.mcp_binding_ids = Some(vec!["mcp_bind_301".to_string()]);
 
     let err = service
@@ -4921,7 +5041,7 @@ async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
 async fn validate_request_constraints_rejects_core_or_unknown_enabled_tools() {
     let service = test_service();
     for tool_name in ["read_file", "not_a_tool"] {
-        let mut request = test_request("hello");
+        let mut request = prepared_test_request("hello");
         request.enabled_tools = Some(vec![tool_name.to_string()]);
 
         let error = service
@@ -4940,7 +5060,7 @@ async fn validate_request_constraints_rejects_core_or_unknown_enabled_tools() {
 #[tokio::test]
 async fn server_request_omission_explicitly_disables_optional_tools() {
     let service = test_service();
-    let request = test_request("hello");
+    let request = prepared_test_request("hello");
 
     let constraints = service
         .validate_request_constraints("u1", &request)
@@ -5024,7 +5144,7 @@ fn runtime_bearer_parser_rejects_malformed_or_multiple_credentials() {
 #[tokio::test]
 async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp_by_default() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
 
     let err = service
@@ -5048,7 +5168,7 @@ async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mc
 #[tokio::test]
 async fn validate_request_constraints_allows_explicit_request_scoped_runtime_mcp() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
     request.runtime_profile = Some(RuntimeProfileRequest::RequestScopedRuntimeMcp);
 
@@ -5061,7 +5181,7 @@ async fn validate_request_constraints_allows_explicit_request_scoped_runtime_mcp
 #[tokio::test]
 async fn validate_request_constraints_requires_model_selection() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.model = None;
     request.model_selection = None;
     request.resolved_model_selection = None;
@@ -5098,6 +5218,7 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
     request.user_intent = Some("continue the approved plan".to_string());
     request.model = None;
     request.resolved_model_selection = None;
+    request.admitted_model_execution = None;
 
     let prepared = service
         .prepare_chat_request(request)
@@ -5105,6 +5226,12 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
         .expect("non-empty user_intent is valid effective input");
 
     assert_eq!(prepared.model.as_deref(), Some("test-model"));
+    let material = prepared
+        .admitted_model_execution
+        .as_ref()
+        .expect("Server admission must materialize the exact Offering once");
+    assert_eq!(material.offering_id, "model-test-model");
+    assert_eq!(material.model_name, "test-model");
     assert_eq!(
         prepared.user_intent.as_deref(),
         Some("continue the approved plan")
@@ -5114,7 +5241,7 @@ async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message
 #[tokio::test]
 async fn validate_request_constraints_allows_native_model_without_gateway_auth() {
     let service = test_service();
-    let request = test_request("hello");
+    let request = prepared_test_request("hello");
 
     service
         .validate_request_constraints("u1", &request)
@@ -5128,6 +5255,7 @@ async fn prepare_chat_request_rejects_unknown_offering_without_name_fallback() {
     let mut request = test_request("hello");
     request.model = None;
     request.resolved_model_selection = None;
+    request.admitted_model_execution = None;
     request.model_selection = Some(ModelSelectionRequest {
         offering_id: "missing-model".to_string(),
     });
@@ -5150,17 +5278,18 @@ fn test_runtime_descriptor(
         descriptor_type: descriptor_type.to_string(),
         transport: "http".to_string(),
         endpoint_url: endpoint_url.to_string(),
-        protocol: "openai_responses".to_string(),
+        protocol: "openai_chat_completions".to_string(),
         semantic_read: None,
         metadata: serde_json::Map::new(),
     }
 }
 
 #[tokio::test]
-async fn validate_request_constraints_accepts_provider_descriptor_without_registered_gateway() {
+async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_gateway() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
     request.runtime_auth = Some(RuntimeAuthRequest {
         authorization: "Bearer runtime-grant".to_string(),
     });
@@ -5176,27 +5305,34 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
             edge_agent: None,
         });
 
-    service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect("provider descriptor should not require registered model gateway");
     let prepared = service
-        .prepare_model_gateway_invocation(request)
+        .prepare_chat_request(request)
         .await
-        .expect("provider descriptor should become llm_token_service");
+        .expect("provider descriptor should become admitted_model_execution");
+    service
+        .validate_request_constraints("u1", &prepared)
+        .await
+        .expect("normalized provider execution should satisfy run invariants");
     assert_eq!(
         prepared
-            .llm_token_service
+            .admitted_model_execution
             .as_ref()
-            .map(|config| &config.url),
-        Some(&"http://127.0.0.1/model-gateway".to_string())
+            .and_then(|execution| execution.completions_url_override.as_deref()),
+        Some("http://127.0.0.1/model-gateway")
+    );
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.model_name.as_str()),
+        Some("test-model")
     );
 }
 
 #[tokio::test]
 async fn validate_request_constraints_rejects_descriptor_without_provider_authorization() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.runtime_auth = Some(RuntimeAuthRequest {
         authorization: "Bearer runtime-grant".to_string(),
     });
@@ -5226,7 +5362,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
 #[tokio::test]
 async fn validate_request_constraints_rejects_agent_binding_registry_profile_without_binding() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
 
     let err = service
@@ -5244,7 +5380,7 @@ async fn validate_request_constraints_rejects_agent_binding_registry_profile_wit
 #[tokio::test]
 async fn validate_request_constraints_allows_agent_binding_with_omitted_runtime_profile() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.agent_binding = Some(AgentBindingRuntimeRequest {
         id: "abnd_test1234567890".to_string(),
         capability_server_refs: CapabilityServerRefs {
@@ -5265,7 +5401,7 @@ async fn validate_request_constraints_allows_agent_binding_with_omitted_runtime_
 #[tokio::test]
 async fn validate_request_constraints_rejects_agent_binding_edge_tools() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.agent_binding = Some(AgentBindingRuntimeRequest {
         id: "abnd_test1234567890".to_string(),
         capability_server_refs: CapabilityServerRefs {
@@ -5300,7 +5436,7 @@ async fn validate_request_constraints_rejects_agent_binding_edge_tools() {
 #[tokio::test]
 async fn validate_request_constraints_rejects_agent_binding_edge_skills() {
     let service = test_service();
-    let mut request = test_request("hello");
+    let mut request = prepared_test_request("hello");
     request.agent_binding = Some(AgentBindingRuntimeRequest {
         id: "abnd_test1234567890".to_string(),
         capability_server_refs: CapabilityServerRefs {
@@ -7738,13 +7874,13 @@ fn extract_edge_tools_from_context() {
         model: None,
         model_selection: None,
         resolved_model_selection: None,
+        admitted_model_execution: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
         runtime_auth: None,
         runtime_skill_binding: None,
         runtime_profile: None,
-        llm_token_service: None,
         skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
@@ -7777,100 +7913,6 @@ fn extract_edge_tools_empty_when_no_context() {
             .expect("empty edge tools")
             .is_empty()
     );
-}
-
-fn trusted_domains_for_tests() -> Vec<super::TrustedLlmDomain> {
-    vec![super::TrustedLlmDomain {
-        host: "catalog".to_string(),
-        port: Some(8081),
-    }]
-}
-
-#[test]
-fn validate_llm_token_service_config_accepts_http_url() {
-    let config = astra_services::LlmTokenServiceConfig {
-        url: "http://catalog:8081/api/v1/llm-token".to_string(),
-        timeout_ms: Some(2500),
-    };
-    let trusted = trusted_domains_for_tests();
-    assert!(super::validate_llm_token_service_config(Some(&config), &trusted).is_ok());
-}
-
-#[test]
-fn validate_llm_token_service_config_rejects_invalid_url() {
-    let config = astra_services::LlmTokenServiceConfig {
-        url: "not-a-url".to_string(),
-        timeout_ms: Some(2500),
-    };
-    let trusted = trusted_domains_for_tests();
-    let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-        .expect_err("invalid url should fail");
-    assert!(err.contains("valid URL"), "unexpected error: {err}");
-}
-
-#[test]
-fn validate_llm_token_service_config_rejects_untrusted_url() {
-    let config = astra_services::LlmTokenServiceConfig {
-        url: "http://evil.example.com/v1/chat/completions".to_string(),
-        timeout_ms: Some(2500),
-    };
-    let trusted = trusted_domains_for_tests();
-    let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-        .expect_err("untrusted url should fail");
-    assert!(
-        err.contains("trusted domains"),
-        "unexpected error message: {err}"
-    );
-}
-
-#[test]
-fn validate_llm_token_service_config_rejects_when_trusted_domains_unconfigured() {
-    let config = astra_services::LlmTokenServiceConfig {
-        url: "http://catalog:8081/api/v1/llm-token".to_string(),
-        timeout_ms: Some(2500),
-    };
-    let err = super::validate_llm_token_service_config(Some(&config), &[])
-        .expect_err("missing trusted domains should fail");
-    assert!(
-        err.contains(super::LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE),
-        "unexpected error message: {err}"
-    );
-}
-
-#[test]
-fn validate_llm_token_service_config_enforces_host_port_boundary_for_trusted_domains() {
-    let config = astra_services::LlmTokenServiceConfig {
-        url: "http://catalog:8082/api/v1/chat".to_string(),
-        timeout_ms: Some(2500),
-    };
-    let trusted = trusted_domains_for_tests();
-    let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-        .expect_err("host:port boundary should be enforced");
-    assert!(
-        err.contains("trusted domains"),
-        "unexpected error message: {err}"
-    );
-}
-
-#[test]
-fn trusted_llm_domain_from_db_values_accepts_valid_host_and_port() {
-    let parsed =
-        super::trusted_llm_domain_from_db_values("catalog", 8081).expect("host+port should parse");
-    assert_eq!(parsed.host, "catalog");
-    assert_eq!(parsed.port, Some(8081));
-    let wildcard = super::trusted_llm_domain_from_db_values("catalog", 0)
-        .expect("sentinel port should represent wildcard");
-    assert_eq!(wildcard.port, None);
-}
-
-#[test]
-fn trusted_llm_domain_from_db_values_rejects_invalid_host_or_port() {
-    let host_err = super::trusted_llm_domain_from_db_values("http://catalog:8081", 8081)
-        .expect_err("host should not include scheme");
-    assert!(host_err.contains("host"));
-    let port_err = super::trusted_llm_domain_from_db_values("catalog", 70000)
-        .expect_err("port out of range should fail");
-    assert!(port_err.contains("port"));
 }
 
 #[test]
@@ -7911,13 +7953,13 @@ fn extract_edge_profile_from_context() {
         model: None,
         model_selection: None,
         resolved_model_selection: None,
+        admitted_model_execution: None,
         capability_descriptors: None,
         provider_runtime_authorized: false,
         agent_binding: None,
         runtime_auth: None,
         runtime_skill_binding: None,
         runtime_profile: None,
-        llm_token_service: None,
         skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
@@ -8507,7 +8549,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     let endpoint = format!("http://{addr}/skills");
 
     let svc = test_service();
-    let mut request = test_request("use the provider skill");
+    let mut request = prepared_test_request("use the provider skill");
     request.allow_skills = Some(vec!["moi-skill".to_string()]);
     request.runtime_skill_binding = Some(RuntimeSkillBindingRequest {
         id: "moi-skills".to_string(),
@@ -8655,8 +8697,9 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
     let service = test_service().with_agent_binding_service(Arc::new(StaticAgentBindingService {
         record: record.clone(),
     }));
-    let mut request = test_request("use binding tools");
+    let mut request = prepared_test_request("use binding tools");
     request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
     request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
     request.agent_binding = Some(runtime_binding_request(record.id, "tools", "skills"));
     request.runtime_auth = Some(RuntimeAuthRequest {
@@ -8732,7 +8775,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
 
 #[test]
 fn runtime_manifest_preserves_server_only_backbone_without_workspace_executor() {
-    let mut request = test_request("answer with server-side context");
+    let mut request = prepared_test_request("answer with server-side context");
     request.parts = vec![json!({"type": "text", "text": "answer with server-side context"})];
     request.attachments = vec![json!({"id": "att-server-only", "kind": "note"})];
     request.capabilities = vec![
@@ -8795,7 +8838,7 @@ fn runtime_manifest_preserves_server_only_backbone_without_workspace_executor() 
 
 #[test]
 fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
-    let mut request = test_request("use binding tools");
+    let mut request = prepared_test_request("use binding tools");
     request.agent_binding = Some(AgentBindingRuntimeRequest {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
         capability_server_refs: CapabilityServerRefs {

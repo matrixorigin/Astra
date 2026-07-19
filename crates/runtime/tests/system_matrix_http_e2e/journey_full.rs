@@ -12,7 +12,7 @@ use super::harness::{
     MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
     get_json, maybe_tool_result_payload_from_sse, post_empty, post_json, post_json_with_headers,
     put_json, row_get_opt_i64, row_get_opt_str, row_get_str, seed_pending_approval,
-    seeded_selected_model, tool_result_payload, wait_for_agent_event_types,
+    seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -39,7 +39,7 @@ async fn run_tool_backed_chat_turn(
         "agent_id": agent_id,
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "read README through a tool" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [read_file_tool],
         "test_llm_rounds": [
             {
@@ -1075,7 +1075,7 @@ pub async fn run_product_matrix_full_journey(
         "agent_id": agent_id,
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "matrix journey ping" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [],
         "test_llm_rounds": [{
             "full_text": LLM_TEXT,

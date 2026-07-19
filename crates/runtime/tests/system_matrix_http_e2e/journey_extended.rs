@@ -11,7 +11,7 @@ use super::harness::{
     E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
     durable_interaction_event_count, get_json, grant_astra_admin_role,
     maybe_tool_result_payload_from_sse, post_empty, post_json, put_json, seed_pending_approval,
-    seeded_selected_model, tool_result_payload,
+    seeded_model_selection, tool_result_payload,
 };
 use axum::{body::Body, http::Request};
 use tower::util::ServiceExt;
@@ -233,7 +233,7 @@ pub async fn run_chat_stream_session_info_smoke() {
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "execution_budget": {
             "initial_turns": 1,
             "hard_turn_limit": 1
@@ -396,7 +396,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
         "agent_id": "system-matrix-dup-tool-agent",
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read the duplicate path" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -558,7 +558,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
         "agent_id": "system-matrix-partial-batch-agent",
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read two files and continue even if one fails" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -727,7 +727,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
         "agent_id": "system-matrix-race-agent",
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "read two files even if callbacks arrive out of order" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -895,7 +895,7 @@ pub async fn run_same_session_concurrent_turns_isolated() {
         "agent_id": "system-matrix-overlap-agent",
         "session_id": session_id,
         "messages": [{ "role": "user", "content": "same-session overlap request A" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response A"
         }]
@@ -904,7 +904,7 @@ pub async fn run_same_session_concurrent_turns_isolated() {
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "same-session overlap request B" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response B"
         }]
@@ -1035,7 +1035,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
         "messages": [{ "role": "user", "content": "waiting overlap tool turn" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -1146,7 +1146,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                     "agent_id": "system-matrix-overlap-agent",
                     "session_id": ctx.session_id,
                     "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
-                    "selected_model": seeded_selected_model(ctx),
+                    "model_selection": seeded_model_selection(ctx),
                     "test_llm_rounds": [{
                         "full_text": "Waiting overlap plain turn finished."
                     }]

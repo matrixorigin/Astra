@@ -485,9 +485,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     let git_branch = read_git_branch_abbrev();
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
-    let (resolved_model, thinking_config) = match requested_model {
+    let thinking_config = match requested_model {
         Some(m) => {
-            let (name, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
             // Per-turn dampener: the model suffix encodes the user's CEILING
             // (e.g. `thinking:high`), not a command to burn that budget on every
             // turn regardless of content. Short read-only questions get a
@@ -495,10 +495,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             // unchanged. See `ThinkingConfig::scale_for_turn` for the policy.
             let signals =
                 astra_turn_core::thinking_config::TurnComplexitySignals::from_message(ctx.message);
-            let cfg = cfg.scale_for_turn(signals);
-            (Some(name), cfg)
+            cfg.scale_for_turn(signals)
         }
-        None => (None, astra_turn_core::thinking_config::ThinkingConfig::Off),
+        None => astra_turn_core::thinking_config::ThinkingConfig::Off,
     };
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: &prompt_messages,
@@ -506,7 +505,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
         model_id: ctx.model_id,
-        model: resolved_model,
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
@@ -2688,8 +2686,7 @@ mod tests {
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
-        assert_eq!(payload["selected_model"]["id"], "model-qwen");
-        assert_eq!(payload["selected_model"]["model"], "qwen3.7-max");
+        assert_eq!(payload["model_selection"]["offering_id"], "model-qwen");
         let edge_tool_name_set: HashSet<String> = edge_tool_names
             .iter()
             .map(|name| (*name).to_string())

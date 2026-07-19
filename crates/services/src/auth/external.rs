@@ -1531,7 +1531,7 @@ mod tests {
                     "type": "model_gateway",
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
-                    "protocol": "openai_responses",
+                    "protocol": "openai_chat_completions",
                     "metadata": {}
                 }
             },
@@ -1552,7 +1552,7 @@ mod tests {
             .capability_descriptors
             .model_gateway
             .expect("model gateway");
-        assert_eq!(model_gateway.protocol, "openai_responses");
+        assert_eq!(model_gateway.protocol, "openai_chat_completions");
         assert_eq!(
             model_gateway.endpoint_url,
             "http://127.0.0.1/api/v1/models/openai/chat/completions"
@@ -1646,7 +1646,7 @@ mod tests {
                     "type": "model_gateway",
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
-                    "protocol": "openai_responses",
+                    "protocol": "openai_chat_completions",
                     "metadata": {}
                 },
                 "mcp": {

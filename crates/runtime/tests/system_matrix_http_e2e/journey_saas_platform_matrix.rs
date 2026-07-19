@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use super::harness::{
     E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role,
-    load_durable_interaction_event, post_empty, post_json, put_json, revoke_astra_admin_role,
-    seed_pending_approval, seeded_model_name, selected_model, wait_for_agent_event_types,
+    load_durable_interaction_event, model_selection, post_empty, post_json, put_json,
+    revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
 use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
@@ -187,7 +187,7 @@ pub async fn run_saas_resource_daily_session_cap_denies_chat() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_id).await;
     grant_astra_admin_role(pool, user_id).await;
@@ -204,7 +204,7 @@ pub async fn run_saas_resource_daily_session_cap_denies_chat() {
     let chat_body = |session_id: Option<&str>| {
         let mut body = json!({
             "message": "saas quota probe",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": {
                 "initial_turns": 1,
                 "hard_turn_limit": 1
@@ -265,7 +265,7 @@ pub async fn run_saas_resource_concurrent_session_cap_denies_chat() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_id).await;
     grant_astra_admin_role(pool, user_id).await;
@@ -287,7 +287,7 @@ pub async fn run_saas_resource_concurrent_session_cap_denies_chat() {
         Some(auth),
         json!({
             "message": "concurrent cap probe",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -447,7 +447,7 @@ pub async fn run_saas_resource_usage_per_user_isolation() {
     let auth_a = &b.auth_header;
     let pool = &ctx.pool;
     let user_a = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_a).await;
 
@@ -457,7 +457,7 @@ pub async fn run_saas_resource_usage_per_user_isolation() {
         Some(auth_a),
         json!({
             "message": "usage isolation probe",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -917,7 +917,7 @@ pub async fn run_saas_resource_usage_increments_after_chat() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_id).await;
 
@@ -931,7 +931,7 @@ pub async fn run_saas_resource_usage_increments_after_chat() {
         Some(auth),
         json!({
             "message": "usage counter probe",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -955,7 +955,7 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth_a = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -964,7 +964,7 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
         json!({
             "message": "cancel isolation probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1136,7 +1136,7 @@ pub async fn run_saas_runs_list_pagination_positive() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1145,7 +1145,7 @@ pub async fn run_saas_runs_list_pagination_positive() {
         json!({
             "message": "runs list probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1322,7 +1322,7 @@ pub async fn run_saas_session_replay_compare_smoke() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1331,7 +1331,7 @@ pub async fn run_saas_session_replay_compare_smoke() {
         json!({
             "message": "replay compare probe",
             "session_id": session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1361,7 +1361,7 @@ pub async fn run_saas_session_replay_post_positive() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1370,7 +1370,7 @@ pub async fn run_saas_session_replay_post_positive() {
         json!({
             "message": "replay post probe",
             "session_id": session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1445,7 +1445,7 @@ pub async fn run_saas_run_projection_smoke() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1454,7 +1454,7 @@ pub async fn run_saas_run_projection_smoke() {
         json!({
             "message": "run projection probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1482,7 +1482,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1491,7 +1491,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         json!({
             "message": "session audit probe",
             "session_id": session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1536,7 +1536,7 @@ pub async fn run_saas_session_activity_transcript_artifacts_smoke() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1545,7 +1545,7 @@ pub async fn run_saas_session_activity_transcript_artifacts_smoke() {
         json!({
             "message": "session handlers probe",
             "session_id": session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -1581,7 +1581,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
     let app = &ctx.app;
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1590,7 +1590,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
         json!({
             "message": "events session probe",
             "session_id": session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )

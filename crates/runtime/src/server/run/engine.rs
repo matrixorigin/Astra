@@ -3244,6 +3244,7 @@ mod tests {
             model: None,
             model_selection: None,
             resolved_model_selection: None,
+            admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
@@ -3256,7 +3257,6 @@ mod tests {
             runtime_auth: None,
             runtime_skill_binding: None,
             runtime_profile: None,
-            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,

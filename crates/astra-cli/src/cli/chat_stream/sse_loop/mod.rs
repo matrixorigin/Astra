@@ -194,6 +194,7 @@ pub(crate) async fn stream_chat_sse(
         match session_runtime::resolve_server_default_model(p.api, p.token).await {
             ServerDefaultModel::Selected(selection) => {
                 model_context_window = selection.context_window;
+                p.model_id = Some(selection.model_id);
                 Some(selection.name)
             }
             ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
@@ -221,11 +222,11 @@ pub(crate) async fn stream_chat_sse(
     };
     p.model = Some(selected_model);
     if model_context_window.is_none() {
-        match session_runtime::resolve_server_model_context_window(p.api, p.token, selected_model)
-            .await
+        match session_runtime::resolve_server_model_selection(p.api, p.token, selected_model).await
         {
-            Ok(context_window) => {
-                model_context_window = Some(context_window);
+            Ok(selection) => {
+                p.model_id = Some(selection.model_id);
+                model_context_window = selection.context_window;
             }
             Err(error) => {
                 tracing::error!(
@@ -261,6 +262,23 @@ pub(crate) async fn stream_chat_sse(
             },
         });
     };
+    if p.model_id.is_none() {
+        let error = format!(
+            "model '{selected_model}' is missing an exact Offering identity in the server registry"
+        );
+        tracing::error!(
+            target: "astra_cli::model_selection",
+            model = selected_model,
+            "turn failed before SSE stream because selected model did not include model_id"
+        );
+        return Err(crate::TurnFailure {
+            error,
+            partial: crate::PartialTurnData {
+                session_id: p.session_id.map(str::to_string),
+                ..Default::default()
+            },
+        });
+    }
     let effective_max_turn_input_tokens = RuntimeLimits::global()
         .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
     let root_agent_id = p.root_agent_id.unwrap_or("main");
@@ -888,7 +906,7 @@ pub(crate) async fn stream_chat_sse(
             teammate_idle_hook_runs: 0,
             workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
             forward_headers: std::collections::HashMap::new(),
-            llm_token_service: None,
+            admitted_model_execution: None,
             task_board_monitor: p.task_manager.clone(),
             task_board_snapshot: Default::default(),
             completion_settlement: Default::default(),
@@ -1285,7 +1303,7 @@ fn record_missing_model_selection_failure(
         error_kind = error.kind.as_str(),
         session_id = ?session_id,
         turn_index,
-        "turn failed before SSE stream because selected_model/default_model was absent"
+        "turn failed before SSE stream because no selectable Offering was resolved"
     );
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return;
@@ -1316,7 +1334,7 @@ fn missing_model_selection_journal_event(
     event.metadata = Some(json!({
         "error_kind": error.kind.as_str(),
         "reason": "missing_model_selection",
-        "selected_model": null,
+        "model_selection": null,
         "model_resolution": {
             "resolved": false,
             "source": "cli_turn_selection",

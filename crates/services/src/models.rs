@@ -398,6 +398,109 @@ pub struct ResolvedModelOffering {
     pub model: ResolvedActiveLlmModel,
 }
 
+/// Non-serializable execution material produced once at the trusted model
+/// admission boundary and consumed by every inference surface.
+///
+/// Credential origin is intentionally absent. Executors receive one normalized
+/// invocation shape and never branch on the product source that produced it.
+#[derive(Clone, PartialEq)]
+pub struct AdmittedModelExecution {
+    pub offering_id: String,
+    pub model_name: String,
+    pub wire_model_name: Option<String>,
+    pub api_key: String,
+    pub base_url: String,
+    pub provider: String,
+    pub cache_capability: Option<PromptCacheCapabilityData>,
+    pub request_body_overrides: Option<Map<String, Value>>,
+    pub context_window: Option<u32>,
+    pub header_overrides: HashMap<String, String>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+}
+
+impl AdmittedModelExecution {
+    pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
+        let header_overrides = offering
+            .model
+            .request_headers
+            .as_ref()
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                            .ok_or_else(|| {
+                                format!("model request header '{name}' must contain a string value")
+                            })
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            offering_id: offering.offering_id,
+            model_name: offering.model.model_name,
+            wire_model_name: offering.model.wire_model_name,
+            api_key: offering.model.api_key,
+            base_url: offering.model.base_url,
+            provider: offering.model.provider,
+            cache_capability: offering.model.prompt_cache_capability,
+            request_body_overrides: offering.model.request_body_overrides,
+            context_window: offering.model.context_window,
+            header_overrides,
+            completions_url_override: None,
+            request_timeout_ms: None,
+        })
+    }
+
+    pub fn from_endpoint(
+        offering_id: String,
+        model_name: String,
+        provider: String,
+        endpoint_url: String,
+        authorization: String,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            offering_id,
+            model_name,
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            provider,
+            cache_capability: None,
+            request_body_overrides: None,
+            context_window: None,
+            header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
+            completions_url_override: Some(endpoint_url),
+            request_timeout_ms: timeout_ms,
+        }
+    }
+}
+
+impl std::fmt::Debug for AdmittedModelExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("AdmittedModelExecution")
+            .field("offering_id", &self.offering_id)
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("provider", &self.provider)
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_names", &header_names)
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelOfferingResolutionError {
     InvalidOfferingId,
@@ -1488,14 +1591,12 @@ pub trait ModelService: Send + Sync {
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)>;
 
-    /// Load the catalog record behind a client-visible Offering ID.
-    ///
-    /// Phase 0 maps Offering identity directly to the durable model ID. This
-    /// lookup is exact and must not fall back to model names or aliases.
-    async fn get_model_by_offering_id(
+    /// Resolve one exact active Offering into short-lived execution material.
+    /// Implementations must not fall back to model names or alternate rows.
+    async fn resolve_model_offering(
         &self,
         offering_id: String,
-    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)>;
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)>;
 
     async fn update_model(
         &self,
@@ -1840,29 +1941,26 @@ impl ModelService for DatabaseModelService {
         Self::model_record_from_row(row)
     }
 
-    async fn get_model_by_offering_id(
+    async fn resolve_model_offering(
         &self,
         offering_id: String,
-    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        validate_model_offering_id(&offering_id)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let sql = format!(
-            "SELECT {} FROM infra_llm_models WHERE model_id = ? LIMIT 1",
-            MODEL_SELECT_COLS
-        );
-        let row = query(&sql)
-            .bind(&offering_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?;
-        let row = row.ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                ModelOfferingResolutionError::NotFound { offering_id }.to_string(),
-            )
-        })?;
-        Self::model_record_from_row(row)
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        resolve_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| {
+            let status = match error {
+                ModelOfferingResolutionError::InvalidOfferingId => StatusCode::BAD_REQUEST,
+                ModelOfferingResolutionError::NotFound { .. }
+                | ModelOfferingResolutionError::Inactive { .. } => StatusCode::NOT_FOUND,
+                ModelOfferingResolutionError::Backend(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            error_response(status, error.to_string())
+        })
     }
 
     async fn update_model(
@@ -2740,10 +2838,10 @@ impl ModelService for UnconfiguredModelService {
     async fn get_model(&self, _: String) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("model service not configured"))
     }
-    async fn get_model_by_offering_id(
+    async fn resolve_model_offering(
         &self,
         _: String,
-    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("model service not configured"))
     }
     async fn update_model(
@@ -2922,6 +3020,24 @@ mod tests {
             ActiveLlmModelCacheKey::new(&matrixone, "same-value"),
             ActiveLlmModelCacheKey::for_offering_id(&matrixone, "same-value")
         );
+    }
+
+    #[test]
+    fn admitted_execution_debug_output_redacts_credentials_and_endpoint() {
+        let execution = AdmittedModelExecution::from_endpoint(
+            "offer-private".to_string(),
+            "private-model".to_string(),
+            "openai".to_string(),
+            "https://private.example/v1/chat/completions".to_string(),
+            "Bearer top-secret".to_string(),
+            Some(2_500),
+        );
+
+        let debug = format!("{execution:?}");
+        assert!(!debug.contains("top-secret"));
+        assert!(!debug.contains("private.example"));
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("completions_url_override_present: true"));
     }
 
     // ── resolve_model_alias ──

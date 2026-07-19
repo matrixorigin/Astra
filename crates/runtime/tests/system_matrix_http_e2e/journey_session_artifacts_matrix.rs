@@ -18,8 +18,8 @@ use astra_services::session_restore::COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND;
 use astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, cleanup_session_data, get_json, post_json, seeded_selected_model,
-    selected_model,
+    E2E_PASSWORD, bootstrap, cleanup_session_data, get_json, model_selection,
+    offering_id_from_model_response, post_json, seeded_model_selection,
 };
 
 async fn collect_full_sse_stream(
@@ -1161,7 +1161,7 @@ pub async fn run_published_session_artifact_round_trip() {
     let payload = json!({
         "message": "publish llm capture and read it back",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Artifact publish verified." }]
         }
@@ -1278,7 +1278,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     let payload = json!({
         "message": "publish llm capture for latest and download routes",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Artifact download verified." }]
         }
@@ -1455,7 +1455,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     let payload = json!({
         "message": "publish failed llm capture for latest and download routes",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{
                 "error": {
@@ -1621,7 +1621,7 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
         "agent_id": agent_id,
         "session_id": &session_id,
         "messages": [{ "role": "user", "content": user_message }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_stream_blocks": stream_blocks
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -1746,7 +1746,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let payload = json!({
         "message": "trigger a server-loop malformed provider block after progress and recover",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -1880,7 +1880,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     let payload = json!({
         "message": "trigger a server-loop malformed provider block after progress and make fallback fail",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2046,7 +2046,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     let payload = json!({
         "message": "trigger a server-loop transport break after partial output",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2187,7 +2187,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
     let payload = json!({
         "message": "trigger a server-loop transport break after progress and recover",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2319,7 +2319,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
     let payload = json!({
         "message": "trigger a server-loop transport break after progress and make fallback fail",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2478,7 +2478,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
     let payload = json!({
         "message": "trigger a server-loop idle timeout after progress and recover",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2612,7 +2612,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     let payload = json!({
         "message": "trigger a server-loop idle timeout after progress and make fallback fail",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2760,7 +2760,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
     let payload = json!({
         "message": "trigger repeated server-loop rate limits",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload.clone()).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -2905,7 +2905,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
     let payload = json!({
         "message": "trigger one server-loop rate limit and then recover",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone())
+        "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
@@ -3040,7 +3040,7 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         "agent_id": "system-matrix-bridge-tail-parse-artifact",
         "session_id": &session_id,
         "messages": [{ "role": "user", "content": "trigger a bridge tail parse failure after partial state" }],
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "test_llm_stream_blocks": [
             format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
             format!("data: {{\"type\":\"reasoning_delta\",\"content\":\"{partial_reasoning}\"}}\n\n"),
@@ -3210,7 +3210,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     let payload = json!({
         "agent_id": "system-matrix-bridge-transport-artifact",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger a bridge transport failure after partial output" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3339,7 +3339,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     let request_body = json!({
         "agent_id": "system-matrix-bridge-client-disconnect",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger a bridge client disconnect after partial output" }]
     })
     .to_string();
@@ -3492,7 +3492,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     let payload = json!({
         "agent_id": "system-matrix-bridge-idle-artifact",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger a bridge idle failure after partial output" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3620,7 +3620,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
     let payload = json!({
         "agent_id": "system-matrix-bridge-rate-limit-artifact",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger repeated bridge rate limits" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload.clone()).await;
@@ -3753,7 +3753,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
     let payload = json!({
         "agent_id": "system-matrix-bridge-rate-limit-retry-success",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger one bridge rate limit and then recover" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3874,7 +3874,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     let payload = json!({
         "agent_id": "system-matrix-bridge-tool-call-block-parse-recovery",
         "session_id": &session_id,
-        "selected_model": selected_model(model_name.clone()),
+        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
         "messages": [{ "role": "user", "content": "trigger a bridge tool-call block parse failure and recover with full arguments" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;

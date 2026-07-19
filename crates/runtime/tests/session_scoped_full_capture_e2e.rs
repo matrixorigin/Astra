@@ -1,3 +1,5 @@
+mod test_support;
+
 use std::sync::Arc;
 
 use astra_runtime::{
@@ -278,6 +280,10 @@ async fn spawn_test_server() -> (
     )
     .with_auth_service(Arc::new(StubAuthService))
     .with_session_service(Arc::new(CaptureEnabledSessionService))
+    .with_model_service(test_support::test_model_service(
+        "offer-test-model",
+        "test-model",
+    ))
     .with_run_lifecycle_service(Arc::new(lifecycle.clone()));
 
     let app = build_app(state);
@@ -317,9 +323,7 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
             "type": "message",
             "content": "hello over websocket",
             "session_id": "capture-session",
-            "selected_model": {
-                "model": "test-model"
-            }
+            "model_selection": {"offering_id": "offer-test-model"}
         })
         .to_string()
         .into(),
@@ -384,9 +388,7 @@ async fn http_chat_propagates_session_scoped_full_capture_over_real_http() {
         .json(&json!({
             "session_id": "capture-session",
             "message": "hello over http",
-            "selected_model": {
-                "model": "test-model"
-            }
+            "model_selection": {"offering_id": "offer-test-model"}
         }))
         .send()
         .await

@@ -3,6 +3,8 @@
 //!
 //! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_TEST_BRIDGE_SECRET` (set below).
 
+mod test_support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -209,6 +211,10 @@ fn ledger_inject_app(capture: ToolPersistCapture) -> (Router, Arc<Mutex<HashMap<
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(LedgerE2eAuth))
         .with_session_service(Arc::new(LedgerE2eSession))
+        .with_model_service(test_support::test_model_service(
+            "offer-mock-model",
+            "mock-model",
+        ))
         .with_turn_tool_event_writer(Arc::new(CapturingTurnToolWriter {
             capture: capture.clone(),
         }));
@@ -249,7 +255,7 @@ async fn canonical_tool_result_continuation_consumes_callback_receipt() {
         "session_turn": 1,
         "turn_chain_id": "chain-ledger-e2e",
         "user_query_event_id": "query-ledger-e2e",
-        "selected_model": { "model": "mock-model" },
+        "model_selection": {"offering_id": "offer-mock-model"},
         "messages": [{ "role": "user", "content": "read README" }],
         "edge_tools": [read_file_tool],
         "test_llm_rounds": [
@@ -339,7 +345,7 @@ async fn canonical_tool_result_continuation_consumes_callback_receipt() {
         "session_turn": 1,
         "turn_chain_id": "chain-ledger-e2e",
         "user_query_event_id": "query-ledger-e2e",
-        "selected_model": { "model": "mock-model" },
+        "model_selection": {"offering_id": "offer-mock-model"},
         "messages": [{ "role": "user", "content": "read README" }],
         "tool_results": [{
             "request_id": "call-ledger-e2e-1",

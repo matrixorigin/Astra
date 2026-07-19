@@ -19,7 +19,6 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub model_id: Option<&'a str>,
-    pub model: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
     pub explain_on: bool,
@@ -42,7 +41,6 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         session_id,
         agent_id,
         model_id,
-        model,
         interaction_mode,
         explain_verbose,
         explain_on,
@@ -70,15 +68,13 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
             detect_workspace_context(project_root),
         ),
     });
-    if let Some(model) = model
+    if let Some(model_id) = model_id
         && let Some(obj) = payload.as_object_mut()
     {
-        let mut selected_model = serde_json::Map::new();
-        if let Some(model_id) = model_id {
-            selected_model.insert("id".to_string(), json!(model_id));
-        }
-        selected_model.insert("model".to_string(), json!(model));
-        obj.insert("selected_model".to_string(), Value::Object(selected_model));
+        obj.insert(
+            "model_selection".to_string(),
+            json!({"offering_id": model_id}),
+        );
     }
     if thinking.is_enabled() {
         if let Some(obj) = payload.as_object_mut() {
@@ -177,7 +173,6 @@ mod tests {
             session_id: None,
             agent_id: Some("test-agent"),
             model_id: Some("model-gpt-test"),
-            model: Some("gpt-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
             explain_on: true,
@@ -192,8 +187,7 @@ mod tests {
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
         assert!(p.get("model").is_none());
-        assert_eq!(p["selected_model"]["id"], "model-gpt-test");
-        assert_eq!(p["selected_model"]["model"], "gpt-test");
+        assert_eq!(p["model_selection"]["offering_id"], "model-gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");
@@ -217,7 +211,6 @@ mod tests {
             session_id: Some("sess-1"),
             agent_id: None,
             model_id: None,
-            model: Some("m"),
             interaction_mode: None,
             explain_verbose: true,
             explain_on: false,
@@ -241,7 +234,6 @@ mod tests {
             session_id: None,
             agent_id: None,
             model_id: None,
-            model: Some("claude-thinking"),
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
             explain_on: false,
@@ -265,7 +257,6 @@ mod tests {
             session_id: None,
             agent_id: None,
             model_id: None,
-            model: Some("gpt-4o"),
             interaction_mode: None,
             explain_verbose: false,
             explain_on: false,

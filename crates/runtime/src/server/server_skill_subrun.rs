@@ -17,7 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_runtime_env::validate_workspace_id;
-use astra_services::{LlmTokenServiceConfig, ReflectService, UnconfiguredReflectService};
+use astra_services::{AdmittedModelExecution, ReflectService, UnconfiguredReflectService};
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -53,8 +53,8 @@ pub struct ServerSkillSubRunExecutor {
     shared_pool: Option<SharedPool>,
     /// Default model to use when the skill manifest doesn't specify one.
     default_model: Option<String>,
-    /// Optional request-scoped LLM token service config inherited from parent run.
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    /// Normalized execution material inherited from the admitted parent run.
+    admitted_model_execution: Option<AdmittedModelExecution>,
     /// Edge tools available to sub-runs (inherited from parent host).
     edge_tools: Vec<Value>,
     /// Edge profile (cwd, git_branch, etc.) inherited from parent.
@@ -110,7 +110,7 @@ impl ServerSkillSubRunExecutor {
             encryptor,
             shared_pool: None,
             default_model: None,
-            llm_token_service: None,
+            admitted_model_execution: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
@@ -166,8 +166,11 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
-    pub fn with_llm_token_service(mut self, service: Option<LlmTokenServiceConfig>) -> Self {
-        self.llm_token_service = service;
+    pub fn with_admitted_model_execution(
+        mut self,
+        execution: Option<AdmittedModelExecution>,
+    ) -> Self {
+        self.admitted_model_execution = execution;
         self
     }
 
@@ -326,7 +329,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             subrun_session_id.clone(),
         )
         .with_model(effective_model.clone())
-        .with_llm_token_service(self.llm_token_service.clone())
+        .with_admitted_model_execution(self.admitted_model_execution.clone())
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
@@ -474,7 +477,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             hooks: StopHookState {
                 workspace_root_hint,
                 forward_headers: self.forward_headers.clone(),
-                llm_token_service: self.llm_token_service.clone(),
+                admitted_model_execution: self.admitted_model_execution.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -673,7 +676,7 @@ mod tests {
         );
         assert!(executor.cancel_token.is_none());
         assert!(executor.skill_resolver.is_none());
-        assert!(executor.llm_token_service.is_none());
+        assert!(executor.admitted_model_execution.is_none());
         assert_eq!(
             executor.inherited_permissions.mode,
             crate::orchestration::PermissionMode::Auto
@@ -692,17 +695,21 @@ mod tests {
             "test-session".to_string(),
         )
         .with_default_model(Some("claude-sonnet-4-20250514".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2500),
-        }))
+        .with_admitted_model_execution(Some(AdmittedModelExecution::from_endpoint(
+            "offer-skill".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "openai".to_string(),
+            "http://catalog:8081/api/v1/chat/completions".to_string(),
+            "Bearer test".to_string(),
+            Some(2500),
+        )))
         .with_edge_tools(vec![
             json!({"type": "function", "function": {"name": "bash"}}),
         ])
         .with_cancel_token(Some(Arc::new(tokio_util::sync::CancellationToken::new())));
 
         assert!(executor.default_model.is_some());
-        assert!(executor.llm_token_service.is_some());
+        assert!(executor.admitted_model_execution.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
     }

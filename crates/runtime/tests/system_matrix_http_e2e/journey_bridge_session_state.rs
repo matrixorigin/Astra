@@ -14,7 +14,7 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    bootstrap, cleanup_session_data, get_json, post_json, seeded_selected_model,
+    bootstrap, cleanup_session_data, get_json, post_json, seeded_model_selection,
     sse_first_data_json_with_type, wait_for_agent_event_types,
 };
 
@@ -51,45 +51,52 @@ async fn post_mock_bridge_payload(app: &axum::Router, auth: &str, payload: Value
     sse
 }
 
-async fn run_mock_bridge_turn(
-    app: &axum::Router,
-    auth: &str,
-    session_id: &str,
-    selected_model: Value,
+struct MockBridgeTurn<'a> {
+    session_id: &'a str,
+    model_selection: Value,
     session_turn: u32,
     messages: Vec<Value>,
     edge_profile: Value,
-    reply: &str,
+    reply: &'a str,
     prompt_tokens: u64,
     completion_tokens: u64,
+}
+
+async fn run_mock_bridge_turn(
+    app: &axum::Router,
+    auth: &str,
+    turn: MockBridgeTurn<'_>,
 ) -> (String, String) {
     let turn_chain_id = format!("bridge-state-chain-{}", Uuid::new_v4());
     let user_query_event_id = format!("bridge-state-query-{}", Uuid::new_v4());
     let payload = json!({
         "agent_id": "astra-cli",
-        "session_id": session_id,
-        "messages": messages,
-        "selected_model": selected_model,
+        "session_id": turn.session_id,
+        "messages": turn.messages,
+        "model_selection": turn.model_selection,
         "edge_tools": [],
-        "edge_profile": edge_profile,
-        "session_turn": session_turn,
+        "edge_profile": turn.edge_profile,
+        "session_turn": turn.session_turn,
         "turn_chain_id": turn_chain_id,
         "user_query_event_id": user_query_event_id,
         "test_llm_rounds": [{
-            "full_text": reply,
+            "full_text": turn.reply,
             "reasoning": "",
             "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
+                "prompt_tokens": turn.prompt_tokens,
+                "completion_tokens": turn.completion_tokens,
+                "total_tokens": turn.prompt_tokens + turn.completion_tokens
             }
         }]
     });
     let sse = post_mock_bridge_payload(app, auth, payload).await;
-    assert!(sse.contains(reply), "bridge reply missing from SSE: {sse}");
+    assert!(
+        sse.contains(turn.reply),
+        "bridge reply missing from SSE: {sse}"
+    );
     let session_info = sse_first_data_json_with_type(&sse, "session_info")
         .unwrap_or_else(|| panic!("missing session_info: {sse}"));
-    assert_eq!(session_info["session_id"].as_str(), Some(session_id));
+    assert_eq!(session_info["session_id"].as_str(), Some(turn.session_id));
     let run_id = session_info["run_id"]
         .as_str()
         .expect("session_info.run_id")
@@ -127,14 +134,16 @@ pub async fn run_cli_bridge_session_views_remain_consistent() {
     let (_, first_run_id) = run_mock_bridge_turn(
         app,
         auth,
-        &session_id,
-        seeded_selected_model(ctx),
-        1,
-        first_messages.clone(),
-        json!({}),
-        FIRST_REPLY,
-        11,
-        5,
+        MockBridgeTurn {
+            session_id: &session_id,
+            model_selection: seeded_model_selection(ctx),
+            session_turn: 1,
+            messages: first_messages.clone(),
+            edge_profile: json!({}),
+            reply: FIRST_REPLY,
+            prompt_tokens: 11,
+            completion_tokens: 5,
+        },
     )
     .await;
 
@@ -144,19 +153,21 @@ pub async fn run_cli_bridge_session_views_remain_consistent() {
     let (_, reconciliation_run_id) = run_mock_bridge_turn(
         app,
         auth,
-        &session_id,
-        seeded_selected_model(ctx),
-        2,
-        reconciliation_messages,
-        json!({
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN: true,
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS: [
-                "Background agent results are terminal and ready for reconciliation."
-            ]
-        }),
-        RECONCILED_REPLY,
-        19,
-        7,
+        MockBridgeTurn {
+            session_id: &session_id,
+            model_selection: seeded_model_selection(ctx),
+            session_turn: 2,
+            messages: reconciliation_messages,
+            edge_profile: json!({
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN: true,
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS: [
+                    "Background agent results are terminal and ready for reconciliation."
+                ]
+            }),
+            reply: RECONCILED_REPLY,
+            prompt_tokens: 19,
+            completion_tokens: 7,
+        },
     )
     .await;
     assert_ne!(first_run_id, reconciliation_run_id);
@@ -430,7 +441,7 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
             "agent_id": "astra-cli",
             "session_id": session_id,
             "messages": [{"role": "user", "content": user_message}],
-            "selected_model": seeded_selected_model(ctx),
+            "model_selection": seeded_model_selection(ctx),
             "edge_tools": [tool_schema.clone()],
             "session_turn": 1,
             "turn_chain_id": turn_chain_id,
@@ -453,7 +464,7 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
                 {"role": "assistant", "content": "", "tool_calls": [tool_call]},
                 {"role": "tool", "tool_call_id": tool_call_id, "content": "state=ready"}
             ],
-            "selected_model": seeded_selected_model(ctx),
+            "model_selection": seeded_model_selection(ctx),
             "edge_tools": [tool_schema],
             "tool_results": [{
                 "tool_call_id": tool_call_id,

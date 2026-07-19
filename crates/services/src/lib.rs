@@ -237,11 +237,11 @@ pub use model_gateways::{
     UnconfiguredModelGatewayService,
 };
 pub use models::{
-    DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelOfferingResolutionError,
-    ModelRecord, ModelService, ModelUpdateRequestData, PricingData, PromptCacheCapabilityData,
-    PromptCacheProtocolData, PromptCacheReuseScopeData, PromptCacheVolatilePlacementData,
-    QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
-    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
+    AdmittedModelExecution, DatabaseModelService, ModelCreateRequestData, ModelListItem,
+    ModelOfferingResolutionError, ModelRecord, ModelService, ModelUpdateRequestData, PricingData,
+    PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
+    PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
+    UnconfiguredModelService, prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
     resolve_active_llm_offering, resolve_memory_model, resolve_reasoning_model,
     validate_model_offering_id,
 };
@@ -276,11 +276,11 @@ pub use reflect::{
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig,
-    LlmTokenServiceRequest, RunContinuationRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationDisposition, RunMutationRecord, RunStateStore, RunStatusRecord,
-    UnconfiguredRunLifecycleService, extract_event_type, run_list_cursor_db_updated_at,
-    run_list_cursor_run_id, transform_run_event_for_client, validate_run_list_limit,
+    DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, RunContinuationRecord,
+    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunStateStore, RunStatusRecord, UnconfiguredRunLifecycleService, extract_event_type,
+    run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
+    validate_run_list_limit,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,

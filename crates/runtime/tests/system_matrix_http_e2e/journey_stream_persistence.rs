@@ -24,7 +24,7 @@ use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    bootstrap, cleanup_session_data, get_json, post_json, seeded_selected_model,
+    bootstrap, cleanup_session_data, get_json, post_json, seeded_model_selection,
     sse_first_data_json_with_type,
 };
 
@@ -150,7 +150,7 @@ pub async fn run_stream_session_and_run_status() {
     let payload = json!({
         "message": "phase-b persistence probe",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Persistence verified." }]
         }
@@ -264,7 +264,7 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
     let payload = json!({
         "message": "Run three reviews as one structured work group.",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [
                 {
@@ -519,7 +519,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         json!({
             "message": "Run three reviews and preserve every failure cause.",
             "session_id": &session_id,
-            "selected_model": seeded_selected_model(ctx),
+            "model_selection": seeded_model_selection(ctx),
             "context": {
                 "test_llm_rounds": [
                     {
@@ -700,7 +700,7 @@ pub async fn run_stream_context_trace_persistence() {
     let payload = json!({
         "message": "context trace persistence test",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Context trace reply." }]
         }
@@ -859,7 +859,7 @@ pub async fn run_stream_multi_turn_persistence() {
     let payload1 = json!({
         "message": "multi-turn message one",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Response one." }]
         }
@@ -910,7 +910,7 @@ pub async fn run_stream_multi_turn_persistence() {
     let payload2 = json!({
         "message": "multi-turn message two",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
+        "model_selection": seeded_model_selection(ctx),
         "context": {
             "test_llm_rounds": [{ "full_text": "Response two." }]
         }

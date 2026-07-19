@@ -15,7 +15,7 @@
 
 mod test_support;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use astra_runtime::{
@@ -117,7 +117,17 @@ impl AuthService for StubAuth {
 }
 
 #[derive(Clone)]
-struct StubSession;
+struct StubSession {
+    default_session_id: String,
+}
+
+impl StubSession {
+    fn new(default_session_id: impl Into<String>) -> Self {
+        Self {
+            default_session_id: default_session_id.into(),
+        }
+    }
+}
 #[async_trait]
 impl SessionService for StubSession {
     async fn create_session(
@@ -126,7 +136,7 @@ impl SessionService for StubSession {
         req: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SessionRecord {
-            session_id: "s-comp-created".into(),
+            session_id: self.default_session_id.clone(),
             user_id,
             agent_id: req.agent_id,
             title: Some("comp-test".into()),
@@ -186,13 +196,13 @@ impl SessionService for StubSession {
     }
     async fn get_session_activity(
         &self,
-        _: String,
+        session_id: String,
         _: String,
         _: u32,
         _: Option<astra_services::auth::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SessionActivityRecord {
-            session_id: "s-comp-created".into(),
+            session_id,
             activities: vec![],
             total: 0,
             limit: 1,
@@ -203,6 +213,15 @@ impl SessionService for StubSession {
 
 #[derive(Clone)]
 struct StubModelService;
+
+fn unsupported_model_service_call<T>() -> Result<T, (StatusCode, axum::Json<ErrorResponse>)> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(ErrorResponse::new(
+            "operation is outside the bridge test model-service contract",
+        )),
+    ))
+}
 
 fn bridge_test_model_record(name: String) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
@@ -234,7 +253,7 @@ impl astra_services::ModelService for StubModelService {
         _: String,
         _: astra_services::ModelCreateRequestData,
     ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        unreachable!()
+        unsupported_model_service_call()
     }
 
     async fn list_models(
@@ -268,17 +287,34 @@ impl astra_services::ModelService for StubModelService {
         ))
     }
 
-    async fn get_model_by_offering_id(
+    async fn resolve_model_offering(
         &self,
         offering_id: String,
-    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        if offering_id == "model-mock-model" {
-            return Ok(bridge_test_model_record("mock-model".to_string()));
+    ) -> Result<astra_services::ResolvedModelOffering, (StatusCode, axum::Json<ErrorResponse>)>
+    {
+        if offering_id != "model-mock-model" {
+            return Err((
+                StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse::new("offering not found")),
+            ));
         }
-        Err((
-            StatusCode::NOT_FOUND,
-            axum::Json(ErrorResponse::new("offering not found")),
-        ))
+        Ok(astra_services::ResolvedModelOffering {
+            offering_id,
+            model: astra_services::ResolvedActiveLlmModel {
+                model_name: "mock-model".to_string(),
+                wire_model_name: None,
+                api_key: "bridge-provider-secret".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                provider: "openai".to_string(),
+                fallback_chain: Vec::new(),
+                tags: Vec::new(),
+                request_body_overrides: None,
+                prompt_cache_capability: None,
+                thinking_capability: None,
+                context_window: Some(128_000),
+                request_headers: None,
+            },
+        })
     }
 
     async fn update_model(
@@ -286,11 +322,11 @@ impl astra_services::ModelService for StubModelService {
         _: String,
         _: astra_services::ModelUpdateRequestData,
     ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        unreachable!()
+        unsupported_model_service_call()
     }
 
     async fn delete_model(&self, _: String) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
-        unreachable!()
+        unsupported_model_service_call()
     }
 
     async fn check_model(
@@ -303,7 +339,7 @@ impl astra_services::ModelService for StubModelService {
 
 #[tokio::test]
 async fn stub_session_forces_full_llm_capture_off() {
-    let session = StubSession;
+    let session = StubSession::new("capture-policy-session");
     let created = session
         .create_session(
             USER_ID.into(),
@@ -333,50 +369,80 @@ async fn stub_session_forces_full_llm_capture_off() {
 
 #[derive(Clone)]
 struct AllCaptures {
+    session_id: String,
     core_plans: Arc<Mutex<Vec<TurnCorePersistPlan>>>,
     tool_plans: Arc<Mutex<Vec<TurnToolEventPersistPlan>>>,
     aux_events: Arc<Mutex<Vec<TurnAuxiliaryEventRecord>>>,
     activity_plans: Arc<Mutex<Vec<(String, String, SessionActivityUpdatePlan)>>>,
     hook_plans: Arc<Mutex<Vec<TurnHookDbPersistPlan>>>,
-    /// Tracks total persist operations for deterministic wait
-    persist_count: Arc<AtomicUsize>,
-    persist_notify: Arc<tokio::sync::Notify>,
+    persist_tracker: TestBridgePersistTracker,
 }
 
 impl Default for AllCaptures {
     fn default() -> Self {
         Self {
+            session_id: format!("bridge-test-{}", uuid::Uuid::now_v7()),
             core_plans: Default::default(),
             tool_plans: Default::default(),
             aux_events: Default::default(),
             activity_plans: Default::default(),
             hook_plans: Default::default(),
-            persist_count: Arc::new(AtomicUsize::new(0)),
-            persist_notify: Arc::new(tokio::sync::Notify::new()),
+            persist_tracker: TestBridgePersistTracker::default(),
         }
     }
 }
 
 impl AllCaptures {
-    fn signal_persist(&self) {
-        self.persist_count.fetch_add(1, Ordering::SeqCst);
-        self.persist_notify.notify_waiters();
+    fn session_id(&self) -> &str {
+        &self.session_id
     }
 
-    /// Wait until no new persist operations have occurred for 10ms (deterministic
-    /// replacement for fixed-duration sleeps). Typical wait: <5ms with in-memory writers.
-    async fn wait_persist_idle(&self) {
-        let mut last = self.persist_count.load(Ordering::SeqCst);
+    fn persist_tracker(
+        &self,
+    ) -> Arc<dyn astra_runtime::matrix_cloud_runtime::BridgePersistTracker> {
+        Arc::new(self.persist_tracker.clone())
+    }
+
+    async fn drain_persist_tasks(&self) {
+        self.persist_tracker.drain().await;
+    }
+}
+
+#[derive(Clone, Default)]
+struct TestBridgePersistTracker {
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl astra_runtime::matrix_cloud_runtime::BridgePersistTracker for TestBridgePersistTracker {
+    fn track_persist_task(
+        &self,
+        task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+    ) {
+        let handle = tokio::spawn(task);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(handle);
+    }
+}
+
+impl TestBridgePersistTracker {
+    async fn drain(&self) {
         loop {
-            let notified = self.persist_notify.notified();
-            let current = self.persist_count.load(Ordering::SeqCst);
-            if current != last {
-                last = current;
-                continue;
+            let handles = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *tasks)
+            };
+            if handles.is_empty() {
+                return;
             }
-            match tokio::time::timeout(std::time::Duration::from_millis(10), notified).await {
-                Ok(()) => continue,
-                Err(_) => return,
+            for handle in handles {
+                handle
+                    .await
+                    .expect("bridge persistence task must not panic");
             }
         }
     }
@@ -389,7 +455,6 @@ impl TurnCoreEventWriter for CapCoreWriter {
     async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
         let event_id = plan.llm_response_event.as_ref().map(|e| e.event_id.clone());
         self.0.core_plans.lock().await.push(plan);
-        self.0.signal_persist();
         Ok(TurnCorePersistOutcome {
             llm_response_event_id: event_id,
         })
@@ -402,7 +467,6 @@ struct CapToolWriter(AllCaptures);
 impl TurnToolEventWriter for CapToolWriter {
     async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
         self.0.tool_plans.lock().await.push(plan);
-        self.0.signal_persist();
         Ok(())
     }
 }
@@ -413,7 +477,6 @@ struct CapAuxWriter(AllCaptures);
 impl TurnAuxiliaryEventWriter for CapAuxWriter {
     async fn persist_events(&self, events: Vec<TurnAuxiliaryEventRecord>) -> Result<(), String> {
         self.0.aux_events.lock().await.extend(events);
-        self.0.signal_persist();
         Ok(())
     }
 }
@@ -433,7 +496,6 @@ impl TurnSessionActivityWriter for CapActivityWriter {
             user_id.to_string(),
             plan,
         ));
-        self.0.signal_persist();
         Ok(())
     }
 }
@@ -444,18 +506,22 @@ struct CapHookWriter(AllCaptures);
 impl TurnHookDbWriter for CapHookWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
         self.0.hook_plans.lock().await.push(plan);
-        self.0.signal_persist();
         Ok(())
     }
 }
 
 // ── App builder ──────────────────────────────────────────────────────────────
 
-fn build_test_app(cap: AllCaptures) -> Router {
-    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+fn bridge_test_app_state(cap: &AllCaptures) -> AppState {
+    AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
-        .with_session_service(Arc::new(StubSession))
+        .with_session_service(Arc::new(StubSession::new(cap.session_id.clone())))
         .with_model_service(Arc::new(StubModelService))
+}
+
+fn build_test_app(cap: AllCaptures) -> Router {
+    let persist_tracker = cap.persist_tracker();
+    let base = bridge_test_app_state(&cap)
         .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
         .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
         .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
@@ -465,7 +531,8 @@ fn build_test_app(cap: AllCaptures) -> Router {
         test_matrixone_settings(),
         test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
-    .with_edge_callback_ledger(base.edge_callback_ledger());
+    .with_edge_callback_ledger(base.edge_callback_ledger())
+    .with_persist_tracker(persist_tracker);
     let state = base
         .with_chat_turn_bridge(Arc::new(bridge))
         .with_chat_turn_bridge_secret("comp-e2e-bridge-secret");
@@ -476,8 +543,8 @@ fn build_test_app(cap: AllCaptures) -> Router {
 
 fn bridge_payload(mut payload: Value) -> Value {
     if let Some(obj) = payload.as_object_mut() {
-        obj.entry("selected_model")
-            .or_insert_with(|| json!({ "model": "mock-model" }));
+        obj.entry("model_selection")
+            .or_insert_with(|| json!({ "offering_id": "model-mock-model" }));
     }
     payload
 }
@@ -625,7 +692,7 @@ async fn run_bridge_turn_scenario(case: BridgeTurnScenario) {
         );
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let plan = core.last().expect("core persist plan");
@@ -819,7 +886,6 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             name: "continuation_skips_user_query",
             payload: json!({
                 "agent_id": "matrix-continuation",
-                "session_id": "s-comp-created",
                 "messages": [
                     { "role": "user", "content": "read file" },
                     { "role": "assistant", "content": "", "tool_calls": [
@@ -943,7 +1009,7 @@ async fn persist_core_events_user_query_and_llm_response_once() {
     assert_eq!(st, StatusCode::OK);
 
     // Allow async persistence to complete.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1, "exactly one core persist call");
@@ -1003,7 +1069,7 @@ async fn persist_tool_events_for_tool_calls() {
         "turn_complete should have has_tool_calls=true"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     let total_events: usize = tools.iter().map(|p| p.events.len()).sum();
@@ -1035,7 +1101,7 @@ async fn no_duplicate_event_ids_in_core_persist() {
 
     let turn2 = json!({
         "agent_id": "dedup-agent",
-        "session_id": "s-comp-created",
+        "session_id": cap.session_id(),
         "messages": [
             { "role": "user", "content": "first question" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -1055,7 +1121,7 @@ async fn no_duplicate_event_ids_in_core_persist() {
     let (st2, _) = chat_turn(&app, turn2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let mut all_event_ids = Vec::new();
@@ -1089,7 +1155,7 @@ async fn continuation_call_skips_user_query_persist() {
     // Simulates second call in a conversation (tool_results are present).
     let payload = json!({
         "agent_id": "cont-agent",
-        "session_id": "s-comp-created",
+        "session_id": cap.session_id(),
         "messages": [
             { "role": "user", "content": "read file" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -1107,7 +1173,7 @@ async fn continuation_call_skips_user_query_persist() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty(), "should have a core persist call");
@@ -1153,7 +1219,7 @@ async fn multi_turn_session_accumulates_state() {
     // Turn 2: CLI provides tool results, LLM completes with text.
     let turn2 = json!({
         "agent_id": "mt-agent",
-        "session_id": "s-comp-created",
+        "session_id": cap.session_id(),
         "messages": [
             { "role": "user", "content": "analyze code" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -1180,7 +1246,7 @@ async fn multi_turn_session_accumulates_state() {
         "turn 2 should complete without tool calls"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify both turns persisted core events.
     let core = cap.core_plans.lock().await;
@@ -1297,7 +1363,7 @@ async fn client_cancellation_does_not_panic() {
     drop(resp);
 
     // Give time for any async cleanup.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // If we get here without panic, the test passes.
     // Verify that persist writers were not corrupted.
@@ -1360,7 +1426,7 @@ async fn core_persist_event_ids_are_valid_uuids() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     for plan in core.iter() {
@@ -1401,7 +1467,7 @@ async fn core_persist_records_correct_metadata() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -1498,7 +1564,7 @@ async fn single_tool_round_full_roundtrip() {
         Some(false)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify persistence: 2 core persist calls.
     let core = cap.core_plans.lock().await;
@@ -1627,7 +1693,7 @@ async fn error_on_continuation_emits_clean_error_event() {
         "continuation with no LLM rounds should produce error or turn_complete"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Turn 1 should have persisted normally despite turn 2 failure.
     let core = cap.core_plans.lock().await;
@@ -1771,7 +1837,7 @@ async fn many_sequential_tool_rounds_no_state_corruption() {
         Some(false)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify persistence across all 5 turns.
     let core = cap.core_plans.lock().await;
@@ -1876,7 +1942,7 @@ async fn reasoning_content_persisted_and_sse_emitted() {
     let deltas = events_of_type(&events, "text_delta");
     assert!(!deltas.is_empty(), "should have text_delta events");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify reasoning is persisted in llm_response.
     let core = cap.core_plans.lock().await;
@@ -1934,7 +2000,7 @@ async fn reasoning_with_tool_calls_persists_reasoning() {
         "reasoning_done should be emitted with tool calls"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Note: reasoning_content on llm_response may be None when has_tool_calls is true
     // (bridge line ~1558: reasoning_content is None when reasoning is empty AND has_tool_calls).
@@ -1977,7 +2043,7 @@ async fn usage_token_tracking_persisted_in_llm_response() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1);
@@ -2062,7 +2128,7 @@ async fn usage_tracking_across_multi_turn_independent() {
     let (st2, _) = chat_turn(&app, turn2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "two core persist calls");
@@ -2137,7 +2203,7 @@ async fn concurrent_requests_no_cross_session_interference() {
         assert_eq!(tc.len(), 1, "request {i} should have turn_complete");
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify 5 independent core persist calls.
     let core = cap.core_plans.lock().await;
@@ -2231,7 +2297,7 @@ async fn large_payload_many_tools_and_long_messages() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify core persistence.
     let core = cap.core_plans.lock().await;
@@ -2288,7 +2354,7 @@ async fn hook_db_persistence_fires_after_turn() {
     assert_eq!(st, StatusCode::OK);
 
     // Hook side effects run asynchronously via tokio::spawn — give them time.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // The hook payload is built in bridge_inprocess and passed to
     // run_bridge_hook_side_effects. The capturing writer should have
@@ -2327,7 +2393,7 @@ async fn auxiliary_routing_decision_persisted() {
     assert_eq!(st, StatusCode::OK);
 
     // Auxiliary events are persisted asynchronously.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let aux = cap.aux_events.lock().await;
     // The bridge always emits a routing_decision auxiliary event.
@@ -2401,7 +2467,7 @@ async fn auxiliary_events_per_turn_in_multi_turn() {
     let (st2, _) = chat_turn(&app, turn2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let aux = cap.aux_events.lock().await;
     let routing_events: Vec<_> = aux
@@ -2462,7 +2528,7 @@ async fn sse_text_delta_content_matches_full_text() {
     );
 
     // Verify the persisted content also matches.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     let lr = core[0].llm_response_event.as_ref().unwrap();
     assert!(
@@ -2493,7 +2559,7 @@ async fn session_activity_last_event_id_accuracy() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let expected_last_event_id = core[0]
@@ -2541,7 +2607,7 @@ async fn session_activity_last_event_id_for_tool_call_turn() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let expected_last_event_id = core[0]
@@ -2575,7 +2641,7 @@ async fn session_activity_last_event_id_for_continuation_turn() {
 
     let payload = json!({
         "agent_id": "activity-cont-agent",
-        "session_id": "s-comp-created",
+        "session_id": cap.session_id(),
         "messages": [
             { "role": "user", "content": "do stuff" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -2593,7 +2659,7 @@ async fn session_activity_last_event_id_for_continuation_turn() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let expected_last_event_id = core[0]
@@ -2635,7 +2701,7 @@ async fn edge_missing_agent_id_persists_as_none() {
     let (st, _raw) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty(), "should have core persist call");
@@ -2687,7 +2753,7 @@ async fn edge_unicode_content_preserved_in_persist_and_sse() {
         "SSE text_delta should contain Unicode LLM text, got: {delta_text}"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -2728,7 +2794,7 @@ async fn edge_empty_tool_results_array_is_fresh_turn() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty(), "should have core persist");
@@ -2782,7 +2848,7 @@ async fn edge_tool_result_error_content_flows_through() {
     let (st2, _) = chat_turn(&app, turn2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify tool events persisted across both turns.
     let tools = cap.tool_plans.lock().await;
@@ -2819,7 +2885,7 @@ async fn edge_empty_full_text_no_tool_calls_skips_llm_persist() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     // A core persist call should still happen (user_query is non-empty).
@@ -2856,7 +2922,7 @@ async fn multi_turn_text_tool_text_alternating_pattern() {
     let ev1 = parse_sse_events(&raw1);
     let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     {
         let core = cap.core_plans.lock().await;
         assert_eq!(core.len(), 1, "after turn 1: 1 core persist");
@@ -2884,7 +2950,7 @@ async fn multi_turn_text_tool_text_alternating_pattern() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     {
         let core = cap.core_plans.lock().await;
         assert_eq!(core.len(), 2, "after turn 2: 2 core persists");
@@ -2915,7 +2981,7 @@ async fn multi_turn_text_tool_text_alternating_pattern() {
         Some(false)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     {
         let core = cap.core_plans.lock().await;
         assert_eq!(core.len(), 3, "after turn 3: 3 core persists (cumulative)");
@@ -2941,7 +3007,7 @@ async fn ten_sequential_turns_all_events_captured() {
         assert_eq!(st, StatusCode::OK, "turn {i} should succeed");
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(
@@ -3021,7 +3087,7 @@ async fn stress_20_parallel_sessions_with_tool_calls() {
     }
 
     // Allow more time for 20 async persist operations to settle.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(
@@ -3052,7 +3118,7 @@ async fn stress_rapid_sequential_same_session() {
         // No sleep between requests — fire as fast as possible.
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(
@@ -3328,7 +3394,7 @@ async fn observability_persist_ok_counter_increments_after_turn() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let after = PERSIST_OK_COUNT.load(Ordering::Relaxed);
     assert!(
@@ -3359,7 +3425,7 @@ async fn observability_persist_fail_counter_stable_on_success() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let after = PERSIST_FAIL_COUNT.load(Ordering::Relaxed);
     assert_eq!(
@@ -3476,7 +3542,7 @@ async fn continuation_with_three_tool_results_all_persisted() {
 
     let payload = json!({
         "agent_id": "cont3-agent",
-        "session_id": "s-comp-created",
+        "session_id": cap.session_id(),
         "messages": [
             { "role": "user", "content": "read three files" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -3500,7 +3566,7 @@ async fn continuation_with_three_tool_results_all_persisted() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Tool events should include entries for the 3 tool results.
     let tools = cap.tool_plans.lock().await;
@@ -3554,7 +3620,7 @@ async fn tool_call_ids_preserved_in_turn_complete() {
         Some(true),
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify persisted tool events contain the correct tool_call_ids.
     let tools = cap.tool_plans.lock().await;
@@ -3748,7 +3814,7 @@ async fn session_id_persisted_in_core_events_matches_created_session() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(
@@ -3759,13 +3825,15 @@ async fn session_id_persisted_in_core_events_matches_created_session() {
     for plan in core.iter() {
         if let Some(ref uq) = plan.user_query_event {
             assert_eq!(
-                uq.session_id, "s-comp-created",
+                uq.session_id,
+                cap.session_id(),
                 "user_query session_id should match StubSession's created session"
             );
         }
         if let Some(ref lr) = plan.llm_response_event {
             assert_eq!(
-                lr.session_id, "s-comp-created",
+                lr.session_id,
+                cap.session_id(),
                 "llm_response session_id should match StubSession's created session"
             );
         }
@@ -3784,9 +3852,7 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
     let cap = AllCaptures::default();
 
     // Build app with a FAILING core writer
-    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
-        .with_auth_service(Arc::new(StubAuth))
-        .with_session_service(Arc::new(StubSession))
+    let base = bridge_test_app_state(&cap)
         .with_turn_core_event_writer(Arc::new(FailCoreWriter))
         .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
         .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
@@ -3796,7 +3862,8 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
         test_matrixone_settings(),
         test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
-    .with_edge_callback_ledger(base.edge_callback_ledger());
+    .with_edge_callback_ledger(base.edge_callback_ledger())
+    .with_persist_tracker(cap.persist_tracker());
     let app = build_app(
         base.with_chat_turn_bridge(Arc::new(bridge))
             .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
@@ -3820,7 +3887,7 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
         "turn_complete still emitted despite persist fail"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Activity should NOT be updated (core persist failed → early return in spawn task)
     let activity = cap.activity_plans.lock().await;
@@ -3837,9 +3904,7 @@ async fn unhappy_tool_persist_failure_core_still_persists() {
     init_env();
     let cap = AllCaptures::default();
 
-    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
-        .with_auth_service(Arc::new(StubAuth))
-        .with_session_service(Arc::new(StubSession))
+    let base = bridge_test_app_state(&cap)
         .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
         .with_turn_tool_event_writer(Arc::new(FailToolWriter))
         .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
@@ -3849,7 +3914,8 @@ async fn unhappy_tool_persist_failure_core_still_persists() {
         test_matrixone_settings(),
         test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
-    .with_edge_callback_ledger(base.edge_callback_ledger());
+    .with_edge_callback_ledger(base.edge_callback_ledger())
+    .with_persist_tracker(cap.persist_tracker());
     let app = build_app(
         base.with_chat_turn_bridge(Arc::new(bridge))
             .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
@@ -3867,7 +3933,7 @@ async fn unhappy_tool_persist_failure_core_still_persists() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Core events persisted OK (uses CapCoreWriter, not FailToolWriter)
     let core = cap.core_plans.lock().await;
@@ -3907,7 +3973,7 @@ async fn unhappy_empty_content_both_sides_no_persist() {
         Some(false)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     // should_persist_llm = false (empty text + no tool_calls), user_query_event = None (no user content)
@@ -3927,9 +3993,7 @@ async fn unhappy_activity_writer_failure() {
     init_env();
     let cap = AllCaptures::default();
 
-    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
-        .with_auth_service(Arc::new(StubAuth))
-        .with_session_service(Arc::new(StubSession))
+    let base = bridge_test_app_state(&cap)
         .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
         .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
         .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
@@ -3939,7 +4003,8 @@ async fn unhappy_activity_writer_failure() {
         test_matrixone_settings(),
         test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
-    .with_edge_callback_ledger(base.edge_callback_ledger());
+    .with_edge_callback_ledger(base.edge_callback_ledger())
+    .with_persist_tracker(cap.persist_tracker());
     let app = build_app(
         base.with_chat_turn_bridge(Arc::new(bridge))
             .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
@@ -3955,7 +4020,7 @@ async fn unhappy_activity_writer_failure() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Core events persisted OK despite activity failure
     let core = cap.core_plans.lock().await;
@@ -3980,7 +4045,7 @@ async fn unhappy_empty_tool_results_not_continuation() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -4015,7 +4080,7 @@ async fn sync_event_ids_monotonically_increasing() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -4071,9 +4136,9 @@ async fn sync_all_writers_same_session_id() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
-    let expected_sid = "s-comp-created"; // From StubSession
+    let expected_sid = cap.session_id();
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -4125,7 +4190,7 @@ async fn sync_activity_last_event_matches_persisted_llm_response() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let plan = &core[0];
@@ -4165,7 +4230,7 @@ async fn sync_causal_chain_consistent_within_turn() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Collect all causal_chain_ids
     let core = cap.core_plans.lock().await;
@@ -4219,7 +4284,7 @@ async fn sync_parent_event_links_correct() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let plan = &core[0];
@@ -4284,7 +4349,7 @@ async fn sync_activity_last_event_id_correct() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let plan = &core[0];
@@ -4341,7 +4406,7 @@ async fn session_multi_turn_causal_chain_propagation() {
     let (st2, _) = chat_turn(&app, payload2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(core.len() >= 2, "should have 2 core persist calls");
@@ -4412,7 +4477,7 @@ async fn session_fork_trace_user_query_event_id() {
     let (st2, _) = chat_turn(&app, p2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(core.len() >= 2);
@@ -4468,7 +4533,7 @@ async fn session_turn_content_accuracy() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty());
@@ -4513,7 +4578,7 @@ async fn session_event_ids_unique_across_turns() {
         assert_eq!(st, StatusCode::OK);
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let mut all_eids = std::collections::HashSet::new();
 
@@ -4649,7 +4714,7 @@ async fn trace_routing_decision_event_persisted() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let aux = cap.aux_events.lock().await;
     let routing = aux
@@ -4657,7 +4722,7 @@ async fn trace_routing_decision_event_persisted() {
         .find(|e| e.event_type == "routing_decision")
         .expect("routing_decision event should exist");
 
-    assert_eq!(routing.session_id, "s-comp-created");
+    assert_eq!(routing.session_id, cap.session_id());
     assert!(!routing.event_id.is_empty());
     let content: Value = serde_json::from_str(&routing.content).expect("valid JSON");
     assert_eq!(
@@ -4714,7 +4779,7 @@ async fn batch_five_tools_all_persisted() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty());
@@ -4788,7 +4853,7 @@ async fn batch_tool_round_trip_with_results() {
         "final round = text only"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify tool results are persisted in turn 2
     let tools = cap.tool_plans.lock().await;
@@ -4844,7 +4909,7 @@ async fn batch_mixed_tool_argument_types() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty());
@@ -4891,7 +4956,7 @@ async fn batch_ten_tools_stress() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty());
@@ -5034,7 +5099,7 @@ async fn prompt_cache_unicode_messages_preserved() {
     );
     assert!(combined.contains("🌍"), "emoji preserved in text_delta");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     if let Some(lr) = core.last().and_then(|c| c.llm_response_event.as_ref()) {
         assert!(
@@ -5061,7 +5126,7 @@ async fn prompt_cache_very_large_single_message_handled() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty(), "core events persisted with large message");
 }
@@ -5379,7 +5444,7 @@ async fn chat_stream(app: &Router, message: &str, extra: Value) -> (StatusCode, 
     let mut payload = json!({
         "message": message,
         "agent_id": "stream-test-agent",
-        "selected_model": { "model": "mock-model" }
+        "model_selection": { "offering_id": "model-mock-model" }
     });
     if let Some(obj) = extra.as_object() {
         for (k, v) in obj {
@@ -5577,7 +5642,7 @@ async fn observability_routing_decision_fields() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let aux = cap.aux_events.lock().await;
     let rd: Vec<_> = aux
         .iter()
@@ -5615,7 +5680,7 @@ async fn observability_persist_ok_multi_turn_accumulation() {
         assert_eq!(st, StatusCode::OK);
     }
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let after = PERSIST_OK_COUNT.load(Ordering::SeqCst);
     assert!(
         after >= before + 3,
@@ -5694,7 +5759,7 @@ async fn gap_tool_call_missing_id_gets_uuid() {
     );
 
     // Verify UUID was assigned via persisted tool events' content.tool_call_id
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let plans = cap.tool_plans.lock().await;
     assert!(!plans.is_empty(), "tool events persisted");
     let tool_events = &plans[0].events;
@@ -5747,7 +5812,7 @@ async fn gap_tool_call_mixed_ids_selective_assignment() {
         Some(true)
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let plans = cap.tool_plans.lock().await;
     assert!(!plans.is_empty());
     let tool_call_events: Vec<_> = plans[0]
@@ -5812,7 +5877,7 @@ async fn gap_tool_result_large_content_handled() {
     let (st2, _) = chat_turn(&app, p2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert!(
         core.len() >= 2,
@@ -5862,7 +5927,7 @@ async fn gap_tool_result_error_status_persisted() {
     assert_eq!(tc.len(), 1);
 
     // LLM response should be persisted
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert!(core.len() >= 2, "both turns persisted");
     assert!(
@@ -6008,7 +6073,7 @@ async fn gap_three_continuation_rounds_all_persisted() {
     let (st3, _) = chat_turn(&app, p3).await;
     assert_eq!(st3, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 3, "3 core persist calls for 3 rounds");
@@ -6055,7 +6120,7 @@ async fn gap_whitespace_only_text_no_persist() {
     let events = parse_sse_events(&raw);
     // Whitespace-only text is trimmed to empty → should_persist_llm = false
     // So no llm_response persisted
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     if let Some(last) = core.last() {
         assert!(
@@ -6128,7 +6193,7 @@ async fn gap_mixed_id_tool_calls_all_persisted_with_unique_ids() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty(), "tool events persisted");
 
@@ -6198,7 +6263,7 @@ async fn deep_causal_chain_refreshes_on_new_user_query() {
     let (st3, _) = chat_turn(&app, p3).await;
     assert_eq!(st3, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(
@@ -6283,7 +6348,7 @@ async fn deep_parent_linkage_continuation_tool_results() {
     let (st2, _) = chat_turn(&app, p2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let tools = cap.tool_plans.lock().await;
@@ -6372,7 +6437,7 @@ async fn deep_all_event_types_single_turn() {
     let (st, raw) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // 1. Core writer: user_query + llm_response
     let core = cap.core_plans.lock().await;
@@ -6481,7 +6546,7 @@ async fn deep_session_activity_cumulative_across_turns() {
     let (st3, _) = chat_turn(&app, p3).await;
     assert_eq!(st3, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let activity = cap.activity_plans.lock().await;
     assert_eq!(activity.len(), 3, "3 activity updates");
@@ -6512,7 +6577,7 @@ async fn deep_snapshot_link_plan_in_core_persist() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1);
     // Bridge currently sets snapshot_link_plan to None (context_capture not available)
@@ -6569,7 +6634,7 @@ async fn deep_distinct_ids_for_independent_user_queries() {
     let (st3, _) = chat_turn(&app, p3).await;
     assert_eq!(st3, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 3, "3 core persists");
 
@@ -6654,7 +6719,7 @@ async fn deep_tool_result_event_structure() {
     let (st2, _) = chat_turn(&app, p2).await;
     assert_eq!(st2, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     // Find the tool_result events (from turn 2)
@@ -6719,7 +6784,7 @@ async fn deep_edge_callback_ledger_wired() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify turn completed successfully with all persists
     let core = cap.core_plans.lock().await;
@@ -6750,7 +6815,7 @@ async fn deep_auxiliary_events_chain_consistency() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let aux = cap.aux_events.lock().await;
@@ -6792,7 +6857,7 @@ async fn deep_hook_plan_session_metadata() {
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let hooks = cap.hook_plans.lock().await;
     assert_eq!(hooks.len(), 1, "1 hook plan");
@@ -6875,7 +6940,7 @@ async fn deep_multi_turn_mixed_pattern_complete() {
     let (st4, _) = chat_turn(&app, p4).await;
     assert_eq!(st4, StatusCode::OK);
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let tools = cap.tool_plans.lock().await;
@@ -7313,7 +7378,7 @@ async fn round_efficiency_text_only_single_round() {
     );
 
     // Verify persistence: 1 core persist.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1, "1 round = 1 core persist");
     assert!(
@@ -7388,7 +7453,7 @@ async fn round_efficiency_parallel_tools_single_round() {
     assert_eq!(ids.len(), 3, "3 unique request_ids");
 
     // 1 persistence round.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1, "1 bridge call = 1 core persist");
 }
@@ -7522,7 +7587,7 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
 
     // ── Verify total round efficiency ──
     // This 3-round pattern is SUBOPTIMAL. The ideal pattern (2d) does it in 2.
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(
         core.len(),
@@ -7640,7 +7705,7 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
     );
 
     // ── Verify: only 2 rounds (vs 3 in suboptimal) ──
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(
         core.len(),
@@ -7760,7 +7825,7 @@ async fn round_efficiency_deep_analysis_batch_tools() {
     assert_eq!(tr2.len(), 0, "round 2: 0 tool_requests (synthesis)");
 
     // ── Verify: 2 rounds total for 4-tool analysis ──
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "batch analysis: 2 rounds = 2 core persists");
 }
@@ -7841,7 +7906,7 @@ async fn round_efficiency_bash_compound_two_rounds() {
     assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(false));
 
     // ── Verify: 2 rounds, 1 tool call (most efficient) ──
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "bash compound: 2 rounds (1 tool + 1 text)");
 }
@@ -8246,7 +8311,7 @@ async fn a3_multi_turn_error_isolation_turn2_error_preserves_turn1() {
 
     let (st1, _) = chat_turn(&app, payload1).await;
     assert_eq!(st1, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core_after_t1 = cap.core_plans.lock().await.len();
     assert_eq!(core_after_t1, 1, "turn 1 persisted one core plan");
@@ -8274,7 +8339,7 @@ async fn a3_multi_turn_error_isolation_turn2_error_preserves_turn1() {
 
     let (st2, _) = chat_turn(&app, payload2).await;
     assert_eq!(st2, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Turn 1's persisted data should still be intact
     let core = cap.core_plans.lock().await;
@@ -8470,7 +8535,7 @@ async fn a5_persist_tool_call_with_full_args() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty(), "tool events persisted");
@@ -8681,7 +8746,7 @@ async fn a5_persist_core_event_has_session_and_user_ids() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(!core.is_empty(), "core events persisted");
@@ -8714,7 +8779,7 @@ async fn a5_persist_activity_writer_called() {
 
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "activity writer called after turn");
@@ -8772,7 +8837,7 @@ async fn b2_bridge_accepts_round_index_without_countdown_directive() {
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
     assert!(!texts.is_empty(), "round 0 should produce text");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Late round: budget directives are removed, but bridge payload handling
     // must remain stable for non-zero round_index.
@@ -8790,7 +8855,7 @@ async fn b2_bridge_accepts_round_index_without_countdown_directive() {
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
     assert!(!texts.is_empty(), "threshold round should produce text");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Former hard-limit-shaped round index should still be accepted.
     let hard = 15;
@@ -8803,7 +8868,7 @@ async fn b2_bridge_accepts_round_index_without_countdown_directive() {
     });
     let (st, _body) = chat_turn(&app, payload_rh).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// B2: round_index defaults to 0 when not provided in payload.
@@ -8828,7 +8893,7 @@ async fn b2_round_index_defaults_to_zero() {
         !texts.is_empty(),
         "should produce normal text without round_index"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// B1: Planning directive in section-based prompt builder too.
@@ -8947,7 +9012,7 @@ async fn b4_bridge_parallel_feedback_in_dynamic_prompt() {
         !texts.is_empty(),
         "should produce text after parallel tools"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// B4: No parallel feedback when messages end with user (first round).
@@ -8969,7 +9034,7 @@ async fn b4_bridge_no_feedback_first_round() {
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
     assert!(!texts.is_empty(), "first round should produce text");
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -9032,7 +9097,7 @@ async fn golden_code_review_parallel_reads() {
     let turn_complete: Vec<&Value> = events_of_type(&events_r1, "turn_complete");
     assert_eq!(turn_complete.len(), 1, "should have turn_complete");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // ── Round 2: LLM synthesizes review (messages include tool results from round 1) ──
     let payload_r2 = json!({
@@ -9076,7 +9141,7 @@ async fn golden_code_review_parallel_reads() {
     );
 
     // Verify persistence
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "2 rounds → 2 core persist calls");
 }
@@ -9109,7 +9174,7 @@ async fn golden_debugging_three_rounds() {
     });
     let (st, _) = chat_turn(&app, payload_r1).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // ── Round 2: LLM searches for related usages ──
     let payload_r2 = json!({
@@ -9140,7 +9205,7 @@ async fn golden_debugging_three_rounds() {
         2,
         "round 2 should request 2 grep tools"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // ── Round 3: LLM provides fix ──
     let payload_r3 = json!({
@@ -9180,7 +9245,7 @@ async fn golden_debugging_three_rounds() {
     );
     assert!(full_text.contains("Fix"), "should contain fix");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 3, "3 rounds → 3 core persist calls");
 }
@@ -9215,7 +9280,7 @@ async fn golden_extended_thinking_with_tools() {
     let tool_requests: Vec<&Value> = events_of_type(&events, "tool_request");
     assert_eq!(tool_requests.len(), 2, "should emit 2 tool_request events");
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// Golden: Token usage tracking across rounds.
@@ -9247,7 +9312,7 @@ async fn golden_token_usage_tracking() {
     // Usage is available in the event (smoke check: presence of either field is optional).
     let _ = (tc.get("prompt_tokens"), tc.get("usage"));
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// Golden: late-round synthesis remains stable without countdown directives.
@@ -9295,7 +9360,7 @@ async fn golden_late_round_synthesis_without_countdown_directive() {
         "should produce synthesis text in a late round"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// Golden: Session continuity — same session_id across rounds preserves context.
@@ -9322,7 +9387,7 @@ async fn golden_session_continuity() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Round 2 — same session, accumulated history
     let (st, body) = chat_turn(
@@ -9356,7 +9421,7 @@ async fn golden_session_continuity() {
         "should reference the function return value"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Verify both rounds persisted under same session
     let core = cap.core_plans.lock().await;
@@ -9385,7 +9450,7 @@ async fn golden_error_recovery_tool_result() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     // Round 2: Tool returned error, LLM adapts
     let (st, body) = chat_turn(&app, json!({
@@ -9412,7 +9477,7 @@ async fn golden_error_recovery_tool_result() {
         "LLM should try glob after file-not-found"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -9569,7 +9634,7 @@ async fn d3_system_prompt_contains_dedup_directives() {
     let events = parse_sse_events(&body);
     let explain = events_of_type(&events, "explain");
     assert!(!explain.is_empty(), "explain event should be emitted");
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -9595,7 +9660,7 @@ async fn c1_trace_core_plan_has_user_and_response() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     assert!(
@@ -9654,7 +9719,7 @@ async fn c1_trace_tool_events_have_required_fields() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     let all_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
@@ -9696,7 +9761,7 @@ async fn c1_trace_activity_plan_has_session_id() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "should have activity update");
@@ -9727,7 +9792,7 @@ async fn c1_trace_causal_chain_links_events() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     let plan = &core[0];
@@ -9767,7 +9832,7 @@ async fn c1_trace_hook_plans_captured() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let hooks = cap.hook_plans.lock().await;
     // Hook plans are always persisted (may have None fields)
@@ -9797,7 +9862,7 @@ async fn c2_journal_core_events_complete() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let core = cap.core_plans.lock().await;
     for plan in core.iter() {
@@ -9849,7 +9914,7 @@ async fn c2_journal_tool_events_match_tool_calls() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
     let all_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
@@ -9880,7 +9945,7 @@ async fn c2_journal_activity_last_event_consistent() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "activity update required");
@@ -9908,7 +9973,7 @@ async fn c2_journal_aux_events_valid_structure() {
     });
     let (st, _) = chat_turn(&app, payload).await;
     assert_eq!(st, StatusCode::OK);
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 
     let aux = cap.aux_events.lock().await;
     // Aux events may or may not be emitted depending on the flow; validate structure if present
@@ -9985,7 +10050,7 @@ async fn c3_explain_event_comprehensive_fields() {
     // Type field
     assert_eq!(ex.get("type").and_then(Value::as_str), Some("explain"));
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// C3: Explain event for text-only turn has zero tools selected.
@@ -10020,7 +10085,7 @@ async fn c3_explain_text_only_zero_tools() {
         Some(1),
         "1 tool available"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// C3: Explain event is NOT emitted when explain=false (default).
@@ -10045,7 +10110,7 @@ async fn c3_explain_not_emitted_by_default() {
         explain.is_empty(),
         "explain should not be emitted without explain=true"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// C3: SSE event ordering: session_info → content/tool events → explain → turn_complete.
@@ -10096,7 +10161,7 @@ async fn c3_sse_event_ordering_correct() {
         "explain must come before turn_complete"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// C3: Explain event includes steps array for context assembly trace.
@@ -10124,7 +10189,7 @@ async fn c3_explain_event_has_steps_array() {
     // Steps should be an array (may be empty but must exist)
     assert!(ex.get("steps").is_some(), "explain should have steps field");
     assert!(ex["steps"].is_array(), "steps should be an array");
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// D1: Schema pruning — TrimSchemas tier truncates descriptions to first sentence.
@@ -10268,7 +10333,7 @@ async fn d2_bridge_handles_large_tool_result_in_history() {
         !texts.is_empty(),
         "should produce text even with large history"
     );
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 // ───────────────────────────── P0: Proactive Context Folding Tests ────────────
@@ -10330,7 +10395,7 @@ async fn p0_context_folding_infrastructure_wired() {
         "should produce text with old tool history that could be folded"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// P0: Context folding preserves recent tool results (within FOLD_AFTER_ROUNDS).
@@ -10376,7 +10441,7 @@ async fn p0_context_folding_preserves_recent_results() {
         "should produce text with recent tool history"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }
 
 /// P0: Context folding skips non-read-only tools (edit_file, bash, etc).
@@ -10422,5 +10487,5 @@ async fn p0_context_folding_skips_side_effect_tools() {
         "should produce text; edit_file results are preserved"
     );
 
-    cap.wait_persist_idle().await;
+    cap.drain_persist_tasks().await;
 }

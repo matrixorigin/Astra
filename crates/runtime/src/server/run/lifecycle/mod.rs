@@ -55,10 +55,10 @@ use astra_services::session_restore::{
     SessionRestoreService,
 };
 use astra_services::skills::SkillService;
+use astra_services::{AdmittedModelExecution, EdgeContext};
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
-use astra_services::{EdgeContext, LlmTokenServiceConfig};
 use astra_services::{
     WorkspaceCleanupDebtEntry, WorkspaceRecordEntry as StoredWorkspaceRecordEntry,
     WorkspaceRecordStoreError, WorkspaceStateStore,
@@ -411,9 +411,6 @@ const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(
 const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
-#[cfg(test)]
-const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
-
 fn should_restore_prior_prompt_history(
     request_targets_existing_session: bool,
     session_has_prior_prompt_history: bool,
@@ -1714,118 +1711,6 @@ fn normalize_request_skill_sources(
     Ok(Some(normalized))
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct TrustedLlmDomain {
-    host: String,
-    port: Option<u16>,
-}
-
-#[cfg(test)]
-fn normalize_trusted_llm_domain_host(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("trusted domain host must not be empty".to_string());
-    }
-    if trimmed.contains("://") {
-        return Err(format!(
-            "trusted domain host '{trimmed}' must not include URL scheme"
-        ));
-    }
-    let parsed = reqwest::Url::parse(&format!("http://{trimmed}"))
-        .map_err(|error| format!("invalid trusted domain host '{trimmed}': {error}"))?;
-    if parsed.username() != ""
-        || parsed.password().is_some()
-        || parsed.path() != "/"
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.port().is_some()
-    {
-        return Err(format!("trusted domain host '{trimmed}' must be host only"));
-    }
-    let Some(host) = parsed.host_str() else {
-        return Err(format!(
-            "trusted domain host '{trimmed}' must include a host"
-        ));
-    };
-    Ok(host.to_ascii_lowercase())
-}
-
-#[cfg(test)]
-fn trusted_llm_domain_from_db_values(
-    host_raw: &str,
-    port_raw: i64,
-) -> Result<TrustedLlmDomain, String> {
-    let host = normalize_trusted_llm_domain_host(host_raw)?;
-    let port = match port_raw {
-        0 => None,
-        port if !(1..=65_535).contains(&port) => {
-            return Err(format!(
-                "trusted domain host '{host_raw}' has invalid port value {port}"
-            ));
-        }
-        port => Some(port as u16),
-    };
-    Ok(TrustedLlmDomain { host, port })
-}
-
-#[cfg(test)]
-fn llm_token_service_domain_is_trusted(
-    url: &reqwest::Url,
-    trusted_domains: &[TrustedLlmDomain],
-) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let normalized_host = host.to_ascii_lowercase();
-    let resolved_port = url.port_or_known_default();
-    trusted_domains.iter().any(|trusted| {
-        if trusted.host != normalized_host {
-            return false;
-        }
-        match trusted.port {
-            Some(port) => resolved_port == Some(port),
-            None => true,
-        }
-    })
-}
-
-#[cfg(test)]
-fn validate_llm_token_service_config(
-    config: Option<&astra_services::LlmTokenServiceConfig>,
-    trusted_domains: &[TrustedLlmDomain],
-) -> Result<(), String> {
-    let Some(config) = config else {
-        return Ok(());
-    };
-    let raw_url = config.url.trim();
-    if raw_url.is_empty() {
-        return Err("llm_token_service.url must not be empty".to_string());
-    }
-    let parsed = reqwest::Url::parse(raw_url)
-        .map_err(|error| format!("llm_token_service.url must be a valid URL: {error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("llm_token_service.url must use http or https scheme".to_string());
-    }
-    if parsed.host_str().is_none() {
-        return Err("llm_token_service.url must include a host".to_string());
-    }
-    if config.timeout_ms == Some(0) {
-        return Err("llm_token_service.timeout_ms must be greater than 0".to_string());
-    }
-    if trusted_domains.is_empty() {
-        return Err(format!(
-            "llm_token_service.url is not allowed without trusted domains configured in table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}"
-        ));
-    }
-    if !llm_token_service_domain_is_trusted(&parsed, trusted_domains) {
-        return Err(format!(
-            "llm_token_service.url host must match trusted domains configured in table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}"
-        ));
-    }
-    Ok(())
-}
-
 fn apply_normalized_skill_allowlist(
     resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     request_constraints: &RequestConstraints,
@@ -1843,7 +1728,7 @@ fn build_server_skill_executor(
     encryptor: &Arc<FernetTokenEncryptor>,
     shared_pool: Option<&SharedPool>,
     model_override: Option<&str>,
-    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
+    admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
@@ -1871,7 +1756,7 @@ fn build_server_skill_executor(
     )
     .with_pool(shared_pool.cloned())
     .with_default_model(model_override.map(String::from))
-    .with_llm_token_service(llm_token_service.cloned())
+    .with_admitted_model_execution(admitted_model_execution.cloned())
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
@@ -2264,7 +2149,7 @@ struct ServerSpawnRuntimeContext {
     session_id: String,
     trace_context: TraceContext,
     forward_headers: HashMap<String, String>,
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     request_constraints: RequestConstraints,
     execution_metadata: Option<Value>,
     /// The session-owned dynamic-agent lifecycle.  Kept weak here because
@@ -3201,7 +3086,7 @@ impl AgenticRunLifecycleService {
                 session_id: session_id.to_string(),
                 trace_context: server_trace_context(user_id, session_id, run_id, turn_seq),
                 forward_headers: request.forward_headers.clone(),
-                llm_token_service: request.llm_token_service.clone(),
+                admitted_model_execution: request.admitted_model_execution.clone(),
                 request_constraints: request_constraints.clone(),
                 execution_metadata: execution_metadata.clone(),
                 spawner: Arc::downgrade(&entry.spawner),
@@ -4039,13 +3924,6 @@ impl AgenticRunLifecycleService {
                 "provider_runtime_context_required",
             ));
         }
-        if request.llm_token_service.is_some() {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "llm_token_service is internal resolved runtime context and is not accepted from clients",
-                "model_selection_invalid",
-            ));
-        }
         if request
             .mcp_binding_ids
             .as_deref()
@@ -4140,6 +4018,13 @@ impl AgenticRunLifecycleService {
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
         Self::validate_effective_user_input(&request)?;
         let selection = Self::validate_model_selection_shape(request.model_selection.as_ref())?;
+        if request.admitted_model_execution.is_some() {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "admitted_model_execution is trusted runtime context and cannot be supplied by clients",
+                "model_selection_invalid",
+            ));
+        }
         if request.provider_runtime_authorized {
             let resolved = request.resolved_model_selection.as_ref().ok_or_else(|| {
                 error_response_coded(
@@ -4160,6 +4045,23 @@ impl AgenticRunLifecycleService {
                 &resolved.model_name,
                 "provider_runtime_context_invalid",
             )?;
+            let gateway = Self::provider_model_descriptor(&request)?.ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "provider-authorized model execution requires capability_descriptors.model_gateway",
+                    "provider_runtime_context_required",
+                )
+            })?;
+            request.admitted_model_execution = Some(
+                crate::server::model_execution_admission::admit_model_execution(
+                    &self.model_service,
+                    selection,
+                    Some(resolved),
+                    Some(gateway),
+                    request.runtime_auth.as_ref(),
+                )
+                .await?,
+            );
             request.model = Some(resolved.model_name.clone());
             return Ok(request);
         }
@@ -4170,26 +4072,21 @@ impl AgenticRunLifecycleService {
                 "model_selection_invalid",
             ));
         }
-        let record = self
-            .model_service
-            .get_model_by_offering_id(selection.offering_id.clone())
-            .await?;
-        if !record.is_active {
-            return Err(error_response_coded(
-                StatusCode::NOT_FOUND,
-                format!(
-                    "Model Offering '{}' is not currently available",
-                    selection.offering_id
-                ),
-                "model_offering_unavailable",
-            ));
-        }
+        let admitted = crate::server::model_execution_admission::admit_model_execution(
+            &self.model_service,
+            selection,
+            None,
+            None,
+            None,
+        )
+        .await?;
         let resolved = ResolvedModelSelection {
-            offering_id: record.model_id,
-            model_name: record.name,
+            offering_id: admitted.offering_id.clone(),
+            model_name: admitted.model_name.clone(),
         };
         request.model = Some(resolved.model_name.clone());
         request.resolved_model_selection = Some(resolved);
+        request.admitted_model_execution = Some(admitted);
         Ok(request)
     }
 
@@ -4250,6 +4147,22 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "resolved model identity is inconsistent with the admitted Offering",
+                "model_resolution_inconsistent",
+            ));
+        }
+        let execution = request.admitted_model_execution.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model selection reached execution without admitted execution material",
+                "model_material_missing",
+            )
+        })?;
+        if execution.offering_id != resolved.offering_id
+            || execution.model_name != resolved.model_name
+        {
+            return Err(error_response_coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model execution material is inconsistent with the admitted Offering",
                 "model_resolution_inconsistent",
             ));
         }
@@ -4414,32 +4327,6 @@ impl AgenticRunLifecycleService {
             ));
         }
         Ok(())
-    }
-
-    async fn prepare_model_gateway_invocation(
-        &self,
-        mut request: ChatRequestData,
-    ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
-        if let Some(model_gateway) = Self::provider_model_descriptor(&request)? {
-            let endpoint_url = model_gateway.endpoint_url.clone();
-            let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "runtime_auth.authorization is required when capability_descriptors.model_gateway is present",
-                    "agent_binding_runtime_auth_missing",
-                )
-            })?;
-            request.forward_headers.insert(
-                "authorization".to_string(),
-                runtime_auth.authorization.clone(),
-            );
-            request.llm_token_service = Some(astra_services::LlmTokenServiceConfig {
-                url: endpoint_url,
-                timeout_ms: None,
-            });
-            return Ok(request);
-        }
-        Ok(request)
     }
 
     async fn resolve_agent_binding_runtime(
@@ -5320,7 +5207,7 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
-        .with_llm_token_service(request.llm_token_service.clone())
+        .with_admitted_model_execution(request.admitted_model_execution.clone())
         .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
         .with_server_service_tool_catalog_enabled(server_service_tool_catalog_enabled)
@@ -5875,7 +5762,7 @@ impl AgenticRunLifecycleService {
             &self.encryptor,
             self.shared_pool.as_ref(),
             request.model.as_deref(),
-            request.llm_token_service.as_ref(),
+            request.admitted_model_execution.as_ref(),
             &edge_tools,
             &edge_profile,
             execution_bindings,
@@ -5968,7 +5855,7 @@ impl AgenticRunLifecycleService {
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
                 forward_headers: request.forward_headers.clone(),
-                llm_token_service: request.llm_token_service.clone(),
+                admitted_model_execution: request.admitted_model_execution.clone(),
                 ..Default::default()
             },
             cancellation: Default::default(),
@@ -7121,7 +7008,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
-        let mut request = self.prepare_model_gateway_invocation(request).await?;
+        let mut request = request;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
 
         // ── Resource governance check (Phase 5) ─────────────────────
@@ -8153,7 +8040,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
-        let mut request = self.prepare_model_gateway_invocation(request).await?;
+        let mut request = request;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
 
         // ── Resource governance check ────────────────────────────────
@@ -10487,7 +10374,7 @@ impl ServerSpawnAgentExecutor {
             session_id: parent.session_id.clone(),
             trace_context: parent.trace_context.clone(),
             forward_headers: parent.forward_headers.clone(),
-            llm_token_service: parent.llm_token_service.clone(),
+            admitted_model_execution: parent.admitted_model_execution.clone(),
             request_constraints,
             execution_metadata: config
                 .execution_metadata
@@ -10510,6 +10397,7 @@ impl ServerSpawnAgentExecutor {
         inherited_permissions: InheritedPermissions,
         dynamic_agent_spawner: Arc<DynamicAgentSpawner>,
         client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
+        admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     ) -> ServerSubRunExecutor {
         let mut executor = ServerSubRunExecutor::new(
             self.matrixone.clone(),
@@ -10539,6 +10427,7 @@ impl ServerSpawnAgentExecutor {
             executor = executor.with_memory_extraction_service(svc);
         }
         executor = executor
+            .with_admitted_model_execution(admitted_model_execution.cloned())
             .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_dynamic_agent_spawner(dynamic_agent_spawner)
             .with_client_tool_delivery_tx(client_tool_delivery_tx);
@@ -10965,7 +10854,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             previous_output: None,
             context: subrun_context,
             forward_headers: context.forward_headers.clone(),
-            llm_token_service: context.llm_token_service.clone(),
+            admitted_model_execution: context.admitted_model_execution.clone(),
             request_constraints,
             recursion_depth: config.recursion_depth,
             max_turns: Some(config.max_turns),
@@ -10989,6 +10878,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             child_permissions,
             dynamic_agent_spawner,
             config.client_tool_delivery_tx.clone(),
+            context.admitted_model_execution.as_ref(),
         );
         #[cfg(feature = "bridge-e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
@@ -11050,6 +10940,9 @@ pub struct ServerSubRunExecutor {
     /// durable control, projection, and recovery share one authority.
     run_engine: Option<RunEngine>,
     shared_pool: Option<SharedPool>,
+    /// Short-lived material inherited from an already admitted live parent.
+    /// Recovery executors leave this empty and re-materialize by durable ID.
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
@@ -11081,6 +10974,7 @@ impl ServerSubRunExecutor {
             encryptor,
             run_engine: None,
             shared_pool: None,
+            admitted_model_execution: None,
             edge_callback_ledger,
             edge_connection_pool: None,
             edge_dispatch_service: None,
@@ -11104,6 +10998,14 @@ impl ServerSubRunExecutor {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_admitted_model_execution(
+        mut self,
+        execution: Option<astra_services::AdmittedModelExecution>,
+    ) -> Self {
+        self.admitted_model_execution = execution;
         self
     }
 
@@ -11204,10 +11106,71 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     agent_binding_name: Some(config.agent_profile.name.clone()),
+                    model_selection: config.admitted_model_execution.as_ref().map(|execution| {
+                        ModelSelectionRequest {
+                            offering_id: execution.offering_id.clone(),
+                        }
+                    }),
+                    resolved_model_selection: config.admitted_model_execution.as_ref().map(
+                        |execution| ResolvedModelSelection {
+                            offering_id: execution.offering_id.clone(),
+                            model_name: execution.model_name.clone(),
+                        },
+                    ),
                     ..Default::default()
                 },
             )
             .await
+    }
+
+    async fn materialize_durable_subrun_execution(
+        &self,
+        config: &SubRunConfig,
+    ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        let inherited_execution = config
+            .admitted_model_execution
+            .as_ref()
+            .or(self.admitted_model_execution.as_ref());
+        let Some(run_engine) = self.durable_run_engine() else {
+            return Ok(inherited_execution.cloned());
+        };
+        let run = run_engine
+            .load_run(&config.user_id, &config.run_id)
+            .await?
+            .ok_or_else(|| {
+                "durable sub-run disappeared before model materialization".to_string()
+            })?;
+        let offering_id = run.model_offering_id.as_deref().ok_or_else(|| {
+            "durable sub-run is missing its admitted Offering identity".to_string()
+        })?;
+        let expected_model_name = run
+            .resolved_model_name
+            .as_deref()
+            .ok_or_else(|| "durable sub-run is missing its resolved model identity".to_string())?;
+        if let Some(execution) = inherited_execution {
+            if execution.offering_id != offering_id || execution.model_name != expected_model_name {
+                return Err(
+                    "inherited model material does not match the durable sub-run Offering identity"
+                        .to_string(),
+                );
+            }
+            return Ok(Some(execution.clone()));
+        }
+        let offering = astra_services::resolve_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if offering.model.model_name != expected_model_name {
+            return Err(
+                "durable sub-run Offering changed after admission; refusing route drift"
+                    .to_string(),
+            );
+        }
+        astra_services::AdmittedModelExecution::from_offering(offering).map(Some)
     }
 
     async fn persist_durable_subrun_status(
@@ -11374,6 +11337,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         use astra_turn_core::turn_guard::TurnGuard;
 
         self.ensure_durable_subrun_started(&config).await?;
+        let admitted_model_execution = self.materialize_durable_subrun_execution(&config).await?;
         if let Some(sink) = config.live_event_sink.as_ref()
             && let Err(error) = sink.send(AgentLiveEvent {
                 run_id: config.run_id.clone(),
@@ -11477,7 +11441,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(config.agent_profile.model_override.clone())
-        .with_llm_token_service(config.llm_token_service.clone())
+        .with_admitted_model_execution(admitted_model_execution)
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
@@ -11649,7 +11613,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
                 forward_headers: config.forward_headers.clone(),
-                llm_token_service: config.llm_token_service.clone(),
+                admitted_model_execution: config.admitted_model_execution.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {

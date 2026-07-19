@@ -1641,7 +1641,7 @@ pub struct StopHookState {
     /// Header names are normalized to lowercase.
     pub forward_headers: HashMap<String, String>,
     /// Request-scoped LLM token service config propagated to nested sub-runs.
-    pub llm_token_service: Option<astra_services::LlmTokenServiceConfig>,
+    pub admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     /// Shared session task board handle, when available.
     pub task_board_monitor: Option<Arc<TaskManager>>,
     /// Cached view of unfinished task-board work for completion gating.

@@ -671,6 +671,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             }
         };
         let effective_model = self.resolve_effective_model(config.model.as_deref());
+        let model_selection = crate::cli::skill_subrun::resolve_subrun_model_selection(
+            &self.api,
+            &token,
+            effective_model.as_deref(),
+        )
+        .await?;
+        let effective_model = Some(model_selection.name);
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &token)
@@ -697,6 +704,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             api: self.api.clone(),
             token: token.clone(),
             model: effective_model.clone(),
+            model_id: model_selection.model_id,
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,

@@ -48,7 +48,7 @@ async fn execute_delegation_with_source_agent_alias(
     request: astra_services::coordination::DelegationRequest,
     source_agent_id: &str,
     forward_headers: &std::collections::HashMap<String, String>,
-    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
+    admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
     // `main` and `orchestrator` are identity aliases at the runtime boundary.
@@ -67,7 +67,7 @@ async fn execute_delegation_with_source_agent_alias(
             &source_agent_id,
             None,
             forward_headers.clone(),
-            llm_token_service.cloned(),
+            admitted_model_execution.cloned(),
             live_event_sink,
         )
         .await
@@ -205,7 +205,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             &state.self_agent_id,
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
-            state.hooks.llm_token_service.as_ref(),
+            state.hooks.admitted_model_execution.as_ref(),
             &state.skills.request_constraints,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
@@ -859,7 +859,7 @@ pub(crate) async fn partition_and_execute_delegations(
     self_agent_id: &str,
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
-    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
+    admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     request_constraints: &RequestConstraints,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
@@ -925,7 +925,7 @@ pub(crate) async fn partition_and_execute_delegations(
                         request,
                         source_agent_id,
                         forward_headers,
-                        llm_token_service,
+                        admitted_model_execution,
                         live_event_sink.clone(),
                     )
                     .await

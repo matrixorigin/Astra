@@ -47,6 +47,30 @@ const SUBRUN_MAX_TURNS: usize = 25;
 /// Caps total (prompt + completion) across all rounds to prevent runaway cost.
 const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 120_000;
 
+pub(crate) async fn resolve_subrun_model_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: Option<&str>,
+) -> Result<crate::cli::session::session_runtime::ServerModelSelection, String> {
+    if let Some(model) = model {
+        return crate::cli::session::session_runtime::resolve_server_model_selection(
+            api, token, model,
+        )
+        .await;
+    }
+    match crate::cli::session::session_runtime::resolve_server_default_model(api, token).await {
+        crate::cli::session::session_runtime::ServerDefaultModel::Selected(selection) => {
+            Ok(selection)
+        }
+        crate::cli::session::session_runtime::ServerDefaultModel::NoModels => {
+            Err("no active model Offering is available for the sub-run".to_string())
+        }
+        crate::cli::session::session_runtime::ServerDefaultModel::Unavailable => {
+            Err("the Server model registry is unavailable for the sub-run".to_string())
+        }
+    }
+}
+
 // ─── SubRunHost ──────────────────────────────────────────────────────────────
 
 /// Minimal agentic loop host for fork sub-runs.
@@ -59,6 +83,7 @@ pub(crate) struct SubRunHost {
     pub(crate) api: astra_thin_client::ThinClient,
     pub(crate) token: String,
     pub(crate) model: Option<String>,
+    pub(crate) model_id: String,
     pub(crate) project_root: PathBuf,
     pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
@@ -391,6 +416,19 @@ impl AgenticLoopHost for SubRunHost {
             .model_override
             .as_deref()
             .or(self.model.as_deref());
+        let effective_model_id = if effective_model == self.model.as_deref() {
+            self.model_id.clone()
+        } else {
+            resolve_subrun_model_selection(&self.api, &self.token, effective_model)
+                .await
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::MissingModelSelection,
+                        error,
+                    )
+                })?
+                .model_id
+        };
         let thinking = effective_model
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
@@ -409,8 +447,7 @@ impl AgenticLoopHost for SubRunHost {
             user_intent: Some(runtime_decision_user_intent.as_str()),
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
-            model: effective_model,
-            model_id: None,
+            model_id: Some(effective_model_id.as_str()),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
@@ -732,6 +769,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
+        let model_selection =
+            resolve_subrun_model_selection(&self.api, &self.token, effective_model.as_deref())
+                .await?;
+        let effective_model = Some(model_selection.name);
         let thinking = effective_model
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
@@ -778,6 +819,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
+            model_id: model_selection.model_id,
             project_root: self.project_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -1192,6 +1234,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            model_id: "model-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1255,6 +1298,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            model_id: "model-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1287,6 +1331,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            model_id: "model-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1401,6 +1446,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            model_id: "model-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1434,6 +1480,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
+            model_id: "model-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),

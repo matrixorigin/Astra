@@ -2,6 +2,9 @@ use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
 use super::*;
 use crate::server::{
+    model_execution_admission::{
+        ModelExecutionAdmissionAuthority, admit_model_execution_from_body,
+    },
     provider_runtime_context::{
         inject_effective_runtime_context, inject_effective_runtime_context_body,
     },
@@ -279,7 +282,19 @@ pub(super) async fn chat_turn_handler(
         Ok(body) => body,
         Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
-    dispatch_chat_turn_bridge(&state, &principal.user, &headers, body).await
+    let model_execution_authority = if principal.is_provider_authorized_request() {
+        ModelExecutionAdmissionAuthority::ProviderRuntime
+    } else {
+        ModelExecutionAdmissionAuthority::Catalog
+    };
+    dispatch_chat_turn_bridge(
+        &state,
+        &principal.user,
+        &headers,
+        body,
+        model_execution_authority,
+    )
+    .await
 }
 
 pub(super) async fn dispatch_chat_turn_bridge(
@@ -287,7 +302,18 @@ pub(super) async fn dispatch_chat_turn_bridge(
     user: &AuthUserRecord,
     source_headers: &HeaderMap,
     body: Bytes,
+    model_execution_authority: ModelExecutionAdmissionAuthority,
 ) -> Response {
+    let admitted_model_execution = match admit_model_execution_from_body(
+        &state.model_service,
+        &body,
+        model_execution_authority,
+    )
+    .await
+    {
+        Ok(execution) => execution,
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+    };
     let mut bridge_headers = HeaderMap::new();
     bridge_headers.insert(
         HeaderName::from_static("x-mo-bridge-secret"),
@@ -428,6 +454,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
         .forward(
             &bridge_headers,
             prepared.body,
+            admitted_model_execution,
             state.turn_persistence.core_event_writer.clone(),
             state.turn_persistence.tool_event_writer.clone(),
             state.turn_persistence.hook_db_writer.clone(),

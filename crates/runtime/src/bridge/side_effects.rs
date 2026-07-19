@@ -24,6 +24,32 @@ struct BridgeHookSideEffectJob {
     turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
     turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     turn_observer_worker: Arc<dyn TurnObserverWorker>,
+    _completion: BridgeHookSideEffectCompletion,
+}
+
+struct BridgeHookSideEffectCompletion(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for BridgeHookSideEffectCompletion {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+/// Completion receipt for one ordered bridge side-effect job.
+///
+/// The receipt represents terminal processing, including a recorded failure.
+/// Callers that own a shutdown task tracker can await it without coupling SSE
+/// delivery latency to hook/reflection persistence.
+pub struct BridgeHookSideEffectReceipt(Option<tokio::sync::oneshot::Receiver<()>>);
+
+impl BridgeHookSideEffectReceipt {
+    pub async fn wait(self) {
+        if let Some(completion) = self.0 {
+            let _ = completion.await;
+        }
+    }
 }
 
 impl BridgeHookSideEffectJob {
@@ -131,17 +157,20 @@ pub fn run_bridge_hook_side_effects(
     turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
     turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     turn_observer_worker: Arc<dyn TurnObserverWorker>,
-) {
+) -> BridgeHookSideEffectReceipt {
     let Some(payload) = payload else {
-        return;
+        return BridgeHookSideEffectReceipt(None);
     };
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     enqueue_bridge_hook_side_effects(BridgeHookSideEffectJob {
         payload,
         turn_hook_db_writer,
         turn_reflection_state_store,
         turn_reflection_lesson_writer,
         turn_observer_worker,
+        _completion: BridgeHookSideEffectCompletion(Some(completion_tx)),
     });
+    BridgeHookSideEffectReceipt(Some(completion_rx))
 }
 
 fn enqueue_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
@@ -192,6 +221,7 @@ async fn execute_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
         turn_reflection_state_store,
         turn_reflection_lesson_writer,
         turn_observer_worker,
+        _completion,
     } = job;
 
     if let Some((plan, writer)) = build_hook_db_persist_from_payload(&payload, turn_hook_db_writer)
@@ -801,6 +831,7 @@ mod inprocess_hook_contract_tests {
             turn_reflection_state_store: Arc::new(RecordingReflectionStateStore::default()),
             turn_reflection_lesson_writer: Arc::new(RecordingReflectionLessonWriter::default()),
             turn_observer_worker: Arc::new(RecordingObserverWorker::default()),
+            _completion: super::BridgeHookSideEffectCompletion(None),
         }
     }
 
@@ -1100,9 +1131,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let plans = hook_writer.plans.lock().await;
         assert_eq!(plans.len(), 1, "should persist exactly one hook plan");
@@ -1161,9 +1192,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let plans = hook_writer.plans.lock().await;
         assert_eq!(plans.len(), 1);
@@ -1189,9 +1220,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(RecordingReflectionStateStore::default()),
             Arc::new(RecordingReflectionLessonWriter::default()),
             Arc::new(RecordingObserverWorker::default()),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let plans = hook_writer.plans.lock().await;
         let plan = &plans[0];
@@ -1225,9 +1256,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let plans = hook_writer.plans.lock().await;
         let audit = plans[0]
@@ -1279,9 +1310,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store.clone()),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let marks = reflection_store.marks.lock().await;
         assert_eq!(marks.len(), 1, "should mark reflection state");
@@ -1306,9 +1337,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         assert!(hook_writer.plans.lock().await.is_empty());
     }
@@ -1321,22 +1352,22 @@ mod inprocess_hook_contract_tests {
         let observer = DelayedRecordingObserverWorker::default();
         let session_id = format!("ordered-session-{}", uuid::Uuid::now_v7());
 
-        run_bridge_hook_side_effects(
+        let first = run_bridge_hook_side_effects(
             Some(build_observer_payload_for_turn(&session_id, 1)),
             Arc::new(hook_writer.clone()),
             Arc::new(reflection_store.clone()),
             Arc::new(lesson_writer.clone()),
             Arc::new(observer.clone()),
         );
-        run_bridge_hook_side_effects(
+        let second = run_bridge_hook_side_effects(
             Some(build_observer_payload_for_turn(&session_id, 2)),
             Arc::new(hook_writer),
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer.clone()),
         );
-
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        first.wait().await;
+        second.wait().await;
 
         let turns = observer
             .requests
@@ -1389,9 +1420,9 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        )
+        .wait()
+        .await;
 
         let plans = hook_writer.plans.lock().await;
         assert_eq!(plans.len(), 1);

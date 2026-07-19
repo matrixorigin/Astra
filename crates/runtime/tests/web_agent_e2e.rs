@@ -28,6 +28,7 @@ use astra_services::skills::{
 };
 use astra_services::{
     ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use async_trait::async_trait;
 use axum::{
@@ -48,7 +49,7 @@ use crate::test_support::{
 const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
 const USER_ID: &str = "web-agent-e2e-user";
-const DEFAULT_SELECTED_MODEL: &str = "test-model";
+const DEFAULT_MODEL_OFFERING_ID: &str = "model-test-model";
 const DEFAULT_TEST_EDGE_AGENT_ID: &str = "web-agent-e2e-edge";
 const DEFAULT_TOOL_RESULT_SESSION_ID: &str = "web-agent-e2e-session";
 const DEFAULT_TOOL_RESULT_RUN_ID: &str = "web-agent-e2e-run";
@@ -501,10 +502,10 @@ impl ModelService for TestModelService {
         Ok(test_model_record(model_name))
     }
 
-    async fn get_model_by_offering_id(
+    async fn resolve_model_offering(
         &self,
         offering_id: String,
-    ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
         let model_name = offering_id
             .strip_prefix("model-")
             .ok_or_else(|| {
@@ -514,7 +515,23 @@ impl ModelService for TestModelService {
                 )
             })?
             .to_string();
-        Ok(test_model_record(model_name))
+        Ok(ResolvedModelOffering {
+            offering_id,
+            model: ResolvedActiveLlmModel {
+                model_name,
+                wire_model_name: None,
+                api_key: "test-provider-secret".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                provider: "mock".to_string(),
+                fallback_chain: Vec::new(),
+                tags: Vec::new(),
+                request_body_overrides: None,
+                prompt_cache_capability: None,
+                thinking_capability: None,
+                context_window: Some(128_000),
+                request_headers: None,
+            },
+        })
     }
 
     async fn update_model(
@@ -635,12 +652,11 @@ fn normalize_chat_stream_payload(mut payload: Value) -> Value {
     let Some(object) = payload.as_object_mut() else {
         return payload;
     };
-    let legacy_model = object.remove("model");
-    if !object.contains_key("selected_model") {
-        let model = legacy_model
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
-        object.insert("selected_model".to_string(), json!({ "model": model }));
+    if !object.contains_key("model_selection") {
+        object.insert(
+            "model_selection".to_string(),
+            json!({ "offering_id": DEFAULT_MODEL_OFFERING_ID }),
+        );
     }
     ensure_test_edge_profile_for_edge_tools(object);
     payload
@@ -3250,7 +3266,7 @@ async fn missing_message_field_returns_sse_error() {
         .header("x-mo-bridge-test-secret", SECRET)
         .body(Body::from(
             json!({
-                "selected_model": { "model": DEFAULT_SELECTED_MODEL },
+                "model_selection": { "offering_id": DEFAULT_MODEL_OFFERING_ID },
                 "context": {}
             })
             .to_string(),
@@ -4869,7 +4885,7 @@ async fn hook_db_decision_audit_model_name() {
         &app,
         json!({
             "message": "test",
-            "model": "test-model-v1",
+            "model_selection": { "offering_id": "model-test-model-v1" },
             "context": {
                 "test_llm_rounds": [{ "full_text": "ok" }]
             }
@@ -5789,7 +5805,7 @@ async fn context_meta_active_skills_survive_model_override() {
             &app,
             json!({
                 "message": "help me review",
-                "model": "MiniMax-M2.7",
+                "model_selection": { "offering_id": "model-MiniMax-M2.7" },
                 "context": {
                     "edge_profile": {
                         "active_skills": ["concise", "markdown"]
@@ -5907,7 +5923,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 
         let payload = json!({
             "message": "Review this commit under the pinned output skills.",
-            "model": "MiniMax-M2.7",
+            "model_selection": { "offering_id": "model-MiniMax-M2.7" },
             "context": {
                 "edge_profile": {
                     "active_skills": ["concise", "markdown"],
@@ -6030,7 +6046,7 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
             json!({
                 "session_id": &sid,
                 "message": "first request: use test-skill",
-                "model": "MiniMax-M2.7",
+                "model_selection": { "offering_id": "model-MiniMax-M2.7" },
                 "context": {
                     "edge_profile": {
                         "active_skills": ["concise"]
@@ -6063,7 +6079,7 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
             json!({
                 "session_id": &sid,
                 "message": "second request: keep the pinned skill",
-                "model": "MiniMax-M2.7",
+                "model_selection": { "offering_id": "model-MiniMax-M2.7" },
                 "context": {
                     "edge_profile": {
                         "active_skills": ["concise"]

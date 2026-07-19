@@ -53,7 +53,7 @@ use astra_services::delegated_findings::{
 use astra_services::runs::{
     DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
 };
-use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
+use astra_services::{AdmittedModelExecution, BubbleUpTarget, DatabaseStateProjectionStore};
 
 pub use astra_core::SubRunState;
 use astra_core::{
@@ -680,8 +680,9 @@ pub struct SubRunConfig {
     pub context: HashMap<String, serde_json::Value>,
     /// Trusted forwarded headers propagated out-of-band for child remote skills.
     pub forward_headers: HashMap<String, String>,
-    /// Optional request-scoped LLM token service for child loop model resolution.
-    pub llm_token_service: Option<LlmTokenServiceConfig>,
+    /// Short-lived execution material inherited from the admitted parent run.
+    /// It is sideband state and is never serialized into delegation context.
+    pub admitted_model_execution: Option<AdmittedModelExecution>,
     /// Request-scoped capability constraints inherited from the parent runtime request.
     pub request_constraints: RequestConstraints,
     /// Current nested agent/sub-run depth for the child loop.
@@ -733,7 +734,10 @@ impl std::fmt::Debug for SubRunConfig {
             .field("user_id", &self.user_id)
             .field("previous_output", &self.previous_output)
             .field("forward_headers", &!self.forward_headers.is_empty())
-            .field("llm_token_service", &self.llm_token_service.is_some())
+            .field(
+                "admitted_model_execution",
+                &self.admitted_model_execution.is_some(),
+            )
             .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
             .field("max_turns", &self.max_turns)
@@ -2541,14 +2545,14 @@ impl DelegationEngine {
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
         forward_headers: HashMap<String, String>,
-        llm_token_service: Option<LlmTokenServiceConfig>,
+        admitted_model_execution: Option<AdmittedModelExecution>,
     ) -> Result<DelegationResult, String> {
         self.execute_with_forward_headers_and_live_events(
             request,
             source_agent_id,
             cancel_token,
             forward_headers,
-            llm_token_service,
+            admitted_model_execution,
             None,
         )
         .await
@@ -2564,7 +2568,7 @@ impl DelegationEngine {
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
         forward_headers: HashMap<String, String>,
-        llm_token_service: Option<LlmTokenServiceConfig>,
+        admitted_model_execution: Option<AdmittedModelExecution>,
         live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         request
@@ -2687,7 +2691,7 @@ impl DelegationEngine {
                     agent_ids,
                     aggregation,
                     &forward_headers,
-                    llm_token_service.as_ref(),
+                    admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -2706,7 +2710,7 @@ impl DelegationEngine {
                     &agent_ids,
                     false,
                     &forward_headers,
-                    llm_token_service.as_ref(),
+                    admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -2725,7 +2729,7 @@ impl DelegationEngine {
                     agent_ids,
                     *stop_on_success,
                     &forward_headers,
-                    llm_token_service.as_ref(),
+                    admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -2747,7 +2751,7 @@ impl DelegationEngine {
                     reviewer_id,
                     *max_rounds,
                     &forward_headers,
-                    llm_token_service.as_ref(),
+                    admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -2770,7 +2774,7 @@ impl DelegationEngine {
                     *max_turns,
                     aggregation,
                     &forward_headers,
-                    llm_token_service.as_ref(),
+                    admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -2850,7 +2854,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
-        llm_token_service: Option<&LlmTokenServiceConfig>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -3001,7 +3005,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
-                llm_token_service: llm_token_service.cloned(),
+                admitted_model_execution: admitted_model_execution.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
@@ -3297,7 +3301,7 @@ impl DelegationEngine {
                                 previous_output: None,
                                 context: ctx,
                                 forward_headers: forward_headers.clone(),
-                                llm_token_service: llm_token_service.cloned(),
+                                admitted_model_execution: admitted_model_execution.cloned(),
                                 request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
                                 max_turns: None,
@@ -3370,7 +3374,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         stop_on_success: bool,
         forward_headers: &HashMap<String, String>,
-        llm_token_service: Option<&LlmTokenServiceConfig>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -3515,7 +3519,7 @@ impl DelegationEngine {
                 previous_output: previous_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
-                llm_token_service: llm_token_service.cloned(),
+                admitted_model_execution: admitted_model_execution.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
@@ -3592,7 +3596,7 @@ impl DelegationEngine {
                             previous_output: prev.clone(),
                             context: ctx.clone(),
                             forward_headers: forward_headers.clone(),
-                            llm_token_service: llm_token_service.cloned(),
+                            admitted_model_execution: admitted_model_execution.cloned(),
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
@@ -3656,7 +3660,7 @@ impl DelegationEngine {
         reviewer_id: &str,
         max_rounds: u32,
         forward_headers: &HashMap<String, String>,
-        llm_token_service: Option<&LlmTokenServiceConfig>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -3799,7 +3803,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
-                llm_token_service: llm_token_service.cloned(),
+                admitted_model_execution: admitted_model_execution.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
@@ -3868,7 +3872,7 @@ impl DelegationEngine {
                             previous_output: prev.clone(),
                             context: ctx.clone(),
                             forward_headers: forward_headers.clone(),
-                            llm_token_service: llm_token_service.cloned(),
+                            admitted_model_execution: admitted_model_execution.cloned(),
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
@@ -4005,7 +4009,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
-                llm_token_service: llm_token_service.cloned(),
+                admitted_model_execution: admitted_model_execution.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
@@ -4086,7 +4090,7 @@ impl DelegationEngine {
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
-        llm_token_service: Option<&LlmTokenServiceConfig>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -4232,7 +4236,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: fork_context,
                 forward_headers: forward_headers.clone(),
-                llm_token_service: llm_token_service.cloned(),
+                admitted_model_execution: admitted_model_execution.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
@@ -6452,16 +6456,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_with_forward_headers_passes_llm_token_service_sideband() {
-        struct LlmTokenServiceCheckExecutor;
+    async fn execute_with_forward_headers_passes_admitted_model_execution_sideband() {
+        struct ExecutionMaterialCheckExecutor;
 
         #[async_trait]
-        impl SubRunExecutor for LlmTokenServiceCheckExecutor {
+        impl SubRunExecutor for ExecutionMaterialCheckExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
                 let encoded = config
-                    .llm_token_service
+                    .admitted_model_execution
                     .as_ref()
-                    .map(|service| format!("{}|{}", service.url, service.timeout_ms.unwrap_or(0)))
+                    .map(|execution| {
+                        format!(
+                            "{}|{}",
+                            execution
+                                .completions_url_override
+                                .as_deref()
+                                .unwrap_or_default(),
+                            execution.request_timeout_ms.unwrap_or(0)
+                        )
+                    })
                     .unwrap_or_else(|| "none".to_string());
                 Ok(AgentResult {
                     agent_id: config.agent_profile.agent_id,
@@ -6481,14 +6494,14 @@ mod tests {
             reg,
             engine,
             tracker,
-            Arc::new(LlmTokenServiceCheckExecutor),
+            Arc::new(ExecutionMaterialCheckExecutor),
         );
 
         let req = DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "llm-token-test".into(),
+            delegation_id: "execution-material-test".into(),
             parent_run_id: "p".into(),
-            task: "check llm token service".into(),
+            task: "check admitted execution material".into(),
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: false,
@@ -6507,10 +6520,14 @@ mod tests {
                 "orch",
                 None,
                 HashMap::new(),
-                Some(LlmTokenServiceConfig {
-                    url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-                    timeout_ms: Some(2500),
-                }),
+                Some(AdmittedModelExecution::from_endpoint(
+                    "offer-coder".to_string(),
+                    "test-model".to_string(),
+                    "openai".to_string(),
+                    "http://catalog:8081/api/v1/chat/completions".to_string(),
+                    "Bearer test".to_string(),
+                    Some(2500),
+                )),
             )
             .await
             .unwrap();
@@ -6758,7 +6775,7 @@ mod tests {
             previous_output: None,
             context: HashMap::new(),
             forward_headers: HashMap::new(),
-            llm_token_service: None,
+            admitted_model_execution: None,
             request_constraints: Default::default(),
             recursion_depth: 1,
             max_turns: None,

@@ -119,6 +119,16 @@ async fn effective_offering_resolution_is_exact_active_and_secret_safe() {
     assert_eq!(resolved.offering_id, offering_id);
     assert_eq!(resolved.model.model_name, model_name);
     assert_eq!(resolved.model.api_key, "offering-secret");
+    assert!(!format!("{resolved:?}").contains("offering-secret"));
+
+    let service = DatabaseModelService::new(settings.clone(), Arc::new(encryptor.clone()))
+        .with_pool(shared_pool.clone());
+    let admitted = service
+        .resolve_model_offering(offering_id.clone())
+        .await
+        .expect("ModelService must materialize the same exact Offering");
+    assert_eq!(admitted.offering_id, offering_id);
+    assert_eq!(admitted.model.model_name, model_name);
 
     let error = resolve_active_llm_offering(&settings, &encryptor, &model_name, Some(&pool))
         .await

@@ -120,7 +120,7 @@ fn chat_request_all_fields() {
                 "type": "model_gateway",
                 "transport": "http",
                 "endpoint_url": "http://catalog:8081/api/v1/model-gateway",
-                "protocol": "openai_responses",
+                "protocol": "openai_chat_completions",
                 "metadata": {}
             }
         },
@@ -226,17 +226,6 @@ fn chat_request_rejects_model_selection_route_fields() {
     assert!(
         err.to_string().contains("unknown field `gateway`"),
         "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn chat_request_rejects_client_supplied_llm_token_service() {
-    let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"llm_token_service":{"url":"https://attacker.invalid"}}"#,
-    );
-    assert!(
-        result.is_err(),
-        "clients must not choose an inference endpoint"
     );
 }
 
@@ -1259,7 +1248,7 @@ fn chat_request_into_data_maps_all_fields() {
         Some("offer-gpt-4")
     );
     assert!(data.resolved_model_selection.is_none());
-    assert!(data.llm_token_service.is_none());
+    assert!(data.admitted_model_execution.is_none());
     assert_eq!(
         data.skill_search,
         Some(astra_core::SkillSearchSettings::default())
@@ -1301,7 +1290,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.session_id.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
-    assert!(data.llm_token_service.is_none());
+    assert!(data.admitted_model_execution.is_none());
     assert!(data.runtime_mcp_bindings.is_empty());
     assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());

@@ -148,77 +148,11 @@ fn track_ordered_bridge_persist<F>(
     }
 }
 
-fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
-    payload
-        .get("selected_model")
-        .and_then(Value::as_object)
-        .and_then(|selected_model| selected_model.get("model"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProviderModelGatewayInvocation {
-    model: String,
-    endpoint_url: String,
-    authorization: String,
-}
-
-fn provider_model_gateway_invocation_from_payload(
-    payload: &Value,
-) -> Result<Option<ProviderModelGatewayInvocation>, String> {
-    let Some(model_gateway) = payload
-        .get("capability_descriptors")
-        .and_then(Value::as_object)
-        .and_then(|descriptors| descriptors.get("model_gateway"))
-        .and_then(Value::as_object)
-    else {
-        return Ok(None);
-    };
-    let selected_model = payload
-        .get("selected_model")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            "selected_model is required with capability_descriptors.model_gateway".to_string()
-        })?;
-    let model = selected_model
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "selected_model.model is required with capability_descriptors.model_gateway".to_string()
-        })?
-        .to_string();
-    let endpoint_url = model_gateway
-        .get("endpoint_url")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "capability_descriptors.model_gateway.endpoint_url is required".to_string())?
-        .to_string();
-    let authorization = payload
-        .get("runtime_auth")
-        .and_then(Value::as_object)
-        .and_then(|runtime_auth| runtime_auth.get("authorization"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "runtime_auth.authorization is required with capability_descriptors.model_gateway"
-                .to_string()
-        })?
-        .to_string();
-    Ok(Some(ProviderModelGatewayInvocation {
-        model,
-        endpoint_url,
-        authorization,
-    }))
-}
-
 fn rewrite_bridge_runtime_manifest_model_resolution(
     trace: &mut Value,
-    requested_model: Option<&str>,
+    offering_id: Option<&str>,
     resolved_model: &str,
     provider: &str,
-    fallback_trace: Option<&Value>,
 ) {
     let Some(trace_obj) = trace.as_object_mut() else {
         return;
@@ -229,23 +163,14 @@ fn rewrite_bridge_runtime_manifest_model_resolution(
     if !manifest.is_object() {
         *manifest = json!({});
     }
-    let selected_model = requested_model.unwrap_or(resolved_model);
-    let source = if fallback_trace.is_some() {
-        "rate_limit_fallback"
-    } else {
-        "bridge_request"
-    };
     manifest["schema_version"] = json!("astra_runtime_manifest.v1");
-    manifest["selected_model"] = json!({
-        "model": selected_model,
-    });
+    manifest["model_selection"] = json!({ "offering_id": offering_id });
     manifest["model_resolution"] = json!({
-        "source": source,
-        "requested_model": requested_model,
+        "source": "catalog_offering",
+        "offering_id": offering_id,
         "model": resolved_model,
         "provider": provider,
         "resolved": true,
-        "fallback": fallback_trace,
     });
     manifest["runtime_profile"] = json!(astra_runtime_env::CapacityProviderType::CliLocal.as_str());
 }
@@ -1230,9 +1155,7 @@ use super::observability::{build_context_trace_signal, persist_legacy_bridge_tra
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
 use super::llm_stream::call_llm_stream_with_request_overrides;
 use super::llm_stream::rate_limit_cooldown;
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    FallbackOutcome, RateLimitAction, try_resolve_fallback,
-};
+use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
@@ -1575,6 +1498,7 @@ impl InProcessChatTurnBridge {
         &self,
         headers: &HeaderMap,
         body: Bytes,
+        admitted_model_execution: astra_services::AdmittedModelExecution,
         turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
         turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
         turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
@@ -1630,10 +1554,8 @@ impl InProcessChatTurnBridge {
         let runtime_memory_binding =
             optional_nested_payload_object(&payload, "runtime_bindings", "memory")?;
         let explain = explain_requested(&payload);
-        let selected_model_name = selected_model_name_from_payload(&payload);
+        let model_offering_id = Some(admitted_model_execution.offering_id.clone());
         let round_index = bridge_round_index(&payload)?;
-        let provider_model_gateway_invocation =
-            provider_model_gateway_invocation_from_payload(&payload);
 
         let _agent_id = payload
             .get("agent_id")
@@ -1645,7 +1567,6 @@ impl InProcessChatTurnBridge {
             .unwrap_or_default();
 
         let matrixone = self.matrixone.clone();
-        let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
         let session_start_memory_cache = self.session_start_memory_cache.clone();
         let (trace_turn, trace_turn_source) = if let Some(turn) = header_session_turn {
@@ -1824,40 +1745,10 @@ impl InProcessChatTurnBridge {
                     .as_ref()
                     .map(|blocks| !blocks.is_empty())
                     .unwrap_or(false);
-            let provider_model_gateway_invocation = match provider_model_gateway_invocation {
-                Ok(invocation) => invocation,
-                Err(error) => {
-                    yield render_sse_map(&build_stream_error_event(
-                        &error,
-                        "PROVIDER_RUNTIME_CONTEXT_INVALID",
-                        false,
-                    ));
-                    mark_disconnect_capture_finalized(&disconnect_capture_state);
-                    return;
-                }
-            };
-
-            // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
-            // Also capture fallback_chain for rate-limit-triggered fallback.
-            let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let requested_model_override =
-                astra_core::model_override::normalize_model_override(selected_model_name.as_deref());
-            let requested_model_name = requested_model_override.map(str::to_string);
-            let mut rate_limit_fallback_trace: Option<Value> = None;
-            if !use_e2e_llm && requested_model_override.is_none() {
-                tracing::warn!(
-                    target: "astra_runtime::bridge_inprocess",
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    turn = trace_turn,
-                    round = round_index,
-                    reason = "missing_model_selection",
-                    "missing selected_model.model; refusing implicit model fallback"
-                );
-            }
-            let mut llm_header_overrides: Option<HashMap<String, String>> = None;
-            let mut completions_url_override: Option<String> = None;
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, mut model_context_window, fallback_chain) = if use_e2e_llm {
+            // Every production route reaches the adapter as the same admitted,
+            // non-serializable execution material. The E2E hook only replaces
+            // the physical provider call; it does not define another route.
+            let (model_name, wire_model_name, api_key, base_url, provider, request_body_overrides, cache_capability, model_context_window) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
@@ -1867,72 +1758,37 @@ impl InProcessChatTurnBridge {
                     None,
                     None,
                     None,
-                    Vec::<String>::new(),
-                )
-            } else if let Some(invocation) = provider_model_gateway_invocation {
-                let mut headers = HashMap::new();
-                headers.insert("authorization".to_string(), invocation.authorization);
-                llm_header_overrides = Some(headers);
-                completions_url_override = Some(invocation.endpoint_url);
-                (
-                    invocation.model,
-                    None::<String>,
-                    "provider-runtime".to_string(),
-                    "http://127.0.0.1".to_string(),
-                    "openai".to_string(),
-                    None,
-                    None,
-                    None,
-                    Vec::<String>::new(),
                 )
             } else {
-                match astra_services::resolve_active_llm_model(
-                    &matrixone,
-                    encryptor.as_ref(),
-                    requested_model_override,
-                    pool_ref,
-                )
-                .await
-                {
-                    Ok(m) => (
-                        m.model_name,
-                        m.wire_model_name,
-                        m.api_key,
-                        m.base_url,
-                        m.provider,
-                        m.request_body_overrides,
-                        crate::turn::llm::context::cache_capability_from_model_metadata(
-                            m.prompt_cache_capability,
-                        ),
-                        m.context_window,
-                        m.fallback_chain,
+                (
+                    admitted_model_execution.model_name.clone(),
+                    admitted_model_execution.wire_model_name.clone(),
+                    admitted_model_execution.api_key.clone(),
+                    admitted_model_execution.base_url.clone(),
+                    admitted_model_execution.provider.clone(),
+                    admitted_model_execution.request_body_overrides.clone(),
+                    crate::turn::llm::context::cache_capability_from_model_metadata(
+                        admitted_model_execution.cache_capability,
                     ),
-                    Err(e) => {
-                        let message = format!("Model resolution failed: {e}");
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::classify_model_resolution_error_message(&message),
-                            message,
-                        );
-                        yield render_sse_map(&build_stream_error_event(
-                            &error.message,
-                            error.kind.as_str(),
-                            error.kind.is_retryable(),
-                        ));
-                        mark_disconnect_capture_finalized(&disconnect_capture_state);
-                        return;
-                    }
-                }
+                    admitted_model_execution.context_window,
+                )
             };
-            let has_fallback = !fallback_chain.is_empty();
+            let llm_header_overrides = (!admitted_model_execution.header_overrides.is_empty())
+                .then(|| admitted_model_execution.header_overrides.clone());
+            let completions_url_override = admitted_model_execution.completions_url_override.clone();
+            let request_timeout = admitted_model_execution
+                .request_timeout_ms
+                .map(std::time::Duration::from_millis);
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
             let cache_cfg =
                 PromptCacheConfig::from_cache_capability(cache_capability, &provider, &model_name);
 
-            // Check rate-limit cooldown and handle fallback model resolution
+            // Offering admission is the routing and billing boundary. Legacy
+            // model-name fallback chains cannot cross it.
             let cooldown = rate_limit_cooldown();
-            match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
+            match cooldown.with(&model_name, |c| c.check_request(false)) {
                 RateLimitAction::Proceed => {}
                 RateLimitAction::WaitAndRetry { delay_ms } => {
                     astra_core::agent_info!(
@@ -1954,69 +1810,11 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    let mx = &matrixone;
-                    let enc = encryptor.as_ref();
-                    match try_resolve_fallback(
-                        cooldown,
-                        &fallback_chain,
-                        reason,
-                        |fb_name| {
-                            async move {
-                                astra_services::resolve_active_llm_model(
-                                    mx,
-                                    enc,
-                                    Some(fb_name.as_str()),
-                                    pool_ref,
-                                )
-                                .await
-                            }
-                        },
-                    )
-                    .await
-                    {
-                        FallbackOutcome::Resolved(fb) => {
-                            let from_model = model_name.clone();
-                            let to_model = fb.model_name.clone();
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit fallback: {} -> {} ({})",
-                                from_model,
-                                to_model,
-                                reason.as_str()
-                            );
-                            rate_limit_fallback_trace = Some(json!({
-                                "from_model": from_model,
-                                "to_model": to_model,
-                                "reason": reason.as_str(),
-                            }));
-                            model_name = fb.model_name;
-                            wire_model_name = fb.wire_model_name;
-                            api_key = fb.api_key;
-                            base_url = fb.base_url;
-                            provider = fb.provider;
-                            request_body_overrides = fb.request_body_overrides;
-                            model_context_window = fb.context_window;
-                            cache_capability =
-                                crate::turn::llm::context::cache_capability_from_model_metadata(
-                                    fb.prompt_cache_capability,
-                                );
-                        }
-                        FallbackOutcome::NoFallbackConfigured => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit cooldown: fallback requested ({}) but no fallback configured",
-                                reason.as_str()
-                            );
-                        }
-                        FallbackOutcome::AllExhausted { chain_len } => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "rate-limit cooldown: all {} fallback models exhausted ({})",
-                                chain_len,
-                                reason.as_str()
-                            );
-                        }
-                    }
+                    astra_core::agent_warn!(
+                        "llm",
+                        "rate-limit controller requested a fallback without an admitted fallback Offering ({})",
+                        reason.as_str()
+                    );
                 }
                 RateLimitAction::Reject {
                     reason,
@@ -2443,10 +2241,9 @@ impl InProcessChatTurnBridge {
             let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
             rewrite_bridge_runtime_manifest_model_resolution(
                 &mut bridge_manifest_trace_json,
-                requested_model_name.as_deref(),
+                model_offering_id.as_deref(),
                 &model_name,
                 &provider,
-                rate_limit_fallback_trace.as_ref(),
             );
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
@@ -2587,10 +2384,9 @@ impl InProcessChatTurnBridge {
                     bridge_manifest_trace_json = bridge_manifest_trace.to_json();
                     rewrite_bridge_runtime_manifest_model_resolution(
                         &mut bridge_manifest_trace_json,
-                        requested_model_name.as_deref(),
+                        model_offering_id.as_deref(),
                         &model_name,
                         &provider,
-                        rate_limit_fallback_trace.as_ref(),
                     );
                     llm_messages.clear();
                     llm_messages.push(system_msg.clone());
@@ -3069,13 +2865,13 @@ impl InProcessChatTurnBridge {
                             &base_url,
                             &provider,
                             Some(max_output_tokens),
-                            has_fallback,
+                            false,
                             cc.clone(),
                             &thinking_config,
                             request_body_overrides.as_ref(),
                             llm_header_overrides.as_ref(),
                             completions_url_override.as_deref(),
-                            None,
+                            request_timeout,
                         )
                         .await
                         {
@@ -3269,13 +3065,13 @@ impl InProcessChatTurnBridge {
                                 &base_url,
                                 &provider,
                                 Some(max_output_tokens / 2), // reduce output budget too
-                                has_fallback,
+                                false,
                                 cc.clone(),
                                 &thinking_config,
                                 request_body_overrides.as_ref(),
                                 llm_header_overrides.as_ref(),
                                 completions_url_override.as_deref(),
-                                None,
+                                request_timeout,
                             )
                             .await
                             {
@@ -4470,13 +4266,16 @@ impl InProcessChatTurnBridge {
                     false, // run_observer = false → triggers observer
                     false, // run_reflection_learning = false → triggers reflection
                 );
-                crate::bridge::side_effects::run_bridge_hook_side_effects(
+                let hook_receipt = crate::bridge::side_effects::run_bridge_hook_side_effects(
                     Some(Value::Object(hook_payload)),
                     turn_hook_db_writer.clone(),
                     turn_reflection_state_store.clone(),
                     turn_reflection_lesson_writer.clone(),
                     turn_observer_worker.clone(),
                 );
+                if let Some(tracker) = persist_tracker_shared.clone() {
+                    tracker.track_persist_task(Box::pin(hook_receipt.wait()));
+                }
             }
 
             // Build request_id → (round, tools_in_round) for observability.
@@ -4659,8 +4458,8 @@ impl InProcessChatTurnBridge {
                     "tier": 0,
                     "latency_ms": 0,
                     "estimated_tokens": final_usage.total_tokens() as i64,
-                    "skipped": selected_model_name.is_some(),
-                    "reason": selected_model_name.as_ref().map(|_| "selected_model").unwrap_or(""),
+                    "skipped": model_offering_id.is_some(),
+                    "reason": model_offering_id.as_ref().map(|_| "model_selection").unwrap_or(""),
                     "cloud_loop_turns": cloud_loop_turns,
                 }));
                 let explain_event = build_explain_event(
@@ -5012,96 +4811,28 @@ mod tests {
     }
 
     #[test]
-    fn selected_model_name_from_payload_ignores_legacy_top_level_model() {
-        assert_eq!(
-            selected_model_name_from_payload(&json!({
-                "selected_model": {"model": "deepseek-v4-pro-official"},
-                "model": "deepseek-v4-flash",
-            }))
-            .as_deref(),
-            Some("deepseek-v4-pro-official")
-        );
-        assert_eq!(
-            selected_model_name_from_payload(&json!({
-                "model": "deepseek-v4-flash",
-            })),
-            None
-        );
-    }
-
-    #[test]
-    fn provider_model_gateway_invocation_from_payload_reads_provider_runtime_context() {
-        let invocation = provider_model_gateway_invocation_from_payload(&json!({
-            "selected_model": {"id": "model-qwen", "model": "qwen3.5-flash"},
-            "runtime_auth": {"authorization": "Bearer runtime-grant"},
-            "capability_descriptors": {
-                "model_gateway": {
-                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
-                }
-            }
-        }))
-        .expect("valid provider runtime context")
-        .expect("provider model gateway invocation");
-
-        assert_eq!(invocation.model, "qwen3.5-flash");
-        assert_eq!(
-            invocation.endpoint_url,
-            "http://catalog.local/api/v1/models/openai/chat/completions"
-        );
-        assert_eq!(invocation.authorization, "Bearer runtime-grant");
-    }
-
-    #[test]
-    fn provider_model_gateway_invocation_allows_missing_provider_model_id() {
-        let invocation = provider_model_gateway_invocation_from_payload(&json!({
-            "selected_model": {"model": "qwen3.5-flash"},
-            "runtime_auth": {"authorization": "Bearer runtime-grant"},
-            "capability_descriptors": {
-                "model_gateway": {
-                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
-                }
-            }
-        }))
-        .expect("valid provider runtime context")
-        .expect("provider model gateway invocation");
-
-        assert_eq!(invocation.model, "qwen3.5-flash");
-    }
-
-    #[test]
-    fn bridge_runtime_manifest_distinguishes_requested_and_fallback_model() {
+    fn bridge_runtime_manifest_records_offering_and_resolved_model() {
         let mut trace = json!({
             "source": "llm_context_bridge",
             "runtime_manifest": {
                 "schema_version": "astra_runtime_manifest.v1"
             }
         });
-        let fallback = json!({
-            "from_model": "deepseek-v4-pro-official",
-            "to_model": "deepseek-v4-flash",
-            "reason": "rate_limit",
-        });
-
         rewrite_bridge_runtime_manifest_model_resolution(
             &mut trace,
-            Some("deepseek-v4-pro-official"),
-            "deepseek-v4-flash",
+            Some("offer-deepseek-v4-pro"),
+            "deepseek-v4-pro-official",
             "openai",
-            Some(&fallback),
         );
 
         let manifest = &trace["runtime_manifest"];
         assert_eq!(
-            manifest["selected_model"]["model"],
-            "deepseek-v4-pro-official"
+            manifest["model_selection"]["offering_id"],
+            "offer-deepseek-v4-pro"
         );
+        assert_eq!(manifest["model_resolution"]["source"], "catalog_offering");
         assert_eq!(
-            manifest["model_resolution"]["source"],
-            "rate_limit_fallback"
-        );
-        assert_eq!(manifest["model_resolution"]["model"], "deepseek-v4-flash");
-        assert_eq!(
-            manifest["model_resolution"]["fallback"]["from_model"],
+            manifest["model_resolution"]["model"],
             "deepseek-v4-pro-official"
         );
         assert_eq!(
@@ -5266,6 +4997,18 @@ mod tests {
         Arc::new(
             FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
                 .expect("valid fernet key"),
+        )
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    fn bridge_test_model_execution() -> astra_services::AdmittedModelExecution {
+        astra_services::AdmittedModelExecution::from_endpoint(
+            "offer-bridge-e2e".to_string(),
+            "bridge-e2e-mock".to_string(),
+            "openai".to_string(),
+            "http://bridge-e2e.invalid/chat/completions".to_string(),
+            "Bearer bridge-e2e".to_string(),
+            None,
         )
     }
 
@@ -7628,6 +7371,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7733,6 +7477,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7805,6 +7550,7 @@ mod tests {
                 .forward(
                     &headers,
                     Bytes::from(payload.to_string()),
+                    bridge_test_model_execution(),
                     Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                     Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                     Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7891,6 +7637,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),
@@ -7963,6 +7710,7 @@ mod tests {
             .forward(
                 &headers,
                 Bytes::from(payload.to_string()),
+                bridge_test_model_execution(),
                 Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
                 Arc::new(crate::turn::services::NoopTurnToolEventWriter),
                 Arc::new(crate::turn::services::NoopTurnHookDbWriter),

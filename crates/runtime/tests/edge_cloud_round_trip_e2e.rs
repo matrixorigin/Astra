@@ -203,6 +203,10 @@ fn build_app_with_capture(capture: Capture) -> Router {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession))
+        .with_model_service(test_support::test_model_service(
+            "offer-mock-model",
+            "mock-model",
+        ))
         .with_turn_tool_event_writer(Arc::new(CapturingWriter(capture)));
     let bridge = InProcessChatTurnBridge::new(
         MatrixOneSettings {
@@ -228,8 +232,8 @@ fn build_app_with_capture(capture: Capture) -> Router {
 
 fn bridge_payload(mut payload: Value) -> Value {
     if let Some(obj) = payload.as_object_mut() {
-        obj.entry("selected_model")
-            .or_insert_with(|| json!({ "model": "mock-model" }));
+        obj.entry("model_selection")
+            .or_insert_with(|| json!({"offering_id": "offer-mock-model"}));
     }
     payload
 }

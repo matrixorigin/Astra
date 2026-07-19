@@ -283,6 +283,13 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
+        let model_selection = crate::cli::skill_subrun::resolve_subrun_model_selection(
+            &self.api,
+            &self.token,
+            effective_model.as_deref(),
+        )
+        .await?;
+        let effective_model = Some(model_selection.name);
 
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
@@ -342,6 +349,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
+            model_id: model_selection.model_id,
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,

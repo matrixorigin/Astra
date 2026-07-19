@@ -15,8 +15,8 @@ use uuid::Uuid;
 use super::harness::{
     E2E_PASSWORD, bootstrap, build_e2e_access_token, cleanup_task_rows, get_json,
     grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
-    post_empty, post_json, post_json_with_headers, put_json, revoke_astra_admin_role,
-    seed_pending_approval, seeded_model_name, selected_model,
+    model_selection, post_empty, post_json, post_json_with_headers, put_json,
+    revoke_astra_admin_role, seed_pending_approval, seeded_model_selection,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
@@ -178,7 +178,7 @@ pub async fn run_saas_resource_governance_negative_paths() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_id).await;
     grant_astra_admin_role(pool, user_id).await;
@@ -224,7 +224,7 @@ pub async fn run_saas_resource_governance_negative_paths() {
         json!({
             "message": "token cap probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -269,7 +269,7 @@ pub async fn run_saas_resource_governance_negative_paths() {
         json!({
             "message": "unlimited token probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -289,7 +289,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
     let auth = &b.auth_header;
     let pool = &ctx.pool;
     let user_id = ctx.user_id.as_str();
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     cleanup_resource_limits(pool, user_id).await;
     grant_astra_admin_role(pool, user_id).await;
@@ -312,7 +312,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
         Some(auth),
         json!({
             "message": "concurrent cap deny",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -339,7 +339,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
         Some(auth),
         json!({
             "message": "concurrent cap recovery",
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -705,7 +705,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
     let payload = json!({
         "agent_id": "saas-edge-callback-agent",
         "session_id": ctx.session_id,
-        "selected_model": selected_model(seeded_model_name(ctx)),
+        "model_selection": seeded_model_selection(ctx),
         "messages": [{ "role": "user", "content": "read saas probe file" }],
         "edge_tools": [{
             "type": "function",
@@ -792,7 +792,7 @@ pub async fn run_saas_memoria_proxy_degradation() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     ctx.memoria.set_fail_forward(true);
 
@@ -832,7 +832,7 @@ pub async fn run_saas_memoria_proxy_degradation() {
         json!({
             "message": "chat while memoria down",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -867,7 +867,7 @@ pub async fn run_saas_run_cross_user_isolation() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth_a = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -876,7 +876,7 @@ pub async fn run_saas_run_cross_user_isolation() {
         json!({
             "message": "run isolation probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )
@@ -930,7 +930,7 @@ pub async fn run_saas_run_double_pause_conflict() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let mock_model = seeded_model_name(ctx);
+    let model_offering_id = ctx.model_offering_id.clone();
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -939,7 +939,7 @@ pub async fn run_saas_run_double_pause_conflict() {
         json!({
             "message": "double pause probe",
             "session_id": ctx.session_id,
-            "selected_model": selected_model(mock_model.clone()),
+            "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
         }),
     )

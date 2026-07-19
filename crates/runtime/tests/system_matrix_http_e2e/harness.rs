@@ -482,16 +482,18 @@ pub fn maybe_tool_result_payload_from_sse(
     ))
 }
 
-pub fn seeded_model_name(ctx: &MatrixE2eCtx) -> String {
-    format!("mock-{}", ctx.suffix)
+pub fn model_selection(offering_id: impl Into<String>) -> Value {
+    json!({ "offering_id": offering_id.into() })
 }
 
-pub fn selected_model(model: impl Into<String>) -> Value {
-    json!({ "model": model.into() })
+pub fn seeded_model_selection(ctx: &MatrixE2eCtx) -> Value {
+    model_selection(ctx.model_offering_id.clone())
 }
 
-pub fn seeded_selected_model(ctx: &MatrixE2eCtx) -> Value {
-    selected_model(seeded_model_name(ctx))
+pub fn offering_id_from_model_response(response: &Value) -> &str {
+    response["model_id"]
+        .as_str()
+        .expect("model creation response must contain model_id")
 }
 
 pub async fn cleanup_session_data(shared_pool: &SharedPool, user_id: &str, session_id: &str) {
@@ -633,6 +635,7 @@ pub struct MatrixE2eCtx {
     pub username: String,
     pub session_id: String,
     pub edge_agent_id: String,
+    pub model_offering_id: String,
     pub suffix: String,
 }
 
@@ -918,7 +921,7 @@ pub async fn bootstrap() -> BootstrapResult {
     // Register a mock model so run-lifecycle tests don't need a real LLM.
     grant_astra_admin_role(&pool, &user_id).await;
     let mock_model = format!("mock-{suffix}");
-    let (st_mdl, _) = post_json(
+    let (st_mdl, model) = post_json(
         &app,
         "/models",
         Some(&auth_header),
@@ -932,7 +935,8 @@ pub async fn bootstrap() -> BootstrapResult {
         }),
     )
     .await;
-    assert_eq!(st_mdl, StatusCode::CREATED, "seed mock model");
+    assert_eq!(st_mdl, StatusCode::CREATED, "seed mock model: {model}");
+    let model_offering_id = offering_id_from_model_response(&model).to_string();
 
     BootstrapResult {
         ctx: MatrixE2eCtx {
@@ -946,6 +950,7 @@ pub async fn bootstrap() -> BootstrapResult {
             username,
             session_id,
             edge_agent_id,
+            model_offering_id,
             suffix,
         },
         auth_header,

@@ -21,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::db_row::RowExt as RunStateDbRow;
+use crate::models::AdmittedModelExecution;
 use crate::pagination::MAX_API_LIST_LIMIT;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
@@ -237,38 +238,6 @@ pub trait RunLifecycleService: Send + Sync {
     /// Default: no-op (returns true immediately).
     async fn drain_background_tasks(&self, _timeout: std::time::Duration) -> bool {
         true
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmTokenServiceConfig {
-    pub url: String,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmTokenServiceRequest {
-    pub url: String,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-}
-
-impl From<LlmTokenServiceRequest> for LlmTokenServiceConfig {
-    fn from(value: LlmTokenServiceRequest) -> Self {
-        Self {
-            url: value.url,
-            timeout_ms: value.timeout_ms,
-        }
-    }
-}
-
-impl From<LlmTokenServiceConfig> for LlmTokenServiceRequest {
-    fn from(value: LlmTokenServiceConfig) -> Self {
-        Self {
-            url: value.url,
-            timeout_ms: value.timeout_ms,
-        }
     }
 }
 
@@ -576,13 +545,15 @@ pub struct ChatRequestData {
     pub model: Option<String>,
     pub model_selection: Option<ModelSelectionRequest>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
+    /// Short-lived execution material for the admitted Offering.
+    /// This value is never client supplied, serialized, persisted, or logged.
+    pub admitted_model_execution: Option<AdmittedModelExecution>,
     pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     pub provider_runtime_authorized: bool,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_skill_binding: Option<RuntimeSkillBindingRequest>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
-    pub llm_token_service: Option<LlmTokenServiceConfig>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
@@ -644,6 +615,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("model", &self.model)
             .field("model_selection", &self.model_selection)
             .field("resolved_model_selection", &self.resolved_model_selection)
+            .field(
+                "admitted_model_execution_present",
+                &self.admitted_model_execution.is_some(),
+            )
             .field("capability_descriptors", &self.capability_descriptors)
             .field(
                 "provider_runtime_authorized",
@@ -653,7 +628,6 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_skill_binding", &self.runtime_skill_binding)
             .field("runtime_profile", &self.runtime_profile)
-            .field("llm_token_service", &self.llm_token_service)
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
@@ -10422,13 +10396,26 @@ mod tests {
             model: None,
             model_selection: None,
             resolved_model_selection: None,
+            admitted_model_execution: Some(AdmittedModelExecution {
+                offering_id: "offer-gpt-4".to_string(),
+                model_name: "gpt-4".to_string(),
+                wire_model_name: None,
+                api_key: "provider-api-secret".to_string(),
+                base_url: "https://models.example.com/v1".to_string(),
+                provider: "openai".to_string(),
+                cache_capability: None,
+                request_body_overrides: None,
+                context_window: Some(128_000),
+                header_overrides: HashMap::new(),
+                completions_url_override: None,
+                request_timeout_ms: None,
+            }),
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: None,
             runtime_skill_binding: None,
             runtime_profile: None,
-            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
@@ -10460,6 +10447,8 @@ mod tests {
         assert!(!rendered.contains("Bearer secret-token"));
         assert!(!rendered.contains("ws-123"));
         assert!(!rendered.contains("__astra_connection_tokens"));
+        assert!(!rendered.contains("provider-api-secret"));
+        assert!(rendered.contains("admitted_model_execution_present: true"));
     }
 
     #[test]
@@ -10493,6 +10482,7 @@ mod tests {
                 offering_id: "offer-gpt-4".to_string(),
                 model_name: "gpt-4".to_string(),
             }),
+            admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
             agent_binding: None,
@@ -10501,7 +10491,6 @@ mod tests {
             }),
             runtime_skill_binding: None,
             runtime_profile: None,
-            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
@@ -10580,13 +10569,13 @@ mod tests {
                     model: None,
                     model_selection: None,
                     resolved_model_selection: None,
+                    admitted_model_execution: None,
                     capability_descriptors: None,
                     provider_runtime_authorized: false,
                     agent_binding: None,
                     runtime_auth: None,
                     runtime_skill_binding: None,
                     runtime_profile: None,
-                    llm_token_service: None,
                     skill_search: None,
                     allow_skills: None,
                     allow_skill_sources: None,

@@ -60,7 +60,7 @@ use crate::turn::llm::client::{
 use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
-use astra_services::LlmTokenServiceConfig;
+use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
@@ -520,7 +520,7 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
         .map(ToString::to_string)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
@@ -543,7 +543,7 @@ struct ResolvedTurnLlmConfig {
 
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RequestAwareSummaryClient {
     model_name: String,
     wire_model_name: Option<String>,
@@ -681,36 +681,34 @@ fn skill_auto_route_service_context(
     }
 }
 
-fn normalize_request_model(preferred_model: Option<&str>) -> Option<String> {
-    preferred_model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(String::from)
-}
-
 async fn resolve_llm_model_for_turn(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     preferred_model: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-    llm_token_service: Option<&LlmTokenServiceConfig>,
-    forward_headers: &HashMap<String, String>,
+    admitted_execution: Option<&astra_services::AdmittedModelExecution>,
 ) -> Result<ResolvedTurnLlmConfig, String> {
-    if let Some(config) = llm_token_service {
+    if let Some(execution) = admitted_execution {
+        if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
+            return Err(
+                "model override does not match the Offering admitted for this run".to_string(),
+            );
+        }
         return Ok(ResolvedTurnLlmConfig {
-            model_name: normalize_request_model(preferred_model)
-                .unwrap_or_else(|| "gpt-4o-mini".to_string()),
-            wire_model_name: None,
-            api_key: String::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            provider: "openai".to_string(),
-            cache_capability: None,
+            model_name: execution.model_name.clone(),
+            wire_model_name: execution.wire_model_name.clone(),
+            api_key: execution.api_key.clone(),
+            base_url: execution.base_url.clone(),
+            provider: execution.provider.clone(),
+            cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
+                execution.cache_capability,
+            ),
             fallback_chain: Vec::new(),
-            header_overrides: forward_headers.clone(),
-            request_body_overrides: None,
-            completions_url_override: Some(config.url.clone()),
-            request_timeout: config.timeout_ms.map(Duration::from_millis),
-            context_window: None,
+            header_overrides: execution.header_overrides.clone(),
+            request_body_overrides: execution.request_body_overrides.clone(),
+            completions_url_override: execution.completions_url_override.clone(),
+            request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
+            context_window: execution.context_window,
         });
     }
     let resolved =
@@ -1053,7 +1051,7 @@ pub struct ServerAgenticLoopHost {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
     /// Cached LLM connection params from the last successful model resolution.
@@ -1319,7 +1317,7 @@ pub struct ServerAgenticLoopHostBuilder {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
-    llm_token_service: Option<LlmTokenServiceConfig>,
+    admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
@@ -1378,7 +1376,7 @@ impl ServerAgenticLoopHostBuilder {
             encryptor,
             shared_pool: None,
             model_override: None,
-            llm_token_service: None,
+            admitted_model_execution: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_bindings: None,
@@ -1476,11 +1474,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_llm_token_service(
+    pub fn with_admitted_model_execution(
         mut self,
-        llm_token_service: Option<LlmTokenServiceConfig>,
+        execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Self {
-        self.llm_token_service = llm_token_service;
+        self.admitted_model_execution = execution;
         self
     }
 
@@ -1755,7 +1753,7 @@ impl ServerAgenticLoopHostBuilder {
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
             model_override: self.model_override,
-            llm_token_service: self.llm_token_service,
+            admitted_model_execution: self.admitted_model_execution,
             resolved_model_name: None,
             resolved_context_window: None,
             resolved_llm_params: None,
@@ -2085,8 +2083,7 @@ impl ServerAgenticLoopHost {
             self.encryptor.as_ref(),
             effective_model_override.as_deref(),
             pool_ref,
-            self.llm_token_service.as_ref(),
-            &state.hooks.forward_headers,
+            self.admitted_model_execution.as_ref(),
         )
         .await?;
         self.remember_resolved_llm_config(&llm_cfg);
@@ -2114,13 +2111,8 @@ impl ServerAgenticLoopHost {
         if inserted_at.elapsed() > RESOLVED_TURN_LLM_CONFIG_CACHE_TTL {
             return false;
         }
-        if self.llm_token_service.is_some()
-            && config.header_overrides != state.hooks.forward_headers
-        {
-            return false;
-        }
         match self.effective_model_override_for_state(state) {
-            Some(requested) => config.model_name.eq_ignore_ascii_case(requested),
+            Some(requested) => config.model_name == requested,
             None => true,
         }
     }
@@ -5207,23 +5199,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             RateLimitAction::UseFallback { reason } => {
                 let mx = &self.matrixone;
                 let enc = self.encryptor.as_ref();
-                let lts = self.llm_token_service.as_ref();
-                let fwd = &state.hooks.forward_headers;
                 let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
                 match try_resolve_fallback(
                     cooldown,
                     &llm_cfg.fallback_chain,
                     reason,
                     |fb_name| async move {
-                        resolve_llm_model_for_turn(
-                            mx,
-                            enc,
-                            Some(fb_name.as_str()),
-                            pool_ref,
-                            lts,
-                            fwd,
-                        )
-                        .await
+                        resolve_llm_model_for_turn(mx, enc, Some(fb_name.as_str()), pool_ref, None)
+                            .await
                     },
                 )
                 .await
@@ -6958,6 +6941,20 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn test_gateway_execution(
+        url: impl Into<String>,
+        timeout_ms: Option<u64>,
+    ) -> AdmittedModelExecution {
+        AdmittedModelExecution::from_endpoint(
+            "offer-gateway".to_string(),
+            "gpt-5-mini".to_string(),
+            "openai".to_string(),
+            url.into(),
+            "Bearer forwarded-token".to_string(),
+            timeout_ms,
+        )
     }
 
     #[derive(Default)]
@@ -11606,29 +11603,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_token_service_uses_gateway_url_and_forwarded_headers() {
-        let mut forward_headers = HashMap::new();
-        forward_headers.insert("authorization".to_string(), "Bearer moi-token".to_string());
-        forward_headers.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
+    async fn admitted_model_execution_uses_its_normalized_url_and_headers() {
+        let mut execution =
+            test_gateway_execution("http://catalog:8081/api/v1/chat/completions", Some(2000));
+        execution
+            .header_overrides
+            .insert("authorization".to_string(), "Bearer moi-token".to_string());
+        execution
+            .header_overrides
+            .insert("x-workspace-id".to_string(), "ws-001".to_string());
 
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             Some("gpt-5-mini"),
             None,
-            Some(&LlmTokenServiceConfig {
-                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-                timeout_ms: Some(2000),
-            }),
-            &forward_headers,
+            Some(&execution),
         )
         .await
-        .expect("resolve via llm token service gateway");
+        .expect("resolve admitted execution");
 
         assert_eq!(resolved.model_name, "gpt-5-mini");
         assert_eq!(resolved.provider, "openai");
-        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert!(resolved.base_url.is_empty());
         assert_eq!(
             resolved.completions_url_override.as_deref(),
             Some("http://catalog:8081/api/v1/chat/completions")
@@ -11651,31 +11648,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_token_service_without_model_uses_default_model_name() {
+    async fn admitted_model_execution_supplies_model_when_no_override_is_requested() {
+        let execution = test_gateway_execution("http://catalog:8081/api/v1/chat/completions", None);
         let resolved = resolve_llm_model_for_turn(
             &mock_matrixone(),
             mock_encryptor().as_ref(),
             None,
             None,
-            Some(&LlmTokenServiceConfig {
-                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
-                timeout_ms: None,
-            }),
-            &HashMap::new(),
+            Some(&execution),
         )
         .await
-        .expect("resolve via llm token service gateway");
-        assert_eq!(resolved.model_name, "gpt-4o-mini");
+        .expect("resolve admitted execution");
+        assert_eq!(resolved.model_name, "gpt-5-mini");
         assert!(resolved.request_timeout.is_none());
     }
 
+    fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
+        astra_services::ResolvedModelOffering {
+            offering_id: "offer-primary".to_string(),
+            model: astra_services::ResolvedActiveLlmModel {
+                model_name: "catalog-model".to_string(),
+                wire_model_name: Some("upstream-model".to_string()),
+                api_key: "provider-secret".to_string(),
+                base_url: "https://provider.example/v1".to_string(),
+                provider: "openai".to_string(),
+                fallback_chain: vec!["legacy-model-name".to_string()],
+                tags: Vec::new(),
+                request_body_overrides: None,
+                prompt_cache_capability: None,
+                thinking_capability: None,
+                context_window: Some(64_000),
+                request_headers: Some(serde_json::Map::from_iter([(
+                    "x-provider-mode".to_string(),
+                    Value::String("coding".to_string()),
+                )])),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn host_model_resolution_reuses_cached_config_for_same_forward_headers() {
-        let mut state = create_test_state();
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer first".to_string());
+    async fn admitted_offering_material_drives_turn_without_model_name_resolution() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let resolved = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            Some("catalog-model"),
+            None,
+            Some(&execution),
+        )
+        .await
+        .expect("admitted material should not require a database lookup");
+
+        assert_eq!(resolved.model_name, "catalog-model");
+        assert_eq!(resolved.wire_model_name.as_deref(), Some("upstream-model"));
+        assert_eq!(resolved.api_key, "provider-secret");
+        assert_eq!(resolved.context_window, Some(64_000));
+        assert_eq!(
+            resolved
+                .header_overrides
+                .get("x-provider-mode")
+                .map(String::as_str),
+            Some("coding")
+        );
+        assert!(
+            resolved.fallback_chain.is_empty(),
+            "legacy model-name fallback must not bypass Offering admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_offering_rejects_unresolved_model_override() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let result = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            Some("other-model"),
+            None,
+            Some(&execution),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_reuses_cached_admitted_execution() {
+        let state = create_test_state();
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -11683,20 +11743,20 @@ mod tests {
             "session-model-cache".to_string(),
         )
         .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            "http://catalog-a/api/v1/chat/completions".to_string(),
+            Some(1000),
+        )))
         .build();
 
         let first = host
             .resolve_llm_config_for_state(&state)
             .await
             .expect("first resolution");
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
+        host.admitted_model_execution = Some(test_gateway_execution(
+            "http://catalog-b/api/v1/chat/completions".to_string(),
+            Some(2000),
+        ));
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -11716,62 +11776,7 @@ mod tests {
                 .header_overrides
                 .get("authorization")
                 .map(String::as_str),
-            Some("Bearer first")
-        );
-    }
-
-    #[tokio::test]
-    async fn host_model_resolution_invalidates_cached_token_config_when_headers_change() {
-        let mut state = create_test_state();
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer first".to_string());
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-model-cache".to_string(),
-            "session-model-cache".to_string(),
-        )
-        .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
-        .build();
-
-        let first = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("first resolution");
-        state
-            .hooks
-            .forward_headers
-            .insert("authorization".to_string(), "Bearer second".to_string());
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
-        let second = host
-            .resolve_llm_config_for_state(&state)
-            .await
-            .expect("second resolution");
-
-        assert_ne!(
-            second.completions_url_override,
-            first.completions_url_override
-        );
-        assert_eq!(
-            second.completions_url_override,
-            Some("http://catalog-b/api/v1/chat/completions".to_string())
-        );
-        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
-        assert_eq!(
-            second
-                .header_overrides
-                .get("authorization")
-                .map(String::as_str),
-            Some("Bearer second")
+            Some("Bearer forwarded-token")
         );
     }
 
@@ -11785,10 +11790,10 @@ mod tests {
             "session-model-cache".to_string(),
         )
         .with_model(Some("gpt-5-mini".to_string()))
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: "http://catalog-a/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(1000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            "http://catalog-a/api/v1/chat/completions".to_string(),
+            Some(1000),
+        )))
         .build();
 
         let first = host
@@ -11797,10 +11802,10 @@ mod tests {
             .expect("first resolution");
         host.resolved_llm_config_at =
             Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
-        host.llm_token_service = Some(LlmTokenServiceConfig {
-            url: "http://catalog-b/api/v1/chat/completions".to_string(),
-            timeout_ms: Some(2000),
-        });
+        host.admitted_model_execution = Some(test_gateway_execution(
+            "http://catalog-b/api/v1/chat/completions".to_string(),
+            Some(2000),
+        ));
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -11998,10 +12003,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -12105,10 +12107,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![
@@ -12214,10 +12213,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(3000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -12294,10 +12290,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -12435,10 +12428,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -12533,10 +12523,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_llm_token_service(Some(LlmTokenServiceConfig {
-            url: gateway_url,
-            timeout_ms: Some(2000),
-        }))
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
         let mut state = create_test_state();
         state.session_turn = 1;
@@ -14247,7 +14234,7 @@ mod tests {
         use astra_config::user_profile::{Scenario, TurnIntent};
         use astra_services::runs::TurnIntentExecutionPolicy;
         use astra_services::{
-            LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+            AdmittedModelExecution, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
             TurnIntentJudgeError,
         };
@@ -14633,10 +14620,10 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
-            .with_llm_token_service(Some(LlmTokenServiceConfig {
-                url: format!("http://{addr}/gateway/chat/completions"),
-                timeout_ms: Some(2_000),
-            }))
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("http://{addr}/gateway/chat/completions"),
+                Some(2_000),
+            )))
             .build();
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
@@ -14749,10 +14736,10 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
-            .with_llm_token_service(Some(LlmTokenServiceConfig {
-                url: format!("http://{addr}/gateway/chat/completions"),
-                timeout_ms: Some(2_000),
-            }))
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("http://{addr}/gateway/chat/completions"),
+                Some(2_000),
+            )))
             .build();
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();

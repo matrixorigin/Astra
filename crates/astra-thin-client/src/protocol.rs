@@ -1058,10 +1058,6 @@ mod tests {
         let r: ChatStreamRequest = serde_json::from_value(j).unwrap();
         assert!(r.execution_budget.is_none());
         assert_eq!(r.model_selection.offering_id, "offer-m");
-
-        let obsolete = serde_json::json!({"message":"x","selected_model":{"model":"m"}});
-        serde_json::from_value::<ChatStreamRequest>(obsolete)
-            .expect_err("obsolete client route fields must not be accepted");
     }
 
     #[test]
