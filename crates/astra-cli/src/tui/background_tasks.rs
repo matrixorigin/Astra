@@ -3418,6 +3418,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_registry_kills_its_descendant_process_group() {
+        let tmp = crate::tests::test_temp_dir();
+        let pid_file = tmp.path().join("drop-child.pid");
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let command = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        let _task_id = reg.spawn_shell(&command, "drop-owned process tree");
+
+        wait_until(Duration::from_secs(1), Duration::from_millis(20), || {
+            pid_file.exists()
+        })
+        .await
+        .expect("descendant pid must be observable before owner drop");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+
+        // Exercise the unhappy path, not the graceful TUI teardown. JoinSet
+        // drop must unwind the runner's process-group guard so early returns
+        // and panic unwinds cannot strand an OS child.
+        drop(reg);
+
+        wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat.contains(") Z "),
+                Err(_) => nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("descendant pid {pid} survived registry owner drop"));
+    }
+
     // ── TDD: progress events ────────────────────────────────────
 
     #[tokio::test]

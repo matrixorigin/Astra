@@ -162,7 +162,7 @@ impl BackgroundTaskView {
 
     fn request_stop(&mut self) {
         if let Some(row) = self.selected_row()
-            && row.status.is_killable()
+            && row.status.can_kill()
             && row.live_control.can_stop()
         {
             self.pending_action = Some(ViewActionRequest {

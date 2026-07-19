@@ -10636,6 +10636,10 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
             "server dynamic agent lifecycle is no longer available for this session".to_string()
         })?;
+        // The child executor runs inside this spawner's own JoinSet. Give its
+        // nested-agent tool context a non-owning handle so the future cannot
+        // keep alive the supervisor that owns that same future.
+        let dynamic_agent_spawner = dynamic_agent_spawner.task_handle();
         let request_constraints =
             spawn_child_request_constraints(&context.request_constraints, &config);
         let child_runtime_context = self

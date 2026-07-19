@@ -32,7 +32,7 @@ pub(crate) type BackgroundTaskStatus = WorkUnitStatus;
 pub(crate) trait BackgroundTaskStatusExt {
     fn label(self) -> &'static str;
     fn color(self) -> Color;
-    fn is_killable(self) -> bool;
+    fn can_kill(self) -> bool;
     fn empty_output_state(self) -> &'static str;
 }
 
@@ -66,7 +66,7 @@ impl BackgroundTaskStatusExt for WorkUnitStatus {
         }
     }
 
-    fn is_killable(self) -> bool {
+    fn can_kill(self) -> bool {
         matches!(self, Self::Running | Self::WaitingForInput)
     }
 

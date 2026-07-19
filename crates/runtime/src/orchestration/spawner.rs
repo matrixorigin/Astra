@@ -922,14 +922,22 @@ pub struct DynamicAgentSpawner {
     agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<VecDeque<SpawnedAgentState>>>,
-    /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
-    /// Shared across `clone_for_task` clones so every background handle lands here.
-    background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Strong ownership of the task supervisor exists only on the
+    /// session/root spawner. Task-side handles deliberately keep this as
+    /// `None`: a task must never keep alive the JoinSet that owns that same
+    /// task.
+    _background_task_owner: Option<Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>>,
+    /// Weak task-side route into the root-owned supervisor. Nested agents can
+    /// still register with the same JoinSet while the session owner exists,
+    /// but dropping the owner deterministically aborts every remaining task.
+    background_tasks: std::sync::Weak<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Spawn setup holds a read permit until its host future is registered.
+    /// Shutdown takes the write permit, closes admission, and then takes the
+    /// JoinSet, so no child can land in an unobserved replacement set.
+    background_task_admission: Arc<tokio::sync::RwLock<bool>>,
     /// Per-agent abort handles for background children so the parent can cancel
     /// a single lagging sub-agent without killing siblings.
     background_abort_handles: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
-    /// Agent IDs spawned in background mode, for result collection after drain.
-    background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Completion notifiers: `agent(action='get_result')` awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Foreground sync agents that the user promoted with Ctrl+B while
@@ -994,6 +1002,7 @@ pub struct DynamicAgentSpawner {
 impl DynamicAgentSpawner {
     /// Create a new spawner with the given dependencies.
     pub fn new(mailbox_router: Arc<AgentMailboxRouter>) -> Self {
+        let background_task_owner = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
         Self {
             mailbox_router,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
@@ -1005,9 +1014,10 @@ impl DynamicAgentSpawner {
             agent_registry:
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(VecDeque::new())),
-            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            background_tasks: Arc::downgrade(&background_task_owner),
+            _background_task_owner: Some(background_task_owner),
+            background_task_admission: Arc::new(tokio::sync::RwLock::new(true)),
             background_abort_handles: Arc::new(RwLock::new(HashMap::new())),
-            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             foreground_promotion_requests: Arc::new(RwLock::new(HashSet::new())),
             prefix_store: None,
@@ -1421,18 +1431,11 @@ impl DynamicAgentSpawner {
         cache.insert(group_id.to_string(), result);
     }
 
-    fn remember_background_agent_id(&self, agent_id: &str) {
-        let mut ids = self
-            .background_agent_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !ids.iter().any(|id| id == agent_id) {
-            ids.push(agent_id.to_string());
-        }
-    }
-
     fn reap_finished_agent_tasks(&self) {
-        let Ok(mut tasks) = self.background_tasks.lock() else {
+        let Some(tasks) = self.background_tasks.upgrade() else {
+            return;
+        };
+        let Ok(mut tasks) = tasks.lock() else {
             return;
         };
         while let Some(result) = tasks.try_join_next() {
@@ -1444,33 +1447,22 @@ impl DynamicAgentSpawner {
         }
     }
 
-    fn spawn_worktree_cleanup(&self, worktree_path: Option<PathBuf>, agent_id: &str) {
+    async fn cleanup_worktree(&self, worktree_path: Option<PathBuf>, agent_id: &str) {
         let Some(path) = worktree_path else {
             return;
         };
         let agent_id = agent_id.to_string();
-        let agent_id_for_log = agent_id.clone();
-        let cleanup_future = async move {
-            let cleanup_agent_id = agent_id.clone();
-            let join_result = tokio::task::spawn_blocking(move || {
-                cleanup_agent_worktree(Some(&path), &cleanup_agent_id);
-            })
-            .await;
-            if let Err(error) = join_result {
-                astra_core::agent_warn!(
-                    "spawner",
-                    "worktree cleanup task for {agent_id} failed to join: {error}"
-                );
-            }
-        };
-        let Ok(mut tasks) = self.background_tasks.lock() else {
+        let cleanup_agent_id = agent_id.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            cleanup_agent_worktree(Some(&path), &cleanup_agent_id);
+        })
+        .await
+        {
             astra_core::agent_warn!(
                 "spawner",
-                "failed to track worktree cleanup task for {agent_id_for_log}"
+                "worktree cleanup task for {agent_id} failed to join: {error}"
             );
-            return;
-        };
-        tasks.spawn(cleanup_future);
+        }
     }
 
     async fn take_foreground_promotion_request(&self, agent_id: &str) -> bool {
@@ -1552,9 +1544,6 @@ impl DynamicAgentSpawner {
                 .collect::<Vec<_>>()
         };
 
-        for agent in &promoted {
-            self.remember_background_agent_id(&agent.agent_id);
-        }
         {
             let mut requests = self.foreground_promotion_requests.write().await;
             requests.extend(promoted.iter().map(|agent| agent.agent_id.clone()));
@@ -2205,6 +2194,14 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
+        // Keep admission open through all pre-execution side effects and the
+        // final JoinSet registration. Shutdown takes the matching write
+        // permit before draining, so a concurrently prepared child is either
+        // fully supervised or rejected before it mutates lifecycle state.
+        let task_admission = self.background_task_admission.read().await;
+        if !*task_admission {
+            return Err(SpawnError::LifecycleShuttingDown);
+        }
         let fanout_slot = input
             .fanout_slot_identity()
             .map_err(SpawnError::InvalidInput)?;
@@ -2816,8 +2813,22 @@ impl DynamicAgentSpawner {
             };
             let _ = terminal_tx.send(output);
         };
-        let abort_handle = self
-            .background_tasks
+        let Some(background_tasks) = self.background_tasks.upgrade() else {
+            // The root/session owner disappeared while this method was
+            // borrowed through a task-side handle. Converge the reservation
+            // through the canonical cancellation path rather than leaving a
+            // running projection with no host future.
+            drop(task_admission);
+            let _ = self
+                .cancel_agent_with_origin(
+                    &agent_id,
+                    "agent lifecycle owner disappeared before execution",
+                    CancelOrigin::System,
+                )
+                .await;
+            return Err(SpawnError::LifecycleShuttingDown);
+        };
+        let abort_handle = background_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .spawn(spawn_future);
@@ -2825,9 +2836,9 @@ impl DynamicAgentSpawner {
             .write()
             .await
             .insert(agent_id.clone(), abort_handle);
+        drop(task_admission);
 
         if input.run_in_background {
-            self.remember_background_agent_id(&agent_id);
             return Ok(SpawnAgentOutput::Launched {
                 agent_id,
                 run_id,
@@ -3007,7 +3018,6 @@ impl DynamicAgentSpawner {
             .write()
             .await
             .remove(agent_id);
-        self.remove_background_agent_id(agent_id);
 
         let status = match origin {
             CancelOrigin::User => AgentStatus::cancelled_by_user(reason),
@@ -3052,7 +3062,7 @@ impl DynamicAgentSpawner {
         }
         let worktree_path = state.worktree_path.take();
         self.archive_state(state.clone()).await;
-        self.spawn_worktree_cleanup(worktree_path, agent_id);
+        self.cleanup_worktree(worktree_path, agent_id).await;
         self.notify_completion(agent_id).await;
         true
     }
@@ -3072,7 +3082,6 @@ impl DynamicAgentSpawner {
             .await
             .remove(agent_id);
         self.background_abort_handles.write().await.remove(agent_id);
-        self.remove_background_agent_id(agent_id);
         let (mut state, messaging_address) = {
             let mut active_agents = self.active_agents.write().await;
             let Some(mut state) = active_agents.remove(agent_id) else {
@@ -3129,7 +3138,7 @@ impl DynamicAgentSpawner {
         }
         let worktree_path = state.worktree_path.take();
         self.archive_state(state).await;
-        self.spawn_worktree_cleanup(worktree_path, agent_id);
+        self.cleanup_worktree(worktree_path, agent_id).await;
         self.notify_completion(agent_id).await;
         true
     }
@@ -3182,14 +3191,6 @@ impl DynamicAgentSpawner {
                 "failed to deliver terminal child result to parent mailbox"
             );
         }
-    }
-
-    fn remove_background_agent_id(&self, agent_id: &str) {
-        let mut ids = self
-            .background_agent_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ids.retain(|id| id != agent_id);
     }
 
     /// Persist final agent state to session journal (best-effort).
@@ -3384,7 +3385,13 @@ impl DynamicAgentSpawner {
         self.classify_wait_failure(agent_id).await
     }
 
-    /// Clone the spawner for use in spawned tasks.
+    /// Clone a non-owning spawner handle for use inside supervised tasks.
+    ///
+    /// The returned handle shares lifecycle state and can register nested
+    /// children while the root owner is alive, but it cannot keep the
+    /// supervisor alive. This is the ownership boundary that makes an
+    /// ordinary root drop cancel its task tree instead of creating a
+    /// `JoinSet -> future -> spawner -> JoinSet` reference cycle.
     fn clone_for_task(&self) -> Self {
         Self {
             mailbox_router: Arc::clone(&self.mailbox_router),
@@ -3396,10 +3403,10 @@ impl DynamicAgentSpawner {
             session_id: self.session_id.clone(),
             agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
-            // Share the same JoinSet so shutdown can drain tasks spawned by clones.
-            background_tasks: Arc::clone(&self.background_tasks),
+            _background_task_owner: None,
+            background_tasks: self.background_tasks.clone(),
+            background_task_admission: Arc::clone(&self.background_task_admission),
             background_abort_handles: Arc::clone(&self.background_abort_handles),
-            background_agent_ids: Arc::clone(&self.background_agent_ids),
             completion_notifiers: Arc::clone(&self.completion_notifiers),
             foreground_promotion_requests: Arc::clone(&self.foreground_promotion_requests),
             // Share prefix-store + resolve-outcomes map so clones
@@ -3417,6 +3424,13 @@ impl DynamicAgentSpawner {
             durable_observed_agent_ids: Arc::clone(&self.durable_observed_agent_ids),
             durable_reconcile_lock: Arc::clone(&self.durable_reconcile_lock),
         }
+    }
+
+    /// Non-owning lifecycle handle for an executor running inside this
+    /// spawner's own task tree. Server sub-runs use this when wiring nested
+    /// agent tools so the child executor cannot retain its supervisor.
+    pub(crate) fn task_handle(&self) -> Arc<Self> {
+        Arc::new(self.clone_for_task())
     }
 
     /// Drain all background agents, wait up to `deadline`, and return
@@ -3446,17 +3460,28 @@ impl DynamicAgentSpawner {
         deadline: std::time::Duration,
         reason: &str,
     ) -> Vec<(String, String)> {
-        let mut set = self
-            .background_tasks
-            .lock()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_else(|poisoned| {
-                let mut guard = poisoned.into_inner();
-                std::mem::take(&mut *guard)
-            });
+        // Close admission before taking the JoinSet. The write permit waits
+        // for any spawn currently preparing side effects to finish
+        // registration, eliminating the old race where a nested child could
+        // be inserted into a fresh, unobserved JoinSet during shutdown.
+        let mut admission = self.background_task_admission.write().await;
+        *admission = false;
+        let mut set = self.background_tasks.upgrade().map(|tasks| {
+            tasks
+                .lock()
+                .map(|mut guard| std::mem::take(&mut *guard))
+                .unwrap_or_else(|poisoned| {
+                    let mut guard = poisoned.into_inner();
+                    std::mem::take(&mut *guard)
+                })
+        });
+        drop(admission);
 
         // Drain JoinSet — even if empty (tasks may have already completed).
         match tokio::time::timeout(deadline, async {
+            let Some(set) = set.as_mut() else {
+                return;
+            };
             while let Some(result) = set.join_next().await {
                 if let Err(e) = result {
                     if e.is_panic() {
@@ -3482,18 +3507,26 @@ impl DynamicAgentSpawner {
                 // active-agent projection and no user-visible explanation.
                 // `cancel_agent` atomically owns and archives each live child,
                 // emits its terminal event, and then aborts the host task.
+                // `active_agents` is the canonical live-work set. The old
+                // background-only ID ledger both raced fast completions and
+                // omitted foreground children still waiting inside a tool
+                // call, causing abort to bypass their terminal finalizer.
                 let unfinished = self
-                    .background_agent_ids
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
+                    .active_agents
+                    .read()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 for agent_id in unfinished {
                     let _ = self
                         .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::System)
                         .await;
                 }
-                set.abort_all();
-                while set.join_next().await.is_some() {}
+                if let Some(set) = set.as_mut() {
+                    set.abort_all();
+                    while set.join_next().await.is_some() {}
+                }
             }
         }
 
@@ -3533,9 +3566,14 @@ impl DynamicAgentSpawner {
     /// Primarily useful for tests and observability.
     pub fn background_task_count(&self) -> usize {
         self.background_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .upgrade()
+            .map(|tasks| {
+                tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len()
+            })
+            .unwrap_or(0)
     }
 
     /// List all active agents spawned by a parent.
@@ -3729,6 +3767,12 @@ pub enum SpawnError {
 
     #[error("Agent executor unavailable: spawned agents cannot run in this context")]
     ExecutorUnavailable,
+
+    /// The session owner has closed spawn admission and is draining its task
+    /// tree. This is a lifecycle boundary, not a retryable model/provider
+    /// failure; callers must start work in the replacement session runtime.
+    #[error("Agent lifecycle is shutting down; no new child work is accepted")]
+    LifecycleShuttingDown,
 
     /// Fork children are allowed to spawn normal children, but not
     /// another inherit-prefix fork. This mirrors the reference agent's
@@ -5701,18 +5745,26 @@ mod tests {
             other => panic!("expected ConcurrencyLimitExceeded, got {other:?}"),
         }
 
-        // Once we let the first two finish + drain, a fresh spawn is
-        // again accepted — the cap is a live measurement, not a one-way
-        // counter.
+        // Once the first two finish naturally, a fresh spawn is again
+        // accepted — the cap is a live measurement, not a one-way counter.
+        // Do not use `shutdown_and_wait` as a generic drain primitive: by
+        // contract shutdown permanently closes this runtime's admission.
         factory2.unblock();
-        spawner
-            .shutdown_and_wait(std::time::Duration::from_secs(2))
-            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !spawner.list_all_agents().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial agents should finish after their executor is released");
         let after_drain = spawner.spawn(make_bg_input(), &make_bg_context()).await;
         assert!(
             after_drain.is_ok(),
             "after drain the cap must accept new spawns again, got {after_drain:?}"
         );
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     #[tokio::test]
@@ -7068,6 +7120,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_root_spawner_aborts_the_task_tree_without_an_explicit_shutdown() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        struct DropAwarePendingExecutor {
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            dropped: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+
+        #[async_trait]
+        impl SpawnAgentExecutor for DropAwarePendingExecutor {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+                let guard = DropSignal(self.dropped.lock().unwrap().take());
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                let result = std::future::pending::<Result<SpawnRunResult, String>>().await;
+                drop(guard);
+                result
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
+            DropAwarePendingExecutor {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                dropped: std::sync::Mutex::new(Some(dropped_tx)),
+            },
+        ));
+        let launched = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .expect("pending child should be supervised");
+        assert!(matches!(launched, SpawnAgentOutput::Launched { .. }));
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("child executor should start")
+            .expect("start signal should be delivered");
+
+        // This is intentionally not `shutdown_and_wait`: the ownership
+        // contract must remain safe on early returns, account replacement,
+        // and panic unwinds that only drop the root runtime.
+        drop(spawner);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("dropping the root must abort its pending task")
+            .expect("pending executor future must be dropped");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_spawn_admission_permanently() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        spawner.shutdown_and_wait(Duration::from_millis(10)).await;
+
+        let result = spawner.spawn(make_bg_input(), &make_bg_context()).await;
+        assert!(matches!(result, Err(SpawnError::LifecycleShuttingDown)));
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert_eq!(spawner.background_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalizes_a_foreground_child_instead_of_only_aborting_its_host() {
+        struct NeverCompletes;
+
+        #[async_trait]
+        impl SpawnAgentExecutor for NeverCompletes {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+                std::future::pending::<Result<SpawnRunResult, String>>().await
+            }
+        }
+
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(mock_router())
+                .with_executor(Arc::new(NeverCompletes) as Arc<dyn SpawnAgentExecutor>),
+        );
+        let spawn_task = {
+            let spawner = Arc::clone(&spawner);
+            tokio::spawn(async move { spawner.spawn(make_sync_input(), &make_bg_context()).await })
+        };
+
+        let agent_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(agent) = spawner.list_all_agents().await.into_iter().next() {
+                    break agent.agent_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground child should enter canonical active state");
+
+        spawner
+            .shutdown_and_wait_with_reason(Duration::from_millis(1), "test session shutdown")
+            .await;
+
+        assert!(spawner.list_all_agents().await.is_empty());
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("shutdown must archive the foreground child");
+        assert!(matches!(
+            archived.status,
+            AgentStatus::Cancelled {
+                by_user: false,
+                ref reason,
+            } if reason == "test session shutdown"
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(1), spawn_task)
+            .await
+            .expect("foreground caller must be released")
+            .expect("foreground spawn host must not panic")
+            .expect("foreground spawn should return a terminal payload");
+        assert!(matches!(terminal, SpawnAgentOutput::Failed { .. }));
+    }
+
+    #[tokio::test]
     async fn foreground_fanout_promotion_is_atomic_for_every_live_slot() {
         struct NeverCompletes;
 
@@ -7302,14 +7481,6 @@ mod tests {
             spawner.completion_notifiers.read().await.is_empty(),
             "panicked background task must not leave completion notifiers"
         );
-        assert!(
-            spawner
-                .background_agent_ids
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty(),
-            "panicked background task must not remain in background ids"
-        );
     }
 
     #[tokio::test]
@@ -7443,15 +7614,6 @@ mod tests {
             spawner.active_agents.read().await.is_empty(),
             "active_agents must be empty after agent completes and is archived"
         );
-        assert!(
-            spawner
-                .background_agent_ids
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty(),
-            "background_agent_ids must not retain finalized agents"
-        );
-
         // Agent should be in completed_agents instead.
         assert!(
             !spawner.completed_agents.read().await.is_empty(),

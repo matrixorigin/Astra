@@ -15,21 +15,34 @@ async fn refresh_auth_runtime(
     state: &mut SessionState,
 ) {
     if let Some(token) = current_access_token(profile) {
-        clear_auth_runtime(state);
+        clear_auth_runtime(state).await;
         initialize_multi_agent_runtime(state, api, token, profile).await;
     }
 }
 
-fn clear_auth_runtime(state: &mut SessionState) {
+const AUTH_RUNTIME_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
+
+async fn clear_auth_runtime(state: &mut SessionState) {
+    // Authentication changes are a runtime ownership boundary just like TUI
+    // exit and session rebind. Retire the old task tree before discarding its
+    // handles; direct `Option::take` used to strand local agents whenever a
+    // user logged out or switched accounts mid-run.
+    if let Some(spawner) = state.agent_spawner.take() {
+        spawner
+            .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
+            .await;
+    }
     state.delegation_engine = None;
-    state.agent_spawner = None;
     state.root_mailbox = None;
     state.pending_idle_agent_messages.clear();
 }
 
-fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState) {
+async fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState) {
+    // Keep credentials available while cancellation/finalization converges;
+    // some executors need the current token to persist their terminal state.
+    clear_auth_runtime(state).await;
     let _ = crate::cli::auth_flow::clear_profile_auth(profile);
-    clear_auth_runtime(state);
 }
 
 pub(crate) async fn handle_account_command(
@@ -97,7 +110,7 @@ pub(crate) async fn handle_account_command(
                     .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh }))
                     .await;
             }
-            clear_local_auth_state(profile, state);
+            clear_local_auth_state(profile, state).await;
             cli_ok!("Logged out");
         }
 
@@ -192,16 +205,15 @@ mod tests {
                 std::sync::Arc::new(astra_runtime::server::delegation::engine::StubSubRunExecutor),
             ),
         ));
-        state.agent_spawner = Some(std::sync::Arc::new(
-            astra_runtime::orchestration::DynamicAgentSpawner::new(std::sync::Arc::new(
-                astra_messaging::AgentMailboxRouter::new(
-                    std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
-                    std::sync::Arc::new(
-                        astra_runtime::server::delegation::engine::DelegationTracker::new(),
-                    ),
+        let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+            std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+                std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
+                std::sync::Arc::new(
+                    astra_runtime::server::delegation::engine::DelegationTracker::new(),
                 ),
             )),
         ));
+        state.agent_spawner = Some(std::sync::Arc::clone(&spawner));
         let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
             std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
             std::sync::Arc::new(
@@ -221,12 +233,44 @@ mod tests {
             ),
         ));
 
-        clear_auth_runtime(&mut state);
+        clear_auth_runtime(&mut state).await;
 
         assert!(state.delegation_engine.is_none());
         assert!(state.agent_spawner.is_none());
         assert!(state.root_mailbox.is_none());
         assert!(state.pending_idle_agent_messages.is_empty());
+
+        let rejected = spawner
+            .spawn(
+                astra_runtime::orchestration::SpawnAgentInput {
+                    description: "must not survive auth replacement".into(),
+                    prompt: "pending work".into(),
+                    agent_type: "explore".into(),
+                    run_in_background: true,
+                    ..Default::default()
+                },
+                &astra_runtime::orchestration::SpawnContext {
+                    parent_run_id: "root".into(),
+                    parent_agent_id: "root".into(),
+                    recursion_depth: 0,
+                    parent_is_fork_child: false,
+                    working_dir: std::path::PathBuf::from("/tmp"),
+                    inherited_permissions:
+                        astra_runtime::orchestration::InheritedPermissions::auto_approve(),
+                    inherited_skills: Vec::new(),
+                    live_event_sink: None,
+                    client_tool_delivery_tx: None,
+                    trace_context: None,
+                    spawn_tool_call_id: None,
+                    execution_metadata: None,
+                    delegation_chain: Vec::new(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(astra_runtime::orchestration::SpawnError::LifecycleShuttingDown)
+        ));
     }
 
     #[serial_test::serial]
@@ -273,7 +317,7 @@ mod tests {
             )),
         ));
 
-        clear_local_auth_state(None, &mut state);
+        clear_local_auth_state(None, &mut state).await;
 
         let creds = load_credentials();
         let profile = creds.profiles.get("default").unwrap();
