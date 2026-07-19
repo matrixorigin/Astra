@@ -132,16 +132,6 @@ impl ChatTurnRequestBody {
     fn user_query(&self) -> String {
         extract_latest_user_query(self.messages_slice())
     }
-
-    fn classify_task(&self) -> Option<String> {
-        let normalized: Vec<_> = self
-            .messages_slice()
-            .iter()
-            .filter_map(serde_json::Value::as_object)
-            .cloned()
-            .collect();
-        classify_task(&normalized)
-    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -167,7 +157,6 @@ pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) turn_chain_id: Option<String>,
     pub(super) user_query_event_id: Option<String>,
     pub(super) tools_changed: Option<bool>,
-    pub(super) task_hint: Option<String>,
     pub(super) user_query_b64: Option<String>,
     pub(super) routing_meta_b64: Option<String>,
     pub(super) force_intent: Option<String>,
@@ -185,7 +174,6 @@ impl PreparedChatTurnBridgeRequest {
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
-            task_hint: None,
             user_query_b64: None,
             routing_meta_b64: None,
             force_intent: None,
@@ -488,7 +476,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     trim_edge_tools_for_result_turn(&mut request, &user_query);
 
     // ── Metadata extraction ─────────────────────────────────────────────
-    let task_hint = request.classify_task();
     let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
     let routing_meta_b64 = request.selected_model_name().map(|_| {
         let meta = serde_json::Value::Object(build_skipped_routing_metadata("selected_model"));
@@ -512,7 +499,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             turn_chain_id,
             user_query_event_id,
             tools_changed,
-            task_hint,
             user_query_b64,
             routing_meta_b64,
             force_intent,
@@ -2049,7 +2035,6 @@ mod tests {
         assert!(result.turn_chain_id.is_none());
         assert!(result.user_query_event_id.is_none());
         assert!(result.tools_changed.is_none());
-        assert!(result.task_hint.is_none());
         assert!(result.user_query_b64.is_none());
         assert!(result.routing_meta_b64.is_none());
         assert!(result.force_intent.is_none());

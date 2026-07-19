@@ -9,7 +9,7 @@ use super::turn_stream_runner::{
 };
 use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
 use crate::cli::session::session_input::{
-    build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
+    clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line, prepare_input,
 };
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
@@ -294,7 +294,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     let resume_guidance = state.resume_guidance.take();
     let consumed_bg_notifications = state.pending_bg_notifications.clone();
     let finalized_input = finalize_effective_line(
-        build_effective_line(&line, state, ui),
+        prepare_input(&line, state, ui),
         line.clone(),
         resume_guidance,
         state,
@@ -313,6 +313,7 @@ pub(crate) async fn handle_chat_input_with_ui(
             message: &finalized_input.user_message,
             user_intent: &finalized_input.user_intent,
             input_runtime_required_texts: &finalized_input.runtime_required_texts,
+            input_active_system_skills: &finalized_input.active_system_skill_names,
             input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
             session_id: session_id.as_deref(),
             semantic_query_override: None,
@@ -332,6 +333,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         effective_line: &finalized_input.user_message,
         user_intent: &finalized_input.user_intent,
         input_runtime_required_texts: &finalized_input.runtime_required_texts,
+        input_active_system_skills: &finalized_input.active_system_skill_names,
         input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
         token,
         session_id: session_id.as_deref(),
@@ -414,6 +416,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
             message: &runtime_envelope,
             user_intent: &user_intent,
             input_runtime_required_texts: &runtime_required_texts,
+            input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             session_id: session_id.as_deref(),
             semantic_query_override: Some(user_intent.as_str()),
@@ -430,6 +433,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         effective_line: &runtime_envelope,
         user_intent: &user_intent,
         input_runtime_required_texts: &runtime_required_texts,
+        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         token,
         session_id: session_id.as_deref(),

@@ -138,20 +138,21 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = crate::cli::session::session_input::build_effective_line(
+        let effective = crate::cli::session::session_input::prepare_input(
             "继续",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(effective, "继续");
+        assert_eq!(effective.user_message, "继续");
+        assert!(effective.runtime_required_texts.is_empty());
 
-        let normal = crate::cli::session::session_input::build_effective_line(
+        let normal = crate::cli::session::session_input::prepare_input(
             "explain Pin in detail",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
-            !normal.contains("[Active task attachment]"),
+            normal.runtime_required_texts.is_empty(),
             "normal prompt must not inject anchor"
         );
     }

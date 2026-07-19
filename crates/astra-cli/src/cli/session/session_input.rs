@@ -12,6 +12,27 @@ pub(crate) struct FinalizedInput {
     /// Dynamic text from external session sources such as task-board
     /// snapshots. Internal runtime state uses required/typed lanes.
     pub(crate) runtime_volatile_texts: Vec<String>,
+    /// Producer-owned names for built-in system skills active on this turn.
+    /// The payload builder projects these into `edge_profile.active_skills`;
+    /// it must never rediscover them by parsing prompt text.
+    pub(crate) active_system_skill_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedInput {
+    pub(crate) user_message: String,
+    pub(crate) runtime_required_texts: Vec<String>,
+    pub(crate) active_system_skill_names: Vec<String>,
+}
+
+impl PreparedInput {
+    pub(crate) fn user_only(user_message: impl Into<String>) -> Self {
+        Self {
+            user_message: user_message.into(),
+            runtime_required_texts: Vec::new(),
+            active_system_skill_names: Vec::new(),
+        }
+    }
 }
 
 pub(crate) fn clear_pending_recovery_for_ordinary_chat_input(state: &mut SessionState) {
@@ -20,13 +41,13 @@ pub(crate) fn clear_pending_recovery_for_ordinary_chat_input(state: &mut Session
 }
 
 pub(crate) async fn finalize_effective_line(
-    effective_line: String,
+    prepared: PreparedInput,
     user_intent: String,
     resume_guidance: Option<String>,
     state: &mut SessionState,
 ) -> FinalizedInput {
     state.diagnostics_context = None;
-    let mut runtime_required_texts = Vec::new();
+    let mut runtime_required_texts = prepared.runtime_required_texts;
     let mut runtime_volatile_texts = Vec::new();
 
     if !state.pending_bg_notifications.is_empty() {
@@ -70,10 +91,11 @@ pub(crate) async fn finalize_effective_line(
     }
 
     FinalizedInput {
-        user_message: effective_line,
+        user_message: prepared.user_message,
         user_intent,
         runtime_required_texts,
         runtime_volatile_texts,
+        active_system_skill_names: prepared.active_system_skill_names,
     }
 }
 
@@ -120,63 +142,68 @@ fn format_open_task_snapshot(tasks: &[SessionTask]) -> Option<String> {
     }
 }
 
-pub(crate) fn build_effective_line(
+pub(crate) fn prepare_input(
     line: &str,
     state: &SessionState,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> String {
-    let mut effective_line = if let Some(skill_dev) = state.skill_dev.as_ref() {
+) -> PreparedInput {
+    let mut runtime_required_texts = Vec::new();
+
+    if let Some(project_instructions) = state.project_instructions.as_ref() {
+        runtime_required_texts.push(format_project_instructions(project_instructions));
+    }
+
+    if let Some(diagnostics_context) = state.diagnostics_context.as_ref() {
+        runtime_required_texts.push(diagnostics_context.clone());
+    }
+
+    if !state.active_system_skills.is_empty() {
+        runtime_required_texts.push(prompts::build_skill_instructions(
+            &state.active_system_skills,
+        ));
+    }
+
+    if let Some(skill_dev) = state.skill_dev.as_ref() {
         let skill_md = skill_dev.dir.join("SKILL.md");
         match std::fs::read_to_string(&skill_md) {
-            Ok(source) if !source.trim().is_empty() => format!(
-                "{}{line}",
-                prompts::build_skill_dev_prefix(
+            Ok(source) if !source.trim().is_empty() => {
+                runtime_required_texts.push(prompts::build_skill_dev_context(
                     &skill_dev.name,
                     &skill_md.display().to_string(),
                     &source,
-                )
-            ),
+                ));
+            }
             Ok(_) => {
                 ui.show_warning(&format!(
                     "  ⚠ SKILL.md is empty at {}, dev context skipped",
                     skill_md.display()
                 ));
-                line.to_string()
             }
             Err(_) => {
                 ui.show_warning(&format!(
                     "  ⚠ SKILL.md not found at {}, dev context skipped",
                     skill_md.display()
                 ));
-                line.to_string()
             }
         }
-    } else {
-        line.to_string()
-    };
-
-    if !state.active_system_skills.is_empty() {
-        let skill_block = prompts::build_skill_instructions(&state.active_system_skills);
-        effective_line = format!("{skill_block}\n\n{effective_line}");
     }
 
-    if let Some(diagnostics_context) = state.diagnostics_context.as_ref() {
-        effective_line = format!("{diagnostics_context}\n\n{effective_line}");
+    PreparedInput {
+        user_message: line.to_string(),
+        runtime_required_texts,
+        active_system_skill_names: state
+            .active_system_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect(),
     }
-
-    if let Some(project_instructions) = state.project_instructions.as_ref() {
-        let block = format_project_instructions(project_instructions);
-        effective_line = format!("{block}\n\n{effective_line}");
-    }
-
-    effective_line
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
-        finalize_effective_line,
+        PreparedInput, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
+        prepare_input,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::session::session_state::SkillDevState;
@@ -223,11 +250,9 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert!(!effective.contains("[Active task attachment]"));
-        assert!(!effective.contains("debug Chinese input drops"));
-        assert_eq!(effective, "继续");
+        let prepared = prepare_input("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        assert!(prepared.runtime_required_texts.is_empty());
+        assert_eq!(prepared.user_message, "继续");
     }
 
     #[test]
@@ -240,9 +265,9 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert_eq!(effective, "修复?");
+        let prepared = prepare_input("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        assert_eq!(prepared.user_message, "修复?");
+        assert!(prepared.runtime_required_texts.is_empty());
     }
 
     #[test]
@@ -254,12 +279,13 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line(
+        let prepared = prepare_input(
             "还有什么？",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(effective, "还有什么？");
+        assert_eq!(prepared.user_message, "还有什么？");
+        assert!(prepared.runtime_required_texts.is_empty());
     }
 
     #[test]
@@ -269,13 +295,13 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line(
+        let prepared = prepare_input(
             "修一下输入法问题",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(!effective.contains("[Active task attachment]"));
-        assert_eq!(effective, "修一下输入法问题");
+        assert_eq!(prepared.user_message, "修一下输入法问题");
+        assert!(prepared.runtime_required_texts.is_empty());
     }
 
     #[tokio::test]
@@ -283,7 +309,7 @@ mod tests {
         let mut state = SessionState::default();
 
         let finalized = finalize_effective_line(
-            "continue".into(),
+            PreparedInput::user_only("continue"),
             "raw continue".into(),
             Some("Resume the interrupted turn before answering.".into()),
             &mut state,
@@ -320,14 +346,15 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line(
+        let prepared = prepare_input(
             "improve this skill",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(effective.contains("[SKILL DEV: test-skill]"));
-        assert!(effective.contains("Do stuff."));
-        assert!(effective.contains("improve this skill"));
+        assert_eq!(prepared.user_message, "improve this skill");
+        assert_eq!(prepared.runtime_required_texts.len(), 1);
+        assert!(prepared.runtime_required_texts[0].contains("[SKILL DEV: test-skill]"));
+        assert!(prepared.runtime_required_texts[0].contains("Do stuff."));
     }
 
     #[test]
@@ -351,9 +378,8 @@ mod tests {
             ..SessionState::default()
         };
 
-        let turn1 =
-            build_effective_line("check", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert!(turn1.contains(OLD_BODY));
+        let turn1 = prepare_input("check", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        assert!(turn1.runtime_required_texts[0].contains(OLD_BODY));
 
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -361,16 +387,19 @@ mod tests {
         )
         .unwrap();
 
-        let turn2 = build_effective_line(
+        let turn2 = prepare_input(
             "check again",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
-            !turn2.contains(OLD_BODY),
+            !turn2.runtime_required_texts[0].contains(OLD_BODY),
             "should not contain old skill body"
         );
-        assert!(turn2.contains(NEW_BODY), "should contain new content");
+        assert!(
+            turn2.runtime_required_texts[0].contains(NEW_BODY),
+            "should contain new content"
+        );
     }
 
     #[test]
@@ -383,9 +412,8 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert_eq!(effective, "hello");
+        let prepared = prepare_input("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        assert_eq!(prepared, PreparedInput::user_only("hello"));
     }
 
     #[test]
@@ -403,9 +431,8 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert_eq!(effective, "hello");
+        let prepared = prepare_input("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        assert_eq!(prepared, PreparedInput::user_only("hello"));
     }
 
     #[test]
@@ -427,11 +454,10 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("x", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        let prepared = prepare_input("x", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         let expected_path = skill_dir.join("SKILL.md").display().to_string();
         assert!(
-            effective.contains(&expected_path),
+            prepared.runtime_required_texts[0].contains(&expected_path),
             "should contain actual path: {expected_path}"
         );
     }
@@ -457,15 +483,16 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line(
+        let prepared = prepare_input(
             "continue",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
-        assert!(effective.contains("Concise"), "system skill");
-        assert!(!effective.contains("[Active task attachment]"), "anchor");
-        assert!(!effective.contains("fix auth"), "anchor content");
+        assert_eq!(prepared.user_message, "continue");
+        assert_eq!(prepared.active_system_skill_names, vec!["concise"]);
+        assert_eq!(prepared.runtime_required_texts.len(), 2);
+        assert!(prepared.runtime_required_texts[0].contains("Concise"));
+        assert!(prepared.runtime_required_texts[1].contains("[SKILL DEV: combo]"));
     }
 
     #[test]
@@ -494,7 +521,7 @@ mod tests {
         };
 
         let finalized = finalize_effective_line(
-            "continue".into(),
+            PreparedInput::user_only("continue"),
             "continue".into(),
             Some("Resume the interrupted task.".into()),
             &mut state,
@@ -567,8 +594,13 @@ mod tests {
             .await;
         assert!(!dependent.starts_with("Error:"), "{dependent}");
 
-        let finalized =
-            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
+        let finalized = finalize_effective_line(
+            PreparedInput::user_only("continue"),
+            "continue".into(),
+            None,
+            &mut state,
+        )
+        .await;
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
@@ -616,8 +648,13 @@ mod tests {
             .await;
         assert!(!done_update.starts_with("Error:"), "{done_update}");
 
-        let finalized =
-            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
+        let finalized = finalize_effective_line(
+            PreparedInput::user_only("continue"),
+            "continue".into(),
+            None,
+            &mut state,
+        )
+        .await;
 
         assert!(
             finalized.runtime_volatile_texts.is_empty(),
@@ -649,8 +686,13 @@ mod tests {
             std::sync::Arc::new(FailingTaskLoadStore),
         ));
 
-        let finalized =
-            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
+        let finalized = finalize_effective_line(
+            PreparedInput::user_only("continue"),
+            "continue".into(),
+            None,
+            &mut state,
+        )
+        .await;
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
@@ -681,8 +723,13 @@ mod tests {
             .await;
         assert!(!create.starts_with("Error:"), "{create}");
 
-        let finalized =
-            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
+        let finalized = finalize_effective_line(
+            PreparedInput::user_only("continue"),
+            "continue".into(),
+            None,
+            &mut state,
+        )
+        .await;
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
@@ -701,7 +748,7 @@ mod tests {
         *state.bg_task_list_cache.write().await = r#"<background_tasks count="1"><task id="fanout:review-group" kind="agent_fanout" status="running" completed="1" active="2" recovery_call="agent_fanout(action='get_results', group_id='review-group')" /></background_tasks>"#.into();
 
         let finalized = finalize_effective_line(
-            "what is running?".into(),
+            PreparedInput::user_only("what is running?"),
             "what is running?".into(),
             None,
             &mut state,

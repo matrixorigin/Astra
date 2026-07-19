@@ -12677,7 +12677,7 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
         run_id: "run-approval".to_string(),
         session_id: "session-1".to_string(),
         agent_id: None,
-        event_tx,
+        event_tx: Some(event_tx),
     };
     let delivery = server_loop_host::HostInteractionSink::commit_and_deliver(
         &sink,
@@ -12715,6 +12715,47 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
     let approval = event_rx.recv().await.unwrap();
     assert_eq!(approval["type"], "approval_required");
     assert_eq!(approval[HOST_INTERACTION_COMMITTED_FIELD], true);
+}
+
+#[tokio::test]
+async fn detached_observer_does_not_revoke_committed_interaction() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    engine
+        .start_run("run-detached-approval", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel(1);
+    drop(event_rx);
+    let sink = DurableHostInteractionSink {
+        run_engine: engine.clone(),
+        user_id: "user-1".to_string(),
+        run_id: "run-detached-approval".to_string(),
+        session_id: "session-1".to_string(),
+        agent_id: None,
+        event_tx: Some(event_tx),
+    };
+
+    server_loop_host::HostInteractionSink::commit_and_deliver(
+        &sink,
+        json!({
+            "type": "approval_required",
+            "request_id": "approval-detached",
+            "tool": "bash",
+            "approval_kind": "standard"
+        }),
+    )
+    .await
+    .expect("durable interaction remains valid after live observer detaches");
+
+    let durable = engine
+        .load_run("user-1", "run-detached-approval")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable.events.iter().any(|event| {
+        event["event_type"] == "approval_required"
+            && event["data"]["request_id"] == "approval-detached"
+    }));
 }
 
 #[test]

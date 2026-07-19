@@ -88,11 +88,7 @@ fn apply_judged_turn_intent_to_observability_session(
     state: &AgenticLoopState,
     intent: &TurnIntent,
 ) {
-    let Some(session) = &state.telemetry.observability_session else {
-        return;
-    };
-
-    {
+    if let Some(session) = &state.telemetry.observability_session {
         let mut session = astra_core::sync_poison::recover_rwlock_write(session);
         if let Some(scenario) = intent.requested_scenario {
             if !intent.prohibited_scenarios.contains(&scenario) {
@@ -3845,6 +3841,23 @@ mod tests {
         assert!(!rendered.contains("stale path"));
         assert!(
             rendered.contains("Latest user correction overrides conflicting prior working memory")
+        );
+    }
+
+    #[test]
+    fn structured_reanchor_feedback_does_not_require_profile_session() {
+        let intent = TurnIntent::default().with_reanchors_current_objective(true);
+        let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+        assert!(state.telemetry.observability_session.is_none());
+
+        apply_judged_turn_intent_to_observability_session(&state, &intent);
+
+        assert!(
+            hub.recent_feedback_signals()
+                .iter()
+                .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Reanchor })
         );
     }
 

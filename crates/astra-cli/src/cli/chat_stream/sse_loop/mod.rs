@@ -665,6 +665,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message,
         user_intent: p.user_intent,
         input_runtime_required_texts: p.input_runtime_required_texts,
+        input_active_system_skills: p.input_active_system_skills,
         input_runtime_volatile_texts: p.input_runtime_volatile_texts,
         semantic_query_override: p.semantic_query_override,
         history: p.history,

@@ -10,7 +10,7 @@ mod system;
 pub use astra_prompts::extraction::{COMPACT_UNIFIED_PROMPT, parse_compact_response};
 pub use astra_prompts::memory_proto;
 pub use astra_prompts::skills::{
-    SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
+    SystemSkill, build_skill_dev_context, build_skill_instructions, builtin_concise_skill,
     builtin_system_skills,
 };
 pub use context::{

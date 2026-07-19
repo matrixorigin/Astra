@@ -88,8 +88,8 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     payload
 }
 
-/// Set `edge_profile.active_skills` when the edge detected system skill hints in the user message.
-pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills: &[&str]) {
+/// Project producer-owned system skill identities into `edge_profile.active_skills`.
+pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills: &[String]) {
     if active_skills.is_empty() {
         return;
     }
@@ -101,9 +101,8 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
-/// Deduped skill names that affected this `/chat` request: selector-chosen registry skills,
-/// message-detected system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`]),
-/// and registry skills whose instruction bodies were merged successfully.
+/// Deduped registry skill names that affected this `/chat` request: selector-chosen
+/// skills and skills whose instruction bodies were merged successfully.
 pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skills: &[String]) {
     if invoked_skills.is_empty() {
         return;
@@ -282,7 +281,10 @@ mod tests {
     #[test]
     fn merge_active_skills_into_edge_profile_inserts_array() {
         let mut p = json!({ "edge_profile": {} });
-        merge_active_skills_into_edge_profile(&mut p, &["markdown", "concise"]);
+        merge_active_skills_into_edge_profile(
+            &mut p,
+            &["markdown".to_string(), "concise".to_string()],
+        );
         assert_eq!(
             p["edge_profile"]["active_skills"],
             json!(["markdown", "concise"])

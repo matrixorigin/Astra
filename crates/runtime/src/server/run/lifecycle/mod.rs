@@ -358,7 +358,9 @@ struct DurableHostInteractionSink {
     run_id: String,
     session_id: String,
     agent_id: Option<String>,
-    event_tx: mpsc::Sender<Value>,
+    /// Optional live projection. Durable persistence is the interaction
+    /// authority; a detached observer can recover the committed event.
+    event_tx: Option<mpsc::Sender<Value>>,
 }
 
 #[async_trait]
@@ -388,17 +390,22 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
             .await
             .map_err(|error| format!("interaction persistence failed: {error}"))?;
 
-        event
+        let event_object = event
             .as_object_mut()
-            .expect("validated interaction object")
-            .insert(
-                HOST_INTERACTION_COMMITTED_FIELD.to_string(),
-                Value::Bool(true),
+            .ok_or_else(|| "interaction event must remain an object".to_string())?;
+        event_object.insert(
+            HOST_INTERACTION_COMMITTED_FIELD.to_string(),
+            Value::Bool(true),
+        );
+        if let Some(event_tx) = &self.event_tx
+            && event_tx.send(event).await.is_err()
+        {
+            tracing::debug!(
+                run_id = %self.run_id,
+                "durable interaction committed after live observer detached"
             );
-        self.event_tx
-            .send(event)
-            .await
-            .map_err(|_| "run interaction fanout is closed".to_string())
+        }
+        Ok(())
     }
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
@@ -1858,6 +1865,7 @@ fn build_server_skill_executor(
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+    interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
     >,
@@ -1881,6 +1889,9 @@ fn build_server_skill_executor(
     .with_skill_resolver(skill_resolver)
     .with_reflect_service(reflect_service)
     .with_cancel_token(cancel_token);
+    if let Some(sink) = interaction_sink {
+        subrun_executor = subrun_executor.with_interaction_sink(sink);
+    }
     if let Some(snapshot) = execution_bindings {
         subrun_executor = subrun_executor.with_execution_binding_snapshot(snapshot.clone());
     }
@@ -5690,6 +5701,7 @@ impl AgenticRunLifecycleService {
             workspace_override,
             execution_bindings,
             cancel_token,
+            None,
             request_constraints,
             &edge_context,
             None,
@@ -5707,6 +5719,7 @@ impl AgenticRunLifecycleService {
         workspace_override: Option<&std::path::Path>,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         cancel_token: Option<Arc<CancellationToken>>,
+        interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
         request_constraints: RequestConstraints,
         edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
@@ -5869,6 +5882,7 @@ impl AgenticRunLifecycleService {
             self.edge_connection_pool.as_ref(),
             cancel_token,
             memory_extraction_service.as_ref(),
+            interaction_sink,
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -7310,6 +7324,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_authoring_active,
             task_board_resume_hint,
         );
+        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
+            Arc::new(DurableHostInteractionSink {
+                run_engine: self.run_engine.clone(),
+                user_id: user_id.clone(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: None,
+                event_tx: None,
+            });
+        host.set_interaction_sink(Arc::clone(&interaction_sink));
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
                 &snapshot.workspace,
@@ -7342,6 +7366,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .or(server_workspace.as_deref()),
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
+            Some(Arc::clone(&interaction_sink)),
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
@@ -8356,6 +8381,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         run_state.live_tx = Some(live_tx.clone());
 
+        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
+            Arc::new(DurableHostInteractionSink {
+                run_engine: self.run_engine.clone(),
+                user_id: user_id.clone(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: None,
+                event_tx: Some(event_tx.clone()),
+            });
         let mut state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -8366,6 +8400,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .or(server_workspace.as_deref()),
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
+            Some(Arc::clone(&interaction_sink)),
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
@@ -8518,14 +8553,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         });
         host.set_event_tx_with_gap(host_event_tx, host_event_gap);
-        host.set_interaction_sink(Arc::new(DurableHostInteractionSink {
-            run_engine: self.run_engine.clone(),
-            user_id: user_id.clone(),
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            agent_id: None,
-            event_tx: event_tx.clone(),
-        }));
+        host.set_interaction_sink(interaction_sink);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
@@ -11494,10 +11522,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 run_id: config.run_id.clone(),
                 session_id: config.session_id.clone(),
                 agent_id: Some(config.agent_profile.agent_id.clone()),
-                event_tx: self
-                    .client_tool_delivery_tx
-                    .clone()
-                    .expect("availability checked above"),
+                event_tx: Some(
+                    self.client_tool_delivery_tx
+                        .clone()
+                        .expect("availability checked above"),
+                ),
             }));
             host.prefer_client_tool_delivery();
         }

@@ -38,30 +38,32 @@ async fn execute_cli_health_command() {
 // ── chat_turn pure functions ──────────────────────────────────────────
 
 #[test]
-fn build_effective_line_plain() {
+fn prepare_input_keeps_plain_user_message() {
     let state = SessionState::default();
-    let result = crate::cli::session::session_input::build_effective_line(
+    let result = crate::cli::session::session_input::prepare_input(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
     );
-    assert_eq!(result, "hello");
+    assert_eq!(result.user_message, "hello");
+    assert!(result.runtime_required_texts.is_empty());
 }
 
 #[test]
-fn build_effective_line_with_system_skills() {
+fn prepare_input_routes_system_skills_out_of_user_message() {
     let mut state = SessionState::default();
     let skills = prompts::builtin_system_skills();
     if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
         state.active_system_skills.push(md.clone());
     }
-    let result = crate::cli::session::session_input::build_effective_line(
+    let result = crate::cli::session::session_input::prepare_input(
         "hello",
         &state,
         &mut crate::cli::ui_adapter::LineUiAdapter,
     );
-    assert!(result.contains("hello"));
-    assert!(result.contains("Markdown"));
+    assert_eq!(result.user_message, "hello");
+    assert_eq!(result.active_system_skill_names, vec!["markdown"]);
+    assert!(result.runtime_required_texts[0].contains("Markdown"));
 }
 
 #[test]

@@ -398,6 +398,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Runtime-owned per-turn control text that must reach the current model
     /// call while staying out of user content and prompt-facing history.
     pub(crate) input_runtime_required_texts: &'a [String],
+    /// Producer-owned built-in system skill identities for this turn.
+    pub(crate) input_active_system_skills: &'a [String],
     /// Dynamic text from external/session sources. Runtime-owned policy,
     /// guardrail, and telemetry signals use the typed injection lane instead.
     pub(crate) input_runtime_volatile_texts: &'a [String],
@@ -658,6 +660,7 @@ impl<'a> ChatTurnParams<'a> {
             message: ctx.message,
             user_intent: ctx.message,
             input_runtime_required_texts: &[],
+            input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             input_work_unit_observations: &[],
             semantic_query_override: None,

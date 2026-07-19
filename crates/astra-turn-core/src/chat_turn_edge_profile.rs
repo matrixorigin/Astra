@@ -265,28 +265,6 @@ pub fn build_base_edge_profile_value(
     })
 }
 
-fn title_case_first_ascii_word(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
-/// Detect built-in system skills advertised in the user message (Output Format / Constraint lines).
-pub fn detect_active_system_skills_in_message(message: &str) -> Vec<&'static str> {
-    const SKILLS: &[&str] = &["markdown", "concise"];
-    SKILLS
-        .iter()
-        .copied()
-        .filter(|name| {
-            let titled = title_case_first_ascii_word(name);
-            message.contains(&format!("Output Format: {titled}"))
-                || message.contains(&format!("Output Constraint: {titled}"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,25 +294,6 @@ mod tests {
         // environment_volatile may be empty outside a git repo but must
         // be present as a typed field so downstream can always read it.
         assert!(v.get("environment_volatile").is_some());
-    }
-
-    #[test]
-    fn detect_skills_from_output_format_line() {
-        let msg = "Do x.\n\nOutput Format: Markdown\n";
-        let s = detect_active_system_skills_in_message(msg);
-        assert_eq!(s, vec!["markdown"]);
-    }
-
-    #[test]
-    fn detect_skills_from_output_constraint() {
-        let msg = "Output Constraint: Concise\n";
-        let s = detect_active_system_skills_in_message(msg);
-        assert_eq!(s, vec!["concise"]);
-    }
-
-    #[test]
-    fn detect_skills_empty_when_no_marker() {
-        assert!(detect_active_system_skills_in_message("hello").is_empty());
     }
 
     #[test]

@@ -326,7 +326,7 @@ const COMPACTION_CONTEXT_NOTE_ZH: &str = "\
 不要仅因为这条说明运行工具。";
 
 /// Append a neutral compaction note when compaction removed messages and the
-/// last remaining assistant message doesn't already signal task completion.
+/// last remaining message is not a real user message.
 ///
 /// Pure function — no I/O. Idempotent when called on messages that already
 /// end in a user message.
@@ -342,14 +342,6 @@ pub(crate) fn maybe_append_continuation_prompt(
         .and_then(|m| m.get("role").and_then(Value::as_str))
         == Some("user");
     if last_is_user {
-        return;
-    }
-    let last_signals_done = messages
-        .last()
-        .and_then(|m| m.get("content").and_then(Value::as_str))
-        .map(is_completion_signal)
-        .unwrap_or(false);
-    if last_signals_done {
         return;
     }
     // Detect CJK content in recent turns to emit a localised context note.
@@ -374,40 +366,6 @@ pub(crate) fn maybe_append_continuation_prompt(
         "role": "user",
         "content": note,
     }));
-}
-
-fn is_completion_signal(content: &str) -> bool {
-    // Look at the last ~200 chars: "completion" phrases anywhere earlier in
-    // a long message don't reliably indicate the agent is done.
-    let tail = if content.len() > 200 {
-        &content[content.floor_char_boundary(content.len() - 200)..]
-    } else {
-        content
-    };
-    let lower = tail.to_ascii_lowercase();
-    let has_completion = lower.contains("task complete")
-        || lower.contains("all done")
-        || lower.contains("finished")
-        || lower.contains("completed successfully")
-        || lower.contains("任务完成")
-        || lower.contains("已完成");
-    if !has_completion {
-        return false;
-    }
-    // Negation near the completion phrase: "not yet", "haven't finished", …
-    let has_negation = lower.contains("not yet")
-        || lower.contains("not complete")
-        || lower.contains("not finished")
-        || lower.contains("haven't finished")
-        || lower.contains("hasn't finished")
-        || lower.contains("won't be finished")
-        || lower.contains("don't think")
-        || lower.contains("not sure")
-        || lower.contains("没有完成")
-        || lower.contains("尚未完成")
-        || lower.contains("except")
-        || lower.contains("but ");
-    !has_negation
 }
 
 /// Stitch the final wire-ready `llm_messages` array.
@@ -1038,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_prompt_noop_when_assistant_signals_done() {
+    fn continuation_prompt_does_not_classify_assistant_completion_prose() {
         let mut msgs = vec![
             json!({"role": "user", "content": "goal"}),
             json!({
@@ -1046,27 +1004,9 @@ mod tests {
                 "content": "All done. Task complete successfully."
             }),
         ];
-        let len_before = msgs.len();
-        maybe_append_continuation_prompt(&mut msgs, true);
-        assert_eq!(
-            msgs.len(),
-            len_before,
-            "completion signal → no continuation appended"
-        );
-    }
-
-    #[test]
-    fn continuation_prompt_still_appends_with_qualified_completion() {
-        // "except X" qualifies completion -> negation wins -> note appends.
-        let mut msgs = vec![
-            json!({"role": "user", "content": "goal"}),
-            json!({
-                "role": "assistant",
-                "content": "All done, except for the migration."
-            }),
-        ];
         maybe_append_continuation_prompt(&mut msgs, true);
         assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "user");
     }
 
     #[test]

@@ -504,7 +504,7 @@ mod tests {
         history_as_messages, merge_continuation_anchor_with_session_memory,
         rebuild_continuation_anchor_from_live_state,
     };
-    use crate::cli::session::session_input::build_effective_line;
+    use crate::cli::session::session_input::prepare_input;
     use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use crate::cli::turn::turn_reporting::build_history_text;
     use astra_services::session_journal;
@@ -909,12 +909,13 @@ mod tests {
                 .to_string()
                 .into(),
         );
-        let effective = build_effective_line(
+        let effective = prepare_input(
             "continue",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(effective, "continue");
+        assert_eq!(effective.user_message, "continue");
+        assert!(effective.runtime_required_texts.is_empty());
 
         let user_messages: Vec<_> = messages
             .iter()

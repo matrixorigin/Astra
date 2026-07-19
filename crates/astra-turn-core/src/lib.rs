@@ -97,7 +97,6 @@ pub use sync_utils::{
     rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
 };
 pub mod tail_persist;
-pub mod task;
 pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;

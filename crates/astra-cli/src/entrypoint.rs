@@ -292,7 +292,7 @@ pub async fn run() {
     });
 
     // Merge project instructions into system_prompt for inline/print modes.
-    // TUI mode handles this separately via build_effective_line.
+    // TUI mode handles this separately via the typed input preparation path.
     let system_prompt = if no_instructions {
         system_prompt
     } else {
@@ -1081,30 +1081,32 @@ mod tests {
     // line-mode REPL.
 
     #[test]
-    fn build_effective_line_plain() {
+    fn prepare_input_keeps_plain_user_message() {
         let state = SessionState::default();
-        let result = crate::cli::session::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::prepare_input(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(result, "hello");
+        assert_eq!(result.user_message, "hello");
+        assert!(result.runtime_required_texts.is_empty());
     }
 
     #[test]
-    fn build_effective_line_with_system_skills() {
+    fn prepare_input_routes_system_skills_out_of_user_message() {
         let mut state = SessionState::default();
         let skills = prompts::builtin_system_skills();
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result = crate::cli::session::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::prepare_input(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert!(result.contains("hello"));
-        assert!(result.contains("Markdown"));
+        assert_eq!(result.user_message, "hello");
+        assert_eq!(result.active_system_skill_names, vec!["markdown"]);
+        assert!(result.runtime_required_texts[0].contains("Markdown"));
     }
 
     #[test]
@@ -2526,38 +2528,35 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn build_effective_line_includes_project_instructions() {
+    fn prepare_input_routes_project_instructions_out_of_user_message() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = crate::cli::session::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::prepare_input(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
-            result.contains("<project_instructions>"),
+            result.runtime_required_texts[0].contains("<project_instructions>"),
             "should wrap in tags"
         );
-        assert!(result.contains("Always use Rust."));
-        assert!(
-            result.contains("hello"),
-            "should still include user message"
-        );
+        assert!(result.runtime_required_texts[0].contains("Always use Rust."));
+        assert_eq!(result.user_message, "hello");
     }
 
     #[test]
-    fn build_effective_line_no_instructions_when_none() {
+    fn prepare_input_has_no_runtime_context_when_none() {
         let state = SessionState::default();
-        let result = crate::cli::session::session_input::build_effective_line(
+        let result = crate::cli::session::session_input::prepare_input(
             "hello",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
-            !result.contains("<project_instructions>"),
+            result.runtime_required_texts.is_empty(),
             "should not inject when None"
         );
-        assert_eq!(result, "hello");
+        assert_eq!(result.user_message, "hello");
     }
 
     #[test]

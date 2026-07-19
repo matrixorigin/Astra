@@ -8685,7 +8685,7 @@ mod resume_tests {
         .unwrap();
 
         let finalized = crate::cli::session::session_input::finalize_effective_line(
-            "continue".into(),
+            crate::cli::session::session_input::PreparedInput::user_only("continue"),
             "continue".into(),
             None,
             &mut state,

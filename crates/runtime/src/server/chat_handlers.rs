@@ -377,15 +377,6 @@ pub(super) async fn dispatch_chat_turn_bridge(
             HeaderValue::from_static(if tools_changed { "1" } else { "0" }),
         );
     }
-    if let Some(task_hint) = prepared.task_hint.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-task-hint"),
-            match safe_header_value(task_hint) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
     if let Some(user_query_b64) = prepared.user_query_b64.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-user-query-b64"),
@@ -487,7 +478,6 @@ mod tests {
             "x-mo-turn-chain-id",
             "x-mo-user-query-event-id",
             "x-mo-tools-changed",
-            "x-mo-task-hint",
             "x-mo-user-query-b64",
             "x-mo-routing-meta-b64",
             "x-mo-force-intent",

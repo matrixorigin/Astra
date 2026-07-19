@@ -93,6 +93,10 @@ pub struct ServerSkillSubRunExecutor {
     reflect_service: Arc<dyn ReflectService>,
     /// Request-level permissions inherited from the parent server run.
     inherited_permissions: crate::orchestration::InheritedPermissions,
+    /// Parent run's durable interaction authority. Skill forks are isolated
+    /// model loops, not independent durable runs, so approvals and client-tool
+    /// requests remain owned by the parent run.
+    interaction_sink: Option<Arc<dyn super::server_loop_host::HostInteractionSink>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -123,6 +127,7 @@ impl ServerSkillSubRunExecutor {
             memory_extraction_service: None,
             reflect_service: Arc::new(UnconfiguredReflectService),
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+            interaction_sink: None,
         }
     }
 
@@ -212,6 +217,14 @@ impl ServerSkillSubRunExecutor {
         inherited_permissions: crate::orchestration::InheritedPermissions,
     ) -> Self {
         self.inherited_permissions = inherited_permissions;
+        self
+    }
+
+    pub(crate) fn with_interaction_sink(
+        mut self,
+        sink: Arc<dyn super::server_loop_host::HostInteractionSink>,
+    ) -> Self {
+        self.interaction_sink = Some(sink);
         self
     }
 
@@ -342,6 +355,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         }
 
         let mut host = builder.build();
+        if let Some(sink) = &self.interaction_sink {
+            host.set_interaction_sink(Arc::clone(sink));
+        }
 
         // Build tool restriction set: if allowed_tools is non-empty, only those
         // tools (plus skill discovery) are permitted.

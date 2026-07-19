@@ -2340,7 +2340,6 @@ fn apply_prepared_headers(
     set_header!(session_turn, "x-mo-session-turn");
     set_header!(turn_chain_id, "x-mo-turn-chain-id");
     set_header!(user_query_event_id, "x-mo-user-query-event-id");
-    set_header!(task_hint, "x-mo-task-hint");
     set_header!(user_query_b64, "x-mo-user-query-b64");
     set_header!(routing_meta_b64, "x-mo-routing-meta-b64");
     set_header!(force_intent, "x-mo-force-intent");
@@ -3302,7 +3301,6 @@ mod tests {
             turn_chain_id: Some("run-1".into()),
             user_query_event_id: None,
             tools_changed: None,
-            task_hint: None,
             user_query_b64: None,
             routing_meta_b64: None,
             force_intent: None,
@@ -3388,7 +3386,6 @@ mod tests {
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
-            task_hint: None,
             user_query_b64: None,
             routing_meta_b64: None,
             force_intent: None,
@@ -4049,7 +4046,6 @@ mod tests {
             turn_chain_id: Some("tc1".into()),
             user_query_event_id: Some("uqe1".into()),
             tools_changed: Some(true),
-            task_hint: Some("code_review".into()),
             user_query_b64: Some("aGVsbG8=".into()),
             routing_meta_b64: Some("cm91dGU=".into()),
             force_intent: Some("question".into()),
@@ -4066,7 +4062,6 @@ mod tests {
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
-            task_hint: None,
             user_query_b64: None,
             routing_meta_b64: None,
             force_intent: None,
@@ -4086,7 +4081,6 @@ mod tests {
         assert_eq!(headers.get("x-mo-turn-chain-id").unwrap(), "tc1");
         assert_eq!(headers.get("x-mo-user-query-event-id").unwrap(), "uqe1");
         assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
-        assert_eq!(headers.get("x-mo-task-hint").unwrap(), "code_review");
         assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
         assert_eq!(headers.get("x-mo-routing-meta-b64").unwrap(), "cm91dGU=");
         assert_eq!(headers.get("x-mo-force-intent").unwrap(), "question");

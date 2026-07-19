@@ -565,7 +565,7 @@ pub(crate) async fn handle_slash_command(
                 state.diagnostics_context = Some(diag_parts.join("\n"));
                 // Queue the user's question for immediate dispatch. The REPL
                 // loop picks up queued_message and sends it as if the user typed
-                // it, with diagnostics_context prepended by build_effective_line.
+                // it, with diagnostics_context routed through required runtime context.
                 state.queued_message = Some(arg.to_string());
             }
         }

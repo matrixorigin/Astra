@@ -1,9 +1,9 @@
-/// Prefix injected into the user message when `/skill dev <name>` is active.
+/// Runtime-owned context used when `/skill dev <name>` is active.
 ///
 /// Provides the full skill source (re-read from disk each turn) plus
 /// structured editing guidelines. Prevents the LLM from re-reading
 /// the file it already has in context.
-pub fn build_skill_dev_prefix(skill_name: &str, skill_path: &str, skill_src: &str) -> String {
+pub fn build_skill_dev_context(skill_name: &str, skill_path: &str, skill_src: &str) -> String {
     format!(
         "[SKILL DEV: {skill_name}]\n\
          You are in skill development mode. The complete, live source of \"{skill_name}\" is below.\n\
@@ -93,8 +93,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_skill_dev_prefix_contains_name_and_src() {
-        let r = build_skill_dev_prefix(
+    fn build_skill_dev_context_contains_name_and_src() {
+        let r = build_skill_dev_context(
             "my-skill",
             "/project/.astra/skills/my-skill/SKILL.md",
             "# My Skill\nDo stuff",
