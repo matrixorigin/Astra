@@ -43,6 +43,7 @@ export type StreamEventType =
   | "agent_spawned"
   | "agent_live_event"
   | "agent_live_gap"
+  | "stream_gap"
   | "agent_waiting"
   | "agent_progress"
   | "agent_completed"
@@ -385,6 +386,14 @@ export type AgentLiveGapEvent = {
   repair: "refresh_run_snapshot";
 };
 
+/** The bounded run stream dropped one or more coalescible events. */
+export type StreamGapEvent = {
+  type: "stream_gap";
+  run_id: string;
+  dropped_event_count: number;
+  repair: "refresh_run_snapshot";
+};
+
 export type AgentCompletedEvent = {
   type: "agent_completed";
   agent_id: string;
@@ -640,6 +649,7 @@ export type StreamEvent = (
   | AgentSpawnedEvent
   | AgentLiveEvent
   | AgentLiveGapEvent
+  | StreamGapEvent
   | AgentWaitingEvent
   | AgentProgressEvent
   | AgentCompletedEvent

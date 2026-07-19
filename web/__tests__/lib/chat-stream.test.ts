@@ -78,6 +78,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"agent_live_gap","run_id":"child-run-1","agent_id":"reviewer","dropped_event_count":4,"repair":"refresh_run_snapshot"}\n\n',
+        'data: {"type":"stream_gap","run_id":"run-123","dropped_event_count":9,"repair":"refresh_run_snapshot"}\n\n',
         'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });
@@ -91,6 +92,12 @@ describe('streamChatMessage cancellation semantics', () => {
       run_id: 'child-run-1',
       agent_id: 'reviewer',
       dropped_event_count: 4,
+      repair: 'refresh_run_snapshot',
+    });
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
+      type: 'stream_gap',
+      run_id: 'run-123',
+      dropped_event_count: 9,
       repair: 'refresh_run_snapshot',
     });
   });

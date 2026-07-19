@@ -153,8 +153,19 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "approval_batch_required"
                 | "ask_user_prompted"
                 | "user_prompt_required"
+                | "stream_gap"
+                | "agent_live_gap"
         )
     )
+}
+
+fn stream_delivery_gap_event(run_id: &str, dropped_event_count: u64) -> Value {
+    json!({
+        "type": "stream_gap",
+        "run_id": run_id,
+        "dropped_event_count": dropped_event_count,
+        "repair": "refresh_run_snapshot",
+    })
 }
 
 /// Deliver to the currently attached SSE observer.
@@ -169,39 +180,13 @@ async fn send_attached_stream_event(
     event: Value,
     run_id: &str,
 ) {
+    if attached_stream_event_requires_reliable_delivery(&event) {
+        send_reliable_attached_stream_event(sender, event, run_id).await;
+        return;
+    }
     let Some(attached) = sender.as_ref() else {
         return;
     };
-    if attached_stream_event_requires_reliable_delivery(&event) {
-        match tokio::time::timeout(ATTACHED_INTERACTION_DELIVERY_GRACE, attached.send(event)).await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                tracing::debug!(
-                    target: "astra_runtime::run_lifecycle",
-                    run_id,
-                    "SSE observer disconnected while delivering an interaction boundary; durable replay remains available"
-                );
-                *sender = None;
-            }
-            Err(_) => {
-                // Keeping a full attached queue alive while dropping this
-                // boundary is worse than ending the stale stream: the client
-                // can neither act nor know that it must reconcile. Closing
-                // this one delivery lane forces a reconnect, where the
-                // already-persisted interaction is replayed. The run and its
-                // reconnectable broadcast lane remain alive.
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    run_id,
-                    grace_ms = ATTACHED_INTERACTION_DELIVERY_GRACE.as_millis() as u64,
-                    "SSE observer stayed full at an interaction boundary; closing the stale delivery lane for durable replay"
-                );
-                *sender = None;
-            }
-        }
-        return;
-    }
     match attached.try_send(event) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -216,8 +201,47 @@ async fn send_attached_stream_event(
             tracing::warn!(
                 target: "astra_runtime::run_lifecycle",
                 run_id,
-                "SSE observer fell behind; dropping this live event while keeping the observer attached for subsequent events and durable replay"
+                "SSE observer fell behind; replacing the dropped live event with a durable-repair boundary"
             );
+            send_reliable_attached_stream_event(
+                sender,
+                stream_delivery_gap_event(run_id, 1),
+                run_id,
+            )
+            .await;
+        }
+    }
+}
+
+async fn send_reliable_attached_stream_event(
+    sender: &mut Option<mpsc::Sender<Value>>,
+    event: Value,
+    run_id: &str,
+) {
+    let Some(attached) = sender.as_ref() else {
+        return;
+    };
+    match tokio::time::timeout(ATTACHED_INTERACTION_DELIVERY_GRACE, attached.send(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::debug!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                "SSE observer disconnected while delivering a reliable boundary; durable replay remains available"
+            );
+            *sender = None;
+        }
+        Err(_) => {
+            // Keeping a full attached queue alive while dropping a human-input
+            // or repair boundary is worse than ending the stale stream. Close
+            // only this observer so reconnect can replay durable truth.
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                grace_ms = ATTACHED_INTERACTION_DELIVERY_GRACE.as_millis() as u64,
+                "SSE observer stayed full at a reliable boundary; closing the stale delivery lane for durable replay"
+            );
+            *sender = None;
         }
     }
 }
@@ -8112,8 +8136,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .spawner;
 
-        // Create bounded live channels. If a client cannot keep up, the host
-        // detaches that live stream without cancelling the server-side run.
+        // Network observer delivery is bounded. Internal producers are
+        // drained independently below so browser backpressure cannot drop an
+        // approval or permanently detach later host progress.
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
@@ -8340,7 +8365,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             state.session_turn,
             request.agent_id.clone(),
         );
-        host.set_event_tx(event_tx.clone());
+        let (host_event_tx, mut host_event_rx) = mpsc::unbounded_channel::<Value>();
+        let host_event_bridge_tx = event_tx.clone();
+        let host_event_bridge = tokio::spawn(async move {
+            while let Some(event) = host_event_rx.recv().await {
+                if host_event_bridge_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        host.set_unbounded_event_tx(host_event_tx);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
@@ -8858,6 +8892,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                host.detach_event_tx();
+                if let Err(error) = host_event_bridge.await {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        run_id = %bg_run_id,
+                        error = %error,
+                        "lossless host event bridge stopped before draining"
+                    );
+                }
                 park_server_root_mailbox(&mut state).await;
                 let loop_success = loop_result.is_ok();
 
@@ -10820,7 +10863,7 @@ fn start_child_client_tool_delivery_bridge(
     child_run_id: String,
     child_agent_id: String,
     session_id: String,
-    mut child_rx: mpsc::Receiver<Value>,
+    mut child_rx: mpsc::UnboundedReceiver<Value>,
 ) -> ChildClientToolDeliveryBridge {
     let join = tokio::spawn(async move {
         while let Some(mut event) = child_rx.recv().await {
@@ -11332,8 +11375,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             );
         }
         let _client_tool_delivery_bridge = if client_tool_delivery_available {
-            let (child_tx, child_rx) = mpsc::channel(512);
-            host.set_event_tx(child_tx);
+            let (child_tx, child_rx) = mpsc::unbounded_channel();
+            host.set_unbounded_event_tx(child_tx);
             host.prefer_client_tool_delivery();
             Some(start_child_client_tool_delivery_bridge(
                 self.client_tool_delivery_tx

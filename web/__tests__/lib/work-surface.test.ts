@@ -2052,4 +2052,19 @@ describe('work surface reducer', () => {
       'Live updates for reviewer were incomplete (7 dropped); refreshing durable run state.',
     ]);
   });
+
+  it('treats a general stream gap as run-level durable repair evidence', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'stream_gap',
+      run_id: 'run-1',
+      dropped_event_count: 9,
+      repair: 'refresh_run_snapshot',
+    });
+
+    expect(state.agents).toEqual([]);
+    expect(state.tools).toEqual([]);
+    expect(state.warnings).toEqual([
+      'Live updates for this run were incomplete (9 dropped); refreshing durable run state.',
+    ]);
+  });
 });

@@ -43,6 +43,7 @@ export type {
   AgentSpawnedEvent,
   AgentLiveEvent,
   AgentLiveGapEvent,
+  StreamGapEvent,
   AgentWaitingEvent,
   AgentProgressEvent,
   AgentCompletedEvent,

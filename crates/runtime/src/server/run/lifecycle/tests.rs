@@ -78,15 +78,25 @@ async fn attached_stream_progress_recovers_after_transient_backpressure() {
 
     send_attached_stream_event(&mut attached, json!({"seq": 1}), "run-1").await;
     assert!(attached.is_some());
-    send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1").await;
-
-    assert!(
-        attached.is_some(),
-        "a momentarily full queue must not permanently detach a live observer"
+    {
+        let delivery = send_attached_stream_event(&mut attached, json!({"seq": 2}), "run-1");
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "a full observer must receive repair evidence before later progress"
+        );
+        assert_eq!(rx.recv().await.unwrap(), json!({"seq": 1}));
+        delivery.await;
+    }
+    assert_eq!(
+        rx.recv().await.unwrap(),
+        stream_delivery_gap_event("run-1", 1)
     );
-    assert_eq!(rx.try_recv().unwrap(), json!({"seq": 1}));
+    assert!(attached.is_some());
     send_attached_stream_event(&mut attached, json!({"seq": 3}), "run-1").await;
-    assert_eq!(rx.try_recv().unwrap(), json!({"seq": 3}));
+    assert_eq!(rx.recv().await.unwrap(), json!({"seq": 3}));
 }
 
 #[tokio::test]
@@ -129,6 +139,32 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
         delivery.await;
     }
     assert_eq!(rx.recv().await.unwrap(), approval);
+    assert!(attached.is_some());
+}
+
+#[tokio::test]
+async fn attached_stream_never_silently_drops_a_repair_gap() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(json!({"type": "text_delta", "content": "queued"}))
+        .await
+        .unwrap();
+    let mut attached = Some(tx);
+    let gap = stream_delivery_gap_event("run-1", 7);
+
+    {
+        let delivery = send_attached_stream_event(&mut attached, gap.clone(), "run-1");
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "repair evidence must wait for capacity instead of being dropped as ordinary progress"
+        );
+        assert_eq!(rx.recv().await.unwrap()["type"], "text_delta");
+        delivery.await;
+    }
+
+    assert_eq!(rx.recv().await.unwrap(), gap);
     assert!(attached.is_some());
 }
 
@@ -12594,7 +12630,7 @@ fn edge_approval_persistence_rejects_unaddressable_items() {
 #[tokio::test]
 async fn child_client_tool_delivery_forwards_requests_without_leaking_child_transcript() {
     let (parent_tx, mut parent_rx) = mpsc::channel(8);
-    let (child_tx, child_rx) = mpsc::channel(8);
+    let (child_tx, child_rx) = mpsc::unbounded_channel();
     let _bridge = start_child_client_tool_delivery_bridge(
         parent_tx,
         "child-run".to_string(),
@@ -12605,11 +12641,9 @@ async fn child_client_tool_delivery_forwards_requests_without_leaking_child_tran
 
     child_tx
         .send(json!({"type": "text_delta", "content": "private child output"}))
-        .await
         .unwrap();
     child_tx
         .send(json!({"type": "tool_request", "request_id": "tool-1"}))
-        .await
         .unwrap();
     child_tx
         .send(json!({
@@ -12617,7 +12651,6 @@ async fn child_client_tool_delivery_forwards_requests_without_leaking_child_tran
             "request_id": "approval-1",
             "tool": "bash"
         }))
-        .await
         .unwrap();
 
     let tool_request = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())

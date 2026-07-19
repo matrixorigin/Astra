@@ -439,7 +439,7 @@ export function useStreamLifecycle(
   const applyWorkSurfaceStreamEvent = useCallback(
     (event: WorkSurfaceEvent) => {
       setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
-      if (event.type === "agent_live_gap") {
+      if (event.type === "agent_live_gap" || event.type === "stream_gap") {
         repairWorkSurfaceFromDurable();
       }
     },

@@ -258,6 +258,7 @@ const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
   "agent_spawned",
   "agent_live_event",
   "agent_live_gap",
+  "stream_gap",
   "agent_progress",
   "agent_completed",
   "agent_failed",

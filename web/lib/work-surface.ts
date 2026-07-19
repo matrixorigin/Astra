@@ -42,6 +42,7 @@ const LIVE_WORK_SURFACE_EVENT_TYPES = [
   "agent_spawned",
   "agent_live_event",
   "agent_live_gap",
+  "stream_gap",
   "agent_progress",
   "agent_completed",
   "agent_failed",
@@ -412,6 +413,7 @@ export function applyWorkSurfaceEvent(
     case "agent_projection":
       return upsertAgent(state, event);
     case "agent_live_gap":
+    case "stream_gap":
       return applyLiveProjectionGap(state, event);
     default:
       return state;
@@ -423,8 +425,9 @@ function applyLiveProjectionGap(
   event: WorkSurfaceEvent,
 ): WorkSurfaceState {
   const dropped = numberField(event, "dropped_event_count") ?? 0;
-  const agentId = stringField(event, "agent_id") ?? "an agent";
-  const warning = `Live updates for ${agentId} were incomplete (${dropped} dropped); refreshing durable run state.`;
+  const agentId = stringField(event, "agent_id");
+  const scope = agentId ? ` for ${agentId}` : " for this run";
+  const warning = `Live updates${scope} were incomplete (${dropped} dropped); refreshing durable run state.`;
   return {
     ...state,
     warnings: state.warnings.includes(warning)

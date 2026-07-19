@@ -1162,7 +1162,7 @@ pub struct ServerAgenticLoopHost {
     /// When set, SSE events are also pushed through this channel for
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
-    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    event_tx: Option<ServerEventSender>,
     /// A server-side child may share its parent's client tool-delivery lane
     /// while retaining a separate transcript stream. Only edge-bound tool
     /// requests use that lane; ordinary child output stays on the typed live
@@ -1262,6 +1262,11 @@ struct AgentLiveMirror {
     sink: SharedAgentLiveEventSink,
 }
 
+enum ServerEventSender {
+    Bounded(tokio::sync::mpsc::Sender<Value>),
+    Unbounded(tokio::sync::mpsc::UnboundedSender<Value>),
+}
+
 /// Builder for [`ServerAgenticLoopHost`].
 pub struct ServerAgenticLoopHostBuilder {
     matrixone: MatrixOneSettings,
@@ -1283,7 +1288,6 @@ pub struct ServerAgenticLoopHostBuilder {
     turn_intent_policy: TurnIntentExecutionPolicy,
     full_llm_capture: bool,
     static_tool_catalog_admissible: bool,
-    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
     task_board_resume_hint: Option<String>,
@@ -1343,7 +1347,6 @@ impl ServerAgenticLoopHostBuilder {
             turn_intent_policy: TurnIntentExecutionPolicy::Auto,
             full_llm_capture: false,
             static_tool_catalog_admissible: true,
-            event_tx: None,
             plan_resume_hint: None,
             plan_authoring_active: false,
             task_board_resume_hint: None,
@@ -1748,7 +1751,7 @@ impl ServerAgenticLoopHostBuilder {
                 Some(std::time::Duration::from_secs(30)),
             ),
             emitted_events: Vec::new(),
-            event_tx: self.event_tx,
+            event_tx: None,
             prefer_client_tool_delivery: false,
             client_cancel_flag: None,
             client_cancel_token: None,
@@ -2470,26 +2473,31 @@ impl ServerAgenticLoopHost {
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
-    /// If the observer channel is closed or full, detach live delivery. The
-    /// durable run continues and may be observed again through run replay.
+    /// The internal host → fanout lane is lossless: it carries approvals as
+    /// well as progress and is isolated from network backpressure by the
+    /// fanout's bounded observer channel. A closed receiver detaches delivery.
     fn emit_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
         let streaming_turn = self.event_tx.is_some();
-        if let Some(ref tx) = self.event_tx {
-            match tx.try_send(event.clone()) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(target: "sse_channel", "SSE observer disconnected; detaching live stream while durable run continues");
-                    self.event_tx = None;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Backpressure is a delivery problem, not a user cancel. Detach
-                    // live streaming and keep the loop running so long jobs survive
-                    // slow clients or background tabs.
-                    tracing::warn!(target: "sse_channel", "SSE event channel full; detaching live stream without cancelling run");
-                    self.event_tx = None;
-                }
+        if let Some(sender) = &self.event_tx {
+            let disconnected = match sender {
+                ServerEventSender::Bounded(tx) => match tx.try_send(event.clone()) {
+                    Ok(()) => false,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Compatibility-only bounded hosts retain the old
+                        // detached behavior. Production root and child loops
+                        // install the lossless internal lane below.
+                        tracing::warn!(target: "sse_channel", "bounded compatibility stream filled; detaching it while durable run continues");
+                        true
+                    }
+                },
+                ServerEventSender::Unbounded(tx) => tx.send(event.clone()).is_err(),
+            };
+            if disconnected {
+                tracing::debug!(target: "sse_channel", "stream fanout disconnected; detaching live delivery while durable run continues");
+                self.event_tx = None;
             }
         }
         self.emitted_events.push(event);
@@ -2669,14 +2677,24 @@ impl ServerAgenticLoopHost {
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
     /// Channel closure detaches this observer; it does not cancel the run.
-    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+    pub(crate) fn set_unbounded_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
         // In live streaming mode, run_lifecycle owns the dedicated progress
         // bridge. Keeping the host subscription active would replay the same
         // agent progress events at turn-boundary drains, duplicating cards and
         // persisted work-surface deltas.
         self.progress_rx = None;
         self.progress_filter = None;
-        self.event_tx = Some(tx);
+        self.event_tx = Some(ServerEventSender::Unbounded(tx));
+    }
+
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+        self.progress_rx = None;
+        self.progress_filter = None;
+        self.event_tx = Some(ServerEventSender::Bounded(tx));
+    }
+
+    pub(crate) fn detach_event_tx(&mut self) {
+        self.event_tx = None;
     }
 
     /// Use the attached event channel as the executable client lane for
@@ -12622,7 +12640,7 @@ mod tests {
     }
 
     #[test]
-    fn full_sse_channel_detaches_stream_without_cancelling_run() {
+    fn lossless_internal_stream_preserves_approval_after_progress_burst() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -12634,12 +12652,15 @@ mod tests {
         let cancel_token = Arc::new(CancellationToken::new());
         host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(json!({"type": "preloaded"}))
-            .expect("pre-fill bounded channel");
-        host.set_event_tx(tx);
-
-        host.emit_event(json!({"type": "text_delta", "content": "slow client"}));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        host.set_unbounded_event_tx(tx);
+        for sequence in 0..1_024 {
+            host.emit_event(json!({"type": "text_delta", "sequence": sequence}));
+        }
+        host.emit_event(json!({
+            "type": "approval_required",
+            "request_id": "approval-after-burst",
+        }));
 
         assert!(
             !cancel_flag.load(Ordering::SeqCst),
@@ -12649,11 +12670,15 @@ mod tests {
             !cancel_token.is_cancelled(),
             "LLM cancellation token must remain active on channel backpressure"
         );
-        assert!(
-            host.event_tx.is_none(),
-            "live stream sender should be detached after bounded channel backpressure"
-        );
-        assert_eq!(host.emitted_events.len(), 1);
+        assert!(host.event_tx.is_some());
+        for expected_sequence in 0..1_024 {
+            let event = rx.try_recv().expect("every progress event remains ordered");
+            assert_eq!(event["sequence"], expected_sequence);
+        }
+        let approval = rx.try_recv().expect("approval survives the progress burst");
+        assert_eq!(approval["type"], "approval_required");
+        assert_eq!(approval["request_id"], "approval-after-burst");
+        assert_eq!(host.emitted_events.len(), 1_025);
     }
 
     #[test]
