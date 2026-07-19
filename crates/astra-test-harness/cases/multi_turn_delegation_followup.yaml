@@ -18,11 +18,14 @@ description: '**What**: Spawn a sub-agent in turn 1, then ask about its result i
   or the sub-agent failed to compute correctly.
 
   '
-prompt: "Use the spawn_agent tool with:\n  agent_id: \"calc-agent\"\n  task: \"Calculate\
-  \ 17*23. Output ONLY the final numeric answer 2014 nothing else, no JSON, no explanation,\
-  \ no tool description, no formatting, no extra words\"\n\nThe child runs synchronously\
-  \ — you will receive its reply directly\nin the tool result. Tell me what it says.\n\
-  \nDo not use any other tools after receiving the child reply.\n"
+prompt: |
+  Use the `agent` tool with action `spawn` to start one foreground child:
+    description: "Calculate 17 times 23"
+    prompt: "Calculate 17*23. Output only the final numeric answer, with no JSON, explanation, tool description, formatting, or extra words."
+    agent_type: "general-purpose"
+
+  The child result returns through the foreground tool call. Tell me the
+  numerical result it gave you. Do not use other tools after receiving it.
 capability: delegation
 difficulty: 3
 weight: 2.0

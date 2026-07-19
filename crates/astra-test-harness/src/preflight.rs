@@ -38,13 +38,18 @@ fn stderr_indicates_model_inactive(stderr: &str, model: &str) -> bool {
 
 /// Run all pre-flight checks in order. Validates binary, server, and
 /// every model in the matrix (not just the first).
-pub async fn run_preflight(astra_bin: &Path, models: &[String]) -> Result<(), PreflightError> {
+pub async fn run_preflight(
+    astra_bin: &Path,
+    models: &[String],
+    requested_profile: Option<&str>,
+) -> Result<Option<String>, PreflightError> {
     check_binary(astra_bin)?;
     check_server(astra_bin).await?;
+    let mut effective_profile = requested_profile.map(str::to_string);
     for model in models {
-        check_model(astra_bin, model).await?;
+        effective_profile = check_model(astra_bin, model, effective_profile.as_deref()).await?;
     }
-    Ok(())
+    Ok(effective_profile)
 }
 
 fn check_binary(astra_bin: &Path) -> Result<(), PreflightError> {
@@ -93,11 +98,33 @@ async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
     Ok(())
 }
 
-async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError> {
+fn astra_command(astra_bin: &Path, profile: Option<&str>) -> Command {
+    let mut command = Command::new(astra_bin);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    command
+}
+
+async fn check_model(
+    astra_bin: &Path,
+    model: &str,
+    profile: Option<&str>,
+) -> Result<Option<String>, PreflightError> {
+    let mut command = astra_command(astra_bin, profile);
+    command.args([
+        "chat",
+        "-m",
+        "ping",
+        "--no-resume",
+        "--model",
+        model,
+        "--json",
+        "-y",
+    ]);
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new(astra_bin)
-            .args(["chat", "-m", "ping", "--model", model, "--json", "-y"])
+        command
             .env("NO_PROXY", "localhost,127.0.0.1")
             .env("no_proxy", "localhost,127.0.0.1")
             .output(),
@@ -129,32 +156,75 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
     }
 
     if stderr_indicates_cli_auth_failure(&stderr) {
-        // Try auto-login: register a harness user and retry.
-        eprintln!("[astra-test] preflight: auth failed, attempting auto-register...");
-        if try_auto_register(astra_bin).await {
-            // Retry the model check after registration.
-            let retry = tokio::time::timeout(
-                Duration::from_secs(30),
-                Command::new(astra_bin)
-                    .args(["chat", "-m", "ping", "--model", model, "--json", "-y"])
-                    .env("NO_PROXY", "localhost,127.0.0.1")
-                    .env("no_proxy", "localhost,127.0.0.1")
-                    .output(),
-            )
-            .await;
-            match retry {
-                Ok(Ok(o)) if o.status.success() => {
-                    eprintln!(
-                        "[astra-test] preflight: auto-register succeeded, model `{model}` OK"
-                    );
-                    return Ok(());
+        // Try auto-login in an isolated profile and retry. The CLI owns its
+        // credential store; the harness must never parse tokens and write that
+        // file through a second implementation.
+        let auto_profile = profile.unwrap_or("harness-auto");
+        eprintln!(
+            "[astra-test] preflight: auth failed, attempting auto-register in profile `{auto_profile}`..."
+        );
+        match try_auto_register(astra_bin, auto_profile).await {
+            Ok(()) => {
+                // Retry the model check after registration.
+                let mut retry_command = astra_command(astra_bin, Some(auto_profile));
+                retry_command.args([
+                    "chat",
+                    "-m",
+                    "ping",
+                    "--no-resume",
+                    "--model",
+                    model,
+                    "--json",
+                    "-y",
+                ]);
+                let retry = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    retry_command
+                        .env("NO_PROXY", "localhost,127.0.0.1")
+                        .env("no_proxy", "localhost,127.0.0.1")
+                        .output(),
+                )
+                .await;
+                match retry {
+                    Ok(Ok(o)) if o.status.success() => {
+                        eprintln!(
+                            "[astra-test] preflight: profile `{auto_profile}` authenticated, model `{model}` OK"
+                        );
+                        return Ok(Some(auto_profile.to_string()));
+                    }
+                    Ok(Ok(o)) => {
+                        let retry_stderr = String::from_utf8_lossy(&o.stderr);
+                        return Err(PreflightError::ModelUnavailable {
+                            model: model.to_string(),
+                            detail: format!(
+                                "profile `{auto_profile}` authenticated, but model probe exited {}: {}",
+                                o.status.code().unwrap_or(-1),
+                                retry_stderr.trim()
+                            ),
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        return Err(PreflightError::ModelUnavailable {
+                            model: model.to_string(),
+                            detail: format!("retry spawn failed: {error}"),
+                        });
+                    }
+                    Err(_) => {
+                        return Err(PreflightError::ModelUnavailable {
+                            model: model.to_string(),
+                            detail: "retry timed out after 30s".to_string(),
+                        });
+                    }
                 }
-                _ => {}
+            }
+            Err(detail) => {
+                return Err(PreflightError::AuthFailed {
+                    detail: format!(
+                        "profile `{auto_profile}` is invalid and isolated auto-register/login failed: {detail}. If this database already has an administrator, log in with `astra --profile {auto_profile} admin login`"
+                    ),
+                });
             }
         }
-        return Err(PreflightError::AuthFailed {
-            detail: "credentials invalid and auto-register failed. Run: astra admin register && astra admin login".to_string(),
-        });
     }
 
     if !output.status.success() {
@@ -169,18 +239,20 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
     }
 
     eprintln!("[astra-test] preflight: model `{model}` responded OK");
-    Ok(())
+    Ok(profile.map(str::to_string))
 }
 
 /// Try to register a test user via `astra admin` and login via astra CLI.
-/// Returns true if credentials are now valid.
-async fn try_auto_register(astra_bin: &Path) -> bool {
+/// The CLI is the only owner of credential persistence; a successful login
+/// means the requested profile is ready for every subsequent subprocess.
+async fn try_auto_register(astra_bin: &Path, profile: &str) -> Result<(), String> {
     if !astra_bin.exists() {
-        return false;
+        return Err("astra binary disappeared before registration".to_string());
     }
 
     // Register (may fail if user already exists — that's fine).
-    let _ = Command::new(astra_bin)
+    let mut register_command = astra_command(astra_bin, Some(profile));
+    let register_out = register_command
         .args([
             "admin",
             "register",
@@ -195,7 +267,8 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
         .await;
 
     // Login to get fresh tokens.
-    let login_out = Command::new(astra_bin)
+    let mut login_command = astra_command(astra_bin, Some(profile));
+    let login_out = login_command
         .args([
             "admin",
             "login",
@@ -210,63 +283,24 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
         .await;
 
     match login_out {
-        Ok(o) if o.status.success() => {
-            // Parse tokens from login output and write to credentials.
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                let access = v.get("access_token").and_then(|t| t.as_str());
-                let refresh = v.get("refresh_token").and_then(|t| t.as_str());
-                if let (Some(a), Some(r)) = (access, refresh) {
-                    return write_credentials(a, r);
-                }
-            }
-            false
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let register_detail = match register_out {
+                Ok(registered) => format!(
+                    "exit {} ({})",
+                    registered.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&registered.stderr).trim()
+                ),
+                Err(error) => format!("spawn failed: {error}"),
+            };
+            let login_detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(format!(
+                "register={register_detail}; login={} ({login_detail})",
+                output.status.code().unwrap_or(-1)
+            ))
         }
-        _ => false,
+        Err(error) => Err(format!("failed to spawn login: {error}")),
     }
-}
-
-/// Write fresh credentials to ~/.astra/credentials.json under the
-/// `harness-auto` profile to avoid clobbering user's active session.
-fn write_credentials(access_token: &str, refresh_token: &str) -> bool {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    let creds_path = std::path::Path::new(&home).join(".astra/credentials.json");
-
-    let mut creds: serde_json::Value = std::fs::read_to_string(&creds_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({"profiles": {}}));
-
-    if let Some(profiles) = creds.get_mut("profiles").and_then(|p| p.as_object_mut()) {
-        profiles.insert(
-            "harness-auto".to_string(),
-            serde_json::json!({
-                "username": "harness-auto",
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "last_session_id": null,
-                "memoria_api_key": null
-            }),
-        );
-    }
-    if creds.get("current_profile").is_none() {
-        creds["current_profile"] = serde_json::json!("harness-auto");
-    }
-
-    let ok = std::fs::write(
-        &creds_path,
-        serde_json::to_string_pretty(&creds).unwrap_or_default(),
-    )
-    .is_ok();
-    #[cfg(unix)]
-    if ok {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600));
-    }
-    ok
 }
 
 #[cfg(test)]
@@ -290,11 +324,36 @@ mod tests {
 
     #[tokio::test]
     async fn model_check_spawn_failure() {
-        let result = check_model(Path::new("/nonexistent/astra"), "gpt-4").await;
+        let result = check_model(Path::new("/nonexistent/astra"), "gpt-4", None).await;
         assert!(matches!(
             result,
             Err(PreflightError::ModelUnavailable { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_uses_requested_profile_without_resuming_user_session() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let bin = dir.path().join("astra-shim");
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile = check_model(&bin, "deepseek", Some("isolated-harness"))
+            .await
+            .unwrap();
+        assert_eq!(profile.as_deref(), Some("isolated-harness"));
+        let args = fs::read_to_string(log).unwrap();
+        assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
+        assert!(args.contains("--no-resume\n"), "{args}");
     }
 
     #[test]
@@ -335,5 +394,36 @@ mod tests {
 
         let result = check_binary(&bin);
         assert!(matches!(result, Err(PreflightError::BinaryNotExecutable)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_register_delegates_profile_persistence_to_cli() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let bin = dir.path().join("astra-shim");
+        fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        try_auto_register(&bin, "isolated-harness").await.unwrap();
+
+        let calls = fs::read_to_string(log).unwrap();
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 2, "{calls}");
+        assert!(
+            lines[0].starts_with("--profile isolated-harness admin register"),
+            "{calls}"
+        );
+        assert!(
+            lines[1].starts_with("--profile isolated-harness admin login"),
+            "{calls}"
+        );
     }
 }

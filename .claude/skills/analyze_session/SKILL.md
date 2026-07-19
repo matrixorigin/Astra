@@ -40,6 +40,22 @@ astra journal digest <SESSION_ID> --focus summary --format json
 If `astra` is not on `PATH`, try an existing local binary such as
 `target/debug/astra` or `target/release/astra`.
 
+Record the exact executable used and its build timestamp before comparing the
+session with current source:
+
+```bash
+ASTRA_BIN="$(command -v astra 2>/dev/null || true)"
+test -n "$ASTRA_BIN" || ASTRA_BIN=target/debug/astra
+readlink -f "$ASTRA_BIN"
+stat "$ASTRA_BIN"
+git log -1 --format='%H %cI'
+```
+
+A journal proves what the executed binary did, not what the current checkout
+would do. If the binary predates a relevant commit or its provenance is
+unknown, label current-code conclusions separately and rebuild before claiming
+the session reproduces on HEAD.
+
 For `/tmp/debug-*.json` input, skip digest metrics and use the debug dump only for
 the message/tool/prompt snapshot it contains.
 
@@ -91,6 +107,25 @@ Flow:
 - Reconstruct the session as `user intent -> turn sequence -> tool outcomes -> compaction/stall/errors -> final state`.
 - Prefer the smallest explanation that accounts for the observed sequence.
 
+Async work and delegation:
+
+- Treat the producer-owned work unit (for example one fixed-size fanout group),
+  not each transport event or child, as the lifecycle unit.
+- A child `turn_complete`, a mailbox event, a progress row, `not_found`, or an
+  empty shell-task list is not evidence that the parent work unit completed.
+- Verify every completion claim against a canonical terminal observation or
+  aggregate whose terminal count equals its target count. Quote the exact
+  contradictory tool result when the model claims more than the producer did.
+- Reconstruct event order: group creation -> accepted identities -> child
+  transitions -> canonical group settlement -> parent synthesis. Report extra
+  parent LLM boundaries between child transitions as a wake/coalescing defect,
+  even if the eventual answer is correct.
+- Separate model epistemic failure from enforcement failure. If the runtime
+  supplied non-terminal truth but still allowed an impossible completion claim,
+  both layers contributed; a stronger prompt alone is not a system fix.
+- Check CLI-only, CLI+Server, and Edge+Server ownership separately. Equivalent
+  status words do not prove they share the same producer or wake contract.
+
 ## Phase 4: Optional Deep Evidence
 
 Use only when the digest does not answer the question.
@@ -112,6 +147,7 @@ Findings:
 
 Evidence:
 - session=<id>, schema=<schema>, turns=<n>, failed_tools=<n>, stalls=<n>, compactions=<n>
+- executable=<resolved path>, built=<timestamp>, source_head=<sha>, provenance=<matched|predates|unknown>
 - <turn/tool/error citations>
 
 Root cause:

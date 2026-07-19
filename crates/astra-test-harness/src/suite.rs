@@ -487,6 +487,19 @@ impl<'a> SuiteRunner<'a> {
         } else {
             None
         };
+        let mut judger_outcome = outcome.clone();
+        if let Some(session) = &session {
+            // Preserve complete moderate-sized receipts here; the judger owns
+            // the final 8k head+tail prompt bound, which keeps both the start
+            // contract and terminal tail of larger fanout results visible.
+            let evidence = session.render_tool_evidence(16_000);
+            if !evidence.is_empty() {
+                judger_outcome
+                    .stderr
+                    .push_str("\n[durable-tool-evidence jsonl]\n");
+                judger_outcome.stderr.push_str(&evidence);
+            }
+        }
 
         // Evaluate criteria.
         // Auto-attach a default judger criterion when the case has none
@@ -530,7 +543,7 @@ impl<'a> SuiteRunner<'a> {
         if !self.no_judger {
             for (i, c) in criteria.iter().enumerate() {
                 if matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. })
-                    && let Some(res) = evaluate_judger(self.judger, c, &outcome).await
+                    && let Some(res) = evaluate_judger(self.judger, c, &judger_outcome).await
                 {
                     det[i] = res;
                 }

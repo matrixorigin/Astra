@@ -56,6 +56,8 @@ pub struct JudgerScore {
 #[derive(Debug, Clone)]
 pub struct JudgerConfig {
     pub astra_bin: PathBuf,
+    /// Optional credential profile shared with the case executor.
+    pub profile: Option<String>,
     /// Default model to use when a Judger criterion doesn't
     /// specify its own.
     pub default_model: String,
@@ -67,6 +69,7 @@ impl JudgerConfig {
     pub fn new(astra_bin: impl Into<PathBuf>, default_model: impl Into<String>) -> Self {
         Self {
             astra_bin: astra_bin.into(),
+            profile: None,
             default_model: default_model.into(),
             timeout_seconds: 120,
         }
@@ -284,9 +287,13 @@ async fn run_judger_call(
     use tokio::process::Command;
 
     let mut cmd = Command::new(&cfg.astra_bin);
+    if let Some(profile) = &cfg.profile {
+        cmd.arg("--profile").arg(profile);
+    }
     cmd.arg("chat")
         .arg("-m")
         .arg(prompt)
+        .arg("--no-resume")
         .arg("--model")
         .arg(model)
         .arg("--json")
@@ -818,6 +825,36 @@ mod tests {
             err.contains("exit_code=Some(42)"),
             "subprocess exit code must appear: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judger_uses_shared_profile_without_resuming_tested_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = tmp.path().join("args.log");
+        let shim = tmp.path().join("fake-astra");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"text\":\"receipt verified\\nSCORE: 1.0\"}}'\n",
+                log.display()
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg = JudgerConfig::new(shim, "judge-model");
+        cfg.profile = Some("isolated-harness".into());
+        let score = AstraCliJudger::new(cfg)
+            .score("question", None, &dummy_outcome())
+            .await
+            .unwrap();
+        assert_eq!(score.score, 1.0);
+        let args = std::fs::read_to_string(log).unwrap();
+        assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
+        assert!(args.contains("--no-resume\n"), "{args}");
     }
 
     fn dummy_outcome() -> RunOutcome {

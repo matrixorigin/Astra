@@ -28,6 +28,19 @@ pub struct JournalEvent {
     pub raw: serde_json::Value,
 }
 
+/// One complete tool record from a durable `turn`/`llm_round` journal event.
+/// Step events deliberately carry previews, so contract assertions use this
+/// full record instead of mistaking truncated observability for lifecycle
+/// evidence.
+#[derive(Debug, Clone)]
+pub struct JournalToolCall {
+    pub call_id: Option<String>,
+    pub name: String,
+    pub ok: Option<bool>,
+    pub arguments: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+}
+
 /// Loaded session with minimal summary counters the report uses.
 ///
 /// `#[non_exhaustive]`: this struct serializes into `--format json`
@@ -92,7 +105,7 @@ impl SessionCapture {
         };
         for e in &self.events {
             // Shape 1: legacy llm_round with nested tool_calls array.
-            if e.event_type == "llm_round"
+            if (e.event_type == "llm_round" || e.event_type == "turn")
                 && let Some(calls) = e.raw.get("tool_calls").and_then(|v| v.as_array())
             {
                 for c in calls {
@@ -123,6 +136,76 @@ impl SessionCapture {
             }
         }
         out
+    }
+
+    /// Complete, de-duplicated tool calls persisted in turn records.
+    pub fn journal_tool_calls(&self) -> Vec<JournalToolCall> {
+        let mut calls = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        for event in &self.events {
+            if event.event_type != "turn" && event.event_type != "llm_round" {
+                continue;
+            }
+            let Some(records) = event
+                .raw
+                .get("tool_calls")
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            for record in records {
+                let Some(name) = record.get("name").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let call_id = record
+                    .get("tool_call_id")
+                    .or_else(|| record.get("call_id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if let Some(call_id) = &call_id
+                    && !seen_ids.insert(call_id.clone())
+                {
+                    continue;
+                }
+                calls.push(JournalToolCall {
+                    call_id,
+                    name: name.to_string(),
+                    ok: record.get("ok").and_then(|value| value.as_bool()),
+                    arguments: embedded_json(
+                        record.get("args_full").or_else(|| record.get("args")),
+                    ),
+                    result: embedded_json(
+                        record.get("result_full").or_else(|| record.get("result")),
+                    ),
+                });
+            }
+        }
+        calls
+    }
+
+    /// Bounded durable evidence supplied to an LLM judger. The journal stays
+    /// authoritative; this is only a transparent projection that lets a
+    /// cross-family judge verify arguments and results instead of trusting the
+    /// final assistant's self-report.
+    pub fn render_tool_evidence(&self, max_chars: usize) -> String {
+        let mut rendered = String::new();
+        for call in self.journal_tool_calls() {
+            let record = serde_json::json!({
+                "call_id": call.call_id,
+                "name": call.name,
+                "ok": call.ok,
+                "arguments": call.arguments,
+                "result": call.result,
+            });
+            let line = serde_json::to_string(&record).unwrap_or_default();
+            if rendered.chars().count() + line.chars().count() + 1 > max_chars {
+                rendered.push_str("[remaining durable tool evidence elided by harness bound]\n");
+                break;
+            }
+            rendered.push_str(&line);
+            rendered.push('\n');
+        }
+        rendered
     }
 
     /// Exact memory records created by this session according to the store
@@ -180,6 +263,15 @@ impl SessionCapture {
             }
         }
         ids
+    }
+}
+
+fn embedded_json(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    match value? {
+        serde_json::Value::String(text) => serde_json::from_str(text)
+            .ok()
+            .or_else(|| Some(serde_json::Value::String(text.clone()))),
+        value => Some(value.clone()),
     }
 }
 
@@ -638,6 +730,55 @@ mod tests {
         assert_eq!(stats.turn_rounds, 1);
         assert_eq!(stats.total_tool_calls, 1);
         assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn complete_turn_tool_records_drive_contract_evidence() {
+        let capture = SessionCapture {
+            session_id: "fanout-session".into(),
+            journal_path: PathBuf::from("/tmp/fanout.jsonl"),
+            skipped_lines: 0,
+            dropped_lines: 0,
+            events: vec![
+                JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({
+                        "tool_calls": [{
+                            "tool_call_id": "call-1",
+                            "name": "agent_fanout",
+                            "ok": true,
+                            "args_full": r#"{"action":"start","target_count":3}"#,
+                            "result_full": r#"{"fanout":{"terminal":3},"provenance":{"all_slots_delivered":true}}"#
+                        }]
+                    }),
+                },
+                JournalEvent {
+                    event_type: "llm_round".into(),
+                    raw: serde_json::json!({
+                        "tool_calls": [{
+                            "tool_call_id": "call-1",
+                            "name": "agent_fanout",
+                            "args_full": "duplicate must be ignored"
+                        }]
+                    }),
+                },
+                JournalEvent {
+                    event_type: "ToolCallCompleted".into(),
+                    raw: serde_json::json!({
+                        "payload": {"tool_name":"agent_fanout","output":"truncated preview"}
+                    }),
+                },
+            ],
+        };
+
+        assert_eq!(capture.tools_invoked(), vec!["agent_fanout"]);
+        let calls = capture.journal_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments.as_ref().unwrap()["target_count"], 3);
+        assert_eq!(calls[0].result.as_ref().unwrap()["fanout"]["terminal"], 3);
+        let evidence = capture.render_tool_evidence(4096);
+        assert!(evidence.contains("all_slots_delivered"), "{evidence}");
+        assert!(!evidence.contains("truncated preview"), "{evidence}");
     }
 
     #[test]

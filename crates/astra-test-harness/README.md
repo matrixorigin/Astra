@@ -125,7 +125,10 @@ criteria:
 | `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
 | `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type                      | journal     |
 | `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
+| `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
+| `journal_tool_json { name, document, path, equals }`| full arguments/result has the exact JSON-pointer value       | journal     |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
+| `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
 
 ### Criterion severity levels
 
@@ -133,9 +136,9 @@ Each criterion has a severity that controls how failures are treated:
 
 | Severity    | Meaning                                                                                                                            | Criteria types                                                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hard**    | Fundamental correctness — failure means the case did not work. Blocks the LLM judger from running (no point scoring a broken run). | `exit_code`, `tool_called`, `text_contains`, `tool_sequence`, `fork_cache_outcome`                                                              |
+| **Hard**    | Fundamental correctness — failure means the case did not work. The judger still runs for diagnostics.                              | envelope correctness, `hard_judger`, strict journal checks, durable tool JSON/count checks                                                     |
 | **Soft**    | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger.          | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `prompt_cache_tokens`, `stderr_matches` |
-| **Quality** | Continuous quality score (0.0-1.0) rather than binary pass/fail.                                                                   | `judger`, `session_event_count`, `journal_tool_called`                                                                                          |
+| **Quality** | Advisory quality signal; failure is a warning rather than a product failure.                                                       | `judger`, optional journal checks                                                                                                               |
 
 Severity is assigned automatically based on criterion type (see
 `criterion_severity()` in `src/criteria.rs`). Case authors do not set
@@ -155,11 +158,12 @@ manual judger config in each YAML. Disable with `--no-judger`.
 
 ### Session-based criteria semantics
 
-`session_event_count` and `journal_tool_called` require a loaded
-session. **Default is strict:** if the session isn't available and
-the criterion was declared, the case FAILs with a hint telling the
-reviewer how to enable capture. Set `optional: true` to skip-pass
-when the session is missing.
+All journal criteria require a loaded session. `session_event_count` and
+`journal_tool_called` are hard requirements by default; set `optional: true`
+only when missing evidence is explicitly acceptable. `journal_tool_call_count`
+and `journal_tool_json` always fail without complete durable evidence. The JSON
+criterion parses `args_full`/`result_full` and applies an RFC 6901 pointer, so
+truncated previews and assistant self-reports cannot satisfy it.
 
 Enable capture by either:
 
@@ -192,6 +196,9 @@ correctly do X?"). Key features:
 - **Sees stderr**: the `[fork-cache]` / `[selector]` observability
   events are embedded (head+tail truncated to 8k chars) so the
   judger can read them.
+- **Sees durable tool receipts**: when a session is captured, bounded complete
+  call arguments/results are projected from the journal into the judger's
+  untrusted-data section. The durable journal remains the source of truth.
 - **Quorum voting**: `--judger-n 3 --judger-agg median` runs the
   judger three times and takes the median, smoothing single-call
   variance. Dissenting votes are preserved in `full_rationale` so a

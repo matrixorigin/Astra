@@ -101,6 +101,11 @@ State:
 - Are transitions valid from every previous state?
 - Are duplicate, stale, out-of-order, and cancellation cases handled?
 - Is persistent state written atomically enough for restore/sync?
+- Can any consumer derive terminal state from a child/transport event, lookup
+  miss, timeout, or cached projection instead of the producer-owned lifecycle?
+- For grouped work, can one slot transition trigger parent analysis before the
+  fixed-size group settles, or can several slot transitions schedule duplicate
+  wakes?
 
 Resource:
 

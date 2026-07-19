@@ -1,0 +1,114 @@
+name: fanout_completion_truth
+description: |
+  **What**: Execute three independent child prompts as one fixed-size fanout and
+  require synthesis only after the canonical group settles.
+  **Tests**: Tool discovery, typed fanout launch, child result aggregation, and
+  completion truth across a real provider. The final answer must contain evidence
+  from every accepted slot and the exact 3/3 settlement ratio.
+  **Why**: Individual child events are progress, not group completion. Treating
+  one child result, a transient lookup miss, or an empty background-shell list as
+  fanout settlement creates fabricated "all completed" answers.
+  **Pass means**: `agent_fanout` ran once as a three-slot work unit, all three
+  child outputs reached the parent, and the parent synthesized the terminal group.
+  **Fail means**: The tool was bypassed, evidence was invented or dropped, a slot
+  was silently replaced, or the parent claimed completion without 3/3 evidence.
+prompt: |
+  Use `agent_fanout` to run exactly one fixed group with target_count 3. Give the
+  group a stable ID. The three slots are independent and must not be replaced or
+  retried:
+
+  1. Ask one child to reply with exactly `FANOUT-EVIDENCE-ALPHA`.
+  2. Ask one child to reply with exactly `FANOUT-EVIDENCE-BETA`.
+  3. Ask one child to reply with exactly `FANOUT-EVIDENCE-GAMMA`.
+
+  Treat child progress as non-terminal. Synthesize from the canonical group
+  result only after all three slots have settled. In the final answer, state the
+  settlement ratio `3/3` and include all three exact evidence tokens. Do not call
+  individual `agent` spawns and do not create replacement slots.
+models:
+  - deepseek-v4-pro-official
+capability: delegation
+difficulty: 4
+weight: 3.0
+timeout_seconds: 300
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: agent_fanout
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/terminal
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /provenance/all_slots_delivered
+    equals: true
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /work_unit_observation/status
+    equals: completed
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /results/0/result/result
+    equals: FANOUT-EVIDENCE-ALPHA
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /results/1/result/result
+    equals: FANOUT-EVIDENCE-BETA
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /results/2/result/result
+    equals: FANOUT-EVIDENCE-GAMMA
+  - type: tools_count_between
+    min: 1
+    max: 8
+  - type: turn_rounds_between
+    min: 2
+    max: 8
+  - type: text_contains
+    needle: "3/3"
+  - type: text_contains
+    needle: "FANOUT-EVIDENCE-ALPHA"
+  - type: text_contains
+    needle: "FANOUT-EVIDENCE-BETA"
+  - type: text_contains
+    needle: "FANOUT-EVIDENCE-GAMMA"
+  - type: hard_judger
+    question: |
+      Did the agent use one three-slot fanout, wait for the canonical group to
+      settle, and synthesize exactly the three returned evidence tokens without
+      replacing slots or claiming completion from partial progress? Score 1.0
+      only when the final answer truthfully reports 3/3 and all three tokens;
+      score 0.0 if any token is missing or fabricated, if individual spawns were
+      substituted, or if completion was claimed from a non-terminal group.
+    threshold: 0.9

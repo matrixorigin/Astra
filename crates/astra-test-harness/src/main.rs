@@ -345,6 +345,7 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let mut runner_profile = args.profile.clone();
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
@@ -364,8 +365,12 @@ async fn main() -> Result<()> {
             all_models.dedup();
             all_models
         };
-        match run_preflight(&astra_bin, &preflight_models).await {
-            Ok(_) => {}
+        match run_preflight(&astra_bin, &preflight_models, args.profile.as_deref()).await {
+            Ok(effective_profile) => {
+                if effective_profile.is_some() {
+                    runner_profile = effective_profile;
+                }
+            }
             Err(e) => {
                 anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
             }
@@ -375,10 +380,11 @@ async fn main() -> Result<()> {
     let mut runner_cfg =
         RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
     runner_cfg.working_dir = args.working_dir.clone();
-    runner_cfg.profile = args.profile.clone();
+    runner_cfg.profile = runner_profile.clone();
 
     let judger_cfg = JudgerConfig {
         astra_bin: astra_bin.clone(),
+        profile: runner_profile.clone(),
         default_model: args.judger_model.clone(),
         timeout_seconds: args.judger_timeout,
     };
@@ -525,6 +531,7 @@ async fn main() -> Result<()> {
         eprintln!("[astra-test] generating LLM summary (model={summary_model})...");
         match astra_test_harness::summarizer::summarize(
             &astra_bin,
+            runner_profile.as_deref(),
             summary_model,
             &suite,
             args.summarize_timeout,

@@ -64,6 +64,13 @@ or compatibility layer:
    tables, compatibility paths, and net code. Added tests do not cancel out a
    second source of truth.
 
+Lifecycle status is owned by the producer that performs the transition. Put
+the canonical typed projection on that producer and make CLI, server, UI,
+persistence, and wake logic consume it. Consumers must not independently
+re-count child states or translate transport events into lifecycle truth. A
+fixed-size fanout is one work unit: individual child events are progress, and
+only the canonical group terminal transition may authorize parent synthesis.
+
 For persistence, a mock-only test is insufficient. Prove schema bootstrap,
 query/transaction semantics, failure behavior, and the public caller against
 the real configured database whenever the change crosses that boundary.

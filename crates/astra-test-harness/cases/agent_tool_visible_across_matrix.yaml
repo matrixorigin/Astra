@@ -6,9 +6,10 @@ description: |
   **Pass means**: All three model families discovered the agent tool and used it, proving the surface contract is universal.
   **Fail means**: Tool surface regression — `agent` is hidden from one or more model families.
 prompt: |
-  You have a `spawn_agent` tool. Call it with:
-    agent_id: "child-G3"
-    task: "Say the exact text: G3-matrix-ok. Do not use any tools, just reply with that text."
+  Use the `agent` tool with action `spawn` to start one foreground child:
+    description: "G3 matrix child"
+    prompt: "Say the exact text: G3-matrix-ok. Do not use any tools, just reply with that text."
+    agent_type: "general-purpose"
 
   Surface the child's exact reply in your final answer.
 models:

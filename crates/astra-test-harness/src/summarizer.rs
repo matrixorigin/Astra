@@ -130,6 +130,7 @@ fn build_summarizer_prompt(payload: &serde_json::Value) -> String {
 /// Run the summarizer by invoking the astra CLI. Returns the summary text.
 pub async fn summarize(
     astra_bin: &Path,
+    profile: Option<&str>,
     model: &str,
     report: &SuiteReport,
     timeout_seconds: u64,
@@ -139,10 +140,15 @@ pub async fn summarize(
     let payload = build_summary_payload(report);
     let prompt = build_summarizer_prompt(&payload);
 
-    let child = Command::new(astra_bin)
+    let mut command = Command::new(astra_bin);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    let child = command
         .arg("chat")
         .arg("-m")
         .arg(&prompt)
+        .arg("--no-resume")
         .arg("--model")
         .arg(model)
         .arg("--json")

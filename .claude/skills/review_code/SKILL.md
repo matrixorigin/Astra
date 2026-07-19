@@ -58,8 +58,9 @@ For each changed behavior, identify:
 | DB write or projection | Test asserts persisted state, not just `Ok(())` |
 | Restore/sync/checkpoint | Test covers missing, stale, duplicate, or partial data |
 | Auth/permission/capability | Denied case and allowed case |
-| State machine/lifecycle | Out-of-order, double-submit, retry, cancellation, terminal-state behavior |
+| State machine/lifecycle | Out-of-order, double-submit, retry, cancellation, terminal-state behavior; every consumer uses the producer-owned status vocabulary |
 | Async task/channel/lock | Cancellation/timeout/cleanup or bounded queue behavior |
+| Fanout/background work | Partial child completion does not wake/synthesize; lookup miss is not terminal; one canonical group wake after settlement |
 | Prompt/tool/skill selection | Test proves the selection rule, not just string presence |
 
 Use `rg` to find tests before reading them:
@@ -86,6 +87,10 @@ Weak test:
 Covered:
 
 - Test reaches the public path, asserts the relevant state/output, and includes at least one failure/lifecycle edge when that edge is material.
+- Async journey tests assert causal counts (model requests, terminal transitions,
+  durable rows, and wake boundaries), not merely final rendered text or elapsed
+  time. At least one real transport/public entrypoint test complements producer
+  unit tests when the change crosses CLI/server/edge topology.
 
 ## Output Contract
 

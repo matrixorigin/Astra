@@ -450,7 +450,7 @@ async fn analyze_handler(
     };
 
     let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
-    match crate::summarizer::summarize(&state.config.astra_bin, model, r, 300).await {
+    match crate::summarizer::summarize(&state.config.astra_bin, None, model, r, 300).await {
         Ok(text) => Json(serde_json::json!({"analysis": text})),
         Err(e) => Json(serde_json::json!({"error": e})),
     }

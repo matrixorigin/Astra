@@ -91,6 +91,17 @@ pub enum Criterion {
         optional: bool,
     },
 
+    /// Exact number of complete tool-call records in durable turn events.
+    JournalToolCallCount { name: String, min: u32, max: u32 },
+
+    /// Exact JSON-pointer assertion against a complete durable tool call.
+    JournalToolJson {
+        name: String,
+        document: JournalToolDocument,
+        path: String,
+        equals: serde_json::Value,
+    },
+
     /// Passes when at least one `[fork-cache]` JSON event in stderr
     /// has its `outcome` field in `expect`. Pins the exact runtime
     /// contract (see `ForkCacheEvent` in astra-turn-core) — outcomes
@@ -243,6 +254,13 @@ fn default_event_min() -> u32 {
     1
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalToolDocument {
+    Arguments,
+    Result,
+}
+
 /// How severe a criterion failure is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -296,8 +314,17 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::ToolSequence { .. }
         | Criterion::ForkCacheOutcome { .. }
         | Criterion::HardJudger { .. }
+        | Criterion::JournalToolCallCount { .. }
+        | Criterion::JournalToolJson { .. }
         | Criterion::AnyOf { .. }
         | Criterion::AllOf { .. } => CriterionSeverity::Hard,
+
+        Criterion::SessionEventCount {
+            optional: false, ..
+        }
+        | Criterion::JournalToolCalled {
+            optional: false, ..
+        } => CriterionSeverity::Hard,
 
         Criterion::ToolsCountBetween { .. }
         | Criterion::TokensBetween { .. }
@@ -308,8 +335,8 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
 
         Criterion::Judger { .. }
-        | Criterion::SessionEventCount { .. }
-        | Criterion::JournalToolCalled { .. }
+        | Criterion::SessionEventCount { optional: true, .. }
+        | Criterion::JournalToolCalled { optional: true, .. }
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. } => CriterionSeverity::Quality,
     }
@@ -356,12 +383,27 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
         | Criterion::JournalToolCalled { .. }
+        | Criterion::JournalToolCallCount { .. }
+        | Criterion::JournalToolJson { .. }
         | Criterion::PipelineAlertCount { .. }
         | Criterion::PipelineAvgCacheHitRatio { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_session_capture(criteria)
         }
         _ => false,
+    }
+}
+
+fn missing_required_session(c: &Criterion, label: &str) -> CriterionResult {
+    CriterionResult {
+        criterion: c.clone(),
+        severity: criterion_severity(c),
+        passed: false,
+        detail: format!(
+            "{label} FAILED: no session loaded (enable debug_log: true / --capture-session)"
+        ),
+        full_detail: None,
+        score: None,
     }
 }
 
@@ -650,6 +692,57 @@ fn evaluate_one(
                 } else {
                     format!("journal tool {name} NOT invoked (journal tools: {tools:?})")
                 },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::JournalToolCallCount { name, min, max } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "journal_tool_call_count");
+            };
+            let count = session
+                .journal_tool_calls()
+                .iter()
+                .filter(|call| call.name == *name)
+                .count() as u32;
+            let passed = count >= *min && count <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!(
+                    "journal tool {name} full-call count={count}, expected {min}..={max}"
+                ),
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::JournalToolJson {
+            name,
+            document,
+            path,
+            equals,
+        } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "journal_tool_json");
+            };
+            let calls = session.journal_tool_calls();
+            let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
+                let value = match document {
+                    JournalToolDocument::Arguments => call.arguments.as_ref(),
+                    JournalToolDocument::Result => call.result.as_ref(),
+                };
+                value.and_then(|value| value.pointer(path)) == Some(equals)
+            });
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!(
+                    "journal tool {name} {document:?} pointer {path:?} {} expected {}",
+                    if passed { "matched" } else { "did not match" },
+                    equals
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -1008,6 +1101,33 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             if min > max {
                 return Err(format!(
                     "ToolsCountBetween: min ({min}) > max ({max}); case will always FAIL"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::JournalToolCallCount { name, min, max } => {
+            if name.trim().is_empty() {
+                return Err("JournalToolCallCount.name must not be empty".into());
+            }
+            if min > max {
+                return Err(format!(
+                    "JournalToolCallCount: min ({min}) > max ({max}); case will always FAIL"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::JournalToolJson {
+            name,
+            path,
+            document: _,
+            equals: _,
+        } => {
+            if name.trim().is_empty() {
+                return Err("JournalToolJson.name must not be empty".into());
+            }
+            if !path.is_empty() && !path.starts_with('/') {
+                return Err(format!(
+                    "JournalToolJson.path must be an RFC 6901 JSON pointer; got {path:?}"
                 ));
             }
             Ok(())
@@ -1387,6 +1507,7 @@ mod tests {
             &out,
         );
         assert!(r[0].passed);
+        assert_eq!(r[0].severity, CriterionSeverity::Soft);
     }
 
     #[test]
@@ -1520,6 +1641,7 @@ mod tests {
             Some(&sess),
         );
         assert!(r[0].passed);
+        assert_eq!(r[0].severity, CriterionSeverity::Hard);
     }
 
     #[test]
@@ -1608,6 +1730,7 @@ mod tests {
         );
         assert!(!r[0].passed, "default must FAIL");
         assert!(r[0].detail.contains("FAILED"));
+        assert_eq!(r[0].severity, CriterionSeverity::Hard);
     }
 
     #[test]
@@ -1622,6 +1745,62 @@ mod tests {
         );
         assert!(r[0].passed);
         assert!(r[0].detail.contains("skipped"));
+        assert_eq!(r[0].severity, CriterionSeverity::Quality);
+    }
+
+    #[test]
+    fn durable_tool_json_proves_exact_fanout_contract() {
+        let sess = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "fanout-call",
+                    "name": "agent_fanout",
+                    "ok": true,
+                    "args_full": r#"{"action":"start","target_count":3}"#,
+                    "result_full": r#"{"fanout":{"terminal":3},"provenance":{"all_slots_delivered":true}}"#
+                }]
+            }),
+        )]);
+        let criteria = [
+            Criterion::JournalToolCallCount {
+                name: "agent_fanout".into(),
+                min: 1,
+                max: 1,
+            },
+            Criterion::JournalToolJson {
+                name: "agent_fanout".into(),
+                document: JournalToolDocument::Arguments,
+                path: "/target_count".into(),
+                equals: serde_json::json!(3),
+            },
+            Criterion::JournalToolJson {
+                name: "agent_fanout".into(),
+                document: JournalToolDocument::Result,
+                path: "/provenance/all_slots_delivered".into(),
+                equals: serde_json::json!(true),
+            },
+        ];
+        let results =
+            evaluate_deterministic_with_session(&criteria, &outcome_with_tools(&[]), Some(&sess));
+        assert!(results.iter().all(|result| result.passed), "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|result| result.severity == CriterionSeverity::Hard)
+        );
+
+        let wrong = evaluate_deterministic_with_session(
+            &[Criterion::JournalToolJson {
+                name: "agent_fanout".into(),
+                document: JournalToolDocument::Result,
+                path: "/fanout/terminal".into(),
+                equals: serde_json::json!(2),
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+        assert!(!wrong[0].passed, "partial settlement must fail");
     }
 
     #[test]
