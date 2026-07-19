@@ -5,6 +5,8 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/", get(meta_handlers::root_handler))
+        .route("/live", get(meta_handlers::live_handler))
+        .route("/ready", get(meta_handlers::ready_handler))
         .route("/health", get(meta_handlers::health_handler))
         .route("/metrics", get(meta_handlers::metrics_handler))
         .route("/auth/register", post(auth_handlers::auth_register_handler))

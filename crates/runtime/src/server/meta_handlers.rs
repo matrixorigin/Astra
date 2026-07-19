@@ -170,10 +170,8 @@ pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResp
 }
 
 pub(super) async fn current_health(state: &AppState) -> HealthResponse {
-    let (database_health, memoria_health) = tokio::join!(
-        state.health_checker.database_health(),
-        state.memoria_forwarder.health(),
-    );
+    let database_health = state.health_checker.database_health().await;
+    let memoria_health = state.cached_memoria_health();
 
     let status = if !database_health.is_healthy() {
         "unhealthy"
@@ -194,6 +192,45 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
 
 pub(super) async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(current_health(&state).await)
+}
+
+#[derive(Serialize)]
+pub(super) struct LivenessResponse {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReadinessResponse {
+    status: &'static str,
+    database: &'static str,
+}
+
+/// Process liveness never performs dependency I/O. Orchestrators should only
+/// restart the process when this endpoint itself is unreachable.
+pub(super) async fn live_handler() -> Json<LivenessResponse> {
+    Json(LivenessResponse { status: "alive" })
+}
+
+/// Traffic readiness is owned by core dependencies only. Optional capability
+/// failures remain visible on `/health` without evicting every replica.
+pub(super) async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let database = state.health_checker.database_health().await;
+    let status = if database.is_healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ReadinessResponse {
+            status: if database.is_healthy() {
+                "ready"
+            } else {
+                "not_ready"
+            },
+            database: database.database_label(),
+        }),
+    )
 }
 
 /// `GET /metrics` — Prometheus text format 0.0.4.
@@ -224,6 +261,7 @@ mod tests {
     use crate::{AppState, HealthChecker, MemoriaForwarder, MemoriaHealth, ServiceInfo};
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct AlwaysHealthy;
@@ -263,6 +301,28 @@ mod tests {
         }
     }
 
+    struct CountingMemoria {
+        probes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MemoriaForwarder for CountingMemoria {
+        async fn forward(
+            &self,
+            _method: reqwest::Method,
+            _endpoint: &str,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("unused".to_string())
+        }
+
+        async fn health(&self) -> MemoriaHealth {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            MemoriaHealth::Unavailable("optional dependency down".to_string())
+        }
+    }
+
     #[tokio::test]
     async fn configured_dependency_failure_is_reported_as_degraded() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
@@ -285,6 +345,52 @@ mod tests {
         assert_eq!(health.status, "unhealthy");
         assert_eq!(health.database, "unavailable");
         assert_eq!(health.memoria, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn capability_probe_is_cached_singleflight_and_does_not_block_health_requests() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
+            .with_memoria_forwarder(Arc::new(CountingMemoria {
+                probes: probes.clone(),
+            }));
+        let callers = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    state
+                        .refresh_memoria_health_if_stale(std::time::Duration::from_secs(60))
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        for caller in callers {
+            assert!(matches!(
+                caller.await.unwrap(),
+                MemoriaHealth::Unavailable(_)
+            ));
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        let health = current_health(&state).await;
+        assert_eq!(health.status, "degraded");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "request path must use cache"
+        );
+
+        let ready = ready_handler(State(state)).await.into_response();
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_only_core_database_failure() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(DatabaseUnavailable))
+            .with_memoria_forwarder(Arc::new(UnavailableMemoria));
+        let response = ready_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test(flavor = "current_thread")]

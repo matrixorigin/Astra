@@ -68,6 +68,21 @@ pub enum MemoriaHealth {
     Disabled,
 }
 
+#[derive(Clone, Debug)]
+struct CachedMemoriaHealth {
+    value: MemoriaHealth,
+    refreshed_at: Option<std::time::Instant>,
+}
+
+impl CachedMemoriaHealth {
+    fn new(value: MemoriaHealth) -> Self {
+        Self {
+            value,
+            refreshed_at: None,
+        }
+    }
+}
+
 impl MemoriaHealth {
     pub fn label(&self) -> &'static str {
         match self {
@@ -200,6 +215,8 @@ pub struct AppState {
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
+    memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
+    memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
     /// Owner-neutral Matrix pool, journal ingestion, sync persistence, and shutdown tracking.
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
@@ -309,6 +326,10 @@ impl AppState {
             memoria_base_url: default_memoria.base_url,
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
+            memoria_health_cache: Arc::new(std::sync::RwLock::new(CachedMemoriaHealth::new(
+                MemoriaHealth::Disabled,
+            ))),
+            memoria_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
             shared_pool: None,
             matrix_cloud_runtime: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
@@ -362,6 +383,14 @@ impl AppState {
         } else {
             Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
+        *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
+            CachedMemoriaHealth::new(
+                if master_key.as_deref().is_some_and(|key| !key.is_empty()) {
+                    MemoriaHealth::Unavailable("probe pending".to_string())
+                } else {
+                    MemoriaHealth::Disabled
+                },
+            );
         self.memoria_base_url = base_url;
         self.memoria_master_key = master_key;
         self
@@ -370,7 +399,38 @@ impl AppState {
     /// Inject a custom MemoriaForwarder (for testing).
     pub fn with_memoria_forwarder(mut self, forwarder: Arc<dyn MemoriaForwarder>) -> Self {
         self.memoria_forwarder = forwarder;
+        *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
+            CachedMemoriaHealth::new(MemoriaHealth::Unavailable("probe pending".to_string()));
         self
+    }
+
+    pub fn cached_memoria_health(&self) -> MemoriaHealth {
+        astra_core::sync_poison::recover_rwlock_read(&self.memoria_health_cache)
+            .value
+            .clone()
+    }
+
+    /// Refresh a capability probe at most once per `max_age`. The lock is
+    /// rechecked after acquisition, so concurrent callers collapse into one
+    /// outbound request instead of serially replaying the same probe.
+    pub async fn refresh_memoria_health_if_stale(
+        &self,
+        max_age: std::time::Duration,
+    ) -> MemoriaHealth {
+        let _refresh = self.memoria_health_refresh.lock().await;
+        {
+            let cached = astra_core::sync_poison::recover_rwlock_read(&self.memoria_health_cache);
+            if cached.refreshed_at.is_some_and(|at| at.elapsed() < max_age) {
+                return cached.value.clone();
+            }
+        }
+        let value = self.memoria_forwarder.health().await;
+        *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
+            CachedMemoriaHealth {
+                value: value.clone(),
+                refreshed_at: Some(std::time::Instant::now()),
+            };
+        value
     }
 
     pub fn with_admin_authorizer(mut self, admin_authorizer: Arc<dyn AdminAuthorizer>) -> Self {
@@ -872,6 +932,18 @@ impl ReqwestMemoriaForwarder {
             .header("Authorization", format!("Bearer {}", self.master_key))
             .json(body)
     }
+
+    async fn bounded_error_body(mut response: reqwest::Response, limit: usize) -> String {
+        let mut body = Vec::with_capacity(limit.min(1024));
+        while body.len() < limit {
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            let remaining = limit - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    }
 }
 
 #[async_trait]
@@ -889,7 +961,7 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
             .map_err(|e| format!("Memoria request failed: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = Self::bounded_error_body(resp, 4096).await;
             return Err(format!("Memoria error {status}: {text}"));
         }
         let text = resp
@@ -915,9 +987,8 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
             Ok(response) if response.status().is_success() => MemoriaHealth::Connected,
             Ok(response) => {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let bounded_body = body.chars().take(1024).collect::<String>();
-                MemoriaHealth::Unavailable(format!("status={status}, body={bounded_body}"))
+                let body = Self::bounded_error_body(response, 1024).await;
+                MemoriaHealth::Unavailable(format!("status={status}, body={body}"))
             }
             Err(error) => MemoriaHealth::Unavailable(error.to_string()),
         }
@@ -1183,9 +1254,14 @@ mod tests {
                     .contains("authorization: bearer test-key"),
                 "{request}"
             );
+            let body = format!("database absent{}", "x".repeat(8192));
             socket
                 .write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndatabase absent",
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -1202,7 +1278,9 @@ mod tests {
         assert!(matches!(
             health,
             MemoriaHealth::Unavailable(detail)
-                if detail.contains("503") && detail.contains("database absent")
+                if detail.contains("503")
+                    && detail.contains("database absent")
+                    && detail.len() < 1200
         ));
         server.await.unwrap();
     }

@@ -256,6 +256,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // the runtime / pool / OTLP exporter.
     let bg_cancel = tokio_util::sync::CancellationToken::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    bg_handles.push(spawn_memoria_health_refresh(
+        state.clone(),
+        bg_cancel.clone(),
+    ));
     if let Some(ref pool) = state.shared_pool {
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
         bg_handles.push(spawn_edge_dispatch_cleanup(
@@ -310,7 +314,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn log_memoria_startup_health(state: &AppState) {
-    match state.memoria_forwarder.health().await {
+    match state
+        .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
+        .await
+    {
         crate::MemoriaHealth::Connected => tracing::info!(
             target: "astra_runtime::serve",
             memoria_base_url = %state.memoria_base_url,
@@ -324,6 +331,23 @@ async fn log_memoria_startup_health(state: &AppState) {
         ),
         crate::MemoriaHealth::Disabled => {}
     }
+}
+
+fn spawn_memoria_health_refresh(
+    state: AppState,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {
+                    let _ = state.refresh_memoria_health_if_stale(PROBE_INTERVAL).await;
+                }
+            }
+        }
+    })
 }
 
 /// Completes on SIGTERM (Unix) or Ctrl+C so `axum::serve` can exit cleanly and OTLP can flush.
