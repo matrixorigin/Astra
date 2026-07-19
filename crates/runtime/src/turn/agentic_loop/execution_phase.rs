@@ -30,6 +30,60 @@ use crate::turn::observation_dispatcher::{
 const USER_INTENT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_TEXTLESS_RESPONSE_RETRIES: u32 = 1;
 
+fn unsettled_work_status_marker(
+    active_work: &[astra_core::work_unit::ActiveWorkUnit],
+) -> Option<String> {
+    if active_work.is_empty() {
+        return None;
+    }
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    let mut automatic_updates = 0_usize;
+    for work in active_work {
+        let status = serde_json::to_value(work.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "non_terminal".to_string());
+        *states.entry(status).or_default() += 1;
+        *kinds.entry(work.kind.trim().replace('_', " ")).or_default() += 1;
+        automatic_updates += usize::from(work.wake_policy.owns_next_update());
+    }
+    let render_counts = |counts: std::collections::BTreeMap<String, usize>| {
+        counts
+            .into_iter()
+            .map(|(label, count)| format!("{count} {label}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let update_contract = if automatic_updates == active_work.len() {
+        "The runtime owns their next meaningful update."
+    } else if automatic_updates == 0 {
+        "No automatic update is promised; a later observation is required."
+    } else {
+        "The runtime owns the next meaningful update for some, but not all, of them."
+    };
+    Some(format!(
+        "\n\nRuntime state (authoritative): {} asynchronous work unit(s) remain non-terminal ({}; {}). This response is a partial snapshot, not a completion report. {update_contract}",
+        active_work.len(),
+        render_counts(kinds),
+        render_counts(states),
+    ))
+}
+
+fn append_unsettled_work_status<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
+    let active_work = state.stall.work_unit_observations.active_work_units();
+    let Some(marker) = unsettled_work_status_marker(&active_work) else {
+        return;
+    };
+    if state.final_text_streamed {
+        // Provider text may already be visible. Emit only the machine-owned
+        // correction delta; replaying the full candidate duplicates the
+        // answer in streaming clients.
+        host.render_final_text(&marker);
+    }
+    state.final_text.push_str(&marker);
+}
+
 fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
     turn_result.accum.tool_calls.is_empty()
         && turn_result.accum.full_text.trim().is_empty()
@@ -215,6 +269,18 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
     for event in &observed.accepted {
         host.apply_user_intent_context(event);
     }
+    let mut active_work_contexts = observed
+        .accepted
+        .iter()
+        .filter_map(|event| event.input.get("astra_runtime_context"))
+        .filter(|context| {
+            context.get("schema").and_then(serde_json::Value::as_str)
+                == Some("active_work_snapshot.v1")
+                && context.get("authority").and_then(serde_json::Value::as_str)
+                    == Some("run_control_provider")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut accepted_for_ack = observed.accepted.clone();
     accepted_for_ack.extend(runtime_notifications.iter().map(|(event, _)| event.clone()));
     state
@@ -271,6 +337,20 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
                     .map(|(_, content)| content)
                     .collect::<Vec<_>>(),
                 "instruction": "Reconcile these runtime facts with the latest user goal. Do not let a stale completion override newer user steering.",
+            }),
+        );
+    }
+    if !active_work_contexts.is_empty() {
+        for context in &mut active_work_contexts {
+            state.reconcile_active_work_context(context);
+        }
+        state.push_volatile_payload(
+            super::host::VolatileKind::ActiveWorkSnapshot,
+            serde_json::json!({
+                "schema": "active_work_guidance_context.v1",
+                "snapshots": active_work_contexts,
+                "instruction": "This is the runtime-owned work state captured when the active-run guidance was accepted. Use canonical group/task IDs from it. Treat fanout groups as one work unit; do not copy child IDs or infer group completion from individual events.",
+                "authority": "runtime_required_context",
             }),
         );
     }
@@ -1792,6 +1872,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // Outside the single bounded reconciliation above, unfinished
             // state remains visible settlement evidence. It cannot create an
             // unbounded retry loop or suppress the best answer we already have.
+
+            // A model response cannot settle producer-owned asynchronous
+            // work. Qualify it from the canonical observation tracker before
+            // accepting the turn, regardless of wording or model quality.
+            // This is deterministic and does not spend another LLM round:
+            // background wake ownership already defines the next boundary.
+            append_unsettled_work_status(host, state);
 
             // Record the LLM round even for text-only responses (no tool calls).
             // Without this, simple Q&A turns have llm_rounds=0 in the
@@ -4138,6 +4225,128 @@ mod tests {
         assert!(
             state.volatile_pending.is_empty(),
             "real deferred user input must not be duplicated as runtime context"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_run_guidance_keeps_runtime_work_truth_out_of_user_speech() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-status".into());
+        state.context_manifest_user_id = Some("user-status".into());
+        let snapshot = "<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" active=\"2\" completed=\"1\" /></background_tasks>";
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
+            next_cursor: 1,
+            inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                intent_id: "input-status".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                event_index: 1,
+                input: serde_json::json!({
+                    "content": "现在什么情况？",
+                    "astra_runtime_context": {
+                        "schema": "active_work_snapshot.v1",
+                        "authority": "run_control_provider",
+                        "background_work_snapshot": snapshot,
+                        "work_unit_observations": [{
+                            "id": "review-group",
+                            "kind": "agent_fanout",
+                            "status": "running",
+                            "version": "7",
+                            "mode": "current",
+                            "wake_policy": "on_terminal"
+                        }],
+                    }
+                }),
+            }],
+            issues: Vec::new(),
+            error: None,
+        }]));
+        state.run_control = Some(provider);
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.message, "现在什么情况？");
+        assert_eq!(
+            state.user_intents.applied_user_intents()[0].content,
+            "现在什么情况？",
+            "runtime projection must not pollute durable user speech"
+        );
+        let work_context = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::ActiveWorkSnapshot)
+            .expect("active guidance must carry its runtime work snapshot");
+        assert_eq!(
+            work_context.payload["snapshots"][0]["background_work_snapshot"],
+            snapshot
+        );
+        assert_eq!(
+            work_context.kind.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        );
+        assert_eq!(
+            state.stall.work_unit_observations.active_work_units()[0].id,
+            "review-group",
+            "the same typed snapshot must gate final-answer settlement"
+        );
+
+        let unchanged = astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            "7",
+            astra_core::work_unit::WorkUnitObservationMode::Current,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal);
+        assert_eq!(
+            state.observe_work_unit(&unchanged),
+            astra_core::work_unit::WorkUnitObservationOutcome::Unchanged { consecutive: 1 }
+        );
+        let unchanged_context = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::ActiveWorkSnapshot)
+            .unwrap();
+        assert_eq!(
+            unchanged_context.payload["snapshots"][0]["background_work_snapshot"], snapshot,
+            "an identical producer observation must not discard unrelated XML projections"
+        );
+        assert!(
+            unchanged_context.payload["snapshots"][0]
+                .get("projection_state")
+                .is_none(),
+            "an identical observation is not a superseding producer revision"
+        );
+
+        let completed = astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Completed,
+            "8",
+            astra_core::work_unit::WorkUnitObservationMode::Transition,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal);
+        state.observe_work_unit(&completed);
+        assert!(state.stall.work_unit_observations.is_empty());
+        let refreshed = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::ActiveWorkSnapshot)
+            .unwrap();
+        assert_eq!(
+            refreshed.payload["snapshots"][0]["work_unit_observations"][0]["status"],
+            "completed"
+        );
+        assert!(
+            refreshed.payload["snapshots"][0]
+                .get("background_work_snapshot")
+                .is_none(),
+            "newer producer truth must retire the stale submission-time XML"
         );
     }
 

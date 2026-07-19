@@ -1559,7 +1559,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     for result in &edge_tool_round {
         if let Some(observation) = work_unit_observation(result) {
-            let outcome = state.stall.work_unit_observations.observe(&observation);
+            let outcome = state.observe_work_unit(&observation);
             tracing::debug!(
                 target: "astra::work_unit",
                 work_unit_id = %observation.id,

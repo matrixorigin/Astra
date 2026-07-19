@@ -1159,8 +1159,12 @@ const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
 const RUN_LIST_CURSOR_SELECT_SQL: &str =
     "DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at";
-const RUN_LIST_CURSOR_FILTER_SQL: &str = " AND (updated_at < ";
-const RUN_LIST_CURSOR_TIE_SQL: &str = " OR (updated_at = ";
+// Keep the seek predicate whole. Splitting its parentheses across several
+// format fragments made a valid query look malformed in review and makes
+// future edits unnecessarily risky. Bind order is updated_at, updated_at,
+// run_id, matching the lexicographic DESC cursor used by the in-memory store.
+const RUN_LIST_CURSOR_PREDICATE_SQL: &str =
+    " AND (updated_at < ? OR (updated_at = ? AND run_id < ?))";
 const RUN_LIST_ORDER_SQL: &str = " ORDER BY updated_at DESC, run_id DESC";
 
 const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, status, waiting_for, \
@@ -5520,7 +5524,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let run_id = run_list_cursor_run_id(&cursor)?;
             let sql = format!(
                 "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
-                 WHERE user_id = ?{RUN_LIST_CURSOR_FILTER_SQL}?{RUN_LIST_CURSOR_TIE_SQL}? AND run_id < ?))\
+                 WHERE user_id = ?{RUN_LIST_CURSOR_PREDICATE_SQL}\
                  {RUN_LIST_ORDER_SQL} LIMIT ?"
             );
             sqlx::query(&sql)
@@ -5675,7 +5679,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let sql = format!(
                 "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
                  WHERE user_id = ? AND session_id = ? AND status IN (?, ?, ?)\
-                 {RUN_LIST_CURSOR_FILTER_SQL}?{RUN_LIST_CURSOR_TIE_SQL}? AND run_id < ?))\
+                 {RUN_LIST_CURSOR_PREDICATE_SQL}\
                  {RUN_LIST_ORDER_SQL} LIMIT ?"
             );
             sqlx::query(&sql)
@@ -9740,16 +9744,16 @@ mod tests {
     #[test]
     fn run_list_sql_contract_uses_seek_cursor_not_offset() {
         let order_sql = RUN_LIST_ORDER_SQL.to_ascii_uppercase();
-        let cursor_sql = format!(
-            "{}?{}? AND run_id < ?))",
-            RUN_LIST_CURSOR_FILTER_SQL, RUN_LIST_CURSOR_TIE_SQL
-        )
-        .to_ascii_uppercase();
+        let cursor_sql = RUN_LIST_CURSOR_PREDICATE_SQL.to_ascii_uppercase();
         assert!(!order_sql.contains(" OFFSET "));
         assert!(!cursor_sql.contains(" OFFSET "));
         assert!(order_sql.contains("UPDATED_AT DESC"));
         assert!(order_sql.contains("RUN_ID DESC"));
         assert!(cursor_sql.contains("RUN_ID < ?"));
+        assert_eq!(
+            RUN_LIST_CURSOR_PREDICATE_SQL,
+            " AND (updated_at < ? OR (updated_at = ? AND run_id < ?))"
+        );
     }
 
     #[test]

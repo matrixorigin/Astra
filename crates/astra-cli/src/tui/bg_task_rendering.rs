@@ -788,16 +788,42 @@ pub(crate) fn live_control_xml_value(
 pub(crate) fn render_background_task_rows_xml(
     rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
 ) -> String {
-    use crate::tui::bottom_pane::background_task_view::BackgroundTaskKind;
+    use crate::tui::bottom_pane::background_task_view::{
+        BackgroundTaskKind, BackgroundTaskStatus, LiveControlState,
+    };
 
     if rows.is_empty() {
         return "<background_tasks count=\"0\" />".to_string();
     }
 
     let rows = crate::tui::bottom_pane::background_task_view::types::sort_rows(rows.to_vec());
+    let mut fanout_groups = std::collections::BTreeMap::<
+        (String, String, usize),
+        Vec<&crate::tui::bottom_pane::background_task_view::BackgroundTaskRow>,
+    >::new();
+    let mut ordinary_rows = Vec::new();
+    for row in &rows {
+        if let Some(fanout) = row.fanout.as_ref() {
+            fanout_groups
+                .entry((
+                    fanout.group_id.clone(),
+                    fanout.group_title.clone(),
+                    fanout.target_count,
+                ))
+                .or_default()
+                .push(row);
+        } else {
+            ordinary_rows.push(row);
+        }
+    }
 
-    let mut out = format!("<background_tasks count=\"{}\">", rows.len());
-    for row in rows {
+    // The model-facing list is a list of user-visible work units. A fanout is
+    // one group, not N independently addressable child tasks. Keeping child
+    // IDs out of this protocol removes a high-entropy copy/paste boundary and
+    // makes the same canonical group state drive status answers and wakeups.
+    let visible_count = ordinary_rows.len() + fanout_groups.len();
+    let mut out = format!("<background_tasks count=\"{visible_count}\">");
+    for row in ordinary_rows {
         let mut attrs = vec![
             ("id", xml_escape_attr(&row.id)),
             ("kind", row.kind.as_str().to_string()),
@@ -849,14 +875,105 @@ pub(crate) fn render_background_task_rows_xml(
         if let Some(reason) = row.terminal_reason.as_deref() {
             attrs.push(("terminal_reason", xml_escape_attr(reason)));
         }
-        if let Some(fanout) = row.fanout.as_ref() {
-            attrs.push(("fanout_group_id", xml_escape_attr(&fanout.group_id)));
-            attrs.push(("fanout_group_title", xml_escape_attr(&fanout.group_title)));
-            attrs.push(("fanout_target_count", fanout.target_count.to_string()));
-            attrs.push(("fanout_slot_index", fanout.slot_index.to_string()));
-            attrs.push(("fanout_slot_label", xml_escape_attr(&fanout.slot_label)));
+        out.push_str("\n<task");
+        for (key, value) in attrs {
+            out.push_str(&format!(" {key}=\"{value}\""));
         }
-
+        out.push_str(" />");
+    }
+    for ((group_id, group_title, target_count), members) in fanout_groups {
+        let completed = members
+            .iter()
+            .filter(|row| row.status == BackgroundTaskStatus::Completed)
+            .count();
+        let failed = members
+            .iter()
+            .filter(|row| row.status == BackgroundTaskStatus::Failed)
+            .count();
+        let interrupted = members
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    BackgroundTaskStatus::Interrupted
+                        | BackgroundTaskStatus::Killed
+                        | BackgroundTaskStatus::Unavailable
+                )
+            })
+            .count();
+        let waiting_for_input = members
+            .iter()
+            .filter(|row| row.status == BackgroundTaskStatus::WaitingForInput)
+            .count();
+        let active = members
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    BackgroundTaskStatus::Pending
+                        | BackgroundTaskStatus::Running
+                        | BackgroundTaskStatus::Stopping
+                        | BackgroundTaskStatus::WaitingForInput
+                )
+            })
+            .count();
+        let terminal = completed + failed + interrupted;
+        let status = if active > 0 {
+            if waiting_for_input == active {
+                "waiting_for_input"
+            } else {
+                "running"
+            }
+        } else if failed > 0 || interrupted > 0 {
+            "completed_with_issues"
+        } else {
+            "completed"
+        };
+        let live_control = if members
+            .iter()
+            .any(|row| row.live_control == LiveControlState::Available)
+        {
+            LiveControlState::Available
+        } else if members
+            .iter()
+            .all(|row| row.live_control == LiveControlState::StaleHandle)
+        {
+            LiveControlState::StaleHandle
+        } else {
+            LiveControlState::UnsupportedInMode
+        };
+        let elapsed_ms = members.iter().map(|row| row.elapsed_ms).max().unwrap_or(0);
+        let result_ref = format!("agent_fanout:{group_id}");
+        let get_results_call = format!("agent_fanout(action='get_results', group_id='{group_id}')");
+        let task_output_call = format!("task_output(task_id='{group_id}')");
+        let instruction = if active > 0 {
+            "Treat this fanout as one running work unit. Do not poll child agents or infer completion from individual events; the runtime owns one terminal group update."
+        } else {
+            "Treat this fanout as one settled work unit. Read results through the canonical group id; do not reconstruct or retype child task ids."
+        };
+        let attrs = [
+            ("id", xml_escape_attr(&group_id)),
+            ("kind", "agent_fanout".to_string()),
+            ("status", status.to_string()),
+            (
+                "live_control",
+                live_control_xml_value(live_control).to_string(),
+            ),
+            ("elapsed_ms", elapsed_ms.to_string()),
+            ("title", xml_escape_attr(&group_title)),
+            ("target_count", target_count.to_string()),
+            ("observed_slots", members.len().to_string()),
+            ("active", active.to_string()),
+            ("terminal", terminal.to_string()),
+            ("completed", completed.to_string()),
+            ("failed", failed.to_string()),
+            ("interrupted", interrupted.to_string()),
+            ("waiting_for_input", waiting_for_input.to_string()),
+            ("result_ref", xml_escape_attr(&result_ref)),
+            ("get_results_call", xml_escape_attr(&get_results_call)),
+            ("task_output_call", xml_escape_attr(&task_output_call)),
+            ("instruction", xml_escape_attr(instruction)),
+        ];
         out.push_str("\n<task");
         for (key, value) in attrs {
             out.push_str(&format!(" {key}=\"{value}\""));

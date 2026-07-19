@@ -1774,6 +1774,11 @@ pub enum VolatileKind {
     /// Runtime-owned terminal/needs-input facts from background work. These
     /// are required context, never synthetic user intent.
     BackgroundTaskNotification,
+    /// Point-in-time work projection captured with active-run guidance. This
+    /// keeps user speech and runtime truth in separate lanes while ensuring a
+    /// mid-turn status/correction boundary sees the same canonical work units
+    /// that the UI exposed when the input was accepted.
+    ActiveWorkSnapshot,
     /// Structured policy evidence suggesting a possible budget review. It does
     /// not mutate the active runtime budget.
     BudgetReview,
@@ -1844,7 +1849,8 @@ impl VolatileKind {
                 | Self::SelfStatus
                 | Self::PolicyAdvisory
                 | Self::BudgetUpdate
-                | Self::ActiveTurnFrame,
+                | Self::ActiveTurnFrame
+                | Self::ActiveWorkSnapshot,
         )
     }
 
@@ -1861,6 +1867,7 @@ impl VolatileKind {
             | Self::CompactResume
             | Self::Mailbox
             | Self::BackgroundTaskNotification
+            | Self::ActiveWorkSnapshot
             | Self::FinalAnswerSettlement
             | Self::SessionHookContext
             | Self::PlanModeMarker
@@ -2595,6 +2602,130 @@ impl AgenticLoopState {
             }
         }
         self.volatile_pending.push(injection);
+    }
+
+    /// Apply one producer-owned work observation to both settlement state and
+    /// any active-guidance snapshot waiting for the next model boundary.
+    ///
+    /// Guidance can be accepted while a foreground tool is still running. If
+    /// that tool reaches a newer revision before the model sees the guidance,
+    /// retaining the submission-time XML would make the newest-looking
+    /// context stale. Updating the structured observation and explicitly
+    /// retiring the textual projection gives producer revision order one
+    /// canonical path across both surfaces.
+    pub fn observe_work_unit(
+        &mut self,
+        observation: &astra_core::work_unit::WorkUnitObservation,
+    ) -> astra_core::work_unit::WorkUnitObservationOutcome {
+        let outcome = self.stall.work_unit_observations.observe(observation);
+        if outcome == astra_core::work_unit::WorkUnitObservationOutcome::Ignored {
+            return outcome;
+        }
+        let Ok(observation_value) = serde_json::to_value(observation) else {
+            return outcome;
+        };
+        for injection in self
+            .volatile_pending
+            .iter_mut()
+            .filter(|injection| injection.kind == VolatileKind::ActiveWorkSnapshot)
+        {
+            let Some(snapshots) = injection
+                .payload
+                .get_mut("snapshots")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for snapshot in snapshots {
+                let Some(context) = snapshot.as_object_mut() else {
+                    continue;
+                };
+                let Some(observations) = context
+                    .get_mut("work_unit_observations")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let mut replaced = false;
+                for current in observations.iter_mut() {
+                    let same_identity = current.get("id").and_then(Value::as_str)
+                        == Some(observation.id.as_str())
+                        && current.get("kind").and_then(Value::as_str)
+                            == Some(observation.kind.as_str());
+                    if same_identity && current != &observation_value {
+                        *current = observation_value.clone();
+                        replaced = true;
+                    }
+                }
+                if replaced {
+                    context.remove("background_work_snapshot");
+                    context.insert(
+                        "projection_state".to_string(),
+                        Value::String("superseded_by_newer_producer_observation".to_string()),
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Reconcile a submission-time work snapshot with producer truth already
+    /// observed by the turn before the snapshot reached its model boundary.
+    ///
+    /// Active guidance and foreground tool settlement are independent input
+    /// lanes. The guidance lane can therefore deliver an older `running`
+    /// projection after the tool lane has delivered `completed`. Terminal
+    /// producer state is absorbing for the work-unit identity, so replace the
+    /// delayed projection and retire its textual cache before prompt assembly.
+    pub fn reconcile_active_work_context(&mut self, context: &mut Value) {
+        let captured = context
+            .get("work_unit_observations")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut replacements = Vec::new();
+        for (index, value) in captured.into_iter().enumerate() {
+            let Ok(observation) =
+                serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value)
+            else {
+                continue;
+            };
+            if !observation.is_valid() {
+                continue;
+            }
+            self.observe_work_unit(&observation);
+            let Some(terminal) = self
+                .stall
+                .work_unit_observations
+                .terminal_observation(&observation.id, &observation.kind)
+            else {
+                continue;
+            };
+            if terminal != &observation {
+                replacements.push((index, terminal.to_value()));
+            }
+        }
+        if replacements.is_empty() {
+            return;
+        }
+        let Some(context) = context.as_object_mut() else {
+            return;
+        };
+        if let Some(observations) = context
+            .get_mut("work_unit_observations")
+            .and_then(Value::as_array_mut)
+        {
+            for (index, replacement) in replacements {
+                if let Some(current) = observations.get_mut(index) {
+                    *current = replacement;
+                }
+            }
+        }
+        context.remove("background_work_snapshot");
+        context.insert(
+            "projection_state".to_string(),
+            Value::String("superseded_by_newer_producer_observation".to_string()),
+        );
     }
 
     /// Drain all pending volatile injections. Called by
@@ -5825,7 +5956,23 @@ pub(crate) mod tests {
         );
         assert_eq!(host.turn_count(), 3);
         assert_eq!(state.total_tool_calls, 2);
-        assert_eq!(state.final_text, "The task is still running.");
+        assert!(
+            state.final_text.starts_with("The task is still running."),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state.final_text.contains("Runtime state (authoritative)"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("partial snapshot, not a completion report"),
+            "{}",
+            state.final_text
+        );
         assert!(
             state
                 .stall
@@ -5833,6 +5980,58 @@ pub(crate) mod tests {
                 .repeatedly_unchanged_ids(1)
                 .is_empty(),
             "historical pagination must not increment live-observation counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonterminal_work_observation_prevents_an_unqualified_completion_claim() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_shell_task_output_observation(
+                    "fanout-review",
+                    "current",
+                    "one reviewer completed; two reviewers still running",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("All three reviewers completed.", 10, 5, None),
+        ])
+        .with_valid_tools(&["task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            2,
+            "settlement must not spend another LLM round"
+        );
+        assert!(
+            state
+                .final_text
+                .contains("1 asynchronous work unit(s) remain non-terminal"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("partial snapshot, not a completion report"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("runtime owns their next meaningful update"),
+            "{}",
+            state.final_text
         );
     }
 

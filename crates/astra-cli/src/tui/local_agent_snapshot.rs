@@ -46,6 +46,82 @@ impl LocalAgentSnapshot {
             .collect()
     }
 
+    /// Canonical fanout observations captured at the same instant as the UI
+    /// projection. Active-run guidance carries these through a typed runtime
+    /// lane so final-answer settlement does not need to parse XML or infer
+    /// group truth from child events.
+    pub(crate) fn fanout_work_unit_observations(
+        &self,
+    ) -> Vec<astra_core::work_unit::WorkUnitObservation> {
+        use astra_core::work_unit::{
+            WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+        };
+
+        self.fanout_groups
+            .iter()
+            .filter_map(|group| {
+                let summary = group.summary();
+                let has_issues = summary.failed > 0
+                    || summary.interrupted > 0
+                    || summary.spawn_rejected > 0
+                    || summary.timed_out > 0
+                    || summary.cancelled_by_user > 0
+                    || summary.cancelled_by_parent_budget > 0;
+                let status = if summary.active > 0 || summary.planned > 0 {
+                    WorkUnitStatus::Running
+                } else if has_issues {
+                    WorkUnitStatus::CompletedWithIssues
+                } else {
+                    WorkUnitStatus::Completed
+                };
+                WorkUnitObservation::new(
+                    &group.group_id,
+                    "agent_fanout",
+                    status,
+                    group.revision.to_string(),
+                    WorkUnitObservationMode::Current,
+                )
+                .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal))
+            })
+            .collect()
+    }
+
+    /// Immediate, model-free receipt for guidance accepted during an active
+    /// run. It confirms delivery and surfaces bounded current progress while
+    /// the foreground tool still owns the next model boundary.
+    pub(crate) fn active_guidance_receipt(&self) -> String {
+        let active_groups = self
+            .fanout_groups
+            .iter()
+            .filter(|group| !group.is_terminal())
+            .collect::<Vec<_>>();
+        if active_groups.len() == 1 {
+            let group = active_groups[0];
+            let summary = group.summary();
+            let title = group.title.trim();
+            let title = if title.is_empty() {
+                "Agent fanout"
+            } else {
+                title
+            };
+            return format!(
+                "Guidance queued · {title}: {}/{} settled, {} running · Shift+↓ inspect",
+                summary.terminal, summary.target_count, summary.active,
+            );
+        }
+        if !active_groups.is_empty() {
+            let running = active_groups
+                .iter()
+                .map(|group| group.summary().active)
+                .sum::<usize>();
+            return format!(
+                "Guidance queued · {} agent groups, {running} agents running · Shift+↓ inspect",
+                active_groups.len(),
+            );
+        }
+        "Guidance queued for the current run.".to_string()
+    }
+
     /// Describe newly launched user-visible work units without involving the
     /// model.  A fanout is one receipt even though its slots enter the runtime
     /// independently; emitting one line per child makes normal concurrency
@@ -313,6 +389,7 @@ impl LocalAgentSnapshot {
 #[cfg(test)]
 mod tests {
     use super::LocalAgentSnapshot;
+    use astra_core::work_unit::{WorkUnitStatus, WorkUnitWakePolicy};
     use astra_turn_core::orchestration_fanout_group::{
         AgentFanoutGroupProjection, AgentFanoutSlotStatus,
     };
@@ -379,6 +456,53 @@ mod tests {
         assert!(collected.notification_still_requires_reconciliation(
             "<task_notification>done</task_notification>"
         ));
+    }
+
+    #[test]
+    fn fanout_work_observation_uses_group_revision_and_terminal_truth() {
+        let mut group = AgentFanoutGroupProjection::new("review", "Review", 2);
+        group
+            .record_spawn_accepted_with_run(0, "reviewer-1", Some("run-1".into()))
+            .unwrap();
+        group
+            .record_spawn_accepted_with_run(1, "reviewer-2", Some("run-2".into()))
+            .unwrap();
+        group
+            .record_terminal_by_agent("reviewer-1", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        let running_revision = group.revision;
+        let running = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![group.clone()],
+            ..LocalAgentSnapshot::default()
+        }
+        .fanout_work_unit_observations();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, "review");
+        assert_eq!(running[0].status, WorkUnitStatus::Running);
+        assert_eq!(running[0].version, running_revision.to_string());
+        assert_eq!(running[0].wake_policy, WorkUnitWakePolicy::OnTerminal);
+        let receipt = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![group.clone()],
+            ..LocalAgentSnapshot::default()
+        }
+        .active_guidance_receipt();
+        assert!(receipt.contains("1/2 settled"), "{receipt}");
+        assert!(receipt.contains("1 running"), "{receipt}");
+        assert!(receipt.contains("Guidance queued"), "{receipt}");
+
+        group
+            .record_terminal_by_agent("reviewer-2", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        let terminal = LocalAgentSnapshot {
+            available: true,
+            fanout_groups: vec![group],
+            ..LocalAgentSnapshot::default()
+        }
+        .fanout_work_unit_observations();
+        assert_eq!(terminal[0].status, WorkUnitStatus::Completed);
+        assert_ne!(terminal[0].version, running_revision.to_string());
     }
 
     #[test]

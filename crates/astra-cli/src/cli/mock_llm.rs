@@ -514,9 +514,16 @@ async fn body_fanout_then_complete(body: &Value, failed_child: Option<usize>) ->
     }
     if latest_user == FANOUT_JOURNEY_STATUS_QUESTION {
         let request = body.to_string();
-        let message = if request.contains("Current background work snapshot")
-            && request.contains("mock-review-group")
+        let has_group_truth = (request.contains("Current background work snapshot")
+            || request.contains("active_work_snapshot.v1"))
+            && request.contains("mock-review-group");
+        let message = if has_group_truth
+            && request.contains("superseded_by_newer_producer_observation")
+            && (request.contains("\"status\":\"completed\"")
+                || request.contains("\\\"status\\\":\\\"completed\\\""))
         {
+            "Astra knows Three mock reviews completed as one foreground work group. Parent synthesized one terminal fanout group exactly once."
+        } else if has_group_truth {
             "Astra knows Three mock reviews are running as one background work group."
         } else {
             "ERROR: authoritative background work snapshot is missing."

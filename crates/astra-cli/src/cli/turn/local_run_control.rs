@@ -65,6 +65,20 @@ impl LocalRunControl {
     }
 
     pub(crate) fn accept_guidance(&self, text: &str) -> Result<LocalUserIntentReceipt, String> {
+        self.accept_guidance_with_runtime_context(text, None, &[])
+    }
+
+    /// Enqueue active-run guidance together with the runtime projection the
+    /// user could inspect at the same instant. The projection is a reserved,
+    /// typed context lane rather than part of `content`, so transcript history
+    /// preserves exactly what the user said while the next model boundary can
+    /// still answer "what is running?" from current truth.
+    pub(crate) fn accept_guidance_with_runtime_context(
+        &self,
+        text: &str,
+        background_work_snapshot: Option<&str>,
+        work_unit_observations: &[astra_core::work_unit::WorkUnitObservation],
+    ) -> Result<LocalUserIntentReceipt, String> {
         if text.trim().is_empty() {
             return Err("Guidance cannot be empty.".to_string());
         }
@@ -73,10 +87,25 @@ impl LocalRunControl {
                 "Guidance is too large. Limit it to {MAX_USER_INTENT_CHARS} characters."
             ));
         }
-        Ok(self.accept_intent(
-            UserIntentDelivery::GuideCurrentRun,
-            serde_json::json!({ "content": text }),
-        ))
+        let mut input = serde_json::json!({ "content": text });
+        let background_work_snapshot = background_work_snapshot
+            .map(str::trim)
+            .filter(|snapshot| !snapshot.is_empty());
+        if background_work_snapshot.is_some() || !work_unit_observations.is_empty() {
+            input
+                .as_object_mut()
+                .expect("guidance input is an object")
+                .insert(
+                    "astra_runtime_context".to_string(),
+                    serde_json::json!({
+                        "schema": "active_work_snapshot.v1",
+                        "authority": "run_control_provider",
+                        "background_work_snapshot": background_work_snapshot.unwrap_or(""),
+                        "work_unit_observations": work_unit_observations,
+                    }),
+                );
+        }
+        Ok(self.accept_intent(UserIntentDelivery::GuideCurrentRun, input))
     }
 
     pub(crate) fn accept_runtime_notification(&self, content: &str) -> Result<(), String> {

@@ -1289,11 +1289,17 @@ async fn submit_active_run_guidance(
         >,
     >,
     text: &str,
+    background_work_snapshot: Option<&str>,
+    work_unit_observations: &[astra_core::work_unit::WorkUnitObservation],
 ) -> Result<crate::cli::turn::local_run_control::LocalUserIntentReceipt, String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| "Run is changing state. Try again, or press Ctrl+C to stop.".to_string())?;
-    provider.accept_guidance(text)
+    provider.accept_guidance_with_runtime_context(
+        text,
+        background_work_snapshot,
+        work_unit_observations,
+    )
 }
 
 async fn submit_active_runtime_notification(
@@ -6287,9 +6293,19 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
+                                                                        let active_work_snapshot =
+                                                                            bg_task_list_cache_for_turn
+                                                                                .read()
+                                                                                .await
+                                                                                .clone();
+                                                                        let active_work_observations =
+                                                                            local_agent_snapshot
+                                                                                .fanout_work_unit_observations();
                                                                         match submit_active_run_guidance(
                                                                             &active_turn_local_run_control,
                                                                             &queued_text,
+                                                                            Some(&active_work_snapshot),
+                                                                            &active_work_observations,
                                                                         )
                                                                         .await
                                                                         {
@@ -6300,6 +6316,27 @@ pub(crate) async fn run_tui_session(
                                                                                         receipt.status,
                                                                                         queued_text,
                                                                                     );
+                                                                                    chat_widget.commit_concurrent_system(
+                                                                                        history_cell::system::SystemCell::runtime_work(
+                                                                                            local_agent_snapshot.active_guidance_receipt(),
+                                                                                        ),
+                                                                                    );
+                                                                                    // Guidance is accepted while the foreground
+                                                                                    // tool still owns the turn, so no normal
+                                                                                    // stream event may arrive for several seconds.
+                                                                                    // Explicitly wake the renderer instead of
+                                                                                    // leaving the receipt buffered behind fan-in.
+                                                                                    // Committed history is rendered through the
+                                                                                    // terminal scrollback queue, independently of
+                                                                                    // the live frame. Drain it now as well as
+                                                                                    // requesting a frame; otherwise the receipt is
+                                                                                    // invisible until the foreground tool commits.
+                                                                                    flush_chat_widget(
+                                                                                        &mut guard,
+                                                                                        &mut chat_widget,
+                                                                                        w,
+                                                                                    );
+                                                                                    frame_requester.schedule_frame();
                                                                                 }
                                                                             Err(error) => {
                                                                                 bottom_pane.composer.set_text(&queued_text);
@@ -10309,13 +10346,12 @@ mod tests {
         assert_eq!(fanout.slot_index, 0);
 
         let xml = render_background_task_rows_xml(&[row]);
-        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
-        assert!(
-            xml.contains("fanout_group_title=\"review fanout\""),
-            "{xml}"
-        );
-        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
-        assert!(xml.contains("fanout_slot_index=\"0\""), "{xml}");
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("kind=\"agent_fanout\""), "{xml}");
+        assert!(xml.contains("title=\"review fanout\""), "{xml}");
+        assert!(xml.contains("target_count=\"3\""), "{xml}");
+        assert!(xml.contains("active=\"1\""), "{xml}");
+        assert!(!xml.contains("agent-auth"), "{xml}");
     }
 
     #[test]
@@ -10365,12 +10401,13 @@ mod tests {
         assert_eq!(fanout.slot_label, "review API surface");
 
         let xml = render_background_task_rows_xml(std::slice::from_ref(&row));
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("status=\"completed_with_issues\""), "{xml}");
+        assert!(xml.contains("failed=\"1\""), "{xml}");
         assert!(
-            xml.contains("id=\"fanout:review-1:slot:1:spawn_rejected\""),
+            !xml.contains("fanout:review-1:slot:1:spawn_rejected"),
             "{xml}"
         );
-        assert!(xml.contains("status=\"failed\""), "{xml}");
-        assert!(xml.contains("preview=\"concurrency cap reached\""), "{xml}");
 
         let snapshot =
             background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
@@ -10612,9 +10649,10 @@ mod tests {
         );
 
         let xml = render_background_task_rows_xml(&rows);
-        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
-        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("target_count=\"3\""), "{xml}");
         assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(!xml.contains("agent-restored-fanout"), "{xml}");
     }
 
     #[tokio::test]
@@ -11727,7 +11765,12 @@ mod tests {
     async fn submit_active_run_guidance_enqueues_against_active_local_run_control() {
         let run_control = Arc::new(std::sync::Mutex::new(Some(LocalRunControl::shared())));
 
-        let receipt = submit_active_run_guidance(&run_control, "先停下来吧")
+        let receipt = submit_active_run_guidance(
+            &run_control,
+            "现在什么情况？",
+            Some("<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"),
+            &[],
+        )
             .await
             .expect("user intent should be accepted");
 
@@ -11739,7 +11782,15 @@ mod tests {
             .await;
         assert_eq!(polled.inputs.len(), 1, "one user intent should be queued");
         assert_eq!(polled.inputs[0].intent_id, receipt.intent_id);
-        assert_eq!(polled.inputs[0].input["content"], "先停下来吧");
+        assert_eq!(polled.inputs[0].input["content"], "现在什么情况？");
+        assert_eq!(
+            polled.inputs[0].input["astra_runtime_context"]["schema"],
+            "active_work_snapshot.v1"
+        );
+        assert_eq!(
+            polled.inputs[0].input["astra_runtime_context"]["background_work_snapshot"],
+            "<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"
+        );
     }
 
     #[tokio::test]
@@ -11763,7 +11814,7 @@ mod tests {
     #[tokio::test]
     async fn submit_active_run_guidance_rejects_missing_local_run_control() {
         let run_control = Arc::new(std::sync::Mutex::new(None));
-        let error = submit_active_run_guidance(&run_control, "先停下来吧")
+        let error = submit_active_run_guidance(&run_control, "先停下来吧", None, &[])
             .await
             .expect_err("missing run control must be rejected locally");
         assert!(

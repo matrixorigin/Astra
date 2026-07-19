@@ -159,12 +159,28 @@ pub enum WorkUnitObservationOutcome {
     Terminal,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct WorkUnitCursor {
     id: String,
+    kind: String,
+    status: WorkUnitStatus,
     wake_policy: WorkUnitWakePolicy,
     version: String,
     unchanged: u32,
+}
+
+/// Latest producer-owned state for one non-terminal work unit.
+///
+/// This is the settlement-facing view of [`WorkUnitObservationTracker`]. It
+/// intentionally omits the producer revision and observation mode: callers
+/// deciding whether a turn may claim completion only need identity, lifecycle
+/// state, and who owns the next meaningful update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveWorkUnit {
+    pub id: String,
+    pub kind: String,
+    pub status: WorkUnitStatus,
+    pub wake_policy: WorkUnitWakePolicy,
 }
 
 /// Turn-scoped progress tracker shared by every asynchronous work producer.
@@ -173,6 +189,11 @@ struct WorkUnitCursor {
 #[derive(Debug, Clone, Default)]
 pub struct WorkUnitObservationTracker {
     cursors: BTreeMap<String, WorkUnitCursor>,
+    /// Terminal truth is retained until the turn settles. A snapshot captured
+    /// before settlement can be delivered after the producer's terminal
+    /// observation; keeping a tombstone prevents that delayed projection from
+    /// resurrecting completed work.
+    terminal: BTreeMap<String, WorkUnitObservation>,
 }
 
 impl WorkUnitObservationTracker {
@@ -181,8 +202,12 @@ impl WorkUnitObservationTracker {
             return WorkUnitObservationOutcome::Ignored;
         }
         let identity = observation.identity();
+        if self.terminal.contains_key(&identity) && !observation.status.is_terminal() {
+            return WorkUnitObservationOutcome::Ignored;
+        }
         if observation.status.is_terminal() {
             self.cursors.remove(&identity);
+            self.terminal.insert(identity, observation.clone());
             return WorkUnitObservationOutcome::Terminal;
         }
         match self.cursors.get_mut(&identity) {
@@ -191,6 +216,8 @@ impl WorkUnitObservationTracker {
                     identity,
                     WorkUnitCursor {
                         id: observation.id.trim().to_string(),
+                        kind: observation.kind.trim().to_string(),
+                        status: observation.status,
                         wake_policy: observation.wake_policy,
                         version: observation.version.clone(),
                         unchanged: 0,
@@ -202,6 +229,7 @@ impl WorkUnitObservationTracker {
                 // Wake ownership is delivery metadata, not lifecycle state.
                 // Honor the latest producer contract even if an adapter adds
                 // it without changing the underlying work revision.
+                cursor.status = observation.status;
                 cursor.wake_policy = observation.wake_policy;
                 cursor.unchanged = cursor.unchanged.saturating_add(1);
                 WorkUnitObservationOutcome::Unchanged {
@@ -210,6 +238,7 @@ impl WorkUnitObservationTracker {
             }
             Some(cursor) => {
                 cursor.version.clone_from(&observation.version);
+                cursor.status = observation.status;
                 cursor.wake_policy = observation.wake_policy;
                 cursor.unchanged = 0;
                 WorkUnitObservationOutcome::Advanced
@@ -235,8 +264,37 @@ impl WorkUnitObservationTracker {
             .collect()
     }
 
+    /// Return the current non-terminal truth used by final-answer settlement.
+    ///
+    /// Terminal observations remove their cursor in [`Self::observe`], so
+    /// this snapshot cannot resurrect completed work or infer state from
+    /// prose/tool names. The map key keeps ordering deterministic for prompts,
+    /// journals, and tests.
+    pub fn active_work_units(&self) -> Vec<ActiveWorkUnit> {
+        self.cursors
+            .values()
+            .map(|cursor| ActiveWorkUnit {
+                id: cursor.id.clone(),
+                kind: cursor.kind.clone(),
+                status: cursor.status,
+                wake_policy: cursor.wake_policy,
+            })
+            .collect()
+    }
+
+    /// Accepted terminal producer observation for an identity, if any.
+    ///
+    /// This is intentionally identity-based and does not compare opaque
+    /// versions. Arrival at the producer seam establishes order; terminal is
+    /// absorbing for a work-unit identity within one turn.
+    pub fn terminal_observation(&self, id: &str, kind: &str) -> Option<&WorkUnitObservation> {
+        let identity = format!("{}:{}", kind.trim(), id.trim());
+        self.terminal.get(&identity)
+    }
+
     pub fn clear(&mut self) {
         self.cursors.clear();
+        self.terminal.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -318,6 +376,22 @@ mod tests {
             WorkUnitObservationOutcome::Terminal
         );
         assert!(tracker.is_empty());
+        assert_eq!(
+            tracker
+                .terminal_observation("work-1", "test")
+                .map(|observation| observation.status),
+            Some(WorkUnitStatus::CompletedWithIssues)
+        );
+        assert_eq!(
+            tracker.observe(&observation(
+                "stale-v1",
+                WorkUnitStatus::Running,
+                WorkUnitObservationMode::Current,
+            )),
+            WorkUnitObservationOutcome::Ignored,
+            "a delayed non-terminal snapshot must not resurrect terminal work"
+        );
+        assert!(tracker.is_empty());
     }
 
     #[test]
@@ -335,5 +409,52 @@ mod tests {
         let promised = first.with_wake_policy(WorkUnitWakePolicy::OnTerminal);
         tracker.observe(&promised);
         assert!(tracker.repeatedly_unchanged_without_wake(1).is_empty());
+    }
+
+    #[test]
+    fn active_work_snapshot_tracks_latest_nonterminal_truth_and_drops_terminal_units() {
+        let mut tracker = WorkUnitObservationTracker::default();
+        let running = observation(
+            "revision-1",
+            WorkUnitStatus::Running,
+            WorkUnitObservationMode::Current,
+        )
+        .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+        assert_eq!(tracker.observe(&running), WorkUnitObservationOutcome::First);
+        assert_eq!(
+            tracker.active_work_units(),
+            [ActiveWorkUnit {
+                id: "work-1".to_string(),
+                kind: "test".to_string(),
+                status: WorkUnitStatus::Running,
+                wake_policy: WorkUnitWakePolicy::OnTerminal,
+            }]
+        );
+
+        let waiting = observation(
+            "revision-2",
+            WorkUnitStatus::WaitingForInput,
+            WorkUnitObservationMode::Transition,
+        )
+        .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal);
+        assert_eq!(
+            tracker.observe(&waiting),
+            WorkUnitObservationOutcome::Advanced
+        );
+        assert_eq!(
+            tracker.active_work_units()[0].status,
+            WorkUnitStatus::WaitingForInput
+        );
+
+        let completed = observation(
+            "revision-3",
+            WorkUnitStatus::Completed,
+            WorkUnitObservationMode::Transition,
+        );
+        assert_eq!(
+            tracker.observe(&completed),
+            WorkUnitObservationOutcome::Terminal
+        );
+        assert!(tracker.active_work_units().is_empty());
     }
 }

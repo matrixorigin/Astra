@@ -1411,7 +1411,7 @@ fn transcript_items_from_server_loop(
         });
         let result_content =
             transcript_tool_text(record.result_full.as_ref(), record.result_preview.as_ref());
-        let result_content = if result_content.is_empty() {
+        let result_content = if result_content.is_empty() && !record.ok {
             transcript_tool_text(record.error.as_ref(), None)
         } else {
             result_content
@@ -3305,6 +3305,46 @@ mod tests {
                 .and_then(|payload| payload.tool_result.as_ref())
                 .and_then(|result| result.status.as_deref()),
             Some("failed")
+        );
+    }
+
+    #[test]
+    fn canonical_run_transcript_does_not_label_error_text_as_a_successful_result() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("call-empty-success".to_string()),
+                name: "write_file".to_string(),
+                ok: true,
+                error: Some("stale diagnostic that must not become output".into()),
+                result_full: Some(String::new()),
+                ..Default::default()
+            });
+
+        let items = transcript_items_from_server_loop(
+            "user-1",
+            "session-1",
+            "run-1",
+            None,
+            "write it",
+            &state,
+            false,
+        );
+        let tool_result = items
+            .iter()
+            .find(|item| item.role == "tool")
+            .expect("successful tool result");
+
+        assert_eq!(tool_result.content, "");
+        assert_eq!(
+            tool_result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.tool_result.as_ref())
+                .and_then(|result| result.status.as_deref()),
+            Some("completed")
         );
     }
 

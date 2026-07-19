@@ -887,6 +887,119 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_settlement() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .expect("start scripted fanout LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.write(b"launch_then_ask_foreground_status\r");
+    wait_for_three_fanout_children(&mock, &mut astra).await;
+    astra.wait_for("parent waits for the complete group", UI_TRANSITION_TIMEOUT);
+
+    // Let the first two deterministic children settle while the third remains
+    // blocked for six seconds, then ask through the still-active composer.
+    let partial_deadline = Instant::now() + Duration::from_millis(1_100);
+    while Instant::now() < partial_deadline {
+        astra.receive(Duration::from_millis(25));
+    }
+    let guidance_submitted_at = Instant::now();
+    astra.write(
+        format!(
+            "{}\r",
+            astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION
+        )
+        .as_bytes(),
+    );
+    astra.wait_for(
+        "Guidance queued · Three mock reviews: 2/3 settled, 1 running",
+        UI_TRANSITION_TIMEOUT,
+    );
+    assert!(
+        guidance_submitted_at.elapsed() < Duration::from_secs(2),
+        "active guidance needs an immediate runtime receipt instead of waiting for foreground fan-in"
+    );
+    astra.wait_for(
+        "Astra knows Three mock reviews completed as one foreground work group.",
+        Duration::from_secs(10),
+    );
+
+    let status_requests = mock
+        .received_requests()
+        .into_iter()
+        .filter(is_fanout_status_question)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        status_requests.len(),
+        1,
+        "one status question gets one analysis"
+    );
+    let status_request = status_requests[0].to_string();
+    assert!(
+        status_request.contains("active_work_snapshot.v1")
+            && status_request.contains("work_unit_observations")
+            && status_request.contains("mock-review-group")
+            && status_request.contains("agent_fanout"),
+        "active guidance must carry canonical typed group truth: {status_request}"
+    );
+    assert!(
+        status_request.contains("superseded_by_newer_producer_observation")
+            && (status_request.contains("\"status\":\"completed\"")
+                || status_request.contains("\\\"status\\\":\\\"completed\\\"")),
+        "the terminal producer revision must replace the stale 2/3 submission snapshot: {status_request}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&astra.output).contains("All three reviewers completed"),
+        "a non-terminal group must never be presented as settled"
+    );
+    assert!(
+        !String::from_utf8_lossy(&astra.output)
+            .contains("are running as one background work group"),
+        "the delayed model boundary must not repeat the stale submission-time status"
+    );
+
+    astra.wait_for(
+        "terminal fanout group exactly once.",
+        Duration::from_secs(12),
+    );
+    let received = mock.received_requests();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_status_question(request))
+            .count(),
+        1,
+        "terminal settlement must not replay the status question"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_root_request(request))
+            .count(),
+        3,
+        "tool discovery, fanout launch, and one combined terminal status/synthesis are the only parent boundaries"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| is_fanout_reconciliation_request(request))
+            .count(),
+        0,
+        "foreground fan-in must remain on its original parent after a status guidance boundary"
+    );
+
+    astra.write(b"/exit\r");
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
     let _journey = pty_journey_lock().lock().await;
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
