@@ -1,7 +1,10 @@
 mod common;
 
 use sqlx::Row;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use astra_services::storage::{CORE_SCHEMA_TABLES, ensure_core_schema};
 
 #[test]
 fn service_table_queries_name_columns_explicitly() {
@@ -43,6 +46,47 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let bootstrap_catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("second core schema bootstrap");
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("third core schema bootstrap");
+
+    let schema = current_schema(&pool).await;
+    let existing =
+        sqlx::query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ?")
+            .bind(&schema)
+            .fetch_all(pool.get())
+            .await
+            .expect("load live schema catalog")
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("TABLE_NAME").unwrap())
+            .collect::<BTreeSet<_>>();
+    let missing = CORE_SCHEMA_TABLES
+        .iter()
+        .filter(|table| !existing.contains(table.name))
+        .map(|table| format!("{} ({})", table.name, table.owner))
+        .collect::<Vec<_>>();
+    assert!(missing.is_empty(), "missing catalog tables: {missing:?}");
+
+    let contracts = sqlx::query(
+        "SELECT COUNT(*) AS count FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .expect("count core schema contract rows")
+    .try_get::<i64, _>("count")
+    .unwrap();
+    assert_eq!(contracts, 1, "repeated bootstrap must remain idempotent");
 }
 
 #[tokio::test]
