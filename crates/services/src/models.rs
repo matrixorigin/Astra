@@ -398,6 +398,49 @@ pub struct ResolvedModelOffering {
     pub model: ResolvedActiveLlmModel,
 }
 
+/// Product-level source that owns access to an admitted model route.
+///
+/// This is intentionally independent from provider identity. A provider model
+/// can be exposed through personal Cloud, a Workspace, a local device, or a
+/// self-hosted deployment without changing the agent runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessKind {
+    AstraCloud,
+    Workspace,
+    ThisDevice,
+    SelfHosted,
+}
+
+impl ModelAccessKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AstraCloud => "astra_cloud",
+            Self::Workspace => "workspace",
+            Self::ThisDevice => "this_device",
+            Self::SelfHosted => "self_hosted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelExecutionPlacement {
+    Server,
+    Edge,
+}
+
+impl ModelExecutionPlacement {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Edge => "edge",
+        }
+    }
+}
+
 /// Non-serializable execution material produced once at the trusted model
 /// admission boundary and consumed by every inference surface.
 ///
@@ -406,6 +449,8 @@ pub struct ResolvedModelOffering {
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub offering_id: String,
+    pub access_kind: ModelAccessKind,
+    pub execution_placement: ModelExecutionPlacement,
     pub model_name: String,
     pub wire_model_name: Option<String>,
     pub api_key: String,
@@ -424,6 +469,8 @@ impl AdmittedModelExecution {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
             offering_id: offering.offering_id,
+            access_kind: ModelAccessKind::SelfHosted,
+            execution_placement: ModelExecutionPlacement::Server,
             model_name: offering.model.model_name,
             wire_model_name: offering.model.wire_model_name,
             api_key: offering.model.api_key,
@@ -448,6 +495,8 @@ impl AdmittedModelExecution {
     ) -> Self {
         Self {
             offering_id,
+            access_kind: ModelAccessKind::ThisDevice,
+            execution_placement: ModelExecutionPlacement::Edge,
             model_name,
             wire_model_name: None,
             api_key: String::new(),
@@ -469,6 +518,8 @@ impl std::fmt::Debug for AdmittedModelExecution {
         header_names.sort_unstable();
         f.debug_struct("AdmittedModelExecution")
             .field("offering_id", &self.offering_id)
+            .field("access_kind", &self.access_kind)
+            .field("execution_placement", &self.execution_placement)
             .field("model_name", &self.model_name)
             .field("wire_model_name", &self.wire_model_name)
             .field("provider", &self.provider)

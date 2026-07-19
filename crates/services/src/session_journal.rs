@@ -9464,7 +9464,7 @@ mod turn_event_buffer_tests {
             run_id: Some("child-run".into()),
             parent_run_id: Some("root-run".into()),
             agent_id: Some("agent-1".into()),
-            ..Default::default()
+            ..LlmRoundRecord::new(InferencePurpose::SubAgent)
         });
 
         let event = buf.drain().pop().expect("child llm round");

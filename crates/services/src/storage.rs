@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-19-v3";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v4";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4269,6 +4269,95 @@ async fn ensure_core_schema_while_leased(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_infra_llm_models_context_window CHECK (context_window > 0),
             INDEX idx_infra_llm_models_active_provider_name (is_active, provider, model_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Canonical inference execution ledger. Admission writes the immutable route
+    // and logical invocation together; each physical attempt is then committed
+    // before its provider I/O. Route rows contain no credential or endpoint
+    // material and remain safe to project after execution.
+    query(
+        "CREATE TABLE IF NOT EXISTS inference_routes (
+            route_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            offering_id VARCHAR(64) NOT NULL,
+            resolved_model_name VARCHAR(255) NOT NULL,
+            upstream_model_name VARCHAR(255) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            execution_placement VARCHAR(32) NOT NULL,
+            access_kind VARCHAR(32) NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, route_id),
+            INDEX idx_inference_routes_owner_session_created (user_id, session_id, created_at, route_id),
+            INDEX idx_inference_routes_owner_run_created (user_id, run_id, created_at, route_id),
+            INDEX idx_inference_routes_offering_created (offering_id, created_at, route_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS inference_invocations (
+            invocation_id VARCHAR(64) NOT NULL,
+            route_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            turn_index BIGINT NOT NULL,
+            round_index BIGINT NOT NULL,
+            logical_attempt BIGINT NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            terminal_fingerprint CHAR(64) NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+            provider_response_id VARCHAR(255) NULL,
+            error_kind VARCHAR(64) NULL,
+            error_message TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            terminal_at DATETIME(6) NULL,
+            PRIMARY KEY (user_id, invocation_id),
+            UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
+            INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
+            INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
+            INDEX idx_inference_invocations_status_created (status, created_at, user_id, invocation_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS inference_provider_attempts (
+            attempt_id VARCHAR(64) NOT NULL,
+            invocation_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            attempt_index BIGINT NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            terminal_fingerprint CHAR(64) NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+            provider_response_id VARCHAR(255) NULL,
+            error_kind VARCHAR(64) NULL,
+            error_message TEXT NULL,
+            started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            terminal_at DATETIME(6) NULL,
+            PRIMARY KEY (user_id, attempt_id),
+            UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
+            INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
+            INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
+            INDEX idx_inference_attempts_status_started (status, started_at, user_id, attempt_id)
         )",
     )
     .execute(&pool)

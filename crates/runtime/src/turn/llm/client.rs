@@ -25,6 +25,7 @@ use std::{
 };
 
 use astra_logging::redact_known_secret_patterns;
+use async_trait::async_trait;
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -466,6 +467,86 @@ pub(crate) struct LlmCall<'a> {
     pub temperature: Option<f64>,
     pub has_fallback: bool,
     pub thinking: &'a ThinkingConfig,
+}
+
+/// Durable observer for physical provider requests.
+///
+/// `begin_attempt` must commit before the HTTP request is sent. Every returned
+/// index is then completed exactly once, including retryable failures and
+/// stream-to-nonstream fallback. Logical invocation lifecycle remains owned by
+/// the caller so one invocation can contain multiple physical attempts.
+#[async_trait]
+pub(crate) trait ProviderAttemptObserver: Send + Sync {
+    async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError>;
+
+    async fn finish_attempt(
+        &self,
+        attempt_index: u32,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError>;
+}
+
+fn provider_attempt_terminal_from_result(
+    result: &LlmCallResult,
+) -> astra_services::InferenceInvocationTerminal {
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+    astra_services::InferenceInvocationTerminal::succeeded(
+        astra_services::InferenceUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cached_input_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+        },
+        result.response_id.clone(),
+    )
+}
+
+fn provider_attempt_terminal_from_error(
+    error: &astra_core::ClassifiedError,
+) -> astra_services::InferenceInvocationTerminal {
+    let status = match error.kind {
+        astra_core::ErrorKind::Cancelled => astra_services::InferenceTerminalStatus::Cancelled,
+        astra_core::ErrorKind::Network
+        | astra_core::ErrorKind::StreamIdle
+        | astra_core::ErrorKind::StreamTransport => {
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        }
+        _ => astra_services::InferenceTerminalStatus::Failed,
+    };
+    let message = redact_provider_secrets(&error.message);
+    astra_services::InferenceInvocationTerminal {
+        status,
+        usage: astra_services::InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some(error.kind.as_str().to_string()),
+        error_message: Some(
+            astra_text_utils::str_preview::truncate_str(&message, 1_000).to_string(),
+        ),
+    }
+}
+
+async fn finish_observed_provider_attempt(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    terminal: &astra_services::InferenceInvocationTerminal,
+) -> Result<(), astra_core::ClassifiedError> {
+    let (Some(observer), Some(attempt_index)) = (observer, attempt_index) else {
+        return Ok(());
+    };
+    observer.finish_attempt(attempt_index, terminal).await
+}
+
+async fn finish_observed_provider_error(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_attempt(
+        observer,
+        attempt_index,
+        &provider_attempt_terminal_from_error(error),
+    )
+    .await
 }
 
 fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
@@ -2781,13 +2862,14 @@ pub(crate) async fn call_llm_and_collect(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_stream_callback(call, cancel, None).await
+    call_llm_and_collect_with_stream_callback(call, cancel, None, None).await
 }
 
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let LlmCall {
         purpose,
@@ -2924,6 +3006,10 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             }
         }
 
+        let observed_attempt = match attempt_observer {
+            Some(observer) => Some(observer.begin_attempt().await?),
+            None => None,
+        };
         let mut req = client.post(&url).header("content-type", "application/json");
         req = apply_provider_auth(req, provider, api_key, header_overrides);
         req = apply_llm_header_overrides(req, header_overrides);
@@ -2957,8 +3043,13 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     error = %e,
                     "LLM send failed"
                 );
-                last_err = format!("LLM request failed: {e}");
-                last_kind = astra_core::ErrorKind::Network;
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Network,
+                    format!("LLM request failed: {e}"),
+                );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                last_err = error.message;
+                last_kind = error.kind;
                 continue;
             }
         };
@@ -2978,12 +3069,23 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 )
                 .await
                 {
-                    Ok(result) => return Ok(result),
+                    Ok(result) => {
+                        finish_observed_provider_attempt(
+                            attempt_observer,
+                            observed_attempt,
+                            &provider_attempt_terminal_from_result(&result),
+                        )
+                        .await?;
+                        return Ok(result);
+                    }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled) => {
-                        return Err(astra_core::ClassifiedError::new(
+                        let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::Cancelled,
                             "LLM call cancelled",
-                        ));
+                        );
+                        finish_observed_provider_error(attempt_observer, observed_attempt, &error)
+                            .await?;
+                        return Err(error);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Exception {
                         kind,
@@ -2992,29 +3094,62 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         use crate::turn::bedrock::stream::{RetryKind, is_retryable_exception};
                         match is_retryable_exception(&kind) {
                             RetryKind::RateLimit => {
-                                last_err = format!("bedrock throttle: {message}");
-                                last_kind = astra_core::ErrorKind::RateLimit;
+                                let error = astra_core::ClassifiedError::new(
+                                    astra_core::ErrorKind::RateLimit,
+                                    format!("bedrock throttle: {message}"),
+                                );
+                                finish_observed_provider_error(
+                                    attempt_observer,
+                                    observed_attempt,
+                                    &error,
+                                )
+                                .await?;
+                                last_err = error.message;
+                                last_kind = error.kind;
                                 cooldown.with(model_key, |c| {
                                     let _ = c.record_429(None, has_fallback);
                                 });
                                 continue;
                             }
                             RetryKind::Transient => {
-                                last_err = format!("bedrock transient {kind}: {message}");
-                                last_kind = astra_core::ErrorKind::ServerError;
+                                let error = astra_core::ClassifiedError::new(
+                                    astra_core::ErrorKind::ServerError,
+                                    format!("bedrock transient {kind}: {message}"),
+                                );
+                                finish_observed_provider_error(
+                                    attempt_observer,
+                                    observed_attempt,
+                                    &error,
+                                )
+                                .await?;
+                                last_err = error.message;
+                                last_kind = error.kind;
                                 continue;
                             }
                             RetryKind::Terminal => {
-                                return Err(astra_core::ClassifiedError::new(
+                                let error = astra_core::ClassifiedError::new(
                                     astra_core::ErrorKind::Unknown,
                                     format!("bedrock {kind}: {message}"),
-                                ));
+                                );
+                                finish_observed_provider_error(
+                                    attempt_observer,
+                                    observed_attempt,
+                                    &error,
+                                )
+                                .await?;
+                                return Err(error);
                             }
                         }
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Transport(e)) => {
-                        last_err = format!("bedrock transport: {e}");
-                        last_kind = astra_core::ErrorKind::StreamTransport;
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::StreamTransport,
+                            format!("bedrock transport: {e}"),
+                        );
+                        finish_observed_provider_error(attempt_observer, observed_attempt, &error)
+                            .await?;
+                        last_err = error.message;
+                        last_kind = error.kind;
                         continue;
                     }
                 }
@@ -3044,19 +3179,38 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 .await
             };
             match stream_result {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    finish_observed_provider_attempt(
+                        attempt_observer,
+                        observed_attempt,
+                        &provider_attempt_terminal_from_result(&result),
+                    )
+                    .await?;
+                    return Ok(result);
+                }
                 Err(StreamCollectError::Cancelled { partial }) => {
-                    return Err(attach_partial_details(
+                    let error = attach_partial_details(
                         astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::Cancelled,
                             "LLM call cancelled",
                         ),
                         &partial,
-                    ));
+                    );
+                    finish_observed_provider_error(attempt_observer, observed_attempt, &error)
+                        .await?;
+                    return Err(error);
                 }
                 Err(StreamCollectError::Transport { error, partial }) => {
                     last_err = format!("LLM stream transport error: {error}");
                     last_kind = astra_core::ErrorKind::StreamTransport;
+                    let observed_error =
+                        astra_core::ClassifiedError::new(last_kind, last_err.clone());
+                    finish_observed_provider_error(
+                        attempt_observer,
+                        observed_attempt,
+                        &observed_error,
+                    )
+                    .await?;
                     if let Some(details_json) = llm_result_details_json(&partial) {
                         let elapsed = started.elapsed();
                         if elapsed > total_budget {
@@ -3100,6 +3254,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                 thinking,
                             },
                             fb_timeout,
+                            attempt_observer,
                         )
                         .await
                         .map_err(|error| error.with_details_json(details_json));
@@ -3112,14 +3267,27 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     partial,
                 }) => {
                     if cancel.is_triggered() {
-                        return Err(attach_partial_details(
+                        let error = attach_partial_details(
                             astra_core::ClassifiedError::new(
                                 astra_core::ErrorKind::Cancelled,
                                 "LLM call cancelled",
                             ),
                             &partial,
-                        ));
+                        );
+                        finish_observed_provider_error(attempt_observer, observed_attempt, &error)
+                            .await?;
+                        return Err(error);
                     }
+                    let observed_error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::StreamIdle,
+                        format!("stream idle timeout after {elapsed_ms}ms"),
+                    );
+                    finish_observed_provider_error(
+                        attempt_observer,
+                        observed_attempt,
+                        &observed_error,
+                    )
+                    .await?;
                     // Check total budget before attempting retry/fallback.
                     let elapsed = started.elapsed();
                     if elapsed > total_budget {
@@ -3188,6 +3356,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                             thinking,
                         },
                         fb_timeout,
+                        attempt_observer,
                     )
                     .await
                     .map_err(|error| attach_partial_details(error, &partial));
@@ -3216,10 +3385,12 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 target: "astra_runtime::llm_client",
                 "LLM auth error ({status}) on {model_key}: {redacted}",
             );
-            return Err(astra_core::ClassifiedError::new(
+            let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Auth,
                 "LLM provider authentication failed".to_string(),
-            ));
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
         }
 
         // For other 4xx errors, suppress the raw response body to avoid
@@ -3235,6 +3406,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
             last_kind = astra_core::ErrorKind::RateLimit;
+            let observed_error = astra_core::ClassifiedError::new(last_kind, last_err.clone());
+            finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
+                .await?;
 
             // Detect TPM exhaustion for extended retry behavior
             if is_tpm_exhaustion(&text) && !tpm_exhaustion_detected {
@@ -3268,6 +3442,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
 
         if is_overload_status(status) {
             last_kind = astra_core::ErrorKind::ServerError;
+            let observed_error = astra_core::ClassifiedError::new(last_kind, last_err.clone());
+            finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
+                .await?;
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
             astra_core::agent_warn!(
                 "llm",
@@ -3284,26 +3461,33 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         // Other 5xx errors are retryable
         if status >= 500 {
             last_kind = astra_core::ErrorKind::ServerError;
+            let observed_error = astra_core::ClassifiedError::new(last_kind, last_err.clone());
+            finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
+                .await?;
             continue;
         }
 
         // Context-window errors — classified at source, no string prefix needed.
         if status == 400 && astra_core::is_llm_context_window_error(&text) {
-            return Err(astra_core::ClassifiedError::new(
+            let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
                 format!("LLM error {status}: {text}"),
-            ));
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
         }
 
         // Other 400 errors
         if status == 400 {
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::InvalidRequest,
-                last_err,
-            ));
+            let error =
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, last_err);
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
         }
 
-        return Err(astra_core::ClassifiedError::new(last_kind, last_err));
+        let error = astra_core::ClassifiedError::new(last_kind, last_err);
+        finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+        return Err(error);
     }
 
     let retries_used = if tpm_exhaustion_detected {
@@ -4029,6 +4213,15 @@ pub(crate) async fn call_llm_nonstream(
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_with_attempt_observer(client, call, timeout, None).await
+}
+
+async fn call_llm_nonstream_with_attempt_observer(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let LlmCall {
         purpose,
         messages,
@@ -4076,6 +4269,10 @@ pub(crate) async fn call_llm_nonstream(
     );
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let observed_attempt = match attempt_observer {
+        Some(observer) => Some(observer.begin_attempt().await?),
+        None => None,
+    };
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
@@ -4092,12 +4289,9 @@ pub(crate) async fn call_llm_nonstream(
         model_name,
         "LLM non-stream request sending"
     );
-    let resp = req
-        .timeout(effective_timeout)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
+    let resp = match req.timeout(effective_timeout).json(&body).send().await {
+        Ok(response) => response,
+        Err(e) => {
             let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
@@ -4107,11 +4301,14 @@ pub(crate) async fn call_llm_nonstream(
                 error = %e,
                 "LLM non-stream request send failed"
             );
-            astra_core::ClassifiedError::new(
+            let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Network,
                 nonstream_send_error_message(&e, effective_timeout, elapsed),
-            )
-        })?;
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+    };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -4128,17 +4325,34 @@ pub(crate) async fn call_llm_nonstream(
         } else {
             astra_core::ErrorKind::Unknown
         };
-        return Err(astra_core::ClassifiedError::new(
+        let detail = redact_provider_secrets(&text);
+        let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+        let error = astra_core::ClassifiedError::new(
             kind,
-            format!("LLM non-stream request error {status}: {text}"),
-        ));
+            format!("LLM non-stream request error {status}: {detail}"),
+        );
+        finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+        return Err(error);
     }
-    let v: Value = resp.json().await.map_err(|e| {
-        astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, e.to_string())
-    })?;
-    Ok(parse_nonstream_response_for_provider(
-        &v, provider, model_name, started,
-    ))
+    let v: Value = match resp.json().await {
+        Ok(value) => value,
+        Err(error) => {
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamTransport,
+                error.to_string(),
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+    };
+    let result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    finish_observed_provider_attempt(
+        attempt_observer,
+        observed_attempt,
+        &provider_attempt_terminal_from_result(&result),
+    )
+    .await?;
+    Ok(result)
 }
 
 async fn call_llm_nonstream_fallback_for_trigger(
@@ -4146,8 +4360,10 @@ async fn call_llm_nonstream_fallback_for_trigger(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let result = call_llm_nonstream(client, call, timeout).await;
+    let result =
+        call_llm_nonstream_with_attempt_observer(client, call, timeout, attempt_observer).await;
     record_llm_nonstream_fallback_outcome(trigger, &result);
     result
 }
@@ -5629,6 +5845,54 @@ mod tests {
     #[derive(Clone)]
     struct Hit(Arc<AtomicU32>);
 
+    #[derive(Default)]
+    struct RecordingAttemptObserver {
+        next: AtomicU32,
+        began: Mutex<Vec<u32>>,
+        finished: Mutex<Vec<(u32, astra_services::InferenceTerminalStatus)>>,
+    }
+
+    #[async_trait]
+    impl ProviderAttemptObserver for RecordingAttemptObserver {
+        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+            let attempt = self.next.fetch_add(1, Ordering::SeqCst);
+            self.began.lock().expect("began lock").push(attempt);
+            Ok(attempt)
+        }
+
+        async fn finish_attempt(
+            &self,
+            attempt_index: u32,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            self.finished
+                .lock()
+                .expect("finished lock")
+                .push((attempt_index, terminal.status));
+            Ok(())
+        }
+    }
+
+    struct RejectingAttemptObserver;
+
+    #[async_trait]
+    impl ProviderAttemptObserver for RejectingAttemptObserver {
+        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::DatabaseError,
+                "durable attempt admission unavailable",
+            ))
+        }
+
+        async fn finish_attempt(
+            &self,
+            _attempt_index: u32,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            panic!("an attempt that was not durably admitted cannot be finished")
+        }
+    }
+
     #[derive(Clone)]
     struct StreamIdleHit {
         stream_hits: Arc<AtomicU32>,
@@ -7037,7 +7301,8 @@ mod tests {
             .with_state(Hit(hits.clone()));
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
-        let res = call_llm_and_collect(
+        let observer = RecordingAttemptObserver::default();
+        let res = call_llm_and_collect_with_stream_callback(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
@@ -7059,11 +7324,63 @@ mod tests {
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
+            None,
+            Some(&observer),
         )
         .await
         .expect("llm ok");
         assert_eq!(res.full_text, "after-429");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(*observer.began.lock().expect("began"), vec![0, 1]);
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![
+                (0, astra_services::InferenceTerminalStatus::Failed),
+                (1, astra_services::InferenceTerminalStatus::Succeeded),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_attempt_admission_failure_prevents_provider_delivery() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_500_once))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+
+        let error = call_llm_and_collect_with_stream_callback(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&RejectingAttemptObserver),
+        )
+        .await
+        .expect_err("provider delivery requires durable attempt admission");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

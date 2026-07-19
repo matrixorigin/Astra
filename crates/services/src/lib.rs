@@ -21,6 +21,7 @@ pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
 pub mod harness;
+pub mod inference_execution;
 pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
@@ -202,6 +203,12 @@ pub use harness::{
     SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
+pub use inference_execution::{
+    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
+    InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
+    admit_inference_invocation, begin_inference_provider_attempt, finish_inference_invocation,
+    finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
+};
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
     InteractionStatus, approval_decision_status, ask_user_response_status, edge_dispatch_status,
@@ -237,11 +244,12 @@ pub use model_gateways::{
     UnconfiguredModelGatewayService,
 };
 pub use models::{
-    AdmittedModelExecution, DatabaseModelService, ModelCreateRequestData, ModelListItem,
-    ModelOfferingResolutionError, ModelRecord, ModelService, ModelUpdateRequestData, PricingData,
-    PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
-    PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
-    UnconfiguredModelService, prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
+    AdmittedModelExecution, DatabaseModelService, ModelAccessKind, ModelCreateRequestData,
+    ModelExecutionPlacement, ModelListItem, ModelOfferingResolutionError, ModelRecord,
+    ModelService, ModelUpdateRequestData, PricingData, PromptCacheCapabilityData,
+    PromptCacheProtocolData, PromptCacheReuseScopeData, PromptCacheVolatilePlacementData,
+    QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
+    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
     resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
     validate_model_offering_id,
 };

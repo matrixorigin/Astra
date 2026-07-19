@@ -275,6 +275,27 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
     SessionBatchDeleteStatement {
+        label: "inference_provider_attempts",
+        sql: "DELETE FROM inference_provider_attempts
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY started_at ASC, attempt_id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "inference_invocations",
+        sql: "DELETE FROM inference_invocations
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, invocation_id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "inference_routes",
+        sql: "DELETE FROM inference_routes
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, route_id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
         label: "session_tool_outputs",
         sql: "DELETE FROM session_tool_outputs
              WHERE session_id = ? AND user_id = ?
@@ -1017,6 +1038,9 @@ mod tests {
                 "agent_events",
                 "agent_run_events",
                 "conversation_log",
+                "inference_invocations",
+                "inference_provider_attempts",
+                "inference_routes",
                 "prompt_deltas",
                 "prompt_request_records",
                 "session_tool_output_batches",

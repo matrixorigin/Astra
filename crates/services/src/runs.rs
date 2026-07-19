@@ -10398,6 +10398,8 @@ mod tests {
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
                 offering_id: "offer-gpt-4".to_string(),
+                access_kind: crate::ModelAccessKind::SelfHosted,
+                execution_placement: crate::ModelExecutionPlacement::Server,
                 model_name: "gpt-4".to_string(),
                 wire_model_name: None,
                 api_key: "provider-api-secret".to_string(),

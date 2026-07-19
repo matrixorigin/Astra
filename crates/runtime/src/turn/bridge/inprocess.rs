@@ -8081,6 +8081,7 @@ mod tests {
                 agentic_step: Some(3),
                 source: Some("bridge_inprocess".to_string()),
                 run_id: None,
+                parent_run_id: None,
                 tool_calls: None,
                 agent_id: None,
             });
