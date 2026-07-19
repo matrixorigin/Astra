@@ -331,12 +331,38 @@ fn carry_forward_user_turn_semantics(
         })
         .count();
 
-    for (previous, incoming) in previous.iter().zip(incoming.iter_mut()).take(shared_prefix) {
-        if incoming.as_object().is_some_and(|message| {
+    for (index, (previous, incoming)) in previous
+        .iter()
+        .zip(incoming.iter_mut())
+        .take(shared_prefix)
+        .enumerate()
+    {
+        if !incoming.as_object().is_some_and(|message| {
             !message.contains_key(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
-        }) && let Some(semantics) = astra_turn_types::user_turn_semantics(previous)
-        {
-            astra_turn_types::mark_user_turn_semantics(incoming, semantics);
+        }) {
+            continue;
+        }
+        match astra_turn_types::user_turn_semantics(previous) {
+            Ok(Some(semantics)) => {
+                astra_turn_types::mark_user_turn_semantics(incoming, semantics);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    message_index = index,
+                    error = %error,
+                    "invalid user-turn semantics in canonical CSL prefix; preserving raw metadata for explicit restore degradation"
+                );
+                if let (Some(raw), Some(object)) = (
+                    previous.get(astra_turn_types::USER_TURN_SEMANTICS_FIELD),
+                    incoming.as_object_mut(),
+                ) {
+                    object.insert(
+                        astra_turn_types::USER_TURN_SEMANTICS_FIELD.to_string(),
+                        raw.clone(),
+                    );
+                }
+            }
         }
     }
 }
@@ -564,7 +590,8 @@ mod tests {
             test_manager_with_config(&tmp, "typed-semantics", CslManagerConfig::default());
         let materialized = loader.load().await.unwrap().unwrap();
         assert_eq!(
-            astra_turn_types::user_turn_semantics(&materialized.messages[0]),
+            astra_turn_types::user_turn_semantics(&materialized.messages[0])
+                .expect("valid semantics"),
             Some(semantics)
         );
     }
@@ -581,7 +608,36 @@ mod tests {
 
         carry_forward_user_turn_semantics(&[objective], &mut rewritten);
 
-        assert!(astra_turn_types::user_turn_semantics(&rewritten[0]).is_none());
+        assert!(
+            astra_turn_types::user_turn_semantics(&rewritten[0])
+                .expect("valid unmarked message")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_prefix_metadata_is_preserved_for_explicit_restore_degradation() {
+        let raw = serde_json::json!({
+            "schema_version": "invalid",
+            "objective_relation": "replace"
+        });
+        let objective = serde_json::json!({
+            "role": "user",
+            "content": "repair lifecycle",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): raw.clone()
+        });
+        let mut projected = vec![user_msg("repair lifecycle")];
+
+        carry_forward_user_turn_semantics(&[objective], &mut projected);
+
+        assert_eq!(
+            projected[0][astra_turn_types::USER_TURN_SEMANTICS_FIELD],
+            raw
+        );
+        assert!(matches!(
+            astra_turn_types::user_turn_semantics(&projected[0]),
+            Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+        ));
     }
 
     #[tokio::test]

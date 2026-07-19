@@ -50,6 +50,21 @@ impl ObjectiveRelation {
     pub const fn updates_objective_context(self) -> bool {
         matches!(self, Self::Refine | Self::Correct | Self::Replace)
     }
+
+    /// Canonical prompt label for typed objective projections.
+    ///
+    /// Keeping this vocabulary on the producer-owned enum prevents CLI and
+    /// server resume surfaces from rendering the same state differently.
+    #[must_use]
+    pub const fn objective_context_label(self) -> &'static str {
+        match self {
+            Self::Replace => "objective",
+            Self::Refine => "refinement",
+            Self::Correct => "correction",
+            Self::Unknown => "initial objective (judge unavailable)",
+            Self::Acknowledge | Self::Continue => "unchanged objective",
+        }
+    }
 }
 
 /// Semantic class of explicit user feedback.
@@ -121,6 +136,19 @@ pub struct UserTurnSemantics {
     pub feedback: Option<UserFeedback>,
 }
 
+/// Invalid producer-owned metadata is distinct from metadata that is absent.
+/// Resume and persistence boundaries can therefore degrade explicitly instead
+/// of silently treating a corrupt canonical message as an unjudged turn.
+#[derive(Debug, thiserror::Error)]
+pub enum UserTurnSemanticsError {
+    #[error("user-turn semantics metadata belongs to a non-user message (role={role:?})")]
+    InvalidOwner { role: Option<String> },
+    #[error("malformed user-turn semantics metadata: {0}")]
+    Malformed(#[source] serde_json::Error),
+    #[error("unsupported user-turn semantics schema version {found}; expected {expected}")]
+    UnsupportedSchemaVersion { found: u8, expected: u8 },
+}
+
 impl UserTurnSemantics {
     #[must_use]
     pub const fn new(
@@ -150,14 +178,29 @@ pub fn mark_user_turn_semantics(message: &mut Value, semantics: UserTurnSemantic
     true
 }
 
-#[must_use]
-pub fn user_turn_semantics(message: &Value) -> Option<UserTurnSemantics> {
+pub fn user_turn_semantics(
+    message: &Value,
+) -> Result<Option<UserTurnSemantics>, UserTurnSemanticsError> {
+    let Some(raw_semantics) = message.get(USER_TURN_SEMANTICS_FIELD) else {
+        return Ok(None);
+    };
     if message.get("role").and_then(Value::as_str) != Some("user") {
-        return None;
+        return Err(UserTurnSemanticsError::InvalidOwner {
+            role: message
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
     }
     let semantics: UserTurnSemantics =
-        serde_json::from_value(message.get(USER_TURN_SEMANTICS_FIELD)?.clone()).ok()?;
-    (semantics.schema_version == USER_TURN_SEMANTICS_SCHEMA_VERSION).then_some(semantics)
+        serde_json::from_value(raw_semantics.clone()).map_err(UserTurnSemanticsError::Malformed)?;
+    if semantics.schema_version != USER_TURN_SEMANTICS_SCHEMA_VERSION {
+        return Err(UserTurnSemanticsError::UnsupportedSchemaVersion {
+            found: semantics.schema_version,
+            expected: USER_TURN_SEMANTICS_SCHEMA_VERSION,
+        });
+    }
+    Ok(Some(semantics))
 }
 
 /// How user input accepted while a run is active must be delivered.
@@ -208,7 +251,7 @@ mod tests {
         let mut message = json!({"role": "user", "content": "arbitrary text"});
 
         assert!(mark_user_turn_semantics(&mut message, semantics));
-        assert_eq!(user_turn_semantics(&message), Some(semantics));
+        assert_eq!(user_turn_semantics(&message).unwrap(), Some(semantics));
     }
 
     #[test]
@@ -218,6 +261,47 @@ mod tests {
 
         assert!(!mark_user_turn_semantics(&mut assistant, semantics));
         assistant[USER_TURN_SEMANTICS_FIELD] = json!(semantics);
-        assert!(user_turn_semantics(&assistant).is_none());
+        assert!(matches!(
+            user_turn_semantics(&assistant),
+            Err(UserTurnSemanticsError::InvalidOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unsupported_semantics_are_not_reported_as_absent() {
+        let malformed = json!({
+            "role": "user",
+            "content": "repair it",
+            (USER_TURN_SEMANTICS_FIELD): {"schema_version": "one"}
+        });
+        assert!(matches!(
+            user_turn_semantics(&malformed),
+            Err(UserTurnSemanticsError::Malformed(_))
+        ));
+
+        let unsupported = json!({
+            "role": "user",
+            "content": "repair it",
+            (USER_TURN_SEMANTICS_FIELD): {
+                "schema_version": USER_TURN_SEMANTICS_SCHEMA_VERSION + 1,
+                "objective_relation": "replace"
+            }
+        });
+        assert!(matches!(
+            user_turn_semantics(&unsupported),
+            Err(UserTurnSemanticsError::UnsupportedSchemaVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn objective_context_labels_have_one_typed_owner() {
+        assert_eq!(
+            ObjectiveRelation::Unknown.objective_context_label(),
+            "initial objective (judge unavailable)"
+        );
+        assert_eq!(
+            ObjectiveRelation::Correct.objective_context_label(),
+            "correction"
+        );
     }
 }

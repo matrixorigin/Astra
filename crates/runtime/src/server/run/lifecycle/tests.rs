@@ -842,7 +842,7 @@ fn shutdown_extraction_request_uses_outer_session_turn() {
 }
 
 #[test]
-fn shutdown_extraction_request_detects_correction_from_structured_user_intent() {
+fn shutdown_extraction_request_uses_typed_objective_relation() {
     let svc = test_service();
     let mut request = test_request(
         "<project-instructions>\nDo not classify this wrapper.\n</project-instructions>\n\ncontinue",
@@ -858,13 +858,17 @@ fn shutdown_extraction_request_detects_correction_from_structured_user_intent() 
         None,
     );
     state.context_manifest_user_id = Some("test-user".to_string());
+    state.turn_intent = Some(
+        astra_config::user_profile::TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct),
+    );
 
     let req = build_shutdown_extraction_request(&state)
         .expect("shutdown extraction request should build");
 
     assert!(
         req.reanchors_current_objective,
-        "shutdown extraction must classify pure user intent, not prompt-facing runtime content"
+        "shutdown extraction must consume the judge-owned objective relation without reclassifying message text"
     );
 }
 
@@ -2951,9 +2955,10 @@ fn server_resume_hydration_uses_transcript_when_primary_restore_is_not_viable() 
         &primary,
         &transcript,
     )
+    .expect("transcript metadata should be valid")
     .expect("transcript fallback should provide viable resume context");
 
-    assert!(hint.contains("active_objective: review branch changes"));
+    assert!(hint.contains("latest_user_input: review branch changes"));
     assert!(hint.contains("last_assistant_state: The review found resume continuity issues."));
 }
 
@@ -2972,12 +2977,40 @@ fn server_resume_hydration_prefers_primary_restore_when_viable() {
         &primary,
         &transcript,
     )
+    .expect("primary metadata should be valid")
     .expect("primary restore should provide viable resume context");
 
-    assert!(hint.contains("active_objective: primary goal"));
+    assert!(hint.contains("latest_user_input: primary goal"));
     assert!(hint.contains("last_assistant_state: primary state"));
     assert!(!hint.contains("transcript goal"));
     assert!(!hint.contains("transcript state"));
+}
+
+#[test]
+fn server_resume_hydration_does_not_hide_corrupt_primary_metadata_with_a_fallback() {
+    let primary = vec![
+        json!({
+            "role": "user",
+            "content": "primary goal",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                "schema_version": "invalid",
+                "objective_relation": "replace"
+            }
+        }),
+        json!({"role": "assistant", "content": "primary state"}),
+    ];
+    let transcript = vec![
+        json!({"role": "user", "content": "fallback goal"}),
+        json!({"role": "assistant", "content": "fallback state"}),
+    ];
+
+    assert!(matches!(
+        AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
+            &primary,
+            &transcript,
+        ),
+        Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+    ));
 }
 
 fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {

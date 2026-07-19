@@ -4027,8 +4027,9 @@ impl ServerAgenticLoopHost {
                             target: "astra_runtime::server_loop_host",
                             run_id,
                             error = %error,
-                            "delivery SSE map was misrouted as an interaction event; skipping"
+                            "delivery SSE map violated the event-lane contract; terminal fault is latched and remaining maps will not be delivered"
                         );
+                        break;
                     }
                 }
 

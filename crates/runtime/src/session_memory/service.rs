@@ -406,8 +406,9 @@ impl MemoryExtractionService {
     /// init/growth gates but still accumulated meaningful state, enqueue one
     /// last extraction before callers block in [`Self::wait_for_pending`].
     ///
-    /// Skips silently when the session is trivial (for example "hi" / "hello")
-    /// or when the latest persisted snapshot is already fresh enough.
+    /// Message text is not classified here. The canonical fingerprint decides
+    /// whether the latest snapshot is already fresh; semantic interpretation
+    /// belongs to the configured extraction provider.
     pub fn maybe_spawn_shutdown_flush(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
         // Shutdown does not invent a second freshness policy. The same
         // semantic fingerprint, low-information gate, health cooldown, and
@@ -1713,7 +1714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_flush_skips_trivial_session() {
+    async fn shutdown_flush_skips_an_unchanged_canonical_snapshot() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
             session_id: format!("shutdown-trivial-{}", nanos()),
@@ -1726,6 +1727,9 @@ mod tests {
             reanchors_current_objective: false,
             turn_number: 1,
         };
+        let fingerprint = extraction_input_fingerprint(&req);
+        ctx.svc
+            .mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
         assert_eq!(
             ctx.svc.maybe_spawn_shutdown_flush(req),
             SpawnDecision::Skipped
@@ -1836,10 +1840,14 @@ mod tests {
 
         let mut latest = first;
         latest.turn_number = 2;
-        latest.messages.push(json!({
-            "role": "user",
-            "content": "Preserve the latest queued user state in the durable snapshot."
-        }));
+        latest
+            .session_facts
+            .active_files
+            .push(astra_turn_types::session_facts::FileEntry {
+                path: "src/latest-queued-state.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 2,
+            });
         assert_eq!(svc.maybe_spawn(latest), SpawnDecision::Queued);
         memoria.release_first.notify_waiters();
         assert_eq!(svc.wait_for_pending(Duration::from_secs(2)).await, 0);
@@ -1853,7 +1861,10 @@ mod tests {
         let final_memory =
             crate::session_memory::runner::decode_session_memory_entry(&stored[1], &sid)
                 .expect("latest canonical snapshot");
-        assert!(final_memory.contains("latest queued user state"));
+        assert!(
+            final_memory.contains("src/latest-queued-state.rs"),
+            "the queued request's producer-owned facts must reach the second durable snapshot"
+        );
     }
 
     #[tokio::test]
@@ -2567,7 +2578,6 @@ mod tests {
         let (svc, mut rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("bc-skip-{}", nanos());
-        // One-character input is rejected by the semantic-information gate.
         let req = ExtractionRequest {
             session_id: sid,
             messages: vec![json!({"role": "user", "content": "x"})],
@@ -2576,6 +2586,8 @@ mod tests {
             reanchors_current_objective: false,
             turn_number: 1,
         };
+        let fingerprint = extraction_input_fingerprint(&req);
+        svc.mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut rx);

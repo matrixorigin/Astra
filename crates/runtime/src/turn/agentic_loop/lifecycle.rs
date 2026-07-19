@@ -171,10 +171,7 @@ fn apply_judged_turn_intent_to_observability(
     hub.record_feedback(signal);
 }
 
-fn record_current_user_turn_semantics(
-    state: &mut AgenticLoopState,
-    intent: Option<&TurnIntent>,
-) -> bool {
+fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &TurnIntent) -> bool {
     // A single submitted user turn owns one marker. The agentic loop may call
     // this preparation phase more than once, and additional user guidance may
     // arrive between rounds. Resolve the canonical owner from the submitted
@@ -203,22 +200,26 @@ fn record_current_user_turn_semantics(
         return false;
     };
 
-    let semantics = astra_turn_types::UserTurnSemantics::new(
-        intent
-            .map(|intent| intent.objective_relation)
-            .unwrap_or_default(),
-        intent.and_then(|intent| intent.feedback),
-    );
+    let semantics =
+        astra_turn_types::UserTurnSemantics::new(intent.objective_relation, intent.feedback);
 
-    if let Some(current) = astra_turn_types::user_turn_semantics(&state.messages[index]) {
-        let advances_unknown = current.objective_relation
-            == astra_turn_types::ObjectiveRelation::Unknown
-            && current.feedback.is_none()
-            && intent.is_some_and(|intent| {
-                intent.objective_relation != astra_turn_types::ObjectiveRelation::Unknown
-                    || intent.feedback.is_some()
-            });
-        if !advances_unknown {
+    match astra_turn_types::user_turn_semantics(&state.messages[index]) {
+        Ok(Some(current)) => {
+            let advances_unknown = current.objective_relation
+                == astra_turn_types::ObjectiveRelation::Unknown
+                && current.feedback.is_none()
+                && (intent.objective_relation != astra_turn_types::ObjectiveRelation::Unknown
+                    || intent.feedback.is_some());
+            if !advances_unknown {
+                return false;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "refusing to overwrite invalid producer-owned user-turn semantics"
+            );
             return false;
         }
     }
@@ -1113,7 +1114,10 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 }
 
-fn apply_structured_user_reanchor(state: &mut AgenticLoopState) -> bool {
+fn apply_structured_user_reanchor(
+    state: &mut AgenticLoopState,
+    relation: astra_turn_types::ObjectiveRelation,
+) -> bool {
     if state.message.trim().is_empty() {
         return false;
     }
@@ -1126,10 +1130,39 @@ fn apply_structured_user_reanchor(state: &mut AgenticLoopState) -> bool {
     state.widen_selection_pending = true;
 
     if let Some(session) = state.pipeline_session.as_mut() {
-        session
-            .working_memory_mut()
-            .apply_user_correction(&state.message);
+        match relation {
+            astra_turn_types::ObjectiveRelation::Replace => session
+                .working_memory_mut()
+                .apply_objective_replacement(&state.message),
+            astra_turn_types::ObjectiveRelation::Correct => session
+                .working_memory_mut()
+                .apply_user_correction(&state.message),
+            astra_turn_types::ObjectiveRelation::Unknown
+            | astra_turn_types::ObjectiveRelation::Acknowledge
+            | astra_turn_types::ObjectiveRelation::Continue
+            | astra_turn_types::ObjectiveRelation::Refine => {}
+        }
     }
+    true
+}
+
+fn apply_structured_user_feedback(state: &mut AgenticLoopState, intent: &TurnIntent) -> bool {
+    let Some(feedback) = intent.feedback else {
+        return false;
+    };
+    // The re-anchor path already records corrections while resetting stale
+    // transient state. Avoid duplicating the same exact feedback entry.
+    if intent.reanchors_current_objective()
+        && feedback.kind == astra_turn_types::UserFeedbackKind::Correction
+    {
+        return false;
+    }
+    let Some(session) = state.pipeline_session.as_mut() else {
+        return false;
+    };
+    session
+        .working_memory_mut()
+        .apply_user_feedback(feedback, &state.message);
     true
 }
 
@@ -1568,22 +1601,24 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
     match host.judge_turn_intent(state).await {
         TurnIntentJudgeOutcome::Intent(intent) => {
-            let record_feedback = record_current_user_turn_semantics(state, Some(&intent));
+            let record_feedback = record_current_user_turn_semantics(state, &intent);
             apply_judged_turn_intent_to_observability(state, &intent, record_feedback);
             apply_judged_turn_intent_to_runtime_profile(state, &intent);
             if record_feedback && intent.reanchors_current_objective() {
-                apply_structured_user_reanchor(state);
+                apply_structured_user_reanchor(state, intent.objective_relation);
+            }
+            if record_feedback {
+                apply_structured_user_feedback(state, &intent);
             }
         }
         TurnIntentJudgeOutcome::FixedDefault => {
             // The baseline profile is constructed once from deterministic
-            // request heuristics. Do not retain or synthesize an LLM intent.
+            // request heuristics. Do not retain or synthesize judge-owned
+            // semantics when no judge result exists.
             state.turn_intent = None;
-            let _ = record_current_user_turn_semantics(state, None);
         }
         TurnIntentJudgeOutcome::Unavailable => {
             tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
-            let _ = record_current_user_turn_semantics(state, None);
         }
     }
     queue_task_board_advisory(host, state).await;
@@ -2968,6 +3003,7 @@ mod tests {
         assert!(state.task_profile.exploratory_task);
         assert_eq!(
             astra_turn_types::user_turn_semantics(&state.messages[0])
+                .expect("valid semantics")
                 .map(|semantics| semantics.objective_relation),
             Some(astra_turn_types::ObjectiveRelation::Replace)
         );
@@ -2977,6 +3013,26 @@ mod tests {
                 .as_ref()
                 .map(|intent| intent.workspace_mutation),
             Some(WorkspaceMutationIntent::ReadOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_turn_intent_judge_does_not_manufacture_objective_semantics() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.message = "repair the lifecycle".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare with the deterministic runtime profile");
+
+        assert!(
+            astra_turn_types::user_turn_semantics(&state.messages[0])
+                .expect("canonical message is valid")
+                .is_none(),
+            "judge unavailability is runtime state, not producer-owned objective semantics"
         );
     }
 
@@ -3002,34 +3058,42 @@ mod tests {
             .await
             .expect("second round should prepare");
 
-        assert!(astra_turn_types::user_turn_semantics(&state.messages[0]).is_some());
-        assert!(astra_turn_types::user_turn_semantics(state.messages.last().unwrap()).is_none());
+        assert!(
+            astra_turn_types::user_turn_semantics(&state.messages[0])
+                .expect("valid semantics")
+                .is_some()
+        );
+        assert!(
+            astra_turn_types::user_turn_semantics(state.messages.last().unwrap())
+                .expect("valid semantics")
+                .is_none()
+        );
     }
 
     #[test]
-    fn turn_semantics_only_advance_from_unknown_once() {
+    fn turn_semantics_only_advance_from_explicit_unknown_once() {
         let mut state = make_state();
         state.message = "repair it".into();
         state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": "repair it"})];
 
-        assert!(record_current_user_turn_semantics(&mut state, None));
         assert!(record_current_user_turn_semantics(
             &mut state,
-            Some(
-                &TurnIntent::default()
-                    .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
-            )
+            &TurnIntent::default()
+        ));
+        assert!(record_current_user_turn_semantics(
+            &mut state,
+            &TurnIntent::default()
+                .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
         ));
         assert!(!record_current_user_turn_semantics(
             &mut state,
-            Some(
-                &TurnIntent::default()
-                    .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace)
-            )
+            &TurnIntent::default()
+                .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace)
         ));
         assert_eq!(
             astra_turn_types::user_turn_semantics(&state.messages[0])
+                .expect("valid semantics")
                 .map(|semantics| semantics.objective_relation),
             Some(astra_turn_types::ObjectiveRelation::Correct)
         );
@@ -3870,7 +3934,10 @@ mod tests {
             memory.set_next_action("retry stale path");
         }
 
-        assert!(apply_structured_user_reanchor(&mut state));
+        assert!(apply_structured_user_reanchor(
+            &mut state,
+            astra_turn_types::ObjectiveRelation::Correct,
+        ));
 
         let rendered = state
             .pipeline_session
@@ -3949,7 +4016,10 @@ mod tests {
         state.restricted_tools.insert("bash".into());
         state.boosted_tools.insert("grep".into());
 
-        assert!(apply_structured_user_reanchor(&mut state));
+        assert!(apply_structured_user_reanchor(
+            &mut state,
+            astra_turn_types::ObjectiveRelation::Correct,
+        ));
 
         assert_eq!(state.turn_guard.nudge_count, 0);
         assert!(state.turn_guard.tool_sigs.is_empty());
@@ -4059,6 +4129,37 @@ mod tests {
         assert!(
             rendered.contains("Latest user correction overrides conflicting prior working memory")
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_retains_typed_requirement_for_the_next_model_boundary() {
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Refine)
+            .with_feedback(astra_turn_types::UserFeedback {
+                kind: astra_turn_types::UserFeedbackKind::Requirement,
+                target: astra_turn_types::UserFeedbackTarget::Verification,
+            });
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "Run the online database journey before merging.".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("Latest user requirement for verification"));
+        assert!(rendered.contains("Run the online database journey before merging."));
     }
 
     #[test]

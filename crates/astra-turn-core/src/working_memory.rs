@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 
+use astra_turn_types::{UserFeedback, UserFeedbackKind};
 use serde::{Deserialize, Serialize};
 
 /// Caps on how many decisions/blockers the prompt section will carry. The
@@ -106,6 +107,42 @@ impl WorkingMemoryState {
         self.clear_next_action();
         self.push_decision(format!(
             "Latest user correction overrides conflicting prior working memory: {correction}"
+        ));
+    }
+
+    /// Record an explicit objective replacement without carrying stale
+    /// transient pressure into the new objective.
+    pub fn apply_objective_replacement(&mut self, objective: impl AsRef<str>) {
+        let objective = compact_line(objective.as_ref(), 240);
+        if objective.is_empty() {
+            return;
+        }
+        self.clear_blockers();
+        self.clear_next_action();
+        self.push_decision(format!(
+            "Latest user objective replaces conflicting prior working memory: {objective}"
+        ));
+    }
+
+    /// Persist judge-owned feedback as bounded prompt-facing state.
+    ///
+    /// The judge supplies the semantic class and target; this method never
+    /// infers them from message text. Approval is observational rather than a
+    /// reusable instruction, while the other classes remain available at the
+    /// next real provider boundary through the WorkingMemory section.
+    pub fn apply_user_feedback(&mut self, feedback: UserFeedback, excerpt: impl AsRef<str>) {
+        let excerpt = compact_line(excerpt.as_ref(), 240);
+        if excerpt.is_empty() || feedback.kind == UserFeedbackKind::Approval {
+            return;
+        }
+        if feedback.kind == UserFeedbackKind::Correction {
+            self.apply_user_correction(excerpt);
+            return;
+        }
+        self.push_decision(format!(
+            "Latest user {} for {}: {excerpt}",
+            feedback.kind.as_str(),
+            feedback.target.as_str(),
         ));
     }
 
@@ -314,6 +351,47 @@ mod tests {
             rendered.contains("Latest user correction overrides conflicting prior working memory")
         );
         assert!(rendered.contains("use the server-side path"));
+    }
+
+    #[test]
+    fn typed_requirement_is_retained_but_approval_is_not_injected() {
+        let mut wm = WorkingMemoryState::default();
+        wm.apply_user_feedback(
+            UserFeedback {
+                kind: UserFeedbackKind::Requirement,
+                target: astra_turn_types::UserFeedbackTarget::Verification,
+            },
+            "Run the online database journey before merging.",
+        );
+        wm.apply_user_feedback(
+            UserFeedback {
+                kind: UserFeedbackKind::Approval,
+                target: astra_turn_types::UserFeedbackTarget::General,
+            },
+            "Looks good.",
+        );
+
+        let rendered = wm.render_prompt_section();
+        assert!(rendered.contains("Latest user requirement for verification"));
+        assert!(rendered.contains("Run the online database journey before merging."));
+        assert!(!rendered.contains("Looks good."));
+    }
+
+    #[test]
+    fn objective_replacement_uses_objective_semantics_and_clears_transient_pressure() {
+        let mut wm = WorkingMemoryState::default();
+        wm.push_blocker("old blocker");
+        wm.set_next_action("old next action");
+
+        wm.apply_objective_replacement("Build the server-owned lifecycle.");
+
+        let rendered = wm.render_prompt_section();
+        assert!(
+            rendered.contains("Latest user objective replaces conflicting prior working memory")
+        );
+        assert!(rendered.contains("Build the server-owned lifecycle."));
+        assert!(!rendered.contains("old blocker"));
+        assert!(!rendered.contains("old next action"));
     }
 
     #[test]

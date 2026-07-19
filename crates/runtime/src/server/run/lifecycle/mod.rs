@@ -5464,11 +5464,12 @@ impl AgenticRunLifecycleService {
             astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
         match restore.restore_session(user_id, session_id).await {
             Ok(Some(restored)) => {
-                if let Some(hint) =
-                    astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                        &restored.conversation_messages,
-                    )
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &restored.conversation_messages,
+                    &[],
+                ) {
                     return Some(hint);
                 }
                 let transcript_messages = self
@@ -5479,7 +5480,9 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_unusable",
                     )
                     .await;
-                if let Some(hint) = Self::session_resume_hydration_hint_from_sources(
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
                     &restored.conversation_messages,
                     &transcript_messages,
                 ) {
@@ -5506,9 +5509,12 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_empty",
                     )
                     .await;
-                if let Some(hint) =
-                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &[],
+                    &transcript_messages,
+                ) {
                     return Some(hint);
                 }
                 tracing::warn!(
@@ -5532,9 +5538,12 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_failed",
                     )
                     .await;
-                if let Some(hint) =
-                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &[],
+                    &transcript_messages,
+                ) {
                     return Some(hint);
                 }
                 tracing::warn!(
@@ -5607,15 +5616,45 @@ impl AgenticRunLifecycleService {
     fn session_resume_hydration_hint_from_sources(
         primary_messages: &[Value],
         transcript_messages: &[Value],
-    ) -> Option<String> {
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            primary_messages,
-        )
-        .or_else(|| {
+    ) -> Result<Option<String>, astra_turn_types::UserTurnSemanticsError> {
+        if let Some(hint) =
             astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                transcript_messages,
-            )
-        })
+                primary_messages,
+            )?
+        {
+            return Ok(Some(hint));
+        }
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            transcript_messages,
+        )
+    }
+
+    fn session_resume_hydration_hint_or_invalid_failure(
+        user_id: &str,
+        session_id: &str,
+        primary_messages: &[Value],
+        transcript_messages: &[Value],
+    ) -> Option<String> {
+        match Self::session_resume_hydration_hint_from_sources(
+            primary_messages,
+            transcript_messages,
+        ) {
+            Ok(hint) => hint,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    error = %error,
+                    "resume hydration degraded: restored typed turn metadata is invalid"
+                );
+                Some(
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "restored resume source contains invalid typed turn metadata",
+                    ),
+                )
+            }
+        }
     }
 
     async fn task_board_resume_hint_for_session(

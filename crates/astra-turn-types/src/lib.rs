@@ -83,5 +83,5 @@ pub use tool_invocation::{
 pub use user_intent::{
     ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,
     UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
-    mark_user_turn_semantics, user_turn_semantics,
+    UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
 };

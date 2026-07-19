@@ -18,8 +18,8 @@ mod verify;
 /// `batch` was deleted: its instructions told the model to call the
 /// removed `delegate` action, and its triggers (`parallel`, `bulk`,
 /// `for each`) auto-fired on read-only review requests. With
-/// `agent(action='spawn', ...)` + `run_in_background: true` documented in the tool
-/// description, the model already knows how to fan out parallel work.
+/// the native fanout schema is advertised by the calling surface, parallel
+/// orchestration belongs to that surface rather than a broadly triggered skill.
 pub fn all_dynamic_skills() -> Vec<String> {
     vec![
         debug::skill_content(),
@@ -57,6 +57,16 @@ mod tests {
              without first proving it doesn't auto-fire on read-only \
              multi-angle review and that it does not reference removed \
              tool actions"
+        );
+    }
+
+    #[test]
+    fn review_skill_does_not_depend_on_a_removed_orchestration_action() {
+        let (manifest, _) = crate::loader::parse_skill_md(&review::skill_content())
+            .expect("dynamic review skill must remain a valid skill document");
+        assert_eq!(
+            manifest.allowed_tools,
+            vec!["bash", "read_file", "write_file"]
         );
     }
 

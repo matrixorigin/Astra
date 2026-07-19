@@ -280,8 +280,23 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
 }
 
 fn objective_context_for_anchor(state: &SessionState, result: &StreamResult) -> Vec<String> {
-    let projected =
-        astra_turn_core::resume_hydration::objective_context_from_messages(&result.final_messages);
+    let projected = match astra_turn_core::resume_hydration::objective_context_from_messages(
+        &result.final_messages,
+    ) {
+        Ok(projected) => projected,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %state.task_manager.session_id(),
+                error = %error,
+                "invalid typed objective metadata in completed turn; preserving previous continuation objective"
+            );
+            return state
+                .continuation_anchor
+                .as_ref()
+                .map(|anchor| anchor.objective_context.clone())
+                .unwrap_or_default();
+        }
+    };
     if projected.is_empty() {
         return state
             .continuation_anchor
@@ -319,14 +334,14 @@ fn render_objective_context_items(
     items
         .into_iter()
         .filter_map(|item| {
-            let label = match item.relation {
-                astra_turn_types::ObjectiveRelation::Replace => "objective",
-                astra_turn_types::ObjectiveRelation::Refine => "refinement",
-                astra_turn_types::ObjectiveRelation::Correct => "correction",
-                astra_turn_types::ObjectiveRelation::Unknown => "initial objective",
+            if matches!(
+                item.relation,
                 astra_turn_types::ObjectiveRelation::Acknowledge
-                | astra_turn_types::ObjectiveRelation::Continue => return None,
-            };
+                    | astra_turn_types::ObjectiveRelation::Continue
+            ) {
+                return None;
+            }
+            let label = item.relation.objective_context_label();
             Some(format!("{label}: {}", truncate_str(&item.text, 220)))
         })
         .collect()
@@ -339,9 +354,19 @@ pub(crate) fn seed_continuation_objective_from_messages(
     state: &mut SessionState,
     messages: &[serde_json::Value],
 ) {
-    let objective_context = render_objective_context_items(
-        astra_turn_core::resume_hydration::objective_context_from_messages(messages),
-    );
+    let objective_context = match astra_turn_core::resume_hydration::objective_context_from_messages(
+        messages,
+    ) {
+        Ok(items) => render_objective_context_items(items),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %state.task_manager.session_id(),
+                error = %error,
+                "invalid typed objective metadata in restored session; preserving existing continuation objective"
+            );
+            return;
+        }
+    };
     if objective_context.is_empty() {
         return;
     }
@@ -536,7 +561,7 @@ pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut Sess
             );
         }
         Err(_) => {
-            tracing::debug!(
+            tracing::warn!(
                 session_id = %state.task_manager.session_id(),
                 budget_ms = ACTIVE_TASK_ANCHOR_REFRESH_BUDGET.as_millis() as u64,
                 "active task board refresh exceeded post-output budget; preserving previous anchor task board"

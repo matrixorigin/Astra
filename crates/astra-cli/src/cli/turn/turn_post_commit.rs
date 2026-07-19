@@ -469,6 +469,7 @@ mod tests {
         assert_eq!(mat.messages[0]["content"], "old review");
         assert_eq!(
             astra_turn_types::user_turn_semantics(&mat.messages[0])
+                .expect("valid semantics")
                 .map(|semantics| semantics.objective_relation),
             Some(astra_turn_types::ObjectiveRelation::Replace)
         );

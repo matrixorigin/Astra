@@ -44,10 +44,21 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
             let messages =
-                astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
+                match astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
                     cp.messages,
                     &prompt_state,
-                );
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            error = %error,
+                            "continuation checkpoint contains invalid typed turn metadata"
+                        );
+                        return None;
+                    }
+                };
             if messages.is_empty() {
                 tracing::warn!(
                     user_id = %user_id,
@@ -114,7 +125,8 @@ fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Val
     let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
         materialized.messages,
         &materialized.session_state,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     Ok((!messages.is_empty()).then_some(messages))
 }
 
@@ -377,11 +389,17 @@ mod tests {
             &checkpoint,
         )
         .unwrap();
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut canonical_current = json!({"role": "user", "content": "canonical current"});
+        astra_turn_types::mark_user_turn_semantics(&mut canonical_current, semantics);
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             2,
             &[
-                json!({"role": "user", "content": "canonical current"}),
+                canonical_current,
                 json!({"role": "assistant", "content": "current answer"}),
             ],
             &astra_turn_core::conversation_log::SessionStateCompact::default(),
@@ -395,7 +413,40 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "canonical current");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&messages[0]).expect("valid semantics"),
+            Some(semantics)
+        );
         assert_eq!(messages[1]["content"], "current answer");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn csl_continuation_reports_corrupt_typed_metadata() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                json!({
+                    "role": "user",
+                    "content": "canonical current",
+                    (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                        "schema_version": "invalid",
+                        "objective_relation": "replace"
+                    }
+                }),
+                json!({"role": "assistant", "content": "current answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        assert!(
+            super::load_csl_messages_for_continuation(&session_id).is_err(),
+            "corrupt canonical metadata must not become an untyped continuation"
+        );
     }
 
     #[test]
@@ -434,7 +485,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            astra_turn_types::user_turn_semantics(&result[0]),
+            astra_turn_types::user_turn_semantics(&result[0]).expect("valid semantics"),
             Some(semantics)
         );
     }

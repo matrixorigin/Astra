@@ -5707,14 +5707,24 @@ async fn apply_restored_session(
         session_memory.as_deref(),
     );
     let session_resume_hydration =
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+        match astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
             canonical_resume_messages,
-        )
-        .unwrap_or_else(|| {
-            astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+        ) {
+            Ok(Some(hint)) => hint,
+            Ok(None) => astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
                 "resume restored session metadata but no prompt-facing transcript/history",
-            )
-        });
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %restored.session_id,
+                    error = %error,
+                    "resume hydration degraded: restored typed turn metadata is invalid"
+                );
+                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                    "restored session contains invalid typed turn metadata",
+                )
+            }
+        };
     state.resume_guidance = astra_turn_core::resume_hydration::merge_resume_hints(
         Some(session_resume_hydration),
         state.resume_guidance.take(),

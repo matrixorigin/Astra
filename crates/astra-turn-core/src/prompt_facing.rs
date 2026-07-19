@@ -50,6 +50,24 @@ pub fn sanitize_prompt_facing_messages_with_turn_semantics(messages: Vec<Value>)
     sanitize_prompt_facing_messages_impl(messages, true)
 }
 
+/// Strict canonical continuation projection. Invalid producer-owned metadata
+/// is returned to the restore boundary instead of being rewritten as absence.
+pub fn try_sanitize_prompt_facing_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    for message in &messages {
+        if message
+            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+            .is_some()
+        {
+            astra_turn_types::user_turn_semantics(message)?;
+        }
+    }
+    Ok(sanitize_prompt_facing_messages_with_turn_semantics(
+        messages,
+    ))
+}
+
 fn sanitize_prompt_facing_messages_impl(
     messages: Vec<Value>,
     preserve_turn_semantics: bool,
@@ -95,11 +113,19 @@ fn sanitize_prompt_facing_messages_impl(
             "role": role,
             "content": content,
         });
-        if preserve_turn_semantics
-            && role == "user"
-            && let Some(semantics) = astra_turn_types::user_turn_semantics(&msg)
-        {
-            astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+        if preserve_turn_semantics && role == "user" {
+            match astra_turn_types::user_turn_semantics(&msg) {
+                Ok(Some(semantics)) => {
+                    astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "dropping invalid user-turn semantics from prompt-facing projection"
+                    );
+                }
+            }
         }
         out.push(projected);
         if role == "user" {
@@ -113,12 +139,14 @@ fn sanitize_prompt_facing_messages_impl(
 pub fn sanitize_prompt_facing_messages_with_state(
     messages: Vec<Value>,
     state: &SessionStateCompact,
-) -> Vec<Value> {
-    let mut out = sanitize_prompt_facing_messages(messages);
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    // This boundary feeds canonical continuation/resume state. Preserve typed
+    // objective metadata while provider-facing sanitizers continue to strip it.
+    let mut out = try_sanitize_prompt_facing_messages_with_turn_semantics(messages)?;
     if let Some(recap) = runtime_recap_message(state) {
         out.push(recap);
     }
-    trim_to_recent_messages(out)
+    Ok(trim_to_recent_messages(out))
 }
 
 pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
@@ -507,8 +535,14 @@ mod tests {
 
     #[test]
     fn sanitize_with_state_replaces_stale_runtime_recap_for_resume_prompt() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Continue,
+            None,
+        );
+        let mut user = json!({"role": "user", "content": "continue"});
+        astra_turn_types::mark_user_turn_semantics(&mut user, semantics);
         let messages = vec![
-            json!({"role": "user", "content": "continue"}),
+            user,
             runtime_owned_message(
                 "system",
                 "stale projection",
@@ -520,13 +554,35 @@ mod tests {
             ..Default::default()
         };
 
-        let got = sanitize_prompt_facing_messages_with_state(messages, &state);
+        let got = sanitize_prompt_facing_messages_with_state(messages, &state)
+            .expect("valid typed continuation metadata");
 
         assert_eq!(got.len(), 2);
         assert_eq!(got[0]["content"], "continue");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&got[0]).unwrap(),
+            Some(semantics)
+        );
         let recap = got[1]["content"].as_str().unwrap();
         assert!(recap.contains("Recent tools: bash"));
         assert!(!recap.contains("stale"));
+    }
+
+    #[test]
+    fn sanitize_with_state_rejects_corrupt_typed_metadata() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "continue",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                "schema_version": "invalid",
+                "objective_relation": "continue"
+            }
+        })];
+
+        assert!(matches!(
+            sanitize_prompt_facing_messages_with_state(messages, &SessionStateCompact::default(),),
+            Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+        ));
     }
 
     #[test]

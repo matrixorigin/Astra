@@ -7,7 +7,9 @@
 
 use serde_json::Value;
 
-use astra_turn_types::{ObjectiveRelation, UserFeedback, UserTurnSemantics};
+use astra_turn_types::{
+    ObjectiveRelation, UserFeedback, UserTurnSemantics, UserTurnSemanticsError,
+};
 
 pub const SESSION_RESUME_PREFIX: &str = "[session-resume:v1]";
 
@@ -18,25 +20,29 @@ const MAX_ASSISTANT_CHARS: usize = 360;
 const MAX_MESSAGE_CHARS: usize = 220;
 const MAX_HINT_CHARS: usize = 2_400;
 
-pub fn build_resume_hydration_hint_from_messages(messages: &[Value]) -> Option<String> {
-    let objective_context = objective_context_from_messages(messages);
+pub fn build_resume_hydration_hint_from_messages(
+    messages: &[Value],
+) -> Result<Option<String>, UserTurnSemanticsError> {
+    let objective_context = objective_context_from_messages(messages)?;
     let prompt_messages = crate::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
         messages.to_vec(),
     );
     build_resume_hydration_hint(&prompt_messages, Some(objective_context))
 }
 
-pub fn build_resume_hydration_hint_from_prompt_messages(messages: &[Value]) -> Option<String> {
+pub fn build_resume_hydration_hint_from_prompt_messages(
+    messages: &[Value],
+) -> Result<Option<String>, UserTurnSemanticsError> {
     build_resume_hydration_hint(messages, None)
 }
 
 fn build_resume_hydration_hint(
     messages: &[Value],
     objective_context: Option<Vec<ObjectiveContextItem>>,
-) -> Option<String> {
-    let entries = prompt_entries(messages);
+) -> Result<Option<String>, UserTurnSemanticsError> {
+    let entries = prompt_entries(messages)?;
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Minimum viability: require at least one user message AND one assistant message.
@@ -45,7 +51,7 @@ fn build_resume_hydration_hint(
     let has_user = entries.iter().any(|e| e.role == "user");
     let has_assistant = entries.iter().any(|e| e.role == "assistant");
     if !has_user || !has_assistant {
-        return None;
+        return Ok(None);
     }
 
     let latest_user_input = latest_user_input(&entries);
@@ -85,7 +91,7 @@ fn build_resume_hydration_hint(
         for item in objective_context {
             lines.push(format!(
                 "- {}: {}",
-                item.label(),
+                item.relation.objective_context_label(),
                 truncate_chars(&item.text, MAX_USER_INPUT_CHARS)
             ));
         }
@@ -125,7 +131,7 @@ fn build_resume_hydration_hint(
         ));
     }
 
-    Some(truncate_chars(&lines.join("\n"), MAX_HINT_CHARS))
+    Ok(Some(truncate_chars(&lines.join("\n"), MAX_HINT_CHARS)))
 }
 
 pub fn build_resume_hydration_failure_hint(reason: &str) -> String {
@@ -170,46 +176,45 @@ pub struct ObjectiveContextItem {
     pub text: String,
 }
 
-impl ObjectiveContextItem {
-    fn label(&self) -> &'static str {
-        match self.relation {
-            ObjectiveRelation::Replace => "objective",
-            ObjectiveRelation::Refine => "refinement",
-            ObjectiveRelation::Correct => "correction",
-            ObjectiveRelation::Unknown => "initial objective (judge unavailable)",
-            ObjectiveRelation::Acknowledge | ObjectiveRelation::Continue => "unchanged objective",
-        }
-    }
-}
-
 /// Project the current objective from producer-owned turn semantics. Messages
 /// without current-schema metadata are deliberately ignored; this function is
 /// not a natural-language classifier or a legacy migration layer.
-pub fn objective_context_from_messages(messages: &[Value]) -> Vec<ObjectiveContextItem> {
-    objective_context_from_entries(&canonical_semantic_entries(messages))
+pub fn objective_context_from_messages(
+    messages: &[Value],
+) -> Result<Vec<ObjectiveContextItem>, UserTurnSemanticsError> {
+    Ok(objective_context_from_entries(&canonical_semantic_entries(
+        messages,
+    )?))
 }
 
-fn canonical_semantic_entries(messages: &[Value]) -> Vec<PromptEntry> {
-    messages
+fn canonical_semantic_entries(
+    messages: &[Value],
+) -> Result<Vec<PromptEntry>, UserTurnSemanticsError> {
+    let mut entries = Vec::new();
+    for message in messages
         .iter()
         .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
-        .filter_map(|message| {
-            let role = message.get("role").and_then(Value::as_str)?;
-            if !matches!(role, "user" | "assistant") {
-                return None;
-            }
-            let text = crate::prompt_facing::extract_text_content(message)?;
-            let text = normalize_ws(&text);
-            if text.is_empty() {
-                return None;
-            }
-            Some(PromptEntry {
-                role: role.to_string(),
-                text,
-                semantics: astra_turn_types::user_turn_semantics(message),
-            })
-        })
-        .collect()
+    {
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let Some(text) = crate::prompt_facing::extract_text_content(message) else {
+            continue;
+        };
+        let text = normalize_ws(&text);
+        if text.is_empty() {
+            continue;
+        }
+        entries.push(PromptEntry {
+            role: role.to_string(),
+            text,
+            semantics: astra_turn_types::user_turn_semantics(message)?,
+        });
+    }
+    Ok(entries)
 }
 
 fn objective_context_from_entries(entries: &[PromptEntry]) -> Vec<ObjectiveContextItem> {
@@ -255,26 +260,29 @@ fn objective_context_from_entries(entries: &[PromptEntry]) -> Vec<ObjectiveConte
     items
 }
 
-fn prompt_entries(messages: &[Value]) -> Vec<PromptEntry> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = message.get("role").and_then(Value::as_str)?;
-            if !matches!(role, "user" | "assistant" | "system") {
-                return None;
-            }
-            let text = crate::prompt_facing::extract_text_content(message)?;
-            let text = normalize_ws(&text);
-            if text.is_empty() {
-                return None;
-            }
-            Some(PromptEntry {
-                role: role.to_string(),
-                text,
-                semantics: astra_turn_types::user_turn_semantics(message),
-            })
-        })
-        .collect()
+fn prompt_entries(messages: &[Value]) -> Result<Vec<PromptEntry>, UserTurnSemanticsError> {
+    let mut entries = Vec::new();
+    for message in messages {
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(role, "user" | "assistant" | "system") {
+            continue;
+        }
+        let Some(text) = crate::prompt_facing::extract_text_content(message) else {
+            continue;
+        };
+        let text = normalize_ws(&text);
+        if text.is_empty() {
+            continue;
+        }
+        entries.push(PromptEntry {
+            role: role.to_string(),
+            text,
+            semantics: astra_turn_types::user_turn_semantics(message)?,
+        });
+    }
+    Ok(entries)
 }
 
 fn latest_user_input(entries: &[PromptEntry]) -> Option<&str> {
@@ -330,7 +338,9 @@ mod tests {
             astra_turn_types::UserTurnSemantics::new(ObjectiveRelation::Continue, None),
         );
 
-        let hint = build_resume_hydration_hint_from_messages(&messages).expect("hint");
+        let hint = build_resume_hydration_hint_from_messages(&messages)
+            .expect("valid semantics")
+            .expect("hint");
 
         assert!(hint.starts_with(SESSION_RESUME_PREFIX));
         assert!(hint.contains("Treat this as the same session"));
@@ -370,7 +380,9 @@ mod tests {
             "normal prompt projection must still honor the compaction boundary"
         );
 
-        let hint = build_resume_hydration_hint_from_messages(&messages).expect("resume hint");
+        let hint = build_resume_hydration_hint_from_messages(&messages)
+            .expect("valid semantics")
+            .expect("resume hint");
         assert!(hint.contains("objective: repair the session lifecycle"));
         assert!(!hint.contains("unchanged objective: continue"));
     }
@@ -399,7 +411,7 @@ mod tests {
             );
         }
 
-        let context = objective_context_from_messages(&messages);
+        let context = objective_context_from_messages(&messages).expect("valid semantics");
 
         assert_eq!(
             context
@@ -421,7 +433,11 @@ mod tests {
             json!({"role": "assistant", "content": "ok"}),
         ];
 
-        assert!(objective_context_from_messages(&messages).is_empty());
+        assert!(
+            objective_context_from_messages(&messages)
+                .expect("unmarked messages are valid")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -430,11 +446,15 @@ mod tests {
         let assistant_only = vec![json!({"role": "assistant", "content": "好的，继续进行"})];
 
         assert!(
-            build_resume_hydration_hint_from_prompt_messages(&user_only).is_none(),
+            build_resume_hydration_hint_from_prompt_messages(&user_only)
+                .expect("unmarked messages are valid")
+                .is_none(),
             "user-only messages should not create resume hints"
         );
         assert!(
-            build_resume_hydration_hint_from_prompt_messages(&assistant_only).is_none(),
+            build_resume_hydration_hint_from_prompt_messages(&assistant_only)
+                .expect("unmarked messages are valid")
+                .is_none(),
             "assistant-only messages should not create resume hints"
         );
     }
@@ -446,6 +466,26 @@ mod tests {
         assert!(hint.contains("degraded resume"));
         assert!(hint.contains("Do not claim this is a new session"));
         assert!(hint.contains("checkpoint unavailable"));
+    }
+
+    #[test]
+    fn corrupt_typed_semantics_degrades_explicitly_instead_of_becoming_absent() {
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": "repair lifecycle",
+                (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "assistant", "content": "working"}),
+        ];
+
+        assert!(matches!(
+            build_resume_hydration_hint_from_messages(&messages),
+            Err(UserTurnSemanticsError::Malformed(_))
+        ));
     }
 
     #[test]

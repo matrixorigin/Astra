@@ -4,7 +4,7 @@
 use axum::http::StatusCode;
 use axum::{body, body::Body, http::Request};
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::sync::{
     Arc, Mutex,
@@ -185,8 +185,7 @@ fn assert_presigned_artifact_download(
 struct RawTransportServerHits {
     stream_hits: Arc<AtomicU32>,
     nonstream_hits: Arc<AtomicU32>,
-    connectivity_probe_hits: Arc<AtomicU32>,
-    turn_intent_judge_hits: Arc<AtomicU32>,
+    stream_request_shapes: Arc<Mutex<Vec<Value>>>,
     primary_nonstream_fallback_hits: Arc<AtomicU32>,
     primary_nonstream_fallback_requests: Arc<Mutex<Vec<String>>>,
 }
@@ -196,24 +195,31 @@ impl RawTransportServerHits {
         Self {
             stream_hits: Arc::new(AtomicU32::new(0)),
             nonstream_hits: Arc::new(AtomicU32::new(0)),
-            connectivity_probe_hits: Arc::new(AtomicU32::new(0)),
-            turn_intent_judge_hits: Arc::new(AtomicU32::new(0)),
+            stream_request_shapes: Arc::new(Mutex::new(Vec::new())),
             primary_nonstream_fallback_hits: Arc::new(AtomicU32::new(0)),
             primary_nonstream_fallback_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn record_stream(&self) {
+    fn record_stream(&self, req: &str) {
         self.stream_hits.fetch_add(1, Ordering::SeqCst);
+        if let Some(shape) = provider_request_shape(req) {
+            self.stream_request_shapes
+                .lock()
+                .expect("stream request shape lock")
+                .push(shape);
+        }
     }
 
     fn record_nonstream(&self, req: &str) -> u32 {
         let previous = self.nonstream_hits.fetch_add(1, Ordering::SeqCst);
-        if is_connectivity_probe_request(req) {
-            self.connectivity_probe_hits.fetch_add(1, Ordering::SeqCst);
-        } else if is_turn_intent_judge_request(req) {
-            self.turn_intent_judge_hits.fetch_add(1, Ordering::SeqCst);
-        } else {
+        let matches_stream_request = provider_request_shape(req).is_some_and(|shape| {
+            self.stream_request_shapes
+                .lock()
+                .expect("stream request shape lock")
+                .contains(&shape)
+        });
+        if matches_stream_request {
             self.primary_nonstream_fallback_hits
                 .fetch_add(1, Ordering::SeqCst);
             self.primary_nonstream_fallback_requests
@@ -236,14 +242,13 @@ impl RawTransportServerHits {
     }
 }
 
-fn is_connectivity_probe_request(req: &str) -> bool {
-    req.contains("\"max_tokens\":1")
-        && req.contains("\"content\":\"hi\"")
-        && !req.contains("\"stream\":true")
-}
-
-fn is_turn_intent_judge_request(req: &str) -> bool {
-    req.contains("turn intent classifier") && req.contains("objective_relation")
+fn provider_request_shape(req: &str) -> Option<Value> {
+    let body = req.split("\r\n\r\n").nth(1)?;
+    let mut value: Value = serde_json::from_str(body).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("stream");
+    object.remove("stream_options");
+    Some(value)
 }
 
 fn summarize_provider_request(req: &str) -> String {
@@ -273,6 +278,22 @@ fn stream_idle_timeout_guard_sets_runtime_override_for_integration_tests() {
     );
 }
 
+#[test]
+fn provider_request_shape_identifies_only_the_matching_stream_fallback() {
+    let streaming = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"task\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
+    let matching_fallback = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"task\"}],\"stream\":false}";
+    let auxiliary_call = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"auxiliary\"}],\"stream\":false}";
+
+    assert_eq!(
+        provider_request_shape(streaming),
+        provider_request_shape(matching_fallback)
+    );
+    assert_ne!(
+        provider_request_shape(streaming),
+        provider_request_shape(auxiliary_call)
+    );
+}
+
 /// Asserts the number of non-stream fallback hits falls inside `min..=max`.
 ///
 /// The non-stream mocks in this journey optionally answer the first non-stream
@@ -297,10 +318,8 @@ fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: 
     assert_eq!(
         actual,
         0,
-        "{message}: expected 0 primary non-stream fallback hits, got {actual}; total_nonstream={}, connectivity_probes={}, turn_intent_judges={}; fallback_requests={}",
+        "{message}: expected 0 primary non-stream fallback hits, got {actual}; total_nonstream={}; fallback_requests={}",
         hits.nonstream_hits.load(Ordering::SeqCst),
-        hits.connectivity_probe_hits.load(Ordering::SeqCst),
-        hits.turn_intent_judge_hits.load(Ordering::SeqCst),
         hits.primary_nonstream_fallback_request_summary()
     );
 }
@@ -328,7 +347,7 @@ async fn spawn_raw_partial_transport_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})
@@ -398,7 +417,7 @@ async fn spawn_raw_idle_after_progress_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})
@@ -465,7 +484,7 @@ async fn spawn_raw_stream_rate_limit_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let retry_after_header = retry_after
                         .map(|value| format!("Retry-After: {value}\r\n"))
                         .unwrap_or_default();
@@ -581,7 +600,7 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let part1 = json!({
                         "choices": [{
                             "delta": {
@@ -683,7 +702,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
                     let body = format!("data: {partial}\n\ndata: not-json\n\n");
                     let response = format!(
@@ -745,7 +764,7 @@ async fn spawn_raw_server_loop_block_parse_failure_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
                     let body = format!("data: {partial}\n\ndata: not-json\n\n");
                     let response = format!(
@@ -796,7 +815,7 @@ async fn spawn_raw_hanging_stream_server(partial_text: &str) -> (String, RawTran
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.record_stream();
+                    hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})

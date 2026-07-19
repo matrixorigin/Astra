@@ -753,6 +753,54 @@ mod tests {
     }
 
     #[test]
+    fn typed_user_feedback_reaches_the_serialized_provider_boundary() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        sess.working_memory_mut().apply_user_feedback(
+            astra_turn_types::UserFeedback {
+                kind: astra_turn_types::UserFeedbackKind::Requirement,
+                target: astra_turn_types::UserFeedbackTarget::Approach,
+            },
+            "Use the server-owned lifecycle, not a UI shadow state.",
+        );
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(2);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "claude-sonnet-4-6",
+                query_source: "repl",
+            })
+            .expect("working-memory correction should serialize");
+
+        let working_memory = output
+            .serialized
+            .system_blocks
+            .iter()
+            .find(|block| block.kind == crate::section_types::SectionKind::WorkingMemory)
+            .expect("provider request must contain the working-memory section");
+        assert!(
+            working_memory
+                .text
+                .contains("Latest user requirement for approach")
+        );
+        assert!(
+            working_memory
+                .text
+                .contains("Use the server-owned lifecycle, not a UI shadow state.")
+        );
+    }
+
+    #[test]
     fn record_feedback_increments_turns() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);

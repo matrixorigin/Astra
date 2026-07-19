@@ -122,7 +122,7 @@ What to do. Be specific and actionable. Include commands when appropriate.
 ```
 
 **Frontmatter rules:**
-- `allowed_tools`: list the specific tools needed (e.g., `bash`, `read_file`, `write_file`, `delegate` for sub-agents, or MCP tool names)
+- `allowed_tools`: list only tools actually advertised by the target surface (e.g., `bash`, `read_file`, `write_file`, or MCP tool names); never name a removed or assumed orchestration action
 - `context`: only set `fork` for self-contained skills that don't need mid-process user input
 - `when_to_use`: describe the *user intent* that should route here ("User wants to ..."). Do not list trigger keywords — the model routes semantically, not by substring match
 

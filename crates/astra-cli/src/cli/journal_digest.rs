@@ -226,6 +226,13 @@ pub struct SubrunRow {
     pub llm_round_details: Vec<LlmRoundRow>,
 }
 
+struct SubrunIdentity {
+    run_id: String,
+    parent_run_id: Option<String>,
+    agent_id: Option<String>,
+    local_turn: Option<u32>,
+}
+
 #[derive(Serialize)]
 pub struct ToolGroupRow {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -522,18 +529,16 @@ fn legacy_metadata_string(ev: &session_journal::JournalEvent, key: &str) -> Opti
         .map(String::from)
 }
 
-fn subrun_identity(
-    ev: &session_journal::JournalEvent,
-) -> Option<(String, Option<String>, Option<String>, Option<u32>)> {
+fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
     if let Some(scope) = ev.producer_scope.as_ref()
         && scope.agent_id.is_some()
     {
-        return Some((
-            scope.run_id.clone(),
-            scope.parent_run_id.clone(),
-            scope.agent_id.clone(),
-            scope.local_turn,
-        ));
+        return Some(SubrunIdentity {
+            run_id: scope.run_id.clone(),
+            parent_run_id: scope.parent_run_id.clone(),
+            agent_id: scope.agent_id.clone(),
+            local_turn: scope.local_turn,
+        });
     }
 
     // Read compatibility for journals written before producer_scope existed.
@@ -541,7 +546,12 @@ fn subrun_identity(
     // producer-local counter in event.turn. Keep that number local here.
     let agent_id = legacy_metadata_string(ev, "agent_id")?;
     let run_id = legacy_metadata_string(ev, "run_id")?;
-    Some((run_id, None, Some(agent_id), ev.turn))
+    Some(SubrunIdentity {
+        run_id,
+        parent_run_id: None,
+        agent_id: Some(agent_id),
+        local_turn: ev.turn,
+    })
 }
 
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
@@ -855,16 +865,15 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
                 if matches!(focus, DigestFocus::All) {
-                    if let Some((run_id, parent_run_id, agent_id, local_turn)) = subrun_identity(ev)
-                    {
+                    if let Some(identity) = subrun_identity(ev) {
                         let mut round = llm_round_row(ev);
-                        round.local_turn = local_turn;
+                        round.local_turn = identity.local_turn;
                         subruns_by_run
-                            .entry(run_id.clone())
+                            .entry(identity.run_id.clone())
                             .or_insert_with(|| SubrunRow {
-                                run_id,
-                                parent_run_id,
-                                agent_id,
+                                run_id: identity.run_id,
+                                parent_run_id: identity.parent_run_id,
+                                agent_id: identity.agent_id,
                                 llm_round_details: Vec::new(),
                             })
                             .llm_round_details
