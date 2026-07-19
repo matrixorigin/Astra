@@ -232,8 +232,8 @@ fn project_run_node_with_status(
         total_tool_calls: run.total_tool_calls,
         runtime: SessionRunRuntimeFacts {
             runtime_profile: run.runtime_profile.clone(),
-            model_name: run.selected_model_name.clone(),
-            model_gateway: run.selected_model_gateway.clone(),
+            offering_id: run.model_offering_id.clone(),
+            model_name: run.resolved_model_name.clone(),
             agent_binding_id: run.agent_binding_id.clone(),
             agent_binding_name: run.agent_binding_name.clone(),
             agent_binding_schema_version: run.agent_binding_schema_version.clone(),
@@ -293,9 +293,8 @@ mod tests {
             agent_binding_id: (depth > 0).then(|| "reviewer-v2".into()),
             agent_binding_name: (depth > 0).then(|| "Reviewer".into()),
             agent_binding_schema_version: (depth > 0).then(|| "2".into()),
-            selected_model_json: None,
-            selected_model_name: (depth > 0).then(|| "gpt-5".into()),
-            selected_model_gateway: (depth > 0).then(|| "primary".into()),
+            model_offering_id: (depth > 0).then(|| "offer-gpt-5".into()),
+            resolved_model_name: (depth > 0).then(|| "gpt-5".into()),
             capability_server_refs_json: (depth > 0)
                 .then(|| r#"{"mcp":"mcp-main","skills":"skills-main"}"#.into()),
             runtime_profile: Some("server".into()),
@@ -447,8 +446,8 @@ mod tests {
         );
         let runtime = &first.runs[1].runtime;
         assert_eq!(runtime.runtime_profile.as_deref(), Some("server"));
+        assert_eq!(runtime.offering_id.as_deref(), Some("offer-gpt-5"));
         assert_eq!(runtime.model_name.as_deref(), Some("gpt-5"));
-        assert_eq!(runtime.model_gateway.as_deref(), Some("primary"));
         assert_eq!(runtime.agent_binding_id.as_deref(), Some("reviewer-v2"));
         assert_eq!(runtime.agent_binding_schema_version.as_deref(), Some("2"));
         let capability_refs = runtime.capability_server_refs.as_ref().unwrap();

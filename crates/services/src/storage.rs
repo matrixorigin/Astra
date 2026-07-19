@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-19-v2";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-19-v3";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1188,6 +1188,35 @@ async fn add_column_if_missing(
     Ok(())
 }
 
+async fn drop_column_if_present(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    column: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(column, "matrixone column")?;
+
+    let exists = query(
+        "SELECT 1 FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !exists {
+        return Ok(());
+    }
+
+    let ddl = format!("ALTER TABLE `{table}` DROP COLUMN `{column}`");
+    query(&ddl).execute(pool).await?;
+    Ok(())
+}
+
 async fn add_index_if_missing(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2033,9 +2062,8 @@ async fn ensure_core_schema_while_leased(
             agent_binding_id VARCHAR(64) NULL,
             agent_binding_name VARCHAR(255) NULL,
             agent_binding_schema_version VARCHAR(32) NULL,
-            selected_model_json LONGTEXT NULL,
-            selected_model_name VARCHAR(255) NULL,
-            selected_model_gateway VARCHAR(128) NULL,
+            model_offering_id VARCHAR(64) NULL,
+            resolved_model_name VARCHAR(255) NULL,
             capability_server_refs_json LONGTEXT NULL,
             runtime_profile VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -2050,7 +2078,7 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_agent_runs_recovery_scan (status, owner_lease_expires_at, updated_at, user_id, run_id),
             INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
             INDEX idx_agent_runs_binding (agent_binding_id, created_at),
-            INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)
+            INDEX idx_agent_runs_model_offering (model_offering_id, created_at)
         )",
     )
     .execute(&pool)
@@ -2143,16 +2171,12 @@ async fn ensure_core_schema_while_leased(
             "ALTER TABLE agent_runs ADD COLUMN agent_binding_schema_version VARCHAR(32) NULL",
         ),
         (
-            "selected_model_json",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_json LONGTEXT NULL",
+            "model_offering_id",
+            "ALTER TABLE agent_runs ADD COLUMN model_offering_id VARCHAR(64) NULL",
         ),
         (
-            "selected_model_name",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_name VARCHAR(255) NULL",
-        ),
-        (
-            "selected_model_gateway",
-            "ALTER TABLE agent_runs ADD COLUMN selected_model_gateway VARCHAR(128) NULL",
+            "resolved_model_name",
+            "ALTER TABLE agent_runs ADD COLUMN resolved_model_name VARCHAR(255) NULL",
         ),
         (
             "capability_server_refs_json",
@@ -2172,11 +2196,26 @@ async fn ensure_core_schema_while_leased(
             "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_binding (agent_binding_id, created_at)",
         ),
         (
-            "idx_agent_runs_model_gateway",
-            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)",
+            "idx_agent_runs_model_offering",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_offering (model_offering_id, created_at)",
         ),
     ] {
         add_index_if_missing(&pool, &settings.database, "agent_runs", index, ddl).await?;
+    }
+
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "agent_runs",
+        "idx_agent_runs_model_gateway",
+    )
+    .await?;
+    for obsolete_column in [
+        "selected_model_json",
+        "selected_model_name",
+        "selected_model_gateway",
+    ] {
+        drop_column_if_present(&pool, &settings.database, "agent_runs", obsolete_column).await?;
     }
 
     query(

@@ -1006,7 +1006,7 @@ pub async fn resolve_active_llm_model(
     }
 }
 
-fn validate_offering_id(offering_id: &str) -> Result<&str, ModelOfferingResolutionError> {
+pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferingResolutionError> {
     if offering_id.is_empty()
         || offering_id.len() > 64
         || offering_id.trim() != offering_id
@@ -1029,7 +1029,7 @@ pub async fn resolve_active_llm_offering(
     offering_id: &str,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedModelOffering, ModelOfferingResolutionError> {
-    let offering_id = validate_offering_id(offering_id)?;
+    let offering_id = validate_model_offering_id(offering_id)?;
     let pool = require_pool(pool, matrixone)
         .await
         .map_err(ModelOfferingResolutionError::Backend)?;
@@ -1844,7 +1844,7 @@ impl ModelService for DatabaseModelService {
         &self,
         offering_id: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        validate_offering_id(&offering_id)
+        validate_model_offering_id(&offering_id)
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         let sql = format!(
@@ -2901,16 +2901,16 @@ mod tests {
 
     #[test]
     fn offering_identity_is_exact_and_bounded() {
-        assert_eq!(validate_offering_id("model-123"), Ok("model-123"));
+        assert_eq!(validate_model_offering_id("model-123"), Ok("model-123"));
         for invalid in ["", " model-123", "model-123 ", "model\n123"] {
             assert_eq!(
-                validate_offering_id(invalid),
+                validate_model_offering_id(invalid),
                 Err(ModelOfferingResolutionError::InvalidOfferingId)
             );
         }
         let too_long = "x".repeat(65);
         assert_eq!(
-            validate_offering_id(&too_long),
+            validate_model_offering_id(&too_long),
             Err(ModelOfferingResolutionError::InvalidOfferingId)
         );
     }

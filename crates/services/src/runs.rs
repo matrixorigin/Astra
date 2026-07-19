@@ -462,6 +462,7 @@ pub struct ModelSelectionRequest {
 /// is derived from the catalog row selected by `offering_id` or from an
 /// authenticated external provider context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedModelSelection {
     pub offering_id: String,
     pub model_name: String,
@@ -982,9 +983,11 @@ pub struct DurableRunRecord {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
-    pub selected_model_json: Option<String>,
-    pub selected_model_name: Option<String>,
-    pub selected_model_gateway: Option<String>,
+    /// Effective Offering selected for this run. This is an authorization
+    /// identity, not a display model name or provider route.
+    pub model_offering_id: Option<String>,
+    /// Concrete model identity resolved when the run was admitted.
+    pub resolved_model_name: Option<String>,
     pub capability_server_refs_json: Option<String>,
     pub runtime_profile: Option<String>,
     pub events: Vec<serde_json::Value>,
@@ -1161,8 +1164,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, \
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
-     agent_binding_schema_version, selected_model_json, selected_model_name, \
-     selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+     agent_binding_schema_version, model_offering_id, resolved_model_name, \
+     capability_server_refs_json, runtime_profile, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
 const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
@@ -4012,9 +4015,9 @@ impl RunStateStore for DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  selected_model_json, selected_model_name, selected_model_gateway,
+                  model_offering_id, resolved_model_name,
                   capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&record.run_id)
             .bind(&record.user_id)
@@ -4044,9 +4047,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.agent_binding_id)
             .bind(&record.agent_binding_name)
             .bind(&record.agent_binding_schema_version)
-            .bind(&record.selected_model_json)
-            .bind(&record.selected_model_name)
-            .bind(&record.selected_model_gateway)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
             .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
             .execute(&mut *tx)
@@ -4065,9 +4067,9 @@ impl RunStateStore for DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  selected_model_json, selected_model_name, selected_model_gateway,
+                  model_offering_id, resolved_model_name,
                   capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
                  ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
             )
             .bind(&record.run_id)
@@ -4098,9 +4100,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.agent_binding_id)
             .bind(&record.agent_binding_name)
             .bind(&record.agent_binding_schema_version)
-            .bind(&record.selected_model_json)
-            .bind(&record.selected_model_name)
-            .bind(&record.selected_model_gateway)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
             .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
             .execute(self.pool.get())
@@ -6506,14 +6507,8 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             table,
             "agent_binding_schema_version",
         )?,
-        selected_model_json: run_row_optional_string(row, operation, table, "selected_model_json")?,
-        selected_model_name: run_row_optional_string(row, operation, table, "selected_model_name")?,
-        selected_model_gateway: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "selected_model_gateway",
-        )?,
+        model_offering_id: run_row_optional_string(row, operation, table, "model_offering_id")?,
+        resolved_model_name: run_row_optional_string(row, operation, table, "resolved_model_name")?,
         capability_server_refs_json: run_row_optional_string(
             row,
             operation,
@@ -7453,9 +7448,8 @@ mod tests {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![],
@@ -7582,9 +7576,8 @@ mod tests {
                 "agent_binding_id" => Some("binding-1".to_string()),
                 "agent_binding_name" => Some("binding".to_string()),
                 "agent_binding_schema_version" => Some("v1".to_string()),
-                "selected_model_json" => Some(r#"{"name":"model"}"#.to_string()),
-                "selected_model_name" => Some("model".to_string()),
-                "selected_model_gateway" => Some("gateway".to_string()),
+                "model_offering_id" => Some("offer-model".to_string()),
+                "resolved_model_name" => Some("model".to_string()),
                 "capability_server_refs_json" => Some("[]".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "latest_event_type" => Some("text_delta".to_string()),
@@ -7910,9 +7903,8 @@ mod tests {
             "agent_binding_id",
             "agent_binding_name",
             "agent_binding_schema_version",
-            "selected_model_json",
-            "selected_model_name",
-            "selected_model_gateway",
+            "model_offering_id",
+            "resolved_model_name",
             "capability_server_refs_json",
             "runtime_profile",
             "created_at",
@@ -10670,9 +10662,8 @@ mod tests {
                     agent_binding_id: None,
                     agent_binding_name: None,
                     agent_binding_schema_version: None,
-                    selected_model_json: None,
-                    selected_model_name: None,
-                    selected_model_gateway: None,
+                    model_offering_id: None,
+                    resolved_model_name: None,
                     capability_server_refs_json: None,
                     runtime_profile: None,
                     events: vec![],

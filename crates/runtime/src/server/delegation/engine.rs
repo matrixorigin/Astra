@@ -7576,6 +7576,11 @@ mod tests {
         let engine = RunEngine::new(store.clone());
 
         engine
+            .start_run("parent-1", "user-1", "sess-1")
+            .await
+            .unwrap();
+
+        engine
             .start_run_ext(
                 "sub-1",
                 "user-1",
@@ -7722,9 +7727,8 @@ mod tests {
                 agent_binding_id: None,
                 agent_binding_name: None,
                 agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
+                model_offering_id: None,
+                resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
                 events: vec![],
@@ -7760,9 +7764,8 @@ mod tests {
                 agent_binding_id: None,
                 agent_binding_name: None,
                 agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
+                model_offering_id: None,
+                resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
                 events: vec![],
@@ -7798,9 +7801,8 @@ mod tests {
                 agent_binding_id: None,
                 agent_binding_name: None,
                 agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
+                model_offering_id: None,
+                resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
                 events: vec![],
@@ -7837,9 +7839,8 @@ mod tests {
                 agent_binding_id: None,
                 agent_binding_name: None,
                 agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
+                model_offering_id: None,
+                resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
                 events: vec![],

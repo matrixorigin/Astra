@@ -197,23 +197,6 @@ fn validate_session_id_shape(
     Ok(())
 }
 
-fn validate_exact_bridge_string(
-    field: &'static str,
-    value: &str,
-    code: &'static str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{field} must be a non-empty exact string without leading/trailing whitespace or control characters"
-            ),
-            code,
-        ));
-    }
-    Ok(())
-}
-
 fn validate_model_selection_shape(
     request: &ChatTurnRequestBody,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -257,18 +240,13 @@ fn validate_model_selection_shape(
             "model_selection_invalid",
         ));
     };
-    validate_exact_bridge_string(
-        "model_selection.offering_id",
-        offering_id,
-        "model_selection_invalid",
-    )?;
-    if offering_id.len() > 64 {
-        return Err(error_response_coded(
+    astra_services::validate_model_offering_id(offering_id).map_err(|_| {
+        error_response_coded(
             StatusCode::BAD_REQUEST,
-            "model_selection.offering_id must be at most 64 bytes",
+            "model_selection.offering_id must be an exact non-empty identifier of at most 64 bytes",
             "model_selection_invalid",
-        ));
-    }
+        )
+    })?;
     Ok(())
 }
 

@@ -4223,18 +4223,13 @@ impl AgenticRunLifecycleService {
                 "model_selection_missing",
             )
         })?;
-        exact_runtime_string(
-            "model_selection.offering_id",
-            &model_selection.offering_id,
-            "model_selection_invalid",
-        )?;
-        if model_selection.offering_id.len() > 64 {
-            return Err(error_response_coded(
+        astra_services::validate_model_offering_id(&model_selection.offering_id).map_err(|_| {
+            error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "model_selection.offering_id must be at most 64 bytes",
+                "model_selection.offering_id must be an exact non-empty identifier of at most 64 bytes",
                 "model_selection_invalid",
-            ));
-        }
+            )
+        })?;
         Ok(model_selection)
     }
 

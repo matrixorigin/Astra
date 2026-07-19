@@ -684,9 +684,8 @@ pub async fn seed_pending_approval(
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![

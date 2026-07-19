@@ -66,15 +66,58 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: vec![],
         created_at: String::new(),
         updated_at: String::new(),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn durable_run_round_trips_offering_identity_without_legacy_route_columns() {
+    let (pool, store) = setup().await;
+    let user_id = format!("model-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("model-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("model-run-{}", uuid::Uuid::new_v4());
+    let mut record = durable_run_record(run_id.clone(), user_id.clone(), session_id);
+    record.model_offering_id = Some("offer-model-primary".to_string());
+    record.resolved_model_name = Some("provider-model-v2".to_string());
+
+    store.insert_run(record).await.expect("insert durable run");
+    let loaded = store
+        .load_run(&user_id, &run_id)
+        .await
+        .expect("load durable run")
+        .expect("durable run exists");
+    assert_eq!(
+        loaded.model_offering_id.as_deref(),
+        Some("offer-model-primary")
+    );
+    assert_eq!(
+        loaded.resolved_model_name.as_deref(),
+        Some("provider-model-v2")
+    );
+
+    let legacy_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agent_runs' \
+         AND COLUMN_NAME IN ('selected_model_json', 'selected_model_name', 'selected_model_gateway')",
+    )
+    .fetch_one(pool.get())
+    .await
+    .expect("inspect agent_runs schema");
+    assert_eq!(legacy_column_count, 0);
+
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .expect("clean durable run");
 }
 
 /// Batch write: insert events, then load back and verify count.
@@ -124,9 +167,8 @@ async fn batch_write_stores_and_loads_events() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: events.clone(),
@@ -201,9 +243,8 @@ async fn batch_write_preserves_event_idx_ordering() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: events.clone(),
@@ -296,9 +337,8 @@ async fn batch_write_idempotency_dedup_skips_duplicates() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: events.clone(),
@@ -793,9 +833,8 @@ async fn single_event_append_uses_batch_path() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: vec![],
@@ -885,9 +924,8 @@ async fn concurrent_append_no_event_idx_gaps() {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![],
@@ -990,9 +1028,8 @@ async fn large_batch_50_events_contiguous() {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![],
@@ -1086,9 +1123,8 @@ async fn dedup_preserves_non_keyed_events() {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
+            model_offering_id: None,
+            resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
             events: vec![],
@@ -1195,9 +1231,8 @@ async fn append_event_delegates_to_append_events_batch() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: vec![],
@@ -1279,9 +1314,8 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
         agent_binding_id: None,
         agent_binding_name: None,
         agent_binding_schema_version: None,
-        selected_model_json: None,
-        selected_model_name: None,
-        selected_model_gateway: None,
+        model_offering_id: None,
+        resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
         events: events.clone(),

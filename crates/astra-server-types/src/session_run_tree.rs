@@ -61,9 +61,9 @@ pub struct SessionRunRuntimeFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_name: Option<String>,
+    pub offering_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_gateway: Option<String>,
+    pub model_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_binding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +158,7 @@ mod tests {
                 total_tool_calls: 3,
                 runtime: SessionRunRuntimeFacts {
                     runtime_profile: Some("edge".into()),
+                    offering_id: Some("offer-gpt-5".into()),
                     model_name: Some("gpt-5".into()),
                     capability_server_refs: Some(SessionRunCapabilityServerRefs {
                         mcp: "mcp-default".into(),
@@ -177,6 +178,9 @@ mod tests {
             payload["runs"][0]["available_actions"],
             serde_json::json!(["resume", "cancel"])
         );
+        assert_eq!(payload["runs"][0]["runtime"]["offering_id"], "offer-gpt-5");
+        assert_eq!(payload["runs"][0]["runtime"]["model_name"], "gpt-5");
+        assert!(payload["runs"][0]["runtime"].get("model_gateway").is_none());
         assert_eq!(
             serde_json::from_value::<SessionRunTreeSnapshot>(payload).unwrap(),
             snapshot

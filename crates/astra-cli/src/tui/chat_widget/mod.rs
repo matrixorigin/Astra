@@ -222,8 +222,8 @@ struct AgentRunProjection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RuntimeFactSources {
     runtime_profile: Option<AgentProjectionSource>,
+    offering_id: Option<AgentProjectionSource>,
     model_name: Option<AgentProjectionSource>,
-    model_gateway: Option<AgentProjectionSource>,
     agent_binding_id: Option<AgentProjectionSource>,
     agent_binding_name: Option<AgentProjectionSource>,
     agent_binding_schema_version: Option<AgentProjectionSource>,
@@ -428,8 +428,8 @@ impl AgentRunProjection {
             };
         }
         merge_fact!(runtime_profile);
+        merge_fact!(offering_id);
         merge_fact!(model_name);
-        merge_fact!(model_gateway);
         merge_fact!(agent_binding_id);
         merge_fact!(agent_binding_name);
         merge_fact!(agent_binding_schema_version);
@@ -1090,8 +1090,8 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
         };
     }
     merge_runtime_fact_from_projection!(runtime_profile);
+    merge_runtime_fact_from_projection!(offering_id);
     merge_runtime_fact_from_projection!(model_name);
-    merge_runtime_fact_from_projection!(model_gateway);
     merge_runtime_fact_from_projection!(agent_binding_id);
     merge_runtime_fact_from_projection!(agent_binding_name);
     merge_runtime_fact_from_projection!(agent_binding_schema_version);
@@ -8673,6 +8673,7 @@ mod tests {
         projection.set_runtime_facts(
             AgentProjectionSource::DurableServer,
             astra_thin_client::SessionRunRuntimeFacts {
+                offering_id: Some("offer-gpt-5".into()),
                 model_name: Some("gpt-5".into()),
                 ..Default::default()
             },
@@ -8680,6 +8681,10 @@ mod tests {
 
         assert_eq!(projection.runtime_facts.background, Some(true));
         assert!(projection.runtime_facts.permission.is_some());
+        assert_eq!(
+            projection.runtime_facts.offering_id.as_deref(),
+            Some("offer-gpt-5")
+        );
         assert_eq!(
             projection.runtime_facts.model_name.as_deref(),
             Some("gpt-5")

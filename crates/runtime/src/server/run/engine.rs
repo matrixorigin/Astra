@@ -157,6 +157,72 @@ pub struct RunStartContext {
     pub runtime_profile: Option<RuntimeProfileRequest>,
 }
 
+fn durable_model_identity(
+    context: &RunStartContext,
+) -> Result<(Option<String>, Option<String>), String> {
+    match (
+        context.model_selection.as_ref(),
+        context.resolved_model_selection.as_ref(),
+    ) {
+        (None, None) => Ok((None, None)),
+        (Some(selection), Some(resolved))
+            if selection.offering_id == resolved.offering_id
+                && astra_services::validate_model_offering_id(&selection.offering_id).is_ok()
+                && !resolved.model_name.is_empty() =>
+        {
+            Ok((
+                Some(selection.offering_id.clone()),
+                Some(resolved.model_name.clone()),
+            ))
+        }
+        _ => Err(
+            "run model identity must contain one matching admitted Offering and resolved model"
+                .to_string(),
+        ),
+    }
+}
+
+fn inherit_parent_model_identity(
+    context: &mut RunStartContext,
+    parent: &DurableRunRecord,
+) -> Result<(), String> {
+    match (
+        parent.model_offering_id.as_deref(),
+        parent.resolved_model_name.as_deref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(offering_id), Some(model_name)) => {
+            match (
+                context.model_selection.as_ref(),
+                context.resolved_model_selection.as_ref(),
+            ) {
+                (None, None) => {
+                    context.model_selection = Some(ModelSelectionRequest {
+                        offering_id: offering_id.to_string(),
+                    });
+                    context.resolved_model_selection = Some(ResolvedModelSelection {
+                        offering_id: offering_id.to_string(),
+                        model_name: model_name.to_string(),
+                    });
+                    Ok(())
+                }
+                (Some(selection), Some(resolved))
+                    if selection.offering_id == offering_id
+                        && resolved.offering_id == offering_id
+                        && resolved.model_name == model_name =>
+                {
+                    Ok(())
+                }
+                _ => Err(
+                    "child run model identity must inherit the admitted parent Offering"
+                        .to_string(),
+                ),
+            }
+        }
+        _ => Err("durable parent run contains an incomplete model identity".to_string()),
+    }
+}
+
 fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
     match mode {
         RequestedTurnInteractionMode::NonInteractive => "non_interactive",
@@ -544,12 +610,13 @@ impl RunEngine {
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
         retry_of: Option<&str>,
-        context: RunStartContext,
+        mut context: RunStartContext,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
             match self.store.load_run(user_id, parent_run_id).await? {
                 Some(parent) => {
+                    inherit_parent_model_identity(&mut context, &parent)?;
                     let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
                     let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
                     (
@@ -558,32 +625,16 @@ impl RunEngine {
                         parent.depth.saturating_add(1),
                     )
                 }
-                None => (
-                    Some(parent_run_id.to_string()),
-                    Some(format!("{parent_run_id}/{run_id}")),
-                    1,
-                ),
+                None => {
+                    return Err(
+                        "delegated run cannot be persisted without its durable parent".to_string(),
+                    );
+                }
             }
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
-        let selected_model_json = context.model_selection.as_ref().and_then(|selection| {
-            serde_json::to_string(selection)
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        target: "astra_runtime::engine",
-                        run_id = %run_id,
-                        error = %e,
-                        "failed to serialize model_selection for durable run record"
-                    );
-                })
-                .ok()
-        });
-        let selected_model_name = context
-            .resolved_model_selection
-            .as_ref()
-            .map(|resolved| resolved.model_name.clone());
-        let selected_model_gateway = None;
+        let (model_offering_id, resolved_model_name) = durable_model_identity(&context)?;
         let capability_server_refs_json =
             context.capability_server_refs.as_ref().and_then(|refs| {
                 serde_json::to_string(refs)
@@ -631,9 +682,8 @@ impl RunEngine {
             agent_binding_id: context.agent_binding_id,
             agent_binding_name: context.agent_binding_name,
             agent_binding_schema_version: context.agent_binding_schema_version,
-            selected_model_json,
-            selected_model_name,
-            selected_model_gateway,
+            model_offering_id,
+            resolved_model_name,
             capability_server_refs_json,
             runtime_profile,
             events: vec![serde_json::json!({
@@ -2988,6 +3038,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_run_with_context_persists_admitted_offering_identity_without_route_fields() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-identity",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelectionRequest {
+                        offering_id: "offer-primary".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-primary".to_string(),
+                        model_name: "provider-model-v2".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("user-1", "run-model-identity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.model_offering_id.as_deref(), Some("offer-primary"));
+        assert_eq!(
+            run.resolved_model_name.as_deref(),
+            Some("provider-model-v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_rejects_inconsistent_model_identity_before_persistence() {
+        let engine = test_engine();
+        let result = engine
+            .start_run_with_context(
+                "run-model-mismatch",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelectionRequest {
+                        offering_id: "offer-a".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-b".to_string(),
+                        model_name: "provider-model-v2".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            engine
+                .load_run("user-1", "run-model-mismatch")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_inherits_parent_offering_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelectionRequest {
+                        offering_id: "offer-primary".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-primary".to_string(),
+                        model_name: "provider-model-v2".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .start_run_ext(
+                "run-model-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent"),
+                Some("delegation-1"),
+                Some("reviewer"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let child = engine
+            .load_run("user-1", "run-model-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.model_offering_id.as_deref(), Some("offer-primary"));
+        assert_eq!(
+            child.resolved_model_name.as_deref(),
+            Some("provider-model-v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_cannot_replace_parent_offering_without_admission() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelectionRequest {
+                        offering_id: "offer-primary".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-primary".to_string(),
+                        model_name: "provider-model-v2".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .start_run_ext_with_context(
+                "run-model-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent"),
+                Some("delegation-1"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_selection: Some(ModelSelectionRequest {
+                        offering_id: "offer-unadmitted".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-unadmitted".to_string(),
+                        model_name: "other-provider-model".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            engine
+                .load_run("user-1", "run-model-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_requires_a_durable_parent() {
+        let engine = test_engine();
+        let result = engine
+            .start_run_ext(
+                "orphan-child",
+                "user-1",
+                "sess-1",
+                Some("missing-parent"),
+                Some("delegation-1"),
+                Some("reviewer"),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            engine
+                .load_run("user-1", "orphan-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn start_run_with_context_persists_effective_agent_binding_runtime_profile_when_omitted()
     {
         let engine = test_engine();
@@ -3114,6 +3355,10 @@ mod tests {
     #[tokio::test]
     async fn start_run_ext_persists_retry_linkage() {
         let engine = test_engine();
+        engine
+            .start_run("parent-1", "user-1", "sess-1")
+            .await
+            .unwrap();
         engine
             .start_run_ext(
                 "run-retry",
@@ -4689,9 +4934,8 @@ mod tests {
                 agent_binding_id: None,
                 agent_binding_name: None,
                 agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
+                model_offering_id: None,
+                resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
                 events: vec![serde_json::json!({"event_type":"run_started","data":{}})],
