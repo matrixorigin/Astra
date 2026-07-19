@@ -1389,7 +1389,7 @@ mod tests {
     fn preloaded_turn_messages_drop_stale_pre_compaction_goal_and_trace() {
         let preloaded = vec![
             json!({"role": "user", "content": "3 agents review everything"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "system", "content": "arbitrary compaction boundary text", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "I may review anyway"}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "No matches"}),

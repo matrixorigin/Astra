@@ -5545,8 +5545,8 @@ impl AgenticRunLifecycleService {
                     "resume hydration skipped: session restore failed"
                 );
                 Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint_for_error(
-                        &error,
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "session restore failed and transcript fallback was unavailable",
                     ),
                 )
             }

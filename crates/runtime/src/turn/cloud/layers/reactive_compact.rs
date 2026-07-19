@@ -44,8 +44,8 @@ impl CompressionLayer for ReactiveCompact {
 
         let mut extra = BTreeMap::new();
         extra.insert("_compact_boundary".to_string(), Value::Bool(true));
-        // Restore the legacy `_reactive: true` marker so audit/telemetry
-        // can distinguish reactive from tiered boundaries on the wire.
+        // Audit/telemetry distinguish reactive from tiered boundaries through
+        // structural metadata, never boundary wording.
         extra.insert("_reactive".to_string(), Value::Bool(true));
         extra.insert(
             "_messages_removed".to_string(),

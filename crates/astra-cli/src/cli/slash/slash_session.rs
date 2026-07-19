@@ -6258,7 +6258,7 @@ mod resume_tests {
         switch_session_into_state, workspace_summary_line,
     };
     use crate::cli::permission_manager::PermissionMode;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use astra_services::session_journal::{self, JournalDirGuard};
     use astra_services::session_restore::RestoredSession;
     use astra_services::session_workspace;
@@ -8368,7 +8368,7 @@ mod resume_tests {
         source.history = vec![("q1".into(), "a1".into())];
         source.recent_tools = vec!["bash".into(), "read_file".into()];
         source.last_response = Some("a1".into());
-        source.continuation_anchor = Some("anchor".into());
+        source.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
         source.csl_manager = Some(mgr);
 
         let snapshot = ForkStateSnapshot::capture(&mut source);
@@ -8411,7 +8411,7 @@ mod resume_tests {
             history: vec![("q".into(), "a".into())],
             recent_tools: vec!["bash".into()],
             last_response: Some("a".into()),
-            continuation_anchor: Some("anchor".into()),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test("anchor")),
             ..Default::default()
         };
         let snapshot = ForkStateSnapshot::capture(&mut source);
@@ -8423,7 +8423,7 @@ mod resume_tests {
         state.history = vec![("stale".into(), "state".into())];
         state.recent_tools = vec!["stale-tool".into()];
         state.last_response = Some("stale".into());
-        state.continuation_anchor = Some("stale-anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("stale-anchor"));
 
         snapshot.restore(&mut state);
 
@@ -8445,7 +8445,7 @@ mod resume_tests {
         state.history = vec![("q1".into(), "a1".into())];
         state.recent_tools = vec!["bash".into()];
         state.last_response = Some("a1".into());
-        state.continuation_anchor = Some("anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
 
         {
             let mut guard = ForkStateGuard::new(&mut state);

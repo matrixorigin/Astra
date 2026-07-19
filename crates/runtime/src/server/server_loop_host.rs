@@ -4147,31 +4147,43 @@ impl ServerAgenticLoopHost {
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
-        fields
-            .entry("runtime_environment_advertisement".to_string())
-            .or_insert_with(|| {
-                let registry = astra_runtime_env::ToolRegistry::builtins();
-                let request = ToolExecutionRequest {
-                    user_id: self.user_id.clone(),
-                    run_id: String::new(),
-                    turn_chain_id: String::new(),
-                    session_id: self.session_id.clone(),
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    args: args.clone(),
-                    workspace: self.workspace_binding.clone(),
-                    workspace_record: None,
-                    executor: self.executor_binding.clone(),
-                    runtime: self.runtime_binding.clone(),
-                    selected_offer: None,
-                    policy: ToolPolicySnapshot::default(),
-                };
-                let binding = request.runtime_environment_binding(&registry);
-                serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
-                    binding,
-                ))
-                .expect("runtime environment advertisement serializes")
-            });
+        if !fields.contains_key("runtime_environment_advertisement") {
+            let registry = astra_runtime_env::ToolRegistry::builtins();
+            let request = ToolExecutionRequest {
+                user_id: self.user_id.clone(),
+                run_id: String::new(),
+                turn_chain_id: String::new(),
+                session_id: self.session_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                args: args.clone(),
+                workspace: self.workspace_binding.clone(),
+                workspace_record: None,
+                executor: self.executor_binding.clone(),
+                runtime: self.runtime_binding.clone(),
+                selected_offer: None,
+                policy: ToolPolicySnapshot::default(),
+            };
+            let binding = request.runtime_environment_binding(&registry);
+            match serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                binding,
+            )) {
+                Ok(advertisement) => {
+                    fields.insert(
+                        "runtime_environment_advertisement".to_string(),
+                        advertisement,
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        tool_call_id,
+                        tool_name,
+                        error = %error,
+                        "failed to serialize runtime environment advertisement"
+                    );
+                }
+            }
+        }
         fields
     }
 
@@ -14231,13 +14243,14 @@ mod tests {
     // judge is absent or fails.
     mod turn_intent_judge_wiring {
         use super::*;
-        use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_config::user_profile::{Scenario, TurnIntent};
         use astra_services::runs::TurnIntentExecutionPolicy;
         use astra_services::{
             LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
             TurnIntentJudgeError,
         };
+        use astra_turn_types::ObjectiveRelation;
         use async_trait::async_trait;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -14391,8 +14404,8 @@ mod tests {
 
         #[tokio::test]
         async fn judge_turn_intent_invokes_wired_judge_and_returns_its_result() {
-            let llm_intent = TurnIntent::default()
-                .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+            let llm_intent =
+                TurnIntent::default().with_objective_relation(ObjectiveRelation::Continue);
             let judge = ScriptedJudge::ok(llm_intent.clone());
             let mut host = host_with_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
 
@@ -14590,7 +14603,7 @@ mod tests {
                     "choices": [
                         {
                             "message": {
-                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
+                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
                             },
                             "finish_reason": "stop"
                         }
@@ -14648,14 +14661,8 @@ mod tests {
             };
 
             assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
-            assert_eq!(
-                intent.continuation_mode,
-                TurnContinuationMode::ContinueCurrentObjective
-            );
-            assert!(
-                intent.reanchors_current_objective,
-                "judge response should drive reanchor behavior"
-            );
+            assert_eq!(intent.objective_relation, ObjectiveRelation::Correct);
+            assert!(intent.reanchors_current_objective());
             assert_eq!(
                 intent.workspace_mutation,
                 astra_config::user_profile::WorkspaceMutationIntent::MustMutate
@@ -14675,8 +14682,8 @@ mod tests {
             assert_eq!(messages.len(), 2);
             let prompt = messages[1]["content"].as_str().expect("user prompt");
             assert!(
-                prompt.contains("reanchors_current_objective"),
-                "judge prompt must request the structured reanchor field"
+                prompt.contains("objective_relation"),
+                "judge prompt must request the structured objective relation"
             );
             assert!(
                 prompt.contains("workspace_mutation"),

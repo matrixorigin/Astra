@@ -225,6 +225,7 @@ name = "astra-config"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-turn-types",
  "chrono",
  "dirs",
  "fs2",

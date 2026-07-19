@@ -100,7 +100,7 @@ pub(crate) fn compact_assistant_message(
 #[cfg(test)]
 mod tests {
     use super::compact_assistant_message;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 
     #[test]
     fn continuation_anchor_survives_simulated_compaction() {
@@ -128,12 +128,11 @@ mod tests {
         assert!(history[0].1.contains("Rust Pin<T>"));
 
         let state = SessionState {
-            continuation_anchor: Some(
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
                 "Latest user input: debug lifetime in tokio::spawn\n\
                  Latest assistant direction: add 'static bound to closure"
-                    .to_string()
-                    .into(),
-            ),
+                    .to_string(),
+            )),
             history,
             ..SessionState::default()
         };

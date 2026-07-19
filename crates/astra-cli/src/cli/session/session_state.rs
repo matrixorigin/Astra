@@ -42,7 +42,8 @@ pub(crate) struct SkillDevState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ContinuationAnchor {
     pub text: String,
-    pub latest_user_input: Option<String>,
+    pub recent_user_input: Option<String>,
+    pub objective_context: Vec<String>,
     pub assistant_direction: Option<String>,
     pub active_task_board: Vec<String>,
     pub has_session_memory_recap: bool,
@@ -51,13 +52,15 @@ pub(crate) struct ContinuationAnchor {
 impl ContinuationAnchor {
     pub(crate) fn from_parts(
         text: impl Into<String>,
-        latest_user_input: Option<String>,
+        recent_user_input: Option<String>,
+        objective_context: Vec<String>,
         assistant_direction: Option<String>,
         active_task_board: Vec<String>,
     ) -> Self {
         Self {
             text: text.into(),
-            latest_user_input,
+            recent_user_input,
+            objective_context,
             assistant_direction,
             active_task_board,
             has_session_memory_recap: false,
@@ -71,6 +74,14 @@ impl ContinuationAnchor {
 
     pub(crate) fn has_active_task_board(&self) -> bool {
         !self.active_task_board.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rendered_for_test(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -94,21 +105,6 @@ impl std::fmt::Display for ContinuationAnchor {
     }
 }
 
-impl From<String> for ContinuationAnchor {
-    fn from(text: String) -> Self {
-        Self {
-            text,
-            ..Self::default()
-        }
-    }
-}
-
-impl From<&str> for ContinuationAnchor {
-    fn from(text: &str) -> Self {
-        text.to_string().into()
-    }
-}
-
 /// Adaptive engine state persisted between sessions.
 /// Holds anti-flap dampening, experiment enrollment, and tuned config so the
 /// adaptive engine doesn't oscillate or lose progress on session restart.
@@ -128,8 +124,7 @@ pub(crate) struct PersistedAdaptiveState {
 pub(crate) struct SessionState {
     pub session_id: Option<String>,
     /// Project-scoped recoverable session detected at startup.
-    /// Becomes a true resume only after explicit user intent (`continue` / `resume` / `继续`)
-    /// or `/resume`.
+    /// Becomes a true resume only through the explicit `/resume` control path.
     pub pending_recovery: Option<String>,
     pub run_id: Option<String>,
     /// Display name for this session (set via --name flag).
@@ -858,7 +853,7 @@ impl SessionState {
 
 #[cfg(test)]
 mod default_tests {
-    use super::{ExplainMode, SessionState};
+    use super::{ContinuationAnchor, ExplainMode, SessionState};
     use crate::cli::permission_manager::PermissionManager;
 
     #[test]
@@ -879,7 +874,7 @@ mod default_tests {
             run_id: Some("run-1".into()),
             turn: 3,
             last_response: Some("answer".into()),
-            continuation_anchor: Some("anchor".into()),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test("anchor")),
             diagnostics_context: Some("diag".into()),
             queued_message: Some("queued".into()),
             history: vec![("u".into(), "a".into())],

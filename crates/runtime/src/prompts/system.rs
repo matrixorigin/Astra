@@ -915,275 +915,6 @@ fn tool_precedence_section(tool_names: &[&str]) -> String {
     body
 }
 
-fn read_file_review_guidance(tool_names: &[&str]) -> &'static str {
-    if tool_visible(tool_names, "read_file") {
-        "call read_file with start_line/end_line for ~30 lines around the change, or outline=true for large files"
-    } else {
-        "use visible read/context tools for small, targeted slices around the change"
-    }
-}
-
-/// Task-type specific strategy. Session-scoped — depends on a caller-supplied
-/// structured task type
-/// and the currently visible tool set.
-fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
-    match task_type {
-        Some("code_review") => {
-            let diff_guidance = if tool_visible(tool_names, "git") {
-                "- **Working-tree / staged changes**: call git(action=\"status\") + git(action=\"diff\") in ONE parallel turn.\n\
-                 - **Specific commit review**: call git(action=\"log\") + git(action=\"show\") (or git(action=\"diff\") with ref) in ONE parallel turn.\n\
-                 - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
-              ONLY use git(action=\"diff\") with `path` if the output shows \"[truncated]\". \
-              The first git(action=\"diff\") returns the COMPLETE diff — do NOT re-fetch the same content with path filters."
-                    .to_string()
-            } else if tool_visible(tool_names, "bash") {
-                "- **Diff/source evidence**: use visible `bash` shell commands to inspect repository state when needed; do not call absent structured git tools.\n\
-                 - **Specific commit review**: fetch commit evidence through visible tools or ask for the commit/diff if the environment cannot expose it."
-                    .to_string()
-            } else {
-                "- **Diff/source evidence**: use the diff or files already provided by the user, visible tools, or ask for the missing diff before reviewing."
-                    .to_string()
-            };
-            let git_antipattern = if tool_visible(tool_names, "git") {
-                "- Do NOT write a review summary in the same response where you call git(action=\"diff\").\n\
-                 - Do NOT call git(action=\"log\") in one turn, wait, then call git(action=\"show\") — call BOTH in the first turn."
-                    .to_string()
-            } else {
-                "- Do NOT call structured git actions when `git` is not visible.\n\
-                 - Do NOT write review conclusions before gathering the available evidence."
-                    .to_string()
-            };
-            let read_budget = if tool_visible(tool_names, "read_file") {
-                "Default budget: no more than 3 read_file calls for the review; only exceed that when an unresolved risk remains. NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true."
-            } else {
-                "Default budget: no more than 3 targeted reads for the review; only exceed that when an unresolved risk remains. Avoid whole large files; use visible ranges or outlines when supported."
-            };
-            format!(
-                "\n## Code Review Strategy\n\
-                  ### CRITICAL: Evidence BEFORE conclusions\n\
-                  You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
-                  before you have examined the diff. Do NOT output review text in the same turn as your \
-                  first tool call — wait for tool results.\n\
-                  \n\
-                  ### Process\n\
-                  1. **Get the diff**:\n\
-                     {diff_guidance}\n\
-                   2. **Identify scope**: list changed files and classify them (logic, test, config, formatting).\n\
-                   Treat the diff as primary evidence — avoid whole-repo or file-by-file crawls unless a specific risk remains.\n\
-                   3. **Read targeted context**: {read_guidance}. \
-                   {read_budget}\n\
-                   4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
-                   5. **If a read fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
-                  \n\
-                  ### Output\n\
-                  Return exactly one JSON object and no surrounding prose or markdown fences:\n\
-                  {{\"summary\":\"1–3 concise points on change and risk\",\"findings\":[{{\"severity\":\"critical|high|medium|low|info\",\"summary\":\"material issue and fix\",\"evidence\":[\"file:line and observed fact\"]}}],\"verification\":\"what was checked and what remains unverified\",\"verdict\":\"lgtm|needs_changes\"}}\n\
-                  Emit 0–5 material findings. Use severity=critical only for evidence that must reach ancestor runs immediately; map any must-fix concern to high or critical severity rather than a separate label. Use an empty findings array when there are no findings. NEVER say LGTM when evidence is incomplete; NEVER use verdict=lgtm when reads failed on logic-changed files.\n\
-                  \n\
-                  ### Anti-patterns (NEVER do these)\n\
-                   {git_antipattern}\n\
-                   - Do NOT say \"tests look good\" without reading at least one test file.\n\
-                   - Do NOT keep calling read tools without a new, explicit risk question to resolve.\n\
-                   - Do NOT output XML-like tags or claim full confidence when evidence is incomplete.\n",
-                read_guidance = read_file_review_guidance(tool_names),
-            )
-        }
-        Some("debugging") => {
-            let history = if tool_visible(tool_names, "git") {
-                "Check recent git changes near the error site with git(action=\"log\") and git(action=\"blame\")."
-            } else if tool_visible(tool_names, "bash") {
-                "If recent history matters, use visible shell git commands through `bash`; do not call absent structured git tools."
-            } else {
-                "If recent history matters, use visible history/context tools or ask for the missing evidence."
-            };
-            format!(
-                "\n## Debugging Strategy\n\
-                 1. Start with the error message / stack trace — read it carefully before exploring.\n\
-                 2. Form a hypothesis about the root cause.\n\
-                 3. Verify with ONE targeted tool call using a visible tool.\n\
-                 4. If hypothesis is wrong, form a new one — don't shotgun search.\n\
-                 5. {history}\n\
-                 6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
-                 7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n"
-            )
-        }
-        Some("exploration") => format!(
-            "\n## Exploration Strategy\n\
-             1. Start broad: use visible layout/file tools for project structure, then identify entry points.\n\
-             2. Narrow: {}.\n\
-             3. Build a mental map: entry points → core modules → dependencies → patterns.\n\
-             4. Read files with targeted ranges, not full files — scan structure first.\n\
-            5. Summarize architecture with concrete file paths and relationships.\n\
-             6. Note patterns: error handling style, naming conventions, test structure.\n",
-            if tool_visible(tool_names, "grep") {
-                if tool_visible(tool_names, "glob") {
-                    "grep for key terms, glob for file patterns"
-                } else {
-                    "grep for key terms"
-                }
-            } else {
-                deferred_search_guidance(tool_names)
-            }
-        ),
-        Some("implementation") => {
-            let symbols = symbols_guidance(tool_names);
-            let edit_guidance = if tool_visible(tool_names, "str_replace") {
-                "minimal changes, follow style. str_replace auto-formats"
-            } else {
-                "minimal changes, follow style. use visible edit tools only"
-            };
-            let verify_guidance = if tool_visible(tool_names, "bash") {
-                "run the repository's normal build/test command, fix errors, repeat"
-            } else {
-                "run a visible build/test path when available, fix errors, repeat"
-            };
-            if tool_visible(tool_names, "grep") {
-                let layout = match (
-                    tool_visible(tool_names, "glob"),
-                    tool_visible(tool_names, "list_dir"),
-                ) {
-                    (true, true) => "glob/list_dir for layout",
-                    (true, false) => "glob for filenames",
-                    (false, true) => "list_dir for layout",
-                    (false, false) => "available context",
-                };
-                let read_suffix = if tool_visible(tool_names, "read_file") {
-                    ", read_file targeted sections"
-                } else {
-                    ""
-                };
-                let find_location = match (
-                    tool_visible(tool_names, "glob"),
-                    tool_visible(tool_names, "read_file"),
-                ) {
-                    (true, true) => "glob → grep → read sections",
-                    (true, false) => "glob → grep",
-                    (false, true) => "grep → read sections",
-                    (false, false) => "grep exact names/usages",
-                };
-                format!(
-                    "\n## Implementation Strategy\n\
-                      1. **Understand structure**: {layout}, grep for names{read_suffix}.{symbols}\n\
-                      2. **Find location**: {find_location}.\n\
-                      3. **Find the owner**: before adding a type, service, registry, state machine, table, or parser, identify the existing canonical owner and extend it when possible.\n\
-                      4. **Check impact**: grep callers/imports and read the relevant call sites.\n\
-                      5. **Implement surgically**: {edit_guidance}.\n\
-                      6. **Replace completely**: if a new path supersedes an old one, migrate callers and remove the old implementation and its self-only tests in the same change.\n\
-                      7. **Wire the product path**: add the real entrypoint/import/registration; a public export or unit test is not proof of use.\n\
-                      8. **Verify behavior**: {verify_guidance}; persistence changes require the real database path, schema, query, and failure behavior.\n\
-                      9. **Commit**: {commit_guidance}.\n",
-                    commit_guidance = if tool_visible(tool_names, "git") {
-                        "git(action=\"commit\") with a clear message"
-                    } else if tool_visible(tool_names, "bash") {
-                        "use visible shell git commands only if the user asked for a commit"
-                    } else {
-                        "only if a visible git-capable tool exists and the user asked for it"
-                    }
-                )
-            } else {
-                format!(
-                    "\n## Implementation Strategy\n\
-                      1. **Understand structure**: use visible layout/file tools and targeted reads.{symbols}\n\
-                      2. **Find location**: {} before using any deferred search tool.\n\
-                      3. **Find the owner**: before adding a type, service, registry, state machine, table, or parser, identify the existing canonical owner and extend it when possible.\n\
-                      4. **Check impact**: find callers/imports with visible search/read tools; do not call hidden structured tools.\n\
-                      5. **Implement surgically**: {edit_guidance}.\n\
-                      6. **Replace completely**: if a new path supersedes an old one, migrate callers and remove the old implementation and its self-only tests in the same change.\n\
-                      7. **Wire the product path**: add the real entrypoint/import/registration; a public export or unit test is not proof of use.\n\
-                      8. **Verify behavior**: {verify_guidance}; persistence changes require the real database path, schema, query, and failure behavior.\n\
-                      9. **Commit**: {}.\n",
-                    deferred_search_guidance(tool_names),
-                    if tool_visible(tool_names, "git") {
-                        "git(action=\"commit\") with a clear message"
-                    } else if tool_visible(tool_names, "bash") {
-                        "use visible shell git commands only if the user asked for a commit"
-                    } else {
-                        "only if a visible git-capable tool exists and the user asked for it"
-                    }
-                )
-            }
-        }
-        Some("refactoring") => format!(
-            "\n## Refactoring Strategy\n\
-             1. Run tests BEFORE refactoring to establish a passing baseline.\n\
-             2. Use {} to find callers before changing a signature.{}\n\
-             3. Inventory competing owners and production callers before introducing any new abstraction.\n\
-             4. Choose one canonical owner per fact; projections are derived and must not become writable truth.\n\
-             5. Migrate callers and delete superseded code, compatibility shims, and self-only tests in the same change; do not leave parallel systems without an explicit external boundary.\n\
-             6. Record the complexity delta (implementations, states, tables, and net code), not only added functionality.\n\
-             7. Verify through the public product entrypoint and unhappy paths; use the real database for persistence contracts.\n\
-             8. Run tests AFTER to confirm nothing regressed.\n",
-            if tool_visible(tool_names, "grep") && tool_visible(tool_names, "read_file") {
-                "grep/read_file"
-            } else if tool_visible(tool_names, "grep") {
-                "grep"
-            } else if tool_visible(tool_names, "read_file") {
-                "read_file"
-            } else {
-                "visible search/read tools"
-            },
-            symbols_guidance(tool_names)
-        ),
-        Some("testing") => "\n## Testing Strategy\n\
-             1. Read the module under test to understand its behavior and edge cases.\n\
-             2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
-             3. Cover: happy path → edge cases → error conditions → boundary values.\n\
-             4. Prove wiring through a public entrypoint; tests that only construct an otherwise-unused abstraction are not coverage.\n\
-             5. For persistence behavior, exercise the real schema, query, transaction, and concurrency/failure path instead of a mock store alone.\n\
-             6. Each test verifies ONE behavior with a clear, descriptive name.\n\
-             7. Run the new tests to confirm they pass — fix failures before reporting.\n"
-            .to_string(),
-        Some("documentation") => "\n## Documentation Strategy\n\
-             - Read the code first — document actual behavior, not assumptions.\n\
-             - Include: purpose, usage examples, parameters, return values, error conditions.\n\
-             - Keep docs close to the code they describe.\n\
-             - Use the project's existing documentation style and format.\n"
-            .to_string(),
-        Some("performance") => "\n## Performance Strategy\n\
-             1. Measure first — don't guess. Profile to locate the actual bottleneck.\n\
-             2. Optimize the hottest path only; avoid premature optimization elsewhere.\n\
-             3. Check: algorithm complexity, allocation patterns, I/O blocking, cache misses.\n\
-             4. Verify improvement with before/after measurements.\n\
-             5. Ensure optimization doesn't break correctness — run tests after.\n"
-            .to_string(),
-        Some("analysis") => {
-            let ownership = if tool_visible(tool_names, "git") {
-                "Use git(action=\"blame\") + git(action=\"file_history\") for ownership/evolution questions."
-            } else if tool_visible(tool_names, "bash") {
-                "Use visible shell git commands for ownership/evolution questions when repository history is needed."
-            } else {
-                "Use visible docs/history/context tools for ownership/evolution questions, or ask for the missing evidence."
-            };
-            format!(
-                "\n## Analysis Strategy\n\
-                 1. Gather data from multiple sources: code, history, logs, docs.\n\
-                 2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
-                 3. {ownership}\n\
-                 4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
-                 5. Present: root cause → impact → recommendation.\n"
-            )
-        }
-        Some("deployment") => {
-            let review = if tool_visible(tool_names, "git") {
-                "Review pending changes: git(action=\"status\") → git(action=\"diff\") → CI status."
-            } else if tool_visible(tool_names, "bash") {
-                "Review pending changes with visible shell git commands and CI status when available."
-            } else {
-                "Review pending changes and CI status using visible tools; ask if deployment evidence is unavailable."
-            };
-            format!(
-                "\n## Deployment Strategy\n\
-                 1. Check CI status FIRST — don't deploy if builds are failing.\n\
-                 2. {review}\n\
-                 3. Verify config files (env vars, secrets) are correct for target environment.\n\
-                 4. Prefer incremental rollout over big-bang deployments.\n"
-            )
-        }
-        _ => String::new(),
-    }
-}
-
-/// Search strategy. Session-scoped — only when search/read tools are available.
 fn search_strategy_section(tool_names: &[&str]) -> String {
     let has_glob = tool_visible(tool_names, "glob");
     let has_grep = tool_visible(tool_names, "grep");
@@ -1302,12 +1033,8 @@ fn self_diagnosis_section(tool_names: &[&str]) -> String {
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Full system-prompt body when tools are available.
-pub fn build_main_system_prompt(
-    tool_names: &[&str],
-    profile_desc: &str,
-    task_type: Option<&str>,
-) -> String {
-    build_main_system_prompt_with_style(tool_names, profile_desc, task_type, None)
+pub fn build_main_system_prompt(tool_names: &[&str], profile_desc: &str) -> String {
+    build_main_system_prompt_with_style(tool_names, profile_desc, None)
 }
 
 /// Full system-prompt body with output style customization.
@@ -1315,11 +1042,10 @@ pub fn build_main_system_prompt(
 pub fn build_main_system_prompt_with_style(
     tool_names: &[&str],
     profile_desc: &str,
-    task_type: Option<&str>,
     output_style: Option<&OutputStyle>,
 ) -> String {
     let mut sections =
-        build_system_prompt_sections_with_style(tool_names, profile_desc, task_type, output_style);
+        build_system_prompt_sections_with_style(tool_names, profile_desc, output_style);
     let overrides = load_overrides(&default_overrides_dir());
     apply_overrides(&mut sections, &overrides);
     sections_to_string(&sections)
@@ -1330,22 +1056,17 @@ pub fn build_main_system_prompt_with_style(
 /// Section layout (fine-grained for maximum cache reuse):
 ///   1. **Global** – core rules, planning, coding discipline, parallel/efficiency,
 ///      plan execution, output format, error recovery (~stable for weeks)
-///   2. **Session** – self-model (tool list), tool-conditional guidance, task-type
-///      strategy, search strategy (stable while tools/task unchanged)
+///   2. **Session** – self-model, tool-conditional guidance, and search
+///      strategy (stable while the visible tool surface is unchanged)
 ///   3. **None** – output style, project profile (changes every turn)
-pub fn build_system_prompt_sections(
-    tool_names: &[&str],
-    profile_desc: &str,
-    task_type: Option<&str>,
-) -> Vec<PromptSection> {
-    build_system_prompt_sections_with_style(tool_names, profile_desc, task_type, None)
+pub fn build_system_prompt_sections(tool_names: &[&str], profile_desc: &str) -> Vec<PromptSection> {
+    build_system_prompt_sections_with_style(tool_names, profile_desc, None)
 }
 
 /// Build system prompt sections with output style customization.
 pub fn build_system_prompt_sections_with_style(
     tool_names: &[&str],
     profile_desc: &str,
-    task_type: Option<&str>,
     output_style: Option<&OutputStyle>,
 ) -> Vec<PromptSection> {
     if tool_names.is_empty() {
@@ -1412,15 +1133,6 @@ pub fn build_system_prompt_sections_with_style(
             tool_cond,
             PromptTokenBucket::BasePersona,
         ));
-    }
-
-    let tt = task_type_section(task_type, tool_names);
-    if !tt.is_empty() {
-        // The detected task type is recomputed each turn from the user
-        // request — it's environmental signal, not part of the agent
-        // persona. Bill to `Environment` so token accounting reflects
-        // reality.
-        sections.push(PromptSection::dynamic(tt, PromptTokenBucket::Environment));
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -1780,46 +1492,10 @@ mod tests {
 
     #[test]
     fn core_prompt_requires_evidence_strength_and_fanout_provenance() {
-        let prompt = build_main_system_prompt(&["agent_fanout"], "", None);
+        let prompt = build_main_system_prompt(&["agent_fanout"], "");
         assert!(prompt.contains("observed facts, inferences, and hypotheses"));
         assert!(prompt.contains("complete child deliverables actually returned"));
         assert!(prompt.contains("root synthesis, not agent consensus"));
-    }
-
-    #[test]
-    fn code_review_prompt_includes_commit_review_guidance() {
-        let p = build_main_system_prompt(&["git", "bash", "read_file"], "", Some("code_review"));
-        assert!(
-            p.contains("Specific commit review"),
-            "should include commit review variant"
-        );
-        assert!(
-            p.contains("git(action=\"log\") + git(action=\"show\")"),
-            "should guide git log + show in parallel"
-        );
-        assert!(
-            p.contains("call BOTH in the first turn"),
-            "should warn against sequential git log then git show"
-        );
-        assert!(
-            p.contains("Default budget: no more than 3 read_file calls"),
-            "should bound read_file fanout for review turns"
-        );
-        assert!(
-            p.contains("\"severity\":\"critical|high|medium|low|info\"")
-                && p.contains("Return exactly one JSON object"),
-            "review output must match the delegated finding wire contract"
-        );
-        assert!(
-            !p.contains("label must-fix/should-fix/suggestion"),
-            "the previous prose review contract must not remain prompt-facing"
-        );
-
-        let p_no_read_file = build_main_system_prompt(&["git", "bash"], "", Some("code_review"));
-        assert!(
-            !p_no_read_file.contains("read_file calls"),
-            "review prompt must not mention structured read_file calls when read_file is hidden"
-        );
     }
 
     // Tests for `## Self-Model\nTools: ...` list, `## Memory Rules` /
@@ -1836,93 +1512,8 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_strategy_for_all_task_types() {
-        // Verify all 10 task types produce their strategy sections
-        let strategies: &[(&str, &[&str])] = &[
-            (
-                "code_review",
-                &[
-                    "Code Review Strategy",
-                    "Evidence BEFORE conclusions",
-                    "NEVER say LGTM",
-                    "must-fix",
-                ],
-            ),
-            (
-                "debugging",
-                &["Debugging Strategy", "hypothesis", "root cause"],
-            ),
-            ("exploration", &["Exploration Strategy", "mental map"]),
-            (
-                "implementation",
-                &["Implementation Strategy", "Implement surgically"],
-            ),
-            ("refactoring", &["Refactoring Strategy", "passing baseline"]),
-            ("testing", &["Testing Strategy", "edge cases"]),
-            (
-                "documentation",
-                &["Documentation Strategy", "usage examples"],
-            ),
-            ("performance", &["Performance Strategy", "bottleneck"]),
-            ("analysis", &["Analysis Strategy", "hypotheses"]),
-            ("deployment", &["Deployment Strategy", "CI status"]),
-        ];
-        for &(task_type, phrases) in strategies {
-            let p = build_main_system_prompt(&["bash"], "", Some(task_type));
-            for &phrase in phrases {
-                assert!(
-                    p.contains(phrase),
-                    "strategy for '{task_type}' missing phrase: {phrase:?}"
-                );
-            }
-        }
-
-        // Implementation strategy also references tool guidance when tools present
-        let p =
-            build_main_system_prompt(&["glob", "grep", "read_file"], "", Some("implementation"));
-        assert!(p.contains("glob"), "implementation should mention glob");
-        assert!(p.contains("grep"), "implementation should mention grep");
-        assert!(p.contains("Find the owner"));
-        assert!(p.contains("public export or unit test is not proof of use"));
-        assert!(p.contains("real database path, schema, query"));
-
-        let p = build_main_system_prompt(&["bash"], "", Some("refactoring"));
-        assert!(p.contains("one canonical owner per fact"));
-        assert!(p.contains("delete superseded code"));
-        assert!(p.contains("complexity delta"));
-
-        let p = build_main_system_prompt(&["bash"], "", Some("testing"));
-        assert!(p.contains("public entrypoint"));
-        assert!(p.contains("real schema, query, transaction"));
-
-        // Unknown task type produces no strategy sections
-        let p = build_main_system_prompt(&["bash"], "", Some("nonexistent_type"));
-        assert!(p.contains("Core Rules"), "base content should be present");
-        for &(label, _) in strategies {
-            assert!(
-                !p.contains(&format!(
-                    "{} Strategy",
-                    label
-                        .replace('_', " ")
-                        .split(' ')
-                        .map(|w| {
-                            let mut c = w.chars();
-                            match c.next() {
-                                None => String::new(),
-                                Some(f) => f.to_uppercase().chain(c).collect(),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )),
-                "unknown task type should not include '{label}' strategy"
-            );
-        }
-    }
-
-    #[test]
     fn test_prompt_core_sections_always_present() {
-        let p = build_main_system_prompt(&["bash"], "", None);
+        let p = build_main_system_prompt(&["bash"], "");
 
         // Planning protocol
         assert!(p.contains("Plan, Batch, Execute"));
@@ -1984,7 +1575,7 @@ mod tests {
 
     #[test]
     fn test_prompt_runaway_file_exploration_bound() {
-        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", None);
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "");
         assert!(p.contains("Open-ended loops"));
         assert!(p.contains("\"as many as you can\""));
         assert!(p.contains("≤2 dir listings"));
@@ -1993,7 +1584,7 @@ mod tests {
     #[test]
     fn test_prompt_tool_conditional_sections() {
         // No tools → fabrication warning, no memory rules, no strategy extras
-        let p_no = build_main_system_prompt(&[], "", None);
+        let p_no = build_main_system_prompt(&[], "");
         assert!(p_no.contains("NO tools available"));
         assert!(p_no.contains("fake data"));
         assert!(
@@ -2003,14 +1594,14 @@ mod tests {
         assert!(!p_no.contains("Memory Rules"));
 
         // With memory tools → memory rules appear (implied by tool surface)
-        let p_mem = build_main_system_prompt(&["bash", "git"], "", None);
+        let p_mem = build_main_system_prompt(&["bash", "git"], "");
         assert!(
             !p_mem.contains("Memory Rules"),
             "without memory tools, no rules"
         );
 
         // Task lifecycle: task_board tool present → lifecycle guidance
-        let p_task = build_main_system_prompt(&["task_board", "bash"], "", None);
+        let p_task = build_main_system_prompt(&["task_board", "bash"], "");
         assert!(p_task.contains("Task Lifecycle"));
         assert!(p_task.contains("task_board(action=\"create\""));
         assert!(p_task.contains(
@@ -2027,11 +1618,11 @@ mod tests {
         );
 
         // Task lifecycle: no task_board tool → no lifecycle guidance
-        let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", None);
+        let p_no_task = build_main_system_prompt(&["bash", "read_file"], "");
         assert!(!p_no_task.contains("Task Lifecycle"));
 
         // Self-diagnosis: introspect tool present → diagnosis guidance with depth ladder
-        let p_intro = build_main_system_prompt(&["introspect", "bash"], "", None);
+        let p_intro = build_main_system_prompt(&["introspect", "bash"], "");
         assert!(p_intro.contains("Self-Diagnosis"));
         assert!(p_intro.contains("introspect"));
         assert!(p_intro.contains("depth=hint"));
@@ -2040,14 +1631,14 @@ mod tests {
         assert!(p_intro.contains("escalate"));
 
         // Self-diagnosis: reflect tool present → diagnosis guidance with depth ladder
-        let p_refl = build_main_system_prompt(&["reflect", "bash"], "", None);
+        let p_refl = build_main_system_prompt(&["reflect", "bash"], "");
         assert!(p_refl.contains("Self-Diagnosis"));
         assert!(p_refl.contains("reflect"));
         assert!(p_refl.contains("depth=summary"));
         assert!(p_refl.contains("depth=forensic"));
 
         // Self-diagnosis: both tools present → both mentioned with depth guidance
-        let p_both = build_main_system_prompt(&["introspect", "reflect", "bash"], "", None);
+        let p_both = build_main_system_prompt(&["introspect", "reflect", "bash"], "");
         assert!(p_both.contains("Self-Diagnosis"));
         assert!(p_both.contains("introspect"));
         assert!(p_both.contains("reflect"));
@@ -2055,21 +1646,20 @@ mod tests {
         assert!(p_both.contains("depth=forensic"));
 
         // Self-diagnosis: no diagnosis tools → no diagnosis guidance
-        let p_no_diag = build_main_system_prompt(&["bash", "read_file"], "", None);
+        let p_no_diag = build_main_system_prompt(&["bash", "read_file"], "");
         assert!(!p_no_diag.contains("Self-Diagnosis"));
 
         // Plan lifecycle: both plan tools → lifecycle stays in schema
-        let p_plan =
-            build_main_system_prompt(&["enter_plan_mode", "exit_plan_mode", "bash"], "", None);
+        let p_plan = build_main_system_prompt(&["enter_plan_mode", "exit_plan_mode", "bash"], "");
         assert!(!p_plan.contains("Plan Mode Lifecycle"));
         assert!(!p_plan.contains("write tools stay blocked"));
 
         // Plan lifecycle: incomplete set → no lifecycle guidance
-        let p_no_plan = build_main_system_prompt(&["enter_plan_mode", "bash"], "", None);
+        let p_no_plan = build_main_system_prompt(&["enter_plan_mode", "bash"], "");
         assert!(!p_no_plan.contains("Plan Mode Lifecycle"));
 
         // Search strategy → present with search tools
-        let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "", None);
+        let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "");
         assert!(p_search.contains("Search Strategy"));
         assert!(p_search.contains("Use glob first"));
         assert!(p_search.contains("Rank by signal density"));
@@ -2078,18 +1668,18 @@ mod tests {
         assert!(p_search.contains("outline/range reads"));
 
         // Search strategy → absent without search tools
-        let p_no_search = build_main_system_prompt(&["bash"], "", None);
+        let p_no_search = build_main_system_prompt(&["bash"], "");
         assert!(!p_no_search.contains("Search Strategy"));
 
         // read_file alone triggers search strategy
-        let p_read = build_main_system_prompt(&["read_file"], "", None);
+        let p_read = build_main_system_prompt(&["read_file"], "");
         assert!(
             p_read.contains("Search Strategy"),
             "read_file alone should trigger search strategy"
         );
 
         // Legacy code-nav tools with no schema must not leak into the prompt.
-        let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "", None);
+        let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "");
         for legacy in [
             "find_definition",
             "find_references",
@@ -2107,17 +1697,13 @@ mod tests {
             "symbols activation guidance must not mention tool_search when tool_search is hidden"
         );
         let p_nav_with_search =
-            build_main_system_prompt(&["glob", "grep", "read_file", "tool_search"], "", None);
+            build_main_system_prompt(&["glob", "grep", "read_file", "tool_search"], "");
         assert!(
             p_nav_with_search.contains("tool_search(query=\"select:symbols\")"),
             "symbols guidance must require deferred activation when tool_search is visible"
         );
 
-        let p_no_grep = build_main_system_prompt(
-            &["bash", "read_file", "tool_search"],
-            "",
-            Some("implementation"),
-        );
+        let p_no_grep = build_main_system_prompt(&["bash", "read_file", "tool_search"], "");
         for direct_grep_phrase in [
             "→ grep",
             "grep for names/usages",
@@ -2140,7 +1726,7 @@ mod tests {
             "prompt should route deferred tools through tool_search activation"
         );
 
-        let p_no_git = build_main_system_prompt(&["bash", "read_file"], "", Some("code_review"));
+        let p_no_git = build_main_system_prompt(&["bash", "read_file"], "");
         for direct_git_phrase in [
             "git(action=\"status\")",
             "git(action=\"diff\")",
@@ -2155,11 +1741,11 @@ mod tests {
         }
 
         // Profile desc in prompt
-        let p_prof = build_main_system_prompt(&["bash"], "\n## Project: TestProj\n", None);
+        let p_prof = build_main_system_prompt(&["bash"], "\n## Project: TestProj\n");
         assert!(p_prof.contains("Project: TestProj"));
 
         // Profile desc in no-tools path
-        let p_no_prof = build_main_system_prompt(&[], "\n## Project: MyApp\n", None);
+        let p_no_prof = build_main_system_prompt(&[], "\n## Project: MyApp\n");
         assert!(p_no_prof.contains("NO tools available"));
         assert!(p_no_prof.contains("Project: MyApp"));
     }
@@ -2174,16 +1760,14 @@ mod tests {
             source: StyleSource::BuiltIn,
             keep_coding_instructions: true,
         };
-        let p_style = build_main_system_prompt_with_style(&["bash"], "", None, Some(&style));
+        let p_style = build_main_system_prompt_with_style(&["bash"], "", Some(&style));
         assert!(p_style.contains("# Output Style: Test"));
         assert!(p_style.contains("Be very brief"));
 
         // No output style
-        let p_no_style = build_main_system_prompt_with_style(&["bash"], "", None, None);
+        let p_no_style = build_main_system_prompt_with_style(&["bash"], "", None);
         assert!(!p_no_style.contains("# Output Style:"));
     }
-
-    // ── Strategy sections for new task types ──
 
     // ── Consolidated tool round + budget tests ───────────────────
 
@@ -2207,18 +1791,6 @@ mod tests {
         assert!(!guidance2.contains("Synthesize Or Batch Now"));
         assert!(guidance2.contains("2 tools executed in parallel"));
         assert!(signals2.parallel_feedback);
-
-        // Ignores trailing runtime system messages
-        let msgs3 = vec![
-            serde_json::json!({"role": "tool", "content": "a"}),
-            serde_json::json!({"role": "tool", "content": "b"}),
-            serde_json::json!({"role": "system", "content": "✓ 2 tools executed in parallel"}),
-            serde_json::json!({"role": "system", "content": "## Already Fetched\nFiles: b"}),
-        ];
-        let (g3, s3) = tool_round_guidance_trace(&msgs3, 0);
-        assert!(!g3.contains("Synthesize Or Batch Now"));
-        assert!(g3.contains("2 tools executed in parallel"));
-        assert!(s3.parallel_feedback);
 
         // Ignores trailing runtime attention manifest
         let msgs4 = vec![
@@ -2262,38 +1834,17 @@ mod tests {
 
     #[test]
     fn test_tool_conditional_and_budget_checks() {
-        // Code nav absent without tools
-        let p = build_main_system_prompt(&["bash", "read_file"], "", Some("implementation"));
-        assert!(!p.contains("Code Navigation"));
-
-        // Build/test absent without tool
-        let p = build_main_system_prompt(&["bash"], "", Some("implementation"));
-        assert!(!p.contains("Build & Test Loop"));
-
         // Plan execution warns about mutating bash in rollback boundaries.
-        let p = build_main_system_prompt(&["bash"], "", Some("implementation"));
+        let p = build_main_system_prompt(&["bash"], "");
         assert!(p.contains("non-read-only `bash` is a manual boundary"));
         assert!(!p.contains("run_build_test"));
 
         // Git mutations absent without commit tool
-        let p = build_main_system_prompt(&["git"], "", None);
+        let p = build_main_system_prompt(&["git"], "");
         assert!(!p.contains("Git Workflow"));
 
-        // Implementation strategy stays grounded in surfaced tools.
-        let p = build_main_system_prompt(
-            &["glob", "grep", "read_file", "str_replace", "git"],
-            "",
-            Some("implementation"),
-        );
-        assert!(!p.contains("find_definition"));
-        assert!(!p.contains("run_build_test"));
-        assert!(!p.contains("call_graph"));
-        assert!(p.contains("git(action=\"commit\")"));
-        assert!(p.contains("str_replace auto-formats"));
-
         // Default persona budget stays bounded
-        let sections =
-            build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "", None);
+        let sections = build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "");
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(bd.base_persona_tokens <= 3600);
 
@@ -2307,7 +1858,7 @@ mod tests {
         assert_eq!(timer.scope, CacheScope::None);
 
         // Search strategy billed to environment bucket
-        let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "", None);
+        let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "");
         let ss = sections
             .iter()
             .find(|s| s.text.contains("Search Strategy"))
@@ -2318,7 +1869,7 @@ mod tests {
     #[test]
     fn test_sections_scopes_and_content() {
         let tools = vec!["bash", "read_file", "glob", "grep"];
-        let sections = build_system_prompt_sections(&tools, "cwd: /tmp", None);
+        let sections = build_system_prompt_sections(&tools, "cwd: /tmp");
 
         // Scope validation: multiple Global sections, first is Global
         let globals: Vec<_> = sections
@@ -2372,30 +1923,12 @@ mod tests {
             "should contain CC skill compatibility rule"
         );
 
-        // Task-type strategy lands in None-scoped segment
-        let task_sections =
-            build_system_prompt_sections(&vec!["bash", "grep", "read_file"], "", Some("debugging"));
-        let post_cache_text: String = task_sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::None)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(
-            post_cache_text.contains("Debugging Strategy"),
-            "task-type strategy should land in None-scoped (post-cache) segment"
-        );
-
-        // sections_to_string contains core and task content
+        // sections_to_string contains core and profile content.
         let profile = "cwd: /test\ngit_branch: main";
-        let impl_sections = build_system_prompt_sections(
-            &vec!["bash", "read_file", "glob"],
-            profile,
-            Some("implementation"),
-        );
+        let impl_sections = build_system_prompt_sections(&["bash", "read_file", "glob"], profile);
         let result = sections_to_string(&impl_sections);
         assert!(result.contains(SYSTEM_PROMPT_BASE));
         assert!(result.contains("Core Rules"));
-        assert!(result.contains("Implementation Strategy"));
         assert!(result.contains("Output Format"));
         assert!(result.contains("Tool Error Recovery"));
         assert!(result.contains("cwd: /test"));
@@ -2405,7 +1938,7 @@ mod tests {
     #[test]
     fn test_sections_edge_cases() {
         // Empty tools + profile → 2 sections (Global + profile-only None)
-        let sections = build_system_prompt_sections(&[], "cwd: /app", None);
+        let sections = build_system_prompt_sections(&[], "cwd: /app");
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].scope, CacheScope::Global);
         assert!(sections[0].text.contains("NO tools available"));
@@ -2413,12 +1946,12 @@ mod tests {
         assert!(sections[1].text.contains("cwd: /app"));
 
         // Empty tools + empty profile → Global only
-        let sections = build_system_prompt_sections(&[], "", None);
+        let sections = build_system_prompt_sections(&[], "");
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].scope, CacheScope::Global);
 
         // Empty tools + profile text → 2 sections
-        let sections = build_system_prompt_sections(&[], "profile text", None);
+        let sections = build_system_prompt_sections(&[], "profile text");
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].scope, CacheScope::Global);
         assert_eq!(sections[1].scope, CacheScope::None);
@@ -2440,7 +1973,7 @@ mod tests {
             source: StyleSource::BuiltIn,
             keep_coding_instructions: true,
         };
-        let sections = build_system_prompt_sections_with_style(&["bash"], "", None, Some(&style));
+        let sections = build_system_prompt_sections_with_style(&["bash"], "", Some(&style));
         let all_text: String = sections.iter().map(|s| s.text.as_str()).collect();
         assert!(all_text.contains("# Output Style: Concise"));
         assert!(all_text.contains("Minimize output"));
@@ -2456,8 +1989,7 @@ mod tests {
     fn test_prompt_overrides() {
         // Replace matching section
         let tools = &["bash", "grep"];
-        let mut sections =
-            build_system_prompt_sections_with_style(tools, "test project", None, None);
+        let mut sections = build_system_prompt_sections_with_style(tools, "test project", None);
 
         let mut overrides = PromptOverrides::new();
         overrides.insert("core_rules".into(), "Custom core rules content".into());
@@ -2468,7 +2000,7 @@ mod tests {
 
         // Ignore unknown keys
         let tools2 = &["bash"];
-        let mut sections2 = build_system_prompt_sections_with_style(tools2, "", None, None);
+        let mut sections2 = build_system_prompt_sections_with_style(tools2, "", None);
         let original_text = sections2[0].text.clone();
         let mut overrides2 = PromptOverrides::new();
         overrides2.insert("nonexistent_section".into(), "should be ignored".into());
@@ -2495,7 +2027,7 @@ mod tests {
         use astra_turn_core::context_assembly_trace::{MemoryInjection, SkillInjection};
 
         // ── Skills + memories ──
-        let sections = build_system_prompt_sections(&["bash", "grep"], "", None);
+        let sections = build_system_prompt_sections(&["bash", "grep"], "");
         let skills = vec![SkillInjection {
             skill_name: "concise".into(),
             skill_version: None,
@@ -2519,7 +2051,7 @@ mod tests {
         assert!(bd.total_tokens >= bd.base_persona_tokens + 150 + 200);
 
         // ── Empty skills/memories ──
-        let sections2 = build_system_prompt_sections(&["bash"], "", None);
+        let sections2 = build_system_prompt_sections(&["bash"], "");
         let bd2 = build_system_prompt_trace(&sections2, vec![], vec![], None);
         assert!(bd2.base_persona_tokens > 0);
         assert!(bd2.skills_injected.is_empty());
@@ -2719,21 +2251,6 @@ mod tests {
         assert!(
             parallel_batching_nudge_directive(&msgs).is_empty(),
             "should not nudge after the model already batched"
-        );
-    }
-
-    #[test]
-    fn parallel_batching_nudge_skips_runtime_system_messages() {
-        // Trailing nudges/feedback injected by the runtime should not break
-        // the streak detection.
-        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1]);
-        msgs.push(serde_json::json!({
-            "role": "system",
-            "content": "## Already Fetched (do NOT re-read these)\nFiles: foo.rs"
-        }));
-        assert_eq!(trailing_single_tool_round_streak(&msgs), 6);
-        assert!(
-            parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected")
         );
     }
 

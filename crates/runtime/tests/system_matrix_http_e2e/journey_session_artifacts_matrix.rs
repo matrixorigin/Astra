@@ -243,7 +243,7 @@ fn is_connectivity_probe_request(req: &str) -> bool {
 }
 
 fn is_turn_intent_judge_request(req: &str) -> bool {
-    req.contains("turn intent classifier") && req.contains("continuation_mode")
+    req.contains("turn intent classifier") && req.contains("objective_relation")
 }
 
 fn summarize_provider_request(req: &str) -> String {

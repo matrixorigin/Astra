@@ -99,9 +99,9 @@ impl CompactionEngine {
         *messages = typed
             .into_iter()
             .map(|message| {
-                // `Value::from(Message)` is also the provider-wire serializer
-                // and therefore removes `_` fields. The compaction result is
-                // still canonical runtime state, so retain only the typed
+                // `Value::from(Message)` removes dynamic `_` fields while
+                // retaining stable user-turn semantics. The compaction result
+                // is still canonical runtime state, so restore the typed
                 // ownership/boundary markers needed by later projections.
                 let compact_boundary = message.extra.get("_compact_boundary").cloned();
                 let runtime_provenance = message

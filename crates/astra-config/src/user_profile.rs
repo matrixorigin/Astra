@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use astra_core::ConfidenceInterval;
+use astra_turn_types::{ObjectiveRelation, UserFeedback};
 use serde::{Deserialize, Serialize};
 
 use crate::lock_ext::RwLockExt;
@@ -398,6 +399,7 @@ pub enum WorkspaceMutationIntent {
 /// requested/prohibited scenarios deterministically and does not parse natural
 /// language negations itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TurnIntent {
     /// Scenario the current user turn asks to enter, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,17 +407,14 @@ pub struct TurnIntent {
     /// Scenarios the current user turn explicitly forbids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prohibited_scenarios: Vec<Scenario>,
-    /// Whether the user is continuing the current objective rather than
-    /// starting a fresh scenario.
-    #[serde(default)]
-    pub continuation_mode: TurnContinuationMode,
-    /// Whether the user is correcting or reanchoring the current objective.
-    ///
-    /// This is deliberately separate from `continuation_mode`: a plain
-    /// "continue" keeps working, while a reanchor may reset transient guard
-    /// state that belongs to the previous failed attempt.
-    #[serde(default)]
-    pub reanchors_current_objective: bool,
+    /// Judge-owned relationship between this message and the session
+    /// objective. This replaces the former continuation + reanchor booleans,
+    /// whose combinations could represent contradictory states.
+    pub objective_relation: ObjectiveRelation,
+    /// Optional typed feedback classification. The exact instruction stays in
+    /// the canonical user message; this field supplies kind and target only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<UserFeedback>,
     /// Whether the current turn requires, permits, or forbids workspace
     /// mutation. Defaults to `Unknown` so judge failures fail closed.
     #[serde(default)]
@@ -435,14 +434,14 @@ impl TurnIntent {
     }
 
     #[must_use]
-    pub fn with_continuation_mode(mut self, mode: TurnContinuationMode) -> Self {
-        self.continuation_mode = mode;
+    pub fn with_objective_relation(mut self, relation: ObjectiveRelation) -> Self {
+        self.objective_relation = relation;
         self
     }
 
     #[must_use]
-    pub fn with_reanchors_current_objective(mut self, reanchors: bool) -> Self {
-        self.reanchors_current_objective = reanchors;
+    pub fn with_feedback(mut self, feedback: UserFeedback) -> Self {
+        self.feedback = Some(feedback);
         self
     }
 
@@ -472,32 +471,14 @@ impl TurnIntent {
     }
 
     #[must_use]
-    pub fn continues_current_objective(&self) -> bool {
-        self.continuation_mode == TurnContinuationMode::ContinueCurrentObjective
-    }
-
-    #[must_use]
     pub fn reanchors_current_objective(&self) -> bool {
-        self.reanchors_current_objective
+        self.objective_relation.reanchors_current_objective()
     }
 
     #[must_use]
     pub fn requires_workspace_mutation(&self) -> bool {
         self.workspace_mutation == WorkspaceMutationIntent::MustMutate
     }
-}
-
-/// LLM-judged relationship between this turn and the existing objective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnContinuationMode {
-    /// No reliable continuation signal was supplied.
-    #[default]
-    Unknown,
-    /// The user is asking to proceed with the existing objective.
-    ContinueCurrentObjective,
-    /// The user is starting or replacing with a new objective.
-    NewObjective,
 }
 
 impl Scenario {
@@ -1139,24 +1120,15 @@ mod tests {
     }
 
     #[test]
-    fn turn_intent_continuation_mode_is_explicit() {
-        let intent = TurnIntent::default()
-            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
-
-        assert!(intent.continues_current_objective());
-        assert!(!TurnIntent::default().continues_current_objective());
-    }
-
-    #[test]
-    fn turn_intent_reanchor_is_separate_from_continuation() {
-        let continued = TurnIntent::default()
-            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
-        assert!(continued.continues_current_objective());
+    fn turn_intent_relation_derives_reanchor_without_a_second_boolean() {
+        let continued = TurnIntent::default().with_objective_relation(ObjectiveRelation::Continue);
         assert!(!continued.reanchors_current_objective());
 
-        let reanchored = TurnIntent::default().with_reanchors_current_objective(true);
+        let reanchored = TurnIntent::default().with_objective_relation(ObjectiveRelation::Correct);
         assert!(reanchored.reanchors_current_objective());
-        assert!(!reanchored.continues_current_objective());
+
+        let replaced = TurnIntent::default().with_objective_relation(ObjectiveRelation::Replace);
+        assert!(replaced.reanchors_current_objective());
     }
 
     #[test]

@@ -32,9 +32,7 @@
 //! The judge is the only component that may classify natural-language turn
 //! intent. Runtime fallbacks must use structural facts, not keyword lists.
 
-use astra_config::user_profile::{
-    Scenario, TurnContinuationMode, TurnIntent, WorkspaceMutationIntent,
-};
+use astra_config::user_profile::TurnIntent;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -109,8 +107,8 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          {\n  \
             \"requested_scenario\": <scenario | null>,\n  \
             \"prohibited_scenarios\": [<scenario>, ...],   // may be empty\n  \
-            \"continuation_mode\": \"continue_current_objective\" | \"new_objective\" | \"unknown\",\n  \
-            \"reanchors_current_objective\": <boolean>,\n  \
+            \"objective_relation\": \"acknowledge\" | \"continue\" | \"refine\" | \"correct\" | \"replace\" | \"unknown\",\n  \
+            \"feedback\": null | {\"kind\": \"approval\" | \"correction\" | \"clarification\" | \"requirement\" | \"preference\", \"target\": \"objective\" | \"scope\" | \"approach\" | \"output\" | \"verification\" | \"general\"},\n  \
             \"workspace_mutation\": \"read_only\" | \"may_mutate\" | \"must_mutate\" | \"unknown\",\n  \
             \"browser_verification_required\": <boolean>\n\
          }\n\
@@ -123,11 +121,14 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          Rules:\n\
          - requested_scenario: pick the BEST single scenario the user is asking for, or null when ambiguous.\n\
          - prohibited_scenarios: include any scenario the user explicitly rejected (e.g. \"don't review, just continue\" → [\"code_review\"]).\n\
-         - continuation_mode:\n  \
-             * \"continue_current_objective\" only when the user explicitly asks to proceed, apply, fix, run, or continue prior work (e.g. \"go on\", \"fix it\", \"继续\").\n  \
-             * \"new_objective\" when starting an unrelated task.\n  \
-             * \"unknown\" for status/progress/why/what-remains questions unless the user also explicitly asks to execute more work.\n\
-         - reanchors_current_objective: true only when the user corrects, redirects, or supersedes the current approach/objective; false for ordinary continuation.\n\
+         - objective_relation describes how this exact message changes the existing objective:\n  \
+             * \"acknowledge\": accepts the prior result without changing work.\n  \
+             * \"continue\": asks to proceed without changing objective or requirements.\n  \
+             * \"refine\": adds a requirement, constraint, scope item, or verification request while retaining the objective.\n  \
+             * \"correct\": says the current understanding or approach is wrong and supplies a correction.\n  \
+             * \"replace\": starts an unrelated objective, or explicitly supersedes the old objective. Use this for the first substantive user task when no prior assistant turn exists.\n  \
+             * \"unknown\": no reliable relationship, including status/why questions that do not change work.\n\
+         - feedback is null when the message contains no evaluation or requirement about prior/current work. Otherwise classify its semantic kind and target. Do not copy or summarize the user text into this object; the canonical message already preserves it.\n\
          - workspace_mutation:\n  \
              * \"must_mutate\" only when the user explicitly requests editing, creating, deleting, applying, refactoring, fixing, or otherwise changing files/workspace state in this turn.\n  \
              * \"read_only\" when the user asks for analysis, explanation, diagnosis, review, lookup, or an answer without asking to change files.\n  \
@@ -138,25 +139,25 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          \n\
          Examples:\n\
          User: \"please inspect the current changes\"\n\
-         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"fix it\" (after assistant proposed an implementation)\n\
-         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"objective_relation\":\"continue\",\"feedback\":null,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"还有什么？\" (after assistant was working on a task)\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"当前的实现，能够想起来吗？\"\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"不对，我要的是系统性修复，不是临时补丁\"\n\
-         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"don't review this, just continue the implementation\"\n\
-         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"objective_relation\":\"refine\",\"feedback\":{\"kind\":\"requirement\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"test the game in a browser and verify the canvas works\"\n\
-         {\"requested_scenario\":\"testing\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":true}\n\
+         {\"requested_scenario\":\"testing\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":true}\n\
          \n",
     );
 
@@ -209,9 +210,8 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
 
 /// Parse the judge's JSON response into a [`TurnIntent`].
 ///
-/// Strict: an unknown scenario or continuation_mode value produces `Err` so
-/// the caller can ignore the explicit intent instead of silently constructing
-/// a degraded one.
+/// Strict: unknown fields or enum values produce `Err` so callers cannot
+/// silently construct a degraded intent from an obsolete schema.
 pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJudgeError> {
     let trimmed = raw.trim();
 
@@ -240,148 +240,9 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
         raw: truncate(raw, 256),
     })?;
 
-    let mut intent = TurnIntent::default();
-
-    // requested_scenario: optional, must parse if present.
-    if let Some(req) = value.get("requested_scenario")
-        && !req.is_null()
-    {
-        let s = req
-            .as_str()
-            .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("requested_scenario not a string: {req}"),
-            })?;
-        let scenario = parse_scenario(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
-            raw: format!("unknown scenario: '{s}'"),
-        })?;
-        intent.requested_scenario = Some(scenario);
-    }
-
-    // prohibited_scenarios: optional array.
-    if let Some(prohibited) = value.get("prohibited_scenarios")
-        && !prohibited.is_null()
-    {
-        let arr = prohibited
-            .as_array()
-            .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("prohibited_scenarios not an array: {prohibited}"),
-            })?;
-        for entry in arr {
-            let s = entry
-                .as_str()
-                .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                    raw: format!("prohibited_scenarios entry not a string: {entry}"),
-                })?;
-            let scenario = parse_scenario(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("unknown prohibited scenario: '{s}'"),
-            })?;
-            if !intent.prohibited_scenarios.contains(&scenario) {
-                intent.prohibited_scenarios.push(scenario);
-            }
-        }
-    }
-
-    // continuation_mode: optional, defaults to Unknown when absent.
-    if let Some(mode) = value.get("continuation_mode")
-        && !mode.is_null()
-    {
-        let s = mode
-            .as_str()
-            .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("continuation_mode not a string: {mode}"),
-            })?;
-        intent.continuation_mode =
-            parse_continuation_mode(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("unknown continuation_mode: '{s}'"),
-            })?;
-    }
-
-    // reanchors_current_objective: optional, defaults to false. A missing
-    // value is fail-closed for the strong runtime reanchor behavior.
-    if let Some(reanchors) = value.get("reanchors_current_objective")
-        && !reanchors.is_null()
-    {
-        intent.reanchors_current_objective =
-            reanchors
-                .as_bool()
-                .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                    raw: format!("reanchors_current_objective not a boolean: {reanchors}"),
-                })?;
-    }
-
-    // workspace_mutation: optional, defaults to Unknown when absent. Unknown
-    // is fail-closed for strong runtime execution control.
-    if let Some(mutation) = value.get("workspace_mutation")
-        && !mutation.is_null()
-    {
-        let s = mutation
-            .as_str()
-            .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("workspace_mutation not a string: {mutation}"),
-            })?;
-        intent.workspace_mutation =
-            parse_workspace_mutation_intent(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
-                raw: format!("unknown workspace_mutation: '{s}'"),
-            })?;
-    }
-
-    // browser_verification_required: optional, defaults to false. Missing is
-    // fail-closed because a browser retry is a strong control-plane action.
-    if let Some(required) = value.get("browser_verification_required")
-        && !required.is_null()
-    {
-        intent.browser_verification_required =
-            required
-                .as_bool()
-                .ok_or_else(|| TurnIntentJudgeError::Malformed {
-                    raw: format!("browser_verification_required not a boolean: {required}"),
-                })?;
-    }
-
-    Ok(intent)
-}
-
-fn parse_scenario(s: &str) -> Option<Scenario> {
-    match s.trim().to_lowercase().as_str() {
-        "code_review" | "review" => Some(Scenario::CodeReview),
-        "debugging" | "debug" => Some(Scenario::Debugging),
-        "exploration" | "explore" => Some(Scenario::Exploration),
-        "planning" | "plan" => Some(Scenario::Planning),
-        "implementation" | "implement" | "impl" => Some(Scenario::Implementation),
-        "refactoring" | "refactor" => Some(Scenario::Refactoring),
-        "testing" | "test" => Some(Scenario::Testing),
-        "documentation" | "docs" | "doc" => Some(Scenario::Documentation),
-        "dev_ops" | "devops" => Some(Scenario::DevOps),
-        "learning" | "learn" => Some(Scenario::Learning),
-        "quick_answer" | "quickanswer" | "quick" => Some(Scenario::QuickAnswer),
-        "benchmark_comparison" | "benchmarkcomparison" | "benchmark" => {
-            Some(Scenario::BenchmarkComparison)
-        }
-        _ => None,
-    }
-}
-
-fn parse_continuation_mode(s: &str) -> Option<TurnContinuationMode> {
-    match s.trim().to_lowercase().as_str() {
-        "continue_current_objective" | "continue" => {
-            Some(TurnContinuationMode::ContinueCurrentObjective)
-        }
-        "new_objective" | "new" => Some(TurnContinuationMode::NewObjective),
-        "unknown" => Some(TurnContinuationMode::Unknown),
-        _ => None,
-    }
-}
-
-fn parse_workspace_mutation_intent(s: &str) -> Option<WorkspaceMutationIntent> {
-    match s.trim().to_lowercase().as_str() {
-        "unknown" => Some(WorkspaceMutationIntent::Unknown),
-        "read_only" | "readonly" | "read-only" => Some(WorkspaceMutationIntent::ReadOnly),
-        "may_mutate" | "may-mutate" | "optional" => Some(WorkspaceMutationIntent::MayMutate),
-        "must_mutate" | "must-mutate" | "mutating" | "required" => {
-            Some(WorkspaceMutationIntent::MustMutate)
-        }
-        _ => None,
-    }
+    serde_json::from_value(value).map_err(|error| TurnIntentJudgeError::Malformed {
+        raw: truncate(&format!("{error}: {raw}"), 256),
+    })
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -399,6 +260,8 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_config::user_profile::{Scenario, WorkspaceMutationIntent};
+    use astra_turn_types::{ObjectiveRelation, UserFeedback, UserFeedbackKind, UserFeedbackTarget};
 
     #[test]
     fn prompt_includes_message_and_turn() {
@@ -413,10 +276,11 @@ mod tests {
         assert!(prompt.contains("Turn: 3"));
         assert!(prompt.contains("Has prior assistant turn: yes"));
         assert!(prompt.contains("read_file, bash"));
-        assert!(prompt.contains("\"reanchors_current_objective\": <boolean>"));
+        assert!(prompt.contains("\"objective_relation\""));
+        assert!(prompt.contains("\"feedback\""));
         assert!(prompt.contains("\"workspace_mutation\""));
         assert!(prompt.contains("\"browser_verification_required\": <boolean>"));
-        assert!(prompt.contains("false for ordinary continuation"));
+        assert!(prompt.contains("without changing objective or requirements"));
         assert!(prompt.contains("当前的实现，能够想起来吗？"));
         assert!(prompt.contains("benchmark_comparison"));
     }
@@ -456,29 +320,33 @@ mod tests {
 
     #[test]
     fn parses_clean_json() {
-        let raw = r#"{"requested_scenario":"code_review","prohibited_scenarios":[],"continuation_mode":"unknown"}"#;
+        let raw = r#"{"requested_scenario":"code_review","prohibited_scenarios":[],"objective_relation":"replace"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::CodeReview));
         assert!(intent.prohibited_scenarios.is_empty());
-        assert_eq!(intent.continuation_mode, TurnContinuationMode::Unknown);
+        assert_eq!(intent.objective_relation, ObjectiveRelation::Replace);
     }
 
     #[test]
-    fn parses_continuation_with_prohibition() {
+    fn parses_refinement_with_prohibition_and_feedback() {
         let raw = r#"{
           "requested_scenario": "implementation",
           "prohibited_scenarios": ["code_review"],
-          "continuation_mode": "continue_current_objective",
-          "reanchors_current_objective": false
+          "objective_relation": "refine",
+          "feedback": {"kind": "requirement", "target": "approach"}
         }"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::Implementation));
         assert_eq!(intent.prohibited_scenarios, vec![Scenario::CodeReview]);
-        assert_eq!(
-            intent.continuation_mode,
-            TurnContinuationMode::ContinueCurrentObjective
-        );
+        assert_eq!(intent.objective_relation, ObjectiveRelation::Refine);
         assert!(!intent.reanchors_current_objective());
+        assert_eq!(
+            intent.feedback,
+            Some(UserFeedback {
+                kind: UserFeedbackKind::Requirement,
+                target: UserFeedbackTarget::Approach,
+            })
+        );
         assert_eq!(
             intent.workspace_mutation,
             WorkspaceMutationIntent::Unknown,
@@ -489,7 +357,7 @@ mod tests {
 
     #[test]
     fn parses_benchmark_comparison_scenario() {
-        let raw = r#"{"requested_scenario":"benchmark_comparison","prohibited_scenarios":[],"continuation_mode":"unknown"}"#;
+        let raw = r#"{"requested_scenario":"benchmark_comparison","prohibited_scenarios":[],"objective_relation":"replace"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(
             intent.requested_scenario,
@@ -498,50 +366,50 @@ mod tests {
     }
 
     #[test]
-    fn parses_structured_reanchor_separately_from_continuation() {
+    fn parses_structured_correction_as_one_relation() {
         let raw = r#"{
           "requested_scenario": "refactoring",
           "prohibited_scenarios": [],
-          "continuation_mode": "continue_current_objective",
-          "reanchors_current_objective": true
+          "objective_relation": "correct",
+          "feedback": {"kind": "correction", "target": "approach"}
         }"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
-        assert!(intent.continues_current_objective());
+        assert_eq!(intent.objective_relation, ObjectiveRelation::Correct);
         assert!(intent.reanchors_current_objective());
     }
 
     #[test]
     fn parses_null_requested_scenario_as_none() {
-        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"continuation_mode":"continue_current_objective"}"#;
+        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"continue"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, None);
     }
 
     #[test]
     fn parses_markdown_fenced_response() {
-        let raw = "```json\n{\"requested_scenario\":\"debugging\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\"}\n```";
+        let raw = "```json\n{\"requested_scenario\":\"debugging\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\"}\n```";
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::Debugging));
     }
 
     #[test]
     fn parses_response_with_surrounding_prose() {
-        let raw = "Here is the classification:\n{\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\"}\nLet me know if you need more.";
+        let raw = "Here is the classification:\n{\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\"}\nLet me know if you need more.";
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::QuickAnswer));
     }
 
     #[test]
     fn unknown_scenario_returns_malformed() {
-        let raw = r#"{"requested_scenario":"mystery","prohibited_scenarios":[],"continuation_mode":"unknown"}"#;
+        let raw = r#"{"requested_scenario":"mystery","prohibited_scenarios":[],"objective_relation":"unknown"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
-    fn unknown_continuation_mode_returns_malformed() {
-        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"continuation_mode":"sometimes"}"#;
+    fn unknown_objective_relation_returns_malformed() {
+        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"sometimes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
@@ -575,18 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_fields_default_to_empty_intent() {
-        // All fields are optional — an empty JSON object yields an empty TurnIntent.
-        let intent = parse_turn_intent_response("{}").unwrap();
-        assert!(intent.requested_scenario.is_none());
-        assert!(intent.prohibited_scenarios.is_empty());
-        assert_eq!(intent.continuation_mode, TurnContinuationMode::Unknown);
-        assert!(!intent.reanchors_current_objective());
+    fn missing_objective_relation_is_malformed() {
+        let err = parse_turn_intent_response("{}").unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
-    fn non_boolean_reanchor_returns_malformed() {
-        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"continuation_mode":"unknown","reanchors_current_objective":"true"}"#;
+    fn malformed_feedback_returns_malformed() {
+        let raw = r#"{"objective_relation":"correct","feedback":{"kind":"correction","target":"unknown_target"}}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
@@ -596,8 +460,7 @@ mod tests {
         let raw = r#"{
           "requested_scenario": "testing",
           "prohibited_scenarios": [],
-          "continuation_mode": "unknown",
-          "reanchors_current_objective": false,
+          "objective_relation": "replace",
           "workspace_mutation": "read_only",
           "browser_verification_required": true
         }"#;
@@ -609,46 +472,30 @@ mod tests {
 
     #[test]
     fn unknown_workspace_mutation_returns_malformed() {
-        let raw = r#"{"workspace_mutation":"sometimes"}"#;
+        let raw = r#"{"objective_relation":"unknown","workspace_mutation":"sometimes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
     fn non_boolean_browser_requirement_returns_malformed() {
-        let raw = r#"{"browser_verification_required":"yes"}"#;
+        let raw = r#"{"objective_relation":"unknown","browser_verification_required":"yes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
-    fn scenario_aliases_are_accepted() {
-        // The judge prompt names canonical forms but real LLMs paraphrase.
-        // Accept common synonyms to reduce parser failures.
-        let cases = [
-            ("review", Scenario::CodeReview),
-            ("debug", Scenario::Debugging),
-            ("explore", Scenario::Exploration),
-            ("plan", Scenario::Planning),
-            ("implement", Scenario::Implementation),
-            ("refactor", Scenario::Refactoring),
-            ("test", Scenario::Testing),
-            ("docs", Scenario::Documentation),
-            ("devops", Scenario::DevOps),
-            ("learn", Scenario::Learning),
-            ("quick", Scenario::QuickAnswer),
-            ("benchmark", Scenario::BenchmarkComparison),
-        ];
-        for (alias, expected) in cases {
+    fn schema_rejects_scenario_aliases() {
+        for alias in ["review", "debug", "impl", "quick"] {
             let raw = format!(
-                r#"{{"requested_scenario":"{alias}","prohibited_scenarios":[],"continuation_mode":"unknown"}}"#
+                r#"{{"requested_scenario":"{alias}","prohibited_scenarios":[],"objective_relation":"unknown"}}"#
             );
-            let intent = parse_turn_intent_response(&raw)
-                .unwrap_or_else(|e| panic!("alias {alias} failed: {e:?}"));
-            assert_eq!(
-                intent.requested_scenario,
-                Some(expected),
-                "alias '{alias}' must map to {expected:?}"
+            assert!(
+                matches!(
+                    parse_turn_intent_response(&raw),
+                    Err(TurnIntentJudgeError::Malformed { .. })
+                ),
+                "non-schema alias {alias:?} must not be normalized"
             );
         }
     }

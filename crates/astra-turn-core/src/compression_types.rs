@@ -265,13 +265,13 @@ impl From<Message> for Value {
         if m.is_synthetic {
             map.insert("_synthetic".to_string(), Value::Bool(true));
         }
-        // Internal telemetry/metadata fields use a `_` prefix and must NOT
-        // cross the provider wire — they're not part of the model-visible
-        // message and would destabilize prompt-cache prefixes (dynamic
-        // counters like `_messages_removed` change across re-compactions,
-        // busting the cache at the boundary even when `content` is stable).
+        // Dynamic compression telemetry must not survive the canonical
+        // conversion because it would destabilize prompt-cache prefixes.
+        // Stable user-turn semantics are different: they are durable
+        // conversation metadata and are stripped only at the provider wire
+        // boundary.
         for (k, v) in m.extra {
-            if !k.starts_with('_') {
+            if !k.starts_with('_') || k == astra_turn_types::USER_TURN_SEMANTICS_FIELD {
                 map.insert(k, v);
             }
         }
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_serialization_strips_underscore_prefixed_extras() {
+    fn canonical_conversion_preserves_stable_semantics_but_strips_dynamic_extras() {
         // Dynamic telemetry counters (`_messages_removed`, `_turns_removed`,
         // `_reactive`, `_compact_boundary`) live in `extra` but must NOT
         // cross the provider wire: they change across re-compactions and
@@ -623,6 +623,11 @@ mod tests {
             "_reactive": false,
             "_messages_removed": 5,
             "_turns_removed": 2,
+            astra_turn_types::USER_TURN_SEMANTICS_FIELD: {
+                "schema_version": 1,
+                "session_turn": 3,
+                "objective_relation": "refine"
+            },
             "custom_provider_field": {"ok": true}
         });
         let msg = Message::from(v);
@@ -642,6 +647,11 @@ mod tests {
         assert!(
             back.get("_turns_removed").is_none(),
             "_turns_removed must not cross provider wire"
+        );
+        assert!(
+            back.get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+                .is_some(),
+            "stable turn semantics must survive canonical compaction"
         );
         // Non-`_`-prefixed extras still pass through.
         assert_eq!(back["custom_provider_field"], json!({"ok": true}));

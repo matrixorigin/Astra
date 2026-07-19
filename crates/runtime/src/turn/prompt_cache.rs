@@ -66,13 +66,6 @@
 //! without markers, so schema churn invalidates only the tail while the always-load
 //! prefix remains cacheable.
 //!
-//! ## Cache Key Design
-//!
-//! [`section_cache_key`] (test-only) produces a hash from `(tool_names, task_type)`.
-//! It deliberately excludes prompt text, so wording tweaks and
-//! formatting changes do not cause cache misses — only semantically meaningful input
-//! changes affect the key.
-//!
 //! ## Provider Strategy Resolution
 //!
 //! [`provider_cache_policy_for`] determines the caching strategy from three sources in
@@ -199,8 +192,8 @@ impl Default for PromptCacheConfig {
 }
 
 // ── Section Cache ────────────────────────────────────────────────────────────
-// Two-level cache for static/dynamic prompt boundary:
-// - Global+Session sections are cached by (tool_names, task_type) — stable within a session
+// Static/dynamic prompt boundary:
+// - Global+Session sections form the stable provider-cache prefix.
 // - Per-turn volatile content (environment_volatile, memoria recall, …) is
 //   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
 //   without invalidating the cached prefix.
@@ -654,22 +647,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     }
 }
 
-/// Test-only: hash a tuple of inputs for cache-key regression tests.
-/// Previously this delegated to `section_cache_key_with_customization` which
-/// folded in prompt-override + output-style fingerprints. Those inputs
-/// belong to the pipeline path now, so the key function is a pure hash
-/// over (tool_names, task_type) — adequate for proving
-/// that cache-key collisions don't hide behind the same hash.
-#[cfg(test)]
-pub(crate) fn section_cache_key(tool_names: &[&str], task_type: Option<&str>) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    tool_names.hash(&mut hasher);
-    task_type.hash(&mut hasher);
-    hasher.finish()
-}
-
 // ── Tool schema annotations ──────────────────────────────────────────────────
 
 /// Add `cache_control` to a tool schema for Anthropic caching.
@@ -862,22 +839,6 @@ mod tests {
             cache_cfg,
             &default_test_always_load_tool_names(),
         );
-    }
-
-    #[test]
-    fn section_cache_key_varies_by_tools_and_task() {
-        let key1 = section_cache_key(&["bash"], Some("implementation"));
-        let key2 = section_cache_key(&["bash", "read_file"], Some("implementation"));
-        let key3 = section_cache_key(&["bash"], Some("debugging"));
-        assert_ne!(key1, key2, "different tools should differ");
-        assert_ne!(key1, key3, "different task types should differ");
-    }
-
-    #[test]
-    fn section_cache_key_differs_for_different_tools() {
-        let k1 = section_cache_key(&["read_file"], None);
-        let k2 = section_cache_key(&["bash"], None);
-        assert_ne!(k1, k2);
     }
 
     #[test]

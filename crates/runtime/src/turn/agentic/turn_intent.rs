@@ -38,8 +38,8 @@ pub(crate) async fn judge_turn_intent_with_llm(
                 turn_count,
                 has_prior_assistant_turn,
                 requested = ?intent.requested_scenario,
-                continuation = ?intent.continuation_mode,
-                reanchors = intent.reanchors_current_objective,
+                objective_relation = ?intent.objective_relation,
+                feedback = ?intent.feedback,
                 workspace_mutation = ?intent.workspace_mutation,
                 browser_verification_required = intent.browser_verification_required,
                 "turn intent judged"
@@ -99,8 +99,9 @@ pub(crate) async fn judge_turn_intent_with_llm(
 #[cfg(test)]
 mod tests {
     use super::judge_turn_intent_with_llm;
-    use astra_config::user_profile::{TurnContinuationMode, TurnIntent};
+    use astra_config::user_profile::TurnIntent;
     use astra_services::{TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError};
+    use astra_turn_types::ObjectiveRelation;
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -138,8 +139,7 @@ mod tests {
     #[tokio::test]
     async fn judge_success_returns_structured_intent() {
         let message = "可以了，按你刚才说的方向继续往下走";
-        let llm_intent = TurnIntent::default()
-            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+        let llm_intent = TurnIntent::default().with_objective_relation(ObjectiveRelation::Continue);
         let judge = FixedJudge::ok(llm_intent.clone());
 
         let out =

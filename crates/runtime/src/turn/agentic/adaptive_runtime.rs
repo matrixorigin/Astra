@@ -73,19 +73,6 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     (tool_calls, unique_tools.len() as u32)
 }
 
-/// Decide whether typed turn intent supports an implicit acceptance signal.
-/// Natural-language content is not classified at this boundary.
-#[must_use]
-pub(crate) fn should_emit_acceptance(
-    message: &str,
-    intent: Option<&astra_config::user_profile::TurnIntent>,
-) -> bool {
-    !message.trim().is_empty()
-        && intent.is_some_and(|intent| {
-            intent.continues_current_objective() && !intent.reanchors_current_objective()
-        })
-}
-
 /// Record feedback signals based on the loop's outcome and accumulated state.
 ///
 /// Called once after the loop finishes (or errors) to feed observation and
@@ -282,24 +269,7 @@ pub(crate) fn record_loop_completion_feedback(
         }
     }
 
-    // ── 7. Acceptance signal ──
-    // If there is a prior assistant message and the current user message shows no correction
-    // intent, emit Acceptance — the user implicitly accepted the previous output.
-    {
-        let has_prior_assistant = state
-            .messages
-            .iter()
-            .rev()
-            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-        if has_prior_assistant && should_emit_acceptance(&state.message, state.turn_intent.as_ref())
-        {
-            hub.record_feedback(enrich_signal(
-                FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
-            ));
-        }
-    }
-
-    // ── 8. Tool health signals ──
+    // ── 7. Tool health signals ──
     // Emit signals for retry-cautioned tools so observation/SelfModel can react.
     {
         let retry_cautioned = state.turn_guard.health.health_avoidance_tools();
@@ -327,7 +297,7 @@ pub(crate) fn record_loop_completion_feedback(
 
 #[cfg(test)]
 mod tests {
-    use super::{per_turn_skill_quality_entries, should_emit_acceptance};
+    use super::per_turn_skill_quality_entries;
     use crate::skills::quality::{SkillOutcome, SkillQualityTracker};
 
     fn record(tracker: &mut SkillQualityTracker, name: &str, succeeded: bool) {
@@ -372,21 +342,5 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.invocations, 1);
         assert_eq!(entries[0].1.failures, 1);
-    }
-
-    #[test]
-    fn acceptance_uses_structured_continuation_evidence() {
-        let continued = astra_config::user_profile::TurnIntent::default().with_continuation_mode(
-            astra_config::user_profile::TurnContinuationMode::ContinueCurrentObjective,
-        );
-        let reanchored = continued.clone().with_reanchors_current_objective(true);
-
-        assert!(should_emit_acceptance("arbitrary input", Some(&continued)));
-        assert!(!should_emit_acceptance(
-            "arbitrary input",
-            Some(&reanchored)
-        ));
-        assert!(!should_emit_acceptance("arbitrary input", None));
-        assert!(!should_emit_acceptance("", Some(&continued)));
     }
 }

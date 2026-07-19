@@ -2815,7 +2815,11 @@ mod tests {
                 usage: astra_turn_types::ContextWindowUsage::provider_reported(25_000, 100_000),
                 scope: RequestContextScope::LastCompletedRequest,
             }),
-            continuation_anchor: Some("refactoring auth".into()),
+            continuation_anchor: Some(
+                crate::cli::session::session_state::ContinuationAnchor::rendered_for_test(
+                    "refactoring auth",
+                ),
+            ),
             queued_message: None,
             diagnostics_context: None,
             read_activity: Default::default(),

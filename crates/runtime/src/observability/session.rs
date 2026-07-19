@@ -380,11 +380,13 @@ impl ObservabilitySession {
     /// Called for hard corrections such as "no, that's wrong". Reanchors and
     /// additional constraints are tracked as feedback, but they must not
     /// inflate session correction pressure.
-    pub fn record_user_correction(&mut self) {
+    pub fn record_user_correction(&mut self) -> bool {
         let turn = self.turn_number;
-        if !self.user_corrections.contains(&turn) {
-            self.user_corrections.push(turn);
+        if self.user_corrections.contains(&turn) {
+            return false;
         }
+        self.user_corrections.push(turn);
+        true
     }
 
     /// Gap 5: push a compact excerpt of the most recent user-correction

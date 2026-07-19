@@ -433,9 +433,18 @@ mod tests {
             turn: 1,
             ..Default::default()
         };
+        let mut objective = serde_json::json!({"role": "user", "content": "old review"});
+        astra_turn_types::mark_user_turn_semantics(
+            &mut objective,
+            astra_turn_types::UserTurnSemantics::new(
+                1,
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
         let final_messages = vec![
-            serde_json::json!({"role": "user", "content": "old review"}),
-            serde_json::json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            objective,
+            serde_json::json!({"role": "system", "content": "arbitrary compaction boundary", "_compact_boundary": true}),
             serde_json::json!({"role": "user", "content": "不要review啊！"}),
             serde_json::json!({"role": "assistant", "reasoning_content": "trace"}),
             serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
@@ -459,6 +468,12 @@ mod tests {
         let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 6);
         assert_eq!(mat.messages[0]["content"], "old review");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&mat.messages[0])
+                .map(|semantics| semantics.objective_relation),
+            Some(astra_turn_types::ObjectiveRelation::Replace)
+        );
+        assert_eq!(mat.messages[1]["_compact_boundary"], true);
         assert_eq!(mat.messages[2]["content"], "不要review啊！");
         assert_eq!(mat.messages[3]["reasoning_content"], "trace");
         assert_eq!(mat.messages[4]["role"], "tool");

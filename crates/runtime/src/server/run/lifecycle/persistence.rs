@@ -3099,12 +3099,25 @@ mod tests {
     #[test]
     fn messages_for_csl_persist_keeps_raw_canonical_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut objective = json!({"role": "user", "content": "old review"});
+        astra_turn_types::mark_user_turn_semantics(
+            &mut objective,
+            astra_turn_types::UserTurnSemantics::new(
+                1,
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
         state.messages = vec![
-            json!({"role": "user", "content": "old review"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            objective,
+            json!({"role": "system", "content": "arbitrary compaction boundary", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "trace"}),
-            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: stale"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary runtime projection",
+                astra_turn_types::RuntimeMessageDelivery::Projection,
+            ),
             json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
         ];
         state.final_text = "ok".to_string();
@@ -3113,12 +3126,15 @@ mod tests {
 
         assert_eq!(messages.len(), 7);
         assert_eq!(messages[0]["content"], "old review");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&messages[0])
+                .map(|semantics| semantics.objective_relation),
+            Some(astra_turn_types::ObjectiveRelation::Replace)
+        );
+        assert_eq!(messages[1]["_compact_boundary"], true);
         assert_eq!(messages[2]["content"], "不要review啊！");
         assert_eq!(messages[3]["reasoning_content"], "trace");
-        assert_eq!(
-            messages[4]["content"],
-            "[Session runtime recap]\nRecent tools: stale"
-        );
+        assert!(astra_turn_types::is_runtime_owned_message(&messages[4]));
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[6]["content"], "ok");
     }

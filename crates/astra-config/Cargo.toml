@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 astra-core.workspace = true
+astra-turn-types.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 dirs = "6.0.0"
 fs2 = "0.4.3"

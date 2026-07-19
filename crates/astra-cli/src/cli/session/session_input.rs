@@ -205,8 +205,7 @@ mod tests {
         PreparedInput, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
         prepare_input,
     };
-    use crate::cli::session::session_state::SessionState;
-    use crate::cli::session::session_state::SkillDevState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState, SkillDevState};
     use astra_runtime::prompts;
     use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskMutation, TaskStore};
 
@@ -242,11 +241,10 @@ mod tests {
     #[test]
     fn build_effective_line_does_not_phrase_match_short_continue() {
         let state = SessionState {
-            continuation_anchor: Some(
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
                 "Latest user input: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
-                    .to_string()
-                    .into(),
-            ),
+                    .to_string(),
+            )),
             ..SessionState::default()
         };
 
@@ -258,10 +256,9 @@ mod tests {
     #[test]
     fn build_effective_line_does_not_reanchor_repair_followup_by_phrase() {
         let state = SessionState {
-            continuation_anchor: Some(
-                "Latest user input: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
-                    .into(),
-            ),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
+                "Latest user input: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges",
+            )),
             ..SessionState::default()
         };
 
@@ -273,9 +270,9 @@ mod tests {
     #[test]
     fn build_effective_line_does_not_reanchor_generic_followup_to_task_board() {
         let state = SessionState {
-            continuation_anchor: Some(
-                "Latest user input: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD".into(),
-            ),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
+                "Latest user input: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD",
+            )),
             ..SessionState::default()
         };
 
@@ -291,7 +288,9 @@ mod tests {
     #[test]
     fn build_effective_line_leaves_normal_prompt_untouched() {
         let state = SessionState {
-            continuation_anchor: Some("Latest user input: debug Chinese input drops".into()),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
+                "Latest user input: debug Chinese input drops",
+            )),
             ..SessionState::default()
         };
 
@@ -479,7 +478,9 @@ mod tests {
                 dir: skill_dir,
             }),
             active_system_skills: vec![prompts::builtin_concise_skill()],
-            continuation_anchor: Some("Previous task: fix auth".into()),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
+                "Previous task: fix auth",
+            )),
             ..SessionState::default()
         };
 

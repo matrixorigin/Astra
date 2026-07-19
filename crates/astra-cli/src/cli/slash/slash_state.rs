@@ -1626,7 +1626,7 @@ mod state_command_tests {
         HistoryEditSnapshot, StateCommandContext, handle_history_edit_persist_failure,
         handle_state_command, handle_undo_persist_failure,
     };
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use crate::lock_recovery::LockRecovery;
     use astra_services::session_journal::{self, JournalEventType};
     use wiremock::matchers::{header_exists, method, path, query_param};
@@ -1697,7 +1697,7 @@ mod state_command_tests {
         state.recent_tools = vec!["bash".into()];
         state.redo_stack = vec![("q".into(), "a".into(), 1)];
         state.last_response = Some("a".into());
-        state.continuation_anchor = Some("anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
         state.diagnostics_context = Some("diag".into());
         state.queued_message = Some("queued".into());
         state.resume_guidance = Some("resume".into());
@@ -2186,7 +2186,7 @@ mod tests {
     use super::{
         parse_reflect_args, parse_reflection_report, reflection_report_lines, render_reflect_diff,
     };
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 
     #[test]
     fn parse_reflect_args_recognises_diff_branch() {
@@ -2526,7 +2526,7 @@ mod tests {
     #[test]
     fn undo_clears_continuation_anchor() {
         let mut state = state_with_turns(3);
-        state.continuation_anchor = Some("some anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("some anchor"));
         // Simulate undo
         state.history.pop();
         state.turn = state.turn.saturating_sub(1);

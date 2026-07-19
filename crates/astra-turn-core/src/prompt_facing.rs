@@ -39,6 +39,20 @@ pub fn extract_text_content(msg: &Value) -> Option<String> {
 }
 
 pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
+    sanitize_prompt_facing_messages_impl(messages, false)
+}
+
+/// Resume-only prompt projection that retains validated user-turn semantics.
+/// Provider/session-memory projections use [`sanitize_prompt_facing_messages`]
+/// and therefore never receive this internal metadata.
+pub fn sanitize_prompt_facing_messages_with_turn_semantics(messages: Vec<Value>) -> Vec<Value> {
+    sanitize_prompt_facing_messages_impl(messages, true)
+}
+
+fn sanitize_prompt_facing_messages_impl(
+    messages: Vec<Value>,
+    preserve_turn_semantics: bool,
+) -> Vec<Value> {
     let mut out = Vec::new();
     let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
     let mut has_user_context = false;
@@ -76,10 +90,17 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
         if role == "assistant" && !has_user_context {
             continue;
         }
-        out.push(json!({
+        let mut projected = json!({
             "role": role,
             "content": content,
-        }));
+        });
+        if preserve_turn_semantics
+            && role == "user"
+            && let Some(semantics) = astra_turn_types::user_turn_semantics(&msg)
+        {
+            astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+        }
+        out.push(projected);
         if role == "user" {
             has_user_context = true;
         }

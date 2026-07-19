@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_no_tools_warns_no_tools() {
-        let p = build_main_system_prompt(&[], "", None);
+        let p = build_main_system_prompt(&[], "");
         assert!(p.contains(SYSTEM_PROMPT_BASE), "should include base");
         assert!(
             p.contains("NO tools available"),
@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_core_rules_and_protocol() {
-        let p = build_main_system_prompt(&["read_file", "write_file"], "", None);
+        let p = build_main_system_prompt(&["read_file", "write_file"], "");
         assert!(p.contains("Core Rules"), "should include rules");
         assert!(
             p.contains("NEVER fabricate"),
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn build_main_system_prompt_includes_profile() {
-        let p = build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust", None);
+        let p = build_main_system_prompt(&["tool_a"], "\n\n## User Memories\nprefers Rust");
         assert!(p.contains("prefers Rust"), "profile should be appended");
     }
 
@@ -85,7 +85,7 @@ mod tests {
     /// This enforces: "prompt mentions tool X ⟹ tool X is available".
     #[test]
     fn no_memory_tools_omits_memory_section() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
+        let p = build_main_system_prompt(&["bash", "read_file"], "");
         assert!(
             !p.contains("`memory(action="),
             "should NOT mention the memory tool when no memory tools selected"
@@ -102,7 +102,7 @@ mod tests {
     /// When no GitHub tools are selected, GitHub-specific rules must be omitted.
     #[test]
     fn no_github_tools_omits_github_rules() {
-        let p = build_main_system_prompt(&["bash", "memory"], "", None);
+        let p = build_main_system_prompt(&["bash", "memory"], "");
         assert!(
             !p.contains("github(action="),
             "should NOT mention the github tool when no GitHub tools selected"
@@ -112,7 +112,7 @@ mod tests {
     /// History awareness rule prevents re-reading data already in context.
     #[test]
     fn prompt_includes_history_awareness() {
-        let p = build_main_system_prompt(&["read_file"], "", None);
+        let p = build_main_system_prompt(&["read_file"], "");
         assert!(
             p.contains("check history") || p.contains("Reuse history"),
             "should instruct checking history before calling tools"
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn no_git_tools_omits_git_guidance() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
+        let p = build_main_system_prompt(&["bash", "read_file"], "");
         assert!(
             !p.contains("COMPOUND git operations"),
             "should NOT include git guidance when no git tools selected"
@@ -131,8 +131,7 @@ mod tests {
     /// Compressed prompt is shorter than the old version.
     #[test]
     fn compressed_prompt_under_token_budget() {
-        let p =
-            build_main_system_prompt(&["read_file", "bash", "memory", "github", "git"], "", None);
+        let p = build_main_system_prompt(&["read_file", "bash", "memory", "github", "git"], "");
         assert!(
             p.len() < 13000,
             "compressed prompt should be under 13000 chars, got {}",
@@ -143,7 +142,7 @@ mod tests {
     /// Discovery Before Access guidance prevents LLMs from guessing file paths.
     #[test]
     fn prompt_includes_discovery_before_access() {
-        let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", None);
+        let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "");
         assert!(
             p.contains("Discover before reading"),
             "should include discovery-first discipline guidance"
@@ -215,63 +214,9 @@ mod tests {
         assert_eq!(b.model_limit, 200_000);
     }
 
-    // ── Task-type specific prompt content tests ──
-
-    #[test]
-    fn prompt_includes_code_review_strategy_when_task_type_set() {
-        let p = build_main_system_prompt(&["bash", "git"], "", Some("code_review"));
-        assert!(
-            p.contains("Code Review Strategy"),
-            "code_review task_type should inject review strategy"
-        );
-        assert!(
-            p.contains("Evidence BEFORE conclusions"),
-            "review strategy should emphasize evidence-first approach"
-        );
-    }
-
-    #[test]
-    fn prompt_includes_debugging_strategy_when_task_type_set() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", Some("debugging"));
-        assert!(
-            p.contains("Debugging Strategy"),
-            "debugging task_type should inject debugging strategy"
-        );
-        assert!(
-            p.contains("hypothesis"),
-            "debugging strategy should mention hypothesis"
-        );
-    }
-
-    #[test]
-    fn prompt_omits_task_strategy_for_general() {
-        let p = build_main_system_prompt(&["bash", "read_file"], "", None);
-        assert!(
-            !p.contains("Code Review Strategy"),
-            "general should not have review strategy"
-        );
-        assert!(
-            !p.contains("Debugging Strategy"),
-            "general should not have debugging strategy"
-        );
-    }
-
-    #[test]
-    fn prompt_omits_task_strategy_for_unknown_type() {
-        let p = build_main_system_prompt(&["bash"], "", Some("planning"));
-        assert!(
-            !p.contains("Code Review Strategy"),
-            "planning should not have review strategy"
-        );
-        assert!(
-            !p.contains("Debugging Strategy"),
-            "planning should not have debugging strategy"
-        );
-    }
-
     #[test]
     fn prompt_omits_editing_guidance_without_multi_edit() {
-        let p = build_main_system_prompt(&["str_replace", "read_file"], "", None);
+        let p = build_main_system_prompt(&["str_replace", "read_file"], "");
         assert!(
             !p.contains("## Editing Strategy"),
             "should not include editing section without multi_edit"
@@ -280,7 +225,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_plan_execution_guidance() {
-        let p = build_main_system_prompt(&["read_file", "bash"], "", None);
+        let p = build_main_system_prompt(&["read_file", "bash"], "");
         assert!(
             p.contains("## Plan Execution"),
             "should include plan execution section"

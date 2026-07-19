@@ -84,9 +84,10 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn apply_judged_turn_intent_to_observability_session(
+fn apply_judged_turn_intent_to_observability(
     state: &AgenticLoopState,
     intent: &TurnIntent,
+    record_feedback: bool,
 ) {
     if let Some(session) = &state.telemetry.observability_session {
         let mut session = astra_core::sync_poison::recover_rwlock_write(session);
@@ -102,15 +103,156 @@ fn apply_judged_turn_intent_to_observability_session(
             session.profile.current_scenario = None;
             session.profile.touch();
         }
+        let is_correction = intent.objective_relation
+            == astra_turn_types::ObjectiveRelation::Correct
+            || intent.feedback.is_some_and(|feedback| {
+                feedback.kind == astra_turn_types::UserFeedbackKind::Correction
+            });
+        if record_feedback && is_correction && session.record_user_correction() {
+            let correction = if state.user_intent.trim().is_empty() {
+                state.message.as_str()
+            } else {
+                state.user_intent.as_str()
+            };
+            session.record_correction_excerpt(correction);
+        }
     }
 
-    if intent.reanchors_current_objective()
-        && let Some(hub) = &state.telemetry.observability_hub
-    {
-        hub.record_feedback(astra_core::feedback::FeedbackSignal::new(
-            astra_core::feedback::SignalType::Reanchor,
-        ));
+    let Some(hub) = &state.telemetry.observability_hub else {
+        return;
+    };
+    if !record_feedback {
+        return;
     }
+    let signal_type = match intent.feedback.map(|feedback| feedback.kind) {
+        Some(astra_turn_types::UserFeedbackKind::Approval) => {
+            astra_core::feedback::SignalType::Acceptance
+        }
+        Some(astra_turn_types::UserFeedbackKind::Correction) => {
+            astra_core::feedback::SignalType::Correction
+        }
+        Some(
+            astra_turn_types::UserFeedbackKind::Clarification
+            | astra_turn_types::UserFeedbackKind::Requirement
+            | astra_turn_types::UserFeedbackKind::Preference,
+        ) => astra_core::feedback::SignalType::Reanchor,
+        None => match intent.objective_relation {
+            astra_turn_types::ObjectiveRelation::Acknowledge => {
+                astra_core::feedback::SignalType::Acceptance
+            }
+            astra_turn_types::ObjectiveRelation::Correct => {
+                astra_core::feedback::SignalType::Correction
+            }
+            astra_turn_types::ObjectiveRelation::Unknown
+            | astra_turn_types::ObjectiveRelation::Continue
+            | astra_turn_types::ObjectiveRelation::Refine
+            | astra_turn_types::ObjectiveRelation::Replace => return,
+        },
+    };
+
+    let mut signal = astra_core::feedback::FeedbackSignal::new(signal_type).with_context(
+        "objective_relation",
+        serde_json::json!(intent.objective_relation.as_str()),
+    );
+    if let Some(feedback) = intent.feedback {
+        signal = signal
+            .with_context("feedback_kind", serde_json::json!(feedback.kind.as_str()))
+            .with_context(
+                "feedback_target",
+                serde_json::json!(feedback.target.as_str()),
+            );
+    }
+    if let Some(run_id) = state.current_run_id.as_deref() {
+        signal = signal.with_turn(run_id);
+    }
+    if let Some(session_id) = state.current_session_id.as_deref() {
+        signal = signal.with_context("session_id", serde_json::json!(session_id));
+    }
+    hub.record_feedback(signal);
+}
+
+fn record_current_user_turn_semantics(
+    state: &mut AgenticLoopState,
+    intent: Option<&TurnIntent>,
+) -> bool {
+    // A single submitted user turn owns one marker. The agentic loop may call
+    // this preparation phase more than once, and additional user guidance may
+    // arrive between rounds. Resolve the canonical owner from the submitted
+    // input rather than the mutable agent-loop counter or the latest user
+    // message, either of which can advance inside the same user turn.
+    let submitted_inputs = [state.user_intent.trim(), state.message.trim()];
+    let matching_owner = state
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if message.get("role").and_then(Value::as_str) != Some("user")
+                || astra_turn_types::is_runtime_owned_message(message)
+            {
+                return None;
+            }
+            let content = astra_turn_core::prompt_facing::extract_text_content(message)?;
+            submitted_inputs
+                .iter()
+                .any(|submitted| !submitted.is_empty() && content.trim() == *submitted)
+                .then_some(index)
+        });
+    let index = matching_owner.or_else(|| {
+        state.messages.iter().rposition(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && !astra_turn_types::is_runtime_owned_message(message)
+        })
+    });
+    let Some(index) = index else {
+        tracing::warn!(
+            "turn intent was judged without a canonical user message to own its semantics"
+        );
+        return false;
+    };
+
+    let session_turn = if state.session_turn > 0 {
+        state.session_turn
+    } else {
+        state.messages[..=index]
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(Value::as_str) == Some("user")
+                    && !astra_turn_types::is_runtime_owned_message(message)
+            })
+            .count()
+            .min(u32::MAX as usize) as u32
+    }
+    .max(1);
+    let semantics = astra_turn_types::UserTurnSemantics::new(
+        session_turn,
+        intent
+            .map(|intent| intent.objective_relation)
+            .unwrap_or_default(),
+        intent.and_then(|intent| intent.feedback),
+    );
+
+    if let Some(current) = astra_turn_types::user_turn_semantics(&state.messages[index]) {
+        let advances_unknown = current.objective_relation
+            == astra_turn_types::ObjectiveRelation::Unknown
+            && current.feedback.is_none()
+            && intent.is_some_and(|intent| {
+                intent.objective_relation != astra_turn_types::ObjectiveRelation::Unknown
+                    || intent.feedback.is_some()
+            });
+        if !advances_unknown {
+            return false;
+        }
+    }
+    let message = &mut state.messages[index];
+    let recorded = astra_turn_types::mark_user_turn_semantics(message, semantics);
+    if !recorded {
+        tracing::warn!(
+            session_turn,
+            "canonical turn-semantics owner was not a user message"
+        );
+    }
+    recorded
 }
 
 fn allowed_requested_scenario(intent: &TurnIntent) -> Option<Scenario> {
@@ -1451,9 +1593,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
     match host.judge_turn_intent(state).await {
         TurnIntentJudgeOutcome::Intent(intent) => {
-            apply_judged_turn_intent_to_observability_session(state, &intent);
+            let record_feedback = record_current_user_turn_semantics(state, Some(&intent));
+            apply_judged_turn_intent_to_observability(state, &intent, record_feedback);
             apply_judged_turn_intent_to_runtime_profile(state, &intent);
-            if intent.reanchors_current_objective() {
+            if record_feedback && intent.reanchors_current_objective() {
                 apply_structured_user_reanchor(state);
             }
         }
@@ -1461,9 +1604,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             // The baseline profile is constructed once from deterministic
             // request heuristics. Do not retain or synthesize an LLM intent.
             state.turn_intent = None;
+            let _ = record_current_user_turn_semantics(state, None);
         }
         TurnIntentJudgeOutcome::Unavailable => {
             tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
+            let _ = record_current_user_turn_semantics(state, None);
         }
     }
     queue_task_board_advisory(host, state).await;
@@ -2716,7 +2861,6 @@ mod tests {
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
             .expect("turn should prepare");
-
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert_eq!(
             state.remaining_turns, 9,
@@ -2826,6 +2970,7 @@ mod tests {
     async fn prepare_turn_iteration_applies_host_judged_turn_intent() {
         let intent = TurnIntent::default()
             .with_requested_scenario(Scenario::CodeReview)
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace)
             .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
         let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let hub = make_hub();
@@ -2847,11 +2992,70 @@ mod tests {
         assert!(!state.task_profile.mutates_workspace);
         assert!(state.task_profile.exploratory_task);
         assert_eq!(
+            astra_turn_types::user_turn_semantics(&state.messages[0])
+                .map(|semantics| semantics.objective_relation),
+            Some(astra_turn_types::ObjectiveRelation::Replace)
+        );
+        assert_eq!(
             state
                 .turn_intent
                 .as_ref()
                 .map(|intent| intent.workspace_mutation),
             Some(WorkspaceMutationIntent::ReadOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_prepare_keeps_semantics_on_the_submitted_turn_owner() {
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Refine);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let mut state = make_state();
+        state.session_turn = 4;
+        state.message = "also verify the database path".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("first round should prepare");
+        state.messages.push(json!({
+            "role": "user",
+            "content": "guidance accepted while the run is active"
+        }));
+        prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .expect("second round should prepare");
+
+        assert!(astra_turn_types::user_turn_semantics(&state.messages[0]).is_some());
+        assert!(astra_turn_types::user_turn_semantics(state.messages.last().unwrap()).is_none());
+    }
+
+    #[test]
+    fn turn_semantics_only_advance_from_unknown_once() {
+        let mut state = make_state();
+        state.session_turn = 3;
+        state.messages = vec![json!({"role": "user", "content": "repair it"})];
+
+        assert!(record_current_user_turn_semantics(&mut state, None));
+        assert!(record_current_user_turn_semantics(
+            &mut state,
+            Some(
+                &TurnIntent::default()
+                    .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
+            )
+        ));
+        assert!(!record_current_user_turn_semantics(
+            &mut state,
+            Some(
+                &TurnIntent::default()
+                    .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace)
+            )
+        ));
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&state.messages[0])
+                .map(|semantics| semantics.objective_relation),
+            Some(astra_turn_types::ObjectiveRelation::Correct)
         );
     }
 
@@ -3795,7 +3999,12 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_turn_applies_structured_reanchor_from_judge() {
-        let intent = TurnIntent::default().with_reanchors_current_objective(true);
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
+            .with_feedback(astra_turn_types::UserFeedback {
+                kind: astra_turn_types::UserFeedbackKind::Correction,
+                target: astra_turn_types::UserFeedbackTarget::Approach,
+            });
         let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
         let hub = make_hub();
@@ -3821,17 +4030,49 @@ mod tests {
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
             .expect("turn should prepare");
+        let repeated = prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .expect("same corrected user turn should remain preparable");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(matches!(repeated, PreparedTurnIteration::Ready(_)));
         assert_eq!(state.turn_guard.nudge_count, 0);
         assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
         assert!(state.boosted_tools.is_empty());
         assert!(state.widen_selection_pending);
-        assert!(
-            hub.recent_feedback_signals()
+        let signals = hub.recent_feedback_signals();
+        let correction = signals
+            .iter()
+            .find(|signal| signal.signal_type == astra_core::feedback::SignalType::Correction)
+            .expect("typed correction feedback");
+        assert_eq!(
+            signals
                 .iter()
-                .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Reanchor })
+                .filter(|signal| {
+                    signal.signal_type == astra_core::feedback::SignalType::Correction
+                })
+                .count(),
+            1,
+            "one user turn must emit one correction signal"
         );
+        assert_eq!(correction.context["objective_relation"], "correct");
+        assert_eq!(correction.context["feedback_kind"], "correction");
+        assert_eq!(correction.context["feedback_target"], "approach");
+        let session = state
+            .telemetry
+            .observability_session
+            .as_ref()
+            .expect("observability session");
+        let session = astra_core::sync_poison::recover_rwlock_read(session);
+        assert_eq!(session.user_corrections.len(), 1);
+        assert_eq!(
+            session
+                .recent_correction_excerpts
+                .last()
+                .map(String::as_str),
+            Some("不是修修补补，我要的是第一性原则系统性修复。")
+        );
+        assert_eq!(session.recent_correction_excerpts.len(), 1);
         let rendered = state
             .pipeline_session
             .as_ref()
@@ -3845,19 +4086,54 @@ mod tests {
     }
 
     #[test]
-    fn structured_reanchor_feedback_does_not_require_profile_session() {
-        let intent = TurnIntent::default().with_reanchors_current_objective(true);
+    fn structured_correction_feedback_does_not_require_profile_session() {
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct);
         let mut state = make_state();
         let hub = make_hub();
         state.telemetry.observability_hub = Some(Arc::clone(&hub));
         assert!(state.telemetry.observability_session.is_none());
 
-        apply_judged_turn_intent_to_observability_session(&state, &intent);
+        apply_judged_turn_intent_to_observability(&state, &intent, true);
 
+        assert!(
+            hub.recent_feedback_signals().iter().any(|signal| {
+                signal.signal_type == astra_core::feedback::SignalType::Correction
+            })
+        );
+    }
+
+    #[test]
+    fn acknowledgement_implies_acceptance_but_work_relations_do_not() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+
+        apply_judged_turn_intent_to_observability(
+            &state,
+            &TurnIntent::default()
+                .with_objective_relation(astra_turn_types::ObjectiveRelation::Continue),
+            true,
+        );
+        assert!(hub.recent_feedback_signals().is_empty());
+        apply_judged_turn_intent_to_observability(
+            &state,
+            &TurnIntent::default()
+                .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace),
+            true,
+        );
+        assert!(hub.recent_feedback_signals().is_empty());
+
+        apply_judged_turn_intent_to_observability(
+            &state,
+            &TurnIntent::default()
+                .with_objective_relation(astra_turn_types::ObjectiveRelation::Acknowledge),
+            true,
+        );
         assert!(
             hub.recent_feedback_signals()
                 .iter()
-                .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Reanchor })
+                .any(|signal| signal.signal_type == astra_core::feedback::SignalType::Acceptance)
         );
     }
 

@@ -1816,7 +1816,7 @@ pub(crate) async fn handle_info_command(
 
             // ── Attention ──
             if let Some(ref anchor) = state.continuation_anchor {
-                if let Some(input) = anchor.latest_user_input.as_deref() {
+                if let Some(input) = anchor.recent_user_input.as_deref() {
                     eprintln!(
                         "  {:<12}  {}",
                         "input".magenta(),
@@ -1830,7 +1830,7 @@ pub(crate) async fn handle_info_command(
                         truncate_str(direction, 80).dim()
                     );
                 }
-                if anchor.latest_user_input.is_none() && anchor.assistant_direction.is_none() {
+                if anchor.recent_user_input.is_none() && anchor.assistant_direction.is_none() {
                     eprintln!(
                         "  {:<12}  {}",
                         "focus".magenta(),

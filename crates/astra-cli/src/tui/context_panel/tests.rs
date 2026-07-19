@@ -629,7 +629,11 @@ fn session_summary_flows_through_snapshot() {
         cache_read_tokens: 8_000,
         cache_creation_tokens: 500,
         request_context: None,
-        continuation_anchor: Some("refactoring auth".into()),
+        continuation_anchor: Some(
+            crate::cli::session::session_state::ContinuationAnchor::rendered_for_test(
+                "refactoring auth",
+            ),
+        ),
         queued_message: None,
         diagnostics_context: None,
         read_activity: Default::default(),
