@@ -52,7 +52,7 @@ pub use astra_skills::manifest::{ExecutionContext, LoadedSkill, SkillManifest, S
 pub use astra_skills::providers::{BundledSkillProvider, LocalSkillProvider, McpSkillProvider};
 pub use astra_skills::quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
 pub use astra_skills::traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
-pub use astra_skills::version::{Dependency, DependencyResolver, Version, VersionConstraint};
+pub use astra_skills::version::{Dependency, Version, VersionConstraint};
 
 pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use astra_skills::providers::DatabaseSkillProvider;

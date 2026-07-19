@@ -46,6 +46,28 @@ Allowed text matching is rare: UI display/search, tests of rendered text, or
 legacy protocol fallback named with a `fallback` suffix. A fallback must not be
 the primary safety/admission/blocking/evaluation decision.
 
+## Hard Rule: One Owner, One Wired Path
+
+Before adding a type, service, registry, state machine, observer, table, parser,
+or compatibility layer:
+
+1. Search for the existing owner of the fact or lifecycle and name it in the
+   execution record.
+2. Trace the real product entrypoint to that owner. Unit tests and constructors
+   called only by tests are not wiring evidence.
+3. Extend the owner when possible. A new owner is justified only by a distinct
+   authority, deployment, security, or resource-lifecycle boundary.
+4. If replacing a path, migrate its callers and delete the old implementation,
+   old state/table/shim, and tests that only exercised the old island in the
+   same change. Do not keep code for unspecified "future extensibility".
+5. Report the complexity delta: implementations, status vocabularies, writers,
+   tables, compatibility paths, and net code. Added tests do not cancel out a
+   second source of truth.
+
+For persistence, a mock-only test is insufficient. Prove schema bootstrap,
+query/transaction semantics, failure behavior, and the public caller against
+the real configured database whenever the change crosses that boundary.
+
 ## Task
 
 $ARGUMENTS

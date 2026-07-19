@@ -87,6 +87,18 @@ Then inspect the highest-risk files first:
 5. Error handling and retry paths.
 6. Tests that claim coverage for the changed behavior.
 
+For a refactor or subsystem addition, also build an ownership delta:
+
+- Which implementation owned the behavior before and after?
+- Did the change add another writer, status vocabulary, registry, observer,
+  parser, table, compatibility path, or retry loop for an existing fact?
+- Were replaced implementations and self-only tests deleted?
+- Does a real CLI/server/web/edge entrypoint reach the new path?
+
+Treat an unwired implementation, dual writable truth, or a replacement that
+leaves the old owner active as a correctness finding. Do not recommend another
+compensating layer until the canonical owner and retirement path are clear.
+
 ## Step 3: Validate Findings
 
 Before reporting a finding:

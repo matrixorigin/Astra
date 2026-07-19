@@ -299,6 +299,35 @@ fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
         text.contains("Self-critique gate") && text.contains("git diff --check"),
         "review_changes must run a self-critique lint gate before the final report"
     );
+    assert!(
+        text.contains("ownership delta")
+            && text.contains("real CLI/server/web/edge entrypoint")
+            && text.contains("Were replaced implementations"),
+        "review_changes must reject parallel or unwired subsystem growth"
+    );
+}
+
+#[test]
+fn astra_dev_skill_requires_one_owner_and_retirement_evidence() {
+    let path = astra_core::test_paths::workspace_path(".agent/skills")
+        .join("astra-dev")
+        .join("SKILL.md");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    for required in [
+        "One Owner, One Wired Path",
+        "real product entrypoint",
+        "authority, deployment, security, or resource-lifecycle boundary",
+        "delete the old implementation",
+        "complexity delta",
+        "real configured database",
+    ] {
+        assert!(
+            text.contains(required),
+            "astra-dev is missing systemic cleanup constraint: {required}"
+        );
+    }
 }
 
 #[test]
@@ -314,12 +343,55 @@ fn project_claude_and_agent_skill_bodies_stay_in_sync() {
     );
 
     for skill_name in agent_names {
-        let agent_body = parsed_skill_body(&agent_root, &skill_name);
-        let claude_body = parsed_skill_body(&claude_root, &skill_name);
+        let (agent_manifest, agent_body) = parsed_skill(&agent_root, &skill_name);
+        let (claude_manifest, claude_body) = parsed_skill(&claude_root, &skill_name);
         assert_eq!(
             claude_body, agent_body,
             "{skill_name}: .claude and .agent skill instruction bodies drifted"
         );
+
+        let agent_tools = agent_manifest.allowed_tools.clone();
+        let claude_tools = claude_manifest.allowed_tools.clone();
+        let mut agent_contract = serde_json::to_value(agent_manifest).unwrap();
+        let mut claude_contract = serde_json::to_value(claude_manifest).unwrap();
+        agent_contract["allowed_tools"] = serde_json::json!([]);
+        claude_contract["allowed_tools"] = serde_json::json!([]);
+        assert_eq!(
+            claude_contract, agent_contract,
+            "{skill_name}: compatibility roots may only differ in host tool availability"
+        );
+        if skill_name == "review_changes" {
+            assert_eq!(
+                agent_tools
+                    .iter()
+                    .filter(|tool| !claude_tools.contains(tool))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["agent"],
+                "review_changes may expose only the Agent-host parallelism capability as a root-specific delta"
+            );
+        } else {
+            assert_eq!(
+                claude_tools, agent_tools,
+                "{skill_name}: allowed tools drifted between compatibility roots"
+            );
+        }
+    }
+}
+
+#[test]
+fn project_skills_have_one_descriptor() {
+    for root in [".agent/skills", ".claude/skills"] {
+        let root = astra_core::test_paths::workspace_path(root);
+        for skill_name in skill_dir_names(&root) {
+            let skill_dir = root.join(&skill_name);
+            for legacy_sidecar in ["manifest.yaml", "metadata.json"] {
+                assert!(
+                    !skill_dir.join(legacy_sidecar).exists(),
+                    "{skill_name}: {legacy_sidecar} duplicates canonical SKILL.md frontmatter"
+                );
+            }
+        }
     }
 }
 
@@ -343,13 +415,11 @@ fn skill_dir_names(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn parsed_skill_body(root: &Path, skill_name: &str) -> String {
+fn parsed_skill(root: &Path, skill_name: &str) -> (astra_skills::manifest::SkillManifest, String) {
     let path = root.join(skill_name).join("SKILL.md");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let (_, body) =
-        parse_skill_md(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-    body
+    parse_skill_md(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 #[test]
