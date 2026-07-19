@@ -514,13 +514,49 @@ async fn body_fanout_then_complete(body: &Value, failed_child: Option<usize>) ->
     }
     if latest_user == FANOUT_JOURNEY_STATUS_QUESTION {
         let request = body.to_string();
-        let has_group_truth = (request.contains("Current background work snapshot")
-            || request.contains("active_work_snapshot.v1"))
-            && request.contains("mock-review-group");
+        let active_work = body
+            .pointer("/edge_profile/runtime_volatile_injections")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|injections| {
+                injections
+                    .iter()
+                    .find(|injection| injection["kind"] == "active_work_snapshot")
+            });
+        let payload = active_work.map(|injection| &injection["payload"]);
+        let guidance_snapshot = payload
+            .and_then(|payload| payload["snapshots"].as_array())
+            .and_then(|snapshots| {
+                snapshots.iter().find(|snapshot| {
+                    snapshot["schema"] == "active_work_snapshot.v1"
+                        && snapshot["authority"] == "run_control_provider"
+                })
+            });
+        let observation = payload
+            .and_then(|payload| payload["work_unit_observations"].as_array())
+            .or_else(|| {
+                guidance_snapshot.and_then(|snapshot| snapshot["work_unit_observations"].as_array())
+            })
+            .and_then(|observations| {
+                observations
+                    .iter()
+                    .find(|observation| observation["id"] == "mock-review-group")
+            });
+        let direct_contract = active_work.is_some_and(|injection| {
+            injection["delivery_class"] == "required_context"
+                && injection["payload"]["authority"] == "runtime_producer"
+                && injection["payload"]["schema"] == "active_work_snapshot.v1"
+        });
+        let guidance_contract = active_work.is_some_and(|injection| {
+            injection["delivery_class"] == "required_context"
+                && injection["payload"]["authority"] == "runtime_required_context"
+                && injection["payload"]["schema"] == "active_work_guidance_context.v1"
+                && guidance_snapshot.is_some()
+        });
+        let has_group_truth = (direct_contract || guidance_contract)
+            && observation.is_some_and(|observation| observation["kind"] == "agent_fanout");
         let message = if has_group_truth
             && request.contains("superseded_by_newer_producer_observation")
-            && (request.contains("\"status\":\"completed\"")
-                || request.contains("\\\"status\\\":\\\"completed\\\""))
+            && observation.is_some_and(|observation| observation["status"] == "completed")
         {
             "Astra knows Three mock reviews completed as one foreground work group. Parent synthesized one terminal fanout group exactly once."
         } else if has_group_truth {

@@ -940,20 +940,36 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
         1,
         "one status question gets one analysis"
     );
-    let status_request = status_requests[0].to_string();
-    assert!(
-        status_request.contains("active_work_snapshot.v1")
-            && status_request.contains("work_unit_observations")
-            && status_request.contains("mock-review-group")
-            && status_request.contains("agent_fanout"),
-        "active guidance must carry canonical typed group truth: {status_request}"
+    let status_request = &status_requests[0];
+    let active_work = status_request
+        .pointer("/edge_profile/runtime_volatile_injections")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|injections| {
+            injections
+                .iter()
+                .find(|injection| injection["kind"] == "active_work_snapshot")
+        })
+        .expect("active guidance must carry canonical typed group truth");
+    assert_eq!(active_work["delivery_class"], "required_context");
+    assert_eq!(
+        active_work["payload"]["authority"],
+        "runtime_required_context"
     );
-    assert!(
-        status_request.contains("superseded_by_newer_producer_observation")
-            && (status_request.contains("\"status\":\"completed\"")
-                || status_request.contains("\\\"status\\\":\\\"completed\\\"")),
-        "the terminal producer revision must replace the stale 2/3 submission snapshot: {status_request}"
+    assert_eq!(
+        active_work["payload"]["schema"],
+        "active_work_guidance_context.v1"
     );
+    let snapshot = &active_work["payload"]["snapshots"][0];
+    assert_eq!(snapshot["schema"], "active_work_snapshot.v1");
+    assert_eq!(snapshot["authority"], "run_control_provider");
+    assert_eq!(
+        snapshot["projection_state"],
+        "superseded_by_newer_producer_observation"
+    );
+    let observation = &snapshot["work_unit_observations"][0];
+    assert_eq!(observation["id"], "mock-review-group");
+    assert_eq!(observation["kind"], "agent_fanout");
+    assert_eq!(observation["status"], "completed");
     assert!(
         !String::from_utf8_lossy(&astra.output).contains("All three reviewers completed"),
         "a non-terminal group must never be presented as settled"
@@ -1197,12 +1213,23 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
         .filter(is_fanout_status_question)
         .collect::<Vec<_>>();
     assert_eq!(status_requests.len(), 1);
-    let status_request = status_requests[0].to_string();
-    assert!(
-        status_request.contains("Current background work snapshot")
-            && status_request.contains("mock-review-group"),
-        "ordinary user questions must receive the runtime-owned task truth: {status_request}"
-    );
+    let status_request = &status_requests[0];
+    let active_work = status_request
+        .pointer("/edge_profile/runtime_volatile_injections")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|injections| {
+            injections
+                .iter()
+                .find(|injection| injection["kind"] == "active_work_snapshot")
+        })
+        .expect("ordinary user questions receive typed runtime-owned work truth");
+    assert_eq!(active_work["delivery_class"], "required_context");
+    assert_eq!(active_work["payload"]["authority"], "runtime_producer");
+    assert_eq!(active_work["payload"]["schema"], "active_work_snapshot.v1");
+    let observation = &active_work["payload"]["work_unit_observations"][0];
+    assert_eq!(observation["id"], "mock-review-group");
+    assert_eq!(observation["kind"], "agent_fanout");
+    assert_eq!(observation["status"], "running");
     assert_eq!(
         mock.received_requests()
             .iter()
