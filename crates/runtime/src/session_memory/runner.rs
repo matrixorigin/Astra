@@ -393,7 +393,18 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
-    let session_id = inference_scope.session_id();
+    let Some(session_id) = inference_scope.session_id() else {
+        return ExtractionArtifacts::PersistFailed {
+            error_reason: SessionMemoryExtractionErrorReason::InvalidScope,
+            persist_error_detail: Some(
+                "session-memory extraction requires a session-owned inference scope".to_string(),
+            ),
+            llm_error_reason: None,
+            llm_error_detail: None,
+            selector_model: None,
+            failed_candidates: Vec::new(),
+        };
+    };
     let filtered_messages = session_memory_extraction_messages(messages);
     let messages = filtered_messages.as_slice();
     let base_memory = if current_memory.trim().is_empty() {
@@ -1841,6 +1852,48 @@ mod tests {
             }
             _ => panic!("expected fallback persistence"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_extraction_rejects_harness_scope_before_provider_or_memoria_io() {
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingMemoryInference {
+            purposes: Arc::clone(&purposes),
+            scopes: Arc::clone(&scopes),
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
+        let scope = astra_turn_types::InferenceInvocationScope::HarnessRun {
+            harness_run_id: "harness-not-a-session".to_string(),
+            operation_id: "skill_synthesis".to_string(),
+            logical_attempt: 0,
+        };
+
+        let artifacts = run_extraction(
+            &memoria_port,
+            &scope,
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[client],
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::PersistFailed {
+                error_reason: SessionMemoryExtractionErrorReason::InvalidScope,
+                ..
+            }
+        ));
+        assert!(purposes.lock().unwrap().is_empty());
+        assert!(scopes.lock().unwrap().is_empty());
+        assert!(memoria.operations.lock().unwrap().is_empty());
+        assert!(memoria.stored.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

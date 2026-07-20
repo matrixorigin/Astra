@@ -313,6 +313,7 @@ pub struct SkillifySourcePacket {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillifyAgentRequest {
     pub user_id: String,
+    pub harness_run_id: String,
     pub skill_name: Option<String>,
     pub topic: Option<String>,
     pub target_scope: String,
@@ -873,6 +874,61 @@ impl DatabaseHarnessService {
         }
         Ok(out)
     }
+
+    async fn record_skillify_run_failure(
+        &self,
+        user_id: &str,
+        harness_run_id: &str,
+        mut failure: (StatusCode, Json<ErrorResponse>),
+    ) -> (StatusCode, Json<ErrorResponse>) {
+        let persisted_error = failure.1.detail.chars().take(4_000).collect::<String>();
+        let update = sqlx::query(
+            "UPDATE harness_runs
+             SET status = 'failed', error = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND harness_run_id = ? AND status = 'running'",
+        )
+        .bind(persisted_error)
+        .bind(user_id)
+        .bind(harness_run_id)
+        .execute(self.pool.get())
+        .await;
+
+        match update {
+            Ok(result) if result.rows_affected() == 1 => {
+                failure.1.metadata = Some(json!({
+                    "harness_run_id": harness_run_id,
+                    "status": "failed"
+                }));
+                failure
+            }
+            Ok(_) => (
+                StatusCode::CONFLICT,
+                Json(
+                    ErrorResponse::new(
+                        "Skillify run failed, but its durable state was no longer running",
+                    )
+                    .with_error_code("harness_terminal_conflict")
+                    .with_metadata(json!({
+                        "harness_run_id": harness_run_id,
+                        "status": "unknown"
+                    })),
+                ),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    ErrorResponse::new(format!(
+                        "Skillify run failed and its terminal state could not be persisted: {error}"
+                    ))
+                    .with_error_code("harness_terminal_persistence_failed")
+                    .with_metadata(json!({
+                        "harness_run_id": harness_run_id,
+                        "status": "unknown"
+                    })),
+                ),
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -904,7 +960,11 @@ impl HarnessService for DatabaseHarnessService {
         }
         self.validate_session_ownership(&user_id, &session_ids)
             .await?;
-        let mut events = self.load_skillify_events(&user_id, &session_ids).await?;
+        let mut events = if session_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.load_skillify_events(&user_id, &session_ids).await?
+        };
         events.extend(source_files);
         if events.is_empty() {
             return Err(error_response(
@@ -924,6 +984,30 @@ impl HarnessService for DatabaseHarnessService {
                 "Skillify agent executor is not configured",
             )
         })?;
+        let harness_run_id = format!("harness-run-{}", Uuid::new_v4());
+        let input_json = json!({
+            "template_id": SKILLIFY_TEMPLATE_ID,
+            "session_ids": &session_ids,
+            "source_file_count": request.source_files.as_ref().map(Vec::len).unwrap_or(0),
+            "skill_name": &request.skill_name,
+            "topic": &request.topic,
+            "target_scope": &target_scope
+        });
+        sqlx::query(
+            "INSERT INTO harness_runs
+             (harness_run_id, harness_id, version_id, user_id, session_id, status,
+              input_json, output_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 'running', ?, '{\"stage\":\"model_execution\"}', NOW(6), NOW(6))",
+        )
+        .bind(&harness_run_id)
+        .bind(SKILLIFY_HARNESS_ID)
+        .bind(SKILLIFY_VERSION_ID)
+        .bind(&user_id)
+        .bind(input_json.to_string())
+        .execute(self.pool.get())
+        .await
+        .map_err(internal_error)?;
+
         let source_packets = events
             .iter()
             .map(skillify_source_packet_from_event)
@@ -932,36 +1016,40 @@ impl HarnessService for DatabaseHarnessService {
             .iter()
             .map(|packet| (packet.source_id.clone(), packet.clone()))
             .collect::<HashMap<_, _>>();
-        let agent_output = executor
+        let agent_output = match executor
             .synthesize_skill_drafts(SkillifyAgentRequest {
                 user_id: user_id.clone(),
+                harness_run_id: harness_run_id.clone(),
                 skill_name: request.skill_name.clone(),
                 topic: request.topic.clone(),
                 target_scope: target_scope.clone(),
                 source_packets,
             })
             .await
-            .map_err(|error| {
-                error_response(
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let failure = error_response(
                     StatusCode::BAD_GATEWAY,
                     format!("Skillify agent failed: {error}"),
-                )
-            })?;
-        validate_skillify_agent_output(&agent_output, &events)?;
+                );
+                return Err(self
+                    .record_skillify_run_failure(&user_id, &harness_run_id, failure)
+                    .await);
+            }
+        };
+        if let Err(failure) = validate_skillify_agent_output(&agent_output, &events) {
+            return Err(self
+                .record_skillify_run_failure(&user_id, &harness_run_id, failure)
+                .await);
+        }
+
+        let persistence_result: HarnessResult<()> = async {
         let rule_count: usize = agent_output
             .drafts
             .iter()
             .map(|draft| draft.rules.len())
             .sum();
-        let harness_run_id = format!("harness-run-{}", Uuid::new_v4());
-        let input_json = json!({
-            "template_id": SKILLIFY_TEMPLATE_ID,
-            "session_ids": session_ids,
-            "source_file_count": request.source_files.as_ref().map(Vec::len).unwrap_or(0),
-            "skill_name": request.skill_name,
-            "topic": request.topic,
-            "target_scope": target_scope
-        });
         let output_json = json!({
             "extractor": agent_output.extractor,
             "subagent_strategy": agent_output.subagent_strategy,
@@ -977,22 +1065,24 @@ impl HarnessService for DatabaseHarnessService {
         };
 
         let mut tx = self.pool.get().begin().await.map_err(internal_error)?;
-        sqlx::query(
-            "INSERT INTO harness_runs
-             (harness_run_id, harness_id, version_id, user_id, session_id, status,
-              input_json, output_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NOW(6), NOW(6))",
+        let transitioned = sqlx::query(
+            "UPDATE harness_runs
+             SET status = ?, output_json = ?, error = NULL, updated_at = NOW(6)
+             WHERE user_id = ? AND harness_run_id = ? AND status = 'running'",
         )
-        .bind(&harness_run_id)
-        .bind(SKILLIFY_HARNESS_ID)
-        .bind(SKILLIFY_VERSION_ID)
-        .bind(&user_id)
         .bind(status)
-        .bind(input_json.to_string())
         .bind(output_json.to_string())
+        .bind(&user_id)
+        .bind(&harness_run_id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        if transitioned.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Skillify run is no longer in running state",
+            ));
+        }
 
         for draft in &agent_output.drafts {
             let skill_draft_id = format!("harness-skill-draft-{}", Uuid::new_v4());
@@ -1120,7 +1210,16 @@ impl HarnessService for DatabaseHarnessService {
         }
 
         tx.commit().await.map_err(internal_error)?;
-        self.load_run(&harness_run_id).await
+        Ok(())
+        }
+        .await;
+
+        match persistence_result {
+            Ok(()) => self.load_run(&harness_run_id).await,
+            Err(failure) => Err(self
+                .record_skillify_run_failure(&user_id, &harness_run_id, failure)
+                .await),
+        }
     }
 
     async fn get_run(

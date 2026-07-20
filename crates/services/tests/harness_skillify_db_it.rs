@@ -5,18 +5,22 @@ use std::sync::{Arc, Mutex};
 use astra_services::{
     DatabaseHarnessService, HarnessDecisionRequest, HarnessService, SkillifyAgentCitation,
     SkillifyAgentDraft, SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest,
-    SkillifyAgentRule, SkillifyRunRequest,
+    SkillifyAgentRule, SkillifyRunRequest, SkillifySourceFile,
 };
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
 use serial_test::serial;
+use sqlx::Row;
 use uuid::Uuid;
 
 #[derive(Default)]
 struct CapturingSkillifyExecutor {
     request: Mutex<Option<SkillifyAgentRequest>>,
     output: Mutex<Option<SkillifyAgentOutput>>,
+    pool: Mutex<Option<sqlx::Pool<sqlx::MySql>>>,
+    owner_observed_running: Mutex<bool>,
+    failure: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -25,7 +29,30 @@ impl SkillifyAgentExecutor for CapturingSkillifyExecutor {
         &self,
         request: SkillifyAgentRequest,
     ) -> Result<SkillifyAgentOutput, String> {
+        let pool = self.pool.lock().expect("pool lock").clone();
+        if let Some(pool) = pool {
+            let row = sqlx::query(
+                "SELECT user_id, status FROM harness_runs WHERE harness_run_id = ? LIMIT 1",
+            )
+            .bind(&request.harness_run_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|error| format!("load durable harness owner: {error}"))?
+            .ok_or_else(|| "durable harness owner was not created before inference".to_string())?;
+            if row.get::<String, _>("user_id") != request.user_id
+                || row.get::<String, _>("status") != "running"
+            {
+                return Err("durable harness owner was not running for this user".to_string());
+            }
+            *self
+                .owner_observed_running
+                .lock()
+                .expect("owner observation lock") = true;
+        }
         *self.request.lock().expect("capture lock") = Some(request);
+        if let Some(error) = self.failure.lock().expect("failure lock").clone() {
+            return Err(error);
+        }
         Ok(self
             .output
             .lock()
@@ -67,6 +94,7 @@ async fn database_skillify_uses_event_level_sources_and_rejects_corrupt_events()
     .expect("insert agent event");
 
     let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.pool.lock().expect("pool lock") = Some(pool.clone());
     let service = DatabaseHarnessService::new(shared_pool.clone())
         .with_skillify_agent_executor(executor.clone());
     let run = service
@@ -89,6 +117,14 @@ async fn database_skillify_uses_event_level_sources_and_rejects_corrupt_events()
         .expect("capture lock")
         .take()
         .expect("skillify executor request captured");
+    assert_eq!(captured.harness_run_id, run.harness_run_id);
+    assert!(
+        *executor
+            .owner_observed_running
+            .lock()
+            .expect("owner observation lock"),
+        "harness owner must be durable and running before model execution"
+    );
     assert_eq!(captured.source_packets.len(), 1);
     let packet = &captured.source_packets[0];
     assert_eq!(packet.event_id, event_id);
@@ -318,6 +354,76 @@ async fn database_skillify_citations_point_to_review_items() {
     );
 
     cleanup_skillify_run(&pool, &run.harness_run_id, &event_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn database_skillify_model_failure_persists_a_recoverable_terminal_run() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get().clone();
+    let user_id = Uuid::new_v4().to_string();
+    let executor = Arc::new(CapturingSkillifyExecutor::default());
+    *executor.pool.lock().expect("pool lock") = Some(pool.clone());
+    *executor.failure.lock().expect("failure lock") = Some("provider unavailable".to_string());
+    let service =
+        DatabaseHarnessService::new(shared_pool).with_skillify_agent_executor(executor.clone());
+
+    let error = service
+        .create_skillify_run(
+            user_id.clone(),
+            SkillifyRunRequest {
+                session_ids: Vec::new(),
+                source_files: Some(vec![SkillifySourceFile {
+                    file_name: "notes.md".to_string(),
+                    mime_type: Some("text/markdown".to_string()),
+                    content: "Prefer concise conclusions with cited evidence.".to_string(),
+                }]),
+                skill_name: Some("concise-review".to_string()),
+                topic: None,
+                target_scope: Some("personal".to_string()),
+            },
+        )
+        .await
+        .expect_err("model failure must be surfaced");
+    assert_eq!(
+        error.0,
+        StatusCode::BAD_GATEWAY,
+        "unexpected failure response: {:?}",
+        error.1
+    );
+    let metadata = error.1.metadata.as_ref().expect("failure metadata");
+    let harness_run_id = metadata["harness_run_id"]
+        .as_str()
+        .expect("durable failed run id");
+    assert_eq!(metadata["status"], "failed");
+
+    let row = sqlx::query(
+        "SELECT status, error FROM harness_runs WHERE user_id = ? AND harness_run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(harness_run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load failed harness run");
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert!(
+        row.get::<String, _>("error")
+            .contains("provider unavailable")
+    );
+    assert!(
+        *executor
+            .owner_observed_running
+            .lock()
+            .expect("owner observation lock")
+    );
+
+    sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
+        .bind(&user_id)
+        .bind(harness_run_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup failed harness run");
 }
 
 async fn cleanup_skillify_run(

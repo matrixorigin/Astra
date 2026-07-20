@@ -17,13 +17,18 @@ pub struct ExtractionRequest {
 
 impl ExtractionRequest {
     #[must_use]
-    pub fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> Option<&str> {
         self.inference_scope.session_id()
     }
 
     #[must_use]
-    pub fn turn_number(&self) -> u32 {
+    pub fn turn_number(&self) -> Option<u32> {
         self.inference_scope.turn()
+    }
+
+    #[must_use]
+    pub fn session_coordinates(&self) -> Option<(&str, u32)> {
+        self.session_id().zip(self.turn_number())
     }
 }
 

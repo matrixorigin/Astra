@@ -419,9 +419,17 @@ impl MemoryExtractionService {
     ///
     /// **Must run inside a Tokio runtime.**
     pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
+        let Some((session_id, turn)) = req.session_coordinates() else {
+            tracing::error!(
+                scope_kind = req.inference_scope.kind(),
+                "refusing session-memory extraction without session coordinates"
+            );
+            return SpawnDecision::Skipped;
+        };
+        let session_id = session_id.to_string();
         let Some(user_id) = self.user_id.as_deref() else {
             tracing::error!(
-                session_id = %req.session_id(),
+                session_id = %session_id,
                 "refusing session-memory extraction from an owner-neutral service template"
             );
             return SpawnDecision::Skipped;
@@ -454,7 +462,7 @@ impl MemoryExtractionService {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
-            let state_ref = map.get(req.session_id());
+            let state_ref = map.get(&session_id);
             let default_state;
             let state = match state_ref {
                 Some(s) => s,
@@ -463,7 +471,7 @@ impl MemoryExtractionService {
                     &default_state
                 }
             };
-            let dec = evaluate(state, req.session_id(), content_fingerprint);
+            let dec = evaluate(state, &session_id, content_fingerprint);
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip(reason)
@@ -477,15 +485,15 @@ impl MemoryExtractionService {
                             .work
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match work.active_fingerprints.get(req.session_id()).copied() {
+                        match work.active_fingerprints.get(&session_id).copied() {
                             None => {
                                 work.active_fingerprints
-                                    .insert(req.session_id().to_string(), content_fingerprint);
+                                    .insert(session_id.clone(), content_fingerprint);
                                 Admission::Spawn
                             }
                             Some(active_fingerprint)
                                 if active_fingerprint == content_fingerprint
-                                    || work.queued_latest.get(req.session_id()).is_some_and(
+                                    || work.queued_latest.get(&session_id).is_some_and(
                                         |(_, queued_fingerprint)| {
                                             *queued_fingerprint == content_fingerprint
                                         },
@@ -494,10 +502,8 @@ impl MemoryExtractionService {
                                 Admission::Skip(SessionMemoryExtractionSkipReason::InFlight)
                             }
                             Some(_) => {
-                                work.queued_latest.insert(
-                                    req.session_id().to_string(),
-                                    (req.clone(), content_fingerprint),
-                                );
+                                work.queued_latest
+                                    .insert(session_id.clone(), (req.clone(), content_fingerprint));
                                 Admission::Queue
                             }
                         }
@@ -510,18 +516,12 @@ impl MemoryExtractionService {
             Admission::Spawn => {}
             Admission::Queue => return SpawnDecision::Queued,
             Admission::Skip(reason) => {
-                let sid_opt = if req.session_id().is_empty() {
+                let sid_opt = if session_id.is_empty() {
                     None
                 } else {
-                    Some(req.session_id())
+                    Some(session_id.as_str())
                 };
-                self.emit_skip_event(
-                    user_id,
-                    sid_opt,
-                    req.turn_number(),
-                    reason,
-                    &skip_breadcrumbs,
-                );
+                self.emit_skip_event(user_id, sid_opt, turn, reason, &skip_breadcrumbs);
                 return SpawnDecision::Skipped;
             }
         }
@@ -538,7 +538,6 @@ impl MemoryExtractionService {
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
         let pending_guard = PendingGuard::new(pending, pending_done);
-        let session_id = req.session_id().to_string();
         let work_guard = SessionWorkGuard::new(Arc::clone(&self.work), session_id.clone());
         tokio::spawn(async move {
             let _pending_guard = pending_guard;
@@ -555,7 +554,14 @@ impl MemoryExtractionService {
     // ── internals ─────────────────────────────────────────────────────
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
-        let session_id = req.session_id().to_string();
+        let Some((session_id, turn)) = req.session_coordinates() else {
+            tracing::error!(
+                scope_kind = req.inference_scope.kind(),
+                "refusing session-memory worker without session coordinates"
+            );
+            return;
+        };
+        let session_id = session_id.to_string();
         let Some(user_id) = self.user_id.as_deref().map(str::to_string) else {
             tracing::error!(
                 session_id = %session_id,
@@ -563,7 +569,6 @@ impl MemoryExtractionService {
             );
             return;
         };
-        let turn = req.turn_number();
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
         // Process-local admission cannot see a worker that completed in a
@@ -700,7 +705,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number());
+                self.mark_session_extracted(&session_id, content_fingerprint, turn);
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -776,7 +781,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number());
+                self.mark_session_extracted(&session_id, content_fingerprint, turn);
                 // LLM failed but rule-based content did land. Surface
                 // the error live, but record the journal outcome as a
                 // successful fallback write so postmortems stop reading
@@ -1750,8 +1755,11 @@ mod tests {
             reanchors_current_objective: false,
         };
         let fingerprint = extraction_input_fingerprint(&req);
+        let (session_id, turn) = req
+            .session_coordinates()
+            .expect("test request has session coordinates");
         ctx.svc
-            .mark_session_extracted(req.session_id(), fingerprint, req.turn_number());
+            .mark_session_extracted(session_id, fingerprint, turn);
         assert_eq!(
             ctx.svc.maybe_spawn_shutdown_flush(req),
             SpawnDecision::Skipped
@@ -2621,7 +2629,10 @@ mod tests {
             reanchors_current_objective: false,
         };
         let fingerprint = extraction_input_fingerprint(&req);
-        svc.mark_session_extracted(req.session_id(), fingerprint, req.turn_number());
+        let (session_id, turn) = req
+            .session_coordinates()
+            .expect("test request has session coordinates");
+        svc.mark_session_extracted(session_id, fingerprint, turn);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut rx);

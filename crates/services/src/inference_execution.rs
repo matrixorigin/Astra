@@ -34,8 +34,6 @@ pub struct InferenceProviderAttemptPlan {
     attempt_id: String,
     invocation_id: String,
     user_id: String,
-    session_id: String,
-    run_id: Option<String>,
     attempt_index: u32,
     provider: String,
 }
@@ -139,9 +137,14 @@ pub fn plan_inference_invocation(
     input: InferenceInvocationInput,
 ) -> ServiceResult<InferenceInvocationPlan> {
     validate_identity(&input.user_id, "user_id", 128)?;
-    validate_identity(input.scope.session_id(), "session_id", 64)?;
+    if let Some(session_id) = input.scope.session_id() {
+        validate_identity(session_id, "session_id", 64)?;
+    }
     if let Some(run_id) = input.scope.run_id() {
         validate_identity(run_id, "run_id", 64)?;
+    }
+    if let Some(harness_run_id) = input.scope.harness_run_id() {
+        validate_identity(harness_run_id, "harness_run_id", 128)?;
     }
     validate_identity(input.scope.operation_id(), "operation_id", 64)?;
     validate_model_offering_id(&input.offering_id)
@@ -150,8 +153,8 @@ pub fn plan_inference_invocation(
     validate_identity(&input.upstream_model_name, "upstream_model_name", 255)?;
     validate_identity(&input.provider, "provider", 64)?;
 
-    let turn = input.scope.turn().to_string();
-    let round = input.scope.round().to_string();
+    let turn = input.scope.turn().map(|value| value.to_string());
+    let round = input.scope.round().map(|value| value.to_string());
     let logical_attempt = input.scope.logical_attempt().to_string();
     let purpose = input.purpose.as_str();
     let placement = input.execution_placement.as_str();
@@ -159,10 +162,11 @@ pub fn plan_inference_invocation(
     let identity_fields = [
         input.user_id.as_str(),
         input.scope.kind(),
-        input.scope.session_id(),
+        input.scope.session_id().unwrap_or(""),
         input.scope.run_id().unwrap_or(""),
-        turn.as_str(),
-        round.as_str(),
+        input.scope.harness_run_id().unwrap_or(""),
+        turn.as_deref().unwrap_or(""),
+        round.as_deref().unwrap_or(""),
         input.scope.operation_id(),
         logical_attempt.as_str(),
         input.offering_id.as_str(),
@@ -198,8 +202,6 @@ pub fn plan_inference_provider_attempt(
         ),
         invocation_id: invocation.invocation_id.clone(),
         user_id: invocation.input.user_id.clone(),
-        session_id: invocation.input.scope.session_id().to_string(),
-        run_id: invocation.input.scope.run_id().map(str::to_string),
         attempt_index,
         provider: invocation.input.provider.clone(),
     }
@@ -243,24 +245,29 @@ async fn ensure_invocation_scope(
     connection: &mut sqlx::MySqlConnection,
     input: &InferenceInvocationInput,
 ) -> ServiceResult<()> {
-    let (statement, run_id) = match input.scope.run_id() {
-        Some(run_id) => (
+    let query = match &input.scope {
+        InferenceInvocationScope::Run {
+            session_id, run_id, ..
+        } => sqlx::query(
             "SELECT 1 FROM agent_runs
              WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
-            Some(run_id),
-        ),
-        None => (
+        )
+        .bind(&input.user_id)
+        .bind(session_id)
+        .bind(run_id),
+        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
             "SELECT 1 FROM agent_sessions
              WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-            None,
-        ),
-    };
-    let mut query = sqlx::query(statement)
+        )
         .bind(&input.user_id)
-        .bind(input.scope.session_id());
-    if let Some(run_id) = run_id {
-        query = query.bind(run_id);
-    }
+        .bind(session_id),
+        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
+            "SELECT 1 FROM harness_runs
+             WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&input.user_id)
+        .bind(harness_run_id),
+    };
     let exists = query
         .fetch_optional(&mut *connection)
         .await
@@ -274,11 +281,15 @@ async fn ensure_invocation_scope(
         .is_some();
     if !exists {
         return Err(ServiceError::not_found(format!(
-            "inference {} scope does not exist for user_id={} session_id={} run_id={}",
+            "inference {} scope does not exist for user_id={} owner_id={}",
             input.scope.kind(),
             input.user_id,
-            input.scope.session_id(),
-            input.scope.run_id().unwrap_or("none")
+            input
+                .scope
+                .run_id()
+                .or_else(|| input.scope.session_id())
+                .or_else(|| input.scope.harness_run_id())
+                .unwrap_or("none")
         )));
     }
     Ok(())
@@ -347,15 +358,17 @@ pub async fn admit_inference_invocation(
         ensure_invocation_scope(&mut tx, &plan.input).await?;
         sqlx::query(
             "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id, offering_id, resolved_model_name,
+             (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+              offering_id, resolved_model_name,
               upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(plan.input.scope.session_id())
         .bind(plan.input.scope.kind())
         .bind(plan.input.scope.run_id())
+        .bind(plan.input.scope.harness_run_id())
         .bind(&plan.input.offering_id)
         .bind(&plan.input.resolved_model_name)
         .bind(&plan.input.upstream_model_name)
@@ -375,9 +388,10 @@ pub async fn admit_inference_invocation(
 
         sqlx::query(
             "INSERT INTO inference_invocations
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, turn_index,
+             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+              turn_index,
               round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
@@ -385,8 +399,9 @@ pub async fn admit_inference_invocation(
         .bind(plan.input.scope.session_id())
         .bind(plan.input.scope.kind())
         .bind(plan.input.scope.run_id())
-        .bind(i64::from(plan.input.scope.turn()))
-        .bind(i64::from(plan.input.scope.round()))
+        .bind(plan.input.scope.harness_run_id())
+        .bind(plan.input.scope.turn().map(i64::from))
+        .bind(plan.input.scope.round().map(i64::from))
         .bind(plan.input.scope.operation_id())
         .bind(i64::from(plan.input.scope.logical_attempt()))
         .bind(plan.input.purpose.as_str())
@@ -466,17 +481,14 @@ pub async fn begin_inference_provider_attempt(
     }
     let result = sqlx::query(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, status, started_at, terminal_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, 'started', NOW(6), NULL
+         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+                ?, ?, 'started', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'",
     )
     .bind(&attempt.attempt_id)
-    .bind(&attempt.invocation_id)
-    .bind(&attempt.user_id)
-    .bind(&attempt.session_id)
-    .bind(&attempt.run_id)
     .bind(i64::from(attempt.attempt_index))
     .bind(&attempt.provider)
     .bind(&attempt.user_id)
@@ -840,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_identity_distinguishes_run_and_session_ownership() {
+    fn invocation_identity_distinguishes_every_owner_kind() {
         let run = plan_inference_invocation(input()).expect("run plan");
         let mut session_input = input();
         session_input.scope = InferenceInvocationScope::Session {
@@ -851,8 +863,18 @@ mod tests {
             logical_attempt: 0,
         };
         let session = plan_inference_invocation(session_input).expect("session plan");
+        let mut harness_input = input();
+        harness_input.scope = InferenceInvocationScope::HarnessRun {
+            harness_run_id: "harness-run-1".to_string(),
+            operation_id: "skillify_extract".to_string(),
+            logical_attempt: 0,
+        };
+        harness_input.purpose = InferencePurpose::SkillSynthesis;
+        let harness = plan_inference_invocation(harness_input).expect("harness plan");
 
         assert_ne!(run.invocation_id(), session.invocation_id());
+        assert_ne!(run.invocation_id(), harness.invocation_id());
+        assert_ne!(session.invocation_id(), harness.invocation_id());
     }
 
     #[test]

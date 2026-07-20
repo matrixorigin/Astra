@@ -80,6 +80,20 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
     }
 }
 
+async fn seed_harness_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, harness_run_id: &str) {
+    sqlx::query(
+        "INSERT INTO harness_runs
+         (harness_run_id, harness_id, version_id, user_id, session_id, status,
+          input_json, output_json, created_at, updated_at)
+         VALUES (?, 'skillify', 'skillify.v1', ?, NULL, 'running', '{}', '{}', NOW(6), NOW(6))",
+    )
+    .bind(harness_run_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("seed harness inference owner");
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -359,4 +373,84 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
         .expect("finish logical invocation");
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("harness-inf-user-{suffix}");
+    let harness_run_id = format!("harness-run-{suffix}");
+    seed_harness_run(pool, &user_id, &harness_run_id).await;
+
+    let input = InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::HarnessRun {
+            harness_run_id: harness_run_id.clone(),
+            operation_id: "skillify_extract".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-skillify".to_string(),
+        resolved_model_name: "skillify-model".to_string(),
+        upstream_model_name: "skillify-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::SkillSynthesis,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    };
+
+    let mut wrong_owner_input = input.clone();
+    wrong_owner_input.user_id = format!("other-{suffix}");
+    let wrong_owner = plan_inference_invocation(wrong_owner_input).expect("wrong owner plan");
+    assert_eq!(
+        admit_inference_invocation(&shared_pool, &wrong_owner)
+            .await
+            .expect_err("cross-user harness ownership must reject")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+
+    let plan = plan_inference_invocation(input).expect("harness inference plan");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit harness inference");
+    let route = sqlx::query(
+        "SELECT scope_kind, session_id, run_id, harness_run_id
+         FROM inference_routes WHERE user_id = ? AND route_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.route_id())
+    .fetch_one(pool)
+    .await
+    .expect("load harness route");
+    assert_eq!(route.get::<String, _>("scope_kind"), "harness_run");
+    assert_eq!(route.get::<Option<String>, _>("session_id"), None);
+    assert_eq!(route.get::<Option<String>, _>("run_id"), None);
+    assert_eq!(
+        route.get::<Option<String>, _>("harness_run_id").as_deref(),
+        Some(harness_run_id.as_str())
+    );
+
+    for table in [
+        "inference_provider_attempts",
+        "inference_invocations",
+        "inference_routes",
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE user_id = ? AND harness_run_id = ?");
+        sqlx::query(&statement)
+            .bind(&user_id)
+            .bind(&harness_run_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
+    }
+    sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
+        .bind(&user_id)
+        .bind(&harness_run_id)
+        .execute(pool)
+        .await
+        .expect("cleanup harness owner");
 }

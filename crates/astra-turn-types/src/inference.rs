@@ -14,9 +14,10 @@ pub struct ModelSelection {
 /// Durable owner and causal coordinates for one logical model invocation.
 ///
 /// Auxiliary work such as memory extraction can belong to a session without
-/// belonging to an active agent run. Keeping that distinction explicit avoids
-/// fake run identities while preserving one stable idempotency key across the
-/// Server, Edge, SDK, and persistence boundaries.
+/// belonging to an active agent run. Product harness work can likewise belong
+/// to a durable harness run without fabricating conversation coordinates.
+/// Keeping those distinctions explicit preserves one stable idempotency key
+/// across the Server, Edge, SDK, and persistence boundaries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InferenceInvocationScope {
@@ -35,13 +36,19 @@ pub enum InferenceInvocationScope {
         operation_id: String,
         logical_attempt: u32,
     },
+    HarnessRun {
+        harness_run_id: String,
+        operation_id: String,
+        logical_attempt: u32,
+    },
 }
 
 impl InferenceInvocationScope {
     #[must_use]
-    pub fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> Option<&str> {
         match self {
-            Self::Run { session_id, .. } | Self::Session { session_id, .. } => session_id,
+            Self::Run { session_id, .. } | Self::Session { session_id, .. } => Some(session_id),
+            Self::HarnessRun { .. } => None,
         }
     }
 
@@ -49,21 +56,31 @@ impl InferenceInvocationScope {
     pub fn run_id(&self) -> Option<&str> {
         match self {
             Self::Run { run_id, .. } => Some(run_id),
-            Self::Session { .. } => None,
+            Self::Session { .. } | Self::HarnessRun { .. } => None,
         }
     }
 
     #[must_use]
-    pub fn turn(&self) -> u32 {
+    pub fn harness_run_id(&self) -> Option<&str> {
         match self {
-            Self::Run { turn, .. } | Self::Session { turn, .. } => *turn,
+            Self::HarnessRun { harness_run_id, .. } => Some(harness_run_id),
+            Self::Run { .. } | Self::Session { .. } => None,
         }
     }
 
     #[must_use]
-    pub fn round(&self) -> u32 {
+    pub fn turn(&self) -> Option<u32> {
         match self {
-            Self::Run { round, .. } | Self::Session { round, .. } => *round,
+            Self::Run { turn, .. } | Self::Session { turn, .. } => Some(*turn),
+            Self::HarnessRun { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn round(&self) -> Option<u32> {
+        match self {
+            Self::Run { round, .. } | Self::Session { round, .. } => Some(*round),
+            Self::HarnessRun { .. } => None,
         }
     }
 
@@ -75,6 +92,9 @@ impl InferenceInvocationScope {
             }
             | Self::Session {
                 logical_attempt, ..
+            }
+            | Self::HarnessRun {
+                logical_attempt, ..
             } => *logical_attempt,
         }
     }
@@ -82,7 +102,9 @@ impl InferenceInvocationScope {
     #[must_use]
     pub fn operation_id(&self) -> &str {
         match self {
-            Self::Run { operation_id, .. } | Self::Session { operation_id, .. } => operation_id,
+            Self::Run { operation_id, .. }
+            | Self::Session { operation_id, .. }
+            | Self::HarnessRun { operation_id, .. } => operation_id,
         }
     }
 
@@ -91,6 +113,7 @@ impl InferenceInvocationScope {
         match self {
             Self::Run { .. } => "run",
             Self::Session { .. } => "session",
+            Self::HarnessRun { .. } => "harness_run",
         }
     }
 
@@ -125,6 +148,15 @@ impl InferenceInvocationScope {
                 operation_id: operation_id.clone(),
                 logical_attempt,
             },
+            Self::HarnessRun {
+                harness_run_id,
+                operation_id,
+                ..
+            } => Self::HarnessRun {
+                harness_run_id: harness_run_id.clone(),
+                operation_id: operation_id.clone(),
+                logical_attempt,
+            },
         }
     }
 }
@@ -146,6 +178,7 @@ pub enum InferencePurpose {
     Reflection,
     Introspection,
     VerificationJudge,
+    SkillSynthesis,
     Embedding,
 }
 
@@ -160,6 +193,7 @@ impl InferencePurpose {
             Self::Reflection => "reflection",
             Self::Introspection => "introspection",
             Self::VerificationJudge => "verification_judge",
+            Self::SkillSynthesis => "skill_synthesis",
             Self::Embedding => "embedding",
         }
     }
@@ -186,6 +220,7 @@ mod tests {
             InferencePurpose::Reflection,
             InferencePurpose::Introspection,
             InferencePurpose::VerificationJudge,
+            InferencePurpose::SkillSynthesis,
             InferencePurpose::Embedding,
         ];
 
@@ -237,6 +272,23 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<InferenceInvocationScope>(scope).is_err());
+    }
+
+    #[test]
+    fn harness_scope_has_no_fabricated_conversation_coordinates() {
+        let scope = InferenceInvocationScope::HarnessRun {
+            harness_run_id: "harness-run-1".to_string(),
+            operation_id: "skillify_extract".to_string(),
+            logical_attempt: 2,
+        };
+
+        let encoded = serde_json::to_value(&scope).expect("serialize harness scope");
+        assert_eq!(encoded["kind"], "harness_run");
+        assert!(encoded.get("session_id").is_none());
+        assert!(encoded.get("run_id").is_none());
+        assert!(encoded.get("turn").is_none());
+        assert!(encoded.get("round").is_none());
+        assert_eq!(scope.harness_run_id(), Some("harness-run-1"));
     }
 
     #[test]

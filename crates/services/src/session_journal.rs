@@ -1616,6 +1616,9 @@ pub enum SessionMemoryExtractionSkipReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMemoryExtractionErrorReason {
+    /// The caller supplied a non-session inference owner to session-memory
+    /// extraction. No provider or Memoria request was attempted.
+    InvalidScope,
     LlmTimeout,
     LlmError,
     EmptyResponse,

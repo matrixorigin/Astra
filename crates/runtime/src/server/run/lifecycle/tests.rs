@@ -901,7 +901,7 @@ fn shutdown_extraction_request_uses_outer_session_turn() {
 
     assert_eq!(
         req.turn_number(),
-        12,
+        Some(12),
         "shutdown extraction must record the persisted session turn, not the request-local loop step"
     );
 }

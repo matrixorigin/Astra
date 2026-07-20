@@ -2858,6 +2858,7 @@ fn has_llm_auth_override(
 /// **Note**: Caller must check rate-limit cooldown state and handle fallback model
 /// resolution BEFORE calling this function. This function only records errors
 /// for cooldown tracking, not pre-checks.
+#[cfg(test)]
 pub(crate) async fn call_llm_and_collect(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,

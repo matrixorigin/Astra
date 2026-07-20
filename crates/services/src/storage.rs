@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v5";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v6";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4312,9 +4312,10 @@ async fn ensure_core_schema_while_leased(
         "CREATE TABLE IF NOT EXISTS inference_routes (
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
+            harness_run_id VARCHAR(128) NULL,
             offering_id VARCHAR(64) NOT NULL,
             resolved_model_name VARCHAR(255) NOT NULL,
             upstream_model_name VARCHAR(255) NOT NULL,
@@ -4325,12 +4326,17 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind
-                CHECK (scope_kind IN ('run', 'session')),
+                CHECK (scope_kind IN ('run', 'session', 'harness_run')),
             CONSTRAINT chk_inference_routes_scope_owner
-                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
-                    OR (scope_kind = 'session' AND run_id IS NULL)),
+                CHECK ((scope_kind = 'run' AND session_id IS NOT NULL
+                        AND run_id IS NOT NULL AND harness_run_id IS NULL)
+                    OR (scope_kind = 'session' AND session_id IS NOT NULL
+                        AND run_id IS NULL AND harness_run_id IS NULL)
+                    OR (scope_kind = 'harness_run' AND session_id IS NULL
+                        AND run_id IS NULL AND harness_run_id IS NOT NULL)),
             INDEX idx_inference_routes_owner_session_created (user_id, session_id, created_at, route_id),
             INDEX idx_inference_routes_owner_run_created (user_id, run_id, created_at, route_id),
+            INDEX idx_inference_routes_owner_harness_created (user_id, harness_run_id, created_at, route_id),
             INDEX idx_inference_routes_offering_created (offering_id, created_at, route_id)
         )",
     )
@@ -4342,11 +4348,12 @@ async fn ensure_core_schema_while_leased(
             invocation_id VARCHAR(64) NOT NULL,
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
-            turn_index BIGINT NOT NULL,
-            round_index BIGINT NOT NULL,
+            harness_run_id VARCHAR(128) NULL,
+            turn_index BIGINT NULL,
+            round_index BIGINT NULL,
             operation_id VARCHAR(64) NOT NULL,
             logical_attempt BIGINT NOT NULL,
             purpose VARCHAR(64) NOT NULL,
@@ -4363,15 +4370,23 @@ async fn ensure_core_schema_while_leased(
             terminal_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, invocation_id),
             CONSTRAINT chk_inference_invocations_scope_kind
-                CHECK (scope_kind IN ('run', 'session')),
+                CHECK (scope_kind IN ('run', 'session', 'harness_run')),
             CONSTRAINT chk_inference_invocations_scope_owner
-                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
-                    OR (scope_kind = 'session' AND run_id IS NULL)),
+                CHECK ((scope_kind = 'run' AND session_id IS NOT NULL
+                        AND run_id IS NOT NULL AND harness_run_id IS NULL
+                        AND turn_index IS NOT NULL AND round_index IS NOT NULL)
+                    OR (scope_kind = 'session' AND session_id IS NOT NULL
+                        AND run_id IS NULL AND harness_run_id IS NULL
+                        AND turn_index IS NOT NULL AND round_index IS NOT NULL)
+                    OR (scope_kind = 'harness_run' AND session_id IS NULL
+                        AND run_id IS NULL AND harness_run_id IS NOT NULL
+                        AND turn_index IS NULL AND round_index IS NULL)),
             CONSTRAINT chk_inference_invocations_status
                 CHECK (status IN ('admitted', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
+            INDEX idx_inference_invocations_owner_harness_created (user_id, harness_run_id, created_at, invocation_id),
             INDEX idx_inference_invocations_status_created (status, created_at, user_id, invocation_id)
         )",
     )
@@ -4383,8 +4398,9 @@ async fn ensure_core_schema_while_leased(
             attempt_id VARCHAR(64) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
             run_id VARCHAR(64) NULL,
+            harness_run_id VARCHAR(128) NULL,
             attempt_index BIGINT NOT NULL,
             provider VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
@@ -4399,11 +4415,16 @@ async fn ensure_core_schema_while_leased(
             started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, attempt_id),
+            CONSTRAINT chk_inference_provider_attempts_scope_owner
+                CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
+                    OR (session_id IS NULL AND run_id IS NULL
+                        AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_provider_attempts_status
                 CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
+            INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id),
             INDEX idx_inference_attempts_status_started (status, started_at, user_id, attempt_id)
         )",
     )
@@ -4424,16 +4445,31 @@ async fn ensure_core_schema_while_leased(
         &["scope_kind", "operation_id"],
     )
     .await?;
-    for table in [
-        "inference_routes",
-        "inference_invocations",
-        "inference_provider_attempts",
+    for (table, nullable_columns) in [
+        (
+            "inference_routes",
+            &["session_id", "run_id", "harness_run_id"][..],
+        ),
+        (
+            "inference_invocations",
+            &[
+                "session_id",
+                "run_id",
+                "harness_run_id",
+                "turn_index",
+                "round_index",
+            ][..],
+        ),
+        (
+            "inference_provider_attempts",
+            &["session_id", "run_id", "harness_run_id"][..],
+        ),
     ] {
         fail_if_required_columns_missing_or_not_nullable(
             &pool,
             &settings.database,
             table,
-            &["run_id"],
+            nullable_columns,
         )
         .await?;
     }

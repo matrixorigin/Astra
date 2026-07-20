@@ -629,8 +629,9 @@ Refresh or reconnect resumes from a durable event cursor. The SDK does not inven
 wire types, not parallel Web/CLI/Server structs. Non-streaming SDK calls use a
 typed `CompletionRequest` and `CompletionResponse`; callers do not construct a
 free-form JSON envelope or index into an unvalidated response. A completion
-scope is either an authenticated agent run or a real session-owned operation.
-It never fabricates a run ID for memory, compaction, or other session work.
+scope is an authenticated agent run, a real session-owned operation, or a
+durable Harness run. Memory and compaction require session ownership; Skillify
+requires Harness ownership. Neither fabricates a run or session identity.
 
 This contract intentionally replaces the former `selected_model` and raw
 model/provider/gateway request shapes. There is no dual interpretation or
@@ -805,8 +806,9 @@ Tests validate behavior, persisted facts, wire payloads, streams, and product pr
 - External-account and cross-tenant isolation.
 - CAS transition and revoke races.
 - Route/invocation/attempt persistence before provider execution.
-- Run-owned and session-owned admission, including cross-user rejection and no
-  fabricated run identity for memory/compaction/reflection work.
+- Run-owned, session-owned, and Harness-owned admission, including cross-user
+  rejection and no fabricated run/session identity for memory, compaction,
+  reflection, or Skillify work.
 - Idempotent usage settlement and crash recovery.
 - Revision invalidation across multiple Server instances.
 
