@@ -296,7 +296,7 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
 }
 
 #[tokio::test]
-async fn execute_with_metadata_read_file_reuse_is_structured_noop_or_cached() {
+async fn execute_with_metadata_read_file_cache_replays_evidence_without_noop_classification() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf());
@@ -315,12 +315,21 @@ async fn execute_with_metadata_read_file_reuse_is_structured_noop_or_cached() {
 
     let second = executor.execute_with_metadata("read_file", &args).await;
     assert!(!second.is_error, "{second:?}");
-    let fields = second.tool_result_fields.expect("metadata fields");
     assert_eq!(
-        fields
-            .get("result_class")
-            .and_then(serde_json::Value::as_str),
-        Some(session_journal::NOOP_OR_CACHED_RESULT_CLASS)
+        second.output, first.output,
+        "an unchanged cached read must replay the requested evidence"
+    );
+    assert!(
+        second.output.contains("fn a()"),
+        "cached read must include file content: {second:?}"
+    );
+    assert!(
+        second
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("result_class"))
+            .is_none(),
+        "content replay must not be classified as cached/noop: {second:?}"
     );
 }
 
