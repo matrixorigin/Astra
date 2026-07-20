@@ -742,6 +742,62 @@ An extreme mode where prompt and agent state never reach Astra Server requires a
 - Repair resumes from durable invocation state and does not relaunch completed children.
 - Agent Workbench shows actual model, Model Access, state, and usage for each branch.
 
+### Execution-authority boundaries
+
+The following boundaries are normative for every inference surface:
+
+1. **Offering admission owns route material.** A run may remember the selected
+   effective Offering ID, but it must not treat a previously decrypted route as
+   authorization for a later provider request. Immediately before each provider
+   request, Server revalidates the Offering and materializes the current route and
+   credential generation. This check occurs per request, never per streamed token.
+   A disabled Offering therefore blocks the next request; credential and endpoint
+   rotation therefore affect the next request without restarting the run.
+2. **The durable ledger owns inference termination.** Admission returns a
+   cancellation-safe invocation handle. Exactly one supervisor owns its deadline
+   and provider attempt. Dropping, aborting, or timing out the caller converges the
+   attempt to `DeliveryUnknown` after provider I/O begins, or `Cancelled` before
+   provider I/O begins, and then settles the logical invocation. Callers must not
+   wrap the same operation in an independent competing timeout.
+3. **Each API surface owns its producer identity.** Public completion proxy calls
+   are session-owned auxiliary inference, not arbitrary internal run or harness
+   work. Server derives their producer namespace, purpose, and durable scope from a
+   typed operation. A client cannot claim an internal producer identity, attach an
+   inference to a run, or pre-create an identity later needed by runtime work.
+4. **Only product policy selects an Offering.** Skills declare capabilities and
+   instructions; they do not pin a provider model or deployment-specific Offering.
+   An agent profile may carry an opaque `ModelSelection`. A child with no explicit
+   selection inherits its parent's Offering. A child with an explicit selection is
+   independently admitted under the same principal, data, billing, and purpose
+   policy before its run starts. Bare model-name overrides do not cross an
+   execution boundary.
+
+These rules deliberately keep caches, skill metadata, client requests, and caller
+futures as consumers of lifecycle truth rather than additional lifecycle
+producers.
+
+### Causal verification gates
+
+Offline contract tests cover typed request rejection, inheritance versus explicit
+child selection, single deadline ownership, and terminal-state transitions. Online
+tests use MatrixOne plus a controllable mock provider and prove observable causes:
+
+- disable an Offering between two requests and assert that the second request
+  never reaches the provider;
+- rotate route or credential generation and assert that the next request uses the
+  new material;
+- abort a non-streaming call after the provider accepts it and assert durable
+  provider-attempt and logical-invocation terminals;
+- retry the same auxiliary request concurrently and assert one producer-owned
+  durable identity;
+- reject public attempts to claim run, harness, or internal producer ownership;
+- independently admit an explicitly selected child Offering, while an unselected
+  child inherits the parent's Offering.
+
+Tests must inspect typed responses and durable rows. Source-text matching, sleeps
+as correctness assertions, and tests that only prove rendering or lack of panic do
+not satisfy these gates.
+
 ## Failure semantics
 
 | Condition | Required behavior |
