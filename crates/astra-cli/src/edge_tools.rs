@@ -1321,6 +1321,10 @@ pub struct ToolExecutor {
     /// Whether the user has been notified about Memoria being down.
     /// Prevents spamming the same warning every turn.
     memoria_notified_down: std::sync::atomic::AtomicBool,
+    /// Canonical executor identity used to attribute memory recalls and their
+    /// eventual feedback. Isolated sub-runs use their host-owned identity even
+    /// when they intentionally have no durable `AgenticLoopState` run id.
+    memory_attribution_id: Option<String>,
     /// File state tracker: records mtime after each read/write/edit.
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
@@ -1539,6 +1543,7 @@ impl ToolExecutor {
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker::default(),
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
+            memory_attribution_id: None,
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             bash_progress_sink: std::sync::RwLock::new(None),
@@ -1754,6 +1759,30 @@ impl ToolExecutor {
             self.install_default_test_visible_surface();
         }
         self
+    }
+
+    /// Bind memory lifecycle events to one host-owned producer identity. Tool
+    /// execution and the loop run boundary then close the same queue.
+    pub fn with_memory_attribution_id(mut self, producer_id: impl Into<String>) -> Self {
+        let producer_id = producer_id.into();
+        self.memory_attribution_id = (!producer_id.trim().is_empty()).then_some(producer_id);
+        self
+    }
+
+    /// Return the exact recall ledger scope used by this executor.
+    pub(crate) fn memory_recall_scope(&self) -> Option<(String, String)> {
+        let session_id = self.active_session_id()?.trim().to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+        let producer_id = self
+            .memory_attribution_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|producer_id| !producer_id.is_empty())
+            .unwrap_or("session")
+            .to_string();
+        Some((session_id, producer_id))
     }
 
     /// Install schemas declared by CLI-side providers so
@@ -2480,28 +2509,17 @@ impl ToolExecutor {
     }
 
     fn memory_args_with_context(&self, args: &Value) -> Value {
-        let mut clean_args = args.clone();
-        if let Some(obj) = clean_args.as_object_mut() {
-            obj.remove("action");
-            // Inject the active session id so memory targets and session-scoped
-            // recalls work. CLI does not own a user_id — leave it to the
-            // cloud proxy / Memoria server to fill in via the bearer token.
-            if let Some(sid) = self.active_session_id().filter(|sid| !sid.is_empty()) {
-                obj.insert("session_id".to_string(), serde_json::Value::String(sid));
-            }
-            let turn = self
-                .journal_turn_index
-                .load(std::sync::atomic::Ordering::Acquire);
-            obj.insert(
-                "turn".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(turn)),
-            );
-            obj.insert(
-                "_attribution_id".to_string(),
-                serde_json::Value::String(format!("cli-turn:{turn}")),
-            );
-        }
-        clean_args
+        let session_id = self.active_session_id();
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Acquire);
+        astra_tools::memoria::MemoriaToolGateway::args_with_runtime_context(
+            args,
+            session_id.as_deref(),
+            None,
+            turn,
+            self.memory_attribution_id.as_deref().unwrap_or("session"),
+        )
     }
 
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
@@ -5599,30 +5617,37 @@ impl ToolExecutor {
             && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
-            let turn = self
-                .journal_turn_index
-                .load(std::sync::atomic::Ordering::Acquire);
-            let producer_id = format!("cli-turn:{turn}");
-            let client = astra_tools::memoria::MemoriaToolGateway::new(
-                self.cloud_base.clone(),
-                self.cloud_token(),
+            let producer_id = self
+                .memory_attribution_id
+                .clone()
+                .unwrap_or_else(|| "session".to_string());
+            let snapshots = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
+                &session_id,
+                &producer_id,
+                None,
             );
-            let ctx = format!("cli-tool:{name}");
-            tokio::spawn(async move {
-                let report = client
-                    .feedback_pending_recalls(&session_id, &producer_id, "useful", &ctx)
-                    .await;
-                if report.attempted > 0 {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        context = %ctx,
-                        attempted = report.attempted,
-                        succeeded = report.succeeded,
-                        failed = report.failed,
-                        "closed recall feedback after successful cli tool"
-                    );
-                }
-            });
+            if !snapshots.is_empty() {
+                let client = astra_tools::memoria::MemoriaToolGateway::new(
+                    self.cloud_base.clone(),
+                    self.cloud_token(),
+                );
+                let ctx = format!("cli-tool:{name}");
+                tokio::spawn(async move {
+                    let report = client
+                        .feedback_recall_snapshots(snapshots, "useful", &ctx)
+                        .await;
+                    if report.attempted > 0 {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            context = %ctx,
+                            attempted = report.attempted,
+                            succeeded = report.succeeded,
+                            failed = report.failed,
+                            "closed recall feedback after successful cli tool"
+                        );
+                    }
+                });
+            }
         }
         self.record_output_size(output.len());
         output
@@ -9478,7 +9503,9 @@ mod tests {
 
     #[test]
     fn memory_args_include_session_and_current_turn() {
-        let executor = test_executor().with_active_session_id("mem-session");
+        let executor = test_executor()
+            .with_active_session_id("mem-session")
+            .with_memory_attribution_id("run-memory-9");
         executor
             .journal_turn_index
             .store(9, std::sync::atomic::Ordering::Release);
@@ -9486,12 +9513,19 @@ mod tests {
         let args = executor.memory_args_with_context(&serde_json::json!({
             "action": "recall",
             "query": "memory loop",
+            "session_id": "prompt-session",
+            "turn": 100,
+            "_attribution_id": "prompt-producer",
         }));
 
         assert!(args.get("action").is_none());
         assert_eq!(args["session_id"].as_str(), Some("mem-session"));
         assert_eq!(args["turn"].as_u64(), Some(9));
-        assert_eq!(args["_attribution_id"].as_str(), Some("cli-turn:9"));
+        assert_eq!(args["_attribution_id"].as_str(), Some("run-memory-9"));
+        assert_eq!(
+            executor.memory_recall_scope(),
+            Some(("mem-session".to_string(), "run-memory-9".to_string()))
+        );
     }
 
     #[tokio::test]

@@ -725,6 +725,42 @@ impl MemoriaToolGateway {
         }
     }
 
+    /// Project caller arguments into the runtime-owned Memoria execution
+    /// context. Identity fields are authoritative runtime data: prompt/tool
+    /// arguments may not preserve, omit, or spoof them.
+    pub fn args_with_runtime_context(
+        args: &Value,
+        session_id: Option<&str>,
+        user_id: Option<&str>,
+        turn: u32,
+        producer_id: &str,
+    ) -> Value {
+        let mut projected = args.clone();
+        let Some(object) = projected.as_object_mut() else {
+            return projected;
+        };
+
+        for key in ["action", "session_id", "user_id", "turn", "_attribution_id"] {
+            object.remove(key);
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            object.insert("session_id".into(), Value::String(session_id.into()));
+        }
+        if let Some(user_id) = user_id.map(str::trim).filter(|id| !id.is_empty()) {
+            object.insert("user_id".into(), Value::String(user_id.into()));
+        }
+        object.insert("turn".into(), Value::Number(turn.into()));
+        let producer_id = match producer_id.trim() {
+            "" => "session",
+            producer_id => producer_id,
+        };
+        object.insert(
+            "_attribution_id".into(),
+            Value::String(producer_id.to_string()),
+        );
+        projected
+    }
+
     /// Record a `focus` hint for the given session. Returns the synthetic
     /// response the LLM sees (mirrors the v2 FocusResponse shape).
     pub fn focus_set(&self, session_id: &str, args: &Value) -> String {
@@ -967,24 +1003,18 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().reset_session(session_id);
     }
 
-    /// Drain pending recalls and push one feedback signal for every
-    /// surfaced memory id. Intended for tool-result lifecycle hooks:
-    /// when a non-memory tool succeeds after a recall, the recall gets
-    /// prompt feedback immediately instead of waiting for session-end.
-    ///
-    /// Best-effort: the recall ledger is consumed exactly once, and failed
-    /// feedback attempts are counted + logged so loss is observable.
-    pub async fn feedback_pending_recalls(
+    /// Submit feedback for snapshots whose ownership has already moved out of
+    /// the in-process recall ledger. Lifecycle hooks use this form so the
+    /// synchronous ownership transfer cannot race turn finalization.
+    pub async fn feedback_recall_snapshots(
         &self,
-        session_id: &str,
-        producer_id: &str,
+        snapshots: Vec<RecallSnapshot>,
         signal: &str,
         context_prefix: &str,
     ) -> FeedbackDrainReport {
-        if session_id.is_empty() || producer_id.is_empty() || signal.is_empty() {
+        if signal.is_empty() {
             return FeedbackDrainReport::default();
         }
-        let snapshots = Self::drain_recalls_for_producer(session_id, producer_id, None);
         let mut report = FeedbackDrainReport::default();
         for snap in snapshots {
             for id in snap.memory_ids {
@@ -3405,6 +3435,31 @@ mod memoria_http_client_tests {
     use super::*;
 
     #[test]
+    fn runtime_context_replaces_prompt_owned_identity_fields() {
+        let projected = MemoriaToolGateway::args_with_runtime_context(
+            &json!({
+                "action": "recall",
+                "query": "relevant decisions",
+                "session_id": "spoofed-session",
+                "user_id": "spoofed-user",
+                "turn": 999,
+                "_attribution_id": "spoofed-producer"
+            }),
+            Some(" session-1 "),
+            Some(" user-1 "),
+            7,
+            "run-1",
+        );
+
+        assert!(projected.get("action").is_none());
+        assert_eq!(projected["query"], "relevant decisions");
+        assert_eq!(projected["session_id"], "session-1");
+        assert_eq!(projected["user_id"], "user-1");
+        assert_eq!(projected["turn"], 7);
+        assert_eq!(projected["_attribution_id"], "run-1");
+    }
+
+    #[test]
     fn purge_session_id_not_supported() {
         // Memoria PurgeRequest only accepts memory_ids and topic.
         // session_id is NOT a valid filter — it would cause 422.
@@ -4239,8 +4294,18 @@ mod memoria_http_client_tests {
     }
 
     #[tokio::test]
-    async fn feedback_pending_recalls_drains_queue_once() {
+    async fn owned_recall_snapshots_submit_feedback_once() {
         use super::*;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/memory/feedback/(m1|m2)$"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
         let session_id = "r5-feedback-drain";
         MemoriaToolGateway::reset_session_process_state(session_id);
         MemoriaToolGateway::record_recall_for_producer(
@@ -4249,18 +4314,20 @@ mod memoria_http_client_tests {
             7,
             vec!["m1".into(), "m2".into()],
         );
-        let client =
-            MemoriaToolGateway::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
+        let client = MemoriaToolGateway::new(Some(server.uri()), Some("token".into()));
+        let snapshots = MemoriaToolGateway::drain_recalls_for_producer(session_id, "session", None);
         let attempted = client
-            .feedback_pending_recalls(session_id, "session", "useful", "unit-test")
+            .feedback_recall_snapshots(snapshots, "useful", "unit-test")
             .await;
         assert_eq!(attempted.attempted, 2);
         assert_eq!(attempted.failed, 2);
         assert_eq!(attempted.succeeded, 0);
         assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
-        let attempted_again = client
-            .feedback_pending_recalls(session_id, "session", "useful", "unit-test")
-            .await;
-        assert_eq!(attempted_again.attempted, 0);
+        assert!(
+            MemoriaToolGateway::drain_recalls_for_producer(session_id, "session", None).is_empty(),
+            "ledger ownership must transfer exactly once"
+        );
+        server.verify().await;
+        MemoriaToolGateway::reset_session_process_state(session_id);
     }
 }

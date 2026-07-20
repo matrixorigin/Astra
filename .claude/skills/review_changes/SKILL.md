@@ -60,11 +60,25 @@ Target resolution:
 
 If the diff is empty after checking staged and unstaged changes, report "No changes found."
 
-Hard rule for `commits:<N>`: fetch all N full diffs before presenting a full review. If only K of N are available, label the review partial before findings.
+Hard rule for `commits:<N>`: cover all N commits before presenting a full review,
+but inspect them in bounded commit/file sections instead of requesting one
+monolithic diff. If only K of N are available, label the review partial before
+findings.
 
-If the user requests parallel reviews or multiple reviewers, use `git worktree` to create
-isolated checkouts — never degrade to serial execution when the user explicitly asked for
-parallelism.
+If the user requests parallel reviews or multiple reviewers, start one fixed-size
+parallel reviewer group immediately after the status/stat/name map. On Astra, use
+the skill-exposed `agent_fanout` directly; do not spend a discovery round searching
+for it and do not replace the group with multiple independent `agent` calls. On
+another host, use its canonical parallel delegation capability or disclose that the
+capability is unavailable. The parent coordinates coverage and validates results;
+it must not perform a duplicate broad review while the reviewers are running.
+Read-only reviewers may share immutable source. Use separate worktrees only when a
+reviewer may mutate files or reviewers need different refs.
+
+Keep review evidence bounded at the source. Prefer per-file hunks and exact line
+ranges over full repository/commit dumps. If a tool returns an artifact reference,
+do not pass `artifact://` to shell/file tools; rerun the evidence query with a
+narrower scope or use the artifact owner supplied by the host.
 
 ## Step 2: Build Review Map
 
@@ -106,6 +120,12 @@ Before reporting a finding:
 - Identify the concrete failure mode and user/system consequence.
 - Check whether an existing test would catch it.
 - Include file and line, using the new file line when possible.
+
+Reviewer output is candidate evidence, not verified truth. Agreement between
+reviewers does not raise confidence by itself. The parent must confirm each finding
+against current source, a reachable failure sequence, and the actual ownership
+boundary before calling it verified. Stop exploring once every changed ownership
+boundary has evidence and every reported finding passes this gate.
 
 Do not report:
 

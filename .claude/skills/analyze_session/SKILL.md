@@ -61,7 +61,7 @@ the message/tool/prompt snapshot it contains.
 
 ## Phase 2: Trust The Digest Schema
 
-Stable schema: `schema_version = "astra-journal-digest-v1"` from
+Stable schema: `schema_version = "astra-journal-digest-v2"` from
 `crates/astra-cli/src/cli/journal_digest.rs`.
 
 Use these fields directly. Do not invent numbers.
@@ -70,6 +70,7 @@ Use these fields directly. Do not invent numbers.
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `aggregates`                      | Turn count, tokens, duration, tool counts, failures, stalls, compactions                                     |
 | `turns[]`                         | Per-turn tokens, latency, TTFT, context time, visible/used/activated tools, selected skills, budget pressure |
+| `subruns[]`                       | Child-run identities and their own LLM/tool rounds; never merge these into root turns by numeric turn id     |
 | `failed_tool_calls[]`             | Failed call category, tool name, args preview, error preview                                                 |
 | `compaction_events[]`             | When context was compacted and what signal triggered it                                                      |
 | `stalls[]`                        | Stall/circuit-breaker evidence                                                                               |

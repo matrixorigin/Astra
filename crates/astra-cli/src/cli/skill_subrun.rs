@@ -350,6 +350,10 @@ fn attach_runtime_volatile_injections(
 
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
+    fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
+        self.executor.memory_recall_scope()
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -743,6 +747,15 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
+        let safe_name = astra_skills::loader::sanitize_for_path(skill_name);
+        let subrun_session_id = format!(
+            "subrun-{}-{}",
+            safe_name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
 
         // Issue #326 P5b: skill subruns are headless — never read
         // project allow rules. Deny rules and the user-level rule
@@ -754,7 +767,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let permission_context = perm_manager.runtime_permission_handle();
 
         let executor = edge_tools::ToolExecutor::new(&self.project_root)
-            .with_cloud(self.api.api_origin(), &self.token);
+            .with_cloud(self.api.api_origin(), &self.token)
+            .with_memory_attribution_id(subrun_session_id.clone());
         executor.set_cli_local_provider_schemas(all_schemas.clone());
         if let Some(session_id) = self.active_session_id.as_deref() {
             executor.set_active_session_id(session_id.to_string());
@@ -823,15 +837,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         };
 
         let task_profile = infer_task_execution_profile(task_context);
-        let safe_name = astra_skills::loader::sanitize_for_path(skill_name);
-        let subrun_session_id = format!(
-            "subrun-{}-{}",
-            safe_name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros()
-        );
         let user_id = cli_user_id();
         let step_recorder = StepRecorder::with_persistence(
             &user_id,

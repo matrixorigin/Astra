@@ -546,6 +546,10 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliAgenticLoopHost<'_> {
+    fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
+        self.executor.memory_recall_scope()
+    }
+
     fn agent_live_event_sink(
         &self,
     ) -> Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink> {

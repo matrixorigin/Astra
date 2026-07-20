@@ -307,7 +307,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         );
 
         let executor = edge_tools::ToolExecutor::new(&effective_root)
-            .with_cloud(self.api.api_origin(), &self.token);
+            .with_cloud(self.api.api_origin(), &self.token)
+            .with_memory_attribution_id(config.run_id.clone());
         executor.set_cli_local_provider_schemas(all_schemas.clone());
         if !config.session_id.trim().is_empty() {
             executor.set_active_session_id(config.session_id.clone());

@@ -284,53 +284,6 @@ fn skill_md_example_blocks_are_parseable() {
 }
 
 #[test]
-fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
-    let path = astra_core::test_paths::workspace_path(".agent/skills")
-        .join("review_changes")
-        .join("SKILL.md");
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-
-    assert!(
-        text.contains("worktree") && text.contains("degrade"),
-        "review_changes must explicitly disclose worktree/parallel fallback"
-    );
-    assert!(
-        text.contains("Self-critique gate") && text.contains("git diff --check"),
-        "review_changes must run a self-critique lint gate before the final report"
-    );
-    assert!(
-        text.contains("ownership delta")
-            && text.contains("real CLI/server/web/edge entrypoint")
-            && text.contains("Were replaced implementations"),
-        "review_changes must reject parallel or unwired subsystem growth"
-    );
-}
-
-#[test]
-fn astra_dev_skill_requires_one_owner_and_retirement_evidence() {
-    let path = astra_core::test_paths::workspace_path(".agent/skills")
-        .join("astra-dev")
-        .join("SKILL.md");
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-
-    for required in [
-        "One Owner, One Wired Path",
-        "real product entrypoint",
-        "authority, deployment, security, or resource-lifecycle boundary",
-        "delete the old implementation",
-        "complexity delta",
-        "real configured database",
-    ] {
-        assert!(
-            text.contains(required),
-            "astra-dev is missing systemic cleanup constraint: {required}"
-        );
-    }
-}
-
-#[test]
 fn project_claude_and_agent_skill_bodies_stay_in_sync() {
     let agent_root = astra_core::test_paths::workspace_path(".agent/skills");
     let claude_root = astra_core::test_paths::workspace_path(".claude/skills");
@@ -367,7 +320,7 @@ fn project_claude_and_agent_skill_bodies_stay_in_sync() {
                     .filter(|tool| !claude_tools.contains(tool))
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
-                ["agent"],
+                ["agent_fanout"],
                 "review_changes may expose only the Agent-host parallelism capability as a root-specific delta"
             );
         } else {

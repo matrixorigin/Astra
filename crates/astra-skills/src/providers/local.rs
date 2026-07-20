@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_changes_skill_keeps_agent_available_for_parallel_reviews() {
+    async fn review_changes_skill_exposes_fixed_fanout_for_parallel_reviews() {
         let repo_skills = astra_core::test_paths::workspace_path(".agent/skills")
             .canonicalize()
             .expect("repo skills dir should resolve in workspace tests");
@@ -299,8 +299,16 @@ mod tests {
                 .manifest
                 .allowed_tools
                 .iter()
+                .any(|tool| tool == "agent_fanout"),
+            "review-changes must expose fixed fanout without a discovery round"
+        );
+        assert!(
+            !loaded
+                .manifest
+                .allowed_tools
+                .iter()
                 .any(|tool| tool == "agent"),
-            "review-changes must keep the agent tool visible so user-requested parallel reviews do not degrade to serial execution"
+            "review-changes must not expose a competing per-agent lifecycle"
         );
     }
 }

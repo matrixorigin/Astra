@@ -194,6 +194,30 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Exact process-local recall ledger scope owned by this loop.
+    ///
+    /// The default covers ordinary CLI and server runs. Hosts whose tool
+    /// executor intentionally uses a different session (for example an
+    /// isolated skill sub-run) override this rather than making finalization
+    /// infer tool ownership from prompt or transcript state.
+    fn memory_recall_scope(&self, state: &AgenticLoopState) -> Option<(String, String)> {
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            return Some(executor.memory_recall_scope(state.current_run_id.as_deref()));
+        }
+        let session_id = state
+            .current_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())?;
+        let producer_id = state
+            .current_run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|producer_id| !producer_id.is_empty())
+            .unwrap_or("session");
+        Some((session_id.to_string(), producer_id.to_string()))
+    }
+
     /// Execute one LLM turn: prepare payload → POST → consume SSE.
     ///
     /// The host is responsible for all CLI/server-specific logic:

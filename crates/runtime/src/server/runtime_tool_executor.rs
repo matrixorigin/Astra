@@ -98,6 +98,15 @@ use astra_turn_core::file_edit_journal::FileEditJournal;
 
 mod tool_handlers;
 
+pub(super) const DEFAULT_MEMORY_PRODUCER_ID: &str = "server-run";
+
+pub(super) fn memory_producer_id(run_id: Option<&str>) -> &str {
+    run_id
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+        .unwrap_or(DEFAULT_MEMORY_PRODUCER_ID)
+}
+
 #[cfg(test)]
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
@@ -601,6 +610,16 @@ impl RuntimeToolExecutor {
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
         }
+    }
+
+    /// Return the exact ledger scope used by server-local memory calls.
+    /// Agentic-loop cleanup asks the executor instead of reconstructing the
+    /// session or fallback producer from unrelated loop state.
+    pub(crate) fn memory_recall_scope(&self, run_id: Option<&str>) -> (String, String) {
+        (
+            self.session_id.clone(),
+            memory_producer_id(run_id).to_string(),
+        )
     }
 
     pub fn task_manager(&self) -> Arc<TaskManager> {
@@ -2781,7 +2800,7 @@ impl RuntimeToolExecutor {
 
         let lifecycle = LocalToolExecutionLifecycle {
             session_id: &self.session_id,
-            producer_id: non_empty_identity(&request.run_id).unwrap_or("server-run"),
+            producer_id: memory_producer_id(Some(&request.run_id)),
             aggregate_output_bytes: &self.aggregate_output_bytes,
             memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),

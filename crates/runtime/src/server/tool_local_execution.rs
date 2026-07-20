@@ -135,24 +135,13 @@ pub(crate) fn memory_args_with_context(
     turn_index: u32,
     producer_id: &str,
 ) -> Value {
-    let mut isolated_args = args.clone();
-    if let Some(obj) = isolated_args.as_object_mut() {
-        obj.remove("action");
-        obj.insert(
-            "session_id".to_string(),
-            Value::String(session_id.to_string()),
-        );
-        obj.insert("user_id".to_string(), Value::String(user_id.to_string()));
-        obj.insert(
-            "turn".to_string(),
-            Value::Number(serde_json::Number::from(turn_index)),
-        );
-        obj.insert(
-            "_attribution_id".to_string(),
-            Value::String(producer_id.to_string()),
-        );
-    }
-    isolated_args
+    astra_tools::memoria::MemoriaToolGateway::args_with_runtime_context(
+        args,
+        Some(session_id),
+        Some(user_id),
+        turn_index,
+        producer_id,
+    )
 }
 
 pub(crate) fn normalize_local_tool_result_output(
@@ -183,8 +172,15 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
         return false;
     }
 
+    let snapshots = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
+        session_id,
+        producer_id,
+        None,
+    );
+    if snapshots.is_empty() {
+        return false;
+    }
     let session_id = session_id.to_string();
-    let producer_id = producer_id.to_string();
     let context = format!("server-tool:{name}");
     let client = astra_tools::memoria::MemoriaToolGateway::new(
         memoria_client.cloud_base.clone(),
@@ -193,7 +189,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     tokio::spawn(
         async move {
             let report = client
-                .feedback_pending_recalls(&session_id, &producer_id, "useful", &context)
+                .feedback_recall_snapshots(snapshots, "useful", &context)
                 .await;
             if report.attempted > 0 {
                 tracing::debug!(
@@ -367,5 +363,35 @@ mod tests {
             &failed,
             &client,
         ));
+    }
+
+    #[tokio::test]
+    async fn memory_recall_feedback_takes_ledger_ownership_before_returning() {
+        let session_id = format!("feedback-ownership-transfer-{}", uuid::Uuid::new_v4());
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            &session_id,
+            "run-1",
+            1,
+            vec!["memory-1".into()],
+        );
+        let client = astra_tools::memoria::MemoriaToolGateway::new(
+            Some("http://127.0.0.1:1".into()),
+            Some("test-token".into()),
+        );
+
+        assert!(spawn_memory_recall_feedback_after_success(
+            &session_id,
+            "run-1",
+            "bash",
+            &astra_tools::ToolResult::text("ok".into()),
+            &client,
+        ));
+        assert_eq!(
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(&session_id),
+            0,
+            "run-boundary cleanup must not race the feedback worker for ledger ownership"
+        );
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }
 }

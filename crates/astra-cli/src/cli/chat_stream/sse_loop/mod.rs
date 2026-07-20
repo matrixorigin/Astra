@@ -316,8 +316,9 @@ pub(crate) async fn stream_chat_sse(
     // not advance its resumable timeline.
     let persist_session_artifacts = p.file_journal.is_some() || p.session_state_journal.is_some();
     let mut executor = {
-        let ex =
-            edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+        let ex = edge_tools::ToolExecutor::new(&project_root)
+            .with_cloud(p.api.api_origin(), p.token)
+            .with_memory_attribution_id(parent_turn_run_id.clone());
         let ex = if let Some(session_id) = p.session_id {
             ex.with_active_session_id(session_id.to_string())
         } else {

@@ -460,6 +460,43 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     state.stall.last_heavy_checkpoint = Some(cp);
 }
 
+/// Producer-scoped cleanup that also runs when the loop future is cancelled.
+struct UnattributedRecallRunBoundary {
+    scope: Option<(String, String)>,
+}
+
+impl UnattributedRecallRunBoundary {
+    fn new(scope: Option<(String, String)>) -> Self {
+        Self { scope }
+    }
+
+    fn settle(&mut self) {
+        let Some((session_id, producer_id)) = self.scope.take() else {
+            return;
+        };
+        let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
+            &session_id,
+            &producer_id,
+            None,
+        )
+        .len();
+        if dropped > 0 {
+            tracing::debug!(
+                session_id,
+                producer_id,
+                dropped,
+                "dropped unattributed memory recalls without changing their rank"
+            );
+        }
+    }
+}
+
+impl Drop for UnattributedRecallRunBoundary {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 /// Run the multi-turn agentic loop using the provided host.
 ///
 /// This is the runtime-portable entry point. The host handles all
@@ -469,6 +506,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+    // Owned before the first await so task cancellation and panic unwinding
+    // settle the same producer queue as normal and error returns.
+    let _recall_run_boundary = UnattributedRecallRunBoundary::new(host.memory_recall_scope(state));
     let result = run_agentic_loop_impl(host, state).await;
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
@@ -586,7 +626,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     }
 
     finalize_turn_trace(state).await;
-    drop_unattributed_memory_recalls_at_turn_end(state);
 
     // Background session-memory extraction. Fire-and-forget; service
     // handles LLM vs. rule-based decision, event emission, UX broker,
@@ -974,34 +1013,6 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         crate::session_memory::SpawnDecision::Spawned => {}
         crate::session_memory::SpawnDecision::Queued => {}
         crate::session_memory::SpawnDecision::Skipped => {}
-    }
-}
-
-fn drop_unattributed_memory_recalls_at_turn_end(state: &mut AgenticLoopState) {
-    let Some(session_id) = state
-        .current_session_id
-        .as_deref()
-        .filter(|sid| !sid.is_empty())
-    else {
-        return;
-    };
-    let producer_id = state
-        .current_run_id
-        .clone()
-        .unwrap_or_else(|| format!("cli-turn:{}", session_turn_number(state)));
-    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
-        session_id,
-        &producer_id,
-        None,
-    )
-    .len();
-    if dropped > 0 {
-        tracing::debug!(
-            session_id = %session_id,
-            producer_id,
-            dropped,
-            "dropped unattributed memory recalls without changing their rank"
-        );
     }
 }
 
@@ -2291,10 +2302,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_drains_pending_recall_feedback_for_server_executor() {
+    async fn run_boundary_uses_executor_owned_scope_after_host_error() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
-        let session_id = format!("server-finalize-feedback-{}", uuid::Uuid::new_v4());
+        let parent_session_id = format!("parent-session-{}", uuid::Uuid::new_v4());
+        let session_id = format!("executor-session-{}", uuid::Uuid::new_v4());
         let workspace = tempfile::TempDir::new().unwrap();
         let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.path().to_path_buf(),
@@ -2303,25 +2315,106 @@ mod tests {
             None,
             None,
         );
+        let (_, producer_id) = executor.memory_recall_scope(None);
+        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
-            "run-1",
+            &producer_id,
             1,
             vec!["m1".into()],
         );
-        state.current_session_id = Some(session_id.clone());
-        state.current_run_id = Some("run-1".to_string());
-        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
-        state.final_text = "Done.".into();
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            &session_id,
+            "concurrent-run",
+            1,
+            vec!["m2".into()],
+        );
+        state.current_session_id = Some(parent_session_id);
+        state.current_run_id = None;
 
-        finalize_and_render(&mut host, &mut state).await;
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(result.is_err(), "empty host must exercise the error exit");
+        assert_eq!(
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(&session_id),
+            1,
+            "run boundary must use the executor session and canonical fallback producer without touching concurrent work"
+        );
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
+    }
+
+    #[tokio::test]
+    async fn aborting_loop_future_drains_its_producer_recall_queue() {
+        struct PendingHost {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            valid_tool_names: std::collections::HashSet<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgenticLoopHost for PendingHost {
+            fn emit_headless_line(
+                &mut self,
+                _style: astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle,
+                _line: String,
+            ) {
+            }
+
+            fn is_quiet(&self) -> bool {
+                true
+            }
+
+            fn valid_tool_names(&self) -> &std::collections::HashSet<String> {
+                &self.valid_tool_names
+            }
+
+            async fn execute_turn(
+                &mut self,
+                _state: &mut AgenticLoopState,
+            ) -> Result<crate::turn::agentic_loop::host::HostTurnResult, astra_core::ClassifiedError>
+            {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                std::future::pending().await
+            }
+        }
+
+        let mut state = make_state();
+        let session_id = format!("cancelled-run-feedback-{}", uuid::Uuid::new_v4());
+        state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("cancelled-run".to_string());
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            &session_id,
+            "cancelled-run",
+            1,
+            vec!["m1".into()],
+        );
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut host = PendingHost {
+                entered: Some(entered_tx),
+                valid_tool_names: std::collections::HashSet::new(),
+            };
+            run_agentic_loop_with_host(&mut host, &mut state).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("loop must reach the cancellable host await")
+            .expect("host must signal before blocking");
+        task.abort();
+        let join_error = task
+            .await
+            .expect_err("aborted loop must not complete normally");
+        assert!(join_error.is_cancelled());
 
         assert_eq!(
             astra_tools::memoria::MemoriaToolGateway::pending_recall_count(&session_id),
             0,
-            "server finalization must drain pending recall feedback on memory-only turns"
+            "cancelling the loop future must release its producer-owned recall queue"
         );
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }
 
     // I11 test removed in rebase: the branch wired a now-deleted

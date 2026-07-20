@@ -673,7 +673,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let effective_model = self.resolve_effective_model(config.model.as_deref());
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
-            .with_cloud(self.api.api_origin(), &token);
+            .with_cloud(self.api.api_origin(), &token)
+            .with_memory_attribution_id(config.run_id.clone());
         executor.set_cli_local_provider_schemas(all_schemas.clone());
         if let Some(ref cmds) = self.bg_task_commands {
             executor = executor.with_bg_task_commands(cmds.clone());

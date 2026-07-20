@@ -8,7 +8,6 @@ use crate::cli::session::session_projection::{
     CslCheckpointFields, build_full_session_state_compact,
 };
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_side_effects::drop_unattributed_memory_recalls_at_turn_end;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 
@@ -58,18 +57,6 @@ pub(crate) fn prepare_turn_post_commit_job(
     csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
 ) -> TurnPostCommitJob {
-    let producer_id = format!("cli-turn:{}", state.turn);
-    let dropped =
-        drop_unattributed_memory_recalls_at_turn_end(state.session_id.as_deref(), &producer_id);
-    if dropped > 0 {
-        tracing::debug!(
-            session_id = ?state.session_id,
-            producer_id,
-            dropped,
-            "dropped unattributed memory recalls without changing their rank"
-        );
-    }
-
     let csl_state = state
         .csl_manager
         .as_ref()
@@ -540,39 +527,5 @@ mod tests {
             Instant::now(),
         );
         assert!(state.csl_manager.is_some());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn turn_commit_drops_unattributed_recall_without_positive_feedback() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let mut state = SessionState::default();
-        let session_id = "sess-memory-drain";
-        state.session_id = Some(session_id.to_string());
-        state.turn = 1;
-        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
-            session_id,
-            "cli-turn:1",
-            1,
-            vec!["m1".into()],
-        );
-        let api = test_api();
-        let _job = prepare_turn_post_commit_job(
-            &mut state,
-            &api,
-            None,
-            Vec::new(),
-            extract_csl_fields_from_result(&crate::tests::stub_stream_result(
-                "The turn completed without attributable memory usage.",
-            )),
-            Instant::now(),
-        );
-
-        assert_eq!(
-            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
-            0,
-            "turn completion must synchronously drop unattributed recall state"
-        );
     }
 }

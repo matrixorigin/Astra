@@ -11,7 +11,7 @@ use astra_tools::tool_engine::{
     DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, ToolInvocationMetadata,
 };
 
-use super::RuntimeToolExecutor;
+use super::{RuntimeToolExecutor, memory_producer_id};
 use crate::server::tool_agent_info::{AgentInfoIdentity, render_agent_info};
 use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent_tool};
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
@@ -208,13 +208,12 @@ impl MemoryToolHandler {
             };
         }
         let turn = context.journal_turn_index.load(Ordering::Relaxed);
-        let fallback_producer = format!("server-turn:{turn}");
         let isolated_args = memory_args_with_context(
             args,
             &context.session_id,
             &context.user_id,
             turn,
-            producer_id.unwrap_or(&fallback_producer),
+            memory_producer_id(producer_id),
         );
         let output = context
             .memoria_client
