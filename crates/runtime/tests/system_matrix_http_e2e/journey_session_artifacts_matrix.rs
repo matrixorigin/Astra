@@ -299,25 +299,6 @@ fn provider_request_shape_identifies_only_the_matching_stream_fallback() {
     );
 }
 
-/// Asserts the number of non-stream fallback hits falls inside `min..=max`.
-///
-/// The non-stream mocks in this journey optionally answer the first non-stream
-/// request with an HTTP 200 body `"probe ok"` connectivity probe before
-/// serving any real fallback (see `spawn_raw_partial_transport_server` and
-/// siblings around line 228 / 302 / 370). The probe is not driven by a config
-/// flag — whether it fires depends on how fast the client notices the
-/// partial-transport failure and engages the non-stream fallback path, which
-/// varies with scheduler / CI load.
-///
-/// Callers that expect N genuine fallbacks must therefore accept `N..=N+1`
-/// (the "+1" = optional probe) to stay stable under CI timing jitter.
-fn assert_nonstream_hits_in_range(actual: u32, min: u32, max: u32, message: &str) {
-    assert!(
-        (min..=max).contains(&actual),
-        "{message}: expected {min}..={max} non-stream hits, got {actual}"
-    );
-}
-
 fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: &str) {
     let actual = hits.primary_nonstream_fallback_hits.load(Ordering::SeqCst);
     assert_eq!(
@@ -331,8 +312,6 @@ fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: 
 
 async fn spawn_raw_partial_transport_server(
     partial_text: &str,
-    fallback_status: u16,
-    fallback_body: &'static str,
 ) -> (String, RawTransportServerHits) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -367,22 +346,10 @@ async fn spawn_raw_partial_transport_server(
                         .expect("write partial stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    let nonstream_ix = hits.record_nonstream(&req);
-                    let (status, body) = if nonstream_ix == 0 {
-                        (
-                            200,
-                            r#"{"choices":[{"message":{"content":"probe ok"}}]}"#.to_string(),
-                        )
-                    } else {
-                        (fallback_status, fallback_body.to_string())
-                    };
-                    let status_text = if status == 200 {
-                        "OK"
-                    } else {
-                        "Internal Server Error"
-                    };
+                    hits.record_nonstream(&req);
+                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
-                        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     socket
@@ -401,8 +368,6 @@ async fn spawn_raw_partial_transport_server(
 async fn spawn_raw_idle_after_progress_server(
     partial_text: &str,
     stall_for: std::time::Duration,
-    fallback_status: u16,
-    fallback_body: &'static str,
 ) -> (String, RawTransportServerHits) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -438,22 +403,10 @@ async fn spawn_raw_idle_after_progress_server(
                     tokio::time::sleep(stall_for).await;
                     let _ = socket.shutdown().await;
                 } else {
-                    let nonstream_ix = hits.record_nonstream(&req);
-                    let (status, body) = if nonstream_ix == 0 {
-                        (
-                            200,
-                            r#"{"choices":[{"message":{"content":"probe ok"}}]}"#.to_string(),
-                        )
-                    } else {
-                        (fallback_status, fallback_body.to_string())
-                    };
-                    let status_text = if status == 200 {
-                        "OK"
-                    } else {
-                        "Internal Server Error"
-                    };
+                    hits.record_nonstream(&req);
+                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
-                        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     socket
@@ -586,7 +539,7 @@ async fn spawn_raw_stream_rate_limit_then_sse_server(
     (format!("http://{addr}"), hits)
 }
 
-async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransportServerHits) {
+async fn spawn_raw_tool_call_block_parse_server() -> (String, RawTransportServerHits) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind tool-call block-parse recovery mock llm listener");
@@ -647,23 +600,7 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
                     let _ = socket.shutdown().await;
                 } else {
                     hits.record_nonstream(&req);
-                    let body = json!({
-                        "choices": [{
-                            "message": {
-                                "content": "",
-                                "tool_calls": [{
-                                    "id": "call-1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "bash",
-                                        "arguments": "{\"command\":\"pwd\"}"
-                                    }
-                                }]
-                            },
-                            "finish_reason": "tool_calls"
-                        }]
-                    })
-                    .to_string();
+                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -681,9 +618,8 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
     (format!("http://{addr}"), hits)
 }
 
-async fn spawn_raw_server_loop_block_parse_recovery_server(
+async fn spawn_raw_server_loop_block_parse_server(
     partial_text: &str,
-    recovered_text: &str,
 ) -> (String, RawTransportServerHits) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -694,7 +630,6 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
     let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
-    let recovered_text = recovered_text.to_string();
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -702,7 +637,6 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
             };
             let hits = hits_task.clone();
             let partial_text = partial_text.clone();
-            let recovered_text = recovered_text.clone();
             tokio::spawn(async move {
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
@@ -721,14 +655,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
                     let _ = socket.shutdown().await;
                 } else {
                     hits.record_nonstream(&req);
-                    let body = json!({
-                        "choices": [{
-                            "message": { "content": recovered_text },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": { "prompt_tokens": 19, "completion_tokens": 4 }
-                    })
-                    .to_string();
+                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -736,62 +663,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
                     socket
                         .write_all(response.as_bytes())
                         .await
-                        .expect("write server-loop block-parse fallback response");
-                    let _ = socket.shutdown().await;
-                }
-            });
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    (format!("http://{addr}"), hits)
-}
-
-async fn spawn_raw_server_loop_block_parse_failure_server(
-    partial_text: &str,
-) -> (String, RawTransportServerHits) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind server-loop block-parse failure mock llm listener");
-    let addr = listener
-        .local_addr()
-        .expect("server-loop block-parse failure local_addr");
-    let hits = RawTransportServerHits::new();
-    let hits_task = hits.clone();
-    let partial_text = partial_text.to_string();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let hits = hits_task.clone();
-            let partial_text = partial_text.clone();
-            tokio::spawn(async move {
-                let req = read_full_http_request(&mut socket).await;
-                let is_stream = req.contains("\"stream\":true");
-                if is_stream {
-                    hits.record_stream(&req);
-                    let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
-                    let body = format!("data: {partial}\n\ndata: not-json\n\n");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write server-loop block-parse failure stream response");
-                    let _ = socket.shutdown().await;
-                } else {
-                    hits.record_nonstream(&req);
-                    let body = "fallback exploded";
-                    let response = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write server-loop block-parse failure fallback response");
+                        .expect("write server-loop block-parse probe response");
                     let _ = socket.shutdown().await;
                 }
             });
@@ -1702,11 +1574,9 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     ctx.pool.close().await;
 }
 
-pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_download_routes() {
+pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes() {
     let partial_text = "server loop partial before malformed block";
-    let recovered_text = "server loop recovered final answer";
-    let (base_url, hits) =
-        spawn_raw_server_loop_block_parse_recovery_server(partial_text, recovered_text).await;
+    let (base_url, hits) = spawn_raw_server_loop_block_parse_server(partial_text).await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -1740,8 +1610,8 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
         "/sessions",
         Some(auth.as_str()),
         json!({
-            "title": "server loop block parse recovery latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_recovery_latest_download" }
+            "title": "server loop malformed stream without replay",
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_no_replay" }
         }),
     )
     .await;
@@ -1749,35 +1619,27 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     let payload = json!({
-        "message": "trigger a server-loop malformed provider block after progress and recover",
+        "message": "trigger a server-loop malformed provider block after progress",
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "server-loop recovery proof must hit the raw streaming provider at least once"
+        body.contains(partial_text),
+        "server-loop SSE should preserve text delivered before the malformed block: {body}"
     );
     assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
-        "server-loop recovery proof must hit non-stream fallback after malformed stream"
+        body.contains("\"error_kind\":\"stream_transport\""),
+        "server-loop SSE should expose the original typed stream failure: {body}"
     );
     assert!(
-        body.contains(recovered_text),
-        "server-loop SSE should surface the recovered final text after non-stream fallback: {body}"
+        body.contains("\"status\":\"failed\""),
+        "server-loop SSE should terminate the run after a partial stream failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"completed\""),
-        "server-loop SSE should end as completed after fallback recovery: {body}"
-    );
-    assert!(
-        body.contains("\"type\":\"turn_complete\""),
-        "server-loop SSE should still terminate with turn_complete on successful recovery: {body}"
-    );
-    assert!(
-        !body.contains("\"status\":\"failed\""),
-        "successful malformed-block recovery should not end in failed status: {body}"
+        !body.contains("\"type\":\"turn_complete\""),
+        "a failed partial stream must not emit turn_complete: {body}"
     );
 
     wait_for_artifact_count(
@@ -1802,10 +1664,14 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
     assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
+    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
-        latest_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
+        latest_j["content"]["response"]["kind"].as_str(),
+        Some("stream_transport")
+    );
+    assert_eq!(
+        latest_j["content"]["response"]["partial_full_text"].as_str(),
+        Some(partial_text)
     );
 
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
@@ -1815,19 +1681,24 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let _download_descriptor =
         assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
     let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
+    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
-        download_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
+        download_j["content"]["response"]["kind"].as_str(),
+        Some("stream_transport")
+    );
+    assert_eq!(
+        download_j["content"]["response"]["partial_full_text"].as_str(),
+        Some(partial_text)
     );
 
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "malformed provider block after progress should trigger at least one streaming request"
+    assert_eq!(
+        hits.stream_hits.load(Ordering::SeqCst),
+        1,
+        "a malformed response after visible output must not replay the stream"
     );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
-        "malformed provider block after progress should trigger at least one non-stream fallback request"
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "a malformed response after visible output must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
@@ -1837,17 +1708,16 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     ctx.pool.close().await;
 }
 
-pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_download_routes() {
-    let partial_text = "server loop partial before malformed block";
-    let failure_fragment = "fallback exploded";
-    let (base_url, hits) = spawn_raw_server_loop_block_parse_failure_server(partial_text).await;
+pub async fn run_server_loop_transport_preserves_partial_without_replay_routes() {
+    let partial_text = "server loop transport partial";
+    let (base_url, hits) = spawn_raw_partial_transport_server(partial_text).await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
-    let model_name = format!("server-loop-block-parse-fail-{}", ctx.suffix);
+    let model_name = format!("server-loop-transport-no-replay-{}", ctx.suffix);
 
     let (st_model, model_j) = post_json(
         app,
@@ -1857,7 +1727,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
             "name": model_name,
             "provider": "openai",
             "context_window": 200000,
-            "api_key": "server-loop-block-parse-fail-e2e-key",
+            "api_key": "server-loop-transport-no-replay-e2e-key",
             "base_url": base_url
         }),
     )
@@ -1867,15 +1737,15 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         .bind(&model_name)
         .execute(pool)
         .await
-        .expect("force-activate server-loop block-parse failure test model");
+        .expect("force-activate server-loop transport no-replay test model");
 
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
         Some(auth.as_str()),
         json!({
-            "title": "server loop block parse failure latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_failure_latest_download" }
+            "title": "server loop transport failure without replay",
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_no_replay" }
         }),
     )
     .await;
@@ -1883,35 +1753,27 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     let payload = json!({
-        "message": "trigger a server-loop malformed provider block after progress and make fallback fail",
+        "message": "trigger a server-loop transport break after progress",
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "server-loop failure proof must hit the raw streaming provider at least once"
+        body.contains(partial_text),
+        "server-loop SSE should retain text delivered before the transport break: {body}"
     );
     assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
-        "server-loop failure proof must hit non-stream fallback after malformed stream"
-    );
-    assert!(
-        body.contains(failure_fragment),
-        "server-loop SSE should surface the fallback failure text: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"SERVER_ERROR\""),
-        "server-loop SSE should expose the provider server-error code on fallback failure: {body}"
+        body.contains("\"error_kind\":\"stream_transport\""),
+        "server-loop SSE should retain the typed transport failure: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
-        "server-loop SSE should end with failed status when malformed-block recovery also fails: {body}"
+        "server-loop transport failure should terminate the run: {body}"
     );
     assert!(
         !body.contains("\"type\":\"turn_complete\""),
-        "server-loop fallback failure should not emit turn_complete: {body}"
+        "server-loop transport failure must not emit turn_complete: {body}"
     );
 
     wait_for_artifact_count(
@@ -1928,7 +1790,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         pool,
         &ctx.user_id,
         &session_id,
-        "latest server-loop block-parse failure llm_capture row",
+        "latest server-loop transport no-replay llm_capture row",
     )
     .await;
 
@@ -1939,14 +1801,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         latest_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        latest_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "latest error payload should retain fallback failure text: {latest_j}"
+        Some("stream_transport")
     );
     assert_eq!(
         latest_j["content"]["response"]["partial_full_text"].as_str(),
@@ -1963,169 +1818,21 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        download_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "download error payload should retain fallback failure text: {download_j}"
+        Some("stream_transport")
     );
     assert_eq!(
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
 
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "malformed provider block after progress should trigger at least one streaming request before failing"
-    );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
-        "malformed provider block after progress should trigger at least one non-stream fallback request before failing"
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_download_routes() {
-    let partial_text = "server loop disconnect partial";
-    let failure_fragment = "server loop disconnect fallback failed";
-    // Use a mock server that sends partial output then immediately closes the
-    // connection (no 10-second hang). The nonstream fallback also fails, so
-    // the artifact is written with a transport error outcome.
-    let (base_url, hits) = spawn_raw_partial_transport_server(
-        partial_text,
-        500,
-        r#"{"error":{"message":"server loop disconnect fallback failed"}}"#,
-    )
-    .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("server-loop-disconnect-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "server-loop-disconnect-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate server-loop disconnect test model");
-    // Pre-consume the probe nonstream hit so the fallback attempt gets the 500.
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "server loop client disconnect latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_client_disconnect_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "message": "trigger a server-loop transport break after partial output",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j))
-    });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains(failure_fragment),
-        "server-loop SSE should surface the transport fallback failure text: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
+    assert_eq!(
+        hits.stream_hits.load(Ordering::SeqCst),
         1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop disconnect llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
+        "a transport break after visible output must not replay the stream"
     );
-    assert!(
-        latest_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "latest error payload should retain transport fallback failure text: {latest_j}"
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        download_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "download error payload should retain transport fallback failure text: {download_j}"
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "disconnect proof must hit the raw streaming provider at least once"
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "a transport break after visible output must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
@@ -2135,316 +1842,18 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     ctx.pool.close().await;
 }
 
-pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_download_routes() {
-    let partial_text = "server loop transport partial";
-    let recovered_text = "server loop transport recovered answer";
-    let fallback_body = format!(
-        r#"{{"choices":[{{"message":{{"content":"{recovered_text}"}}}}],"usage":{{"prompt_tokens":19,"completion_tokens":4}}}}"#
-    );
-    let (base_url, hits) = spawn_raw_partial_transport_server(
-        partial_text,
-        200,
-        Box::leak(fallback_body.into_boxed_str()),
-    )
-    .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("server-loop-transport-recovery-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "server-loop-transport-recovery-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate server-loop transport recovery test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "server loop transport recovery latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_recovery_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "message": "trigger a server-loop transport break after progress and recover",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j))
-    });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains(recovered_text),
-        "server-loop SSE should surface the recovered final text after transport fallback: {body}"
-    );
-    assert!(
-        body.contains("\"status\":\"completed\""),
-        "server-loop transport recovery should end as completed: {body}"
-    );
-    assert!(
-        body.contains("\"type\":\"turn_complete\""),
-        "server-loop transport recovery should still emit turn_complete: {body}"
-    );
-    assert!(
-        !body.contains("\"status\":\"failed\""),
-        "successful transport fallback should not fail the client stream: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop transport recovery llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        latest_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        download_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
-    );
-
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "transport recovery should hit the streaming provider at least once"
-    );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
-        "transport recovery should perform one probe and one non-stream fallback request"
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_server_loop_transport_failure_session_artifact_latest_and_download_routes() {
-    let partial_text = "server loop transport partial";
-    let failure_fragment = "fallback transport recovery failed";
-    let (base_url, hits) = spawn_raw_partial_transport_server(
-        partial_text,
-        500,
-        r#"{"error":{"message":"fallback transport recovery failed"}}"#,
-    )
-    .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("server-loop-transport-failure-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "server-loop-transport-failure-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate server-loop transport failure test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "server loop transport failure latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_failure_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "message": "trigger a server-loop transport break after progress and make fallback fail",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j))
-    });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains(failure_fragment),
-        "server-loop SSE should surface the transport fallback failure text: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"SERVER_ERROR\""),
-        "server-loop transport fallback failure should surface a provider server-error code: {body}"
-    );
-    assert!(
-        body.contains("\"status\":\"failed\""),
-        "server-loop transport fallback failure should terminate as failed: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "server-loop transport fallback failure should not emit turn_complete: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop transport failure llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        latest_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "latest error payload should retain transport fallback failure text: {latest_j}"
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        download_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "download error payload should retain transport fallback failure text: {download_j}"
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "transport failure should hit the streaming provider at least once"
-    );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
-        "transport failure should perform one probe and one non-stream fallback request"
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_routes() {
+pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
     let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
     let partial_text = "server loop idle partial";
-    let recovered_text = "server loop idle recovered answer";
-    let fallback_body = format!(
-        r#"{{"choices":[{{"message":{{"content":"{recovered_text}"}}}}],"usage":{{"prompt_tokens":19,"completion_tokens":4}}}}"#
-    );
-    let (base_url, hits) = spawn_raw_idle_after_progress_server(
-        partial_text,
-        std::time::Duration::from_secs(2),
-        200,
-        Box::leak(fallback_body.into_boxed_str()),
-    )
-    .await;
+    let (base_url, hits) =
+        spawn_raw_idle_after_progress_server(partial_text, std::time::Duration::from_secs(2)).await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
-    let model_name = format!("server-loop-idle-recovery-{}", ctx.suffix);
+    let model_name = format!("server-loop-idle-no-replay-{}", ctx.suffix);
 
     let (st_model, model_j) = post_json(
         app,
@@ -2454,7 +1863,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
             "name": model_name,
             "provider": "openai",
             "context_window": 200000,
-            "api_key": "server-loop-idle-recovery-e2e-key",
+            "api_key": "server-loop-idle-no-replay-e2e-key",
             "base_url": base_url
         }),
     )
@@ -2464,16 +1873,15 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
         .bind(&model_name)
         .execute(pool)
         .await
-        .expect("force-activate server-loop idle recovery test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
+        .expect("force-activate server-loop idle no-replay test model");
 
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
         Some(auth.as_str()),
         json!({
-            "title": "server loop idle recovery latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_recovery_latest_download" }
+            "title": "server loop idle failure without replay",
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_no_replay" }
         }),
     )
     .await;
@@ -2481,161 +1889,27 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     let payload = json!({
-        "message": "trigger a server-loop idle timeout after progress and recover",
+        "message": "trigger a server-loop idle timeout after progress",
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
     let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        body.contains(recovered_text),
-        "server-loop SSE should surface the recovered final text after idle fallback: {body}"
+        body.contains(partial_text),
+        "server-loop SSE should retain text delivered before the idle timeout: {body}"
     );
     assert!(
-        body.contains("\"status\":\"completed\""),
-        "server-loop idle recovery should end as completed: {body}"
-    );
-    assert!(
-        body.contains("\"type\":\"turn_complete\""),
-        "server-loop idle recovery should still emit turn_complete: {body}"
-    );
-    assert!(
-        !body.contains("\"status\":\"failed\""),
-        "successful idle fallback should not fail the client stream: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop idle recovery llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        latest_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        download_j["content"]["response"]["full_text"].as_str(),
-        Some(recovered_text)
-    );
-
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "idle recovery should hit the streaming provider at least once"
-    );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
-        "idle recovery should perform one probe and one non-stream fallback request"
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_routes() {
-    let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
-    let partial_text = "server loop idle partial";
-    let failure_fragment = "fallback idle recovery failed";
-    let (base_url, hits) = spawn_raw_idle_after_progress_server(
-        partial_text,
-        std::time::Duration::from_secs(2),
-        500,
-        r#"{"error":{"message":"fallback idle recovery failed"}}"#,
-    )
-    .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("server-loop-idle-failure-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "server-loop-idle-failure-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate server-loop idle failure test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "server loop idle failure latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_failure_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "message": "trigger a server-loop idle timeout after progress and make fallback fail",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j))
-    });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains(failure_fragment),
-        "server-loop SSE should surface the idle fallback failure text: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"SERVER_ERROR\""),
-        "server-loop idle fallback failure should surface a provider server-error code: {body}"
+        body.contains("\"error_kind\":\"stream_idle\""),
+        "server-loop SSE should retain the typed idle failure: {body}"
     );
     assert!(
         body.contains("\"status\":\"failed\""),
-        "server-loop idle fallback failure should terminate as failed: {body}"
+        "server-loop idle timeout should terminate the run: {body}"
     );
     assert!(
         !body.contains("\"type\":\"turn_complete\""),
-        "server-loop idle fallback failure should not emit turn_complete: {body}"
+        "server-loop idle timeout must not emit turn_complete: {body}"
     );
 
     wait_for_artifact_count(
@@ -2652,7 +1926,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         pool,
         &ctx.user_id,
         &session_id,
-        "latest server-loop idle failure llm_capture row",
+        "latest server-loop idle no-replay llm_capture row",
     )
     .await;
 
@@ -2663,14 +1937,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         latest_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        latest_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "latest error payload should retain idle fallback failure text: {latest_j}"
+        Some("stream_idle")
     );
     assert_eq!(
         latest_j["content"]["response"]["partial_full_text"].as_str(),
@@ -2687,27 +1954,21 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
-        Some("server_error")
-    );
-    assert!(
-        download_j["content"]["response"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(failure_fragment),
-        "download error payload should retain idle fallback failure text: {download_j}"
+        Some("stream_idle")
     );
     assert_eq!(
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
 
-    assert!(
-        hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "idle failure should hit the streaming provider at least once"
+    assert_eq!(
+        hits.stream_hits.load(Ordering::SeqCst),
+        1,
+        "an idle timeout after visible output must not replay the stream"
     );
-    assert!(
-        hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
-        "idle failure should perform one probe and one non-stream fallback request"
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "an idle timeout after visible output must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
@@ -3162,14 +2423,9 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
     ctx.pool.close().await;
 }
 
-pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_routes() {
+pub async fn run_bridge_transport_preserves_partial_without_replay_routes() {
     let partial_text = "bridge transport partial";
-    let (base_url, hits) = spawn_raw_partial_transport_server(
-        partial_text,
-        500,
-        r#"{"error":{"message":"fallback transport recovery failed"}}"#,
-    )
-    .await;
+    let (base_url, hits) = spawn_raw_partial_transport_server(partial_text).await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -3197,8 +2453,6 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
         .execute(pool)
         .await
         .expect("force-activate transport test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
@@ -3227,6 +2481,10 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     assert!(
         body.contains("\"code\":\"stream_transport\""),
         "bridge SSE should expose the transport failure code: {body}"
+    );
+    assert!(
+        !body.contains("\"type\":\"turn_complete\""),
+        "bridge transport failure must not emit turn_complete: {body}"
     );
 
     wait_for_artifact_count(
@@ -3278,10 +2536,9 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        2,
-        "expected one model-connectivity probe and one fallback request"
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "a bridge transport break after visible output must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
@@ -3435,6 +2692,10 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "client disconnect must cancel the active stream without replaying inference",
+    );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
@@ -3443,16 +2704,11 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     ctx.pool.close().await;
 }
 
-pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes() {
+pub async fn run_bridge_idle_preserves_partial_without_replay_routes() {
     let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
     let partial_text = "bridge idle partial";
-    let (base_url, hits) = spawn_raw_idle_after_progress_server(
-        partial_text,
-        std::time::Duration::from_secs(2),
-        500,
-        r#"{"error":{"message":"fallback idle recovery failed"}}"#,
-    )
-    .await;
+    let (base_url, hits) =
+        spawn_raw_idle_after_progress_server(partial_text, std::time::Duration::from_secs(2)).await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -3480,8 +2736,6 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
         .execute(pool)
         .await
         .expect("force-activate idle test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
@@ -3565,10 +2819,9 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        2,
-        "expected one model-connectivity probe and one fallback request"
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "a bridge idle timeout after visible output must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
@@ -3834,15 +3087,15 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
     ctx.pool.close().await;
 }
 
-pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_routes() {
-    let (base_url, hits) = spawn_raw_tool_call_block_parse_recovery_server().await;
+pub async fn run_bridge_tool_call_parse_failure_does_not_replay_or_execute_routes() {
+    let (base_url, hits) = spawn_raw_tool_call_block_parse_server().await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let pool = &ctx.pool;
-    let model_name = format!("bridge-tool-call-block-recovery-{}", ctx.suffix);
+    let model_name = format!("bridge-tool-call-parse-no-replay-{}", ctx.suffix);
 
     let (st_model, model_j) = post_json(
         app,
@@ -3852,7 +3105,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
             "name": model_name,
             "provider": "openai",
             "context_window": 200000,
-            "api_key": "tool-call-block-recovery-e2e-key",
+            "api_key": "tool-call-parse-no-replay-e2e-key",
             "base_url": base_url
         }),
     )
@@ -3862,15 +3115,15 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         .bind(&model_name)
         .execute(pool)
         .await
-        .expect("force-activate tool-call block recovery test model");
+        .expect("force-activate tool-call parse no-replay test model");
 
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
         Some(auth.as_str()),
         json!({
-            "title": "bridge tool-call block parse recovery latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_tool_call_block_parse_recovery_latest_download" }
+            "title": "bridge malformed tool call without replay",
+            "metadata": { "full_llm_capture": true, "suite": "bridge_tool_call_parse_no_replay" }
         }),
     )
     .await;
@@ -3878,10 +3131,10 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     let payload = json!({
-        "agent_id": "system-matrix-bridge-tool-call-block-parse-recovery",
+        "agent_id": "system-matrix-bridge-tool-call-parse-no-replay",
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger a bridge tool-call block parse failure and recover with full arguments" }]
+        "messages": [{ "role": "user", "content": "trigger a bridge tool-call parse failure after partial arguments" }]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
@@ -3890,8 +3143,8 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         "bridge SSE should surface a tool_call_start event from streamed provider deltas: {body}"
     );
     assert!(
-        body.contains("\"type\":\"tool_request\""),
-        "bridge should continue with a tool_request after fallback recovery: {body}"
+        !body.contains("\"type\":\"tool_request\""),
+        "an untrusted partial tool call must never become an executable request: {body}"
     );
     assert_eq!(
         body.matches("\"type\":\"tool_call_start\"").count(),
@@ -3899,16 +3152,12 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         "tool_call_start should be emitted once for the streamed call: {body}"
     );
     assert!(
-        body.contains("\"command\":\"pwd\""),
-        "tool_request should carry the recovered full arguments, not the partial streamed prefix: {body}"
+        body.contains("\"code\":\"stream_transport\""),
+        "bridge should expose the original typed parse failure: {body}"
     );
     assert!(
-        body.contains("\"has_tool_calls\":true"),
-        "recovered tool-call turn should complete with has_tool_calls=true: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"error\""),
-        "successful fallback recovery should not expose an error event to the client: {body}"
+        !body.contains("\"type\":\"turn_complete\""),
+        "a malformed tool-call stream must not complete the turn: {body}"
     );
 
     wait_for_artifact_count(
@@ -3925,21 +3174,27 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         pool,
         &ctx.user_id,
         &session_id,
-        "latest bridge tool-call block recovery llm_capture row",
+        "latest bridge tool-call parse failure llm_capture row",
     )
     .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
+    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        latest_j["content"]["response"]["kind"].as_str(),
+        Some("stream_transport")
+    );
     assert_eq!(
         latest_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
+    // Capture the last arguments fragment that crossed the bridge boundary;
+    // later provider bytes never become executable state after the parse error.
     assert_eq!(
         latest_j["content"]["response"]["tool_calls"][0]["function"]["arguments"].as_str(),
-        Some("{\"command\":\"pwd\"}")
+        Some("{\"command\":\"p")
     );
 
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
@@ -3949,22 +3204,24 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     let _download_descriptor =
         assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
     let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
+    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        download_j["content"]["response"]["kind"].as_str(),
+        Some("stream_transport")
+    );
     assert_eq!(
         download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
     assert_eq!(
         download_j["content"]["response"]["tool_calls"][0]["function"]["arguments"].as_str(),
-        Some("{\"command\":\"pwd\"}")
+        Some("{\"command\":\"p")
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_nonstream_hits_in_range(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        1,
-        2,
-        "invalid provider block after progress should trigger exactly one successful non-stream fallback, plus at most one optional connectivity probe",
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "a malformed tool-call stream after visible progress must not replay as non-stream",
     );
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)

@@ -59,7 +59,7 @@ fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
     DelegationRequest {
         session_id: "test-session".into(),
         delegation_id: delegation_id.into(),
-        parent_run_id: format!("parent-{delegation_id}"),
+        parent_run_id: "parent-root".into(),
         task: "nested cancel probe".into(),
         pattern: CoordinationPattern::FanOut {
             agent_ids: agents.into_iter().map(String::from).collect(),
@@ -74,6 +74,17 @@ fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
         context: HashMap::new(),
         execution_metadata: None,
     }
+}
+
+async fn persist_request_parent(run_engine: &RunEngine, request: &DelegationRequest) {
+    run_engine
+        .start_run(
+            &request.parent_run_id,
+            &request.user_id,
+            &request.session_id,
+        )
+        .await
+        .expect("nested cancellation fixture should persist its durable parent");
 }
 
 /// Mock executor whose `execute()` itself opens two additional nesting levels
@@ -139,7 +150,7 @@ impl SubRunExecutor for NestedMockExecutor {
                     _ = tokio::time::sleep(NATURAL_TIMEOUT) => {}
                 }
                 for h in grand {
-                    let _ = h.await;
+                    h.await.expect("depth-2 cancellation task should not panic");
                 }
             }));
         }
@@ -152,7 +163,8 @@ impl SubRunExecutor for NestedMockExecutor {
             _ = tokio::time::sleep(NATURAL_TIMEOUT) => {}
         }
         for h in depth_1_handles {
-            let _ = h.await;
+            h.await
+                .map_err(|error| format!("depth-1 cancellation task failed: {error}"))?;
         }
 
         Ok(AgentResult {
@@ -177,10 +189,11 @@ impl SubRunExecutor for NestedMockExecutor {
 async fn nested_cancel_propagates_through_three_levels() {
     let (reg, engine, tracker) = setup();
     let exec = Arc::new(NestedMockExecutor::new(3));
-    let de = DelegationEngine::with_executor(reg, engine, tracker, exec.clone());
+    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone());
 
     let token = Arc::new(CancellationToken::new());
     let req = fan_out("del-nested-1", vec!["w1", "w2"]);
+    persist_request_parent(&engine, &req).await;
 
     // Wait for the executor to actually start at least one sub-run before
     // cancelling — and only then give depth-1/2 tasks a small grace window
@@ -206,7 +219,9 @@ async fn nested_cancel_propagates_through_three_levels() {
     let started = Instant::now();
     let result = de.execute(req, "orch", Some(token.clone())).await.unwrap();
     let elapsed = started.elapsed();
-    let _ = cancel_after.await;
+    cancel_after
+        .await
+        .expect("cancellation trigger should not panic");
 
     // Sanity: the top-level execute returned quickly, not after the natural
     // timeout. The budget is intentionally below NATURAL_TIMEOUT but wide
@@ -256,12 +271,13 @@ async fn nested_cancel_propagates_through_three_levels() {
 async fn pre_cancelled_token_short_circuits_nested_execute() {
     let (reg, engine, tracker) = setup();
     let exec = Arc::new(NestedMockExecutor::new(2));
-    let de = DelegationEngine::with_executor(reg, engine, tracker, exec.clone());
+    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone());
 
     let token = Arc::new(CancellationToken::new());
     token.cancel(); // pre-cancel
 
     let req = fan_out("del-nested-2", vec!["w1", "w2", "w3"]);
+    persist_request_parent(&engine, &req).await;
 
     let started = Instant::now();
     let _ = de.execute(req, "orch", Some(token.clone())).await;
@@ -283,7 +299,7 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
     let exec = Arc::new(NestedMockExecutor::new(2));
     let de = Arc::new(DelegationEngine::with_executor(
         reg,
-        engine,
+        engine.clone(),
         tracker,
         exec.clone(),
     ));
@@ -291,20 +307,18 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
     let token_a = Arc::new(CancellationToken::new());
     let token_b = Arc::new(CancellationToken::new());
 
-    // Two independent in-flight delegations on the same engine.
+    // Two independent in-flight delegations from one durable parent.
+    let req_a = fan_out("del-iso-a", vec!["w1"]);
+    let req_b = fan_out("del-iso-b", vec!["w2"]);
+    persist_request_parent(&engine, &req_a).await;
+
     let de_a = de.clone();
     let ta = token_a.clone();
-    let handle_a = tokio::spawn(async move {
-        let req = fan_out("del-iso-a", vec!["w1"]);
-        de_a.execute(req, "orch", Some(ta)).await
-    });
+    let handle_a = tokio::spawn(async move { de_a.execute(req_a, "orch", Some(ta)).await });
 
     let de_b = de.clone();
     let tb = token_b.clone();
-    let handle_b = tokio::spawn(async move {
-        let req = fan_out("del-iso-b", vec!["w2"]);
-        de_b.execute(req, "orch", Some(tb)).await
-    });
+    let mut handle_b = tokio::spawn(async move { de_b.execute(req_b, "orch", Some(tb)).await });
 
     // Give both a chance to reach the cancel-await boundary. Fixed sleeps are
     // scheduler-sensitive under full nextest parallelism, so wait for the
@@ -332,7 +346,7 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
 
     // B must still be running — poll its handle (don't await, would block).
     // Use a short timeout to prove it hasn't finished.
-    let b_timeout = tokio::time::timeout(Duration::from_millis(200), handle_b).await;
+    let b_timeout = tokio::time::timeout(Duration::from_millis(200), &mut handle_b).await;
     assert!(
         b_timeout.is_err(),
         "sibling delegation B must NOT be affected by A's cancel"
@@ -340,6 +354,11 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
 
     // Clean up B so the test actually exits.
     token_b.cancel();
+    let b = tokio::time::timeout(CANCEL_LATENCY_BUDGET, handle_b)
+        .await
+        .expect("B must unwind after its own token fires")
+        .expect("B execution task should not panic");
+    assert!(b.is_ok(), "delegation B should return Ok, got {b:?}");
 }
 
 // ─── 4. REMOVED: `shared_arc_cancellation_token_fires_every_clone_once`
@@ -453,7 +472,10 @@ async fn nested_cancel_primitive_exact_counts_per_depth() {
     token.cancel();
 
     for h in depth_0_handles {
-        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+        tokio::time::timeout(Duration::from_secs(3), h)
+            .await
+            .expect("depth-0 cancellation task should finish")
+            .expect("depth-0 cancellation task should not panic");
     }
 
     // EXACT counts — every spawned task observed exactly one cancel.

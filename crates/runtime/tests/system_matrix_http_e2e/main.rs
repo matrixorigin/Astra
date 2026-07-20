@@ -403,58 +403,27 @@ async fn e2e_matrix_failed_session_artifact_latest_and_download() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_block_parse_recovery_session_artifact_latest_and_download() {
+async fn e2e_matrix_server_loop_block_parse_preserves_partial_without_replay() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_block_parse_recovery_session_artifact_latest_and_download_routes()
+    journey_session_artifacts_matrix::run_server_loop_block_parse_preserves_partial_without_replay_routes()
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_block_parse_failure_session_artifact_latest_and_download() {
+async fn e2e_matrix_server_loop_transport_preserves_partial_without_replay() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_block_parse_failure_session_artifact_latest_and_download_routes()
+    journey_session_artifacts_matrix::run_server_loop_transport_preserves_partial_without_replay_routes()
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_client_disconnect_session_artifact_latest_and_download() {
+async fn e2e_matrix_server_loop_idle_preserves_partial_without_replay() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_client_disconnect_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_transport_recovery_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_transport_recovery_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_transport_failure_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_transport_failure_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_idle_recovery_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_idle_recovery_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_server_loop_idle_failure_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_server_loop_idle_failure_session_artifact_latest_and_download_routes()
-        .await;
+    journey_session_artifacts_matrix::run_server_loop_idle_preserves_partial_without_replay_routes(
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -499,10 +468,11 @@ async fn e2e_matrix_bridge_tail_parse_error_artifact_preserves_partial_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_transport_failure_session_artifact_latest_and_download() {
+async fn e2e_matrix_bridge_transport_preserves_partial_without_replay() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_transport_failure_session_artifact_latest_and_download_routes()
-        .await;
+    journey_session_artifacts_matrix::run_bridge_transport_preserves_partial_without_replay_routes(
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -515,9 +485,9 @@ async fn e2e_matrix_bridge_client_disconnect_session_artifact_latest_and_downloa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_idle_failure_session_artifact_latest_and_download() {
+async fn e2e_matrix_bridge_idle_preserves_partial_without_replay() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_idle_failure_session_artifact_latest_and_download_routes()
+    journey_session_artifacts_matrix::run_bridge_idle_preserves_partial_without_replay_routes()
         .await;
 }
 
@@ -539,9 +509,9 @@ async fn e2e_matrix_bridge_rate_limit_retry_success_session_artifact_latest_and_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_tool_call_block_parse_recovery_preserves_arguments() {
+async fn e2e_matrix_bridge_tool_call_parse_failure_does_not_replay_or_execute() {
     require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_tool_call_block_parse_recovery_preserves_arguments_routes()
+    journey_session_artifacts_matrix::run_bridge_tool_call_parse_failure_does_not_replay_or_execute_routes()
         .await;
 }
 

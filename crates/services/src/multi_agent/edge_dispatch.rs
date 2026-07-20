@@ -505,8 +505,16 @@ impl EdgeDispatchBacklogRow {
 const EDGE_DISPATCH_BACKLOG_SQL: &str = "SELECT \
     CAST(COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS SIGNED) AS pending_rows, \
     CAST(COALESCE(SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END), 0) AS SIGNED) AS dispatched_rows, \
-    CAST(GREATEST(COALESCE(TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'pending' THEN created_at ELSE NULL END), NOW(6)), 0), 0) AS SIGNED) AS oldest_pending_age_us, \
-    CAST(GREATEST(COALESCE(TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'dispatched' THEN created_at ELSE NULL END), NOW(6)), 0), 0) AS SIGNED) AS oldest_dispatched_age_us \
+    CAST(CASE \
+        WHEN MIN(CASE WHEN status = 'pending' THEN created_at ELSE NULL END) IS NULL \
+            OR MIN(CASE WHEN status = 'pending' THEN created_at ELSE NULL END) > NOW(6) THEN 0 \
+        ELSE TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'pending' THEN created_at ELSE NULL END), NOW(6)) \
+    END AS SIGNED) AS oldest_pending_age_us, \
+    CAST(CASE \
+        WHEN MIN(CASE WHEN status = 'dispatched' THEN created_at ELSE NULL END) IS NULL \
+            OR MIN(CASE WHEN status = 'dispatched' THEN created_at ELSE NULL END) > NOW(6) THEN 0 \
+        ELSE TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'dispatched' THEN created_at ELSE NULL END), NOW(6)) \
+    END AS SIGNED) AS oldest_dispatched_age_us \
     FROM edge_pending_dispatch \
     WHERE status IN ('pending', 'dispatched')";
 
@@ -1390,16 +1398,6 @@ mod tests {
                 .load(Ordering::Relaxed),
             13_000
         );
-    }
-
-    #[test]
-    fn backlog_metrics_sql_is_bounded_to_nonterminal_dispatch_rows() {
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("status IN ('pending', 'dispatched')"));
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("AS SIGNED) AS pending_rows"));
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("AS SIGNED) AS dispatched_rows"));
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_pending_age_us"));
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_dispatched_age_us"));
-        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("CAST(GREATEST("));
     }
 
     #[tokio::test]

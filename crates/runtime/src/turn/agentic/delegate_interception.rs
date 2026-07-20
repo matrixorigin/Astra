@@ -2091,7 +2091,7 @@ mod tests {
     async fn intercept_delegations_respects_valid_tool_names() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&[]);
         let mut state = make_state();
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
 
         let turn_result = HostTurnResult {
             accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
@@ -2176,7 +2176,7 @@ mod tests {
     async fn intercept_delegations_refuses_after_per_turn_limit() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
         let mut state = make_state();
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
         // Simulate 3 delegations already executed this turn.
         state.delegations_this_turn = 3;
 

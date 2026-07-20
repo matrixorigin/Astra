@@ -601,6 +601,31 @@ impl RunEngine {
         .await
     }
 
+    /// Load and validate the durable parent for a delegated run before any
+    /// child-side effects are emitted.
+    ///
+    /// A run tree cannot cross user or session boundaries. User ownership is
+    /// enforced by the store lookup; session ownership is checked here so a
+    /// caller cannot attach a child to a run from another conversation.
+    pub(crate) async fn require_delegation_parent(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+    ) -> Result<DurableRunRecord, String> {
+        let parent = self
+            .store
+            .load_run(user_id, parent_run_id)
+            .await?
+            .ok_or_else(|| {
+                "delegated run cannot be persisted without its durable parent".to_string()
+            })?;
+        if parent.session_id != session_id {
+            return Err("delegated run and durable parent must belong to one session".to_string());
+        }
+        Ok(parent)
+    }
+
     /// Extended version of `start_run` with delegation metadata and interaction context.
     pub(crate) async fn start_run_ext_with_context(
         &self,
@@ -615,23 +640,17 @@ impl RunEngine {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
-            match self.store.load_run(user_id, parent_run_id).await? {
-                Some(parent) => {
-                    inherit_parent_model_identity(&mut context, &parent)?;
-                    let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
-                    let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
-                    (
-                        Some(parent_root),
-                        Some(format!("{parent_path}/{run_id}")),
-                        parent.depth.saturating_add(1),
-                    )
-                }
-                None => {
-                    return Err(
-                        "delegated run cannot be persisted without its durable parent".to_string(),
-                    );
-                }
-            }
+            let parent = self
+                .require_delegation_parent(user_id, session_id, parent_run_id)
+                .await?;
+            inherit_parent_model_identity(&mut context, &parent)?;
+            let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
+            let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
+            (
+                Some(parent_root),
+                Some(format!("{parent_path}/{run_id}")),
+                parent.depth.saturating_add(1),
+            )
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
@@ -3223,6 +3242,36 @@ mod tests {
         assert!(
             engine
                 .load_run("user-1", "orphan-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_cannot_cross_its_parent_session_boundary() {
+        let engine = test_engine();
+        engine
+            .start_run("parent-run", "user-1", "session-a")
+            .await
+            .unwrap();
+
+        let result = engine
+            .start_run_ext(
+                "cross-session-child",
+                "user-1",
+                "session-b",
+                Some("parent-run"),
+                Some("delegation-1"),
+                Some("reviewer"),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            engine
+                .load_run("user-1", "cross-session-child")
                 .await
                 .unwrap()
                 .is_none()

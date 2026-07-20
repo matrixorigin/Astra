@@ -345,7 +345,10 @@ async fn ws_auth(
 
     let resp = ws.next().await.unwrap().unwrap();
     let resp_json: serde_json::Value = serde_json::from_str(&resp.into_text().unwrap()).unwrap();
-    assert_eq!(resp_json["type"], "edge_auth_ok");
+    assert_eq!(
+        resp_json["type"], "edge_auth_ok",
+        "edge authentication failed: {resp_json}"
+    );
     assert_eq!(resp_json["user_id"], "test-user-1");
 
     ws
@@ -1215,7 +1218,11 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
             edge_agent_id.to_string(),
             edge_id_header.to_string(),
         ));
-        self.notify.notify_waiters();
+        // Keep one completion permit when the heartbeat races ahead of the
+        // assertion. `notify_waiters` would lose that signal when no waiter is
+        // currently registered, turning this behavior test into a scheduler
+        // timing test.
+        self.notify.notify_one();
         Ok(())
     }
 
@@ -1244,7 +1251,7 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
     }
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn edge_ws_heartbeat_tick_updates_db_registry() {
     let registry = Arc::new(RecordingEdgeRegistry::default());
     let registry_clone = Arc::clone(&registry);
@@ -1268,16 +1275,45 @@ async fn edge_ws_heartbeat_tick_updates_db_registry() {
     }
 
     // Connect and auth normally.
-    let _ws = ws_auth(addr, "edge-b3", "host-b3").await;
+    let mut ws = ws_auth(addr, "edge-b3", "host-b3").await;
+
+    // AuthOk is emitted before the server constructs its heartbeat interval.
+    // A protocol round-trip proves that the bidirectional loop (and therefore
+    // the ticker) is live before virtual time moves.
+    ws.send(Message::Text(
+        json!({ "type": "edge_ping" }).to_string().into(),
+    ))
+    .await
+    .expect("send readiness ping");
+    let pong = ws
+        .next()
+        .await
+        .expect("readiness pong frame")
+        .expect("readiness pong message");
+    let pong: serde_json::Value =
+        serde_json::from_str(&pong.into_text().expect("readiness pong text"))
+            .expect("readiness pong JSON");
+    assert_eq!(
+        pong["type"], "edge_pong",
+        "unexpected readiness reply: {pong}"
+    );
+
+    // Real networking and a globally paused Tokio clock do not compose: when
+    // the runtime is otherwise idle, virtual time may jump to the auth timeout
+    // before the socket is scheduled. Freeze time only after the real TCP/WS
+    // handshake has completed.
+    tokio::time::pause();
 
     // Advance mock clock past one heartbeat interval (30 s) so the ticker fires.
-    // start_paused = true means time is already frozen; advance() moves it forward
-    // and yields to let the server's heartbeat task run.
+    // Wait for the registry call itself instead of guessing how many executor
+    // yields the WebSocket task needs under full-suite load.
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    // Yield a few more times to let the server task process the tick.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        registry.notify.notified(),
+    )
+    .await
+    .expect("heartbeat registry call after advancing the mock clock");
 
     let beats = registry.heartbeats.lock().unwrap().clone();
     assert!(

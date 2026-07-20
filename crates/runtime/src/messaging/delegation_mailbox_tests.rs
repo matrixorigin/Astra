@@ -149,6 +149,19 @@ mod tests {
         }
     }
 
+    async fn persist_request_parent(
+        run_engine: &RunEngine,
+        request: &DelegationRequest,
+    ) -> Result<(), String> {
+        run_engine
+            .start_run(
+                &request.parent_run_id,
+                &request.user_id,
+                &request.session_id,
+            )
+            .await
+    }
+
     // ── Tests ───────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -162,13 +175,14 @@ mod tests {
 
         let engine = DelegationEngine::with_executor(
             profiles,
-            run_engine,
+            run_engine.clone(),
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
+        persist_request_parent(&run_engine, &request).await.unwrap();
         let result = engine.execute(request, "orch", None).await;
 
         assert!(result.is_ok(), "delegation should succeed: {result:?}");
@@ -203,13 +217,14 @@ mod tests {
 
         let engine = DelegationEngine::with_executor(
             profiles,
-            run_engine,
+            run_engine.clone(),
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
+        persist_request_parent(&run_engine, &request).await.unwrap();
         let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
@@ -264,13 +279,14 @@ mod tests {
 
         let engine = DelegationEngine::with_executor(
             profiles,
-            run_engine,
+            run_engine.clone(),
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer", "tester"]);
+        persist_request_parent(&run_engine, &request).await.unwrap();
         let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
@@ -314,13 +330,14 @@ mod tests {
         // No mailbox_router → agents should get mailbox=None.
         let engine = DelegationEngine::with_executor(
             profiles,
-            run_engine,
+            run_engine.clone(),
             tracker,
             Arc::new(MailboxTestExecutor),
         );
         // Intentionally NOT calling .with_mailbox_router()
 
         let request = fan_out_request(vec!["coder"]);
+        persist_request_parent(&run_engine, &request).await.unwrap();
         let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
@@ -346,13 +363,14 @@ mod tests {
 
         let engine = DelegationEngine::with_executor(
             profiles,
-            run_engine,
+            run_engine.clone(),
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
         .with_mailbox_router(router);
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
+        persist_request_parent(&run_engine, &request).await.unwrap();
         let _ = engine.execute(request, "orch", None).await;
 
         // DelegationTracker should have records for both sub-runs.

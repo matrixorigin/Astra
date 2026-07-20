@@ -135,6 +135,40 @@ impl PtyAstra {
         self.writer.flush().expect("flush PTY input");
     }
 
+    fn paste_and_submit(&mut self, text: &str, timeout: Duration) {
+        // The journey is injecting a whole message, not simulating a human
+        // typing one character at a time. Use the terminal's bracketed-paste
+        // protocol so the application receives the same typed event as a
+        // real terminal paste. Raw bulk bytes intentionally exercise the
+        // fallback paste-burst detector, where Enter is briefly interpreted
+        // as a pasted newline rather than a submit gesture.
+        self.write(b"\x1b[200~");
+        self.write(text.as_bytes());
+        self.write(b"\x1b[201~");
+        let expected = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let visible = self
+                .current_screen()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            if visible.contains(&expected) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "composer did not accept {text:?}\n{}",
+                self.screen_diagnostic()
+            );
+            self.receive(Duration::from_millis(25));
+        }
+        self.write(b"\r");
+    }
+
     fn signal(&self, signal: nix::sys::signal::Signal) {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.child.id() as i32), signal)
             .expect("signal Astra PTY child");
@@ -178,6 +212,34 @@ impl PtyAstra {
             assert!(
                 !remaining.is_zero(),
                 "timed out waiting for {needle:?} to clear\n{}",
+                self.screen_diagnostic()
+            );
+            self.receive(remaining.min(Duration::from_millis(100)));
+        }
+    }
+
+    fn wait_for_before(&mut self, expected: &str, forbidden: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.current_screen();
+            if screen.contains(expected) {
+                return;
+            }
+            assert!(
+                !screen.contains(forbidden),
+                "rendered {forbidden:?} before {expected:?}\n{}",
+                self.screen_diagnostic()
+            );
+            if let Some(status) = self.child.try_wait().expect("poll Astra child") {
+                panic!(
+                    "Astra exited before rendering {expected:?} ({status})\n{}",
+                    self.screen_diagnostic()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {expected:?} before {forbidden:?}\n{}",
                 self.screen_diagnostic()
             );
             self.receive(remaining.min(Duration::from_millis(100)));
@@ -390,18 +452,29 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
-    )
-    .await
-    .expect("start scripted slow LLM server");
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response()
+        .await
+        .expect("start scripted slow LLM server");
     let home = tempfile::tempdir().expect("temporary isolated Astra home");
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"hold this turn open\r");
-    astra.wait_for("Working", UI_TRANSITION_TIMEOUT);
+
+    // Synchronize on the request reaching the provider. A transient activity
+    // label is presentation state, not proof that the turn is still live; on
+    // a loaded workspace it can first be observed at the completion boundary.
+    let request_deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(
+            Instant::now() < request_deadline,
+            "the slow turn never reached the provider\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
     astra.write(&[0x03]); // Ctrl+C through the real raw-mode input boundary.
 
     astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);
@@ -410,6 +483,7 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
         "the accepted stop intent must replace the prior activity projection\n{}",
         astra.screen_diagnostic()
     );
+    mock.release_held_response();
     astra.wait_for("Enter send", Duration::from_secs(15));
 }
 
@@ -590,6 +664,32 @@ async fn wait_for_three_fanout_children(
         assert!(
             tokio::time::Instant::now() < deadline,
             "expected three fanout child requests, got {count}\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_completed_fanout_children(
+    mock: &astra_cli::cli::mock_llm::MockLlmServer,
+    astra: &mut PtyAstra,
+    expected: u32,
+) {
+    let deadline = tokio::time::Instant::now() + UI_TRANSITION_TIMEOUT;
+    loop {
+        let completed = mock.completed_fanout_children();
+        if completed == expected {
+            return;
+        }
+        assert!(
+            completed < expected,
+            "fanout advanced past the expected {expected} completed children; got {completed}\n{}",
+            astra.screen_diagnostic()
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {expected} completed fanout children, got {completed}\n{}",
             astra.screen_diagnostic()
         );
         astra.receive(Duration::from_millis(25));
@@ -781,7 +881,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_settlement() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
     )
     .await
@@ -833,10 +933,8 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
         );
     };
 
-    let refresh_deadline = Instant::now() + Duration::from_millis(1_700);
-    while Instant::now() < refresh_deadline {
-        astra.receive(Duration::from_millis(50));
-    }
+    wait_for_completed_fanout_children(&mock, &mut astra, 2).await;
+    astra.wait_for("2 done", UI_TRANSITION_TIMEOUT);
     let refreshed = astra.current_screen();
     let first = refreshed
         .find("slot 1: Mock review 1")
@@ -873,6 +971,7 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
         "foreground fan-in must not create a detached reconciliation turn"
     );
     astra.write(b"\x1b");
+    mock.release_held_response();
 
     astra.wait_for(
         "Parent synthesized one terminal fanout group exactly once.",
@@ -915,7 +1014,7 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_settlement() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
     )
     .await
@@ -929,28 +1028,20 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("parent waits for the complete group", UI_TRANSITION_TIMEOUT);
 
-    // Let the first two deterministic children settle while the third remains
-    // blocked for six seconds, then ask through the still-active composer.
-    let partial_deadline = Instant::now() + Duration::from_millis(1_100);
-    while Instant::now() < partial_deadline {
-        astra.receive(Duration::from_millis(25));
-    }
-    let guidance_submitted_at = Instant::now();
-    astra.write(
-        format!(
-            "{}\r",
-            astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION
-        )
-        .as_bytes(),
-    );
-    astra.wait_for(
-        "Guidance queued · Three mock reviews: 2/3 settled, 1 running",
+    // Let the first two deterministic children settle while the fixture holds
+    // the third at an explicit lifecycle boundary.
+    wait_for_completed_fanout_children(&mock, &mut astra, 2).await;
+    astra.wait_for("2 done", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit(
+        astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION,
         UI_TRANSITION_TIMEOUT,
     );
-    assert!(
-        guidance_submitted_at.elapsed() < Duration::from_secs(2),
-        "active guidance needs an immediate runtime receipt instead of waiting for foreground fan-in"
+    astra.wait_for_before(
+        "Guidance queued · Three mock reviews: 2/3 settled, 1 running",
+        "Astra knows Three mock reviews completed as one foreground work group.",
+        UI_TRANSITION_TIMEOUT,
     );
+    mock.release_held_response();
     astra.wait_for(
         "Astra knows Three mock reviews completed as one foreground work group.",
         Duration::from_secs(10),
@@ -1044,7 +1135,7 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutPartialThenComplete,
     )
     .await
@@ -1081,6 +1172,7 @@ async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
     astra.wait_for("  Tasks", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b");
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
 
     astra.wait_for(
         "Parent synthesized the available 2/3 fanout evidence exactly once.",
@@ -1126,7 +1218,7 @@ async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
     )
     .await
@@ -1147,6 +1239,7 @@ async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
     );
     astra.wait_for("one update after the group settles", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Shift+↓ inspect", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
     astra.wait_for(
         "Three mock reviews finished · 3/3 completed",
         UI_TRANSITION_TIMEOUT,
@@ -1202,7 +1295,7 @@ async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_group_is_queryable_before_its_single_terminal_wake() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
     )
     .await
@@ -1222,12 +1315,9 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
     );
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
-    astra.write(
-        format!(
-            "{}\r",
-            astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION
-        )
-        .as_bytes(),
+    astra.paste_and_submit(
+        astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION,
+        UI_TRANSITION_TIMEOUT,
     );
     astra.wait_for(
         "Astra knows Three mock reviews are running as one background work group.",
@@ -1264,6 +1354,7 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
         0,
         "an active background group must not wake before its terminal boundary"
     );
+    mock.release_held_response();
 
     astra.wait_for(
         "Parent reconciled one terminal fanout group exactly once.",

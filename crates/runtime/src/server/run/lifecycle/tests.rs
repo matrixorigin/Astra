@@ -291,16 +291,36 @@ impl UserIntentProvider for StaticRunControlProvider {
     }
 }
 
-struct ActiveTestModelService;
+struct ActiveTestModelService {
+    base_url: String,
+}
+
+impl ActiveTestModelService {
+    fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+        }
+    }
+}
+
+impl Default for ActiveTestModelService {
+    fn default() -> Self {
+        Self::new("https://models.example.com/v1")
+    }
+}
 
 fn test_resolved_model_offering() -> astra_services::ResolvedModelOffering {
+    test_resolved_model_offering_at("https://models.example.com/v1")
+}
+
+fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedModelOffering {
     astra_services::ResolvedModelOffering {
         offering_id: "model-test-model".to_string(),
         model: astra_services::ResolvedActiveLlmModel {
             model_name: "test-model".to_string(),
             wire_model_name: None,
             api_key: "test-provider-secret".to_string(),
-            base_url: "https://models.example.com/v1".to_string(),
+            base_url: base_url.to_string(),
             provider: "openai".to_string(),
             fallback_chain: Vec::new(),
             tags: Vec::new(),
@@ -318,12 +338,12 @@ fn test_admitted_model_execution() -> astra_services::AdmittedModelExecution {
         .expect("valid test model execution")
 }
 
-fn test_model_record(name: String) -> astra_services::ModelRecord {
+fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRecord {
     astra_services::ModelRecord {
         model_id: format!("model-{name}"),
         name,
         provider: "openai".to_string(),
-        base_url: Some("https://models.example.com/v1".to_string()),
+        base_url: Some(base_url.to_string()),
         description: None,
         is_active: true,
         context_window: 128_000,
@@ -364,7 +384,7 @@ impl astra_services::ModelService for ActiveTestModelService {
         model_name: String,
     ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if model_name == "test-model" {
-            return Ok(test_model_record(model_name));
+            return Ok(test_model_record_at(model_name, &self.base_url));
         }
         Err(error_response_coded(
             StatusCode::NOT_FOUND,
@@ -384,7 +404,7 @@ impl astra_services::ModelService for ActiveTestModelService {
                 "offering_not_found",
             ));
         }
-        Ok(test_resolved_model_offering())
+        Ok(test_resolved_model_offering_at(&self.base_url))
     }
 
     async fn update_model(
@@ -2807,7 +2827,67 @@ fn test_service() -> AgenticRunLifecycleService {
         Arc::new(TokioMutex::new(HashMap::new())),
         engine,
     )
-    .with_model_service(Arc::new(ActiveTestModelService))
+    .with_model_service(Arc::new(ActiveTestModelService::default()))
+}
+
+struct TerminalTestLlm {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TerminalTestLlm {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn spawn_terminal_test_llm() -> TerminalTestLlm {
+    use axum::{Router, response::IntoResponse, routing::post};
+
+    async fn chat_completions(Json(request): Json<Value>) -> axum::response::Response {
+        if request.get("stream").and_then(Value::as_bool) == Some(true) {
+            let delta = json!({"choices":[{"delta":{"content":"done"}}]});
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}});
+            return (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response();
+        }
+
+        Json(json!({
+            "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        }))
+        .into_response()
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(chat_completions));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind terminal test LLM");
+    let addr = listener.local_addr().expect("terminal test LLM address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve terminal test LLM");
+    });
+    TerminalTestLlm {
+        base_url: format!("http://{addr}/v1"),
+        server,
+    }
+}
+
+async fn terminal_test_service() -> (AgenticRunLifecycleService, TerminalTestLlm) {
+    let llm = spawn_terminal_test_llm().await;
+    let service = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    (service, llm)
 }
 
 #[tokio::test]
@@ -3086,7 +3166,7 @@ fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycle
         Arc::new(TokioMutex::new(HashMap::new())),
         engine,
     )
-    .with_model_service(Arc::new(ActiveTestModelService))
+    .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
 async fn install_live_run_state(
@@ -3140,7 +3220,7 @@ fn db_backed_test_service(
         Arc::new(TokioMutex::new(HashMap::new())),
         engine,
     )
-    .with_model_service(Arc::new(ActiveTestModelService))
+    .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
 async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
@@ -6608,9 +6688,8 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
 }
 
 #[tokio::test]
-#[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
 async fn stream_chat_tracks_run_for_status_and_replay() {
-    let svc = test_service();
+    let (svc, _llm) = terminal_test_service().await;
     let stream = ok(svc
         .stream_chat("user-1".into(), test_request("hello"))
         .await);
@@ -10289,9 +10368,8 @@ async fn durable_create_run_persists_to_store() {
 }
 
 #[tokio::test]
-#[ignore] // runs full agentic loop; needs live infra
 async fn durable_create_run_eventually_persists_terminal_event() {
-    let svc = test_service();
+    let (svc, _llm) = terminal_test_service().await;
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
     let engine = &svc.run_engine;
@@ -10322,9 +10400,8 @@ async fn durable_create_run_eventually_persists_terminal_event() {
 }
 
 #[tokio::test]
-#[ignore] // runs full agentic loop; needs live infra
 async fn durable_stream_chat_persists_final_state() {
-    let svc = test_service();
+    let (svc, _llm) = terminal_test_service().await;
     let stream = ok(svc
         .stream_chat("user-1".into(), test_request("hello"))
         .await);
@@ -11614,61 +11691,6 @@ async fn stream_chat_rejects_malformed_edge_context_before_agent_start() {
 }
 
 // ─── Background spawning integration tests ──────────────────────────
-
-#[tokio::test]
-#[ignore] // runs full agentic loop; needs live infra
-async fn create_run_spawns_background_task() {
-    let svc = test_service();
-    let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-    assert_eq!(run.status, "running");
-
-    // Deterministic wait: poll until the background task advances state.
-    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let status = ok(svc
-                .get_run_status(run.run_id.clone(), "user-1".into())
-                .await);
-            if status.status != "running" || status.events_count > 1 {
-                break status;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("timeout waiting for background task to advance state");
-    assert!(
-        status.status != "running" || status.events_count > 1,
-        "Expected background task to advance state, but status={} events={}",
-        status.status,
-        status.events_count
-    );
-}
-
-#[tokio::test]
-#[ignore] // runs full agentic loop; needs live infra
-async fn create_run_with_engine_persists_final_state() {
-    let svc = test_service();
-    let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-
-    // Deterministic wait: poll durable state until it leaves "running".
-    let engine = &svc.run_engine;
-    let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let durable = engine
-                .load_run("user-1", &run.run_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if durable.status != "running" {
-                break durable;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("timeout waiting for durable run status to finalize");
-    assert_ne!(durable.status, "running");
-}
 
 #[tokio::test]
 async fn fail_started_run_before_spawn_persists_terminal_events() {

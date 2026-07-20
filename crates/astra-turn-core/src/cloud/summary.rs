@@ -282,6 +282,7 @@ pub mod test_support {
         pub responses: Vec<Result<SummaryResponse, String>>,
         pub call_count: Arc<AtomicUsize>,
         purposes: Arc<Mutex<Vec<astra_turn_types::InferencePurpose>>>,
+        requests: Arc<Mutex<Vec<Vec<Value>>>>,
     }
 
     impl MockSummaryClient {
@@ -293,6 +294,7 @@ pub mod test_support {
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -310,6 +312,7 @@ pub mod test_support {
                 ],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -321,6 +324,7 @@ pub mod test_support {
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -329,6 +333,7 @@ pub mod test_support {
                 responses: vec![Err(msg.to_string())],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -338,6 +343,13 @@ pub mod test_support {
                 .expect("mock summary purpose lock")
                 .clone()
         }
+
+        pub fn recorded_requests(&self) -> Vec<Vec<Value>> {
+            self.requests
+                .lock()
+                .expect("mock summary request lock")
+                .clone()
+        }
     }
 
     #[async_trait]
@@ -345,12 +357,16 @@ pub mod test_support {
         async fn summarize(
             &self,
             purpose: astra_turn_types::InferencePurpose,
-            _messages: &[Value],
+            messages: &[Value],
         ) -> Result<SummaryResponse, String> {
             self.purposes
                 .lock()
                 .expect("mock summary purpose lock")
                 .push(purpose);
+            self.requests
+                .lock()
+                .expect("mock summary request lock")
+                .push(messages.to_vec());
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             let idx = count.min(self.responses.len() - 1);
             self.responses[idx].clone()
@@ -457,6 +473,44 @@ mod tests {
         assert!(
             !INLINE_COMPACT_INSTRUCTION.contains("**Goals**"),
             "inline compaction must not use a parallel summary schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_summary_preserves_system_prefix_and_history_wire_order() {
+        let system_messages = vec![
+            json!({"role": "system", "content": "stable prefix"}),
+            json!({"role": "system", "content": "runtime contract"}),
+        ];
+        let history = make_messages(2);
+        let client = MockSummaryClient::success("current state");
+
+        let summary = generate_inline_summary(&system_messages, &history, &client)
+            .await
+            .expect("inline summary should succeed");
+
+        assert!(summary.contains("current state"));
+        let requests = client.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            &request[..system_messages.len()],
+            system_messages.as_slice()
+        );
+        assert_eq!(
+            &request[system_messages.len()..system_messages.len() + history.len()],
+            history.as_slice()
+        );
+        assert_eq!(
+            request.last(),
+            Some(&json!({
+                "role": "user",
+                "content": INLINE_COMPACT_INSTRUCTION,
+            }))
+        );
+        assert_eq!(
+            client.recorded_purposes(),
+            [astra_turn_types::InferencePurpose::RequiredCompaction]
         );
     }
 

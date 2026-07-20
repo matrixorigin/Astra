@@ -113,6 +113,13 @@ impl StatusIndicator {
     }
 
     pub fn set_state(&mut self, state: IndicatorState) {
+        // Only the submission boundary may open a turn. Provider progress can
+        // arrive after a terminal event because input and stream producers use
+        // independent queues; accepting it from Idle resurrects a finished
+        // turn and leaves the composer stuck in follow-up mode.
+        if !matches!(state, IndicatorState::Idle) && self.turn_started_at.is_none() {
+            return;
+        }
         // Stream events queued before Ctrl+C can arrive during shutdown. They
         // are progress evidence, not authority to revoke the user's cancel
         // intent, so keep Stopping monotonic until terminal settlement.
@@ -145,21 +152,12 @@ impl StatusIndicator {
             self.turn_label = None;
         } else if matches!(state, IndicatorState::Cancelling { .. }) {
             self.turn_label = Some("Stopping");
-        } else if self.turn_started_at.is_none() {
-            // Auto-start a turn when transitioning out of Idle. Lets
-            // existing callers that drive `set_state(Thinking{...})`
-            // directly (and forget to invoke `begin_turn`) still get
-            // the correct turn-stable elapsed counter. The state's
-            // own `started_at` is the truthy turn-start signal — it
-            // was set by the caller at `Instant::now()` for exactly
-            // this transition.
-            if let Some(t) = state.started_at() {
-                self.turn_started_at = Some(t);
-                self.turn_label = Some(DEFAULT_TURN_LABEL);
-                self.stream_chars = 0;
-            }
         }
         self.state = state;
+    }
+
+    pub fn turn_is_open(&self) -> bool {
+        self.turn_started_at.is_some()
     }
 
     /// Mark the start of a new turn. Drives the elapsed counter that
@@ -502,6 +500,7 @@ mod tests {
     fn thinking_contains_star_label_and_elapsed() {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
+        s.begin_turn(t0);
         s.set_state(IndicatorState::Thinking { started_at: t0 });
         let line = render_for(
             &s.state,
@@ -539,6 +538,7 @@ mod tests {
     fn long_running_activity_stays_neutral_without_typed_failure_evidence() {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
+        s.begin_turn(t0);
         s.set_state(IndicatorState::Thinking { started_at: t0 });
         let line = s.render_at(t0 + Duration::from_secs(600)).unwrap();
         assert_eq!(
@@ -577,6 +577,7 @@ mod tests {
     fn bash_tool_can_surface_ctrl_b_hint() {
         let t0 = Instant::now();
         let mut s = StatusIndicator::new();
+        s.begin_turn(t0);
         s.set_state(IndicatorState::Tool {
             name: "bash".into(),
             started_at: t0,
@@ -612,6 +613,7 @@ mod tests {
     fn non_bash_state_transition_clears_ctrl_b_hint() {
         let t0 = Instant::now();
         let mut s = StatusIndicator::new();
+        s.begin_turn(t0);
         s.set_state(IndicatorState::Tool {
             name: "bash".into(),
             started_at: t0,
@@ -891,32 +893,21 @@ mod tests {
     }
 
     #[test]
-    fn first_active_set_state_auto_begins_turn() {
-        // Production callers in event_loop.rs invoke
-        // `set_state(Thinking { started_at: now })` directly without
-        // remembering `begin_turn`. The auto-promote keeps the
-        // turn-stable elapsed counter working without forcing every
-        // call site to be updated.
+    fn progress_cannot_resurrect_a_terminal_turn() {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
-        assert_eq!(
-            s.turn_started_at,
-            Some(t0),
-            "first transition out of Idle must seed the turn origin"
-        );
+        assert!(matches!(s.state(), IndicatorState::Idle));
+        assert!(s.turn_started_at.is_none());
 
-        // Subsequent state changes do NOT overwrite the turn origin.
-        let later = t0 + Duration::from_secs(5);
-        s.set_state(IndicatorState::Tool {
-            name: "bash".into(),
-            started_at: later,
+        s.begin_turn(t0);
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+        s.set_state(IndicatorState::Idle);
+        s.set_state(IndicatorState::WaitingModel {
+            started_at: t0 + Duration::from_secs(1),
         });
-        assert_eq!(
-            s.turn_started_at,
-            Some(t0),
-            "mid-turn state change must preserve the original turn origin"
-        );
+        assert!(matches!(s.state(), IndicatorState::Idle));
+        assert!(s.render_at(t0 + Duration::from_secs(2)).is_none());
     }
 
     #[test]

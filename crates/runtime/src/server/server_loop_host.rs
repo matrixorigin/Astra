@@ -12700,40 +12700,31 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
-        use axum::{Router, extract::State, routing::post};
+    async fn maybe_pre_turn_compact_requires_a_durable_inference_ledger() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use tokio::net::TcpListener;
 
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
-        #[derive(Default)]
-        struct RequestCapture {
-            body: tokio::sync::Mutex<Option<Value>>,
-        }
-
-        async fn handler(
-            State(capture): State<Arc<RequestCapture>>,
-            request: axum::extract::Request,
-        ) -> axum::Json<Value> {
-            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                .await
-                .expect("read request body");
-            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
-            axum::Json(json!({
-                "choices": [
-                    {
-                        "message": { "content": "inline summary" },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }))
-        }
-
-        let capture = Arc::new(RequestCapture::default());
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(capture.clone());
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": { "content": "inline summary" },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -12777,55 +12768,13 @@ mod tests {
         .await;
         assert_eq!(
             state.compact_tier_applied,
-            CompactionTier::CompactHistory,
-            "pre-turn compact should bump tier to CompactHistory",
-        );
-
-        let body = capture
-            .body
-            .lock()
-            .await
-            .clone()
-            .expect("summary request should be captured");
-        let messages = body["messages"]
-            .as_array()
-            .expect("openai request should contain messages");
-
-        assert!(
-            messages.len() > state.messages.len() / 2,
-            "inline summary request should include system prompt plus much of the original history"
+            CompactionTier::Normal,
+            "auxiliary inference must not bypass its durable admission ledger",
         );
         assert_eq!(
-            messages
-                .first()
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str),
-            Some("system"),
-            "inline summary request should begin with main-turn system messages"
-        );
-        assert!(
-            messages.iter().any(|m| {
-                m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("question 0"))
-            }),
-            "expected original conversation history in inline summary request"
-        );
-        assert_eq!(
-            messages
-                .last()
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str),
-            Some(astra_turn_core::cloud_summary::INLINE_COMPACT_INSTRUCTION),
-            "expected trailing inline compact instruction"
-        );
-        assert!(
-            !messages.iter().any(|m| {
-                m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("You are a conversation summarizer"))
-            }),
-            "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "provider I/O must not begin without durable admission material",
         );
 
         server.abort();
@@ -14544,56 +14493,31 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
-            use axum::{Router, extract::State, routing::post};
+        async fn builtin_turn_intent_judge_requires_a_durable_inference_ledger() {
+            use axum::{Router, routing::post};
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
             use tokio::net::TcpListener;
 
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
-            #[derive(Default)]
-            struct RequestCapture {
-                authorization: tokio::sync::Mutex<Option<String>>,
-                workspace_id: tokio::sync::Mutex<Option<String>>,
-                body: tokio::sync::Mutex<Option<Value>>,
-            }
-
-            async fn handler(
-                State(capture): State<Arc<RequestCapture>>,
-                headers: axum::http::HeaderMap,
-                request: axum::extract::Request,
-            ) -> axum::Json<Value> {
-                *capture.authorization.lock().await = headers
-                    .get("authorization")
-                    .and_then(|value| value.to_str().ok())
-                    .map(String::from);
-                *capture.workspace_id.lock().await = headers
-                    .get("x-workspace-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(String::from);
-
-                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("read request body");
-                *capture.body.lock().await =
-                    Some(serde_json::from_slice(&bytes).expect("json body"));
-
-                axum::Json(json!({
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                }))
-            }
-
-            let capture = Arc::new(RequestCapture::default());
-            let app = Router::new()
-                .route("/gateway/chat/completions", post(handler))
-                .with_state(capture.clone());
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_handler = request_count.clone();
+            let app = Router::new().route(
+                "/gateway/chat/completions",
+                post(move || {
+                    let request_count = request_count_for_handler.clone();
+                    async move {
+                        request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {"content": "{}"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            );
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind listener");
@@ -14619,61 +14543,15 @@ mod tests {
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "不对，我要的是系统性修复，不是临时补丁".to_string();
             state.user_intent = state.message.clone();
-            state.messages = vec![
-                serde_json::json!({"role": "user", "content": "earlier"}),
-                serde_json::json!({"role": "assistant", "content": "ok"}),
-            ];
-            state.hooks.forward_headers.insert(
-                "authorization".to_string(),
-                "Bearer forwarded-token".to_string(),
-            );
-            state
-                .hooks
-                .forward_headers
-                .insert("x-workspace-id".to_string(), "ws-judge".to_string());
-
-            let crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(intent) =
-                host.judge_turn_intent(&state).await
-            else {
-                panic!("gateway judge should return intent");
-            };
-
-            assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
-            assert_eq!(intent.objective_relation, ObjectiveRelation::Correct);
-            assert!(intent.reanchors_current_objective());
             assert_eq!(
-                intent.workspace_mutation,
-                astra_config::user_profile::WorkspaceMutationIntent::MustMutate
-            );
-            assert!(!intent.browser_verification_required);
-            assert_eq!(
-                capture.authorization.lock().await.as_deref(),
-                Some("Bearer forwarded-token")
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable,
+                "built-in intent inference must not bypass its durable ledger"
             );
             assert_eq!(
-                capture.workspace_id.lock().await.as_deref(),
-                Some("ws-judge")
-            );
-
-            let body = capture.body.lock().await.clone().expect("judge request");
-            let messages = body["messages"].as_array().expect("messages");
-            assert_eq!(messages.len(), 2);
-            let prompt = messages[1]["content"].as_str().expect("user prompt");
-            assert!(
-                prompt.contains("objective_relation"),
-                "judge prompt must request the structured objective relation"
-            );
-            assert!(
-                prompt.contains("workspace_mutation"),
-                "judge prompt must request the structured workspace mutation field"
-            );
-            assert!(
-                prompt.contains("browser_verification_required"),
-                "judge prompt must request the structured browser verification field"
-            );
-            assert!(
-                prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
-                "judge prompt must include the current user message as data"
+                request_count.load(AtomicOrdering::SeqCst),
+                0,
+                "provider I/O must not begin without durable admission material"
             );
 
             server.abort();

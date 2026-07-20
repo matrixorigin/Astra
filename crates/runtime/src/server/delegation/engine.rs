@@ -2604,6 +2604,9 @@ impl DelegationEngine {
             )?;
 
         let session_id = Self::session_id_for(&request);
+        self.run_engine
+            .require_delegation_parent(&request.user_id, &session_id, &request.parent_run_id)
+            .await?;
 
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
@@ -4763,6 +4766,65 @@ mod tests {
         (Arc::new(RwLock::new(reg)), engine, tracker)
     }
 
+    /// Establish the production precondition for a delegation test: the
+    /// parent conversation run already exists in the durable run store.
+    ///
+    /// Delegated runs inherit lineage and admitted model identity from their
+    /// parent. Tests must therefore create that parent through the same
+    /// `RunEngine` API used by the lifecycle instead of relying on the legacy
+    /// orphan-child fallback.
+    async fn persist_durable_parent_fixture(
+        engine: &DelegationEngine,
+        request: &DelegationRequest,
+    ) -> Result<(), String> {
+        if engine
+            .run_engine
+            .load_run(&request.user_id, &request.parent_run_id)
+            .await?
+            .is_none()
+        {
+            engine
+                .run_engine
+                .start_run(
+                    &request.parent_run_id,
+                    &request.user_id,
+                    &request.session_id,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_with_durable_parent(
+        engine: &DelegationEngine,
+        request: DelegationRequest,
+        source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    ) -> Result<DelegationResult, String> {
+        persist_durable_parent_fixture(engine, &request).await?;
+        engine.execute(request, source_agent_id, cancel_token).await
+    }
+
+    async fn execute_with_durable_parent_and_headers(
+        engine: &DelegationEngine,
+        request: DelegationRequest,
+        source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        forward_headers: HashMap<String, String>,
+        admitted_model_execution: Option<AdmittedModelExecution>,
+    ) -> Result<DelegationResult, String> {
+        persist_durable_parent_fixture(engine, &request).await?;
+        engine
+            .execute_with_forward_headers(
+                request,
+                source_agent_id,
+                cancel_token,
+                forward_headers,
+                admitted_model_execution,
+            )
+            .await
+    }
+
     #[test]
     fn missing_agent_profile_error_lists_operation_and_available_profiles() {
         let mut reg = AgentProfileRegistry::new();
@@ -5300,7 +5362,9 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.delegation_id, "del-1");
@@ -5327,6 +5391,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_durable_parent_is_rejected_before_live_delegation_state_exists() {
+        let (reg, engine, tracker) = setup();
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            Arc::new(crate::messaging::InProcessTransport::new()),
+            tracker.clone(),
+        ));
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
+                .with_mailbox_router(router.clone());
+        let request = fan_out_request(vec!["coder"]);
+
+        let result = de.execute(request, "orch", None).await;
+
+        assert!(result.is_err());
+        assert!(tracker.get_progress("del-1").await.is_none());
+        assert!(tracker.get_sub_runs("del-1").await.is_empty());
+        assert!(!router.is_run_registered("parent-1").await);
+    }
+
+    #[tokio::test]
     async fn sequential_spawns_ordered_sub_runs() {
         let (reg, engine, tracker) = setup();
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
@@ -5348,7 +5432,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.agent_results[0].agent_id, "coder");
         assert_eq!(result.agent_results[1].agent_id, "reviewer");
@@ -5384,7 +5470,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         let subs = tracker.get_sub_runs("del-pipe").await;
@@ -5415,7 +5503,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         // 2 rounds × 2 agents = 4 sub-runs
         assert_eq!(result.agent_results.len(), 4);
 
@@ -5506,7 +5596,7 @@ mod tests {
         let req2 = DelegationRequest {
             session_id: "test-session".into(),
             delegation_id: "del-B".into(),
-            parent_run_id: "pB".into(),
+            parent_run_id: "pA".into(),
             task: "b".into(),
             pattern: CoordinationPattern::FanOut {
                 agent_ids: vec!["reviewer".into()],
@@ -5520,8 +5610,12 @@ mod tests {
             delegation_chain: Vec::new(),
         };
 
-        de.execute(req1, "orch", None).await.unwrap();
-        de.execute(req2, "orch", None).await.unwrap();
+        execute_with_durable_parent(&de, req1, "orch", None)
+            .await
+            .unwrap();
+        execute_with_durable_parent(&de, req2, "orch", None)
+            .await
+            .unwrap();
 
         let subs_a = tracker.get_sub_runs("del-A").await;
         let subs_b = tracker.get_sub_runs("del-B").await;
@@ -5675,6 +5769,9 @@ mod tests {
             execution_metadata: None,
         };
 
+        persist_durable_parent_fixture(&engine, &request)
+            .await
+            .unwrap();
         engine
             .execute_with_forward_headers_and_live_events(
                 request,
@@ -5712,37 +5809,30 @@ mod tests {
             }),
         );
 
-        engine
-            .execute(
-                DelegationRequest {
-                    session_id: "test-session".into(),
-                    delegation_id: "delegation-adversarial-cancel".into(),
-                    parent_run_id: "run-root-adversarial".into(),
-                    task: "review the implementation".into(),
-                    pattern: CoordinationPattern::AdversarialReview {
-                        producer_id: "coder".into(),
-                        reviewer_id: "reviewer".into(),
-                        max_rounds: 1,
-                        acceptance_threshold: 1.0,
-                        timeout_sec: 0,
-                    },
-                    user_id: "user-1".into(),
-                    depth: 0,
-                    delegation_chain: Vec::new(),
-                    context: HashMap::new(),
-                    execution_metadata: None,
-                },
-                "orch",
-                None,
-            )
+        let adversarial_request = DelegationRequest {
+            session_id: "test-session".into(),
+            delegation_id: "delegation-adversarial-cancel".into(),
+            parent_run_id: "run-root-adversarial".into(),
+            task: "review the implementation".into(),
+            pattern: CoordinationPattern::AdversarialReview {
+                producer_id: "coder".into(),
+                reviewer_id: "reviewer".into(),
+                max_rounds: 1,
+                acceptance_threshold: 1.0,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: HashMap::new(),
+            execution_metadata: None,
+        };
+        execute_with_durable_parent(&engine, adversarial_request, "orch", None)
             .await
             .unwrap();
-        engine
-            .execute(
-                fork_request("delegation-fork-cancel", vec!["a", "b"], "writer"),
-                "orch",
-                None,
-            )
+        let mut fork_request = fork_request("delegation-fork-cancel", vec!["a", "b"], "writer");
+        fork_request.parent_run_id = "run-root-adversarial".into();
+        execute_with_durable_parent(&engine, fork_request, "orch", None)
             .await
             .unwrap();
 
@@ -5783,6 +5873,9 @@ mod tests {
         let mut request = fan_out_request(vec!["coder"]);
         request.delegation_id = "delegation-cancel-awaits-executor".into();
         request.parent_run_id = "parent-cancel-awaits-executor".into();
+        persist_durable_parent_fixture(&engine, &request)
+            .await
+            .unwrap();
 
         let execution = {
             let engine = engine.clone();
@@ -5860,6 +5953,9 @@ mod tests {
         let mut request = fan_out_request(vec!["coder"]);
         request.delegation_id = "delegation-parent-cancel".into();
         request.parent_run_id = "parent-fanout-cancel".into();
+        persist_durable_parent_fixture(&engine, &request)
+            .await
+            .unwrap();
 
         let execution = {
             let engine = engine.clone();
@@ -5924,6 +6020,9 @@ mod tests {
         ));
         let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let request = fork_request("delegation-fork-parent-cancel", vec!["inspect"], "writer");
+        persist_durable_parent_fixture(&engine, &request)
+            .await
+            .unwrap();
 
         let execution = {
             let engine = engine.clone();
@@ -5987,6 +6086,9 @@ mod tests {
         request
             .context
             .insert("team_max_parallel".into(), serde_json::json!(1));
+        persist_durable_parent_fixture(&engine, &request)
+            .await
+            .unwrap();
 
         let execution = {
             let parent_cancel = parent_cancel.clone();
@@ -6098,7 +6200,9 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -6139,8 +6243,7 @@ mod tests {
             error: None,
         }));
 
-        let result = de
-            .execute(fan_out_request(vec!["coder"]), "orch", None)
+        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
             .await
             .unwrap();
         assert_eq!(result.agent_results.len(), 1);
@@ -6184,7 +6287,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // First stage has no previous_output
@@ -6220,7 +6325,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         // First agent succeeds → stops
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].agent_id, "coder");
@@ -6234,7 +6341,9 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(executor);
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.status, "partial");
         assert_eq!(result.agent_results.len(), 2);
@@ -6279,7 +6388,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         // 2 rounds × (producer + reviewer) = 4
         assert_eq!(result.agent_results.len(), 4);
         assert_eq!(result.status, "completed");
@@ -6326,7 +6437,9 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.status, "completed");
         // EchoExecutor returns prompt_tokens=10
         assert_eq!(result.total_prompt_tokens, 10);
@@ -6378,7 +6491,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("context_present=true")
@@ -6436,19 +6551,19 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de
-            .execute_with_forward_headers(
-                req,
-                "orch",
-                None,
-                HashMap::from([(
-                    "authorization".to_string(),
-                    "Bearer trusted-token".to_string(),
-                )]),
-                None,
-            )
-            .await
-            .unwrap();
+        let result = execute_with_durable_parent_and_headers(
+            &de,
+            req,
+            "orch",
+            None,
+            HashMap::from([(
+                "authorization".to_string(),
+                "Bearer trusted-token".to_string(),
+            )]),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("auth_present=true;context_key_present=false")
@@ -6514,23 +6629,23 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de
-            .execute_with_forward_headers(
-                req,
-                "orch",
-                None,
-                HashMap::new(),
-                Some(AdmittedModelExecution::from_endpoint(
-                    "offer-coder".to_string(),
-                    "test-model".to_string(),
-                    "openai".to_string(),
-                    "http://catalog:8081/api/v1/chat/completions".to_string(),
-                    "Bearer test".to_string(),
-                    Some(2500),
-                )),
-            )
-            .await
-            .unwrap();
+        let result = execute_with_durable_parent_and_headers(
+            &de,
+            req,
+            "orch",
+            None,
+            HashMap::new(),
+            Some(AdmittedModelExecution::from_endpoint(
+                "offer-coder".to_string(),
+                "test-model".to_string(),
+                "openai".to_string(),
+                "http://catalog:8081/api/v1/chat/completions".to_string(),
+                "Bearer test".to_string(),
+                Some(2500),
+            )),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             result.agent_results[0].output.as_deref(),
@@ -6593,7 +6708,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("auth_present=false;context_key_present=false")
@@ -6747,7 +6864,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // Each agent should see its own worktree path
@@ -6803,7 +6922,9 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // Pause all children of parent-1 (sub-runs are already completed)
@@ -6838,7 +6959,9 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        de.execute(req, "orch", None).await.unwrap();
+        execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         let paused = de.pause_delegation("user-1", "del-1").await;
         assert_eq!(paused, 0);
@@ -6865,6 +6988,10 @@ mod tests {
     #[tokio::test]
     async fn live_sub_run_pause_resume_commits_status_and_event_before_flag() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        engine
+            .start_run("parent-live", "user-1", "session-live")
+            .await
+            .unwrap();
         engine
             .start_run_ext(
                 "sub-live",
@@ -6916,6 +7043,10 @@ mod tests {
     #[tokio::test]
     async fn waiting_sub_run_retains_its_required_context_when_parent_pauses() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        engine
+            .start_run("parent-live", "user-1", "session-live")
+            .await
+            .unwrap();
         engine
             .start_run_ext(
                 "sub-waiting",
@@ -7169,7 +7300,9 @@ mod tests {
             .with_gate(Arc::new(AlwaysPassGate));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -7185,7 +7318,9 @@ mod tests {
             .with_gate(Arc::new(AlwaysFailGate));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Fan-out with always-fail gate: result should be verification_failed
         assert_eq!(result.agent_results.len(), 1);
@@ -7223,7 +7358,9 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Should eventually pass after retry
         assert_eq!(result.agent_results.len(), 1);
@@ -7253,7 +7390,9 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         let output = result.agent_results[0].output.as_deref().unwrap_or("");
         assert!(output.contains("## Team Coordination: Pipeline"));
@@ -7285,7 +7424,9 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         let producer_output = result.agent_results[0].output.as_deref().unwrap_or("");
         assert!(producer_output.contains("## Team Coordination: Adversarial Review (Producer)"));
@@ -7300,8 +7441,7 @@ mod tests {
             DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
                 .with_gate(gate);
 
-        let result = de
-            .execute(fan_out_request(vec!["coder"]), "orch", None)
+        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
             .await
             .unwrap();
         assert_eq!(result.agent_results.len(), 1);
@@ -7328,8 +7468,7 @@ mod tests {
             DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
                 .with_gate(gate);
 
-        let result = de
-            .execute(fan_out_request(vec!["coder"]), "orch", None)
+        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
             .await
             .unwrap();
         let chain = tracker
@@ -7362,7 +7501,9 @@ mod tests {
         req.parent_run_id = "parent-journal-retry".into();
         req.session_id = "sess-journal-retry".into();
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
 
@@ -7529,7 +7670,9 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         };
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "verification_failed");
@@ -7540,7 +7683,9 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -7566,7 +7711,9 @@ mod tests {
         .with_gate(Arc::new(AlwaysFailGate));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Should be "failed" (from executor), NOT "verification_failed"
         assert_eq!(result.agent_results[0].status, "failed");
@@ -7978,7 +8125,9 @@ mod tests {
             vec!["task-a", "task-b", "task-c"],
             "writer",
         );
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.agent_results.len(), 3);
         assert_eq!(result.status, "completed");
@@ -8025,7 +8174,9 @@ mod tests {
             DelegationEngine::with_executor(reg, engine, tracker, Arc::new(DelegateCheckExecutor));
 
         let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.agent_results[0].output.as_deref(),
@@ -8042,7 +8193,9 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, executor);
 
         let req = fork_request("del-fork-fail", vec!["task-a", "task-b"], "writer");
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // All children use "writer" which fails → all failed
         assert_eq!(result.agent_results.len(), 2);
@@ -8057,7 +8210,9 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fork_request("del-fork-single", vec!["only-task"], "writer");
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.status, "completed");
@@ -8103,7 +8258,9 @@ mod tests {
         );
 
         let req = fork_request("del-fork-ctx", vec!["a", "b"], "writer");
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Both children should have fork metadata
         let outputs: Vec<String> = result
@@ -8201,7 +8358,9 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, failing);
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // All results should be failed
         assert_eq!(result.agent_results.len(), 2);
@@ -8232,7 +8391,9 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(HardErrorExecutor));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Hard errors should be captured as failed agent results, not propagated
         assert_eq!(result.agent_results.len(), 1);
@@ -8270,7 +8431,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 3);
 
         // Each stage receives previous output
@@ -8641,11 +8804,12 @@ mod tests {
         let mut req2 = fan_out_request(vec!["reviewer"]);
         req2.delegation_id = "del-iso-2".into();
         req2.parent_run_id = "parent-iso-2".into();
+        req2.session_id = "test-session-2".into();
 
         // Execute with different tokens — cancelling one shouldn't affect the other
         let (r1, r2) = tokio::join!(
-            de.execute(req1, "orch", Some(token1.clone())),
-            de.execute(req2, "orch", Some(token2.clone())),
+            execute_with_durable_parent(&de, req1, "orch", Some(token1.clone())),
+            execute_with_durable_parent(&de, req2, "orch", Some(token2.clone())),
         );
 
         // Both should succeed since neither token was cancelled
@@ -8750,7 +8914,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Should fail due to timeout
         assert_eq!(result.agent_results.len(), 1);
@@ -8793,7 +8959,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "failed");
@@ -8822,8 +8990,7 @@ mod tests {
                 .with_gate(gate)
                 .with_mailbox_router(router);
 
-        let result = de
-            .execute(fan_out_request(vec!["coder"]), "orch", None)
+        let result = execute_with_durable_parent(&de, fan_out_request(vec!["coder"]), "orch", None)
             .await
             .unwrap();
         assert_eq!(
@@ -8856,7 +9023,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
 
         // Both agents should fail due to timeout
         assert_eq!(result.agent_results.len(), 2);
@@ -8895,7 +9064,9 @@ mod tests {
             execution_metadata: None,
         };
 
-        let result = de.execute(req, "orch", None).await.unwrap();
+        let result = execute_with_durable_parent(&de, req, "orch", None)
+            .await
+            .unwrap();
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
     }

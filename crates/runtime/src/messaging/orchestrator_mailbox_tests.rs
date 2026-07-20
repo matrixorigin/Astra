@@ -143,7 +143,30 @@ mod tests {
 
     struct TestHarness {
         engine: DelegationEngine,
+        run_engine: Arc<RunEngine>,
         router: Arc<AgentMailboxRouter>,
+    }
+
+    impl TestHarness {
+        async fn persist_request_parent(&self, request: &DelegationRequest) {
+            self.run_engine
+                .start_run(
+                    &request.parent_run_id,
+                    &request.user_id,
+                    &request.session_id,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn execute(
+            &self,
+            request: DelegationRequest,
+            cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        ) -> Result<astra_services::coordination::DelegationResult, String> {
+            self.persist_request_parent(&request).await;
+            self.engine.execute(request, "orch", cancel_token).await
+        }
     }
 
     fn setup_harness(executor: Arc<dyn SubRunExecutor>) -> TestHarness {
@@ -154,11 +177,19 @@ mod tests {
         let transport = Arc::new(InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
 
-        let engine =
-            DelegationEngine::with_executor(profiles, run_engine, tracker.clone(), executor)
-                .with_mailbox_router(router.clone());
+        let engine = DelegationEngine::with_executor(
+            profiles,
+            run_engine.clone(),
+            tracker.clone(),
+            executor,
+        )
+        .with_mailbox_router(router.clone());
 
-        TestHarness { engine, router }
+        TestHarness {
+            engine,
+            run_engine,
+            router,
+        }
     }
 
     /// Build a harness WITHOUT mailbox_router to test the no-router path.
@@ -170,11 +201,19 @@ mod tests {
         let transport = Arc::new(InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
 
-        let engine =
-            DelegationEngine::with_executor(profiles, run_engine, tracker.clone(), executor);
+        let engine = DelegationEngine::with_executor(
+            profiles,
+            run_engine.clone(),
+            tracker.clone(),
+            executor,
+        );
         // Intentionally NOT calling .with_mailbox_router()
 
-        TestHarness { engine, router }
+        TestHarness {
+            engine,
+            run_engine,
+            router,
+        }
     }
 
     // ── Core fix: engine auto-registers parent ──────────────────────────
@@ -197,7 +236,7 @@ mod tests {
             "del-fanout-auto",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok(), "delegation should succeed");
 
         let results = results.lock().await;
@@ -228,7 +267,7 @@ mod tests {
             "del-adv-auto",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let results = results.lock().await;
@@ -260,7 +299,7 @@ mod tests {
             "del-seq-auto",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let results = results.lock().await;
@@ -290,7 +329,7 @@ mod tests {
             "del-cleanup",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         // After delegation completes, the auto-registered parent should be
@@ -324,7 +363,7 @@ mod tests {
             "del-all-cleanup",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let registered = h
@@ -357,7 +396,7 @@ mod tests {
             "del-no-router",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let results = results.lock().await;
@@ -457,6 +496,7 @@ mod tests {
             "parent-run",
             "del-mid-unreg",
         );
+        h.persist_request_parent(&request).await;
 
         let engine_handle = {
             let engine = h.engine;
@@ -514,7 +554,7 @@ mod tests {
         );
 
         // Engine will attempt to re-register the same parent — should not panic.
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let results = results.lock().await;
@@ -551,7 +591,7 @@ mod tests {
             "del-diff-run",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         // Child progress should still succeed (engine registered parent-run).
@@ -615,6 +655,7 @@ mod tests {
             "parent-run",
             "del-cancel",
         );
+        h.persist_request_parent(&request).await;
 
         let cancel_clone = cancel.clone();
         let engine_handle = {
@@ -661,7 +702,7 @@ mod tests {
             "del-fork-auto",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
         let results = results.lock().await;
@@ -693,21 +734,24 @@ mod tests {
             "del-drop-cleanup",
         );
 
-        let result = h.engine.execute(request, "orch", None).await;
+        let result = h.execute(request, None).await;
         assert!(result.is_ok());
 
-        // Give the Drop-spawned unregister tasks time to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let registered = h
-            .router
-            .list_registered_agents("del-drop-cleanup")
-            .await
-            .unwrap();
-        assert!(
-            registered.is_empty(),
-            "all mailboxes (parent + children) should be cleaned up via Drop, still registered: {registered:?}"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let registered = h
+                    .router
+                    .list_registered_agents("del-drop-cleanup")
+                    .await
+                    .unwrap();
+                if registered.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all parent and child mailboxes should unregister after their handles drop");
     }
 
     // ── Cancellation: fan-out collection loop aborts promptly ───────────
@@ -753,6 +797,7 @@ mod tests {
             "parent-run",
             "del-abort-fanout",
         );
+        h.persist_request_parent(&request).await;
 
         let cancel_clone = cancel.clone();
         let engine_handle = {
@@ -799,6 +844,7 @@ mod tests {
             "parent-run",
             "del-abort-fork",
         );
+        h.persist_request_parent(&request).await;
 
         let cancel_clone = cancel.clone();
         let engine_handle = {

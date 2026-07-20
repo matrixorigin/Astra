@@ -6310,6 +6310,16 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
+                                                                        // The live agent strip is updated by streamed child events,
+                                                                        // while `local_agent_snapshot` advances on a bounded polling
+                                                                        // cadence. Capture the producer directly at this acceptance
+                                                                        // boundary so the immediate receipt cannot report older slot
+                                                                        // counts than the UI the user just acted on.
+                                                                        let guidance_agent_snapshot =
+                                                                            super::local_agent_snapshot::LocalAgentSnapshot::capture(
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                            )
+                                                                            .await;
                                                                         let active_work_snapshot =
                                                                             bg_task_list_cache_for_turn
                                                                                 .read()
@@ -6335,7 +6345,7 @@ pub(crate) async fn run_tui_session(
                                                                                     );
                                                                                     chat_widget.commit_concurrent_system(
                                                                                         history_cell::system::SystemCell::runtime_work(
-                                                                                            local_agent_snapshot.active_guidance_receipt(),
+                                                                                            guidance_agent_snapshot.active_guidance_receipt(),
                                                                                         ),
                                                                                     );
                                                                                     // Guidance is accepted while the foreground
@@ -8373,20 +8383,32 @@ pub(crate) async fn run_tui_session(
                             agent_workbench_tx.clone(),
                         );
                     }
-                    local_agent_snapshot =
-                        super::local_agent_snapshot::LocalAgentSnapshot::capture(
-                            state.agent_spawner.as_ref(),
-                        )
-                        .await;
-                    let projection_changed = chat_widget.reconcile_local_agent_snapshot(
-                        &local_agent_snapshot,
-                        &restored_local_agent_task_projections,
-                    );
-                    next_local_agent_reconcile =
-                        std::time::Instant::now() + LOCAL_AGENT_RECONCILE_INTERVAL;
-                    if projection_changed {
-                        refresh_open_agent_views(&chat_widget, &mut bottom_pane);
-                        frame_requester.schedule_frame();
+                    if reset_agent_scope {
+                        // A real session switch installs a new spawner, so its
+                        // first snapshot is a baseline rather than a transition
+                        // from the retired session.
+                        local_agent_snapshot =
+                            super::local_agent_snapshot::LocalAgentSnapshot::capture(
+                                state.agent_spawner.as_ref(),
+                            )
+                            .await;
+                        let projection_changed = chat_widget.reconcile_local_agent_snapshot(
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                        );
+                        next_local_agent_reconcile =
+                            std::time::Instant::now() + LOCAL_AGENT_RECONCILE_INTERVAL;
+                        if projection_changed {
+                            refresh_open_agent_views(&chat_widget, &mut bottom_pane);
+                            frame_requester.schedule_frame();
+                        }
+                    } else {
+                        // The server assigning the first durable session id
+                        // does not replace the local runtime. Preserve the
+                        // pre-binding snapshot and reconcile immediately so a
+                        // child that settles during turn handoff cannot become
+                        // the new baseline and lose its one terminal update.
+                        next_local_agent_reconcile = std::time::Instant::now();
                     }
                 }
                 if std::time::Instant::now() >= next_local_agent_reconcile {
@@ -8689,7 +8711,7 @@ fn handle_app_event(
     fr: &FrameRequester,
 ) {
     let now = std::time::Instant::now();
-    if matches!(
+    let is_turn_progress = matches!(
         ev,
         TuiAppEvent::Token(_)
             | TuiAppEvent::ThinkingStarted
@@ -8701,7 +8723,11 @@ fn handle_app_event(
             | TuiAppEvent::ToolCompleted { .. }
             | TuiAppEvent::AgentControlStarted { .. }
             | TuiAppEvent::AgentControlCompleted { .. }
-    ) {
+    );
+    if is_turn_progress && !status_indicator.turn_is_open() {
+        return;
+    }
+    if is_turn_progress {
         status_indicator.mark_dispatched();
     }
     match ev {
@@ -8944,6 +8970,7 @@ mod tests {
         chat_widget.handle_event(event);
         let mut bottom_pane = BottomPane::new();
         let mut indicator = status_indicator::StatusIndicator::new();
+        indicator.begin_turn(now);
         indicator.set_state(status_indicator::IndicatorState::Tool {
             name: "agent_fanout".into(),
             started_at: now,
@@ -11836,6 +11863,7 @@ mod tests {
         let mut cancel_control_tasks = tokio::task::JoinSet::new();
         let started_at = std::time::Instant::now();
         bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at });
+        status_indicator.begin_turn(started_at);
         status_indicator.set_state(status_indicator::IndicatorState::Thinking { started_at });
         let run_control = LocalRunControl::default();
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -12508,6 +12536,25 @@ mod tests {
         bottom_pane.render(area, &mut settled);
         let settled_text = crate::tui::testing::render::buffer_to_string(&settled);
         assert!(!settled_text.contains("Enter queues follow-up"));
+
+        handle_app_event(
+            &TuiAppEvent::WaitingForModel,
+            &mut bottom_pane,
+            &mut indicator,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(matches!(
+            indicator.state(),
+            status_indicator::IndicatorState::Idle
+        ));
+        let mut after_late_progress = ratatui::buffer::Buffer::empty(area);
+        bottom_pane.render(area, &mut after_late_progress);
+        let after_late_progress =
+            crate::tui::testing::render::buffer_to_string(&after_late_progress);
+        assert!(
+            !after_late_progress.contains("Enter queues follow-up"),
+            "late progress resurrected a terminal turn: {after_late_progress:?}"
+        );
     }
 
     #[test]

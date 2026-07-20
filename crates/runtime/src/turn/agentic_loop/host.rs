@@ -6720,8 +6720,10 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine()
-    -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) async fn make_test_delegation_engine(
+        parent_run_id: &str,
+        session_id: &str,
+    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
@@ -6743,9 +6745,14 @@ pub(crate) mod tests {
         let _ = registry.register(reviewer);
 
         let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        run_engine
+            .start_run(parent_run_id, "system", session_id)
+            .await
+            .expect("test delegation parent should persist");
         Arc::new(DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
-            Arc::new(RunEngine::new(run_store)),
+            run_engine,
             Arc::new(DelegationTracker::new()),
             Arc::new(StubSubRunExecutor),
         ))
@@ -6810,7 +6817,8 @@ pub(crate) mod tests {
         state.current_session_id = Some("test-session-e2e".to_string());
 
         // Wire delegation engine
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine =
+            Some(make_test_delegation_engine("test-run-e2e", "test-session-e2e").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop should complete: {outcome:?}");
@@ -6915,7 +6923,7 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "review and list files"}));
         state.current_run_id = Some("run-mix".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("run-mix", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -6945,7 +6953,7 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "delegate something"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -6989,7 +6997,7 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "implement and review"}));
         state.current_run_id = Some("run-fanout".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("run-fanout", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -7061,7 +7069,8 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "write and review auth"}));
         state.current_run_id = Some("run-adversarial".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine =
+            Some(make_test_delegation_engine("run-adversarial", "unknown").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -7082,7 +7091,7 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "list files"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
+        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
