@@ -216,14 +216,14 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn server_memory_inference_preserves_typed_purpose_on_the_wire() {
+    async fn server_memory_inference_sends_typed_operation_and_session_coordinates() {
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let request_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(request_tx)));
         let app = Router::new().route(
             "/v1/chat/completions",
             post({
                 let request_tx = request_tx.clone();
-                move |Json(body): Json<serde_json::Value>| {
+                move |Json(body): Json<astra_thin_client::CompletionRequest>| {
                     let request_tx = request_tx.clone();
                     async move {
                         if let Some(tx) = request_tx.lock().expect("request lock").take() {
@@ -279,14 +279,31 @@ mod tests {
         let body = request_rx.await.expect("captured request");
 
         assert_eq!(output, "[0]");
-        assert_eq!(body["purpose"], "memory_retrieval_rerank");
-        assert_eq!(body["invocation_scope"]["kind"], "session");
         assert_eq!(
-            body["model_selection"],
-            serde_json::json!({"offering_id": "memory-offering"})
+            body.operation,
+            astra_thin_client::CompletionOperation::MemoryRetrievalRerank
         );
-        assert!(body.get("model").is_none());
-        assert_eq!(body["messages"], serde_json::json!(messages));
+        assert_eq!(
+            body.model_selection,
+            Some(astra_turn_types::ModelSelection {
+                offering_id: "memory-offering".to_string(),
+            })
+        );
+        assert_eq!(body.session_id, "session-memory");
+        assert_eq!(body.turn, 1);
+        assert_eq!(body.round, 0);
+        assert_eq!(body.logical_attempt, 0);
+        assert_eq!(body.messages, messages);
+        assert_eq!(
+            body.invocation_scope(),
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-memory".to_string(),
+                turn: 1,
+                round: 0,
+                operation_id: "completion_proxy:memory_retrieval_rerank".to_string(),
+                logical_attempt: 0,
+            }
+        );
         server.abort();
         assert!(
             server

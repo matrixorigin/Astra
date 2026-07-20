@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn completion_http_boundary_persists_session_scope_attempt_and_usage_before_returning() {
+    async fn completion_http_boundary_persists_success_failure_and_caller_cancellation() {
         use axum::response::IntoResponse;
         use sqlx::Row;
 

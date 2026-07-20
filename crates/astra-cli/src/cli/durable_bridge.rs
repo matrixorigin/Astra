@@ -2601,7 +2601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_proxy_judge_uses_governed_default_and_typed_purpose() {
+    async fn server_proxy_judge_sends_typed_operation_and_session_coordinates() {
         use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
 
@@ -2610,7 +2610,7 @@ mod tests {
 
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
+            post(move |Json(body): Json<astra_thin_client::CompletionRequest>| {
                 let cap = captured_clone.clone();
                 async move {
                     *cap.lock_recover() = Some(body);
@@ -2644,15 +2644,25 @@ mod tests {
             .lock_recover()
             .take()
             .expect("completion request captured");
-        assert!(body.get("model").is_none());
-        assert!(body.get("model_selection").is_none());
-        assert_eq!(body["purpose"], "verification_judge");
-        assert_eq!(body["invocation_scope"]["kind"], "session");
         assert_eq!(
-            body["invocation_scope"]["operation_id"],
-            "plan_verification"
+            body.operation,
+            astra_thin_client::CompletionOperation::VerificationJudge
         );
-        assert_eq!(body["invocation_scope"]["logical_attempt"], 0);
+        assert!(body.model_selection.is_none());
+        assert_eq!(body.session_id, "session-judge");
+        assert_eq!(body.turn, 7);
+        assert_eq!(body.round, 0);
+        assert_eq!(body.logical_attempt, 0);
+        assert_eq!(
+            body.invocation_scope(),
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-judge".to_string(),
+                turn: 7,
+                round: 0,
+                operation_id: "completion_proxy:verification_judge".to_string(),
+                logical_attempt: 0,
+            }
+        );
         server.abort();
     }
 

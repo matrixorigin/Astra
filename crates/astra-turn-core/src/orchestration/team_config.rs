@@ -275,7 +275,6 @@ agents:
   - name: test-agent
     description: A test agent
     extends: task
-    model: claude-haiku
     max_turns: 5
     allowed_tools:
       - bash
