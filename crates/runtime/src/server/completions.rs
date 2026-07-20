@@ -11,7 +11,9 @@ use astra_server_types::{
 use std::time::Duration;
 
 fn completion_response_id(response_id: Option<&str>) -> String {
-    response_id.unwrap_or("chatcmpl-proxy").to_string()
+    response_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("chatcmpl-proxy-{}", uuid::Uuid::new_v4().simple()))
 }
 
 /// `POST /v1/chat/completions` — lightweight LLM proxy.

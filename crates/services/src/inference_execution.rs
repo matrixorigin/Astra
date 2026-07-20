@@ -421,10 +421,18 @@ pub async fn admit_inference_invocation(
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation").await;
-        if let Some(status) = existing_invocation_status(db, plan).await? {
-            return Err(existing_invocation_error(plan, &status));
+        match existing_invocation_status(db, plan).await {
+            Ok(Some(status)) => return Err(existing_invocation_error(plan, &status)),
+            Ok(None) => return Err(error),
+            Err(status_err) => {
+                tracing::error!(
+                    %error,
+                    %status_err,
+                    "admission write failed and existing-status re-check also failed"
+                );
+                return Err(error);
+            }
         }
-        return Err(error);
     }
     tx.commit().await.map_err(|error| {
         ServiceError::with_source(

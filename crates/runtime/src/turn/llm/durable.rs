@@ -134,11 +134,25 @@ impl DurableInferenceLedger {
         .await;
         match result {
             Ok(result) => {
-                invocation.finish_result(&result).await?;
+                if let Err(e) = invocation.finish_result(&result).await {
+                    tracing::error!(
+                        ?result.response_id,
+                        %e,
+                        "LLM call succeeded but ledger write failed; delivery evidence lost"
+                    );
+                    return Err(e);
+                }
                 Ok(result)
             }
             Err(error) => {
-                invocation.finish_error(&error).await?;
+                if let Err(e) = invocation.finish_error(&error).await {
+                    tracing::error!(
+                        %error,
+                        %e,
+                        "LLM call failed and ledger write also failed; delivery evidence lost"
+                    );
+                    return Err(e);
+                }
                 Err(error)
             }
         }
