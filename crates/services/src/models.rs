@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, query};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -3035,7 +3036,6 @@ pub struct ModelListItemResponse {
     pub context_window: i32,
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_capability: Option<ThinkingCapability>,
 }
 
@@ -3124,6 +3124,8 @@ pub struct ModelAccessViewResponse {
 pub struct ModelAccessProjectionResponse {
     pub accesses: Vec<ModelAccessViewResponse>,
     pub offerings: Vec<ModelListItemResponse>,
+    pub default_offering_id: Option<String>,
+    pub catalog_revision: String,
     pub observed_at: String,
 }
 
@@ -3134,7 +3136,7 @@ pub struct ModelAccessProjectionResponse {
 /// access source. That mismatch is a contract error rather than a UI guess.
 pub fn project_model_access(
     declared: Vec<DeclaredModelAccess>,
-    offerings: Vec<ModelListItemResponse>,
+    mut offerings: Vec<ModelListItemResponse>,
     observed_at: String,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let mut accesses = BTreeMap::new();
@@ -3149,8 +3151,35 @@ pub fn project_model_access(
         }
     }
 
+    offerings.sort_by_cached_key(|offering| {
+        (
+            offering.access_id.clone(),
+            offering.name.to_ascii_lowercase(),
+            offering.offering_id.clone(),
+        )
+    });
+
+    let mut offering_ids = BTreeSet::new();
     let mut counts = BTreeMap::<String, u32>::new();
     for offering in &offerings {
+        validate_model_offering_id(&offering.offering_id).map_err(|_| {
+            crate::service_error::ServiceError::invalid(format!(
+                "effective Offering has invalid identity: {:?}",
+                offering.offering_id
+            ))
+        })?;
+        if !offering.is_active {
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "inactive Offering '{}' cannot appear in the effective catalog",
+                offering.offering_id
+            )));
+        }
+        if !offering_ids.insert(offering.offering_id.clone()) {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "effective Offering '{}' was projected more than once",
+                offering.offering_id
+            )));
+        }
         let Some(access) = accesses.get(&offering.access_id) else {
             return Err(crate::service_error::ServiceError::invalid(format!(
                 "Offering '{}' references undeclared Model Access '{}'",
@@ -3170,7 +3199,7 @@ pub fn project_model_access(
         *count = count.saturating_add(1);
     }
 
-    let accesses = accesses
+    let accesses: Vec<ModelAccessViewResponse> = accesses
         .into_values()
         .map(|access| {
             let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
@@ -3200,9 +3229,38 @@ pub fn project_model_access(
         })
         .collect();
 
+    // Phase 0 has one deterministic Server-owned default policy: the first
+    // canonical active Offering. Clients receive the decision and never
+    // recreate this ordering rule locally.
+    let default_offering_id = offerings
+        .first()
+        .map(|offering| offering.offering_id.clone());
+
+    #[derive(Serialize)]
+    struct CatalogRevisionFacts<'a> {
+        accesses: &'a [ModelAccessViewResponse],
+        offerings: &'a [ModelListItemResponse],
+        default_offering_id: &'a Option<String>,
+    }
+    let revision_bytes = serde_json::to_vec(&CatalogRevisionFacts {
+        accesses: &accesses,
+        offerings: &offerings,
+        default_offering_id: &default_offering_id,
+    })
+    .map_err(|error| {
+        crate::service_error::ServiceError::with_source(
+            crate::service_error::ServiceErrorKind::Internal,
+            "failed to serialize Model Access catalog revision facts",
+            error,
+        )
+    })?;
+    let catalog_revision = format!("sha256:{:x}", Sha256::digest(revision_bytes));
+
     Ok(ModelAccessProjectionResponse {
         accesses,
         offerings,
+        default_offering_id,
+        catalog_revision,
         observed_at,
     })
 }
@@ -4185,6 +4243,17 @@ mod tests {
         assert_eq!(ready.accesses[0].available_model_count, 1);
         assert!(ready.accesses[0].actions.is_empty());
         assert_eq!(ready.offerings[0].offering_id, "offer-1");
+        assert_eq!(ready.default_offering_id.as_deref(), Some("offer-1"));
+        assert!(ready.catalog_revision.starts_with("sha256:"));
+
+        let same_catalog_later = project_model_access(
+            vec![declared.clone()],
+            ready.offerings.clone(),
+            "2026-07-20T01:00:00Z".into(),
+        )
+        .expect("same catalog at a later observation time");
+        assert_eq!(same_catalog_later.catalog_revision, ready.catalog_revision);
+        assert_ne!(same_catalog_later.observed_at, ready.observed_at);
 
         let unavailable =
             project_model_access(vec![declared], Vec::new(), "2026-07-20T00:00:01Z".into())
@@ -4193,6 +4262,53 @@ mod tests {
             unavailable.accesses[0].actions,
             vec![ModelAccessAction::ContactAdministrator]
         );
+        assert!(unavailable.default_offering_id.is_none());
+        assert_ne!(unavailable.catalog_revision, ready.catalog_revision);
+    }
+
+    #[test]
+    fn model_access_projection_has_order_independent_default_and_revision() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+        };
+        let offering = |id: &str, name: &str| ModelListItemResponse {
+            offering_id: id.into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: name.into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let alpha = offering("offer-alpha", "Alpha");
+        let beta = offering("offer-beta", "Beta");
+
+        let forward = project_model_access(
+            vec![declared.clone()],
+            vec![alpha.clone(), beta.clone()],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("forward catalog");
+        let reverse = project_model_access(
+            vec![declared],
+            vec![beta, alpha],
+            "2026-07-20T00:00:01Z".into(),
+        )
+        .expect("reverse catalog");
+
+        assert_eq!(forward.default_offering_id.as_deref(), Some("offer-alpha"));
+        assert_eq!(reverse.default_offering_id, forward.default_offering_id);
+        assert_eq!(reverse.catalog_revision, forward.catalog_revision);
+        assert_eq!(reverse.offerings, forward.offerings);
     }
 
     #[test]

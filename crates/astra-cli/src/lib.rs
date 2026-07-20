@@ -86,6 +86,13 @@ pub(crate) mod tests {
         ]))
     }
 
+    async fn mock_model_access_response() -> axum::Json<serde_json::Value> {
+        axum::Json(super::test_utils::mock_model_access_json(&[
+            "test-model",
+            "mock-model",
+        ]))
+    }
+
     async fn spawn_mock_app(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -98,7 +105,11 @@ pub(crate) mod tests {
     }
 
     async fn spawn_mock(app: Router) -> String {
-        spawn_mock_app(app.route("/models", get(mock_models_response))).await
+        spawn_mock_app(
+            app.route("/models", get(mock_models_response))
+                .route("/model-access", get(mock_model_access_response)),
+        )
+        .await
     }
 
     mod auth_tests;

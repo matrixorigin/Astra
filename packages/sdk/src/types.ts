@@ -1165,6 +1165,8 @@ export type RuntimeModelAccessView = {
 export type RuntimeModelAccessProjection = {
   accesses: RuntimeModelAccessView[];
   offerings: RuntimeModelListItem[];
+  default_offering_id: string | null;
+  catalog_revision: string;
   observed_at: string;
 };
 

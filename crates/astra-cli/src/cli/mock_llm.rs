@@ -800,12 +800,33 @@ fn mock_model_catalog_entry(name: &str) -> Value {
 }
 
 async fn handle_models() -> axum::Json<Value> {
-    axum::Json(Value::Array(
-        ["gpt-5", "test-model", "mock-model"]
-            .into_iter()
-            .map(mock_model_catalog_entry)
-            .collect(),
-    ))
+    axum::Json(Value::Array(mock_model_catalog()))
+}
+
+fn mock_model_catalog() -> Vec<Value> {
+    ["gpt-5", "test-model", "mock-model"]
+        .into_iter()
+        .map(mock_model_catalog_entry)
+        .collect()
+}
+
+async fn handle_model_access() -> axum::Json<Value> {
+    let offerings = mock_model_catalog();
+    axum::Json(serde_json::json!({
+        "accesses": [{
+            "id": "self-hosted",
+            "kind": "self_hosted",
+            "label": "Self-hosted",
+            "execution_placement": "server",
+            "status": "ready",
+            "available_model_count": offerings.len(),
+            "actions": []
+        }],
+        "default_offering_id": "offer-gpt-5",
+        "catalog_revision": "sha256:mock-catalog",
+        "observed_at": "2026-07-20T00:00:00Z",
+        "offerings": offerings
+    }))
 }
 
 async fn handle_tool_result() -> axum::Json<Value> {
@@ -841,6 +862,7 @@ impl MockLlmServer {
             .route("/chat/turn", post(handle_chat_turn))
             .route("/tools/result", post(handle_tool_result))
             .route("/models", get(handle_models))
+            .route("/model-access", get(handle_model_access))
             .with_state(state);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

@@ -497,6 +497,21 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn get_model_access_response_timeout(
+        &self,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<Response, ThinClientError> {
+        let url = self.url(paths::MODEL_ACCESS)?;
+        Ok(self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .timeout(timeout)
+            .send()
+            .await?)
+    }
+
     pub async fn get_model_text(
         &self,
         token: &str,

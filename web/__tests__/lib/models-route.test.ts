@@ -32,9 +32,11 @@ describe("/api/models", () => {
         label: "Self-hosted",
         execution_placement: "server",
         status: "ready",
-        available_model_count: 3,
+        available_model_count: 2,
         actions: [],
       }],
+      default_offering_id: "row-only",
+      catalog_revision: "sha256:catalog",
       observed_at: "2026-07-20T00:00:00Z",
       offerings: [{
         offering_id: "row-flash",
@@ -64,20 +66,6 @@ describe("/api/models", () => {
         max_completion_tokens: null,
         is_active: true,
       },
-      {
-        offering_id: "row-inactive",
-        access_id: "self-hosted",
-        access_kind: "self_hosted",
-        access_label: "Self-hosted",
-        execution_placement: "server",
-        name: "inactive-model",
-        provider: "openai",
-        description: null,
-        architecture: null,
-        context_window: 8192,
-        max_completion_tokens: null,
-        is_active: false,
-      },
     ]});
     mockRequireRuntimeClient.mockResolvedValue(
       runtimeClient("astra-access", getModelAccess) as never,
@@ -103,6 +91,9 @@ describe("/api/models", () => {
       tier: "included",
     });
     expect(payload.items[1].subtitle).toContain("Self-hosted");
+    expect(payload.defaultOfferingId).toBe("row-only");
+    expect(payload.catalogRevision).toBe("sha256:catalog");
+    expect(payload.actions).toEqual([]);
     expect(payload.observedAt).toBe("2026-07-20T00:00:00Z");
   });
 

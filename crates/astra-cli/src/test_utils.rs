@@ -32,6 +32,35 @@ pub(crate) fn mock_model_catalog_json(names: &[&str]) -> serde_json::Value {
     )
 }
 
+pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
+    let offerings = mock_model_catalog_json(names);
+    let default_offering_id = offerings
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("offering_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "accesses": [{
+            "id": "self-hosted",
+            "kind": "self_hosted",
+            "label": "Self-hosted",
+            "execution_placement": "server",
+            "status": if names.is_empty() { "unavailable" } else { "ready" },
+            "available_model_count": names.len(),
+            "actions": if names.is_empty() {
+                serde_json::json!(["contact_administrator"])
+            } else {
+                serde_json::json!([])
+            }
+        }],
+        "offerings": offerings,
+        "default_offering_id": default_offering_id,
+        "catalog_revision": "sha256:test-catalog",
+        "observed_at": "2026-07-20T00:00:00Z"
+    })
+}
+
 // ── Safe env helpers ───────────────────────────────────────────────────
 //
 // Centralised wrappers for `std::env::set_var` and `std::env::remove_var`.

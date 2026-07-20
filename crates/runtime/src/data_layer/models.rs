@@ -85,7 +85,7 @@ async fn effective_model_catalog(
         });
     }
     let user = principal.user;
-    let is_admin = state.admin.authorizer.require_admin(&headers).await.is_ok();
+    let is_admin = state.admin.authorizer.require_admin(headers).await.is_ok();
     let offerings = state
         .model_service
         .list_models(user.user_id, is_admin)

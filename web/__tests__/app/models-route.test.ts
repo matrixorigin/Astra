@@ -56,6 +56,8 @@ describe("/api/models route", () => {
           actions: ["contact_administrator"],
         }],
         offerings: [],
+        default_offering_id: null,
+        catalog_revision: "sha256:empty",
         observed_at: "2026-07-20T00:00:00Z",
       })) as never,
     );
@@ -75,6 +77,8 @@ describe("/api/models route", () => {
         available_model_count: 0,
         actions: ["contact_administrator"],
       }],
+      defaultOfferingId: null,
+      catalogRevision: "sha256:empty",
       observedAt: "2026-07-20T00:00:00Z",
       source: "astra",
       status: "unavailable",

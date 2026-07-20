@@ -3,9 +3,24 @@
 import { Check, ChevronDown, Circle } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Popover } from '@/components/ui/popover';
-import { listModels } from '@/lib/api/models';
+import { listModels, type ModelCatalogResponse } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
+
+type CatalogLoadState =
+  | { kind: 'loading' }
+  | { kind: 'loaded'; catalog: ModelCatalogResponse }
+  | { kind: 'error' };
+
+function unavailableMessage(catalog: ModelCatalogResponse) {
+  if (catalog.actions.includes('reconnect_device')) {
+    return 'Reconnect this device in Model Access.';
+  }
+  if (catalog.actions.includes('contact_administrator')) {
+    return 'Ask an administrator to enable a model.';
+  }
+  return 'No eligible models are available.';
+}
 
 export function ModelSwitcher({
   value,
@@ -20,26 +35,27 @@ export function ModelSwitcher({
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
-  const [models, setModels] = useState<ModelSummary[]>([]);
-  const [loadedModels, setLoadedModels] = useState(false);
+  const [catalogState, setCatalogState] = useState<CatalogLoadState>({
+    kind: 'loading',
+  });
 
   useEffect(() => {
     listModels()
-      .then((result) => {
-        setModels(result.items);
-        setLoadedModels(true);
-      })
+      .then((catalog) => setCatalogState({ kind: 'loaded', catalog }))
       .catch(() => {
-        setModels([]);
-        setLoadedModels(true);
+        setCatalogState({ kind: 'error' });
       });
   }, []);
 
+  const catalog = catalogState.kind === 'loaded' ? catalogState.catalog : undefined;
+  const models: ModelSummary[] = catalog?.items ?? [];
   const selected = models.find((model) => model.id === value);
-  const defaultModel = loadedModels ? models[0] : undefined;
+  const defaultModel = catalog?.defaultOfferingId
+    ? models.find((model) => model.id === catalog.defaultOfferingId)
+    : undefined;
   const shouldSelectDefault = Boolean(defaultModel) && !value;
   const visibleSelected = selected ?? (shouldSelectDefault ? defaultModel : undefined);
-  const modelUnavailable = loadedModels && Boolean(value) && !visibleSelected;
+  const modelUnavailable = Boolean(catalog) && Boolean(value) && !visibleSelected;
 
   useEffect(() => {
     if (!defaultModel || !shouldSelectDefault || value === defaultModel.id) {
@@ -49,8 +65,10 @@ export function ModelSwitcher({
   }, [defaultModel, onChange, shouldSelectDefault, value]);
 
   useEffect(() => {
-    onModelAvailabilityChange?.(loadedModels && Boolean(visibleSelected) && !modelUnavailable);
-  }, [loadedModels, modelUnavailable, onModelAvailabilityChange, visibleSelected]);
+    onModelAvailabilityChange?.(
+      Boolean(catalog) && Boolean(visibleSelected) && !modelUnavailable,
+    );
+  }, [catalog, modelUnavailable, onModelAvailabilityChange, visibleSelected]);
 
   return (
     <Popover
@@ -66,8 +84,10 @@ export function ModelSwitcher({
             {visibleSelected?.name ??
               (modelUnavailable
                 ? 'Unavailable model'
-                : !loadedModels
+                : catalogState.kind === 'loading'
                   ? 'Loading models…'
+                  : catalogState.kind === 'error'
+                    ? 'Model access unavailable'
                   : 'No models available')}
           </span>
           <ChevronDown className="size-4" />
@@ -77,9 +97,14 @@ export function ModelSwitcher({
     >
       <div className="flex flex-col">
         <div className="max-h-[25vh] min-h-0 space-y-1 overflow-y-auto overscroll-contain p-2 pr-1">
-          {loadedModels && models.length === 0 ? (
+          {catalogState.kind === 'error' ? (
             <div className="px-3 py-4 text-sm text-text-muted">
-              No eligible models. Check Model Access or ask an administrator.
+              Model Access could not be loaded. Sign in again or retry.
+            </div>
+          ) : null}
+          {catalog && models.length === 0 ? (
+            <div className="px-3 py-4 text-sm text-text-muted">
+              {unavailableMessage(catalog)}
             </div>
           ) : null}
           {models.map((model) => {

@@ -51,6 +51,10 @@ pub async fn run_chat_route_and_models_smoke() {
     let effective_offerings = access_j["offerings"]
         .as_array()
         .expect("model-access offerings array");
+    assert!(
+        !effective_offerings.is_empty(),
+        "seeded MatrixOne catalog must expose an effective Offering: {access_j}"
+    );
     assert!(effective_offerings.iter().all(|offering| {
         offering["is_active"] == true
             && offering["access_id"] == "self-hosted"
@@ -63,6 +67,31 @@ pub async fn run_chat_route_and_models_smoke() {
         accesses[0]["available_model_count"].as_u64(),
         Some(effective_offerings.len() as u64),
         "access readiness must derive from effective Offerings"
+    );
+    let default_offering_id = access_j["default_offering_id"]
+        .as_str()
+        .expect("non-empty catalog has a Server-governed default Offering");
+    assert!(
+        effective_offerings
+            .iter()
+            .any(|offering| offering["offering_id"] == default_offering_id),
+        "default must reference an effective Offering: {access_j}"
+    );
+    let catalog_revision = access_j["catalog_revision"]
+        .as_str()
+        .expect("catalog revision");
+    assert!(catalog_revision.starts_with("sha256:"));
+
+    let (st_access_again, access_again) =
+        get_json(&ctx.app, "/model-access", Some(auth), &[]).await;
+    assert_eq!(st_access_again, StatusCode::OK, "model-access repeat");
+    assert_eq!(
+        access_again["catalog_revision"], access_j["catalog_revision"],
+        "observation time must not churn stable catalog revision"
+    );
+    assert_eq!(
+        access_again["default_offering_id"], access_j["default_offering_id"],
+        "default Offering must be stable for the same effective catalog"
     );
 
     b.ctx.pool.close().await;
