@@ -1,5 +1,5 @@
 use super::*;
-use astra_services::runs::ModelSelectionRequest;
+use astra_turn_types::ModelSelection;
 
 // ─── Typed request body ──────────────────────────────────────────────────────
 
@@ -228,7 +228,7 @@ fn validate_model_selection_shape(
             "model_selection_invalid",
         ));
     };
-    if serde_json::from_value::<ModelSelectionRequest>(model_selection.clone()).is_err() {
+    if serde_json::from_value::<ModelSelection>(model_selection.clone()).is_err() {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
             "model_selection must match {offering_id: string}",

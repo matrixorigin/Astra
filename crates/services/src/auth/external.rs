@@ -16,10 +16,11 @@ use serde_json::{Map, Value};
 
 use crate::models::ModelListItem;
 use crate::runs::{
-    ModelSelectionRequest, ResolvedModelSelection, RuntimeAuthRequest,
-    RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
-    RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
+    ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
+    RuntimeCapabilityDescriptorsRequest, RuntimeMcpBindingRequest,
+    RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
 };
+use astra_turn_types::ModelSelection;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalProviderPublicRecord {
@@ -437,8 +438,8 @@ pub struct ExternalSelectedModelResponse {
 }
 
 impl ExternalSelectedModelResponse {
-    pub fn to_model_selection_request(&self) -> ModelSelectionRequest {
-        ModelSelectionRequest {
+    pub fn to_model_selection(&self) -> ModelSelection {
+        ModelSelection {
             offering_id: self.id.clone(),
         }
     }

@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -258,181 +258,6 @@ fn record_llm_main_attempt_metrics(
         labels,
         estimated_tokens.max(1),
     );
-}
-
-fn inference_ledger_contract_error(
-    stage: &'static str,
-    error: impl std::fmt::Display,
-) -> astra_core::ClassifiedError {
-    astra_core::ClassifiedError::new(
-        astra_core::ErrorKind::ContractViolation,
-        format!("durable inference {stage} failed: {error}"),
-    )
-    .with_details_json(
-        json!({
-            "source": "inference_execution_ledger",
-            "stage": stage,
-        })
-        .to_string(),
-    )
-}
-
-fn inference_ledger_service_error(
-    stage: &'static str,
-    error: astra_services::ServiceError,
-) -> astra_core::ClassifiedError {
-    let kind = match error.kind {
-        astra_services::ServiceErrorKind::Persistence => astra_core::ErrorKind::DatabaseError,
-        astra_services::ServiceErrorKind::Network => astra_core::ErrorKind::Network,
-        astra_services::ServiceErrorKind::Invalid
-        | astra_services::ServiceErrorKind::NotFound
-        | astra_services::ServiceErrorKind::Verification
-        | astra_services::ServiceErrorKind::Conflict
-        | astra_services::ServiceErrorKind::ConflictTransient
-        | astra_services::ServiceErrorKind::Internal => astra_core::ErrorKind::ContractViolation,
-    };
-    astra_core::ClassifiedError::new(kind, format!("durable inference {stage} failed: {error}"))
-        .with_details_json(
-            json!({
-                "source": "inference_execution_ledger",
-                "stage": stage,
-                "service_error_kind": error.kind.as_str(),
-            })
-            .to_string(),
-        )
-}
-
-async fn admit_durable_inference_invocation(
-    shared_pool: Option<&SharedPool>,
-    admitted_execution: Option<&astra_services::AdmittedModelExecution>,
-    user_id: &str,
-    session_id: &str,
-    state: &AgenticLoopState,
-    resolved_model_name: &str,
-    upstream_model_name: &str,
-    provider: &str,
-    round: u32,
-    logical_attempt: u32,
-) -> Result<Option<astra_services::InferenceInvocationPlan>, astra_core::ClassifiedError> {
-    let Some(shared_pool) = shared_pool else {
-        return Ok(None);
-    };
-    let execution = admitted_execution.ok_or_else(|| {
-        inference_ledger_contract_error(
-            "admission",
-            "Server execution has no admitted Offering material",
-        )
-    })?;
-    if execution.model_name != resolved_model_name || execution.provider != provider {
-        return Err(inference_ledger_contract_error(
-            "admission",
-            "resolved provider route drifted from the admitted Offering",
-        ));
-    }
-    let run_id = state.current_run_id.as_deref().ok_or_else(|| {
-        inference_ledger_contract_error("admission", "Server execution has no durable run identity")
-    })?;
-    let plan =
-        astra_services::plan_inference_invocation(astra_services::InferenceInvocationInput {
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            turn: state.session_turn,
-            round,
-            logical_attempt,
-            offering_id: execution.offering_id.clone(),
-            resolved_model_name: resolved_model_name.to_string(),
-            upstream_model_name: upstream_model_name.to_string(),
-            provider: provider.to_string(),
-            purpose: state.inference_purpose,
-            execution_placement: execution.execution_placement,
-            access_kind: execution.access_kind,
-        })
-        .map_err(|error| inference_ledger_service_error("planning", error))?;
-    astra_services::admit_inference_invocation(shared_pool, &plan)
-        .await
-        .map_err(|error| inference_ledger_service_error("admission", error))?;
-    Ok(Some(plan))
-}
-
-fn inference_terminal_from_error(
-    error: &astra_core::ClassifiedError,
-) -> astra_services::InferenceInvocationTerminal {
-    let status = match error.kind {
-        astra_core::ErrorKind::Cancelled => astra_services::InferenceTerminalStatus::Cancelled,
-        astra_core::ErrorKind::Network
-        | astra_core::ErrorKind::StreamIdle
-        | astra_core::ErrorKind::StreamTransport => {
-            astra_services::InferenceTerminalStatus::DeliveryUnknown
-        }
-        _ => astra_services::InferenceTerminalStatus::Failed,
-    };
-    let message = crate::turn::llm::client::redact_provider_secrets(&error.message);
-    astra_services::InferenceInvocationTerminal {
-        status,
-        usage: astra_services::InferenceUsage::default(),
-        provider_response_id: None,
-        error_kind: Some(error.kind.as_str().to_string()),
-        error_message: Some(
-            astra_text_utils::str_preview::truncate_str(&message, 1_000).to_string(),
-        ),
-    }
-}
-
-async fn finish_durable_inference_invocation(
-    shared_pool: Option<&SharedPool>,
-    plan: Option<&astra_services::InferenceInvocationPlan>,
-    terminal: &astra_services::InferenceInvocationTerminal,
-) -> Result<(), astra_core::ClassifiedError> {
-    let (Some(shared_pool), Some(plan)) = (shared_pool, plan) else {
-        return Ok(());
-    };
-    astra_services::finish_inference_invocation(shared_pool, plan, terminal)
-        .await
-        .map_err(|error| inference_ledger_service_error("terminal commit", error))
-}
-
-struct DurableProviderAttemptObserver {
-    shared_pool: SharedPool,
-    invocation: astra_services::InferenceInvocationPlan,
-    next_attempt: AtomicU32,
-}
-
-impl DurableProviderAttemptObserver {
-    fn new(shared_pool: SharedPool, invocation: astra_services::InferenceInvocationPlan) -> Self {
-        Self {
-            shared_pool,
-            invocation,
-            next_attempt: AtomicU32::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl crate::turn::llm::client::ProviderAttemptObserver for DurableProviderAttemptObserver {
-    async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
-        let attempt_index = self.next_attempt.fetch_add(1, Ordering::AcqRel);
-        let attempt =
-            astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
-        astra_services::begin_inference_provider_attempt(&self.shared_pool, &attempt)
-            .await
-            .map_err(|error| inference_ledger_service_error("provider attempt admission", error))?;
-        Ok(attempt_index)
-    }
-
-    async fn finish_attempt(
-        &self,
-        attempt_index: u32,
-        terminal: &astra_services::InferenceInvocationTerminal,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        let attempt =
-            astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
-        astra_services::finish_inference_provider_attempt(&self.shared_pool, &attempt, terminal)
-            .await
-            .map_err(|error| {
-                inference_ledger_service_error("provider attempt terminal commit", error)
-            })
-    }
 }
 
 #[derive(Debug)]
@@ -713,10 +538,6 @@ impl ResolvedTurnLlmConfig {
             completions_url_override: self.completions_url_override.clone(),
             request_timeout: self.request_timeout,
         }
-    }
-
-    fn summary_client(&self, max_output_tokens: usize) -> RuntimeSummaryClient {
-        RuntimeSummaryClient::new(self.execution_route(), max_output_tokens)
     }
 }
 
@@ -2234,12 +2055,15 @@ impl ServerAgenticLoopHost {
     async fn turn_intent_summary_client(
         &mut self,
         state: &AgenticLoopState,
+        operation_id: &'static str,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
         if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
             self.clear_resolved_llm_config();
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
-            return Some(Box::new(config.summary_client(256)));
+            return self
+                .durable_summary_client(config, 256, state, operation_id)
+                .map(|client| Box::new(client) as Box<_>);
         }
 
         let llm_cfg = match self.resolve_llm_config_for_state(state).await {
@@ -2254,7 +2078,46 @@ impl ServerAgenticLoopHost {
             }
         };
         self.remember_resolved_llm_config(&llm_cfg);
-        Some(Box::new(llm_cfg.summary_client(256)))
+        self.durable_summary_client(&llm_cfg, 256, state, operation_id)
+            .map(|client| Box::new(client) as Box<_>)
+    }
+
+    fn durable_summary_client(
+        &self,
+        config: &ResolvedTurnLlmConfig,
+        max_output_tokens: usize,
+        state: &AgenticLoopState,
+        operation_id: &'static str,
+    ) -> Option<RuntimeSummaryClient> {
+        let ledger = match crate::turn::llm::durable::DurableInferenceLedger::from_optional(
+            self.shared_pool.as_ref(),
+            self.admitted_model_execution.as_ref(),
+            &self.user_id,
+        ) {
+            Ok(Some(ledger)) => ledger,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::inference",
+                    operation_id,
+                    error = %error,
+                    "auxiliary inference skipped because durable admission material is unavailable"
+                );
+                return None;
+            }
+        };
+        Some(RuntimeSummaryClient::new(
+            config.execution_route(),
+            max_output_tokens,
+            ledger,
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: self.session_id.clone(),
+                turn: state.session_turn,
+                round: state.llm_rounds_completed,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+        ))
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -4872,15 +4735,20 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = llm_cfg.summary_client(compact_config.summary_token_budget);
+        let summary_client = self.durable_summary_client(
+            llm_cfg,
+            compact_config.summary_token_budget,
+            state,
+            "required_compaction",
+        );
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
             context_window: llm_cfg.context_window,
             memoria_client: self.memoria_client.as_deref(),
-            summary_client: Some(
-                &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-            ),
+            summary_client: summary_client
+                .as_ref()
+                .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
             tier,
             session_facts: None,
         };
@@ -5014,7 +4882,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         let phase_started_at = Instant::now();
         let model_resolution_started_at = Instant::now();
-        let Some(client) = self.turn_intent_summary_client(state).await else {
+        let Some(client) = self.turn_intent_summary_client(state, "turn_intent").await else {
             let duration_ms = phase_started_at.elapsed().as_millis() as u64;
             tracing::info!(
                 target: "astra::turn_intent",
@@ -5086,7 +4954,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 return None;
             }
-            let client = self.turn_intent_summary_client(state).await?;
+            let client = self
+                .turn_intent_summary_client(state, "skill_auto_route")
+                .await?;
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
         };
@@ -5619,29 +5489,43 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     prompt_request_plan.clone(),
                 );
             }
-            let durable_invocation = admit_durable_inference_invocation(
+            let durable_ledger = crate::turn::llm::durable::DurableInferenceLedger::from_optional(
                 self.shared_pool.as_ref(),
                 self.admitted_model_execution.as_ref(),
                 &self.user_id,
-                &self.session_id,
-                state,
-                &llm_cfg.model_name,
-                llm_cfg
-                    .wire_model_name
-                    .as_deref()
-                    .unwrap_or(&llm_cfg.model_name),
-                &llm_cfg.provider,
-                prompt_round,
-                attempt_in_round,
-            )
-            .await?;
-            let provider_attempt_observer = self
-                .shared_pool
-                .clone()
-                .zip(durable_invocation.clone())
-                .map(|(shared_pool, invocation)| {
-                    DurableProviderAttemptObserver::new(shared_pool, invocation)
-                });
+            )?;
+            let durable_invocation = match durable_ledger {
+                Some(ledger) => {
+                    let run_id = state.current_run_id.clone().ok_or_else(|| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "durable inference admission failed: Server execution has no durable run identity",
+                        )
+                    })?;
+                    Some(
+                        ledger
+                            .admit(
+                                astra_turn_types::InferenceInvocationScope::Run {
+                                    session_id: self.session_id.clone(),
+                                    run_id,
+                                    turn: state.session_turn,
+                                    round: prompt_round,
+                                    operation_id: "agent_turn".to_string(),
+                                    logical_attempt: attempt_in_round,
+                                },
+                                state.inference_purpose,
+                                &llm_cfg.model_name,
+                                llm_cfg
+                                    .wire_model_name
+                                    .as_deref()
+                                    .unwrap_or(&llm_cfg.model_name),
+                                &llm_cfg.provider,
+                            )
+                            .await?,
+                    )
+                }
+                None => None,
+            };
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
@@ -5787,9 +5671,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     },
                     llm_cancel,
                     Some(&mut on_stream_update),
-                    provider_attempt_observer.as_ref().map(|observer| {
-                        observer as &dyn crate::turn::llm::client::ProviderAttemptObserver
-                    }),
+                    durable_invocation
+                        .as_ref()
+                        .map(|invocation| invocation.attempt_observer()),
                 )
                 .await
             };
@@ -5799,12 +5683,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let r = match r {
                 Ok(r) => r,
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
-                    finish_durable_inference_invocation(
-                        self.shared_pool.as_ref(),
-                        durable_invocation.as_ref(),
-                        &inference_terminal_from_error(e),
-                    )
-                    .await?;
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(e).await?;
+                    }
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -5892,21 +5773,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
-                    // A ledger failure means provider delivery or its durable
-                    // terminal write may be unknown. Keep the logical
-                    // invocation admitted for reconciliation instead of
-                    // inventing a failed provider outcome.
-                    if !matches!(
-                        e.kind,
-                        astra_core::ErrorKind::DatabaseError
-                            | astra_core::ErrorKind::ContractViolation
-                    ) {
-                        finish_durable_inference_invocation(
-                            self.shared_pool.as_ref(),
-                            durable_invocation.as_ref(),
-                            &inference_terminal_from_error(&e),
-                        )
-                        .await?;
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(&e).await?;
                     }
                     record_llm_main_attempt_metrics(
                         "call",
@@ -5982,20 +5850,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
-                finish_durable_inference_invocation(
-                    self.shared_pool.as_ref(),
-                    durable_invocation.as_ref(),
-                    &astra_services::InferenceInvocationTerminal::succeeded(
-                        astra_services::InferenceUsage {
-                            input_tokens: u.input_tokens,
-                            output_tokens: u.output_tokens,
-                            cache_read_tokens: u.cached_input_tokens,
-                            cache_creation_tokens: u.cache_creation_tokens,
-                        },
-                        r.response_id.clone(),
-                    ),
-                )
-                .await?;
+                if let Some(invocation) = durable_invocation.as_ref() {
+                    invocation.finish_result(&r).await?;
+                }
                 crate::llm_provider_admission::record_llm_provider_admission_calibration(
                     admission_estimated_tokens as u64,
                     &r.usage,
@@ -6279,15 +6136,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return;
             }
         };
-        // Use the trait's summary_client() so gateway overrides and forwarded
-        // auth headers are respected, rather than constructing a plain client inline.
-        let Some(client) = self.summary_client() else {
+        let Some(client) = self.durable_summary_client(&config, 4096, state, "pre_turn_compaction")
+        else {
             return;
         };
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages,
-            client.as_ref(),
+            &client,
         )
         .await
         {
@@ -6343,12 +6199,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ),
             );
         }
-    }
-
-    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
-        self.resolved_llm_config
-            .as_ref()
-            .map(|config| Box::new(config.summary_client(4096)) as Box<_>)
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -12807,7 +12657,7 @@ mod tests {
         let mut forwarded = HashMap::new();
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        let client = RuntimeSummaryClient::new(
+        let client = RuntimeSummaryClient::new_direct_for_test(
             OwnedLlmExecutionRoute {
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,

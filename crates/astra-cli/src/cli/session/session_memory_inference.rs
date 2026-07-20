@@ -98,21 +98,6 @@ impl std::fmt::Debug for CliServerMemoryInferenceClient {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct CompletionEnvelope {
-    choices: Vec<CompletionChoice>,
-}
-
-#[derive(serde::Deserialize)]
-struct CompletionChoice {
-    message: CompletionMessage,
-}
-
-#[derive(serde::Deserialize)]
-struct CompletionMessage {
-    content: String,
-}
-
 #[async_trait::async_trait]
 impl MemoryInferencePort for CliServerMemoryInferenceClient {
     fn model_name(&self) -> &str {
@@ -123,18 +108,22 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
         &self,
         request: MemoryInferenceRequest<'_>,
     ) -> Result<String, ClassifiedError> {
-        let body = serde_json::json!({
-            "purpose": request.purpose,
-            "model_selection": {
-                "offering_id": self.offering_id,
-            },
-            "messages": request.messages,
-            "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
-        });
+        let mut completion = astra_thin_client::CompletionRequest::new(
+            request.purpose,
+            request.invocation_scope.clone(),
+            request.messages.to_vec(),
+        )
+        .with_offering_id(&self.offering_id);
+        completion.max_tokens = request.max_output_tokens.try_into().map_err(|_| {
+            ClassifiedError::new(
+                ErrorKind::InvalidRequest,
+                "Memory inference output limit exceeds the Server protocol range",
+            )
+        })?;
+        completion.temperature = request.temperature;
         let response = tokio::time::timeout(
             request.deadline,
-            self.api.post_completions(&self.token, &body),
+            self.api.post_completions(&self.token, &completion),
         )
         .await
         .map_err(|_| {
@@ -144,13 +133,7 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
             )
         })?
         .map_err(classify_thin_client_error)?;
-        let envelope = serde_json::from_value::<CompletionEnvelope>(response).map_err(|_| {
-            ClassifiedError::new(
-                ErrorKind::ServerError,
-                "Astra Server returned a malformed completion response",
-            )
-        })?;
-        envelope
+        response
             .choices
             .into_iter()
             .next()
@@ -238,7 +221,15 @@ mod tests {
                             tx.send(body).expect("capture request body");
                         }
                         Json(serde_json::json!({
-                            "choices": [{"message": {"content": "[0]"}}]
+                            "id": "memory-response",
+                            "object": "chat.completion",
+                            "offering_id": "memory-offering",
+                            "model": "memory-model",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "[0]"},
+                                "finish_reason": "stop"
+                            }]
                         }))
                     }
                 }
@@ -262,6 +253,13 @@ mod tests {
         let output = client
             .complete(MemoryInferenceRequest {
                 purpose: InferencePurpose::MemoryRetrievalRerank,
+                invocation_scope: &astra_turn_types::InferenceInvocationScope::Session {
+                    session_id: "session-memory".to_string(),
+                    turn: 1,
+                    round: 0,
+                    operation_id: "memory_rerank".to_string(),
+                    logical_attempt: 0,
+                },
                 messages: &messages,
                 max_output_tokens: 50,
                 temperature: 0.0,
@@ -273,6 +271,7 @@ mod tests {
 
         assert_eq!(output, "[0]");
         assert_eq!(body["purpose"], "memory_retrieval_rerank");
+        assert_eq!(body["invocation_scope"]["kind"], "session");
         assert_eq!(
             body["model_selection"],
             serde_json::json!({"offering_id": "memory-offering"})

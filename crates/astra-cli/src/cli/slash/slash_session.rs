@@ -5754,7 +5754,17 @@ async fn apply_restored_session(
         let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
             match get_profile_and_token(profile) {
                 Ok((_, _, _, token)) => Some(std::sync::Arc::new(
-                    durable_bridge::ServerProxyLlmJudge::new(api.clone(), token),
+                    durable_bridge::ServerProxyLlmJudge::new(
+                        api.clone(),
+                        token,
+                        astra_turn_types::InferenceInvocationScope::Session {
+                            session_id: restored.session_id.clone(),
+                            turn: state.turn,
+                            round: 0,
+                            operation_id: "plan_verification".to_string(),
+                            logical_attempt: 0,
+                        },
+                    ),
                 )),
                 Err(_) => None,
             };

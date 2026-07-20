@@ -384,7 +384,7 @@ pub(crate) struct LlmCandidateFailure {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     memoria: &Arc<dyn MemoriaPort>,
-    session_id: &str,
+    inference_scope: &astra_turn_types::InferenceInvocationScope,
     messages: &[Value],
     turn_number: usize,
     current_memory: &str,
@@ -393,6 +393,7 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
+    let session_id = inference_scope.session_id();
     let filtered_messages = session_memory_extraction_messages(messages);
     let messages = filtered_messages.as_slice();
     let base_memory = if current_memory.trim().is_empty() {
@@ -438,11 +439,16 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     }
 
     let mut failed_candidates = Vec::new();
-    for client in memory_clients {
+    for (candidate_index, client) in memory_clients.iter().enumerate() {
+        let Ok(logical_attempt) = u32::try_from(candidate_index) else {
+            break;
+        };
+        let candidate_scope = inference_scope.with_logical_attempt(logical_attempt);
         match update_memory_with_llm(
             &base_memory,
             messages,
             client,
+            &candidate_scope,
             llm_timeout,
             max_output_tokens,
         )
@@ -926,12 +932,14 @@ async fn update_memory_with_llm(
     current_memory: &str,
     messages: &[Value],
     client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> Result<String, LlmExtractionFailure> {
     let prompt = build_extraction_prompt(current_memory, messages);
     let call = client.complete(MemoryInferenceRequest {
         purpose: InferencePurpose::MemoryExtraction,
+        invocation_scope,
         messages: &prompt,
         max_output_tokens,
         temperature: 0.0,
@@ -1434,6 +1442,16 @@ mod tests {
     use crate::turn::cloud::memoria_compact::MemoriaMemory;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn test_scope(session_id: &str) -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: session_id.to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "memory_extraction_test".to_string(),
+            logical_attempt: 0,
+        }
+    }
+
     #[derive(Default)]
     struct CapturingMemoria {
         stored: Mutex<Vec<(String, String, Option<String>)>>,
@@ -1729,6 +1747,7 @@ mod tests {
     #[derive(Debug)]
     struct CapturingMemoryInference {
         purposes: Arc<Mutex<Vec<InferencePurpose>>>,
+        scopes: Arc<Mutex<Vec<astra_turn_types::InferenceInvocationScope>>>,
     }
 
     #[async_trait::async_trait]
@@ -1742,6 +1761,10 @@ mod tests {
             request: MemoryInferenceRequest<'_>,
         ) -> Result<String, astra_core::ClassifiedError> {
             self.purposes.lock().unwrap().push(request.purpose);
+            self.scopes
+                .lock()
+                .unwrap()
+                .push(request.invocation_scope.clone());
             Ok(r#"{"session_title":"Captured purpose"}"#.to_string())
         }
     }
@@ -1798,7 +1821,7 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
@@ -1823,14 +1846,16 @@ mod tests {
     #[tokio::test]
     async fn run_extraction_attributes_the_call_as_memory_extraction() {
         let purposes = Arc::new(Mutex::new(Vec::new()));
+        let scopes = Arc::new(Mutex::new(Vec::new()));
         let client = CapturingMemoryInference {
             purposes: Arc::clone(&purposes),
+            scopes: Arc::clone(&scopes),
         };
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-purpose",
+            &test_scope("sess-purpose"),
             &sample_messages(),
             1,
             "",
@@ -1852,6 +1877,11 @@ mod tests {
             *purposes.lock().unwrap(),
             vec![InferencePurpose::MemoryExtraction]
         );
+        assert_eq!(
+            scopes.lock().unwrap()[0].operation_id(),
+            "memory_extraction_test"
+        );
+        assert_eq!(scopes.lock().unwrap()[0].logical_attempt(), 0);
     }
 
     #[tokio::test]
@@ -1885,7 +1915,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-openai",
+            &test_scope("sess-openai"),
             &sample_messages(),
             1,
             "",
@@ -1938,7 +1968,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-scalar-selector",
+            &test_scope("sess-scalar-selector"),
             &sample_messages(),
             1,
             "",
@@ -2005,7 +2035,7 @@ mod tests {
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-selector",
+            &test_scope("sess-filtered-selector"),
             &messages,
             4,
             "",
@@ -2079,7 +2109,7 @@ mod tests {
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-scaffolding",
+            &test_scope("sess-filtered-scaffolding"),
             &messages,
             4,
             "",
@@ -2154,7 +2184,7 @@ mod tests {
 
         let artifacts = run_extraction(
             &memoria,
-            "sess-filtered-transient-status",
+            &test_scope("sess-filtered-transient-status"),
             &messages,
             4,
             "",
@@ -2208,7 +2238,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-anthropic",
+            &test_scope("sess-anthropic"),
             &sample_messages(),
             1,
             "",
@@ -2261,7 +2291,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-bedrock",
+            &test_scope("sess-bedrock"),
             &sample_messages(),
             1,
             "",
@@ -2311,7 +2341,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-double-fail",
+            &test_scope("sess-double-fail"),
             &sample_messages(),
             1,
             "",
@@ -2374,7 +2404,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-http-detail",
+            &test_scope("sess-http-detail"),
             &sample_messages(),
             1,
             "",
@@ -2455,7 +2485,7 @@ mod tests {
         };
         let artifacts = run_extraction(
             &memoria,
-            "sess-retry",
+            &test_scope("sess-retry"),
             &sample_messages(),
             1,
             "",
@@ -2513,7 +2543,7 @@ mod tests {
 
         let artifacts = run_extraction(
             &memoria_dyn,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
@@ -2646,7 +2676,7 @@ mod tests {
         }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-1",
+            &test_scope("sess-1"),
             &sample_messages(),
             3,
             "",
@@ -2670,7 +2700,7 @@ mod tests {
         }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
-            "sess-overflow",
+            &test_scope("sess-overflow"),
             &sample_messages(),
             3,
             "",
@@ -2696,7 +2726,7 @@ mod tests {
         let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria_dyn,
-            "sess-bounded",
+            &test_scope("sess-bounded"),
             &sample_messages(),
             3,
             "",

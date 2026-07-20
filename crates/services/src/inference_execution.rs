@@ -1,5 +1,5 @@
 use astra_core::SharedPool;
-use astra_turn_types::InferencePurpose;
+use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -12,11 +12,7 @@ const INFERENCE_ID_HEX_LEN: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
     pub user_id: String,
-    pub session_id: String,
-    pub run_id: String,
-    pub turn: u32,
-    pub round: u32,
-    pub logical_attempt: u32,
+    pub scope: InferenceInvocationScope,
     pub offering_id: String,
     pub resolved_model_name: String,
     pub upstream_model_name: String,
@@ -39,7 +35,7 @@ pub struct InferenceProviderAttemptPlan {
     invocation_id: String,
     user_id: String,
     session_id: String,
-    run_id: String,
+    run_id: Option<String>,
     attempt_index: u32,
     provider: String,
 }
@@ -143,26 +139,31 @@ pub fn plan_inference_invocation(
     input: InferenceInvocationInput,
 ) -> ServiceResult<InferenceInvocationPlan> {
     validate_identity(&input.user_id, "user_id", 128)?;
-    validate_identity(&input.session_id, "session_id", 64)?;
-    validate_identity(&input.run_id, "run_id", 64)?;
+    validate_identity(input.scope.session_id(), "session_id", 64)?;
+    if let Some(run_id) = input.scope.run_id() {
+        validate_identity(run_id, "run_id", 64)?;
+    }
+    validate_identity(input.scope.operation_id(), "operation_id", 64)?;
     validate_model_offering_id(&input.offering_id)
         .map_err(|error| ServiceError::invalid(error.to_string()))?;
     validate_identity(&input.resolved_model_name, "resolved_model_name", 255)?;
     validate_identity(&input.upstream_model_name, "upstream_model_name", 255)?;
     validate_identity(&input.provider, "provider", 64)?;
 
-    let turn = input.turn.to_string();
-    let round = input.round.to_string();
-    let logical_attempt = input.logical_attempt.to_string();
+    let turn = input.scope.turn().to_string();
+    let round = input.scope.round().to_string();
+    let logical_attempt = input.scope.logical_attempt().to_string();
     let purpose = input.purpose.as_str();
     let placement = input.execution_placement.as_str();
     let access_kind = input.access_kind.as_str();
     let identity_fields = [
         input.user_id.as_str(),
-        input.session_id.as_str(),
-        input.run_id.as_str(),
+        input.scope.kind(),
+        input.scope.session_id(),
+        input.scope.run_id().unwrap_or(""),
         turn.as_str(),
         round.as_str(),
+        input.scope.operation_id(),
         logical_attempt.as_str(),
         input.offering_id.as_str(),
         input.resolved_model_name.as_str(),
@@ -197,8 +198,8 @@ pub fn plan_inference_provider_attempt(
         ),
         invocation_id: invocation.invocation_id.clone(),
         user_id: invocation.input.user_id.clone(),
-        session_id: invocation.input.session_id.clone(),
-        run_id: invocation.input.run_id.clone(),
+        session_id: invocation.input.scope.session_id().to_string(),
+        run_id: invocation.input.scope.run_id().map(str::to_string),
         attempt_index,
         provider: invocation.input.provider.clone(),
     }
@@ -238,30 +239,46 @@ async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation
     }
 }
 
-async fn ensure_run_scope(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn ensure_invocation_scope(
+    connection: &mut sqlx::MySqlConnection,
     input: &InferenceInvocationInput,
 ) -> ServiceResult<()> {
-    let exists = sqlx::query(
-        "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1",
-    )
-    .bind(&input.user_id)
-    .bind(&input.session_id)
-    .bind(&input.run_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "verify inference run ownership",
-            error,
-        )
-    })?
-    .is_some();
+    let (statement, run_id) = match input.scope.run_id() {
+        Some(run_id) => (
+            "SELECT 1 FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
+            Some(run_id),
+        ),
+        None => (
+            "SELECT 1 FROM agent_sessions
+             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+            None,
+        ),
+    };
+    let mut query = sqlx::query(statement)
+        .bind(&input.user_id)
+        .bind(input.scope.session_id());
+    if let Some(run_id) = run_id {
+        query = query.bind(run_id);
+    }
+    let exists = query
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "verify inference owner scope",
+                error,
+            )
+        })?
+        .is_some();
     if !exists {
         return Err(ServiceError::not_found(format!(
-            "inference run scope does not exist for user_id={} session_id={} run_id={}",
-            input.user_id, input.session_id, input.run_id
+            "inference {} scope does not exist for user_id={} session_id={} run_id={}",
+            input.scope.kind(),
+            input.user_id,
+            input.scope.session_id(),
+            input.scope.run_id().unwrap_or("none")
         )));
     }
     Ok(())
@@ -315,7 +332,6 @@ pub async fn admit_inference_invocation(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     let db = pool.get();
-    ensure_run_scope(db, &plan.input).await?;
     if let Some(status) = existing_invocation_status(db, plan).await? {
         return Err(existing_invocation_error(plan, &status));
     }
@@ -328,16 +344,18 @@ pub async fn admit_inference_invocation(
         )
     })?;
     let write_result: ServiceResult<()> = async {
+        ensure_invocation_scope(&mut tx, &plan.input).await?;
         sqlx::query(
             "INSERT INTO inference_routes
-             (route_id, user_id, session_id, run_id, offering_id, resolved_model_name,
+             (route_id, user_id, session_id, scope_kind, run_id, offering_id, resolved_model_name,
               upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
-        .bind(&plan.input.session_id)
-        .bind(&plan.input.run_id)
+        .bind(plan.input.scope.session_id())
+        .bind(plan.input.scope.kind())
+        .bind(plan.input.scope.run_id())
         .bind(&plan.input.offering_id)
         .bind(&plan.input.resolved_model_name)
         .bind(&plan.input.upstream_model_name)
@@ -357,18 +375,20 @@ pub async fn admit_inference_invocation(
 
         sqlx::query(
             "INSERT INTO inference_invocations
-             (invocation_id, route_id, user_id, session_id, run_id, turn_index,
-              round_index, logical_attempt, purpose, status, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
+             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, turn_index,
+              round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
-        .bind(&plan.input.session_id)
-        .bind(&plan.input.run_id)
-        .bind(i64::from(plan.input.turn))
-        .bind(i64::from(plan.input.round))
-        .bind(i64::from(plan.input.logical_attempt))
+        .bind(plan.input.scope.session_id())
+        .bind(plan.input.scope.kind())
+        .bind(plan.input.scope.run_id())
+        .bind(i64::from(plan.input.scope.turn()))
+        .bind(i64::from(plan.input.scope.round()))
+        .bind(plan.input.scope.operation_id())
+        .bind(i64::from(plan.input.scope.logical_attempt()))
         .bind(plan.input.purpose.as_str())
         .execute(&mut *tx)
         .await
@@ -757,11 +777,14 @@ mod tests {
     fn input() -> InferenceInvocationInput {
         InferenceInvocationInput {
             user_id: "user-1".to_string(),
-            session_id: "session-1".to_string(),
-            run_id: "run-1".to_string(),
-            turn: 3,
-            round: 2,
-            logical_attempt: 0,
+            scope: InferenceInvocationScope::Run {
+                session_id: "session-1".to_string(),
+                run_id: "run-1".to_string(),
+                turn: 3,
+                round: 2,
+                operation_id: "agent_turn".to_string(),
+                logical_attempt: 0,
+            },
             offering_id: "offer-1".to_string(),
             resolved_model_name: "model-1".to_string(),
             upstream_model_name: "provider-model-1".to_string(),
@@ -790,15 +813,46 @@ mod tests {
 
     #[test]
     fn invocation_identity_rejects_ambiguous_runtime_scope() {
-        for mutate in [
-            |input: &mut InferenceInvocationInput| input.session_id.clear(),
-            |input: &mut InferenceInvocationInput| input.run_id = " run-1".to_string(),
-            |input: &mut InferenceInvocationInput| input.provider = "open\nAI".to_string(),
-        ] {
-            let mut candidate = input();
-            mutate(&mut candidate);
-            assert!(plan_inference_invocation(candidate).is_err());
-        }
+        let mut empty_session = input();
+        empty_session.scope = InferenceInvocationScope::Session {
+            session_id: String::new(),
+            turn: 3,
+            round: 2,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        };
+        assert!(plan_inference_invocation(empty_session).is_err());
+
+        let mut ambiguous_run = input();
+        ambiguous_run.scope = InferenceInvocationScope::Run {
+            session_id: "session-1".to_string(),
+            run_id: " run-1".to_string(),
+            turn: 3,
+            round: 2,
+            operation_id: "agent_turn".to_string(),
+            logical_attempt: 0,
+        };
+        assert!(plan_inference_invocation(ambiguous_run).is_err());
+
+        let mut invalid_provider = input();
+        invalid_provider.provider = "open\nAI".to_string();
+        assert!(plan_inference_invocation(invalid_provider).is_err());
+    }
+
+    #[test]
+    fn invocation_identity_distinguishes_run_and_session_ownership() {
+        let run = plan_inference_invocation(input()).expect("run plan");
+        let mut session_input = input();
+        session_input.scope = InferenceInvocationScope::Session {
+            session_id: "session-1".to_string(),
+            turn: 3,
+            round: 2,
+            operation_id: "agent_turn".to_string(),
+            logical_attempt: 0,
+        };
+        let session = plan_inference_invocation(session_input).expect("session plan");
+
+        assert_ne!(run.invocation_id(), session.invocation_id());
     }
 
     #[test]

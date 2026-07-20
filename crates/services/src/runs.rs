@@ -4,7 +4,7 @@ use astra_core::{
     error_response_coded,
 };
 use astra_turn_types::{
-    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
+    ModelSelection, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
     ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
 };
 use async_trait::async_trait;
@@ -419,12 +419,6 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelSelectionRequest {
-    pub offering_id: String,
-}
-
 /// Server-resolved model identity for one admitted Offering selection.
 ///
 /// This is internal runtime context, not a client wire shape. The model name
@@ -543,7 +537,7 @@ pub struct ChatRequestData {
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
-    pub model_selection: Option<ModelSelectionRequest>,
+    pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     /// Short-lived execution material for the admitted Offering.
     /// This value is never client supplied, serialized, persisted, or logged.
@@ -10477,7 +10471,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: Some("gpt-4".to_string()),
-            model_selection: Some(ModelSelectionRequest {
+            model_selection: Some(ModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
             }),
             resolved_model_selection: Some(ResolvedModelSelection {

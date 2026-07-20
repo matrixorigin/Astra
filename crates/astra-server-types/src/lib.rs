@@ -1,5 +1,6 @@
 #[cfg(feature = "server")]
 mod chat_route;
+mod completions;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;
 #[cfg(feature = "server")]
@@ -36,6 +37,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
 pub use chat_route::{ChatRouteResponse, classify_chat_route};
+pub use completions::{
+    CompletionChoice, CompletionMessage, CompletionRequest, CompletionResponse, CompletionUsage,
+};
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
     EdgeClientMessage, EdgeServerMessage,
@@ -99,7 +103,7 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     #[serde(default)]
-    pub model_selection: Option<astra_services::runs::ModelSelectionRequest>,
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
     #[serde(default)]
     pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
@@ -707,7 +711,7 @@ pub enum WsClientMessage {
         session_id: Option<String>,
         #[serde(default)]
         agent_id: Option<String>,
-        model_selection: astra_services::runs::ModelSelectionRequest,
+        model_selection: astra_turn_types::ModelSelection,
         #[serde(default)]
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]

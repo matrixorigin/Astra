@@ -13,7 +13,10 @@ use astra_turn_types::InferencePurpose;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, call_llm_nonstream, global_llm_client};
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, global_llm_client};
+
+#[cfg(test)]
+use crate::turn::llm::client::call_llm_nonstream;
 
 /// One typed inference request issued by memory extraction or retrieval.
 ///
@@ -23,6 +26,7 @@ use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, call_llm_nonstream, g
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryInferenceRequest<'a> {
     pub purpose: InferencePurpose,
+    pub invocation_scope: &'a astra_turn_types::InferenceInvocationScope,
     pub messages: &'a [Value],
     pub max_output_tokens: usize,
     pub temperature: f64,
@@ -78,24 +82,6 @@ pub(crate) struct DirectMemoryInferenceClient {
 }
 
 impl DirectMemoryInferenceClient {
-    pub(crate) fn from_offering(
-        offering: astra_services::ResolvedModelOffering,
-    ) -> Result<Self, String> {
-        let model = offering.model;
-        let header_overrides = model.execution_header_overrides()?;
-        Ok(Self {
-            base_url: model.base_url,
-            api_key: model.api_key,
-            model_name: model.model_name,
-            wire_model_name: model.wire_model_name,
-            provider: model.provider,
-            header_overrides,
-            request_body_overrides: model.request_body_overrides,
-            completions_url_override: None,
-            request_timeout: None,
-        })
-    }
-
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             model_name: &self.model_name,
@@ -108,6 +94,80 @@ impl DirectMemoryInferenceClient {
             completions_url_override: self.completions_url_override.as_deref(),
             request_timeout: self.request_timeout,
         }
+    }
+}
+
+pub(crate) struct DurableMemoryInferenceClient {
+    direct: DirectMemoryInferenceClient,
+    ledger: crate::turn::llm::durable::DurableInferenceLedger,
+}
+
+impl DurableMemoryInferenceClient {
+    pub(crate) fn from_offering(
+        offering: astra_services::ResolvedModelOffering,
+        shared_pool: astra_core::SharedPool,
+        user_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        let admitted_execution =
+            astra_services::AdmittedModelExecution::from_offering(offering.clone())?;
+        let model = offering.model;
+        let header_overrides = model.execution_header_overrides()?;
+        Ok(Self {
+            direct: DirectMemoryInferenceClient {
+                base_url: model.base_url,
+                api_key: model.api_key,
+                model_name: model.model_name,
+                wire_model_name: model.wire_model_name,
+                provider: model.provider,
+                header_overrides,
+                request_body_overrides: model.request_body_overrides,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            ledger: crate::turn::llm::durable::DurableInferenceLedger::new(
+                shared_pool,
+                user_id,
+                admitted_execution,
+            ),
+        })
+    }
+}
+
+impl std::fmt::Debug for DurableMemoryInferenceClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.direct.fmt(f)
+    }
+}
+
+#[async_trait]
+impl MemoryInferencePort for DurableMemoryInferenceClient {
+    fn model_name(&self) -> &str {
+        &self.direct.model_name
+    }
+
+    async fn complete(
+        &self,
+        request: MemoryInferenceRequest<'_>,
+    ) -> Result<String, astra_core::ClassifiedError> {
+        let result = self
+            .ledger
+            .execute_nonstream(
+                global_llm_client(),
+                request.invocation_scope.clone(),
+                LlmCall {
+                    purpose: request.purpose,
+                    messages: request.messages,
+                    tools: &[],
+                    route: self.direct.execution_route(),
+                    max_output_tokens: Some(request.max_output_tokens),
+                    temperature: Some(request.temperature),
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                },
+                request.deadline,
+            )
+            .await?;
+        Ok(result.full_text)
     }
 }
 
@@ -132,6 +192,7 @@ impl std::fmt::Debug for DirectMemoryInferenceClient {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl MemoryInferencePort for DirectMemoryInferenceClient {
     fn model_name(&self) -> &str {

@@ -143,7 +143,7 @@ pub(super) struct WsChatMessage {
     session_id: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
-    model_selection: astra_services::runs::ModelSelectionRequest,
+    model_selection: astra_turn_types::ModelSelection,
     #[serde(default)]
     skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
@@ -726,7 +726,7 @@ async fn handle_chat_message(
     user_intent: Option<String>,
     requested_session_id: Option<String>,
     agent_id: Option<String>,
-    model_selection: astra_services::runs::ModelSelectionRequest,
+    model_selection: astra_turn_types::ModelSelection,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
@@ -1213,7 +1213,7 @@ fn build_ws_chat_request(
     user_intent: Option<String>,
     session_id: Option<String>,
     agent_id: Option<String>,
-    model_selection: astra_services::runs::ModelSelectionRequest,
+    model_selection: astra_turn_types::ModelSelection,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
@@ -2714,7 +2714,7 @@ mod tests {
             Some("pure hello".into()),
             Some("session-1".into()),
             Some("agent-1".into()),
-            astra_services::runs::ModelSelectionRequest {
+            astra_turn_types::ModelSelection {
                 offering_id: "offer-gpt-5.4".into(),
             },
             Some(astra_core::SkillSearchSettings {

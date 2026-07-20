@@ -42,7 +42,7 @@ use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, CancelRunRecord, CapabilityServerRefs, ChatRequestData,
-    ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind, ModelSelectionRequest,
+    ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind,
     RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
     RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
     RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord, RunUserIntentData,
@@ -65,6 +65,7 @@ use astra_services::{
 };
 use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
+use astra_turn_types::ModelSelection;
 use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
@@ -4111,8 +4112,8 @@ impl AgenticRunLifecycleService {
     }
 
     fn validate_model_selection_shape(
-        model_selection: Option<&ModelSelectionRequest>,
-    ) -> Result<&ModelSelectionRequest, (StatusCode, Json<ErrorResponse>)> {
+        model_selection: Option<&ModelSelection>,
+    ) -> Result<&ModelSelection, (StatusCode, Json<ErrorResponse>)> {
         let model_selection = model_selection.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -6456,7 +6457,13 @@ fn build_shutdown_extraction_request(
         .current_session_id
         .as_ref()
         .map(|session_id| crate::session_memory::ExtractionRequest {
-            session_id: session_id.clone(),
+            inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id: session_id.clone(),
+                turn: state.current_session_turn_number(),
+                round: state.current_round_index,
+                operation_id: "memory_extraction_shutdown".to_string(),
+                logical_attempt: 0,
+            },
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
             had_error: state.error_recovery.consecutive_same_error > 0,
@@ -6464,7 +6471,6 @@ fn build_shutdown_extraction_request(
                 .turn_intent
                 .as_ref()
                 .is_some_and(|intent| intent.reanchors_current_objective()),
-            turn_number: state.current_session_turn_number(),
         })
 }
 
@@ -11107,7 +11113,7 @@ impl ServerSubRunExecutor {
                 crate::server::run::engine::RunStartContext {
                     agent_binding_name: Some(config.agent_profile.name.clone()),
                     model_selection: config.admitted_model_execution.as_ref().map(|execution| {
-                        ModelSelectionRequest {
+                        ModelSelection {
                             offering_id: execution.offering_id.clone(),
                         }
                     }),

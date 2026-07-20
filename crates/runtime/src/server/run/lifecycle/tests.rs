@@ -900,7 +900,8 @@ fn shutdown_extraction_request_uses_outer_session_turn() {
         .expect("shutdown extraction request should build");
 
     assert_eq!(
-        req.turn_number, 12,
+        req.turn_number(),
+        12,
         "shutdown extraction must record the persisted session turn, not the request-local loop step"
     );
 }
@@ -3470,7 +3471,7 @@ fn test_request(message: &str) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
-        model_selection: Some(ModelSelectionRequest {
+        model_selection: Some(ModelSelection {
             offering_id: "model-test-model".to_string(),
         }),
         resolved_model_selection: None,
@@ -3870,7 +3871,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
             Some("parent-agent"),
             None,
             crate::server::run::engine::RunStartContext {
-                model_selection: Some(ModelSelectionRequest {
+                model_selection: Some(ModelSelection {
                     offering_id: "model-test-model".to_string(),
                 }),
                 resolved_model_selection: Some(ResolvedModelSelection {
@@ -5256,7 +5257,7 @@ async fn prepare_chat_request_rejects_unknown_offering_without_name_fallback() {
     request.model = None;
     request.resolved_model_selection = None;
     request.admitted_model_execution = None;
-    request.model_selection = Some(ModelSelectionRequest {
+    request.model_selection = Some(ModelSelection {
         offering_id: "missing-model".to_string(),
     });
 

@@ -211,6 +211,7 @@ fn is_meaningful_term(term: &str) -> bool {
 /// list. Prompt noise is more harmful than a missed memory.
 pub async fn filter_memories(
     client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     user_message: &str,
     items: &[String],
 ) -> Vec<String> {
@@ -220,6 +221,7 @@ pub async fn filter_memories(
     let query = build_relevance_query(user_message, items);
     let text = match run_selector_prompt(
         client,
+        invocation_scope,
         InferencePurpose::MemoryRetrievalRerank,
         RELEVANCE_FILTER_PROMPT,
         query,
@@ -255,6 +257,7 @@ pub async fn filter_memories(
 /// than guessing from surface words.
 pub async fn select_dismissed_memory_indices(
     client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     user_message: &str,
     items: &[String],
 ) -> Vec<usize> {
@@ -264,6 +267,7 @@ pub async fn select_dismissed_memory_indices(
     let query = build_memory_feedback_query(user_message, items);
     let text = match run_selector_prompt(
         client,
+        invocation_scope,
         InferencePurpose::MemoryRetrievalRerank,
         MEMORY_FEEDBACK_FILTER_PROMPT,
         query,
@@ -290,6 +294,7 @@ pub async fn select_dismissed_memory_indices(
 
 async fn run_selector_prompt(
     client: &dyn MemoryInferencePort,
+    invocation_scope: &astra_turn_types::InferenceInvocationScope,
     purpose: InferencePurpose,
     system_prompt: &str,
     user_content: String,
@@ -301,6 +306,7 @@ async fn run_selector_prompt(
     let result = client
         .complete(MemoryInferenceRequest {
             purpose,
+            invocation_scope,
             messages: &messages,
             max_output_tokens: 50,
             temperature: 0.0,
@@ -348,6 +354,16 @@ mod tests {
     use super::*;
     use crate::memory_hooks::DirectMemoryInferenceClient;
     use async_trait::async_trait;
+
+    fn test_scope() -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "session-memory-test".to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "memory_rerank_test".to_string(),
+            logical_attempt: 0,
+        }
+    }
 
     #[derive(Debug)]
     struct CapturingInference {
@@ -426,7 +442,7 @@ mod tests {
         };
         let items = vec!["Prefer cargo test for Rust changes".to_string()];
 
-        let filtered = filter_memories(&client, "review Rust", &items).await;
+        let filtered = filter_memories(&client, &test_scope(), "review Rust", &items).await;
 
         assert_eq!(filtered, items);
         assert_eq!(
@@ -481,7 +497,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
         };
-        let result = filter_memories(&params, "query", &[]).await;
+        let result = filter_memories(&params, &test_scope(), "query", &[]).await;
         assert!(result.is_empty());
     }
 
@@ -502,7 +518,7 @@ mod tests {
             "browser verification for html pages".into(),
             "cargo test for rust executor changes".into(),
         ];
-        let result = filter_memories(&params, "rust executor review", &items).await;
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert_eq!(
             result,
             vec!["cargo test for rust executor changes".to_string()],
@@ -556,7 +572,7 @@ mod tests {
             request_timeout: None,
         };
         let items = vec!["mem-a".into(), "mem-b".into()];
-        let _ = filter_memories(&params, "test query", &items).await;
+        let _ = filter_memories(&params, &test_scope(), "test query", &items).await;
 
         let body = captured.lock().unwrap().take().expect("request captured");
         assert_eq!(
@@ -581,7 +597,7 @@ mod tests {
             request_timeout: None,
         };
         let items = vec!["mem-a".into()];
-        let _ = filter_memories(&params, "test", &items).await;
+        let _ = filter_memories(&params, &test_scope(), "test", &items).await;
 
         let body = captured.lock().unwrap().take().expect("request captured");
         assert!(
@@ -606,7 +622,7 @@ mod tests {
             request_timeout: None,
         };
         let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
-        let result = filter_memories(&params, "query", &items).await;
+        let result = filter_memories(&params, &test_scope(), "query", &items).await;
         assert_eq!(result, vec!["mem-0", "mem-2"]);
     }
 
@@ -629,7 +645,7 @@ mod tests {
             "cargo test for rust executor changes".to_string(),
             "browser verification for html pages".to_string(),
         ];
-        let result = filter_memories(&params, "rust executor review", &items).await;
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert_eq!(
             result,
             vec!["cargo test for rust executor changes".to_string()]
@@ -652,7 +668,7 @@ mod tests {
             request_timeout: None,
         };
         let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
-        let result = filter_memories(&params, "query", &items).await;
+        let result = filter_memories(&params, &test_scope(), "query", &items).await;
         assert_eq!(result, vec!["relevant"]);
     }
 
@@ -672,7 +688,7 @@ mod tests {
             request_timeout: None,
         };
         let items = vec!["cargo test for rust executor changes".into()];
-        let result = filter_memories(&params, "rust executor review", &items).await;
+        let result = filter_memories(&params, &test_scope(), "rust executor review", &items).await;
         assert!(
             result.is_empty(),
             "selector's explicit empty relevance result should be respected"
@@ -700,6 +716,7 @@ mod tests {
         ];
         let dismissed = select_dismissed_memory_indices(
             &params,
+            &test_scope(),
             "the first candidate should not apply",
             &items,
         )

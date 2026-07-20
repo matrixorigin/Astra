@@ -62,7 +62,10 @@ impl std::fmt::Debug for PoolMemoryInferenceResolver {
 
 #[async_trait::async_trait]
 impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResolver {
-    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::MemoryInferenceClient> {
+    async fn resolve_candidates(
+        &self,
+        user_id: &str,
+    ) -> Vec<crate::memory_hooks::MemoryInferenceClient> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
         let offerings = match astra_services::models::resolve_memory_offerings(
@@ -87,7 +90,11 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
             .filter_map(|offering| {
                 let offering_id = offering.offering_id.clone();
                 let model_name = offering.model.model_name.clone();
-                match crate::memory_hooks::DirectMemoryInferenceClient::from_offering(offering) {
+                match crate::memory_hooks::DurableMemoryInferenceClient::from_offering(
+                    offering,
+                    self.pool.clone(),
+                    user_id,
+                ) {
                     Ok(client) => {
                         Some(std::sync::Arc::new(client)
                             as crate::memory_hooks::MemoryInferenceClient)

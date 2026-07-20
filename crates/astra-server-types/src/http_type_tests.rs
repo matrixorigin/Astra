@@ -1182,7 +1182,7 @@ fn chat_request_into_data_maps_all_fields() {
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
-        model_selection: Some(astra_services::runs::ModelSelectionRequest {
+        model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
         }),
         capability_descriptors: None,

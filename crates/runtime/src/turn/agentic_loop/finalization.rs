@@ -998,7 +998,13 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // cache reads + cache creation. Using `total_prompt` alone here
     // was a semantic bug: on prompt-cache-heavy sessions 90% of the
     let req = crate::session_memory::ExtractionRequest {
-        session_id,
+        inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+            session_id,
+            turn: turn_number,
+            round: state.current_round_index,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        },
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),
         had_error,
@@ -1006,7 +1012,6 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
             .turn_intent
             .as_ref()
             .is_some_and(|intent| intent.reanchors_current_objective()),
-        turn_number,
     };
 
     match svc.maybe_spawn(req) {

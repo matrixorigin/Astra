@@ -4,10 +4,11 @@ use astra_core::ErrorResponse;
 use astra_services::{
     AdmittedModelExecution, ModelService,
     runs::{
-        ModelSelectionRequest, ResolvedModelSelection, RuntimeAuthRequest,
-        RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
+        ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
+        RuntimeCapabilityDescriptorsRequest,
     },
 };
+use astra_turn_types::ModelSelection;
 use axum::{Json, body::Bytes, http::StatusCode};
 use serde::Deserialize;
 
@@ -28,7 +29,7 @@ pub(crate) enum ModelExecutionAdmissionAuthority {
 /// non-serializable value.
 pub(crate) async fn admit_model_execution(
     model_service: &Arc<dyn ModelService>,
-    selection: &ModelSelectionRequest,
+    selection: &ModelSelection,
     resolved: Option<&ResolvedModelSelection>,
     gateway: Option<&RuntimeCapabilityDescriptorRequest>,
     runtime_auth: Option<&RuntimeAuthRequest>,
@@ -189,7 +190,7 @@ pub(crate) async fn admit_model_execution_from_body(
 #[derive(Deserialize)]
 struct ModelExecutionAdmissionFields {
     #[serde(default)]
-    model_selection: Option<ModelSelectionRequest>,
+    model_selection: Option<ModelSelection>,
     #[serde(default)]
     resolved_model_selection: Option<ResolvedModelSelection>,
     #[serde(default)]

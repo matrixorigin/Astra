@@ -60,13 +60,20 @@ pub(crate) fn should_bootstrap_lessons(state: &SessionState) -> bool {
 }
 
 async fn filter_lessons_by_relevance(
+    invocation_scope: Option<&astra_turn_types::InferenceInvocationScope>,
     user_message: &str,
     lessons: Vec<astra_services::LessonHint>,
     client: Option<&dyn astra_runtime::memory_hooks::MemoryInferencePort>,
 ) -> Vec<astra_services::LessonHint> {
     let texts: Vec<String> = lessons.iter().map(|lesson| lesson.action.clone()).collect();
-    let filtered = if let Some(client) = client {
-        astra_runtime::memory_hooks::relevance::filter_memories(client, user_message, &texts).await
+    let filtered = if let (Some(client), Some(invocation_scope)) = (client, invocation_scope) {
+        astra_runtime::memory_hooks::relevance::filter_memories(
+            client,
+            invocation_scope,
+            user_message,
+            &texts,
+        )
+        .await
     } else {
         astra_runtime::memory_hooks::relevance::lexical_filter_memories(user_message, &texts)
     };
@@ -106,6 +113,19 @@ pub(crate) async fn ensure_bootstrapped_lessons(
     token: &str,
     user_message: &str,
 ) {
+    let turn = state.turn.saturating_add(1);
+    let session_id_for_scope = state.session_id.clone();
+    let session_scope = |operation_id: &str| {
+        session_id_for_scope.as_ref().map(|session_id| {
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: session_id.clone(),
+                turn,
+                round: 0,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            }
+        })
+    };
     if !state.session_lessons.is_empty() {
         maybe_load_memory_inference_offering(state, api, token).await;
         if let Some(offering) = state.memory_inference_offering.as_ref() {
@@ -120,13 +140,18 @@ pub(crate) async fn ensure_bootstrapped_lessons(
                 .iter()
                 .map(|lesson| lesson.action.clone())
                 .collect();
-            let dismissed =
-                astra_runtime::memory_hooks::relevance::select_dismissed_memory_indices(
-                    &client,
-                    user_message,
-                    &texts,
-                )
-                .await;
+            let dismissed = match session_scope("memory_feedback") {
+                Some(scope) => {
+                    astra_runtime::memory_hooks::relevance::select_dismissed_memory_indices(
+                        &client,
+                        &scope,
+                        user_message,
+                        &texts,
+                    )
+                    .await
+                }
+                None => Vec::new(),
+            };
             if !dismissed.is_empty() {
                 let dismissed: std::collections::HashSet<usize> = dismissed.into_iter().collect();
                 state.session_lessons = state
@@ -161,6 +186,7 @@ pub(crate) async fn ensure_bootstrapped_lessons(
         )
     });
     state.session_lessons = filter_lessons_by_relevance(
+        session_scope("memory_relevance").as_ref(),
         user_message,
         lessons,
         client
@@ -213,7 +239,7 @@ mod tests {
         ];
 
         let filtered =
-            filter_lessons_by_relevance("review Rust executor code", lessons, None).await;
+            filter_lessons_by_relevance(None, "review Rust executor code", lessons, None).await;
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(

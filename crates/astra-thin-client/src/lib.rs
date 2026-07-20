@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod sse;
 
 pub use astra_server_types::{
+    CompletionChoice, CompletionMessage, CompletionRequest, CompletionResponse, CompletionUsage,
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
     SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
     SessionRunTreeSnapshot,
@@ -30,8 +31,8 @@ pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
     EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    LegacyEdgePendingRequest, RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest,
-    SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
+    LegacyEdgePendingRequest, ModelSelection, RunUserIntentRequest, RunUserIntentResponse,
+    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
     SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
     SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
     ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,

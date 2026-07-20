@@ -75,7 +75,7 @@ pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 2048;
 /// Called once per extraction attempt.
 #[async_trait]
 pub trait MemoryInferenceResolver: Send + Sync + std::fmt::Debug {
-    async fn resolve_candidates(&self) -> Vec<MemoryInferenceClient>;
+    async fn resolve_candidates(&self, user_id: &str) -> Vec<MemoryInferenceClient>;
 }
 
 /// Always returns the same client. Unit tests.
@@ -84,7 +84,7 @@ pub struct ConstMemoryInferenceResolver(pub Option<MemoryInferenceClient>);
 
 #[async_trait]
 impl MemoryInferenceResolver for ConstMemoryInferenceResolver {
-    async fn resolve_candidates(&self) -> Vec<MemoryInferenceClient> {
+    async fn resolve_candidates(&self, _user_id: &str) -> Vec<MemoryInferenceClient> {
         self.0.iter().cloned().collect()
     }
 }
@@ -421,7 +421,7 @@ impl MemoryExtractionService {
     pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
         let Some(user_id) = self.user_id.as_deref() else {
             tracing::error!(
-                session_id = %req.session_id,
+                session_id = %req.session_id(),
                 "refusing session-memory extraction from an owner-neutral service template"
             );
             return SpawnDecision::Skipped;
@@ -454,7 +454,7 @@ impl MemoryExtractionService {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
-            let state_ref = map.get(&req.session_id);
+            let state_ref = map.get(req.session_id());
             let default_state;
             let state = match state_ref {
                 Some(s) => s,
@@ -463,7 +463,7 @@ impl MemoryExtractionService {
                     &default_state
                 }
             };
-            let dec = evaluate(state, &req.session_id, content_fingerprint);
+            let dec = evaluate(state, req.session_id(), content_fingerprint);
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip(reason)
@@ -477,15 +477,15 @@ impl MemoryExtractionService {
                             .work
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match work.active_fingerprints.get(&req.session_id).copied() {
+                        match work.active_fingerprints.get(req.session_id()).copied() {
                             None => {
                                 work.active_fingerprints
-                                    .insert(req.session_id.clone(), content_fingerprint);
+                                    .insert(req.session_id().to_string(), content_fingerprint);
                                 Admission::Spawn
                             }
                             Some(active_fingerprint)
                                 if active_fingerprint == content_fingerprint
-                                    || work.queued_latest.get(&req.session_id).is_some_and(
+                                    || work.queued_latest.get(req.session_id()).is_some_and(
                                         |(_, queued_fingerprint)| {
                                             *queued_fingerprint == content_fingerprint
                                         },
@@ -495,7 +495,7 @@ impl MemoryExtractionService {
                             }
                             Some(_) => {
                                 work.queued_latest.insert(
-                                    req.session_id.clone(),
+                                    req.session_id().to_string(),
                                     (req.clone(), content_fingerprint),
                                 );
                                 Admission::Queue
@@ -510,12 +510,18 @@ impl MemoryExtractionService {
             Admission::Spawn => {}
             Admission::Queue => return SpawnDecision::Queued,
             Admission::Skip(reason) => {
-                let sid_opt = if req.session_id.is_empty() {
+                let sid_opt = if req.session_id().is_empty() {
                     None
                 } else {
-                    Some(req.session_id.as_str())
+                    Some(req.session_id())
                 };
-                self.emit_skip_event(user_id, sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.emit_skip_event(
+                    user_id,
+                    sid_opt,
+                    req.turn_number(),
+                    reason,
+                    &skip_breadcrumbs,
+                );
                 return SpawnDecision::Skipped;
             }
         }
@@ -532,7 +538,7 @@ impl MemoryExtractionService {
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
         let pending_guard = PendingGuard::new(pending, pending_done);
-        let session_id = req.session_id.clone();
+        let session_id = req.session_id().to_string();
         let work_guard = SessionWorkGuard::new(Arc::clone(&self.work), session_id.clone());
         tokio::spawn(async move {
             let _pending_guard = pending_guard;
@@ -549,7 +555,7 @@ impl MemoryExtractionService {
     // ── internals ─────────────────────────────────────────────────────
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
-        let session_id = req.session_id.clone();
+        let session_id = req.session_id().to_string();
         let Some(user_id) = self.user_id.as_deref().map(str::to_string) else {
             tracing::error!(
                 session_id = %session_id,
@@ -557,7 +563,7 @@ impl MemoryExtractionService {
             );
             return;
         };
-        let turn = req.turn_number;
+        let turn = req.turn_number();
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
         // Process-local admission cannot see a worker that completed in a
@@ -591,7 +597,7 @@ impl MemoryExtractionService {
             return;
         }
         let current_memory = current.map(|loaded| loaded.content).unwrap_or_default();
-        let selector_candidates = self.inference_resolver.resolve_candidates().await;
+        let selector_candidates = self.inference_resolver.resolve_candidates(&user_id).await;
         let resolved_selector_model = selector_candidates
             .first()
             .map(|candidate| candidate.model_name().to_string());
@@ -625,7 +631,7 @@ impl MemoryExtractionService {
 
         let artifacts = run_extraction(
             &self.memoria_client,
-            &session_id,
+            &req.inference_scope,
             &req.messages,
             turn as usize,
             &current_memory,
@@ -694,7 +700,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number);
+                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number());
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -770,7 +776,7 @@ impl MemoryExtractionService {
                     });
                     return;
                 }
-                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number);
+                self.mark_session_extracted(&session_id, content_fingerprint, req.turn_number());
                 // LLM failed but rule-based content did land. Surface
                 // the error live, but record the journal outcome as a
                 // successful fallback write so postmortems stop reading
@@ -1140,6 +1146,19 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn extraction_scope(
+        session_id: impl Into<String>,
+        turn: u32,
+    ) -> astra_turn_types::InferenceInvocationScope {
+        astra_turn_types::InferenceInvocationScope::Session {
+            session_id: session_id.into(),
+            turn,
+            round: 0,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        }
+    }
+
     /// Minimal capturing mock — records every `store` for assertion.
     #[derive(Default)]
     struct CapturingMemoria {
@@ -1382,7 +1401,7 @@ mod tests {
 
     fn sample_req(session_id: &str, _tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "Design a durable runtime history boundary that separates root conversation history from child agent artifacts and keeps prompt cache stable."}),
                 json!({"role": "assistant", "content": "I will inspect the restore path, session history tool, and event persistence boundary, then update the shared runtime code and regression tests."}),
@@ -1390,7 +1409,6 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
@@ -1418,7 +1436,7 @@ mod tests {
 
     fn meaningful_shutdown_req(session_id: &str, _tokens: usize) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
                 json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
@@ -1426,13 +1444,12 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
     fn short_conversation_req(session_id: &str) -> ExtractionRequest {
         ExtractionRequest {
-            session_id: session_id.to_string(),
+            inference_scope: extraction_scope(session_id, 1),
             messages: vec![
                 json!({"role": "user", "content": "1+1"}),
                 json!({"role": "assistant", "content": "2"}),
@@ -1440,7 +1457,6 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         }
     }
 
@@ -1448,7 +1464,7 @@ mod tests {
     fn extraction_fingerprint_ignores_turn_counter() {
         let mut first = sample_req("fingerprint", 1_000, false);
         let mut second = first.clone();
-        second.turn_number = 42;
+        second.inference_scope = extraction_scope("fingerprint", 42);
 
         assert_eq!(
             extraction_input_fingerprint(&first),
@@ -1595,7 +1611,7 @@ mod tests {
             Arc::new(BackgroundActivityBroker::new()),
         ));
         let mut first = sample_req("restart-idempotent", 1_000, false);
-        first.turn_number = 7;
+        first.inference_scope = extraction_scope("restart-idempotent", 7);
         assert_eq!(service_a.maybe_spawn(first.clone()), SpawnDecision::Spawned);
         assert_eq!(service_a.wait_for_pending(Duration::from_secs(2)).await, 0);
         assert_eq!(memoria.stored.lock().unwrap().len(), 1);
@@ -1724,7 +1740,7 @@ mod tests {
     async fn shutdown_flush_skips_an_unchanged_canonical_snapshot() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
-            session_id: format!("shutdown-trivial-{}", nanos()),
+            inference_scope: extraction_scope(format!("shutdown-trivial-{}", nanos()), 1),
             messages: vec![
                 json!({"role": "user", "content": "hi"}),
                 json!({"role": "assistant", "content": "hello"}),
@@ -1732,11 +1748,10 @@ mod tests {
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         };
         let fingerprint = extraction_input_fingerprint(&req);
         ctx.svc
-            .mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
+            .mark_session_extracted(req.session_id(), fingerprint, req.turn_number());
         assert_eq!(
             ctx.svc.maybe_spawn_shutdown_flush(req),
             SpawnDecision::Skipped
@@ -1846,7 +1861,7 @@ mod tests {
         memoria.first_started.notified().await;
 
         let mut latest = first;
-        latest.turn_number = 2;
+        latest.inference_scope = extraction_scope(&sid, 2);
         latest
             .session_facts
             .active_files
@@ -2026,7 +2041,7 @@ mod tests {
 
     #[async_trait]
     impl MemoryInferenceResolver for OrderedMemoryInferenceResolver {
-        async fn resolve_candidates(&self) -> Vec<MemoryInferenceClient> {
+        async fn resolve_candidates(&self, _user_id: &str) -> Vec<MemoryInferenceClient> {
             self.0
                 .iter()
                 .cloned()
@@ -2599,15 +2614,14 @@ mod tests {
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("bc-skip-{}", nanos());
         let req = ExtractionRequest {
-            session_id: sid,
+            inference_scope: extraction_scope(sid, 1),
             messages: vec![json!({"role": "user", "content": "x"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             had_error: false,
             reanchors_current_objective: false,
-            turn_number: 1,
         };
         let fingerprint = extraction_input_fingerprint(&req);
-        svc.mark_session_extracted(&req.session_id, fingerprint, req.turn_number);
+        svc.mark_session_extracted(req.session_id(), fingerprint, req.turn_number());
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut rx);

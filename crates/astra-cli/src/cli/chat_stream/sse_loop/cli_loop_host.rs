@@ -51,6 +51,8 @@ const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 struct CliServerProxySummaryClient {
     api: astra_thin_client::ThinClient,
     token: String,
+    base_scope: astra_turn_types::InferenceInvocationScope,
+    next_logical_attempt: std::sync::atomic::AtomicU32,
 }
 
 #[async_trait]
@@ -60,20 +62,24 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryC
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        let body = serde_json::json!({
-            "purpose": purpose,
-            "messages": messages,
-            "max_tokens": 256,
-            "temperature": 0.0,
-        });
+        let logical_attempt = self
+            .next_logical_attempt
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut request = astra_thin_client::CompletionRequest::new(
+            purpose,
+            self.base_scope.with_logical_attempt(logical_attempt),
+            messages.to_vec(),
+        );
+        request.max_tokens = 256;
+        request.temperature = 0.0;
         let response = self
             .api
-            .post_completions(&self.token, &body)
+            .post_completions(&self.token, &request)
             .await
             .map_err(|error| error.to_string())?;
-        let text = response["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| format!("missing completion content in response: {response}"))?
+        let text = response
+            .first_text()
+            .ok_or_else(|| "Astra Server returned a completion without choices".to_string())?
             .to_string();
         Ok(astra_turn_core::cloud_summary::SummaryResponse {
             text,
@@ -926,16 +932,25 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     async fn judge_skill_auto_route(
         &mut self,
-        _state: &AgenticLoopState,
+        state: &AgenticLoopState,
         ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
             return None;
         }
+        let session_id = state.current_session_id.as_ref()?.clone();
         let service_ctx = cli_skill_auto_route_service_context(ctx);
         let client = CliServerProxySummaryClient {
             api: self.api.clone(),
             token: self.token.clone(),
+            base_scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id,
+                turn: state.session_turn,
+                round: state.current_round_index,
+                operation_id: "skill_auto_route".to_string(),
+                logical_attempt: 0,
+            },
+            next_logical_attempt: std::sync::atomic::AtomicU32::new(0),
         };
         let judge = CliSummaryClientSkillAutoRouteJudge {
             client: Box::new(client),

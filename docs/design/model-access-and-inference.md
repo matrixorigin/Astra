@@ -495,6 +495,35 @@ A logical inference and a physical provider request are distinct:
 - `InferenceInvocation` is the budget, lifecycle, and aggregate-usage unit.
 - `ProviderAttempt` is one actual request, including provider request ID and delivery certainty.
 
+Every invocation has exactly one durable owner scope:
+
+```rust
+enum InferenceOwnerScope {
+    Run {
+        session_id: SessionId,
+        run_id: RunId,
+        turn: u32,
+        round: u32,
+        operation_id: OperationId,
+        logical_attempt: u32,
+    },
+    Session {
+        session_id: SessionId,
+        turn: u32,
+        round: u32,
+        operation_id: OperationId,
+        logical_attempt: u32,
+    },
+}
+```
+
+Primary agent and subagent inference is run-owned. Work that is genuinely
+outside an active run—such as pre-turn memory reranking or post-turn memory
+extraction—is session-owned. Both scopes verify the authenticated user's
+durable ownership before provider I/O. Producers must never invent a run ID to
+make auxiliary work billable, and consumers must never infer ownership from an
+operation label or prompt text.
+
 Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
@@ -534,6 +563,7 @@ Server and Edge share one request and stream contract:
 struct InferenceRequest {
     invocation_id: InferenceInvocationId,
     provider_attempt_id: ProviderAttemptId,
+    owner: InferenceOwnerScope,
     route: ResolvedInferenceRoute,
     messages: Vec<CanonicalMessage>,
     tools: Vec<CanonicalToolSchema>,
@@ -590,9 +620,22 @@ create_run(model_selection, data_boundary_profile, budget, idempotency_key)
 submit_turn(run_id, message, optional_model_selection, idempotency_key)
 stream_run_events(run_id, cursor)
 get_inference_usage(run_id)
+get_session_inference_usage(session_id, cursor)
 ```
 
 Refresh or reconnect resumes from a durable event cursor. The SDK does not invent client-specific provider fields.
+
+`ModelSelection`, `InferencePurpose`, and `InferenceInvocationScope` are shared
+wire types, not parallel Web/CLI/Server structs. Non-streaming SDK calls use a
+typed `CompletionRequest` and `CompletionResponse`; callers do not construct a
+free-form JSON envelope or index into an unvalidated response. A completion
+scope is either an authenticated agent run or a real session-owned operation.
+It never fabricates a run ID for memory, compaction, or other session work.
+
+This contract intentionally replaces the former `selected_model` and raw
+model/provider/gateway request shapes. There is no dual interpretation or
+legacy fallback: clients upgrade by selecting an `offering_id` obtained from
+the current Model Access projection.
 
 ## Resolution lifecycle
 
@@ -762,6 +805,8 @@ Tests validate behavior, persisted facts, wire payloads, streams, and product pr
 - External-account and cross-tenant isolation.
 - CAS transition and revoke races.
 - Route/invocation/attempt persistence before provider execution.
+- Run-owned and session-owned admission, including cross-user rejection and no
+  fabricated run identity for memory/compaction/reflection work.
 - Idempotent usage settlement and crash recovery.
 - Revision invalidation across multiple Server instances.
 

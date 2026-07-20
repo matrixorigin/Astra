@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v4";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v5";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1418,9 +1418,41 @@ async fn fail_if_required_columns_missing_or_nullable(
     table: &str,
     required_not_null_columns: &[&str],
 ) -> Result<(), sqlx::Error> {
+    let requirements = required_not_null_columns
+        .iter()
+        .map(|column| (*column, ColumnNullability::NotNull))
+        .collect::<Vec<_>>();
+    fail_if_required_column_nullability_mismatches(pool, database, table, &requirements).await
+}
+
+async fn fail_if_required_columns_missing_or_not_nullable(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    required_nullable_columns: &[&str],
+) -> Result<(), sqlx::Error> {
+    let requirements = required_nullable_columns
+        .iter()
+        .map(|column| (*column, ColumnNullability::Nullable))
+        .collect::<Vec<_>>();
+    fail_if_required_column_nullability_mismatches(pool, database, table, &requirements).await
+}
+
+#[derive(Clone, Copy)]
+enum ColumnNullability {
+    NotNull,
+    Nullable,
+}
+
+async fn fail_if_required_column_nullability_mismatches(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    requirements: &[(&str, ColumnNullability)],
+) -> Result<(), sqlx::Error> {
     validate_schema_identifier(database, "matrixone database")?;
     validate_schema_identifier(table, "matrixone table")?;
-    for column in required_not_null_columns {
+    for (column, _) in requirements {
         validate_schema_identifier(column, "matrixone column")?;
     }
 
@@ -1436,36 +1468,34 @@ async fn fail_if_required_columns_missing_or_nullable(
         return Ok(());
     }
 
-    let mut present_columns = BTreeSet::new();
-    let mut nullable_columns = Vec::new();
+    let mut columns = BTreeMap::new();
     for row in rows {
         let column: String = row.try_get("COLUMN_NAME")?;
         let is_nullable: String = row.try_get("IS_NULLABLE")?;
-        present_columns.insert(column.clone());
-        if required_not_null_columns.contains(&column.as_str()) && is_nullable == "YES" {
-            nullable_columns.push(column);
+        columns.insert(column, is_nullable == "YES");
+    }
+    let mut reasons = Vec::new();
+    for (column, required) in requirements {
+        match (columns.get(*column), required) {
+            (None, ColumnNullability::NotNull) => {
+                reasons.push(format!("missing NOT NULL column {column}"));
+            }
+            (None, ColumnNullability::Nullable) => {
+                reasons.push(format!("missing nullable column {column}"));
+            }
+            (Some(true), ColumnNullability::NotNull) => {
+                reasons.push(format!("nullable owner column {column}"));
+            }
+            (Some(false), ColumnNullability::Nullable) => {
+                reasons.push(format!("non-nullable column {column}"));
+            }
+            (Some(false), ColumnNullability::NotNull)
+            | (Some(true), ColumnNullability::Nullable) => {}
         }
     }
-    let missing_columns = required_not_null_columns
-        .iter()
-        .copied()
-        .filter(|column| !present_columns.contains(*column))
-        .collect::<Vec<_>>();
-    if missing_columns.is_empty() && nullable_columns.is_empty() {
+    if reasons.is_empty() {
         return Ok(());
     }
-
-    let mut reasons = Vec::new();
-    reasons.extend(
-        missing_columns
-            .into_iter()
-            .map(|column| format!("missing NOT NULL column {column}")),
-    );
-    reasons.extend(
-        nullable_columns
-            .into_iter()
-            .map(|column| format!("nullable owner column {column}")),
-    );
     Err(sqlx::Error::Protocol(format!(
         "obsolete core schema table {table} requires manual migration before startup: {}",
         reasons.join(", ")
@@ -4283,7 +4313,8 @@ async fn ensure_core_schema_while_leased(
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
+            scope_kind VARCHAR(16) NOT NULL,
+            run_id VARCHAR(64) NULL,
             offering_id VARCHAR(64) NOT NULL,
             resolved_model_name VARCHAR(255) NOT NULL,
             upstream_model_name VARCHAR(255) NOT NULL,
@@ -4293,6 +4324,11 @@ async fn ensure_core_schema_while_leased(
             purpose VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
+            CONSTRAINT chk_inference_routes_scope_kind
+                CHECK (scope_kind IN ('run', 'session')),
+            CONSTRAINT chk_inference_routes_scope_owner
+                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
+                    OR (scope_kind = 'session' AND run_id IS NULL)),
             INDEX idx_inference_routes_owner_session_created (user_id, session_id, created_at, route_id),
             INDEX idx_inference_routes_owner_run_created (user_id, run_id, created_at, route_id),
             INDEX idx_inference_routes_offering_created (offering_id, created_at, route_id)
@@ -4307,9 +4343,11 @@ async fn ensure_core_schema_while_leased(
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
+            scope_kind VARCHAR(16) NOT NULL,
+            run_id VARCHAR(64) NULL,
             turn_index BIGINT NOT NULL,
             round_index BIGINT NOT NULL,
+            operation_id VARCHAR(64) NOT NULL,
             logical_attempt BIGINT NOT NULL,
             purpose VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
@@ -4324,6 +4362,13 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, invocation_id),
+            CONSTRAINT chk_inference_invocations_scope_kind
+                CHECK (scope_kind IN ('run', 'session')),
+            CONSTRAINT chk_inference_invocations_scope_owner
+                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
+                    OR (scope_kind = 'session' AND run_id IS NULL)),
+            CONSTRAINT chk_inference_invocations_status
+                CHECK (status IN ('admitted', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
@@ -4339,7 +4384,7 @@ async fn ensure_core_schema_while_leased(
             invocation_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NULL,
             attempt_index BIGINT NOT NULL,
             provider VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
@@ -4354,6 +4399,8 @@ async fn ensure_core_schema_while_leased(
             started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, attempt_id),
+            CONSTRAINT chk_inference_provider_attempts_status
+                CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
@@ -4362,6 +4409,34 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "inference_routes",
+        &["scope_kind"],
+    )
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "inference_invocations",
+        &["scope_kind", "operation_id"],
+    )
+    .await?;
+    for table in [
+        "inference_routes",
+        "inference_invocations",
+        "inference_provider_attempts",
+    ] {
+        fail_if_required_columns_missing_or_not_nullable(
+            &pool,
+            &settings.database,
+            table,
+            &["run_id"],
+        )
+        .await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS model_gateways (

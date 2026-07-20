@@ -1802,8 +1802,7 @@ impl InProcessChatTurnBridge {
                 )
             };
             let compact_config = crate::prompts::CompactConfig::from_env();
-            let summary_client = RuntimeSummaryClient::new(
-                OwnedLlmExecutionRoute {
+            let summary_route = OwnedLlmExecutionRoute {
                     model_name: model_name.clone(),
                     wire_model_name: wire_model_name.clone(),
                     api_key: api_key.clone(),
@@ -1813,9 +1812,28 @@ impl InProcessChatTurnBridge {
                     request_body_overrides: request_body_overrides.clone(),
                     completions_url_override: completions_url_override.clone(),
                     request_timeout,
-                },
-                compact_config.summary_token_budget,
-            );
+                };
+            let summary_client = (!use_e2e_llm && !session_id.is_empty())
+                .then(|| shared_pool.clone())
+                .flatten()
+                .map(|pool| {
+                    RuntimeSummaryClient::new(
+                        summary_route,
+                        compact_config.summary_token_budget,
+                        crate::turn::llm::durable::DurableInferenceLedger::new(
+                            pool,
+                            user_id.clone(),
+                            admitted_model_execution.clone(),
+                        ),
+                        astra_turn_types::InferenceInvocationScope::Session {
+                            session_id: session_id.clone(),
+                            turn: trace_turn,
+                            round: round_index,
+                            operation_id: "bridge_compaction".to_string(),
+                            logical_attempt: 0,
+                        },
+                    )
+                });
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
@@ -2345,10 +2363,9 @@ impl InProcessChatTurnBridge {
                     memoria_client: memoria_client.as_ref().map(|c| {
                         c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                     }),
-                    summary_client: Some(
-                        &summary_client
-                            as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-                    ),
+                    summary_client: summary_client.as_ref().map(|client| {
+                        client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient
+                    }),
                     tier: pipeline_tier,
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
@@ -2948,10 +2965,9 @@ impl InProcessChatTurnBridge {
                                 memoria_client: memoria_client.as_ref().map(|c| {
                                     c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                                 }),
-                                summary_client: Some(
-                                    &summary_client
-                                        as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-                                ),
+                                summary_client: summary_client.as_ref().map(|client| {
+                                    client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient
+                                }),
                                 tier: crate::prompts::CompactionTier::AggressivePrune,
                                 session_facts: session_facts_shared
                                     .lock()

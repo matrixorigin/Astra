@@ -51,7 +51,7 @@ async fn hydrate_edge_registration_runtime_context(
         )
         .await?;
     let authorization = context.runtime_auth.authorization.clone();
-    request.model_selection = Some(context.selected_model.to_model_selection_request());
+    request.model_selection = Some(context.selected_model.to_model_selection());
     request.resolved_model_selection = Some(context.selected_model.to_resolved_model_selection());
     request.admitted_model_execution = None;
     request.runtime_auth = Some(context.runtime_auth.to_runtime_auth_request());
@@ -160,7 +160,7 @@ async fn inject_edge_registration_runtime_context_body(
         "astra_timing: issue_runtime_context completed (edge-jwt path)"
     );
     let authorization = context.runtime_auth.authorization.clone();
-    let model_selection = context.selected_model.to_model_selection_request();
+    let model_selection = context.selected_model.to_model_selection();
     let resolved_model_selection = context.selected_model.to_resolved_model_selection();
     let runtime_auth = context.runtime_auth.to_runtime_auth_request();
     if let Some(runtime_system_prompt) = context.runtime_system_prompt {

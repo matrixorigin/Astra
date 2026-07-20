@@ -39,12 +39,13 @@ use astra_services::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
         DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
         DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
-        GuardedRunStatusTransitionRequest, ModelSelectionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
+        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
         RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
         RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use astra_turn_types::ModelSelection;
 
 use astra_core::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_PAUSED,
@@ -151,7 +152,7 @@ pub struct RunStartContext {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
-    pub model_selection: Option<ModelSelectionRequest>,
+    pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
@@ -197,7 +198,7 @@ fn inherit_parent_model_identity(
                 context.resolved_model_selection.as_ref(),
             ) {
                 (None, None) => {
-                    context.model_selection = Some(ModelSelectionRequest {
+                    context.model_selection = Some(ModelSelection {
                         offering_id: offering_id.to_string(),
                     });
                     context.resolved_model_selection = Some(ResolvedModelSelection {
@@ -3046,7 +3047,7 @@ mod tests {
                 "user-1",
                 "sess-1",
                 RunStartContext {
-                    model_selection: Some(ModelSelectionRequest {
+                    model_selection: Some(ModelSelection {
                         offering_id: "offer-primary".to_string(),
                     }),
                     resolved_model_selection: Some(ResolvedModelSelection {
@@ -3080,7 +3081,7 @@ mod tests {
                 "user-1",
                 "sess-1",
                 RunStartContext {
-                    model_selection: Some(ModelSelectionRequest {
+                    model_selection: Some(ModelSelection {
                         offering_id: "offer-a".to_string(),
                     }),
                     resolved_model_selection: Some(ResolvedModelSelection {
@@ -3111,7 +3112,7 @@ mod tests {
                 "user-1",
                 "sess-1",
                 RunStartContext {
-                    model_selection: Some(ModelSelectionRequest {
+                    model_selection: Some(ModelSelection {
                         offering_id: "offer-primary".to_string(),
                     }),
                     resolved_model_selection: Some(ResolvedModelSelection {
@@ -3158,7 +3159,7 @@ mod tests {
                 "user-1",
                 "sess-1",
                 RunStartContext {
-                    model_selection: Some(ModelSelectionRequest {
+                    model_selection: Some(ModelSelection {
                         offering_id: "offer-primary".to_string(),
                     }),
                     resolved_model_selection: Some(ResolvedModelSelection {
@@ -3181,7 +3182,7 @@ mod tests {
                 Some("reviewer"),
                 None,
                 RunStartContext {
-                    model_selection: Some(ModelSelectionRequest {
+                    model_selection: Some(ModelSelection {
                         offering_id: "offer-unadmitted".to_string(),
                     }),
                     resolved_model_selection: Some(ResolvedModelSelection {

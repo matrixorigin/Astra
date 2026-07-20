@@ -914,26 +914,26 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
     // ── Context snapshots ──────────────────────────────────────────────────
-    /// `POST /v1/chat/completions` — lightweight LLM proxy for verification judge.
+    /// `POST /v1/chat/completions` — governed non-streaming model invocation.
     ///
-    /// Returns the raw JSON response from the server's completions proxy.
-    /// The server resolves the active model, decrypts the API key, and forwards
-    /// to the upstream LLM provider.
+    /// The typed request carries an Offering selection and causal scope, never
+    /// provider credentials. The typed response keeps SDK consumers from
+    /// duplicating response-shape parsing.
     pub async fn post_completions(
         &self,
         token: &str,
-        body: &Value,
-    ) -> Result<Value, ThinClientError> {
+        request: &astra_server_types::CompletionRequest,
+    ) -> Result<astra_server_types::CompletionResponse, ThinClientError> {
         let url = self.url(paths::COMPLETIONS)?;
         let resp = self
             .http
             .post(url)
             .headers(Self::bearer_headers(token)?)
             .timeout(std::time::Duration::from_secs(120))
-            .json(body)
+            .json(request)
             .send()
             .await?;
-        Self::json_or_error(resp).await
+        Self::typed_json_or_error(resp).await
     }
 
     // ── Reflect / decision trace ─────────────────────────────────────────────
@@ -1961,6 +1961,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
+    }
+
+    #[tokio::test]
+    async fn wiremock_completion_uses_typed_scope_and_decodes_typed_response() {
+        let srv = MockServer::start().await;
+        let mut request = astra_server_types::CompletionRequest::new(
+            astra_turn_types::InferencePurpose::MemoryExtraction,
+            astra_turn_types::InferenceInvocationScope::Session {
+                session_id: "session-1".to_string(),
+                turn: 3,
+                round: 1,
+                operation_id: "memory_extraction".to_string(),
+                logical_attempt: 0,
+            },
+            vec![serde_json::json!({"role": "user", "content": "summarize"})],
+        )
+        .with_offering_id("offer-memory");
+        request.max_tokens = 128;
+        request.temperature = 0.0;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_json(serde_json::to_value(&request).unwrap()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "response-1",
+                "object": "chat.completion",
+                "offering_id": "offer-memory",
+                "model": "memory-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "summary"},
+                    "finish_reason": "stop",
+                    "future_optional_fact": true
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10
+                },
+                "future_optional_projection": {"revision": 2}
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client.post_completions("token", &request).await.unwrap();
+
+        assert_eq!(response.offering_id, "offer-memory");
+        assert_eq!(response.first_text(), Some("summary"));
+        assert_eq!(response.usage.unwrap().total_tokens, 10);
     }
 
     #[tokio::test]

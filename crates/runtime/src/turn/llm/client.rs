@@ -4216,7 +4216,7 @@ pub(crate) async fn call_llm_nonstream(
     call_llm_nonstream_with_attempt_observer(client, call, timeout, None).await
 }
 
-async fn call_llm_nonstream_with_attempt_observer(
+pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,

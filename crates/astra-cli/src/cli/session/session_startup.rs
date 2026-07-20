@@ -296,7 +296,10 @@ struct CliSessionMemoryInferenceResolver {
 
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::MemoryInferenceResolver for CliSessionMemoryInferenceResolver {
-    async fn resolve_candidates(&self) -> Vec<astra_runtime::memory_hooks::MemoryInferenceClient> {
+    async fn resolve_candidates(
+        &self,
+        _user_id: &str,
+    ) -> Vec<astra_runtime::memory_hooks::MemoryInferenceClient> {
         let Some(token) =
             session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
         else {

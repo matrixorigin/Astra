@@ -113,7 +113,13 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
             let _ =
                 svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
-                    session_id: session_id.to_string(),
+                    inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+                        session_id: session_id.to_string(),
+                        turn: state.turn,
+                        round: 0,
+                        operation_id: "memory_extraction_shutdown".to_string(),
+                        logical_attempt: 0,
+                    },
                     messages: super::session_projection::history_as_messages(&state.history),
                     session_facts: shutdown_session_facts(state),
                     had_error: state
@@ -122,7 +128,6 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                         .and_then(|event| event.error.as_ref())
                         .is_some(),
                     reanchors_current_objective: false,
-                    turn_number: state.turn,
                 });
         }
         let leftover = svc

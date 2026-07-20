@@ -12,7 +12,7 @@ use astra_services::{
     begin_inference_provider_attempt, finish_inference_invocation,
     finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
 };
-use astra_turn_types::InferencePurpose;
+use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
@@ -94,11 +94,14 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
 
     let input = InferenceInvocationInput {
         user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        run_id: run_id.clone(),
-        turn: 4,
-        round: 2,
-        logical_attempt: 0,
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 4,
+            round: 2,
+            operation_id: "agent_turn".to_string(),
+            logical_attempt: 0,
+        },
         offering_id: "offer-online".to_string(),
         resolved_model_name: "wire-model".to_string(),
         upstream_model_name: "provider-wire-model".to_string(),
@@ -285,6 +288,75 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
             .kind,
         ServiceErrorKind::Conflict
     );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("aux-user-{suffix}");
+    let session_id = format!("aux-session-{suffix}");
+    let run_id = format!("aux-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 5,
+            round: 0,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-memory".to_string(),
+        resolved_model_name: "memory-model".to_string(),
+        upstream_model_name: "memory-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::MemoryExtraction,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan session-scoped inference");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit session-scoped inference");
+
+    let route = sqlx::query(
+        "SELECT scope_kind, run_id FROM inference_routes
+         WHERE user_id = ? AND route_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.route_id())
+    .fetch_one(pool)
+    .await
+    .expect("load session-scoped route");
+    assert_eq!(route.get::<String, _>("scope_kind"), "session");
+    assert_eq!(route.get::<Option<String>, _>("run_id"), None);
+
+    let attempt = plan_inference_provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin provider attempt");
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input_tokens: 20,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        },
+        Some("provider-memory".to_string()),
+    );
+    finish_inference_provider_attempt(&shared_pool, &attempt, &terminal)
+        .await
+        .expect("finish provider attempt");
+    finish_inference_invocation(&shared_pool, &plan, &terminal)
+        .await
+        .expect("finish logical invocation");
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
