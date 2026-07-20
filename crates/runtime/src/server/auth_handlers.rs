@@ -161,8 +161,7 @@ async fn memory_proxy_call_for_user(
     } else {
         None
     };
-    let inject_identity = should_inject_memory_proxy_identity(endpoint);
-    let body = apply_memory_proxy_identity(body, user_id, inject_identity, endpoint);
+    let body = apply_memory_proxy_identity(body, user_id, endpoint);
 
     let response = state
         .memoria_forwarder
@@ -285,14 +284,61 @@ fn exact_memory_ids_for_user_purge(body: &serde_json::Value) -> Result<Vec<Strin
     Ok(exact)
 }
 
+fn normalize_exact_memory_purge_receipt(
+    response: serde_json::Value,
+    memory_ids: &[String],
+) -> Result<serde_json::Value, &'static str> {
+    let Some(deleted_count) = response
+        .get("purged")
+        .or_else(|| response.get("deleted_count"))
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Err("memory backend did not return a confirmed purge count");
+    };
+    let requested_count = u64::try_from(memory_ids.len()).unwrap_or(u64::MAX);
+    if deleted_count > requested_count {
+        return Err("memory backend returned a purge count larger than the exact request");
+    }
+    let unresolved_count = requested_count.saturating_sub(deleted_count);
+    let status = if unresolved_count == 0 {
+        "completed"
+    } else if deleted_count == 0 {
+        "not_found"
+    } else {
+        "partial"
+    };
+    let message = match status {
+        "completed" => format!(
+            "memory_purge: backend confirmed all {deleted_count} exact entries were removed"
+        ),
+        "not_found" => {
+            format!("memory_purge: none of the {requested_count} exact entries matched; 0 removed")
+        }
+        _ => format!(
+            "memory_purge: backend confirmed {deleted_count}/{requested_count} exact entries removed; {unresolved_count} remain unresolved"
+        ),
+    };
+    let identity_resolution = match status {
+        "completed" => "all_requested_confirmed",
+        "not_found" => "none_requested_confirmed",
+        _ => "aggregate_count_only",
+    };
+    Ok(serde_json::json!({
+        "status": status,
+        "requested_count": requested_count,
+        "deleted_count": deleted_count,
+        "unresolved_count": unresolved_count,
+        "requested_memory_ids": memory_ids,
+        "identity_resolution": identity_resolution,
+        "receipt_source": "memoria_purge",
+        "message": message,
+    }))
+}
+
 fn parse_memoria_forward_status(error: &str) -> Option<StatusCode> {
     let suffix = error.strip_prefix("Memoria error ")?;
     let code = suffix.split_whitespace().next()?.parse::<u16>().ok()?;
     StatusCode::from_u16(code).ok()
-}
-
-fn should_inject_memory_proxy_identity(endpoint: &str) -> bool {
-    !endpoint.ends_with("/purge")
 }
 
 fn encode_memoria_memory_id(memory_id: &str) -> String {
@@ -303,10 +349,9 @@ fn encode_memoria_memory_id(memory_id: &str) -> String {
 fn apply_memory_proxy_identity(
     mut body: serde_json::Value,
     user_id: &str,
-    inject_identity: bool,
     endpoint: &str,
 ) -> serde_json::Value {
-    if inject_identity && let Some(obj) = body.as_object_mut() {
+    if let Some(obj) = body.as_object_mut() {
         // Authentication owns `user_id`; the durable session id remains a
         // separate, caller-selected identity that was authorized against the
         // session store before this function runs.
@@ -316,13 +361,13 @@ fn apply_memory_proxy_identity(
         );
     }
 
-    // Memoria PurgeRequest only accepts: memory_ids, topic, reason.
-    // Strip injected fields that would cause a 422 Unprocessable Entity.
+    // An exact-ID purge and a session purge are mutually exclusive selectors.
+    // Keep the authenticated user identity: the HTTP forwarder projects it to
+    // Memoria's X-User-Id scope header before serializing the request body.
     if endpoint.ends_with("/purge")
         && let Some(obj) = body.as_object_mut()
     {
         obj.remove("session_id");
-        obj.remove("user_id");
     }
 
     body
@@ -394,25 +439,32 @@ pub(super) async fn memory_proxy_purge_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let memory_ids = exact_memory_ids_for_user_purge(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-    let mut deleted = 0_u64;
-    for memory_id in memory_ids {
-        let memory_id = encode_memoria_memory_id(&memory_id);
-        let _deleted_response = memory_proxy_call_for_user(
-            &state,
-            &user.user_id,
-            reqwest::Method::DELETE,
-            &format!("/v1/memories/{memory_id}"),
-            serde_json::json!({}),
-        )
-        .await?;
-        deleted = deleted.saturating_add(1);
-    }
-    let enriched = serde_json::json!({
-        "status": "ok",
-        "deleted_count": deleted,
-        "message": format!("memory_purge: deleted {deleted} exact entries"),
-    });
-    Ok(Json(enriched))
+    let reason = body
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "memory purge requires a non-empty reason",
+            )
+        })?;
+    let response = memory_proxy_call_for_user(
+        &state,
+        &user.user_id,
+        reqwest::Method::POST,
+        "/v1/memories/purge",
+        serde_json::json!({
+            "memory_ids": memory_ids.clone(),
+            "reason": reason,
+        }),
+    )
+    .await?
+    .0;
+    let receipt = normalize_exact_memory_purge_receipt(response, &memory_ids)
+        .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(receipt))
 }
 
 pub(super) async fn memory_proxy_expand_handler(
@@ -726,7 +778,7 @@ mod tests {
     use super::{
         apply_memoria_management_identity, apply_memory_proxy_identity, encode_memoria_memory_id,
         exact_memory_ids_for_user_purge, is_strict_session_recall, memory_proxy_scope,
-        parse_memoria_forward_status, should_inject_memory_proxy_identity,
+        normalize_exact_memory_purge_receipt, parse_memoria_forward_status,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -740,35 +792,25 @@ mod tests {
             "session_id": "spoofed-session"
         });
 
-        let out = apply_memory_proxy_identity(body, "real-user", true, "/v1/memories");
+        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories");
 
         assert_eq!(out["user_id"].as_str(), Some("real-user"));
         assert_eq!(out["session_id"].as_str(), Some("spoofed-session"));
     }
 
     #[test]
-    fn apply_memory_proxy_identity_strips_injected_fields_for_purge() {
+    fn apply_memory_proxy_identity_keeps_authenticated_owner_for_purge() {
         let body = json!({
             "memory_ids": ["m1"],
             "user_id": "spoofed-user",
             "session_id": "spoofed-session"
         });
 
-        let out = apply_memory_proxy_identity(body, "real-user", true, "/v1/memories/purge");
+        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories/purge");
 
-        assert!(out.get("user_id").is_none());
+        assert_eq!(out["user_id"], "real-user");
         assert!(out.get("session_id").is_none());
         assert_eq!(out["memory_ids"], json!(["m1"]));
-    }
-
-    #[test]
-    fn memory_proxy_identity_policy_only_skips_purge() {
-        assert!(should_inject_memory_proxy_identity("/v1/memories"));
-        assert!(should_inject_memory_proxy_identity(
-            "/v1/memories/m-1/feedback"
-        ));
-        assert!(should_inject_memory_proxy_identity("/v1/profiles/me"));
-        assert!(!should_inject_memory_proxy_identity("/v1/memories/purge"));
     }
 
     #[test]
@@ -820,6 +862,33 @@ mod tests {
         assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": ["m1", 2]})).is_err());
         let too_many = (0..65).map(|index| format!("m{index}")).collect::<Vec<_>>();
         assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": too_many})).is_err());
+    }
+
+    #[test]
+    fn exact_purge_receipt_uses_backend_count_instead_of_requested_count() {
+        let ids = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+        let receipt = normalize_exact_memory_purge_receipt(json!({"purged": 2}), &ids).unwrap();
+
+        assert_eq!(receipt["status"], "partial");
+        assert_eq!(receipt["requested_count"], 3);
+        assert_eq!(receipt["deleted_count"], 2);
+        assert_eq!(receipt["unresolved_count"], 1);
+        assert_eq!(receipt["identity_resolution"], "aggregate_count_only");
+        assert_eq!(receipt["requested_memory_ids"], json!(ids));
+        assert!(receipt.get("memory_ids").is_none());
+        assert_eq!(receipt["receipt_source"], "memoria_purge");
+    }
+
+    #[test]
+    fn exact_purge_receipt_never_fabricates_success_for_noop_or_ambiguous_response() {
+        let ids = vec!["missing".to_string()];
+        let noop = normalize_exact_memory_purge_receipt(json!({"deleted_count": 0}), &ids).unwrap();
+        assert_eq!(noop["status"], "not_found");
+        assert_eq!(noop["deleted_count"], 0);
+        assert_eq!(noop["identity_resolution"], "none_requested_confirmed");
+
+        assert!(normalize_exact_memory_purge_receipt(json!({}), &ids).is_err());
+        assert!(normalize_exact_memory_purge_receipt(json!({"purged": 2}), &ids).is_err());
     }
 
     #[test]

@@ -927,10 +927,22 @@ impl ReqwestMemoriaForwarder {
         body: &serde_json::Value,
     ) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.base_url, endpoint);
-        self.client
+        let request = self
+            .client
             .request(method, url)
             .header("Authorization", format!("Bearer {}", self.master_key))
-            .json(body)
+            .json(body);
+        // Astra authenticates the caller before reaching this boundary and
+        // overwrites body.user_id. Memoria's master-key mode derives its
+        // storage scope from X-User-Id, not from arbitrary request fields.
+        // Project the authenticated principal into the transport header so
+        // reads and mutations share the same tenant boundary.
+        match body.get("user_id").and_then(serde_json::Value::as_str) {
+            Some(user_id) if !user_id.trim().is_empty() => {
+                request.header("X-User-Id", user_id.trim())
+            }
+            _ => request,
+        }
     }
 
     async fn bounded_error_body(mut response: reqwest::Response, limit: usize) -> String {
@@ -1296,6 +1308,12 @@ mod tests {
             let n = socket.read(&mut buf).await.unwrap_or(0);
             let request = String::from_utf8_lossy(&buf[..n]);
             assert!(request.starts_with("DELETE /v1/memories/memory-1 "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-user-id: user-1\r\n"),
+                "authenticated owner must be projected to Memoria scope: {request}"
+            );
             let _ = socket
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",

@@ -212,34 +212,14 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
 
         if !all_lessons.is_empty() {
-            // Store T3 semantic lessons FIRST, then purge T4 working copies.
-            // Sequenced to prevent the purge from racing ahead and deleting
-            // in-flight T3 writes that share the same topic prefix.
-            let sid_for_purge = state.session_id.clone();
+            // Persist synthesized lessons. Broad topic deletion is not part of
+            // the authenticated user purge contract: it cannot prove record
+            // ownership or an exact mutation receipt, so cleanup must not
+            // issue it in the background and discard the deterministic error.
+            let session_id = state.session_id.clone();
             tokio::spawn(async move {
-                edge_tools::memoria::memoria_store_lessons_fire_and_forget(
-                    all_lessons,
-                    sid_for_purge.clone(),
-                )
-                .await;
-                // Only purge AFTER store completes.
-                if let Some(sid) = sid_for_purge {
-                    let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
-                        "topic": format!("LESSON session:{sid}"),
-                        "reason": "session-end promotion to semantic T3",
-                    }))
+                edge_tools::memoria::memoria_store_lessons_fire_and_forget(all_lessons, session_id)
                     .await;
-                }
-            });
-        } else if let Some(ref sid) = state.session_id {
-            // No new lessons but still purge stale T4 working copies.
-            let sid = sid.clone();
-            tokio::spawn(async move {
-                let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
-                    "topic": format!("LESSON session:{sid}"),
-                    "reason": "session-end cleanup (no new lessons)",
-                }))
-                .await;
             });
         }
     }

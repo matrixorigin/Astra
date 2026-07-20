@@ -1363,8 +1363,9 @@ pub(crate) async fn delete_session_handler(
     let user = state.auth_service.current_user(&headers).await?;
     state
         .session_service
-        .delete_session(session_id, user.user_id)
+        .delete_session(session_id.clone(), user.user_id)
         .await?;
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1377,7 +1378,7 @@ pub(crate) async fn close_session_handler(
     let session = state
         .session_service
         .update_session(
-            session_id,
+            session_id.clone(),
             user.user_id,
             SessionUpdateRequestData {
                 title: None,
@@ -1386,6 +1387,7 @@ pub(crate) async fn close_session_handler(
             },
         )
         .await?;
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     Ok(Json(SessionResponse::from(session)))
 }
 

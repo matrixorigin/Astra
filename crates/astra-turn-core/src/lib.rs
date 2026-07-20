@@ -132,7 +132,6 @@ pub mod view;
 // Re-exports: old flat module names → new directory paths
 pub mod decision_explainer;
 pub mod delegation_tree;
-pub mod hallucination_tripwire;
 pub mod liquid_step_signals;
 pub mod liquid_tactical;
 pub mod llm_request_dump;

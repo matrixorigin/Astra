@@ -4,7 +4,7 @@ use serde_json::Value;
 pub const MEMORY_ACTIONS: &[&str] = &[
     "remember",
     "recall",
-    "inventory",
+    "session_audit",
     "expand",
     "forget",
     "update",
@@ -15,13 +15,13 @@ pub const MEMORY_ACTIONS: &[&str] = &[
 ];
 
 pub const MEMORY_ACTIONS_DISPLAY: &str =
-    "remember, recall, inventory, expand, forget, update, focus, reflect, profile, feedback";
+    "remember, recall, session_audit, expand, forget, update, focus, reflect, profile, feedback";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryAction {
     Remember,
     Recall,
-    Inventory,
+    SessionAudit,
     Expand,
     Forget,
     Update,
@@ -36,7 +36,7 @@ impl MemoryAction {
         match self {
             Self::Remember => "remember",
             Self::Recall => "recall",
-            Self::Inventory => "inventory",
+            Self::SessionAudit => "session_audit",
             Self::Expand => "expand",
             Self::Forget => "forget",
             Self::Update => "update",
@@ -67,7 +67,7 @@ pub fn memory_action_from_args(args: &Value) -> Result<MemoryAction, String> {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "remember" => Ok(MemoryAction::Remember),
             "recall" => Ok(MemoryAction::Recall),
-            "inventory" => Ok(MemoryAction::Inventory),
+            "session_audit" => Ok(MemoryAction::SessionAudit),
             "expand" => Ok(MemoryAction::Expand),
             "forget" => Ok(MemoryAction::Forget),
             "update" => Ok(MemoryAction::Update),

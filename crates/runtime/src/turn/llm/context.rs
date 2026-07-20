@@ -930,6 +930,17 @@ pub(crate) fn assemble_bridge_context(
         .iter()
         .filter_map(tool_name)
         .collect();
+    let mut extra_volatile_sections = input.runtime_signals.extra_volatile_sections.to_vec();
+    if effective_tool_names.contains(&"memory")
+        && let Some(selection) = astra_tools::memoria::MemoriaToolGateway::latest_selection_context(
+            input.session.session_id,
+        )
+    {
+        extra_volatile_sections.push(crate::prompts::PromptSection::dynamic(
+            selection,
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
     let _tool_surface_metadata = (
         input.tool_surface.visible_tools.len(),
         input.tool_surface.always_load_tools.len(),
@@ -941,7 +952,7 @@ pub(crate) fn assemble_bridge_context(
         &effective_tool_names,
         &effective_tool_schemas,
         input.runtime_signals.extra_stable_sections,
-        input.runtime_signals.extra_volatile_sections,
+        &extra_volatile_sections,
         input.runtime_signals.memory_entries,
         input.runtime_signals.session_memory_entry.as_ref(),
         input.runtime_signals.system_override,
@@ -1081,6 +1092,17 @@ pub(crate) fn assemble_context_pipeline(
             .iter()
             .cloned(),
     );
+    if tool_names.contains(&"memory")
+        && let Some(selection) =
+            astra_tools::memoria::MemoriaToolGateway::latest_selection_context(input.session_id)
+    {
+        external
+            .extra_dynamic_sections
+            .push(crate::prompts::PromptSection::dynamic(
+                selection,
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+    }
     let model_identity_section =
         crate::turn::prompt_cache::model_identity_prompt_section_for_cache_capability(
             input.cache_capability,
@@ -2337,6 +2359,62 @@ mod context_cache_contract_tests {
                 "delivery": "typed_runtime_dynamic",
             })
         );
+    }
+
+    #[test]
+    fn bridge_context_carries_the_latest_resource_selection_only_with_its_tool() {
+        let session_id = "bridge-resource-selection";
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall(
+            session_id,
+            3,
+            vec!["memory-1".to_string(), "memory-2".to_string()],
+        );
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let memory_tool = vec![tool("memory")];
+        let unrestricted = HashSet::new();
+        let assemble = |restricted_tools: &HashSet<String>| {
+            assemble_bridge_context(BridgeContextAssemblyInput {
+                tool_surface: ToolSurfacePlan::from_visible_tools(&memory_tool, restricted_tools),
+                runtime_signals: BridgeRuntimeSignals::new(&[], &[], &[], None, None),
+                session: BridgeSessionContextInput::new(
+                    &cache_cfg,
+                    None,
+                    session_id,
+                    "test-model",
+                    "openai",
+                    None,
+                    None,
+                    None,
+                    "2026-07-20",
+                ),
+            })
+        };
+
+        let visible = assemble(&unrestricted);
+        let selection = visible
+            .prompt_sections
+            .iter()
+            .filter_map(|section| serde_json::from_str::<serde_json::Value>(&section.text).ok())
+            .find(|section| section["schema"] == "astra.resource_selection.v1")
+            .expect("typed selection section");
+        assert_eq!(selection["resource_kind"], "memory");
+        assert_eq!(
+            selection["identities"],
+            serde_json::json!(["memory-1", "memory-2"])
+        );
+
+        let restricted = HashSet::from(["memory".to_string()]);
+        let hidden = assemble(&restricted);
+        assert!(hidden.prompt_sections.iter().all(|section| {
+            serde_json::from_str::<serde_json::Value>(&section.text)
+                .ok()
+                .is_none_or(|value| value["schema"] != "astra.resource_selection.v1")
+        }));
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
     #[test]

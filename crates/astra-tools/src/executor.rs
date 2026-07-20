@@ -329,6 +329,10 @@ impl DefaultToolExecutor {
 #[async_trait]
 impl ToolExecutor for DefaultToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+        if let Err(error) = crate::schemas::validate_tool_arguments(name, args) {
+            return error.into_tool_result();
+        }
+
         // ── Approval gate ────────────────────────────────────────────
         if let Some(gate) = &self.approval_gate
             && gate.requires_approval_for(name, args)
@@ -653,21 +657,21 @@ impl DefaultToolExecutor {
                     Ok(action) => action,
                     Err(error) => return ToolResult::error(format!("Error: {error}")),
                 };
-                if action == crate::memory_tool_contract::MemoryAction::Inventory {
+                if action == crate::memory_tool_contract::MemoryAction::SessionAudit {
                     let inventory = match astra_services::session_memory_inventory::load_local_session_memory_inventory(
                         &self.ctx.session_id,
                     ) {
                         Ok(inventory) => inventory,
                         Err(error) => {
                             return ToolResult::error(format!(
-                                "Error: session memory inventory failed: {error}"
+                                "Error: session memory extraction audit failed: {error}"
                             ));
                         }
                     };
                     return match serde_json::to_string(&inventory) {
                         Ok(output) => ToolResult::text(output),
                         Err(error) => ToolResult::error(format!(
-                            "Error: serialize session memory inventory: {error}"
+                            "Error: serialize session memory extraction audit: {error}"
                         )),
                     };
                 }
@@ -1862,7 +1866,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_memory_inventory_uses_journal_even_without_memoria_endpoint() {
+    async fn shared_executor_rejects_invalid_action_arguments_before_dispatch() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "memory",
+                &serde_json::json!({"action": "forget", "memory_id": "m1"}),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_memory_session_audit_uses_journal_even_without_memoria_endpoint() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let (_tmp, exec) = test_executor();
@@ -1883,19 +1908,22 @@ mod tests {
             .unwrap();
 
         let result = exec
-            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .execute("memory", &serde_json::json!({"action": "session_audit"}))
             .await;
         let inventory: astra_services::session_memory_inventory::SessionMemoryInventory =
             serde_json::from_str(&result.output).unwrap();
 
         assert!(!result.is_error, "{result:?}");
+        assert_eq!(inventory.report_type, "session_memory_extraction_audit");
+        assert_eq!(inventory.scope, "session");
+        assert!(!inventory.contains_memory_identities);
         assert_eq!(inventory.successful_extraction_versions, 1);
         assert_eq!(inventory.llm_versions, 1);
         assert_eq!(inventory.logical_current_snapshot_count, Some(0));
     }
 
     #[tokio::test]
-    async fn dispatch_memory_inventory_fails_when_exactness_cannot_be_proven() {
+    async fn dispatch_memory_session_audit_fails_when_exactness_cannot_be_proven() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let path = astra_services::session_journal::journal_file_path("test-session");
@@ -1904,7 +1932,7 @@ mod tests {
         let (_tmp, exec) = test_executor();
 
         let result = exec
-            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .execute("memory", &serde_json::json!({"action": "session_audit"}))
             .await;
 
         assert!(result.is_error, "{result:?}");

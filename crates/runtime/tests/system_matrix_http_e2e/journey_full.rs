@@ -719,10 +719,15 @@ pub async fn run_product_matrix_full_journey(
         app,
         "/memory/purge",
         Some(auth_header),
-        json!({ "memory_ids": [stored_memory_id] }),
+        json!({
+            "memory_ids": [stored_memory_id],
+            "reason": "system journey cleanup"
+        }),
     )
     .await;
     assert_eq!(st_mem_p, StatusCode::OK, "memory purge: {mem_p}");
+    assert_eq!(mem_p["status"], "completed");
+    assert_eq!(mem_p["deleted_count"], 1);
 
     assert!(
         !memoria.calls.lock().await.is_empty(),

@@ -1792,12 +1792,6 @@ pub enum VolatileKind {
     /// pressure checks replace the prior guidance instead of stacking prompt
     /// noise inside the same LLM call.
     ContextPressure,
-    /// Post-turn hallucination self-check nudge. Fires when the
-    /// assistant's prose for the just-finished turn claimed a
-    /// phantom tool outcome (e.g. "silently returned {}") that no
-    /// tool call actually produced. See
-    /// [`astra_turn_core::hallucination_tripwire`] for the detector.
-    HallucinationTripwire,
     /// Advisory evidence about task-board state: either unfinished tracked
     /// work or broad work that may benefit from a board. It never gates tools,
     /// delegation, or completion.
@@ -1885,7 +1879,6 @@ impl VolatileKind {
             | Self::BehaviorAdvisory
             | Self::BudgetReview
             | Self::ContextPressure
-            | Self::HallucinationTripwire
             | Self::TaskBoardAdvisory
             | Self::StopHookEvidence
             | Self::IntentDrift => VolatileDeliveryClass::AdvisoryEvidence,

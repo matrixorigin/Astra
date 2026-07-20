@@ -158,9 +158,8 @@ fn strip_optional_params(func: &mut Value) {
 }
 
 /// Collect every field name that's required by *any* action of the
-/// schema — top-level `required` plus every field name listed in the
-/// `x-astra-per-action-required` vendor-prefixed extension map
-/// (shape: `{"action_name": ["field1", "field2"], ...}`).
+/// schema — top-level `required`, every field in the per-action required map,
+/// and every field in the per-action alternative groups.
 ///
 /// Background: we originally encoded per-action required fields via
 /// JSON-Schema `allOf + if/then/required`, but Anthropic/Bedrock
@@ -175,6 +174,14 @@ fn strip_optional_params(func: &mut Value) {
 /// (`PER_ACTION_REQUIRED_KEY`) so schema producers and pruners stay in
 /// lockstep.
 pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
+
+/// Per-action alternatives where at least one field group must be present.
+///
+/// Shape: `{ "action": [["field_a"], ["field_b", "field_c"]] }`.
+/// Each inner array is one valid alternative; every field in the selected
+/// alternative is required. This complements [`PER_ACTION_REQUIRED_KEY`]
+/// without relying on provider-specific support for JSON-Schema composition.
+pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
 
 pub fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
     let mut union: HashSet<String> = HashSet::new();
@@ -195,6 +202,18 @@ pub fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSe
                     if let Some(s) = v.as_str() {
                         union.insert(s.to_string());
                     }
+                }
+            }
+        }
+    }
+    if let Some(map) = params
+        .get(PER_ACTION_ANY_OF_REQUIRED_KEY)
+        .and_then(Value::as_object)
+    {
+        for alternatives in map.values().filter_map(Value::as_array) {
+            for fields in alternatives.iter().filter_map(Value::as_array) {
+                for field in fields.iter().filter_map(Value::as_str) {
+                    union.insert(field.to_string());
                 }
             }
         }
@@ -494,16 +513,21 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["spawn","get_result"]},
+                        "action": {"type": "string", "enum": ["spawn","get_result","forget"]},
                         "description": {"type": "string"},
                         "prompt": {"type": "string"},
                         "agent_id": {"type": "string"},
+                        "memory_ids": {"type": "array"},
+                        "selection_id": {"type": "string"},
                         "name": {"type": "string"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "spawn": ["description", "prompt"],
                         "get_result": ["agent_id"]
+                    },
+                    "x-astra-per-action-any-of-required": {
+                        "forget": [["memory_ids"], ["selection_id"]]
                     }
                 }
             }
@@ -517,6 +541,8 @@ mod tests {
             "description must survive"
         );
         assert!(props.get("prompt").is_some(), "prompt must survive");
+        assert!(props.get("memory_ids").is_some());
+        assert!(props.get("selection_id").is_some());
         assert!(
             props.get("agent_id").is_some(),
             "agent_id (get_result required) must survive"

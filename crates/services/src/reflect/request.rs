@@ -52,13 +52,14 @@ impl ReflectRequest {
             .or(topic_facet)
             .unwrap_or_else(|| default_reflect_facet_for_topic(topic));
         let (facet_topic, facet_tail) = split_reflect_topic(facet_candidate);
-        if !topic_supplied && facet_tail.is_some() {
-            topic = ObservationTopic::from_arg(facet_topic);
+        if !topic_supplied {
+            topic = if facet_tail.is_some() {
+                ObservationTopic::from_arg(facet_topic)
+            } else {
+                reflect_topic_for_standalone_facet(facet_candidate).unwrap_or(topic)
+            };
         }
-        let facet: ObservationFacet = facet_tail
-            .unwrap_or(facet_candidate)
-            .parse()
-            .unwrap_or(ObservationFacet::Session);
+        let facet = normalize_reflect_facet(facet_tail.unwrap_or(facet_candidate));
         let analysis_view = analysis_view_for_topic_facet(topic, facet);
 
         Self {
@@ -214,6 +215,29 @@ fn default_reflect_facet_for_topic(topic: ObservationTopic) -> &'static str {
         ObservationTopic::Execution => "tools",
         ObservationTopic::Knowledge => "context",
         ObservationTopic::Overview => "overview",
+    }
+}
+
+fn reflect_topic_for_standalone_facet(facet: &str) -> Option<ObservationTopic> {
+    match facet.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "errors" | "tools" | "trace" | "recent" => Some(ObservationTopic::Execution),
+        "performance" | "runtime" | "cache" | "stall" | "noise" => Some(ObservationTopic::Runtime),
+        "context" | "memory" | "session_memory" => Some(ObservationTopic::Knowledge),
+        "overview" | "all" => Some(ObservationTopic::Overview),
+        _ => None,
+    }
+}
+
+fn normalize_reflect_facet(facet: &str) -> ObservationFacet {
+    match facet.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        // Reflect's persisted-view vocabulary maps onto the shared typed
+        // observation facets. Keep the mapping here instead of letting valid
+        // schema values silently fall back to Session.
+        "performance" => ObservationFacet::Session,
+        "tools" => ObservationFacet::Recent,
+        "context" => ObservationFacet::Overview,
+        "memory" => ObservationFacet::SessionMemory,
+        normalized => normalized.parse().unwrap_or(ObservationFacet::Session),
     }
 }
 
@@ -375,6 +399,41 @@ mod tests {
         assert_eq!(request.topic, ObservationTopic::Execution);
         assert_eq!(request.facet, ObservationFacet::Errors);
         assert_eq!(request.analysis_view, "execution_errors");
+    }
+
+    #[test]
+    fn standalone_error_facet_infers_execution_evidence() {
+        let request = ReflectRequest::from_observation_params(
+            None,
+            Some("errors"),
+            None,
+            None,
+            20,
+            "why did the tool fail?",
+        );
+        assert_eq!(request.topic, ObservationTopic::Execution);
+        assert_eq!(request.facet, ObservationFacet::Errors);
+        assert_eq!(request.analysis_view, "execution_errors");
+    }
+
+    #[test]
+    fn every_advertised_reflect_facet_maps_to_a_typed_view() {
+        let cases = [
+            (
+                "performance",
+                ObservationTopic::Runtime,
+                "runtime_performance",
+            ),
+            ("tools", ObservationTopic::Execution, "execution_tools"),
+            ("context", ObservationTopic::Knowledge, "knowledge_context"),
+            ("memory", ObservationTopic::Knowledge, "knowledge_context"),
+        ];
+        for (facet, topic, analysis_view) in cases {
+            let request =
+                ReflectRequest::from_observation_params(None, Some(facet), None, None, 20, "");
+            assert_eq!(request.topic, topic, "facet={facet}");
+            assert_eq!(request.analysis_view, analysis_view, "facet={facet}");
+        }
     }
 
     #[test]

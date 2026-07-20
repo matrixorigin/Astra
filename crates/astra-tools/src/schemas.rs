@@ -3,7 +3,292 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::OnceLock;
+
+use serde_json::{Map, Value, json};
+
+pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
+pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
+
+/// Structured failure returned when model-authored arguments do not satisfy
+/// the invocation constraints encoded in the advertised built-in schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArgumentValidationError {
+    pub tool_name: String,
+    pub action: Option<String>,
+    pub issues: Vec<String>,
+}
+
+impl fmt::Display for ToolArgumentValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Invalid arguments for tool `{}`", self.tool_name)?;
+        if let Some(action) = self.action.as_deref() {
+            write!(formatter, " (action `{action}`)")?;
+        }
+        write!(formatter, ": {}", self.issues.join("; "))
+    }
+}
+
+impl std::error::Error for ToolArgumentValidationError {}
+
+impl ToolArgumentValidationError {
+    #[must_use]
+    pub fn failure_evidence(&self) -> astra_core::ToolFailureEvidence {
+        astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ToolFailureCause::InvalidArguments,
+            false,
+            vec![astra_core::ToolRecoveryAction::CorrectArguments],
+        )
+    }
+
+    #[must_use]
+    pub fn into_tool_result(self) -> crate::ToolResult {
+        let evidence = self.failure_evidence();
+        crate::ToolResult::error(format!(
+            "Error: {self}. Correct the arguments and issue one new call matching the advertised schema."
+        ))
+        .with_failure_evidence(evidence)
+    }
+}
+
+fn built_in_schema_index() -> &'static HashMap<String, Value> {
+    static INDEX: OnceLock<HashMap<String, Value>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        all_tool_schemas()
+            .into_iter()
+            .filter_map(|schema| {
+                let name = schema.get("function")?.get("name")?.as_str()?.to_string();
+                Some((name, schema))
+            })
+            .collect()
+    })
+}
+
+fn value_is_present(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn schema_type_matches(value: &Value, expected: &Value) -> bool {
+    let matches_one = |expected: &str| match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    };
+    match expected {
+        Value::String(expected) => matches_one(expected),
+        Value::Array(expected) => expected.iter().filter_map(Value::as_str).any(matches_one),
+        _ => true,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn collect_required_fields(parameters: &Map<String, Value>, action: Option<&str>) -> Vec<String> {
+    let mut required = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(action) = action
+        && let Some(fields) = parameters
+            .get(PER_ACTION_REQUIRED_KEY)
+            .and_then(Value::as_object)
+            .and_then(|requirements| requirements.get(action))
+            .and_then(Value::as_array)
+    {
+        required.extend(fields.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    required.sort();
+    required.dedup();
+    required
+}
+
+fn any_of_required_alternatives(
+    parameters: &Map<String, Value>,
+    action: Option<&str>,
+) -> Vec<Vec<String>> {
+    let Some(action) = action else {
+        return Vec::new();
+    };
+    parameters
+        .get(PER_ACTION_ANY_OF_REQUIRED_KEY)
+        .and_then(Value::as_object)
+        .and_then(|requirements| requirements.get(action))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|fields| !fields.is_empty())
+        .collect()
+}
+
+/// Validate invocation-level constraints from the canonical built-in schema.
+///
+/// Unknown/dynamic tools are intentionally left to their owning provider.
+/// Built-ins use this at every executor boundary, so CLI, server-only, and
+/// edge+server deployments cannot drift into handler-specific validation.
+pub fn validate_tool_arguments(
+    tool_name: &str,
+    args: &Value,
+) -> Result<(), ToolArgumentValidationError> {
+    let Some(schema) = built_in_schema_index().get(tool_name) else {
+        return Ok(());
+    };
+    let Some(parameters) = schema
+        .get("function")
+        .and_then(|function| function.get("parameters"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty());
+    let mut issues = Vec::new();
+    let Some(arguments) = args.as_object() else {
+        issues.push(format!(
+            "expected an object, received {}",
+            json_type_name(args)
+        ));
+        return Err(ToolArgumentValidationError {
+            tool_name: tool_name.to_string(),
+            action: action.map(str::to_string),
+            issues,
+        });
+    };
+
+    for field in collect_required_fields(parameters, action) {
+        if !value_is_present(arguments.get(&field)) {
+            issues.push(format!("missing non-empty required field `{field}`"));
+        }
+    }
+
+    let alternatives = any_of_required_alternatives(parameters, action);
+    if !alternatives.is_empty()
+        && !alternatives.iter().any(|fields| {
+            fields
+                .iter()
+                .all(|field| value_is_present(arguments.get(field)))
+        })
+    {
+        let rendered = alternatives
+            .iter()
+            .map(|fields| fields.join(" + "))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        issues.push(format!("requires one of: {rendered}"));
+    }
+
+    let properties = parameters.get("properties").and_then(Value::as_object);
+    if parameters
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        == Some(false)
+        && let Some(properties) = properties
+    {
+        let unknown = arguments
+            .keys()
+            .filter(|field| !properties.contains_key(*field))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            issues.push(format!("unknown field(s): {}", unknown.join(", ")));
+        }
+    }
+
+    if let Some(properties) = properties {
+        for (field, value) in arguments {
+            let Some(property) = properties.get(field) else {
+                continue;
+            };
+            if let Some(expected) = property.get("type")
+                && !schema_type_matches(value, expected)
+            {
+                issues.push(format!(
+                    "field `{field}` has type {}, expected {expected}",
+                    json_type_name(value)
+                ));
+                continue;
+            }
+            if let Some(allowed) = property.get("enum").and_then(Value::as_array)
+                && !allowed.contains(value)
+            {
+                issues.push(format!("field `{field}` is outside its advertised enum"));
+            }
+            if let Some(values) = value.as_array() {
+                if let Some(minimum) = property.get("minItems").and_then(Value::as_u64)
+                    && values.len() < minimum as usize
+                {
+                    issues.push(format!(
+                        "field `{field}` requires at least {minimum} item(s)"
+                    ));
+                }
+                if let Some(maximum) = property.get("maxItems").and_then(Value::as_u64)
+                    && values.len() > maximum as usize
+                {
+                    issues.push(format!("field `{field}` accepts at most {maximum} item(s)"));
+                }
+                if let Some(item_type) = property.get("items").and_then(|items| items.get("type")) {
+                    for (index, item) in values.iter().enumerate() {
+                        if !schema_type_matches(item, item_type) {
+                            issues.push(format!(
+                                "field `{field}` item {index} has type {}, expected {item_type}",
+                                json_type_name(item)
+                            ));
+                        } else if item.as_str().is_some_and(|item| item.trim().is_empty()) {
+                            issues.push(format!("field `{field}` item {index} must be non-empty"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolArgumentValidationError {
+            tool_name: tool_name.to_string(),
+            action: action.map(str::to_string),
+            issues,
+        })
+    }
+}
 
 /// RPC tools exposed inside server-side `run_script`.
 ///
@@ -667,18 +952,29 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory evidence. Recall is advisory. Copy exact returned memory_id; never invent it. Update by query without ID.",
+                "description": "Memory evidence. Recall is advisory. For a referential follow-up use the runtime selection_id; otherwise copy an exact returned memory_id. Never invent either identity. Update by query without ID.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["remember","recall","inventory","expand","forget","update","focus","reflect","profile","feedback"],
-                            "description": "Operation. inventory gives exact extraction/version counts; recall is relevance-ranked, not a counting API."
+                            "enum": ["remember","recall","session_audit","expand","forget","update","focus","reflect","profile","feedback"],
+                            "description": "Operation. session_audit reports this session's extraction lifecycle and version ledger; it is not a catalog of memory records or identities. recall is relevance-ranked, not a counting API."
                         },
                         "content": {"type": "string", "description": "Fact to store or replacement content."},
                         "query": {"type": "string", "description": "Search query or update selector."},
-                        "memory_id": {"type": "string", "description": "Exact opaque ID from recall, evidence, inventory, or conflict; never invent."},
+                        "memory_id": {"type": "string", "description": "One exact opaque ID from recall, evidence, or conflict; never invent."},
+                        "memory_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 64,
+                            "items": {"type": "string"},
+                            "description": "Exact opaque IDs from one surfaced selection. Prefer this single bulk call over one call per ID."
+                        },
+                        "selection_id": {
+                            "type": "string",
+                            "description": "Exact session-scoped selection receipt supplied by runtime context. Use this for referential follow-ups such as the user's selected/listed results; never invent it."
+                        },
                         "memory_type": {
                             "type": "string",
                             "enum": ["semantic","profile","procedural","working","episodic"],
@@ -744,6 +1040,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "forget": ["reason"],
                         "update": ["reason"],
                         "feedback": ["memory_id", "signal"]
+                    },
+                    "x-astra-per-action-any-of-required": {
+                        "forget": [["memory_id"], ["memory_ids"], ["selection_id"]],
+                        "update": [["memory_id"], ["query"]]
                     }
                 }
             }
@@ -2508,5 +2808,82 @@ mod tests {
             desc.contains("120"),
             "powershell schema must document the REAL default (120s), got {desc:?}"
         );
+    }
+
+    #[test]
+    fn built_in_contract_enforces_per_action_required_fields() {
+        let error = validate_tool_arguments(
+            "memory",
+            &json!({
+                "action": "forget",
+                "memory_id": "m1"
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.action.as_deref(), Some("forget"));
+        assert_eq!(
+            error.issues,
+            vec!["missing non-empty required field `reason`"]
+        );
+        assert_eq!(
+            error.failure_evidence().kind,
+            astra_core::ErrorKind::ToolInvalidArgs
+        );
+    }
+
+    #[test]
+    fn built_in_contract_supports_bulk_identity_alternative() {
+        validate_tool_arguments(
+            "memory",
+            &json!({
+                "action": "forget",
+                "memory_ids": ["m1", "m2"],
+                "reason": "user selected these records"
+            }),
+        )
+        .unwrap();
+
+        let error = validate_tool_arguments(
+            "memory",
+            &json!({
+                "action": "forget",
+                "memory_ids": [],
+                "reason": "user selected these records"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.issues,
+            vec![
+                "requires one of: memory_id or memory_ids or selection_id",
+                "field `memory_ids` requires at least 1 item(s)",
+            ]
+        );
+    }
+
+    #[test]
+    fn built_in_contract_validates_types_and_closed_objects() {
+        let error = validate_tool_arguments(
+            "reflect",
+            &json!({
+                "last_n": "many",
+                "legacy_focus": "errors"
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.issues,
+            vec![
+                "unknown field(s): legacy_focus",
+                "field `last_n` has type string, expected \"integer\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn dynamic_tools_remain_owned_by_their_provider_contract() {
+        validate_tool_arguments("mcp__custom__future_tool", &json!({"anything": true})).unwrap();
     }
 }

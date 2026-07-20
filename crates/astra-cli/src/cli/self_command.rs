@@ -888,10 +888,11 @@ fn analysis_view_recent_event_previews(
         "execution_errors" => &[
             JournalEventType::TurnError,
             JournalEventType::Error,
+            JournalEventType::ToolCallError,
+            JournalEventType::TurnGuardVerdict,
             JournalEventType::StallDetected,
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
-            JournalEventType::SessionMemoryExtraction,
             JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
             JournalEventType::InterruptionRecorded,
@@ -912,6 +913,8 @@ fn analysis_view_recent_event_previews(
         ],
         "execution_tools" => &[
             JournalEventType::Turn,
+            JournalEventType::ToolCallError,
+            JournalEventType::TurnGuardVerdict,
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
             JournalEventType::AgentSpawned,
@@ -924,6 +927,8 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
+            JournalEventType::ToolCallError,
+            JournalEventType::TurnGuardVerdict,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
             JournalEventType::TurnEvaluation,
@@ -1339,8 +1344,10 @@ fn metadata_fields_summary(metadata: &serde_json::Value, keys: &[&str]) -> Optio
 
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     if event.error.is_some()
-        || event.event_type.contains("error")
-        || event.event_type.contains("stall")
+        || matches!(
+            event.event_type.as_str(),
+            "turn_error" | "error" | "tool_call_error" | "stall_detected"
+        )
     {
         return true;
     }
@@ -2344,6 +2351,61 @@ mod tests {
                 .summary
                 .contains("Detected 13 LLM rounds with low evidence yield")
         }));
+    }
+
+    #[tokio::test]
+    async fn standalone_error_reflect_includes_canonical_tool_failure() {
+        let session_id = "reflect-tool-error-session";
+        let tool_error = JournalEvent::tool_call_error(
+            Some(session_id),
+            5,
+            "memory",
+            "tool 'memory' failed: missing non-empty required field `reason`",
+            astra_services::session_journal::ToolCallRecord {
+                name: "memory".to_string(),
+                ok: false,
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                ..Default::default()
+            },
+        );
+        let unrelated = JournalEvent::session_memory_extraction(
+            Some(session_id),
+            5,
+            1,
+            astra_services::session_journal::SessionMemoryExtractionOutcome::Skipped {
+                reason:
+                    astra_services::session_journal::SessionMemoryExtractionSkipReason::InFlight,
+            },
+            &astra_services::session_journal::SessionMemoryExtractionBreadcrumbs::default(),
+        );
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: None,
+            journal_events: vec![unrelated, tool_error],
+            latest_full_context_trace: None,
+        };
+        let request = ReflectRequest::from_observation_params(
+            None,
+            Some("errors"),
+            None,
+            None,
+            8,
+            "why did the operation fail?",
+        );
+
+        let response = build_reflect_response(&artifacts, 8, request).await;
+
+        let projected_event_labels = response
+            .graph_slice
+            .nodes
+            .iter()
+            .filter(|node| node.layer == astra_core::ObservationGraphLayer::Runtime)
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(projected_event_labels, vec!["tool_call_error"]);
+        assert_eq!(response.evidence.len(), 1);
+        assert_eq!(response.evidence[0].source, "local_journal");
     }
 
     #[tokio::test]

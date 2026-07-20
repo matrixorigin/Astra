@@ -94,6 +94,31 @@ fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
     Ok((memory_id, reason))
 }
 
+fn confirmed_memory_purge_notice(body: &str, memory_id: &str) -> Result<String, String> {
+    let receipt: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("Purge returned an invalid receipt: {error}"))?;
+    let status = receipt
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let deleted = receipt
+        .get("deleted_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let unresolved = receipt
+        .get("unresolved_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if status == "completed" && deleted == 1 && unresolved == 0 {
+        return Ok(format!("Forgot memory {memory_id}"));
+    }
+    let message = receipt
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("the backend did not confirm this deletion");
+    Err(format!("Memory was not confirmed deleted: {message}"))
+}
+
 pub(crate) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
@@ -352,13 +377,12 @@ pub(crate) async fn handle_memory_domain_command(
                     let body =
                         serde_json::json!({"memory_ids": [memory_id.clone()], "reason": reason});
                     match crate::edge_tools::memoria::memoria_purge(&body).await {
-                        Ok(_) => {
-                            eprintln!(
-                                "  {} Forgot memory {}",
-                                theme::icon_ok(),
-                                memory_id.magenta()
-                            );
-                        }
+                        Ok(receipt) => match confirmed_memory_purge_notice(&receipt, &memory_id) {
+                            Ok(message) => {
+                                eprintln!("  {} {}", theme::icon_ok(), message.magenta());
+                            }
+                            Err(message) => eprintln!("  {}", message.yellow()),
+                        },
                         Err(e) => eprintln!("{}", format!("  ✗ Purge failed: {e}").red()),
                     }
                 }
@@ -2036,9 +2060,9 @@ fn collect_dismiss_candidates(arr: &[serde_json::Value]) -> Vec<DismissCandidate
 mod tests {
     use super::{
         DismissCandidate, SECTION_NAMES, SessionMemorySurfaceStatus, collect_dismiss_candidates,
-        extract_md_section, format_session_memory_display, format_session_memory_response,
-        is_session_proto, load_current_session_memory, load_local_session_memory,
-        memory_health_lines, memory_result_id, parse_memory_forget_args,
+        confirmed_memory_purge_notice, extract_md_section, format_session_memory_display,
+        format_session_memory_response, is_session_proto, load_current_session_memory,
+        load_local_session_memory, memory_health_lines, memory_result_id, parse_memory_forget_args,
         parse_session_memory_status_hint_from_journal_text, replace_md_section,
         sanitize_md_section_content, select_session_memory_record,
         session_memory_headline_from_body, store_current_session_memory,
@@ -2543,6 +2567,25 @@ mod tests {
         let parsed = parse_memory_forget_args("mem-1 --reason duplicate stale memory").unwrap();
         assert_eq!(parsed.0, "mem-1");
         assert_eq!(parsed.1, "duplicate stale memory");
+    }
+
+    #[test]
+    fn memory_forget_ui_requires_a_confirmed_complete_receipt() {
+        assert!(
+            confirmed_memory_purge_notice(
+                r#"{"status":"completed","deleted_count":1,"unresolved_count":0}"#,
+                "mem-1"
+            )
+            .is_ok()
+        );
+        assert!(
+            confirmed_memory_purge_notice(
+                r#"{"status":"not_found","deleted_count":0,"unresolved_count":1,"message":"0 removed"}"#,
+                "mem-1"
+            )
+            .is_err()
+        );
+        assert!(confirmed_memory_purge_notice(r#"{"memory_id":"generic"}"#, "mem-1").is_err());
     }
 
     // ── /memory edit — replace_md_section ───────────────────────────────

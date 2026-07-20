@@ -2293,6 +2293,25 @@ mod tests {
 
         let executed = pipeline.execute_execution(permitted).await;
         assert!(executed.is_err, "got: {}", executed.execution.result_str);
+        assert_eq!(
+            pipeline.ctx.turn_guard.errors.total_errors, 1,
+            "one failed execution must have exactly one accounting owner"
+        );
+        assert_eq!(
+            pipeline
+                .ctx
+                .turn_guard
+                .health
+                .get("grep")
+                .map(|health| health.total_failures),
+            Some(1),
+            "one failed execution must advance tool health exactly once"
+        );
+        pipeline.record_execution(executed).await;
+        assert_eq!(
+            pipeline.ctx.turn_guard.errors.total_errors, 1,
+            "persisting the already-accounted result must not count it again"
+        );
     }
 
     #[tokio::test]

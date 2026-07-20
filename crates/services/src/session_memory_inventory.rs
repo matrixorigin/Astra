@@ -12,11 +12,16 @@ use sqlx::Row;
 use crate::session_artifact_store::SessionArtifactStore;
 use crate::session_journal::{JournalEvent, JournalEventType};
 
-pub const SESSION_MEMORY_INVENTORY_SCHEMA_VERSION: u16 = 1;
+pub const SESSION_MEMORY_INVENTORY_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMemoryInventory {
     pub schema_version: u16,
+    /// Self-describing report identity. This report audits extraction
+    /// lifecycle events; it is not a catalog of stored memory records.
+    pub report_type: String,
+    pub scope: String,
+    pub contains_memory_identities: bool,
     pub session_id: String,
     /// Audit events, including skips and errors. This is not a memory count.
     pub extraction_events: u64,
@@ -46,6 +51,9 @@ impl SessionMemoryInventory {
     pub fn empty(session_id: impl Into<String>, source: impl Into<String>) -> Self {
         Self {
             schema_version: SESSION_MEMORY_INVENTORY_SCHEMA_VERSION,
+            report_type: "session_memory_extraction_audit".to_string(),
+            scope: "session".to_string(),
+            contains_memory_identities: false,
             session_id: session_id.into(),
             extraction_events: 0,
             successful_extraction_versions: 0,
@@ -301,6 +309,9 @@ mod tests {
         .unwrap();
 
         let inventory = load_local_session_memory_inventory(session_id).unwrap();
+        assert_eq!(inventory.report_type, "session_memory_extraction_audit");
+        assert_eq!(inventory.scope, "session");
+        assert!(!inventory.contains_memory_identities);
         assert_eq!(inventory.successful_extraction_versions, 1);
         assert_eq!(inventory.logical_current_snapshot_count, Some(1));
         assert_eq!(inventory.inventory_source, "local_journal");

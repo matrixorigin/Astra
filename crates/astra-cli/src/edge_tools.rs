@@ -5070,6 +5070,10 @@ impl ToolExecutor {
     }
 
     async fn execute_run(&self, name: &str, args: &Value) -> EdgeToolRun {
+        if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
+            let evidence = error.failure_evidence();
+            return EdgeToolRun::failure_evidence(format!("Error: {error}"), evidence);
+        }
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
         }
@@ -5305,10 +5309,10 @@ impl ToolExecutor {
                             Ok(action) => action,
                             Err(error) => return format!("Error: {error}"),
                         };
-                    if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+                    if action == astra_tools::memory_tool_contract::MemoryAction::SessionAudit {
                         let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty())
                         else {
-                            return "Error: memory inventory requires an active session_id"
+                            return "Error: memory session_audit requires an active session_id"
                                 .to_string();
                         };
                         let inventory = match astra_services::session_memory_inventory::load_local_session_memory_inventory(
@@ -5317,12 +5321,12 @@ impl ToolExecutor {
                             Ok(inventory) => inventory,
                             Err(error) => {
                                 return format!(
-                                    "Error: session memory inventory failed: {error}"
+                                    "Error: session memory extraction audit failed: {error}"
                                 );
                             }
                         };
                         return serde_json::to_string(&inventory).unwrap_or_else(|error| {
-                            format!("Error: serialize session memory inventory: {error}")
+                            format!("Error: serialize session memory extraction audit: {error}")
                         });
                     }
                     let clean_args = self.memory_args_with_context(args);
@@ -6556,6 +6560,27 @@ mod tests {
                 || result.output.contains("empty"),
             "shared trait must return the CLI tool output, got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_boundary_preserves_invalid_argument_failure_evidence() {
+        let (_dir, executor) = temp_executor();
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "memory",
+            &serde_json::json!({"action": "forget", "memory_id": "m1"}),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
         );
     }
 
@@ -9443,7 +9468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_inventory_reads_authoritative_local_journal_without_memoria_recall() {
+    async fn memory_session_audit_reads_authoritative_local_journal_without_memoria_recall() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "cli-memory-inventory";
@@ -9464,7 +9489,7 @@ mod tests {
         let executor = test_executor().with_active_session_id(session_id);
 
         let output = executor
-            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .execute("memory", &serde_json::json!({"action": "session_audit"}))
             .await;
         let inventory: astra_services::session_memory_inventory::SessionMemoryInventory =
             serde_json::from_str(&output).unwrap();
@@ -9477,7 +9502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_inventory_surfaces_corrupt_journal_instead_of_reporting_zero() {
+    async fn memory_session_audit_surfaces_corrupt_journal_instead_of_reporting_zero() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "cli-memory-inventory-corrupt";
@@ -9486,12 +9511,14 @@ mod tests {
         std::fs::write(path, "{not-json}\n").unwrap();
         let executor = test_executor().with_active_session_id(session_id);
 
-        let output = executor
-            .execute("memory", &serde_json::json!({"action": "inventory"}))
-            .await;
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "memory",
+            &serde_json::json!({"action": "session_audit"}),
+        )
+        .await;
 
-        assert!(output.starts_with("Error: session memory inventory failed:"));
-        assert!(output.contains("cannot be exact"));
+        assert!(result.is_error);
     }
 
     // ── File-journal persistence wiring (regression guard) ──────────────

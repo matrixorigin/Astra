@@ -10356,15 +10356,24 @@ esac
     }
 
     #[tokio::test]
-    async fn memory_inventory_is_structured_and_does_not_call_recall() {
+    async fn memory_session_audit_is_structured_and_does_not_call_recall() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute("memory", &json!({"action": "inventory"}))
+            .execute("memory", &json!({"action": "session_audit"}))
             .await;
-        let inventory: Value = serde_json::from_str(&result).expect("structured inventory");
-        assert_eq!(inventory["schema_version"].as_u64(), Some(1));
+        let inventory: Value = serde_json::from_str(&result).expect("structured session audit");
+        assert_eq!(inventory["schema_version"].as_u64(), Some(2));
+        assert_eq!(
+            inventory["report_type"].as_str(),
+            Some("session_memory_extraction_audit")
+        );
+        assert_eq!(inventory["scope"].as_str(), Some("session"));
+        assert_eq!(
+            inventory["contains_memory_identities"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             inventory["session_id"].as_str(),
             Some(exec.session_id.as_str())
@@ -10375,7 +10384,7 @@ esac
     }
 
     #[tokio::test]
-    async fn memory_inventory_surfaces_local_journal_corruption() {
+    async fn memory_session_audit_surfaces_local_journal_corruption() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let (exec, _dir) = test_executor();
@@ -10384,7 +10393,7 @@ esac
         std::fs::write(path, "{not-json}\n").unwrap();
 
         let result = exec
-            .execute_with_metadata("memory", &json!({"action": "inventory"}))
+            .execute_with_metadata("memory", &json!({"action": "session_audit"}))
             .await;
 
         assert!(result.is_error, "{result:?}");

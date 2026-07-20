@@ -177,11 +177,19 @@ impl MemoriaForwarder for E2eMemoriaStub {
         if self.fail_forward.load(Ordering::Relaxed) {
             return Err(format!("memoria unavailable (e2e stub): {endpoint}"));
         }
+        let response = if endpoint.ends_with("/retrieve") {
+            json!({ "memories": [] })
+        } else if endpoint.ends_with("/purge") {
+            let purged = body
+                .get("memory_ids")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            json!({ "purged": purged })
+        } else {
+            json!({ "memory_id": "e2e-stub-memory" })
+        };
         self.calls.lock().await.push((endpoint.to_string(), body));
-        if endpoint.contains("retrieve") {
-            return Ok(json!({ "memories": [] }));
-        }
-        Ok(json!({ "memory_id": "e2e-stub-memory" }))
+        Ok(response)
     }
 
     async fn health(&self) -> astra_runtime::MemoriaHealth {

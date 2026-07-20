@@ -487,6 +487,39 @@ fn memoria_output_is_error(output: &str) -> bool {
         .is_some()
 }
 
+fn exact_memory_ids_from_args(args: &Value) -> Vec<String> {
+    let mut ids = args
+        .get("memory_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty()
+        && let Some(id) = args
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    {
+        ids.push(id.to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+fn confirmed_purge_count(output: &str) -> Option<u64> {
+    let response = serde_json::from_str::<Value>(output).ok()?;
+    response
+        .get("purged")
+        .or_else(|| response.get("deleted_count"))
+        .and_then(Value::as_u64)
+}
+
 fn memory_status_counts_toward_circuit(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || matches!(
@@ -560,7 +593,7 @@ fn format_memory_http_error(
         (
             "memory_not_found",
             "The requested memory identity does not exist or is not visible to this caller.",
-            "Use an exact memory_id returned by recall/inventory, or use query-based update when selecting by meaning. Do not invent an ID.",
+            "Use an exact memory_id returned by recall/evidence, or use query-based update when selecting by meaning. Do not invent an ID.",
         )
     } else if status.is_client_error() {
         (
@@ -733,6 +766,90 @@ impl MemoriaToolGateway {
     /// doesn't leak memory.
     pub fn record_recall(session_id: &str, turn: u32, memory_ids: Vec<String>) {
         astra_memoria::memoria_runtime_state().record_recall(session_id, turn, memory_ids);
+    }
+
+    /// Latest non-consuming selection receipt for a session. Feedback
+    /// attribution drains a separate queue and therefore cannot erase this
+    /// cross-turn referential identity.
+    pub fn latest_recall(session_id: &str) -> Option<RecallSnapshot> {
+        astra_memoria::memoria_runtime_state().latest_recall(session_id)
+    }
+
+    /// Render a compact typed selection receipt for dynamic runtime context.
+    /// The envelope carries identities only; memory content remains in its
+    /// producer-owned result and is never duplicated here.
+    pub fn latest_selection_context(session_id: &str) -> Option<String> {
+        let selection = Self::latest_recall(session_id)?;
+        if selection.memory_ids.is_empty() {
+            return None;
+        }
+        Some(
+            json!({
+                "schema": "astra.resource_selection.v1",
+                "resource_kind": "memory",
+                "source_tool": "memory",
+                "source_action": "recall",
+                "selection_id": selection.selection_id(),
+                "selected_at_turn": selection.turn,
+                "identities": selection.memory_ids,
+                "instruction": "For a referential follow-up about these selected resources, use selection_id directly. Do not recall again and do not invent or transcribe identities."
+            })
+            .to_string(),
+        )
+    }
+
+    fn resolve_selection_reference(op: &str, args: &Value) -> Result<Value, Value> {
+        let mut resolved = args.clone();
+        if op != "forget" {
+            return Ok(resolved);
+        }
+        let Some(selection_id) = args
+            .get("selection_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|selection_id| !selection_id.is_empty())
+        else {
+            return Ok(resolved);
+        };
+        if args.get("memory_id").is_some() || args.get("memory_ids").is_some() {
+            return Err(json!({
+                "error": "memory(action=forget) accepts selection_id or explicit memory identities, not both",
+                "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+            }));
+        }
+        let session_id = args
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| {
+                json!({
+                    "error": "selection_id requires an active session_id",
+                    "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                })
+            })?;
+        let selection = Self::latest_recall(session_id).ok_or_else(|| {
+            json!({
+                "error": "the referenced resource selection is no longer available; read the resources once to create a fresh selection receipt",
+                "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+            })
+        })?;
+        if selection.selection_id() != selection_id {
+            return Err(json!({
+                "error": "selection_id does not match the latest producer-owned selection for this session",
+                "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                "expected_selection_id": selection.selection_id(),
+            }));
+        }
+        let Some(object) = resolved.as_object_mut() else {
+            return Err(json!({
+                "error": "memory arguments must be an object",
+                "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+            }));
+        };
+        object.remove("selection_id");
+        object.insert("memory_ids".to_string(), json!(selection.memory_ids));
+        Ok(resolved)
     }
 
     /// Drain and return all recall snapshots for a session older than
@@ -1093,6 +1210,12 @@ impl MemoriaToolGateway {
             return self.focus_set(sid, args);
         }
 
+        let resolved_args = match Self::resolve_selection_reference(op, args) {
+            Ok(resolved) => resolved,
+            Err(error) => return error.to_string(),
+        };
+        let args = &resolved_args;
+
         // Argument errors belong to the current call, not service health. Keep
         // them actionable even while the remote circuit is open and never let
         // them contribute to opening that circuit.
@@ -1274,6 +1397,16 @@ impl MemoriaToolGateway {
                 &raw_text,
                 args.get("level").and_then(Value::as_str),
             );
+        }
+        if op == "forget" {
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let ids = exact_memory_ids_from_args(args);
+            if !ids.is_empty() && confirmed_purge_count(&raw_text) == Some(ids.len() as u64) {
+                astra_memoria::memoria_runtime_state().acknowledge_removed(session_id, ids);
+            }
         }
         raw_text
     }
@@ -1814,7 +1947,7 @@ impl MemoriaToolGateway {
                     pl["memory_ids"] = if ids.is_array() {
                         ids.clone()
                     } else if let Some(s) = ids.as_str() {
-                        json!(s.split(',').map(str::trim).collect::<Vec<_>>())
+                        json!([s.trim()])
                     } else {
                         json!([ids.to_string()])
                     };
@@ -1988,6 +2121,29 @@ impl MemoriaToolGateway {
                     return Some(
                         json!({"error": "memory(action=forget) requires `memory_id` or `topic`"}),
                     );
+                }
+                let ids = exact_memory_ids_from_args(args);
+                if let Some(session_id) = args
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session_id| !session_id.is_empty())
+                    && !ids.is_empty()
+                {
+                    let surfaced = Self::seen_snapshot(session_id);
+                    let unproven = ids
+                        .iter()
+                        .filter(|id| !surfaced.contains(*id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !unproven.is_empty() {
+                        return Some(json!({
+                            "error": "destructive resource identities must come from producer-owned evidence surfaced in this session",
+                            "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                            "unproven_memory_ids": unproven,
+                            "recovery": "Use the exact latest selection_id, or recall once and use the returned identities."
+                        }));
+                    }
                 }
                 None
             }
@@ -3031,11 +3187,11 @@ mod tests {
     }
 
     #[test]
-    fn purge_with_memory_id_string_becomes_array() {
+    fn purge_with_one_opaque_memory_id_becomes_one_element_array() {
         let args = json!({"memory_id": "id1,id2", "reason": "batch cleanup"});
         let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         let ids = pl["memory_ids"].as_array().expect("should be array");
-        assert_eq!(ids.len(), 2);
+        assert_eq!(ids, &vec![json!("id1,id2")]);
     }
 
     // ── P9: auto-snapshot naming helper (pure) ────────────────────────
@@ -3317,6 +3473,151 @@ mod memoria_http_client_tests {
         assert_eq!(arr.len(), 1, "seen id must be filtered");
         assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
         assert_eq!(newly, vec!["m-new"], "only surviving ids recorded");
+    }
+
+    #[test]
+    fn latest_selection_receipt_resolves_without_model_copying_identities() {
+        let session_id = "selection-receipt-resolution";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_seen(session_id, ["m1".into(), "m2".into()]);
+        MemoriaToolGateway::record_recall(session_id, 4, vec!["m1".into(), "m2".into()]);
+        let selection = MemoriaToolGateway::latest_recall(session_id).unwrap();
+
+        let resolved = MemoriaToolGateway::resolve_selection_reference(
+            "forget",
+            &json!({
+                "selection_id": selection.selection_id(),
+                "session_id": session_id,
+                "reason": "user selected these resources"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(resolved["memory_ids"], json!(["m1", "m2"]));
+        assert!(resolved.get("selection_id").is_none());
+        assert!(MemoriaToolGateway::validate_before_side_effects("forget", &resolved).is_none());
+        let context: Value = serde_json::from_str(
+            &MemoriaToolGateway::latest_selection_context(session_id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(context["schema"], "astra.resource_selection.v1");
+        assert_eq!(context["selection_id"], selection.selection_id());
+        assert_eq!(context["identities"], json!(["m1", "m2"]));
+        MemoriaToolGateway::reset_session_process_state(session_id);
+    }
+
+    #[tokio::test]
+    async fn selection_receipt_executes_one_confirmed_bulk_mutation() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/snapshots"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"status": "created"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/purge"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_json(json!({
+                "memory_ids": ["m1", "m2"],
+                "reason": "user selected these resources"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "completed",
+                "requested_count": 2,
+                "deleted_count": 2,
+                "unresolved_count": 0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session_id = "selection-confirmed-bulk-mutation";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_seen(session_id, ["m1".into(), "m2".into()]);
+        MemoriaToolGateway::record_recall(session_id, 4, vec!["m1".into(), "m2".into()]);
+        let selection_id = MemoriaToolGateway::latest_recall(session_id)
+            .unwrap()
+            .selection_id();
+        let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("token".to_string()));
+
+        let output = gateway
+            .call_with_timeout(
+                "forget",
+                &json!({
+                    "selection_id": selection_id,
+                    "session_id": session_id,
+                    "reason": "user selected these resources"
+                }),
+                Duration::from_secs(1),
+            )
+            .await;
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["status"],
+            "completed"
+        );
+        assert!(
+            MemoriaToolGateway::latest_recall(session_id).is_none(),
+            "only a complete backend receipt closes the selected identities"
+        );
+        server.verify().await;
+        MemoriaToolGateway::reset_session_process_state(session_id);
+    }
+
+    #[test]
+    fn destructive_identity_requires_session_surfaced_provenance() {
+        let session_id = "selection-provenance-rejection";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_seen(session_id, ["real-id".into()]);
+
+        let error = MemoriaToolGateway::validate_before_side_effects(
+            "forget",
+            &json!({
+                "memory_ids": ["invented-id"],
+                "session_id": session_id,
+                "reason": "user requested cleanup"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            error["error_kind"],
+            astra_core::ErrorKind::ToolInvalidArgs.as_str()
+        );
+        assert_eq!(error["unproven_memory_ids"], json!(["invented-id"]));
+        MemoriaToolGateway::reset_session_process_state(session_id);
+    }
+
+    #[test]
+    fn stale_selection_receipt_cannot_target_a_newer_selection() {
+        let session_id = "selection-stale-rejection";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_recall(session_id, 1, vec!["m1".into()]);
+        let stale = MemoriaToolGateway::latest_recall(session_id)
+            .unwrap()
+            .selection_id();
+        MemoriaToolGateway::record_recall(session_id, 2, vec!["m2".into()]);
+
+        let error = MemoriaToolGateway::resolve_selection_reference(
+            "forget",
+            &json!({
+                "selection_id": stale,
+                "session_id": session_id,
+                "reason": "cleanup"
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error["error_kind"],
+            astra_core::ErrorKind::ToolInvalidArgs.as_str()
+        );
+        MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
     #[test]

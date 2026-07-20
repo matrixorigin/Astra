@@ -33,6 +33,10 @@ pub(crate) async fn run_local_tool_preflight(
     name: &str,
     args: &Value,
 ) -> LocalToolPreflight {
+    if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
+        return LocalToolPreflight::ShortCircuit(error.into_tool_result());
+    }
+
     if context.plan_mode_authoring_active && is_plan_mode_blocked_tool(name, args) {
         return LocalToolPreflight::ShortCircuit(plan_mode_blocked_tool_result(name));
     }
@@ -278,6 +282,36 @@ mod tests {
     #[tokio::test]
     async fn preview_template_missing_skips_missing_pool() {
         assert!(!record_preview_template_missing("user-1", "session-1", None, "ghost_tool").await);
+    }
+
+    #[tokio::test]
+    async fn server_preflight_rejects_invalid_arguments_before_policy_and_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        let result = run_local_tool_preflight(
+            LocalToolPreflightContext {
+                session_id: "session-1",
+                workspace_root: workspace.path(),
+                workspace_binding: &binding,
+                approval_gate: None,
+                plan_mode_authoring_active: false,
+            },
+            "memory",
+            &json!({"action": "forget", "memory_id": "m1"}),
+        )
+        .await;
+
+        let LocalToolPreflight::ShortCircuit(result) = result else {
+            panic!("invalid built-in arguments must short-circuit server execution");
+        };
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
     }
 
     #[test]

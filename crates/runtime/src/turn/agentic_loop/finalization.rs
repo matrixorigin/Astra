@@ -4,73 +4,13 @@ use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
 
 use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
-use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, VolatileKind, run_agentic_loop_impl,
-};
+use super::host::{AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_impl};
 use super::lifecycle::{current_agentic_step, interruption_state_summary, session_turn_number};
-
-fn inject_hallucination_tripwire_nudge_if_fired(state: &mut AgenticLoopState) {
-    use astra_turn_core::hallucination_tripwire::{
-        TripwireToolObservation, TripwireVerdict, detect,
-    };
-
-    if state.final_text.is_empty() {
-        return;
-    }
-
-    let observations: Vec<TripwireToolObservation<'_>> = state
-        .stall
-        .tool_call_records
-        .iter()
-        .map(|record| {
-            let result_preview = record
-                .result_preview
-                .as_deref()
-                .or(record.result_full.as_deref())
-                .or(record.error.as_deref())
-                .unwrap_or_else(|| {
-                    if record.output_bytes == Some(0) {
-                        ""
-                    } else {
-                        "[tool result unavailable]"
-                    }
-                });
-            TripwireToolObservation {
-                name: record.name.as_str(),
-                result_preview,
-            }
-        })
-        .collect();
-
-    if let TripwireVerdict::Mismatch {
-        nudge,
-        matched_phrases,
-    } = detect(state.final_text.as_str(), observations)
-    {
-        state.push_volatile_payload(
-            VolatileKind::HallucinationTripwire,
-            serde_json::json!({
-                "schema": "hallucination_tripwire.v1",
-                "signal": "ungrounded_tool_outcome_claim",
-                "evidence": {
-                    "matched_phrases": matched_phrases,
-                    "tool_observation_count": state.stall.tool_call_records.len(),
-                },
-                "recommendation": nudge,
-                "authority": "advisory_evidence_only",
-            }),
-        );
-    }
-}
 
 /// Finalize the turn trace collector: record measured token budget, feed to
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
 pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
-    // Detect phantom tool-outcome claims in the assistant's completed prose and
-    // queue a correction for the next LLM call before this turn's records reset.
-    inject_hallucination_tripwire_nudge_if_fired(state);
-
     // ── Update L1a SessionFacts from this turn's tool call records ──
     update_session_facts_from_turn(state);
 
@@ -276,60 +216,6 @@ async fn persist_context_trace_to_workspace_if_present(
                 err
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod hallucination_tripwire_integration_tests {
-    use super::*;
-    use astra_services::session_journal::ToolCallRecord;
-
-    #[test]
-    fn queues_next_turn_nudge_when_final_text_claims_phantom_empty_result() {
-        let mut state = super::super::host::tests::make_state();
-        state.final_text =
-            "The str_replace edit silently returned {}, so the file stayed unchanged.".to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".to_string(),
-            ok: false,
-            error: Some("Error: old_str not found. Aborting edit.".to_string()),
-            output_bytes: Some(42),
-            ..Default::default()
-        });
-
-        inject_hallucination_tripwire_nudge_if_fired(&mut state);
-
-        assert_eq!(state.volatile_pending.len(), 1);
-        assert_eq!(
-            state.volatile_pending[0].kind,
-            VolatileKind::HallucinationTripwire
-        );
-        let payload = &state.volatile_pending[0].payload;
-        assert_eq!(payload["schema"], "hallucination_tripwire.v1");
-        assert_eq!(payload["signal"], "ungrounded_tool_outcome_claim");
-        assert_eq!(payload["evidence"]["tool_observation_count"], 1);
-        assert_eq!(
-            payload["evidence"]["matched_phrases"],
-            serde_json::json!(["silently returned {}"])
-        );
-        assert_eq!(payload["authority"], "advisory_evidence_only");
-    }
-
-    #[test]
-    fn stays_silent_when_tool_record_anchors_empty_result_claim() {
-        let mut state = super::super::host::tests::make_state();
-        state.final_text = "The helper silently returned {}.".to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "helper".to_string(),
-            ok: true,
-            output_bytes: Some(2),
-            result_preview: Some("{}".to_string()),
-            ..Default::default()
-        });
-
-        inject_hallucination_tripwire_nudge_if_fired(&mut state);
-
-        assert!(state.volatile_pending.is_empty());
     }
 }
 

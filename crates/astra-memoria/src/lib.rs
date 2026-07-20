@@ -393,9 +393,18 @@ pub struct FocusHint {
 #[derive(Debug, Clone)]
 pub struct RecallSnapshot {
     pub session_id: String,
+    /// Session-scoped producer revision for referential follow-up actions.
+    pub revision: u64,
     pub memory_ids: Vec<String>,
     pub turn: u32,
     pub at: Instant,
+}
+
+impl RecallSnapshot {
+    #[must_use]
+    pub fn selection_id(&self) -> String {
+        format!("{}:memory-selection:{}", self.session_id, self.revision)
+    }
 }
 
 pub const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
@@ -413,6 +422,8 @@ struct SessionRuntimeState {
     seen: HashSet<String>,
     seen_order: VecDeque<String>,
     recalls: VecDeque<RecallSnapshot>,
+    latest_recall: Option<RecallSnapshot>,
+    recall_revision: u64,
     last_touched: Instant,
 }
 
@@ -423,12 +434,17 @@ impl SessionRuntimeState {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             recalls: VecDeque::new(),
+            latest_recall: None,
+            recall_revision: 0,
             last_touched: now,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.focus.is_empty() && self.seen.is_empty() && self.recalls.is_empty()
+        self.focus.is_empty()
+            && self.seen.is_empty()
+            && self.recalls.is_empty()
+            && self.latest_recall.is_none()
     }
 }
 
@@ -603,15 +619,73 @@ impl MemoriaRuntimeState {
             return;
         };
         let state = Self::session_mut(&mut sessions, session_id, Instant::now());
+        state.recall_revision = state.recall_revision.saturating_add(1);
         if state.recalls.len() >= MAX_RECALL_LEDGER_PER_SESSION {
             state.recalls.pop_front();
         }
-        state.recalls.push_back(RecallSnapshot {
+        let snapshot = RecallSnapshot {
             session_id: session_id.to_string(),
+            revision: state.recall_revision,
             memory_ids,
             turn,
             at: Instant::now(),
-        });
+        };
+        state.latest_recall = Some(snapshot.clone());
+        state.recalls.push_back(snapshot);
+    }
+
+    /// Latest producer-owned recall selection. Unlike the feedback queue this
+    /// receipt is non-consuming: closing recall feedback must not erase the
+    /// identities needed by a later referential user turn.
+    pub fn latest_recall(&self, session_id: &str) -> Option<RecallSnapshot> {
+        let session_id = Self::session_key(session_id)?;
+        let Ok(mut sessions) = self.sessions.write() else {
+            return None;
+        };
+        let now = Instant::now();
+        Self::prune_idle_sessions(&mut sessions, now);
+        let state = sessions.get_mut(session_id)?;
+        state.last_touched = now;
+        state.latest_recall.clone()
+    }
+
+    /// Remove identities after a producer-confirmed mutation receipt. This
+    /// prevents a completed selection from being offered again while leaving
+    /// unresolved identities available for an explicit retry or inspection.
+    pub fn acknowledge_removed(&self, session_id: &str, ids: impl IntoIterator<Item = String>) {
+        let Some(session_id) = Self::session_key(session_id) else {
+            return;
+        };
+        let removed = ids
+            .into_iter()
+            .filter(|id| !id.trim().is_empty())
+            .collect::<HashSet<_>>();
+        if removed.is_empty() {
+            return;
+        }
+        let Ok(mut sessions) = self.sessions.write() else {
+            return;
+        };
+        let Some(state) = sessions.get_mut(session_id) else {
+            return;
+        };
+        state.last_touched = Instant::now();
+        state.seen.retain(|id| !removed.contains(id));
+        state.seen_order.retain(|id| !removed.contains(id));
+        for recall in &mut state.recalls {
+            recall.memory_ids.retain(|id| !removed.contains(id));
+        }
+        state.recalls.retain(|recall| !recall.memory_ids.is_empty());
+        let mut clear_latest = false;
+        if let Some(latest) = state.latest_recall.as_mut() {
+            latest.memory_ids.retain(|id| !removed.contains(id));
+            if latest.memory_ids.is_empty() {
+                clear_latest = true;
+            }
+        }
+        if clear_latest {
+            state.latest_recall = None;
+        }
     }
 
     pub fn drain_recalls(
@@ -699,6 +773,7 @@ impl MemoriaRuntimeState {
             && let Some(state) = sessions.get_mut(session_id)
         {
             state.recalls.clear();
+            state.latest_recall = None;
             if state.is_empty() {
                 sessions.remove(session_id);
             }
@@ -823,6 +898,28 @@ mod tests {
         assert_eq!(drained.len(), MAX_RECALL_LEDGER_PER_SESSION);
         assert_eq!(drained.first().map(|entry| entry.turn), Some(4));
         assert_eq!(drained.last().map(|entry| entry.turn), Some(19));
+    }
+
+    #[test]
+    fn latest_selection_survives_feedback_drain_and_closes_on_confirmed_removal() {
+        let state = MemoriaRuntimeState::default();
+        state.record_seen("s", ["m1".to_string(), "m2".to_string()]);
+        state.record_recall("s", 7, vec!["m1".to_string(), "m2".to_string()]);
+
+        let selection = state.latest_recall("s").unwrap();
+        assert_eq!(selection.selection_id(), "s:memory-selection:1");
+        assert_eq!(state.drain_recalls("s", None).len(), 1);
+        assert_eq!(
+            state.latest_recall("s").unwrap().memory_ids,
+            vec!["m1", "m2"]
+        );
+
+        state.acknowledge_removed("s", ["m1".to_string()]);
+        assert_eq!(state.latest_recall("s").unwrap().memory_ids, vec!["m2"]);
+        assert!(!state.seen_snapshot("s").contains("m1"));
+
+        state.acknowledge_removed("s", ["m2".to_string()]);
+        assert!(state.latest_recall("s").is_none());
     }
 
     #[test]

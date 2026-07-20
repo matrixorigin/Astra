@@ -172,7 +172,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                 return astra_tools::ToolResult::error(format!("Error: {error}"));
             }
         };
-        if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+        if action == astra_tools::memory_tool_contract::MemoryAction::SessionAudit {
             let inventory = if let Some(shared_pool) = context.context_manifest_pool.as_ref() {
                 match astra_services::session_memory_inventory::load_database_session_memory_inventory(
                     shared_pool.get(),
@@ -184,7 +184,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                     Ok(inventory) => inventory,
                     Err(error) => {
                         return astra_tools::ToolResult::error(format!(
-                            "Error: session memory inventory failed: {error}"
+                            "Error: session memory extraction audit failed: {error}"
                         ));
                     }
                 }
@@ -195,7 +195,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                     Ok(inventory) => inventory,
                     Err(error) => {
                         return astra_tools::ToolResult::error(format!(
-                            "Error: session memory inventory failed: {error}"
+                            "Error: session memory extraction audit failed: {error}"
                         ));
                     }
                 }
@@ -203,7 +203,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
             return match serde_json::to_string(&inventory) {
                 Ok(output) => astra_tools::ToolResult::text(output),
                 Err(error) => astra_tools::ToolResult::error(format!(
-                    "Error: serialize session memory inventory: {error}"
+                    "Error: serialize session memory extraction audit: {error}"
                 )),
             };
         }

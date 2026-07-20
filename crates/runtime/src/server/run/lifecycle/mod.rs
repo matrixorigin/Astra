@@ -1442,9 +1442,9 @@ type ServerSkillResolverBundle = (
 /// Post-loop session-memory cleanup shared by `create_run` and
 /// `stream_chat`. Schedules session-end governance (purge working memory +
 /// persist episodic overview + Memoria reflect) when the per-session
-/// debounce window allows, and always clears the bridge seen-ledger +
-/// extraction-service debounce so long-lived servers don't accumulate
-/// per-session state.
+/// debounce window allows, and clears only run-scoped attribution/extraction
+/// state. Session-scoped selections, surfaced identities, and focus survive
+/// follow-up runs and are bounded independently by the memory runtime.
 ///
 /// Best-effort: every step logs and continues on failure. Safe to call
 /// with an empty `session_id` (no-op).
@@ -1628,25 +1628,29 @@ async fn run_post_loop_memory_cleanup_work(
     // have ignored or worked around a bad memory, so session end never marks
     // every surfaced item `useful`. Tool/user outcome paths send feedback only
     // when they can attribute useful/outdated/wrong to a concrete memory id.
-    reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+    finish_post_loop_memory_run_boundary(&session_id, extraction_service.as_ref());
     record_post_loop_memory_cleanup_worker_metrics(metrics_registry.as_ref(), "completed");
 }
 
-fn reset_post_loop_memory_process_state(
+fn finish_post_loop_memory_run_boundary(
     session_id: &str,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
 ) {
-    // ── Always: clear canonical memory process state for this session ──
-    //
-    // A single process-global set in `astra_tools::memoria` holds both
-    // the bridge-side content-dedup keys and the tool-side
-    // memory_id dedup entries. The shared reset also ensures focus hints
-    // and the recall ledger are clean even if
-    // governance didn't run (e.g. no memoria client configured, or drain
-    // was conditional on an episode being written).
-    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+    // A run boundary is not a session boundary. Drop only attribution work
+    // that cannot be causally credited after the run. The latest selection,
+    // seen identities, and focus remain session-scoped so the next user turn
+    // can refer to what was just shown. The shared runtime independently caps
+    // sessions/identities and evicts idle state.
+    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len();
+    if dropped > 0 {
+        tracing::debug!(
+            session_id,
+            dropped,
+            "dropped unattributed memory recalls at server run boundary"
+        );
+    }
 
-    // ── Always: release extraction service's per-session debounce ──
+    // Release extraction service's per-run debounce.
     if let Some(svc) = extraction_service {
         svc.forget_session(session_id);
     }
