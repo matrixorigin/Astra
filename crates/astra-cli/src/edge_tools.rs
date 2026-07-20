@@ -2829,7 +2829,7 @@ impl ToolExecutor {
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
     fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        astra_tools::task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
+        astra_tools::task_tool_contract::validate_public_task_tool_args_for_action(action, args)
     }
 
     fn task_action_mutates_board(action: &str) -> bool {
@@ -2933,6 +2933,16 @@ impl ToolExecutor {
     /// touches MO directly. Falls back to the in-memory manager only
     /// when no cloud is wired (one-shot CLI, headless tests).
     async fn route_task_action(&self, action: &str, args: &Value) -> Option<RoutedTaskAction> {
+        self.route_task_action_with_call_id(action, args, None)
+            .await
+    }
+
+    async fn route_task_action_with_call_id(
+        &self,
+        action: &str,
+        args: &Value,
+        tool_call_id: Option<&str>,
+    ) -> Option<RoutedTaskAction> {
         let cloud_base = self.cloud_base.clone()?;
         let session_id = self.active_session_id()?;
         if session_id.is_empty() {
@@ -2945,6 +2955,7 @@ impl ToolExecutor {
             &session_id,
             action,
             args,
+            tool_call_id,
         )
         .await
         {
@@ -3336,7 +3347,18 @@ impl ToolExecutor {
     }
 
     async fn task_action_create(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("create", args).await {
+        self.task_action_create_with_invocation(args, None).await
+    }
+
+    async fn task_action_create_with_invocation(
+        &self,
+        args: &Value,
+        tool_call_id: Option<&str>,
+    ) -> String {
+        if let Some(routed) = self
+            .route_task_action_with_call_id("create", args, tool_call_id)
+            .await
+        {
             if let Some(mutation) = routed
                 .mutation
                 .as_ref()
@@ -3382,14 +3404,17 @@ impl ToolExecutor {
         outcome.output
     }
 
-    async fn execute_task_tool_args(&self, args: &Value) -> String {
+    async fn execute_task_tool_args(&self, args: &Value, tool_call_id: Option<&str>) -> String {
         let action = match astra_tools::task_tool_contract::task_action_from_args(args) {
             Ok(action) => action,
             Err(error) => return format!("Error: {error}"),
         };
         match action {
             "create" => match Self::validate_task_tool_args_for_action("create", args) {
-                Ok(()) => self.task_action_create(args).await,
+                Ok(()) => {
+                    self.task_action_create_with_invocation(args, tool_call_id)
+                        .await
+                }
                 Err(error) => format!("Error: {error}"),
             },
             "list" => match Self::validate_task_tool_args_for_action("list", args) {
@@ -4970,17 +4995,36 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> ToolExecutionOutcome {
-        // Admission gate (fail-closed). Every public execution entry point
-        // must pass through `tool_admission_denial` before any tool runs —
-        // including the cancel-aware shell path and metadata-tagged paths,
-        // which otherwise bypass `execute_run`'s gate.
-        if let Some(denied) = self.tool_admission_denial(name, args) {
-            return denied.into_outcome();
+        self.execute_with_invocation_metadata_cancelable(
+            name,
+            args,
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    pub async fn execute_with_invocation_metadata_cancelable(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> ToolExecutionOutcome {
+        // The sync shell path bypasses `execute_run`, so it owns admission.
+        // Every other tool falls through to the invocation-aware async path,
+        // which validates and admits exactly once.
+        let is_blocking_shell = name == "bash" || (cfg!(windows) && name == "powershell");
+        if is_blocking_shell {
+            if let Some(denied) = self.tool_admission_denial(name, args) {
+                return denied.into_outcome();
+            }
+            if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
+                return outcome;
+            }
         }
-        if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
-            return outcome;
-        }
-        self.execute_with_metadata(name, args).await
+        self.execute_with_invocation_metadata(name, args, invocation)
+            .await
     }
 
     /// Synchronous core for `bash` / `powershell` execution. Returns
@@ -4995,12 +5039,12 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
-        // Deferred activation must be consumed exactly once per tool call.
-        // The other public entry points (execute_with_metadata, execute) also
-        // call consume, but they do NOT call this function — so this is the
-        // only consume site for shell-tool paths.
-        self.consume_activated_deferred_tool_if_called(name);
         if name == "bash" {
+            // Deferred activation must be consumed exactly once, and only
+            // after this sync dispatcher has claimed the call. Non-shell
+            // names fall through to the async dispatcher, which owns their
+            // activation lifecycle.
+            self.consume_activated_deferred_tool_if_called(name);
             let mut outcome = self.bash_outcome_with_cancel(args, cancel_token);
             outcome.output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(outcome.output.len());
@@ -5008,6 +5052,7 @@ impl ToolExecutor {
         }
         #[cfg(windows)]
         if name == "powershell" {
+            self.consume_activated_deferred_tool_if_called(name);
             let output =
                 self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
@@ -5019,6 +5064,20 @@ impl ToolExecutor {
     }
 
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
+        self.execute_with_invocation_metadata(
+            name,
+            args,
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+        )
+        .await
+    }
+
+    pub async fn execute_with_invocation_metadata(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+    ) -> ToolExecutionOutcome {
         // Admission gate (fail-closed). This is a public entry point called
         // directly by the server executor; without this gate, `mo_query`
         // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
@@ -5084,15 +5143,28 @@ impl ToolExecutor {
                 }
             }
         }
-        self.execute_run(name, args).await.into_outcome()
+        self.execute_run(name, args, invocation)
+            .await
+            .into_outcome()
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
         self.consume_activated_deferred_tool_if_called(name);
-        self.execute_run(name, args).await.output
+        self.execute_run(
+            name,
+            args,
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+        )
+        .await
+        .output
     }
 
-    async fn execute_run(&self, name: &str, args: &Value) -> EdgeToolRun {
+    async fn execute_run(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+    ) -> EdgeToolRun {
         if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
             let evidence = error.failure_evidence();
             return EdgeToolRun::failure_evidence(format!("Error: {error}"), evidence);
@@ -5106,7 +5178,9 @@ impl ToolExecutor {
             return EdgeToolRun::failure_evidence(error.message, error.evidence);
         }
         let mut tool_result_fields = None;
-        let output = self.execute_raw(name, args, &mut tool_result_fields).await;
+        let output = self
+            .execute_raw(name, args, invocation, &mut tool_result_fields)
+            .await;
         let embedded_work_observation = embedded_work_unit_observation(&output);
         // Structural error propagation: `execute_raw` returns a plain String,
         // discarding any structured error kind at the source. Recover it here
@@ -5141,6 +5215,7 @@ impl ToolExecutor {
         &self,
         name: &str,
         args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
     ) -> String {
         let output = if let Err(error) =
@@ -5544,7 +5619,10 @@ impl ToolExecutor {
                         }
                     }
                 }
-                "task_board" => self.execute_task_tool_args(args).await,
+                "task_board" => {
+                    self.execute_task_tool_args(args, invocation.tool_call_id)
+                        .await
+                }
                 "task_output" => self.task_output_with_fields(args, tool_result_fields).await,
                 "task_stop" => self.task_kill_bg(args).await,
                 "task_list" => self.task_list_bg().await,

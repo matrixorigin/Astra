@@ -3592,11 +3592,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else {
                 let _pending_tool_request_guard =
                     crate::cli::edge_lifecycle::PendingToolRequestGuard::acquire();
-                let execution_args = args_with_runtime_tool_call_id(tool, args, request_id);
-                let mut outcome = execute_with_metadata_responsive(
+                let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+                    tool_call_id: Some(request_id),
+                    ..Default::default()
+                };
+                let mut outcome = execute_with_invocation_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
                     tool.to_string(),
-                    execution_args,
+                    args.clone(),
+                    invocation,
                     self.cancel_token.cloned(),
                 )
                 .await;
@@ -3783,10 +3787,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         "post-approval expansion rejected: {e}"
                                     );
                                 }
-                                outcome = execute_with_metadata_responsive(
+                                outcome = execute_with_invocation_metadata_responsive(
                                     std::sync::Arc::clone(&self.executor),
                                     tool.to_string(),
                                     args.clone(),
+                                    invocation,
                                     self.cancel_token.cloned(),
                                 )
                                 .await;
@@ -4457,14 +4462,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // (it lives only for this batch), so acquire() won't fail; the
                         // `ok()` fallback is defensive.
                         let _permit = sem.acquire_owned().await.ok();
-                        let execution_args =
-                            args_with_runtime_tool_call_id(&tool, &effective_args, &request_id);
-                        let exec = catch_tool_execution_panic(execute_with_metadata_responsive(
-                            std::sync::Arc::clone(&executor),
-                            tool.clone(),
-                            execution_args,
-                            cancel_token_for_tool,
-                        ));
+                        let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+                            tool_call_id: Some(&request_id),
+                            ..Default::default()
+                        };
+                        let exec = catch_tool_execution_panic(
+                            execute_with_invocation_metadata_responsive(
+                                std::sync::Arc::clone(&executor),
+                                tool.clone(),
+                                effective_args.clone(),
+                                invocation,
+                                cancel_token_for_tool,
+                            ),
+                        );
                         let (outcome, dur) = if let Some(token) = cancel_token {
                             tokio::select! {
                                 biased;
@@ -4669,12 +4679,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if let Some(pm) = &mut self.perm_manager {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
             }
-            let execution_args = args_with_runtime_tool_call_id(&tool, &args, &req.request_id);
             let (retried, retry_dur) =
-                catch_tool_execution_panic(execute_with_metadata_responsive(
+                catch_tool_execution_panic(execute_with_invocation_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
                     tool.clone(),
-                    execution_args,
+                    args,
+                    astra_tools::tool_engine::ToolInvocationMetadata {
+                        tool_call_id: Some(&req.request_id),
+                        ..Default::default()
+                    },
                     self.cancel_token.cloned(),
                 ))
                 .await;
@@ -4888,11 +4901,14 @@ fn build_streaming_tool_exec(
                         other => other.clone(),
                     })
                     .unwrap_or_else(|| serde_json::json!({}));
-                let execution_args = args_with_runtime_tool_call_id(&tool_name, &args, &call_id);
-                let outcome = execute_with_metadata_responsive(
+                let outcome = execute_with_invocation_metadata_responsive(
                     executor,
                     tool_name.clone(),
-                    execution_args,
+                    args,
+                    astra_tools::tool_engine::ToolInvocationMetadata {
+                        tool_call_id: Some(&call_id),
+                        ..Default::default()
+                    },
                     None,
                 )
                 .await;
@@ -4902,23 +4918,6 @@ fn build_streaming_tool_exec(
     Some(std::sync::Arc::new(
         astra_turn_core::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
     ))
-}
-
-/// Attach caller-owned execution identity only to tools whose runtime contract
-/// explicitly accepts private fields.  Public model arguments remain unchanged
-/// for permission checks, hooks, rendering, and deduplication.
-fn args_with_runtime_tool_call_id(tool: &str, args: &Value, tool_call_id: &str) -> Value {
-    if tool != astra_tools::task_tool_contract::TASK_BOARD_TOOL_NAME {
-        return args.clone();
-    }
-    let mut execution_args = args.clone();
-    if let Some(object) = execution_args.as_object_mut() {
-        object.insert(
-            "_tool_call_id".to_string(),
-            Value::String(tool_call_id.to_string()),
-        );
-    }
-    execution_args
 }
 
 // ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
@@ -6328,6 +6327,23 @@ pub(crate) async fn execute_with_metadata_responsive(
     args: Value,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> crate::edge_tools::ToolExecutionOutcome {
+    execute_with_invocation_metadata_responsive(
+        executor,
+        tool_name,
+        args,
+        astra_tools::tool_engine::ToolInvocationMetadata::default(),
+        cancel_token,
+    )
+    .await
+}
+
+pub(crate) async fn execute_with_invocation_metadata_responsive(
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
+    tool_name: String,
+    args: Value,
+    invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+) -> crate::edge_tools::ToolExecutionOutcome {
     if tool_name == "bash"
         && let Some(outcome) = executor
             .bash_detachable_with_metadata(&args, cancel_token.as_ref())
@@ -6338,7 +6354,12 @@ pub(crate) async fn execute_with_metadata_responsive(
 
     if !should_offload_blocking_tool(&tool_name) {
         return executor
-            .execute_with_metadata_cancelable(&tool_name, &args, cancel_token.as_ref())
+            .execute_with_invocation_metadata_cancelable(
+                &tool_name,
+                &args,
+                invocation,
+                cancel_token.as_ref(),
+            )
             .await;
     }
 
@@ -6366,7 +6387,12 @@ pub(crate) async fn execute_with_metadata_responsive(
         // unreachable; fall back to the async path defensively.
         Ok(None) => {
             executor
-                .execute_with_metadata_cancelable(&tool_name, &args, cancel_token.as_ref())
+                .execute_with_invocation_metadata_cancelable(
+                    &tool_name,
+                    &args,
+                    invocation,
+                    cancel_token.as_ref(),
+                )
                 .await
         }
         Err(join_error) => crate::edge_tools::ToolExecutionOutcome::error(format!(
@@ -6835,14 +6861,14 @@ mod tests {
         append_skill_loaded_marker, apply_edge_auth_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
-        args_with_runtime_tool_call_id, catch_tool_execution_panic, dispatch_turn_event_block,
-        edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
-        extract_cli_diff_block, format_terminal_tool_summary, format_tool_display_from_preview,
-        is_edge_auth_failure, merge_edge_tool_rounds, normalize_sandbox_denied_outcome,
-        path_mtime_ms, reusable_speculative_output, sanitize_final_stream_text,
-        style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
-        task_preview_from_args, theme, tool_completion_icon, tool_dedup_signature,
-        tool_output_event_text, turn_has_tool_work,
+        catch_tool_execution_panic, dispatch_turn_event_block, edge_tool_is_cacheable_read,
+        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
+        execute_with_metadata_responsive, extract_cli_diff_block, format_terminal_tool_summary,
+        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
+        normalize_sandbox_denied_outcome, path_mtime_ms, reusable_speculative_output,
+        sanitize_final_stream_text, style_tool_description, sync_incremental_accum_state,
+        sync_incremental_tool_result_state, task_preview_from_args, theme, tool_completion_icon,
+        tool_dedup_signature, tool_output_event_text, turn_has_tool_work,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -6910,19 +6936,80 @@ mod tests {
         assert!(RenderPolicy::Silent.suppress_final_text());
     }
 
-    #[test]
-    fn runtime_call_identity_is_attached_only_to_task_board_execution() {
-        let public = serde_json::json!({"action": "create", "title": "ship"});
-        let task_args = args_with_runtime_tool_call_id("task_board", &public, "call-1");
-        assert_eq!(task_args["_tool_call_id"], "call-1");
-        assert!(public.get("_tool_call_id").is_none());
-
-        let bash_args = args_with_runtime_tool_call_id(
-            "bash",
-            &serde_json::json!({"command": "echo ok"}),
-            "call-2",
+    #[tokio::test]
+    async fn task_board_invocation_identity_stays_outside_public_schema_and_reaches_transport() {
+        let server = MockServer::start().await;
+        let request_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observed_keys = std::sync::Arc::clone(&request_keys);
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/todos:execute"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("request json");
+                assert_eq!(
+                    body["args"],
+                    serde_json::json!({
+                        "action": "create",
+                        "title": "ship"
+                    })
+                );
+                let key = body["idempotency_key"]
+                    .as_str()
+                    .expect("create idempotency key")
+                    .to_string();
+                observed_keys.lock().expect("request keys").push(key);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "output": "created",
+                    "mutation": {
+                        "status": "applied",
+                        "data": {"task_id": "task-1"}
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+        let dir = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(dir.path())
+                .with_cloud(server.uri(), "token")
+                .with_active_session_id("session-1"),
         );
-        assert!(bash_args.get("_tool_call_id").is_none());
+        let public_args = serde_json::json!({"action": "create", "title": "ship"});
+
+        let outcome = execute_with_invocation_metadata_responsive(
+            std::sync::Arc::clone(&executor),
+            "task_board".to_string(),
+            public_args.clone(),
+            astra_tools::tool_engine::ToolInvocationMetadata {
+                tool_call_id: Some("call-1"),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+
+        assert!(!outcome.is_error, "{}", outcome.output);
+        assert_eq!(outcome.output, "created");
+
+        let replay = execute_with_invocation_metadata_responsive(
+            executor,
+            "task_board".to_string(),
+            public_args.clone(),
+            astra_tools::tool_engine::ToolInvocationMetadata {
+                tool_call_id: Some("call-1"),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+
+        assert!(!replay.is_error, "{}", replay.output);
+        let keys = request_keys.lock().expect("request keys");
+        assert_eq!(keys.len(), 2, "one HTTP request per logical execution");
+        assert_eq!(
+            keys[0], keys[1],
+            "replaying the same tool-call identity must reuse its idempotency key"
+        );
+        assert!(public_args.get("_tool_call_id").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

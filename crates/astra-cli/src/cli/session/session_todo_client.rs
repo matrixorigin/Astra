@@ -165,7 +165,7 @@ pub async fn execute_todo_action(
     action: &str,
     args: &Value,
 ) -> Result<String, String> {
-    execute_todo_request(cloud_base, token, session_id, action, args)
+    execute_todo_request(cloud_base, token, session_id, action, args, None)
         .await
         .map(|response| response.output)
 }
@@ -178,8 +178,9 @@ pub(crate) async fn execute_todo_action_typed(
     session_id: &str,
     action: &str,
     args: &Value,
+    tool_call_id: Option<&str>,
 ) -> Result<ExecuteTodoResponse, String> {
-    execute_todo_request(cloud_base, token, session_id, action, args).await
+    execute_todo_request(cloud_base, token, session_id, action, args, tool_call_id).await
 }
 
 async fn execute_todo_request(
@@ -188,25 +189,24 @@ async fn execute_todo_request(
     session_id: &str,
     action: &str,
     args: &Value,
+    tool_call_id: Option<&str>,
 ) -> Result<ExecuteTodoResponse, String> {
     let url = format!(
         "{}/sessions/{}/todos:execute",
         cloud_base.trim_end_matches('/'),
         session_id
     );
-    // Runtime-only fields carry execution identity and observability context;
-    // they are not part of the public task-board contract and must never cross
-    // the REST boundary as task data.  The call id still gives create a stable
-    // idempotency identity, so a lost response followed by replay cannot create
-    // a duplicate task.  Direct callers without a runtime identity retain the
-    // old per-invocation UUID behavior, which deliberately does not collapse
-    // two legitimate tasks merely because their public fields are identical.
+    // Model/provider arguments stay public-schema-pure. Trusted invocation
+    // identity travels beside them and is used only for transport concerns
+    // such as idempotency. Direct callers without an invocation identity retain
+    // per-invocation UUID behavior, which deliberately does not collapse two
+    // legitimate tasks merely because their public fields are identical.
     let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
     let body = if action == "create" {
         json!({
             "action": action,
             "args": public_args,
-            "idempotency_key": todo_create_idempotency_key(session_id, args),
+            "idempotency_key": todo_create_idempotency_key(session_id, tool_call_id),
         })
     } else {
         json!({ "action": action, "args": public_args })
@@ -251,13 +251,8 @@ async fn execute_todo_request(
     Err("execute_todo_action: retry loop exhausted".to_string())
 }
 
-fn todo_create_idempotency_key(session_id: &str, args: &Value) -> String {
-    let Some(tool_call_id) = args
-        .get("_tool_call_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
+fn todo_create_idempotency_key(session_id: &str, tool_call_id: Option<&str>) -> String {
+    let Some(tool_call_id) = tool_call_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return format!("todo-create:{}", uuid::Uuid::new_v4());
     };
 
@@ -288,6 +283,7 @@ pub(crate) async fn copy_todos_for_fork(
         &json!({
             "source_session_id": source_session_id,
         }),
+        None,
     )
     .await?;
     let result = response.fork_copy.ok_or_else(|| {
@@ -643,34 +639,27 @@ impl TaskStore for HttpTaskStore {
 #[cfg(test)]
 mod tests {
     use super::todo_create_idempotency_key;
-    use serde_json::json;
 
     #[test]
     fn create_idempotency_uses_stable_runtime_execution_identity() {
-        let args = json!({
-            "action": "create",
-            "title": "ship",
-            "_tool_call_id": "call-1"
-        });
-        let first = todo_create_idempotency_key("session-1", &args);
-        let replay = todo_create_idempotency_key("session-1", &args);
+        let first = todo_create_idempotency_key("session-1", Some("call-1"));
+        let replay = todo_create_idempotency_key("session-1", Some("call-1"));
         assert_eq!(first, replay);
-        assert_ne!(first, todo_create_idempotency_key("session-2", &args));
-
-        let other_call = json!({
-            "action": "create",
-            "title": "ship",
-            "_tool_call_id": "call-2"
-        });
-        assert_ne!(first, todo_create_idempotency_key("session-1", &other_call));
+        assert_ne!(
+            first,
+            todo_create_idempotency_key("session-2", Some("call-1"))
+        );
+        assert_ne!(
+            first,
+            todo_create_idempotency_key("session-1", Some("call-2"))
+        );
     }
 
     #[test]
     fn equal_public_creates_without_execution_identity_remain_distinct() {
-        let args = json!({"action": "create", "title": "ship"});
         assert_ne!(
-            todo_create_idempotency_key("session-1", &args),
-            todo_create_idempotency_key("session-1", &args)
+            todo_create_idempotency_key("session-1", None),
+            todo_create_idempotency_key("session-1", None)
         );
     }
 }
@@ -704,7 +693,7 @@ mod tests {
 mod wiring_e2e {
     use super::{
         ForkTaskBoardCopyStatus, HttpTaskStore, copy_todos_for_fork, execute_todo_action,
-        health_for_http_status, list_user_todos,
+        execute_todo_action_typed, health_for_http_status, list_user_todos,
     };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::lock_recovery::LockRecovery;
@@ -1159,11 +1148,9 @@ mod wiring_e2e {
         let server = MockServer::start().await;
         let args = json!({
             "action": "create",
-            "title": "ship",
-            "_tool_call_id": "call-create-1",
-            "_run_id": "run-1"
+            "title": "ship"
         });
-        let expected_key = super::todo_create_idempotency_key("session-1", &args);
+        let expected_key = super::todo_create_idempotency_key("session-1", Some("call-create-1"));
         Mock::given(method("POST"))
             .and(path("/sessions/session-1/todos:execute"))
             .respond_with(move |request: &Request| {
@@ -1183,10 +1170,17 @@ mod wiring_e2e {
             .mount(&server)
             .await;
 
-        let output = execute_todo_action(&server.uri(), None, "session-1", "create", &args)
-            .await
-            .expect("create request");
-        assert_eq!(output, "created");
+        let response = execute_todo_action_typed(
+            &server.uri(),
+            None,
+            "session-1",
+            "create",
+            &args,
+            Some("call-create-1"),
+        )
+        .await
+        .expect("create request");
+        assert_eq!(response.output, "created");
     }
 
     #[tokio::test]

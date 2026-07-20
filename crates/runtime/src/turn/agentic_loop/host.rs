@@ -966,10 +966,11 @@ pub struct SkillState {
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type hint from the most recently activated skill.
     pub agent_type: Option<String>,
-    /// Tool allow-list from the most recently activated skill.
-    /// This is enforced only by runtime tool interception. Hosts must not use
-    /// it to prune prompt-visible tool schemas, because that would churn the
-    /// provider prompt-cache prefix every time a skill is loaded.
+    /// Tool guidance from the most recently activated skill.
+    /// This does not override request policy or prune prompt-visible schemas;
+    /// changing the schema set after activation would churn the provider
+    /// prompt-cache prefix. The inline skill result exposes the guidance to the
+    /// model while request constraints remain the authorization boundary.
     pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.

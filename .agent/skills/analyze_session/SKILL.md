@@ -21,6 +21,10 @@ allowed_tools:
 
 Use machine-generated evidence first. `astra journal digest` is the primary source;
 raw JSONL parsing is a fallback only when digest is unavailable or missing a field.
+Before synthesizing session metrics or causes, run the digest command for the
+resolved session. Generic reflection/introspection output does not satisfy this
+evidence boundary. If no executable can produce a digest, report that limitation
+instead of estimating or filling in metrics.
 
 ## Task
 

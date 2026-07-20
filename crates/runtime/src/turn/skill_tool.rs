@@ -743,6 +743,24 @@ pub fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
     format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
 }
 
+fn declared_skill_tool_guidance(allowed_tools: &[String]) -> Option<String> {
+    let mut tools = astra_turn_core::tool_allowlist::normalize_tool_names(allowed_tools)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if tools.is_empty() {
+        return None;
+    }
+    tools.sort();
+    Some(format!(
+        "Declared workflow tools: {}. Prefer this set for the skill's normal path. This is workflow guidance, not an authorization boundary; other available tools may still be used when needed for recovery or verification.",
+        tools
+            .iter()
+            .map(|tool| format!("`{tool}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 // ─── Skill execution ─────────────────────────────────────────────────────────
 
 /// Activation effects from a skill invocation.
@@ -753,8 +771,9 @@ pub fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 pub struct SkillActivation {
     /// Model override for subsequent turns (e.g. `"claude-sonnet-4-20250514"`).
     pub model_override: Option<String>,
-    /// Tool allow-list — only these tools should be available.
-    /// Empty means no restriction (all tools allowed).
+    /// Tools declared by the skill for its normal workflow.
+    /// This is model guidance and nested-execution configuration, not a new
+    /// authorization boundary for the current turn. Empty means no guidance.
     pub allowed_tools: Vec<String>,
     /// Effort level override for subsequent turns.
     pub effort: Option<EffortLevel>,
@@ -1964,11 +1983,15 @@ fn execute_skill<'a>(
                 let mut output = format!(
                     "# Skill: {}\n\n\
                  You are now executing the **{}** skill. \
-                 Follow the instructions below carefully.\n\n\
-                 ---\n\n\
-                 {}",
-                    skill.name, skill.name, instructions
+                 Follow the instructions below carefully.",
+                    skill.name, skill.name
                 );
+                if let Some(guidance) = declared_skill_tool_guidance(&skill.allowed_tools) {
+                    output.push_str("\n\n");
+                    output.push_str(&guidance);
+                }
+                output.push_str("\n\n---\n\n");
+                output.push_str(&instructions);
 
                 if !task_hint.is_empty() {
                     output.push_str(&format!("\n\n---\n\n**Task context:** {}", task_hint));
@@ -4004,12 +4027,18 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        // allowed_tools must NOT appear as restrictive text in the prompt
+        // The declaration is visible as workflow feedback, without turning a
+        // skill hint into a new authorization boundary.
         assert!(
             !r.output.contains("Allowed tools"),
             "skill output must not contain restrictive 'Allowed tools' hint"
         );
-        // activation carries allowed_tools for additive schema injection
+        assert!(
+            r.output
+                .contains("Declared workflow tools: `bash`, `read_file`")
+        );
+        assert!(r.output.contains("not an authorization boundary"));
+        // Activation retains the typed declaration for hosts and nested runs.
         let act = r.activation.unwrap();
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
         assert!(act.model_override.is_none());

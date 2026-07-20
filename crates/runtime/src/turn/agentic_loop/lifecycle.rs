@@ -2911,6 +2911,12 @@ mod tests {
         assert!(
             state.tool_results[0]["result"]
                 .as_str()
+                .is_some_and(|content| content.contains("Declared workflow tools: `read_file`")),
+            "auto-routed skills must expose their typed workflow guidance at the model boundary"
+        );
+        assert!(
+            state.tool_results[0]["result"]
+                .as_str()
                 .is_some_and(|content| {
                     content.contains(
                         "only these request-allowlisted non-skill tools are callable: read_file",
