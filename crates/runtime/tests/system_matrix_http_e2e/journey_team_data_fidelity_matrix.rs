@@ -17,7 +17,7 @@ fn fidelity_team_payload(name: &str) -> Value {
                 "role": "coder",
                 "system_prompt": "Do coding",
                 "skills": ["read"],
-                "model_override": null,
+                "model_selection": null,
                 "mcp_servers": [],
                 "agent_id": null,
                 "can_delegate": false,

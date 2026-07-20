@@ -17,10 +17,10 @@ pub mod protocol;
 pub mod sse;
 
 pub use astra_server_types::{
-    CompletionChoice, CompletionMessage, CompletionRequest, CompletionResponse, CompletionUsage,
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
-    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
-    SessionRunTreeSnapshot,
+    CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
+    CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
+    SessionRunCapabilityServerRefs, SessionRunLifecycleStatus, SessionRunNode,
+    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 pub use client::ThinClient;
 pub use edge::{

@@ -247,7 +247,7 @@ pub use models::{
     ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService, project_model_access,
     prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
     resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
-    validate_model_offering_id,
+    revalidate_active_llm_offering, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,

@@ -35,7 +35,6 @@ pub struct SkillCheckpoint {
     /// Task context passed to the skill
     pub task_context: String,
     /// Model override (if any)
-    pub model_override: Option<String>,
     /// Max tokens budget
     pub max_tokens: Option<u32>,
     /// Allowed tools for the skill
@@ -220,7 +219,6 @@ impl SkillCheckpointManager {
             skill_name: skill_name.to_string(),
             instructions: String::new(),
             task_context: String::new(),
-            model_override: None,
             max_tokens: None,
             allowed_tools: Vec::new(),
             effort: None,
@@ -259,7 +257,6 @@ impl SkillCheckpointManager {
             skill_name: skill_name.to_string(),
             instructions: String::new(),
             task_context: String::new(),
-            model_override: None,
             max_tokens: None,
             allowed_tools: Vec::new(),
             effort: None,
@@ -363,7 +360,6 @@ mod tests {
             skill_name: "test-skill".to_string(),
             instructions: "Test instructions".to_string(),
             task_context: "Test task".to_string(),
-            model_override: Some("claude-3-sonnet".to_string()),
             max_tokens: Some(4096),
             allowed_tools: vec!["bash".to_string(), "read_file".to_string()],
             effort: Some("high".to_string()),
@@ -402,7 +398,6 @@ mod tests {
             skill_name: "resumable-skill".to_string(),
             instructions: String::new(),
             task_context: String::new(),
-            model_override: None,
             max_tokens: None,
             allowed_tools: Vec::new(),
             effort: None,
@@ -444,7 +439,6 @@ mod tests {
             skill_name: "progress-skill".to_string(),
             instructions: String::new(),
             task_context: String::new(),
-            model_override: None,
             max_tokens: None,
             allowed_tools: Vec::new(),
             effort: None,
@@ -543,7 +537,6 @@ mod tests {
             skill_name: "running".to_string(),
             instructions: String::new(),
             task_context: String::new(),
-            model_override: None,
             max_tokens: None,
             allowed_tools: Vec::new(),
             effort: None,

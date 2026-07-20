@@ -10774,7 +10774,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut profile =
             AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
-        profile.model_override = config.model.clone();
+        profile.model_selection = None;
         profile.skill_filter = config.allowed_tools.clone();
         profile.metadata.insert(
             "spawn_agent_type".to_string(),
@@ -11079,7 +11079,11 @@ impl ServerSubRunExecutor {
         self.run_engine.clone()
     }
 
-    async fn ensure_durable_subrun_started(&self, config: &SubRunConfig) -> Result<(), String> {
+    async fn ensure_durable_subrun_started(
+        &self,
+        config: &SubRunConfig,
+        execution: Option<&astra_services::AdmittedModelExecution>,
+    ) -> Result<(), String> {
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok(());
         };
@@ -11101,17 +11105,13 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     agent_binding_name: Some(config.agent_profile.name.clone()),
-                    model_selection: config.admitted_model_execution.as_ref().map(|execution| {
-                        ModelSelection {
-                            offering_id: execution.offering_id.clone(),
-                        }
+                    model_selection: execution.map(|execution| ModelSelection {
+                        offering_id: execution.offering_id.clone(),
                     }),
-                    resolved_model_selection: config.admitted_model_execution.as_ref().map(
-                        |execution| ResolvedModelSelection {
-                            offering_id: execution.offering_id.clone(),
-                            model_name: execution.model_name.clone(),
-                        },
-                    ),
+                    resolved_model_selection: execution.map(|execution| ResolvedModelSelection {
+                        offering_id: execution.offering_id.clone(),
+                        model_name: execution.model_name.clone(),
+                    }),
                     ..Default::default()
                 },
             )
@@ -11121,10 +11121,10 @@ impl ServerSubRunExecutor {
     async fn materialize_durable_subrun_execution(
         &self,
         config: &SubRunConfig,
+        selected_execution: Option<&astra_services::AdmittedModelExecution>,
     ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
-        let inherited_execution = config
-            .admitted_model_execution
-            .as_ref()
+        let inherited_execution = selected_execution
+            .or(config.admitted_model_execution.as_ref())
             .or(self.admitted_model_execution.as_ref());
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok(inherited_execution.cloned());
@@ -11165,6 +11165,28 @@ impl ServerSubRunExecutor {
                     .to_string(),
             );
         }
+        astra_services::AdmittedModelExecution::from_offering(offering).map(Some)
+    }
+
+    async fn select_subrun_execution(
+        &self,
+        config: &SubRunConfig,
+    ) -> Result<Option<astra_services::AdmittedModelExecution>, String> {
+        let Some(selection) = config.agent_profile.model_selection.as_ref() else {
+            return Ok(config
+                .admitted_model_execution
+                .as_ref()
+                .or(self.admitted_model_execution.as_ref())
+                .cloned());
+        };
+        let offering = astra_services::revalidate_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &selection.offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         astra_services::AdmittedModelExecution::from_offering(offering).map(Some)
     }
 
@@ -11331,8 +11353,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
         };
         use astra_turn_core::turn_guard::TurnGuard;
 
-        self.ensure_durable_subrun_started(&config).await?;
-        let admitted_model_execution = self.materialize_durable_subrun_execution(&config).await?;
+        let selected_execution = self.select_subrun_execution(&config).await?;
+        self.ensure_durable_subrun_started(&config, selected_execution.as_ref())
+            .await?;
+        let admitted_model_execution = self
+            .materialize_durable_subrun_execution(&config, selected_execution.as_ref())
+            .await?;
+        let child_model_name = admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.model_name.clone());
         if let Some(sink) = config.live_event_sink.as_ref()
             && let Err(error) = sink.send(AgentLiveEvent {
                 run_id: config.run_id.clone(),
@@ -11398,7 +11427,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         // Build edge profile from agent's system prompt and metadata.
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            config.agent_profile.model_override.as_deref().unwrap_or(""),
+            child_model_name.as_deref().unwrap_or(""),
         );
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
@@ -11407,7 +11436,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Value::String(prompt.clone()),
             );
         }
-        if let Some(model) = &config.agent_profile.model_override {
+        if let Some(model) = &child_model_name {
             edge_profile.insert("model".to_string(), Value::String(model.clone()));
         }
         edge_profile.insert(
@@ -11435,7 +11464,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.user_id.clone(),
             config.session_id.clone(),
         )
-        .with_model(config.agent_profile.model_override.clone())
+        .with_model(child_model_name.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
@@ -11538,7 +11567,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // override, not a request field.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
-            .resolve_for_model(config.agent_profile.model_override.as_deref());
+            .resolve_for_model(child_model_name.as_deref());
         let permission_context = PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         let mut loop_state = AgenticLoopState {
@@ -11552,7 +11581,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: Some(config.user_id.clone()),
-            context_manifest_model_name: config.agent_profile.model_override.clone(),
+            context_manifest_model_name: child_model_name.clone(),
             runtime_manifest: None,
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
@@ -11818,7 +11847,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     run_id: config.run_id.clone(),
                     agent_id: config.agent_profile.agent_id.clone(),
                     delegation_chain: config.delegation_chain.clone(),
-                    current_model: config.agent_profile.model_override.clone(),
+                    current_model: child_model_name.clone(),
                     recursion_depth: config.recursion_depth,
                     is_fork_child: config.inherited_prefix.is_some(),
                     working_dir: agent_working_dir,
@@ -11933,7 +11962,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             trace_context_from_subrun_context(&config.context),
             &config.task,
             &loop_state,
-            config.agent_profile.model_override.as_deref(),
+            child_model_name.as_deref(),
         )
         .await;
         persist_server_loop_trace_events(
@@ -11950,7 +11979,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .and_then(Value::as_str),
             trace_context_from_subrun_context(&config.context),
             &loop_state,
-            config.agent_profile.model_override.as_deref(),
+            child_model_name.as_deref(),
         )
         .await;
         let committed_assistant = match persist_server_loop_transcript_items(

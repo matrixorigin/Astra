@@ -431,9 +431,6 @@ pub(crate) async fn handle_skill_command(
                     if let Some(ref author) = m.author {
                         eprintln!("  {:<16} {}", "Author:".dim(), author);
                     }
-                    if let Some(ref model) = m.model {
-                        eprintln!("  {:<16} {}", "Model:".dim(), model);
-                    }
                     if let Some(max_tok) = m.max_tokens {
                         eprintln!("  {:<16} {}", "Max tokens:".dim(), max_tok);
                     }

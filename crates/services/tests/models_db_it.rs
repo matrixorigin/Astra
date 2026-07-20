@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelOfferingResolutionError, ModelService,
-    resolve_active_llm_offering,
+    resolve_active_llm_offering, revalidate_active_llm_offering,
 };
 use axum::http::StatusCode;
 use serial_test::serial;
@@ -130,6 +130,20 @@ async fn effective_offering_resolution_is_exact_active_and_secret_safe() {
     assert_eq!(admitted.offering_id, offering_id);
     assert_eq!(admitted.model.model_name, model_name);
 
+    let rotated_key = encryptor
+        .encrypt("rotated-offering-secret")
+        .expect("encrypt rotated API key");
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(rotated_key)
+        .bind(&offering_id)
+        .execute(&pool)
+        .await
+        .expect("rotate Offering credential without process-local cache invalidation");
+    let rotated = revalidate_active_llm_offering(&settings, &encryptor, &offering_id, Some(&pool))
+        .await
+        .expect("provider request boundary must materialize current route data");
+    assert_eq!(rotated.model.api_key, "rotated-offering-secret");
+
     let error = resolve_active_llm_offering(&settings, &encryptor, &model_name, Some(&pool))
         .await
         .expect_err("model display/name must not act as Offering identity");
@@ -140,13 +154,12 @@ async fn effective_offering_resolution_is_exact_active_and_secret_safe() {
         }
     );
 
-    astra_services::models::invalidate_active_llm_model_resolution_cache();
     sqlx::query("UPDATE infra_llm_models SET is_active = 0 WHERE model_id = ?")
         .bind(&offering_id)
         .execute(&pool)
         .await
         .expect("disable Offering fixture");
-    let error = resolve_active_llm_offering(&settings, &encryptor, &offering_id, Some(&pool))
+    let error = revalidate_active_llm_offering(&settings, &encryptor, &offering_id, Some(&pool))
         .await
         .expect_err("disabled Offering must fail closed");
     assert_eq!(

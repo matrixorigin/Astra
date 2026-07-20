@@ -929,7 +929,10 @@ impl ThinClient {
             .http
             .post(url)
             .headers(Self::bearer_headers(token)?)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(
+                std::time::Duration::from_millis(request.timeout_ms)
+                    .saturating_add(std::time::Duration::from_secs(5)),
+            )
             .json(request)
             .send()
             .await?;
@@ -1967,14 +1970,11 @@ mod tests {
     async fn wiremock_completion_uses_typed_scope_and_decodes_typed_response() {
         let srv = MockServer::start().await;
         let mut request = astra_server_types::CompletionRequest::new(
-            astra_turn_types::InferencePurpose::MemoryExtraction,
-            astra_turn_types::InferenceInvocationScope::Session {
-                session_id: "session-1".to_string(),
-                turn: 3,
-                round: 1,
-                operation_id: "memory_extraction".to_string(),
-                logical_attempt: 0,
-            },
+            astra_server_types::CompletionOperation::MemoryExtraction,
+            "session-1",
+            3,
+            1,
+            0,
             vec![serde_json::json!({"role": "user", "content": "summarize"})],
         )
         .with_offering_id("offer-memory");

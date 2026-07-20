@@ -228,6 +228,7 @@ impl AgentTier {
 
 /// Extended profile for an agent participating in multi-agent coordination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentProfile {
     /// Unique agent identifier.
     pub agent_id: String,
@@ -240,8 +241,9 @@ pub struct AgentProfile {
     /// Filter limiting which skills/tools this agent can use.
     /// Empty = unrestricted.
     pub skill_filter: Vec<String>,
-    /// Model override (e.g., "gpt-4o", "claude-3-opus").
-    pub model_override: Option<String>,
+    /// Optional product-level Offering selected for this agent.
+    /// Absence means the child inherits its parent's admitted Offering.
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
     /// Whether this agent can delegate tasks to sub-agents.
     pub can_delegate: bool,
     /// Explicit list of agent IDs this agent may delegate to.
@@ -266,7 +268,7 @@ impl AgentProfile {
             tier,
             system_prompt: None,
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: tier != AgentTier::User,
             delegate_to: Vec::new(),
             max_delegation_depth: match tier {
@@ -839,6 +841,37 @@ pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_profile_selects_an_offering_not_a_provider_model_name() {
+        let mut profile = AgentProfile::new("reviewer", "Reviewer", AgentTier::User);
+        profile.model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offer-review".to_string(),
+        });
+
+        let encoded = serde_json::to_value(&profile).expect("serialize agent profile");
+        assert_eq!(encoded["model_selection"]["offering_id"], "offer-review");
+        assert!(encoded.get("model_override").is_none());
+
+        let legacy = serde_json::json!({
+            "agent_id": "reviewer",
+            "name": "Reviewer",
+            "tier": "user",
+            "system_prompt": null,
+            "skill_filter": [],
+            "model_override": "provider-model",
+            "can_delegate": false,
+            "delegate_to": [],
+            "max_delegation_depth": 0,
+            "triggers": [],
+            "metadata": {},
+            "mcp_servers": []
+        });
+        assert!(
+            serde_json::from_value::<AgentProfile>(legacy).is_err(),
+            "bare model names must not be silently accepted at an Offering boundary"
+        );
+    }
 
     fn orchestrator() -> AgentProfile {
         AgentProfile::new("orch-1", "Orchestrator", AgentTier::Orchestrator)

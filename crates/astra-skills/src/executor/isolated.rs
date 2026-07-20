@@ -1,7 +1,7 @@
 //! Isolated (fork) skill executor — runs skills in a separate sub-agent loop.
 //!
 //! Skills with `context: fork` or `isolated: true` are executed in their own
-//! context window with a separate token budget, tool set, and model override.
+//! context window with a separate token budget and tool set.
 //! Only the summarized result returns to the parent conversation.
 //!
 //! The actual sub-run execution is delegated to a [`SkillSubRunExecutor`] which
@@ -42,7 +42,6 @@ pub trait SkillSubRunExecutor: Send + Sync {
         skill_name: &str,
         instructions: &str,
         task_context: &str,
-        model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
         parent_recursion_depth: u8,
@@ -154,7 +153,6 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 skill_name: skill.manifest.name.clone(),
                 instructions: skill.instructions.clone(),
                 task_context: context.task.clone(),
-                model_override: skill.manifest.model.clone(),
                 max_tokens: skill.manifest.max_tokens,
                 allowed_tools: skill.manifest.allowed_tools.clone(),
                 effort: skill.manifest.effort.as_ref().map(|e| e.to_string()),
@@ -182,7 +180,6 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 &skill.manifest.name,
                 &skill.instructions,
                 &context.task,
-                skill.manifest.model.as_deref(),
                 skill.manifest.max_tokens,
                 &skill.manifest.allowed_tools,
                 context.recursion_depth,
@@ -256,18 +253,8 @@ impl SkillExecutor for IsolatedSkillExecutor {
 
         let formatted_output = format!(
             "## Skill Result: {}\n\n{}{}\n\n---\n\
-             *Executed in isolated sub-run: {} turns, {} tokens{}*",
-            skill.manifest.name,
-            result.output,
-            outcome_note,
-            result.turns,
-            result.tokens_used,
-            skill
-                .manifest
-                .model
-                .as_ref()
-                .map(|m| format!(", model: {m}"))
-                .unwrap_or_default(),
+             *Executed in isolated sub-run: {} turns, {} tokens*",
+            skill.manifest.name, result.output, outcome_note, result.turns, result.tokens_used,
         );
 
         Ok(SkillExecutionResult {
@@ -350,7 +337,6 @@ mod tests {
             skill_name: &str,
             _instructions: &str,
             task_context: &str,
-            _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
             _parent_recursion_depth: u8,
@@ -375,7 +361,6 @@ mod tests {
             _skill_name: &str,
             _instructions: &str,
             _task_context: &str,
-            _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
             _parent_recursion_depth: u8,
@@ -400,7 +385,6 @@ mod tests {
             manifest: SkillManifest {
                 name: "deep-review".into(),
                 execution_context: ExecutionContext::Fork,
-                model: Some("claude-sonnet-4-20250514".into()),
                 ..Default::default()
             },
             instructions: "Review everything.".into(),
@@ -418,7 +402,6 @@ mod tests {
         let result = executor.execute(&skill, &context).await.unwrap();
         assert!(result.output.contains("## Skill Result: deep-review"));
         assert!(result.output.contains("3 turns, 500 tokens"));
-        assert!(result.output.contains("claude-sonnet-4-20250514"));
         assert_eq!(result.turns, 3);
         assert_eq!(result.tokens_used, 500);
     }
@@ -541,7 +524,6 @@ mod tests {
             _skill_name: &str,
             _instructions: &str,
             _task_context: &str,
-            _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
             _parent_recursion_depth: u8,
@@ -577,33 +559,6 @@ mod tests {
         assert!(matches!(err, SkillError::ExecutionFailed(_)));
     }
 
-    #[tokio::test]
-    async fn isolated_executor_no_model_omits_model_suffix_in_output() {
-        let executor = IsolatedSkillExecutor::new(Arc::new(MockSubRunExecutor));
-        let skill = LoadedSkill {
-            manifest: SkillManifest {
-                name: "no-model".into(),
-                execution_context: ExecutionContext::Fork,
-                model: None,
-                ..Default::default()
-            },
-            instructions: "Review.".into(),
-            instruction_tokens: 5,
-            resources: None,
-            skill_dir: None,
-        };
-
-        let context = SkillExecutionContext {
-            task: "test".into(),
-            arguments: HashMap::new(),
-            recursion_depth: 0,
-        };
-
-        let result = executor.execute(&skill, &context).await.unwrap();
-        // When no model is set, the ", model: X" suffix should be absent
-        assert!(!result.output.contains(", model:"));
-    }
-
     #[test]
     fn isolated_executor_supports_fork_only() {
         let executor = IsolatedSkillExecutor::new(Arc::new(MockSubRunExecutor));
@@ -634,7 +589,6 @@ mod tests {
             manifest: SkillManifest {
                 name: "forked".into(),
                 execution_context: ExecutionContext::Fork,
-                model: Some("test-model".into()),
                 ..Default::default()
             },
             instructions: "Fork instructions.".into(),
@@ -652,7 +606,6 @@ mod tests {
         let result = router.execute(&skill, &context).await.unwrap();
         // Should use isolated (## Skill Result) not inline (# Skill)
         assert!(result.output.contains("## Skill Result: forked"));
-        assert!(result.output.contains("test-model"));
     }
 
     // ── Effort/agent_type threading test ─────────────────────────────────
@@ -681,7 +634,6 @@ mod tests {
             _skill_name: &str,
             _instructions: &str,
             _task_context: &str,
-            _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
             parent_recursion_depth: u8,

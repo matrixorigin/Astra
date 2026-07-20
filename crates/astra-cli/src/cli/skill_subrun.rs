@@ -411,24 +411,8 @@ impl AgenticLoopHost for SubRunHost {
         // and makes soft runtime evidence look like user content.
         let runtime_volatile_injections = state.take_volatile_pending();
 
-        let effective_model = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model.as_deref());
-        let effective_offering_id = if effective_model == self.model.as_deref() {
-            self.offering_id.clone()
-        } else {
-            resolve_subrun_model_selection(&self.api, &self.token, effective_model)
-                .await
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::MissingModelSelection,
-                        error,
-                    )
-                })?
-                .offering_id
-        };
+        let effective_model = self.model.as_deref();
+        let effective_offering_id = self.offering_id.clone();
         let thinking = effective_model
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
@@ -760,7 +744,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         skill_name: &str,
         instructions: &str,
         task_context: &str,
-        model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
         parent_recursion_depth: u8,
@@ -771,9 +754,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
-        let effective_model = model
-            .map(String::from)
-            .or_else(|| self.default_model.clone());
+        let effective_model = self.default_model.clone();
         let model_selection =
             resolve_subrun_model_selection(&self.api, &self.token, effective_model.as_deref())
                 .await?;
@@ -1732,7 +1713,6 @@ mod tests {
                 "depth-test",
                 "Do work",
                 "task",
-                None,
                 None,
                 &allowed_tools,
                 astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,

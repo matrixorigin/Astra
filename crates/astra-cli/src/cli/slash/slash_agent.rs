@@ -2577,6 +2577,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "root-run".to_string(),
             parent_agent_id: "main".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(

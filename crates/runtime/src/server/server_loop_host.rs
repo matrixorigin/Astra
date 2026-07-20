@@ -504,7 +504,7 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
         .map(ToString::to_string)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
@@ -1987,6 +1987,7 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        self.revalidate_catalog_execution().await?;
         if let Some(config) = self.resolved_llm_config.as_ref() {
             if self.cached_llm_config_matches_state(state) {
                 return Ok(config.clone());
@@ -2011,15 +2012,35 @@ impl ServerAgenticLoopHost {
         Ok(llm_cfg)
     }
 
+    async fn revalidate_catalog_execution(&mut self) -> Result<(), String> {
+        let Some(admitted) = self.admitted_model_execution.as_ref() else {
+            return Ok(());
+        };
+        if admitted.execution_placement != astra_services::ModelExecutionPlacement::Server {
+            // Edge execution material was authenticated from the current
+            // client request, not resolved from the Server catalog. There is
+            // no Server-owned route or secret to refresh at this boundary.
+            return Ok(());
+        }
+        let offering = astra_services::revalidate_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &admitted.offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let execution = astra_services::AdmittedModelExecution::from_offering(offering)?;
+        self.admitted_model_execution = Some(execution);
+        self.clear_resolved_llm_config();
+        Ok(())
+    }
+
     fn effective_model_override_for_state<'a>(
         &'a self,
-        state: &'a AgenticLoopState,
+        _state: &'a AgenticLoopState,
     ) -> Option<&'a str> {
-        state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref())
+        self.model_override.as_deref()
     }
 
     fn cached_llm_config_matches_state(&self, state: &AgenticLoopState) -> bool {
@@ -6102,8 +6123,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return;
         }
-        let Some(config) = self.resolved_llm_config.clone() else {
-            return;
+        let config = match self.resolve_llm_config_for_state(state).await {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::pre_turn_compaction",
+                    %error,
+                    "pre-turn LLM compaction skipped because Offering revalidation failed"
+                );
+                return;
+            }
         };
 
         let user_content = state
@@ -11712,6 +11741,116 @@ mod tests {
             resolved.fallback_chain.is_empty(),
             "legacy model-name fallback must not bypass Offering admission"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial]
+    async fn catalog_execution_refreshes_route_material_before_each_provider_request() {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        let settings = MatrixOneSettings::from_env();
+        let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        astra_services::ensure_core_schema(&settings, &catalog)
+            .await
+            .expect("ensure canonical core schema");
+        let shared_pool = SharedPool::new(&settings)
+            .await
+            .expect("connect to MatrixOne");
+        let pool = shared_pool.get();
+        let encryptor = Arc::new(
+            FernetTokenEncryptor::new("runtime-offering-refresh-test").expect("test encryptor"),
+        );
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let offering_id = format!("refresh-{suffix}");
+        let model_name = format!("refresh-model-{suffix}");
+        let initial_secret = encryptor.encrypt("initial-secret").expect("encrypt key");
+        sqlx::query(
+            "INSERT INTO infra_llm_models
+             (model_id, model_name, provider, api_key_encrypted, base_url, is_active,
+              context_window, input_modalities, output_modalities, supported_parameters,
+              pricing, tags, quirks)
+             VALUES (?, ?, 'openai', ?, 'https://provider-a.example/v1', 1, 128000,
+                     ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&offering_id)
+        .bind(&model_name)
+        .bind(initial_secret)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .expect("seed catalog Offering");
+
+        let offering = astra_services::resolve_active_llm_offering(
+            &settings,
+            encryptor.as_ref(),
+            &offering_id,
+            Some(pool),
+        )
+        .await
+        .expect("initial Offering admission");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            settings.clone(),
+            encryptor.clone(),
+            format!("user-{suffix}"),
+            format!("session-{suffix}"),
+        )
+        .with_model(Some(model_name))
+        .with_pool(shared_pool.clone())
+        .with_admitted_model_execution(Some(
+            AdmittedModelExecution::from_offering(offering).expect("admitted Offering"),
+        ))
+        .build();
+        let state = create_test_state();
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first request material");
+        assert_eq!(first.api_key, "initial-secret");
+
+        let rotated_secret = encryptor.encrypt("rotated-secret").expect("encrypt key");
+        sqlx::query(
+            "UPDATE infra_llm_models
+             SET api_key_encrypted = ?, base_url = 'https://provider-b.example/v1'
+             WHERE model_id = ?",
+        )
+        .bind(rotated_secret)
+        .bind(&offering_id)
+        .execute(pool)
+        .await
+        .expect("rotate catalog Offering");
+
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second request material");
+        assert_eq!(second.api_key, "rotated-secret");
+        assert_eq!(second.base_url, "https://provider-b.example/v1");
+
+        sqlx::query("UPDATE infra_llm_models SET is_active = 0 WHERE model_id = ?")
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("disable catalog Offering");
+        host.resolve_llm_config_for_state(&state)
+            .await
+            .expect_err("revoked Offering must block the next provider request");
+
+        sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+            .bind(&offering_id)
+            .execute(pool)
+            .await
+            .expect("clean catalog Offering");
+        astra_services::models::invalidate_active_llm_model_resolution_cache();
     }
 
     #[tokio::test]

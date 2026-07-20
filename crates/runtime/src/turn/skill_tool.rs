@@ -765,12 +765,10 @@ fn declared_skill_tool_guidance(allowed_tools: &[String]) -> Option<String> {
 
 /// Activation effects from a skill invocation.
 ///
-/// Returned alongside tool results so the agentic loop can apply
-/// model overrides and tool restrictions to subsequent turns.
+/// Returned alongside tool results so the agentic loop can apply workflow
+/// hints and sandbox restrictions to subsequent turns.
 #[derive(Clone, Debug, Default)]
 pub struct SkillActivation {
-    /// Model override for subsequent turns (e.g. `"claude-sonnet-4-20250514"`).
-    pub model_override: Option<String>,
     /// Tools declared by the skill for its normal workflow.
     /// This is model guidance and nested-execution configuration, not a new
     /// authorization boundary for the current turn. Empty means no guidance.
@@ -1053,7 +1051,6 @@ pub async fn partition_and_execute_skills(
 /// When multiple skills fire in one turn, their activations must be
 /// reconciled so the enforced state is consistent with ALL injected
 /// instruction sets:
-/// - `model_override`: None = "no opinion" (keep previous), Some = overwrite.
 /// - `effort` / `agent_type`: same semantics — None preserves, Some overwrites.
 /// - `allowed_tools`: union of all allow-lists. This field is an *additive*
 ///   schema-visibility hint, not a restriction: it ensures every
@@ -1064,11 +1061,6 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
     let Some(mut merged) = prev else {
         return new;
     };
-
-    // Model: None = "no opinion" (keep previous), Some = overwrite.
-    if new.model_override.is_some() {
-        merged.model_override = new.model_override;
-    }
 
     // Effort & agent_type: new value wins when present, otherwise keep previous.
     // None means "no opinion", not "clear".
@@ -1863,7 +1855,6 @@ fn execute_skill<'a>(
                         let loaded = LoadedSkill {
                             manifest: SkillManifest {
                                 name: skill.name.clone(),
-                                model: skill.model.clone(),
                                 max_tokens: skill.max_tokens,
                                 allowed_tools: skill.allowed_tools.clone(),
                                 execution_context: ExecutionContext::Fork,
@@ -2071,7 +2062,6 @@ fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
         ))
     };
     SkillActivation {
-        model_override: skill.model.clone(),
         allowed_tools: skill.allowed_tools.clone(),
         effort: skill.effort.clone(),
         agent_type: skill.agent_type.clone(),
@@ -2101,7 +2091,6 @@ mod tests {
                 .map(|(n, _, inst)| ResolvedSkill {
                     name: n.clone(),
                     instructions: inst.clone(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -2217,7 +2206,6 @@ mod tests {
                     "code-review" => Ok(ResolvedSkill {
                         name: "code-review".into(),
                         instructions: "review".into(),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,
@@ -2796,9 +2784,8 @@ mod tests {
             r.output
                 .contains("Check for bugs, security issues, and style.")
         );
-        // Activation always returned on success (even with no overrides)
+        // Activation is returned so typed workflow hints remain available.
         let act = r.activation.unwrap();
-        assert!(act.model_override.is_none());
         assert!(act.allowed_tools.is_empty());
     }
 
@@ -2845,7 +2832,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -2918,7 +2904,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3007,7 +2992,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3060,7 +3044,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "remote-invalid-required-header".into(),
             instructions: "Remote skill placeholder.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -3091,7 +3074,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "remote-community-auth-header".into(),
             instructions: "Remote skill placeholder.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -3128,7 +3110,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "remote-cookie-header".into(),
             instructions: "Remote skill placeholder.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -3164,7 +3145,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "remote-connection-token-header".into(),
             instructions: "Remote skill placeholder.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -3208,7 +3188,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3267,7 +3246,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3339,7 +3317,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3419,7 +3396,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3501,7 +3477,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3583,7 +3558,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Run forked task.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Fork,
@@ -3681,7 +3655,6 @@ mod tests {
                     name: name.into(),
                     instructions: "This instruction must not be returned as an inline fallback."
                         .into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Fork,
@@ -3834,7 +3807,6 @@ mod tests {
                     name: "ctx-test".into(),
                     instructions: "Working in ${CTX_WORK_DIR} with session ${CTX_SESSION_ID}"
                         .into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -3992,7 +3964,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: "review".into(),
                     instructions: "Do the thing.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec!["bash".into(), "read_file".into()],
                     execution_context: ExecutionContext::Inline,
@@ -4041,55 +4012,6 @@ mod tests {
         // Activation retains the typed declaration for hosts and nested runs.
         let act = r.activation.unwrap();
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
-        assert!(act.model_override.is_none());
-    }
-
-    #[tokio::test]
-    async fn execute_skill_returns_activation_with_model() {
-        struct ModelOverrideResolver;
-        impl SkillResolver for ModelOverrideResolver {
-            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
-                Ok(ResolvedSkill {
-                    name: "fancy".into(),
-                    instructions: "Be fancy.".into(),
-                    model: Some("gpt-4o".into()),
-                    max_tokens: Some(4096),
-                    allowed_tools: vec!["bash".into()],
-                    execution_context: ExecutionContext::Inline,
-                    hooks: crate::skills::hooks::SkillHooks::default(),
-                    skill_dir: None,
-                    source: SkillSourceKind::Local,
-                    success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    output_schema: None,
-                    remote_url: None,
-                    forward_headers: vec![],
-                    required_headers: vec![],
-                    aliases: Vec::new(),
-
-                    effort: None,
-                    agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
-                })
-            }
-            fn available_skills(&self) -> Vec<SkillToolInfo> {
-                vec![]
-            }
-        }
-
-        let r = execute_skill(
-            &ModelOverrideResolver,
-            None,
-            "fancy",
-            "",
-            None,
-            &SkillContext::default(),
-        )
-        .await;
-        let act = r.activation.unwrap();
-        assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
-        assert_eq!(act.allowed_tools, vec!["bash"]);
     }
 
     #[tokio::test]
@@ -4104,9 +4026,8 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        // Activation is always returned on success so the loop can clear stale overrides
+        // Activation is always returned for a successfully resolved workflow.
         let act = r.activation.unwrap();
-        assert!(act.model_override.is_none());
         assert!(act.allowed_tools.is_empty());
     }
 
@@ -4217,7 +4138,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do things.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -4279,7 +4199,6 @@ mod tests {
                     name: name.into(),
                     // Inline shell command — blocked for MCP skills
                     instructions: "Do things.\n\n! echo hello\n".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -4346,7 +4265,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "plain".into(),
             instructions: "Do things.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -4367,16 +4285,14 @@ mod tests {
             trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
-        assert!(act.model_override.is_none());
         assert!(act.allowed_tools.is_empty());
     }
 
     #[test]
-    fn build_activation_with_model_and_tools() {
+    fn build_activation_with_tools() {
         let skill = ResolvedSkill {
             name: "fancy".into(),
             instructions: "Be fancy.".into(),
-            model: Some("claude-sonnet-4-20250514".into()),
             max_tokens: Some(4096),
             allowed_tools: vec!["bash".into(), "read_file".into()],
             execution_context: ExecutionContext::Inline,
@@ -4397,10 +4313,6 @@ mod tests {
             trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
-        assert_eq!(
-            act.model_override.as_deref(),
-            Some("claude-sonnet-4-20250514")
-        );
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
     }
 
@@ -4409,55 +4321,13 @@ mod tests {
     #[test]
     fn merge_activations_none_plus_new() {
         let new = SkillActivation {
-            model_override: Some("gpt-4o".into()),
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let merged = super::merge_activations(None, new);
-        assert_eq!(merged.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(merged.allowed_tools, vec!["bash"]);
-    }
-
-    #[test]
-    fn merge_activations_model_last_writer_wins() {
-        let prev = SkillActivation {
-            model_override: Some("model-a".into()),
-            allowed_tools: vec![],
-            effort: None,
-            agent_type: None,
-            sandbox_policy: None,
-        };
-        let new = SkillActivation {
-            model_override: Some("model-b".into()),
-            allowed_tools: vec![],
-            effort: None,
-            agent_type: None,
-            sandbox_policy: None,
-        };
-        let merged = super::merge_activations(Some(prev), new);
-        assert_eq!(merged.model_override.as_deref(), Some("model-b"));
-    }
-
-    #[test]
-    fn merge_activations_model_none_preserves_previous() {
-        let prev = SkillActivation {
-            model_override: Some("model-a".into()),
-            allowed_tools: vec![],
-            effort: None,
-            agent_type: None,
-            sandbox_policy: None,
-        };
-        let new = SkillActivation {
-            model_override: None, // no opinion — should keep "model-a"
-            allowed_tools: vec![],
-            effort: None,
-            agent_type: None,
-            sandbox_policy: None,
-        };
-        let merged = super::merge_activations(Some(prev), new);
-        assert_eq!(merged.model_override.as_deref(), Some("model-a"));
     }
 
     #[test]
@@ -4467,14 +4337,12 @@ mod tests {
         // Insertion order (prev first, then new additions) is preserved;
         // duplicates are deduped.
         let prev = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["bash".into(), "read_file".into(), "edit".into()],
             effort: None,
             agent_type: None,
@@ -4491,14 +4359,12 @@ mod tests {
     #[test]
     fn merge_activations_unrestricted_plus_restricted_yields_union() {
         let prev = SkillActivation {
-            model_override: None,
             allowed_tools: vec![], // empty hint
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
@@ -4512,14 +4378,12 @@ mod tests {
     fn merge_activations_restricted_plus_unrestricted_keeps_previous_hint() {
         // Empty `new.allowed_tools` must not erase prev's visibility hint.
         let prev = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
-            model_override: None,
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
@@ -4534,14 +4398,12 @@ mod tests {
         // Regression guard: the old intersection logic would return empty
         // here, silently hiding both skills' tools. Union preserves both.
         let prev = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
-            model_override: None,
             allowed_tools: vec!["edit".into()],
             effort: None,
             agent_type: None,
@@ -4556,7 +4418,6 @@ mod tests {
         let skill = ResolvedSkill {
             name: "effort-skill".into(),
             instructions: "Work hard.".into(),
-            model: None,
             max_tokens: None,
             allowed_tools: vec![],
             execution_context: ExecutionContext::Inline,
@@ -4585,14 +4446,12 @@ mod tests {
     #[test]
     fn merge_activations_effort_last_writer_wins() {
         let prev = SkillActivation {
-            model_override: None,
             allowed_tools: vec![],
             effort: Some(EffortLevel::Low),
             agent_type: Some("researcher".into()),
             sandbox_policy: None,
         };
         let new = SkillActivation {
-            model_override: None,
             allowed_tools: vec![],
             effort: Some(EffortLevel::Max),
             agent_type: None, // no opinion — should keep previous
@@ -4615,7 +4474,6 @@ mod tests {
                     "skill-a" => Ok(ResolvedSkill {
                         name: "skill-a".into(),
                         instructions: "Do A.".into(),
-                        model: Some("model-a".into()),
                         max_tokens: None,
                         allowed_tools: vec!["bash".into(), "grep".into()],
                         execution_context: ExecutionContext::Inline,
@@ -4638,7 +4496,6 @@ mod tests {
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
                         instructions: "Do B.".into(),
-                        model: Some("model-b".into()),
                         max_tokens: None,
                         allowed_tools: vec!["bash".into(), "edit".into()],
                         execution_context: ExecutionContext::Inline,
@@ -4712,8 +4569,6 @@ mod tests {
         assert!(remaining.is_empty());
 
         let act = activation.unwrap();
-        // Model: last writer wins → model-b
-        assert_eq!(act.model_override.as_deref(), Some("model-b"));
         // Tools: union of [bash, grep] ∪ [bash, edit] → [bash, grep, edit]
         let mut tools = act.allowed_tools.clone();
         tools.sort();
@@ -4729,7 +4584,6 @@ mod tests {
                     Ok(ResolvedSkill {
                         name: "good".into(),
                         instructions: "Do good.".into(),
-                        model: Some("good-model".into()),
                         max_tokens: None,
                         allowed_tools: vec!["bash".into()],
                         execution_context: ExecutionContext::Inline,
@@ -4785,9 +4639,8 @@ mod tests {
         assert!(results[0].result.contains("# Skill: good"));
         assert!(results[1].result.contains("Failed to load skill"));
 
-        // Good skill's activation preserved (failure returns None, doesn't overwrite)
+        // The successful skill's activation survives the unrelated failure.
         let act = activation.unwrap();
-        assert_eq!(act.model_override.as_deref(), Some("good-model"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
     }
 
@@ -4802,7 +4655,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do things.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -4856,7 +4708,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do composable things.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -4917,7 +4768,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Deep skill.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -4981,7 +4831,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Top level only.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -5037,7 +4886,6 @@ mod tests {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Schema skill.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -5096,7 +4944,6 @@ mod tests {
                 "pipeline-skill" => Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "This is a pipeline skill.".into(),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -5138,7 +4985,6 @@ mod tests {
                 "step-a" | "step-b" => Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: format!("Instructions for {name}."),
-                    model: None,
                     max_tokens: None,
                     allowed_tools: vec![],
                     execution_context: ExecutionContext::Inline,
@@ -5244,7 +5090,6 @@ mod tests {
                     "fail-pipeline" => Ok(ResolvedSkill {
                         name: name.into(),
                         instructions: "Pipeline.".into(),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,
@@ -5292,7 +5137,6 @@ mod tests {
                     "ok-step" => Ok(ResolvedSkill {
                         name: name.into(),
                         instructions: "OK step.".into(),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,
@@ -5360,7 +5204,6 @@ mod tests {
                     "fail-pipeline2" => Ok(ResolvedSkill {
                         name: name.into(),
                         instructions: "Pipeline.".into(),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,
@@ -5430,7 +5273,6 @@ mod tests {
                     "pipeline-two" => Ok(ResolvedSkill {
                         name: name.into(),
                         instructions: "Pipeline.".into(),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,
@@ -5472,7 +5314,6 @@ mod tests {
                     "step-a" | "step-b" => Ok(ResolvedSkill {
                         name: name.into(),
                         instructions: format!("Instructions for {name}."),
-                        model: None,
                         max_tokens: None,
                         allowed_tools: vec![],
                         execution_context: ExecutionContext::Inline,

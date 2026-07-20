@@ -6,7 +6,8 @@
 
 use super::*;
 use astra_server_types::{
-    CompletionChoice, CompletionMessage, CompletionRequest, CompletionResponse, CompletionUsage,
+    CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
+    CompletionResponse, CompletionUsage,
 };
 use std::time::Duration;
 
@@ -14,6 +15,17 @@ fn completion_response_id(response_id: Option<&str>) -> String {
     response_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("chatcmpl-proxy-{}", uuid::Uuid::new_v4().simple()))
+}
+
+fn completion_timeout(timeout_ms: u64) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
+    if timeout_ms == 0 || timeout_ms > 120_000 {
+        return Err(crate::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Completion timeout_ms must be between 1 and 120000",
+            "invalid_completion_deadline",
+        ));
+    }
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 /// `POST /v1/chat/completions` — lightweight LLM proxy.
@@ -27,6 +39,7 @@ pub(super) async fn completions_handler(
 ) -> Result<Json<CompletionResponse>, (StatusCode, Json<ErrorResponse>)> {
     // 1. Authenticate
     let user = state.auth_service.current_user(&headers).await?;
+    let provider_timeout = completion_timeout(request.timeout_ms)?;
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
     // as durable chat runs; omission invokes the Server-owned default policy.
@@ -51,7 +64,7 @@ pub(super) async fn completions_handler(
                     "model_catalog_unavailable",
                 )
             })?;
-        let offering = astra_services::resolve_reasoning_offering(
+        let selected = astra_services::resolve_reasoning_offering(
             &matrixone,
             &state.fernet_encryptor,
             state.admin.config_service.as_ref(),
@@ -65,6 +78,10 @@ pub(super) async fn completions_handler(
                 "model_default_unavailable",
             )
         })?;
+        let offering = state
+            .model_service
+            .revalidate_model_offering(selected.offering_id)
+            .await?;
         astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
             crate::error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -90,15 +107,17 @@ pub(super) async fn completions_handler(
         admitted.clone(),
     );
     // 4. Execute through the same typed provider boundary as agent turns.
+    let invocation_scope = request.invocation_scope();
+    let purpose = request.purpose();
     let mut messages = request.messages;
     crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
     let parsed = durable_ledger
         .execute_nonstream(
             &state.http_client,
-            request.invocation_scope,
+            invocation_scope,
             crate::turn::llm::client::LlmCall {
-                purpose: request.purpose,
+                purpose,
                 messages: &messages,
                 tools: &[],
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
@@ -107,7 +126,7 @@ pub(super) async fn completions_handler(
                 has_fallback: false,
                 thinking: &thinking,
             },
-            Duration::from_secs(120),
+            provider_timeout,
         )
         .await;
     let parsed = match parsed {
@@ -299,20 +318,18 @@ mod tests {
 
     fn explicit_completion_request(offering_id: &str) -> CompletionRequest {
         CompletionRequest {
-            purpose: astra_turn_types::InferencePurpose::MemoryExtraction,
-            invocation_scope: astra_turn_types::InferenceInvocationScope::Session {
-                session_id: "session-completion".to_string(),
-                turn: 1,
-                round: 0,
-                operation_id: "completion_test".to_string(),
-                logical_attempt: 0,
-            },
+            operation: CompletionOperation::MemoryExtraction,
+            session_id: "session-completion".to_string(),
+            turn: 1,
+            round: 0,
+            logical_attempt: 0,
             model_selection: Some(astra_turn_types::ModelSelection {
                 offering_id: offering_id.to_string(),
             }),
             messages: vec![json!({"role": "user", "content": "extract"})],
             max_tokens: 64,
             temperature: 0.0,
+            timeout_ms: 120_000,
         }
     }
 
@@ -325,20 +342,16 @@ mod tests {
     #[test]
     fn completion_request_defaults() {
         let json = r#"{
-            "purpose": "verification_judge",
-            "invocation_scope": {
-                "kind": "session",
-                "session_id": "session-1",
-                "turn": 1,
-                "round": 0,
-                "operation_id": "verification",
-                "logical_attempt": 0
-            },
+            "operation": "verification_judge",
+            "session_id": "session-1",
+            "turn": 1,
+            "round": 0,
+            "logical_attempt": 0,
             "messages": [{"role": "user", "content": "hello"}]
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(
-            req.purpose,
+            req.purpose(),
             astra_turn_types::InferencePurpose::VerificationJudge
         );
         assert_eq!(req.max_tokens, 512);
@@ -399,9 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_request_requires_a_known_inference_purpose() {
+    fn completion_request_requires_a_known_server_operation() {
         let missing = r#"{"messages": []}"#;
-        let unknown = r#"{"purpose": "other", "messages": []}"#;
+        let unknown = r#"{"operation": "other", "session_id": "s", "turn": 1, "round": 0, "logical_attempt": 0, "messages": []}"#;
         assert!(serde_json::from_str::<CompletionRequest>(missing).is_err());
         assert!(serde_json::from_str::<CompletionRequest>(unknown).is_err());
     }
@@ -409,15 +422,11 @@ mod tests {
     #[test]
     fn completion_request_rejects_model_name_selection() {
         let legacy = r#"{
-            "purpose": "verification_judge",
-            "invocation_scope": {
-                "kind": "session",
-                "session_id": "session-1",
-                "turn": 1,
-                "round": 0,
-                "operation_id": "verification",
-                "logical_attempt": 0
-            },
+            "operation": "verification_judge",
+            "session_id": "session-1",
+            "turn": 1,
+            "round": 0,
+            "logical_attempt": 0,
             "model": "gpt-4o-mini",
             "messages": []
         }"#;
@@ -427,15 +436,11 @@ mod tests {
     #[test]
     fn completion_request_accepts_only_typed_offering_selection() {
         let json = r#"{
-            "purpose": "memory_extraction",
-            "invocation_scope": {
-                "kind": "session",
-                "session_id": "session-1",
-                "turn": 1,
-                "round": 0,
-                "operation_id": "memory_extraction",
-                "logical_attempt": 0
-            },
+            "operation": "memory_extraction",
+            "session_id": "session-1",
+            "turn": 1,
+            "round": 0,
+            "logical_attempt": 0,
             "model_selection": {"offering_id": "offer-memory"},
             "messages": []
         }"#;
@@ -447,6 +452,22 @@ mod tests {
                 .offering_id,
             "offer-memory"
         );
+    }
+
+    #[test]
+    fn completion_deadline_has_one_bounded_server_owner() {
+        assert_eq!(
+            completion_timeout(37).expect("valid deadline"),
+            Duration::from_millis(37)
+        );
+        for invalid in [0, 120_001] {
+            let error = completion_timeout(invalid).expect_err("invalid deadline");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("invalid_completion_deadline")
+            );
+        }
     }
 
     #[test]
@@ -574,12 +595,15 @@ mod tests {
         .expect("seed completion session");
 
         let provider_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hanging_request_started = Arc::new(tokio::sync::Notify::new());
         let provider = axum::Router::new().route(
             "/v1/chat/completions",
             axum::routing::post({
                 let provider_requests = Arc::clone(&provider_requests);
+                let hanging_request_started = Arc::clone(&hanging_request_started);
                 move |Json(body): Json<serde_json::Value>| {
                     let provider_requests = Arc::clone(&provider_requests);
+                    let hanging_request_started = Arc::clone(&hanging_request_started);
                     async move {
                         provider_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let force_failure = body["messages"].as_array().is_some_and(|messages| {
@@ -593,6 +617,16 @@ mod tests {
                                 Json(json!({"error": {"message": "provider unavailable"}})),
                             )
                                 .into_response();
+                        }
+                        let hang_until_cancelled =
+                            body["messages"].as_array().is_some_and(|messages| {
+                                messages.iter().any(|message| {
+                                    message["content"].as_str() == Some("hang-until-cancelled")
+                                })
+                            });
+                        if hang_until_cancelled {
+                            hanging_request_started.notify_one();
+                            return std::future::pending::<axum::response::Response>().await;
                         }
                         Json(json!({
                             "id": "provider-session-scope",
@@ -623,13 +657,9 @@ mod tests {
             }))
             .with_shared_pool(shared_pool.clone());
         let mut request = explicit_completion_request("offer-completion");
-        request.invocation_scope = astra_turn_types::InferenceInvocationScope::Session {
-            session_id: session_id.clone(),
-            turn: 3,
-            round: 1,
-            operation_id: "memory_extraction".to_string(),
-            logical_attempt: 0,
-        };
+        request.session_id = session_id.clone();
+        request.turn = 3;
+        request.round = 1;
 
         let response =
             completions_handler(State(state.clone()), completion_headers(), Json(request))
@@ -662,7 +692,7 @@ mod tests {
         assert_eq!(durable.get::<Option<String>, _>("run_id"), None);
         assert_eq!(
             durable.get::<String, _>("operation_id"),
-            "memory_extraction"
+            "completion_proxy:memory_extraction"
         );
         assert_eq!(durable.get::<String, _>("invocation_status"), "succeeded");
         assert_eq!(durable.get::<i64, _>("input_tokens"), 13);
@@ -674,13 +704,10 @@ mod tests {
         );
 
         let mut rejected_request = explicit_completion_request("offer-completion");
-        rejected_request.invocation_scope = astra_turn_types::InferenceInvocationScope::Session {
-            session_id: format!("not-owned-{session_id}"),
-            turn: 3,
-            round: 1,
-            operation_id: "memory_extraction".to_string(),
-            logical_attempt: 1,
-        };
+        rejected_request.session_id = format!("not-owned-{session_id}");
+        rejected_request.turn = 3;
+        rejected_request.round = 1;
+        rejected_request.logical_attempt = 1;
         let rejected = completions_handler(
             State(state.clone()),
             completion_headers(),
@@ -706,17 +733,17 @@ mod tests {
             "role": "user",
             "content": "force-provider-failure"
         })];
-        failed_request.invocation_scope = astra_turn_types::InferenceInvocationScope::Session {
-            session_id: session_id.clone(),
-            turn: 3,
-            round: 1,
-            operation_id: "memory_extraction_failure".to_string(),
-            logical_attempt: 0,
-        };
-        let provider_failure =
-            completions_handler(State(state), completion_headers(), Json(failed_request))
-                .await
-                .expect_err("provider failure must remain visible to the caller");
+        failed_request.session_id = session_id.clone();
+        failed_request.turn = 3;
+        failed_request.round = 1;
+        failed_request.logical_attempt = 2;
+        let provider_failure = completions_handler(
+            State(state.clone()),
+            completion_headers(),
+            Json(failed_request),
+        )
+        .await
+        .expect_err("provider failure must remain visible to the caller");
         assert_eq!(provider_failure.0, StatusCode::BAD_GATEWAY);
         assert!(
             provider_requests.load(std::sync::atomic::Ordering::SeqCst)
@@ -726,10 +753,11 @@ mod tests {
 
         let failed_invocation = sqlx::query(
             "SELECT status FROM inference_invocations
-             WHERE user_id = 'test-user' AND session_id = ? AND operation_id = ?",
+             WHERE user_id = 'test-user' AND session_id = ? AND operation_id = ?
+               AND logical_attempt = 2",
         )
         .bind(&session_id)
-        .bind("memory_extraction_failure")
+        .bind("completion_proxy:memory_extraction")
         .fetch_one(pool)
         .await
         .expect("load failed logical invocation");
@@ -738,10 +766,11 @@ mod tests {
             "SELECT a.status FROM inference_provider_attempts a
              JOIN inference_invocations i
                ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id
-             WHERE i.user_id = 'test-user' AND i.session_id = ? AND i.operation_id = ?",
+             WHERE i.user_id = 'test-user' AND i.session_id = ? AND i.operation_id = ?
+               AND i.logical_attempt = 2",
         )
         .bind(&session_id)
-        .bind("memory_extraction_failure")
+        .bind("completion_proxy:memory_extraction")
         .fetch_all(pool)
         .await
         .expect("load failed provider attempts");
@@ -751,6 +780,62 @@ mod tests {
                 .iter()
                 .all(|row| row.get::<String, _>("status") == "failed")
         );
+
+        let mut cancelled_request = explicit_completion_request("offer-completion");
+        cancelled_request.session_id = session_id.clone();
+        cancelled_request.turn = 3;
+        cancelled_request.round = 1;
+        cancelled_request.logical_attempt = 3;
+        cancelled_request.messages = vec![json!({
+            "role": "user",
+            "content": "hang-until-cancelled"
+        })];
+        let cancelled_call = tokio::spawn(completions_handler(
+            State(state),
+            completion_headers(),
+            Json(cancelled_request),
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hanging_request_started.notified(),
+        )
+        .await
+        .expect("provider must observe the admitted request before cancellation");
+        cancelled_call.abort();
+        assert!(
+            cancelled_call
+                .await
+                .expect_err("HTTP caller should be cancelled")
+                .is_cancelled()
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
+            loop {
+                poll.tick().await;
+                let row = sqlx::query(
+                    "SELECT i.status AS invocation_status, a.status AS attempt_status
+                     FROM inference_invocations i
+                     JOIN inference_provider_attempts a
+                       ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
+                     WHERE i.user_id = 'test-user' AND i.session_id = ?
+                       AND i.operation_id = 'completion_proxy:memory_extraction'
+                       AND i.logical_attempt = 3",
+                )
+                .bind(&session_id)
+                .fetch_optional(pool)
+                .await
+                .expect("poll cancelled durable inference");
+                if row.as_ref().is_some_and(|row| {
+                    row.get::<String, _>("invocation_status") == "delivery_unknown"
+                        && row.get::<String, _>("attempt_status") == "delivery_unknown"
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("detached settlement must converge after caller cancellation");
 
         for statement in [
             "DELETE FROM inference_provider_attempts WHERE user_id = 'test-user' AND session_id = ?",

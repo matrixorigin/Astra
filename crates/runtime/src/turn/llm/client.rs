@@ -4189,6 +4189,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
             let retry_safe = e.is_connect();
             let kind = if retry_safe {
                 astra_core::ErrorKind::Network
+            } else if e.is_timeout() {
+                astra_core::ErrorKind::StreamIdle
             } else {
                 astra_core::ErrorKind::StreamTransport
             };
@@ -4867,6 +4869,11 @@ mod tests {
         .await;
         assert!(result.is_err(), "should timeout: {result:?}");
         let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            astra_core::ErrorKind::StreamIdle,
+            "the provider request deadline must have a typed timeout outcome"
+        );
         assert!(
             err.message.contains("timeout") || err.message.contains("Timeout"),
             "error should mention timeout: {err}"

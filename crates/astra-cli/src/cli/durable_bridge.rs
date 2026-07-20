@@ -877,11 +877,12 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
             )
         });
 
-        let mut request = astra_thin_client::CompletionRequest::new(
-            astra_turn_types::InferencePurpose::VerificationJudge,
-            self.inference.next_scope(),
+        let mut request = astra_thin_client::CompletionRequest::from_session_scope(
+            astra_thin_client::CompletionOperation::VerificationJudge,
+            &self.inference.next_scope(),
             vec![system_msg, user_msg],
-        );
+        )
+        .map_err(str::to_string)?;
         request.max_tokens = 2_000;
         request.temperature = 0.1;
         let resp = self

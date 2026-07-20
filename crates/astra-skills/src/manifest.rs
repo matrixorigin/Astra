@@ -178,9 +178,6 @@ pub struct SkillManifest {
     /// Natural-language hint for when the model should pick this skill.
     #[serde(default)]
     pub when_to_use: Option<String>,
-    /// Model override (e.g. `"claude-sonnet-4-20250514"`).
-    #[serde(default)]
-    pub model: Option<String>,
     /// Maximum token budget for a single invocation.
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -459,7 +456,6 @@ impl Default for SkillManifest {
             user_invocable: true,
             allowed_tools: Vec::new(),
             when_to_use: None,
-            model: None,
             max_tokens: None,
             hooks: None,
             paths: Vec::new(),

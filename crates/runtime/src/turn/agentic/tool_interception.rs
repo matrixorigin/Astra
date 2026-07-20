@@ -789,7 +789,6 @@ pub(crate) fn apply_skill_activation(
     state: &mut AgenticLoopState,
     act: crate::turn::skill_tool::SkillActivation,
 ) {
-    state.skills.model_override = act.model_override.filter(|m| is_valid_model_string(m));
     let normalized_allowed_tools =
         astra_turn_core::tool_allowlist::normalize_tool_names(&act.allowed_tools);
     state.skills.allowed_tools = if normalized_allowed_tools.is_empty() {
@@ -896,20 +895,6 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
     }
 
     extra
-}
-
-pub(crate) fn is_valid_model_string(model: &str) -> bool {
-    let len = model.len();
-    if !(2..=128).contains(&len) {
-        return false;
-    }
-    let first = model.as_bytes()[0];
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-    model.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':' || b == b'/'
-    })
 }
 
 pub(crate) fn extract_repo_name_from_url(url: &str) -> Option<String> {
@@ -1026,7 +1011,6 @@ mod tests {
         apply_skill_activation(
             &mut state,
             crate::turn::skill_tool::SkillActivation {
-                model_override: None,
                 allowed_tools: vec![" READ_FILE ".to_string()],
                 effort: None,
                 agent_type: None,
@@ -1074,7 +1058,6 @@ mod tests {
         apply_skill_activation(
             &mut state,
             crate::turn::skill_tool::SkillActivation {
-                model_override: None,
                 allowed_tools: vec!["bash".to_string()],
                 effort: None,
                 agent_type: None,
@@ -1128,7 +1111,6 @@ mod tests {
         apply_skill_activation(
             &mut state,
             crate::turn::skill_tool::SkillActivation {
-                model_override: None,
                 allowed_tools: vec!["read_file".to_string()],
                 effort: None,
                 agent_type: None,

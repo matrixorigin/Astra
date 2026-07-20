@@ -44,7 +44,7 @@ fn test_team(
                 agent_id: None,
                 system_prompt: prompt.map(String::from),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,

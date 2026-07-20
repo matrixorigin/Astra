@@ -62,14 +62,20 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryC
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
+        if purpose != astra_turn_types::InferencePurpose::Introspection {
+            return Err(format!(
+                "skill auto-route proxy received unsupported inference purpose {purpose}"
+            ));
+        }
         let logical_attempt = self
             .next_logical_attempt
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let mut request = astra_thin_client::CompletionRequest::new(
-            purpose,
-            self.base_scope.with_logical_attempt(logical_attempt),
+        let mut request = astra_thin_client::CompletionRequest::from_session_scope(
+            astra_thin_client::CompletionOperation::SkillAutoRoute,
+            &self.base_scope.with_logical_attempt(logical_attempt),
             messages.to_vec(),
-        );
+        )
+        .map_err(str::to_string)?;
         request.max_tokens = 256;
         request.temperature = 0.0;
         let response = self
@@ -634,18 +640,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // but do not inline it into `messages[]`. The server resolves the
         // concrete model row and applies prompt-cache capability metadata before
         // deciding whether this lane is safe to inject.
-        // If a skill activation overrode the model, use that; otherwise fall back to host default.
-        let effective_model_owned = state
-            .skills
-            .model_override
-            .clone()
-            .or_else(|| self.model.map(str::to_owned));
+        let effective_model_owned = self.model.map(str::to_owned);
         let effective_model = effective_model_owned.as_deref();
-        let effective_offering_id = if state.skills.model_override.is_some() {
-            None
-        } else {
-            self.offering_id.as_deref()
-        };
+        let effective_offering_id = self.offering_id.as_deref();
         let runtime_volatile_injections = state.take_volatile_pending();
         let runtime_volatile_texts = self
             .input_runtime_volatile_texts
@@ -1351,12 +1348,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return,
         };
-        let model_selector = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model)
-            .unwrap_or("");
+        let model_selector = self.model.unwrap_or("");
         let model_id = model_selector.to_string();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();

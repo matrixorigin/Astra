@@ -790,8 +790,6 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     agent_type: Option<String>,
     #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
@@ -812,8 +810,6 @@ struct AgentFanoutStartSlot {
 struct AgentFanoutDefaults {
     #[serde(default)]
     agent_type: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
@@ -864,7 +860,6 @@ const FANOUT_START_FIELDS: &[&str] = &[
 ];
 const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "agent_type",
-    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -876,7 +871,6 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "description",
     "prompt",
     "agent_type",
-    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -1816,12 +1810,6 @@ fn fanout_slot_spawn_args(
         slot.agent_type
             .or_else(|| defaults.and_then(|d| d.agent_type.clone())),
     );
-    insert_optional_string(
-        object,
-        "model",
-        slot.model
-            .or_else(|| defaults.and_then(|d| d.model.clone())),
-    );
     insert_optional_u32(object, "max_turns", effective_max_turns);
     insert_optional_u32(
         object,
@@ -1968,7 +1956,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
 
 /// Handle `agent(action='spawn')`.
 pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
-    let mut input: SpawnAgentInput = match normalize_agent_spawn_args(args)
+    let input: SpawnAgentInput = match normalize_agent_spawn_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
         Ok(i) => i,
@@ -1984,9 +1972,6 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         }
     };
 
-    if input.model.is_none() {
-        input.model = ctx.current_model.clone();
-    }
     // Structured concurrency is the public default. The spawner waits for the
     // child result while still streaming live progress and accepting UI
     // control. Only an explicit user Ctrl+B promotion can flip the runtime
@@ -2022,6 +2007,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
+        resolved_model_name: ctx.current_model.clone(),
         recursion_depth: ctx.recursion_depth,
         parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
@@ -3593,7 +3579,6 @@ mod tests {
             description: "Review storage".into(),
             prompt: "Review storage layer".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -3632,7 +3617,6 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness deeply".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -3668,7 +3652,6 @@ mod tests {
             description: "Investigate runtime".into(),
             prompt: "Investigate runtime failures".into(),
             agent_type: None,
-            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -4464,15 +4447,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_preserves_explicit_model_override() {
+    async fn handle_spawn_agent_tool_inherits_the_admitted_parent_model() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
         let args = json!({
             "description": "Code quality review",
             "prompt": "Review the latest commit",
-            "agent_type": "general-purpose",
-            "model": "claude-sonnet-4.6"
+            "agent_type": "general-purpose"
         });
 
         let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
@@ -4481,7 +4463,7 @@ mod tests {
         assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(
             executor.take_captured_model().as_deref(),
-            Some("claude-sonnet-4.6")
+            Some("MiniMax-M2.7")
         );
     }
 

@@ -206,7 +206,7 @@ fn dev_team_payload() -> Value {
                 "agent_id": "fast-coder",
                 "system_prompt": "Implement code changes following the plan.",
                 "skills": ["edit", "shell"],
-                "model_override": "claude-sonnet",
+                "model_selection": { "offering_id": "offer-dev-implementer" },
                 "mcp_servers": ["filesystem"],
                 "can_delegate": true,
                 "max_delegation_depth": 2
@@ -223,7 +223,7 @@ fn dev_team_payload() -> Value {
                 "role": "reviewer",
                 "system_prompt": "Review code changes for correctness, style, and security.",
                 "skills": ["review-changes"],
-                "model_override": "claude-opus",
+                "model_selection": { "offering_id": "offer-dev-reviewer" },
                 "mcp_servers": ["github"],
                 "can_delegate": false,
                 "max_delegation_depth": 0
@@ -719,7 +719,7 @@ async fn scenario_complex_team_full_roundtrip() {
                 "agent_id": "agent-lead-001",
                 "system_prompt": "You are the tech lead. Coordinate and review.",
                 "skills": ["review-changes", "plan-decompose"],
-                "model_override": "claude-opus",
+                "model_selection": { "offering_id": "offer-mega-lead" },
                 "mcp_servers": ["github", "jira"],
                 "can_delegate": true,
                 "max_delegation_depth": 3
@@ -728,7 +728,7 @@ async fn scenario_complex_team_full_roundtrip() {
                 "role": "backend",
                 "system_prompt": "Implement backend features in Rust.",
                 "skills": ["edit", "shell", "review-changes"],
-                "model_override": "claude-sonnet",
+                "model_selection": { "offering_id": "offer-mega-backend" },
                 "mcp_servers": ["filesystem", "database"],
                 "can_delegate": true,
                 "max_delegation_depth": 1
@@ -746,7 +746,7 @@ async fn scenario_complex_team_full_roundtrip() {
                 "role": "devops",
                 "system_prompt": "Handle CI/CD, Docker, and deployment.",
                 "skills": ["shell"],
-                "model_override": "claude-haiku",
+                "model_selection": { "offering_id": "offer-mega-devops" },
                 "mcp_servers": ["kubernetes", "docker"],
                 "can_delegate": false,
                 "max_delegation_depth": 0
@@ -809,7 +809,7 @@ async fn scenario_complex_team_full_roundtrip() {
     let lead = &members[0];
     assert_eq!(lead["role"], "lead");
     assert_eq!(lead["agent_id"], "agent-lead-001");
-    assert_eq!(lead["model_override"], "claude-opus");
+    assert_eq!(lead["model_selection"]["offering_id"], "offer-mega-lead");
     assert!(lead["can_delegate"].as_bool().unwrap());
     assert_eq!(lead["max_delegation_depth"], 3);
     let lead_skills: Vec<&str> = lead["skills"]

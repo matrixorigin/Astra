@@ -1098,7 +1098,6 @@ mod tests {
             let mut custom =
                 AgentProfile::new("team-research-explorer", "explorer", AgentTier::System);
             custom.system_prompt = Some("Custom registered prompt.".to_string());
-            custom.model_override = Some("gpt-4-turbo".to_string());
             let _ = reg.register(custom);
         }
 
@@ -1117,9 +1116,7 @@ mod tests {
                 .unwrap()
                 .contains("search the codebase")
         );
-        // But the resolve path DID use registry as base — model_override was empty
-        // on the member, so it should be None (member override is None → no override)
-        // This confirms the profile was freshly resolved.
+        // The registered profile was freshly resolved through the team member.
     }
 
     #[tokio::test]
@@ -1373,7 +1370,7 @@ mod tests {
                 agent_id: None,
                 system_prompt: Some("do work".into()),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
@@ -1494,7 +1491,7 @@ mod tests {
                 agent_id: None,
                 system_prompt: Some("do work".into()),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,

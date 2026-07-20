@@ -52,9 +52,6 @@ pub struct SpawnAgentInput {
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
 
-    /// Optional model override.
-    pub model: Option<String>,
-
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
@@ -219,7 +216,6 @@ impl Default for SpawnAgentInput {
             description: String::new(),
             prompt: String::new(),
             agent_type: default_agent_type(),
-            model: None,
             run_in_background: false,
             name: None,
             max_turns: None,
@@ -457,6 +453,13 @@ mod tests {
             err.to_string().contains("unknown field `type`"),
             "canonical field is agent_type; got: {err}"
         );
+    }
+
+    #[test]
+    fn spawn_rejects_provider_model_selection() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
+        serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("dynamic agents inherit the admitted Offering");
     }
 
     #[test]

@@ -37,6 +37,7 @@ use serde::Deserialize;
 
 /// YAML frontmatter parsed from agent definition Markdown.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentFrontmatter {
     /// Agent identifier. Defaults to filename stem if absent.
     name: Option<String>,
@@ -47,8 +48,8 @@ struct AgentFrontmatter {
     /// Allowed tool/skill names. Empty = unrestricted.
     #[serde(default)]
     tools: Vec<String>,
-    /// Model override (e.g., "claude-sonnet-4-20250514").
-    model: Option<String>,
+    /// Optional governed Offering for this agent.
+    model_selection: Option<astra_turn_types::ModelSelection>,
     /// Maximum turns for this agent's sub-run.
     max_turns: Option<u32>,
     /// Whether this agent can delegate to sub-agents.
@@ -178,7 +179,7 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             description: None,
             tier: None,
             tools: Vec::new(),
-            model: None,
+            model_selection: None,
             max_turns: None,
             can_delegate: None,
             max_delegation_depth: None,
@@ -248,7 +249,7 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             Some(body.to_string())
         },
         skill_filter: fm.tools,
-        model_override: fm.model,
+        model_selection: fm.model_selection,
         can_delegate,
         delegate_to: Vec::new(),
         max_delegation_depth,
@@ -298,7 +299,8 @@ name: security-auditor
 description: Finds security vulnerabilities
 tier: system
 tools: ["read_file", "grep", "glob"]
-model: claude-sonnet-4-20250514
+model_selection:
+  offering_id: offer-security-review
 max_turns: 15
 can_delegate: false
 triggers:
@@ -318,8 +320,10 @@ including SQL injection, XSS, and authentication bypasses.
         assert_eq!(p.tier, AgentTier::System);
         assert_eq!(p.skill_filter, vec!["read_file", "grep", "glob"]);
         assert_eq!(
-            p.model_override.as_deref(),
-            Some("claude-sonnet-4-20250514")
+            p.model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-security-review")
         );
         assert!(!p.can_delegate);
         assert_eq!(p.triggers.len(), 2);

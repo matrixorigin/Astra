@@ -1165,6 +1165,7 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
     let context = crate::orchestration::SpawnContext {
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
+        resolved_model_name: None,
         recursion_depth: 0,
         parent_is_fork_child: false,
         inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -1245,6 +1246,7 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
     let context = crate::orchestration::SpawnContext {
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
+        resolved_model_name: None,
         recursion_depth: 0,
         parent_is_fork_child: false,
         inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
@@ -3997,7 +3999,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     };
 
     executor
-        .ensure_durable_subrun_started(&config)
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
         .await
         .expect("child start must persist the admitted Offering identity");
     let child = run_engine
@@ -4018,7 +4020,10 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     ));
     assert!(
         executor
-            .materialize_durable_subrun_execution(&config)
+            .materialize_durable_subrun_execution(
+                &config,
+                config.admitted_model_execution.as_ref(),
+            )
             .await
             .is_err(),
         "execution material must not drift from the durable child Offering"

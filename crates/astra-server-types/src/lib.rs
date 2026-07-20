@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 pub use chat_route::{ChatRouteResponse, classify_chat_route};
 pub use completions::{
-    CompletionChoice, CompletionMessage, CompletionRequest, CompletionResponse, CompletionUsage,
+    CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
+    CompletionResponse, CompletionUsage,
 };
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,

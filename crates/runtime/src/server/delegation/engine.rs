@@ -2994,7 +2994,10 @@ impl DelegationEngine {
             // parent's provider doesn't match). Soft semantics
             // match agent spawn: on miss or mismatch the child
             // runs fresh, no hard error.
-            let delegate_model = profile.model_override.as_deref().unwrap_or("");
+            // Prefix inheritance is a performance optimization. The
+            // delegation engine does not materialize Offering routes, so it
+            // must not reinterpret an Offering ID as a provider model name.
+            let delegate_model = "";
             let inherited_prefix =
                 self.resolve_inherited_prefix_for_delegate(&request.parent_run_id, delegate_model);
 
@@ -3289,7 +3292,7 @@ impl DelegationEngine {
                                     "missing stored retry template for agent {retry_agent_id}"
                                 ));
                             };
-                            let delegate_model = profile.model_override.as_deref().unwrap_or("");
+                            let delegate_model = "";
                             let inherited_prefix = self.resolve_inherited_prefix_for_delegate(
                                 &request.parent_run_id,
                                 delegate_model,

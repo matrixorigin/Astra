@@ -501,6 +501,17 @@ pub(crate) fn model_selection_for_name_from_catalog(
         .and_then(model_selection_from_list_entry)
 }
 
+pub(crate) fn model_selection_for_offering_from_catalog(
+    models: &[ModelListItemResponse],
+    offering_id: &str,
+) -> Option<ServerModelSelection> {
+    models
+        .iter()
+        .filter(|entry| model_list_entry_is_active(entry))
+        .find(|entry| entry.offering_id == offering_id)
+        .and_then(model_selection_from_list_entry)
+}
+
 pub(crate) async fn resolve_server_model_selection(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -523,6 +534,29 @@ pub(crate) async fn resolve_server_model_selection(
     model_selection_for_name_from_catalog(&catalog, model).ok_or_else(|| {
         format!("model '{model}' is not an active Server Offering with an exact offering_id")
     })
+}
+
+pub(crate) async fn resolve_server_offering_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    offering_id: &str,
+) -> Result<ServerModelSelection, String> {
+    let resp = api
+        .get_models_response_timeout(token, std::time::Duration::from_secs(3))
+        .await
+        .map_err(|error| format!("failed to load Server Offering catalog: {error}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Server Offering catalog request failed with status {}",
+            resp.status()
+        ));
+    }
+    let catalog: Vec<ModelListItemResponse> = resp
+        .json()
+        .await
+        .map_err(|error| format!("Server Offering catalog was not valid JSON: {error}"))?;
+    model_selection_for_offering_from_catalog(&catalog, offering_id)
+        .ok_or_else(|| format!("Offering '{offering_id}' is not active in the Server catalog"))
 }
 
 /// Resolve the Server-governed default Offering when the user did not choose

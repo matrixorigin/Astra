@@ -283,7 +283,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         skill_name: &str,
         instructions: &str,
         task_context: &str,
-        model: Option<&str>,
         _max_tokens: Option<u32>,
         allowed_tools: &[String],
         parent_recursion_depth: u8,
@@ -295,9 +294,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 parent_recursion_depth,
             )?;
 
-        let effective_model = model
-            .map(String::from)
-            .or_else(|| self.default_model.clone());
+        let effective_model = self.default_model.clone();
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
@@ -805,7 +802,6 @@ mod tests {
                 "depth-test",
                 "Do work",
                 "task",
-                None,
                 None,
                 &allowed_tools,
                 crate::turn::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,

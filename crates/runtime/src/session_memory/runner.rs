@@ -954,24 +954,22 @@ async fn update_memory_with_llm(
         messages: &prompt,
         max_output_tokens,
         temperature: 0.0,
-        deadline: llm_timeout.saturating_add(Duration::from_secs(1)),
+        deadline: llm_timeout,
     });
-    let parsed = match tokio::time::timeout(llm_timeout, call).await {
-        Err(_) => {
+    let parsed = match call.await {
+        Err(error) => {
             return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
-                detail: None,
-            });
-        }
-        Ok(Err(error)) => {
-            return Err(LlmExtractionFailure {
-                reason: SessionMemoryExtractionErrorReason::LlmError,
+                reason: if error.kind == astra_core::ErrorKind::StreamIdle {
+                    SessionMemoryExtractionErrorReason::LlmTimeout
+                } else {
+                    SessionMemoryExtractionErrorReason::LlmError
+                },
                 detail: Some(summarize_llm_detail(&redact_provider_secrets(
                     &error.message,
                 ))),
             });
         }
-        Ok(Ok(result)) => result,
+        Ok(result) => result,
     };
     let content = parsed.trim();
     if content.is_empty() {
@@ -1759,6 +1757,7 @@ mod tests {
     struct CapturingMemoryInference {
         purposes: Arc<Mutex<Vec<InferencePurpose>>>,
         scopes: Arc<Mutex<Vec<astra_turn_types::InferenceInvocationScope>>>,
+        deadlines: Arc<Mutex<Vec<Duration>>>,
     }
 
     #[async_trait::async_trait]
@@ -1776,8 +1775,45 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.invocation_scope.clone());
+            self.deadlines.lock().unwrap().push(request.deadline);
             Ok(r#"{"session_title":"Captured purpose"}"#.to_string())
         }
+    }
+
+    #[derive(Debug)]
+    struct DeadlineExpiredMemoryInference;
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for DeadlineExpiredMemoryInference {
+        fn model_name(&self) -> &str {
+            "deadline-expired"
+        }
+
+        async fn complete(
+            &self,
+            _request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamIdle,
+                "provider request deadline expired",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_owned_deadline_preserves_timeout_classification() {
+        let error = update_memory_with_llm(
+            "",
+            &sample_messages(),
+            &DeadlineExpiredMemoryInference,
+            &test_scope("sess-provider-deadline"),
+            Duration::from_millis(20),
+            128,
+        )
+        .await
+        .expect_err("provider deadline must remain a typed extraction timeout");
+
+        assert_eq!(error.reason, SessionMemoryExtractionErrorReason::LlmTimeout);
     }
 
     #[test]
@@ -1861,6 +1897,7 @@ mod tests {
         let client = CapturingMemoryInference {
             purposes: Arc::clone(&purposes),
             scopes: Arc::clone(&scopes),
+            deadlines: Arc::new(Mutex::new(Vec::new())),
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
@@ -1900,9 +1937,11 @@ mod tests {
     async fn run_extraction_attributes_the_call_as_memory_extraction() {
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let scopes = Arc::new(Mutex::new(Vec::new()));
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
         let client = CapturingMemoryInference {
             purposes: Arc::clone(&purposes),
             scopes: Arc::clone(&scopes),
+            deadlines: Arc::clone(&deadlines),
         };
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
 
@@ -1935,6 +1974,10 @@ mod tests {
             "memory_extraction_test"
         );
         assert_eq!(scopes.lock().unwrap()[0].logical_attempt(), 0);
+        assert_eq!(
+            deadlines.lock().unwrap().as_slice(),
+            &[Duration::from_secs(3)]
+        );
     }
 
     #[tokio::test]

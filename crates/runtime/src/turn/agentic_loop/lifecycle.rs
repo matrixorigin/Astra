@@ -2246,7 +2246,6 @@ mod tests {
             Ok(ResolvedSkill {
                 name: name.to_string(),
                 instructions: format!("Use the {name} workflow."),
-                model: None,
                 max_tokens: None,
                 allowed_tools: vec!["read_file".into()],
                 execution_context: ExecutionContext::Inline,

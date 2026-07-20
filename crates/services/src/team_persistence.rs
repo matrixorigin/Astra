@@ -173,6 +173,7 @@ pub enum TeamCoordination {
 ///
 /// Resolved to a full [`AgentProfile`] at execution time via [`resolve_member_to_profile`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamMemberDef {
     pub role: String,
     /// Reference to an existing registered agent. When `None`, a transient
@@ -180,7 +181,7 @@ pub struct TeamMemberDef {
     pub agent_id: Option<String>,
     pub system_prompt: Option<String>,
     pub skills: Vec<String>,
-    pub model_override: Option<String>,
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
     pub mcp_servers: Vec<String>,
     /// Whether this member can delegate to sub-agents.  
     /// Defaults to `false` (User tier, no delegation).
@@ -259,8 +260,8 @@ pub fn resolve_member_to_profile_with_registry(
     if !member.skills.is_empty() {
         profile.skill_filter = member.skills.clone();
     }
-    if member.model_override.is_some() {
-        profile.model_override = member.model_override.clone();
+    if member.model_selection.is_some() {
+        profile.model_selection = member.model_selection.clone();
     }
     if !member.mcp_servers.is_empty() {
         profile.mcp_servers = member.mcp_servers.clone();
@@ -1872,7 +1873,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                             .to_string(),
                     ),
                     skills: vec!["review-changes".to_string()],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1886,7 +1887,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                             .to_string(),
                     ),
                     skills: vec!["review-changes".to_string()],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1916,7 +1917,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                             .to_string(),
                     ),
                     skills: vec!["analyze-session".to_string()],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1928,7 +1929,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                         "You synthesize findings into a coherent analysis report.".to_string(),
                     ),
                     skills: vec![],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1958,7 +1959,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                             .to_string(),
                     ),
                     skills: vec![],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1970,7 +1971,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                         "You implement code changes following the plan.".to_string(),
                     ),
                     skills: vec![],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -1982,7 +1983,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                         "You write and run tests, verifying acceptance criteria.".to_string(),
                     ),
                     skills: vec!["verify-task".to_string()],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -2005,6 +2006,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn selection(offering_id: &str) -> astra_turn_types::ModelSelection {
+        astra_turn_types::ModelSelection {
+            offering_id: offering_id.to_string(),
+        }
+    }
+
     fn test_team() -> TeamDefinition {
         TeamDefinition {
             team_id: "test-team-1".to_string(),
@@ -2018,7 +2025,7 @@ mod tests {
                     agent_id: Some("coder-agent".to_string()),
                     system_prompt: None,
                     skills: vec!["edit".to_string()],
-                    model_override: None,
+                    model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -2028,7 +2035,7 @@ mod tests {
                     agent_id: None,
                     system_prompt: Some("Review carefully".to_string()),
                     skills: vec!["review-changes".to_string()],
-                    model_override: Some("claude-3-opus".to_string()),
+                    model_selection: Some(selection("offer-claude-opus")),
                     mcp_servers: vec!["github".to_string()],
                     can_delegate: false,
                     max_delegation_depth: 0,
@@ -2117,7 +2124,7 @@ mod tests {
         let profile = resolve_member_to_profile(&team.members[0], &team);
         assert_eq!(profile.agent_id, "coder-agent");
         assert_eq!(profile.skill_filter, vec!["edit"]);
-        assert!(profile.model_override.is_none());
+        assert!(profile.model_selection.is_none());
         assert_eq!(profile.tier, AgentTier::User);
         assert!(!profile.can_delegate);
     }
@@ -2127,7 +2134,13 @@ mod tests {
         let team = test_team();
         let profile = resolve_member_to_profile(&team.members[1], &team);
         assert_eq!(profile.agent_id, "team-test-team-reviewer");
-        assert_eq!(profile.model_override.as_deref(), Some("claude-3-opus"));
+        assert_eq!(
+            profile
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-claude-opus")
+        );
         assert_eq!(profile.mcp_servers, vec!["github"]);
     }
 
@@ -2342,7 +2355,7 @@ mod tests {
                 agent_id: Some("my-coder".to_string()),
                 system_prompt: None,
                 skills: vec!["edit".to_string(), "test".to_string()],
-                model_override: Some("gpt-4".to_string()),
+                model_selection: Some(selection("offer-gpt-4")),
                 mcp_servers: vec!["github".to_string()],
                 can_delegate: false,
                 max_delegation_depth: 0,
@@ -2352,7 +2365,7 @@ mod tests {
                 agent_id: None,
                 system_prompt: Some("Be thorough".to_string()),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
@@ -2612,7 +2625,7 @@ mod tests {
             agent_id: None,
             system_prompt: None,
             skills: vec![],
-            model_override: None,
+            model_selection: None,
             mcp_servers: vec![],
             can_delegate: false,
             max_delegation_depth: 0,
@@ -2752,7 +2765,7 @@ mod tests {
         let mut base = AgentProfile::new("coder-agent", "coder", AgentTier::System);
         base.system_prompt = Some("I am the registered coder.".to_string());
         base.skill_filter = vec!["search".to_string(), "read".to_string()];
-        base.model_override = Some("gpt-4".to_string());
+        base.model_selection = Some(selection("offer-gpt-4"));
         registry.register(base).unwrap();
 
         let profile = resolve_member_to_profile_with_registry(member, &team, Some(&registry));
@@ -2764,8 +2777,14 @@ mod tests {
         );
         // Member has skills=["edit"] → overrides registry
         assert_eq!(profile.skill_filter, vec!["edit"]);
-        // Member has no model_override → registry model preserved
-        assert_eq!(profile.model_override.as_deref(), Some("gpt-4"));
+        // Member has no model_selection → registry model preserved
+        assert_eq!(
+            profile
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-gpt-4")
+        );
     }
 
     #[test]
@@ -2774,13 +2793,13 @@ mod tests {
         let mut member = team.members[1].clone(); // reviewer, no agent_id → "team-test-team-reviewer"
         member.system_prompt = Some("Custom override prompt.".to_string());
         member.skills = vec!["edit".to_string()];
-        member.model_override = Some("claude-4".to_string());
+        member.model_selection = Some(selection("offer-claude-4"));
 
         let mut registry = AgentProfileRegistry::new();
         let mut base = AgentProfile::new("team-test-team-reviewer", "reviewer", AgentTier::System);
         base.system_prompt = Some("Registry prompt.".to_string());
         base.skill_filter = vec!["search".to_string()];
-        base.model_override = Some("gpt-4".to_string());
+        base.model_selection = Some(selection("offer-gpt-4"));
         registry.register(base).unwrap();
 
         let profile = resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
@@ -2791,7 +2810,13 @@ mod tests {
             Some("Custom override prompt.")
         );
         assert_eq!(profile.skill_filter, vec!["edit"]);
-        assert_eq!(profile.model_override.as_deref(), Some("claude-4"));
+        assert_eq!(
+            profile
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.offering_id.as_str()),
+            Some("offer-claude-4")
+        );
     }
 
     #[test]
@@ -2964,7 +2989,7 @@ mod tests {
             "agent_id": null,
             "system_prompt": null,
             "skills": [],
-            "model_override": null,
+            "model_selection": null,
             "mcp_servers": []
         }"#;
         let member: TeamMemberDef = serde_json::from_str(json).unwrap();
@@ -2979,7 +3004,7 @@ mod tests {
             "agent_id": "orch-1",
             "system_prompt": "Run the show",
             "skills": ["delegate"],
-            "model_override": null,
+            "model_selection": null,
             "mcp_servers": [],
             "can_delegate": true,
             "max_delegation_depth": 3

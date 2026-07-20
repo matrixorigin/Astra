@@ -176,14 +176,13 @@ mod tests {
         create_test_skill(
             dir.path(),
             "test-skill",
-            "---\nname: test-skill\ndescription: A test\nmodel: gpt-4o\n---\nStep 1: Do it.\nStep 2: Done.",
+            "---\nname: test-skill\ndescription: A test\n---\nStep 1: Do it.\nStep 2: Done.",
         );
 
         let provider = LocalSkillProvider::with_paths(vec![dir.path().to_path_buf()]);
         let loaded = provider.load("test-skill").await.unwrap();
 
         assert_eq!(loaded.manifest.name, "test-skill");
-        assert_eq!(loaded.manifest.model.as_deref(), Some("gpt-4o"));
         assert!(loaded.instructions.contains("Step 1"));
         assert_eq!(loaded.manifest.source, SkillSourceKind::Local);
     }

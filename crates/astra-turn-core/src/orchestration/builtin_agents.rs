@@ -51,7 +51,6 @@ pub struct AgentTypeDefinition {
     pub agent_type: String,
     pub description: String,
     pub system_prompt_addendum: String,
-    pub default_model: Option<String>,
     pub max_turns: u32,
     pub allowed_tools: HashSet<String>,
     pub read_only: bool,
@@ -66,7 +65,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             agent_type: "explore".to_string(),
             description: "Fast codebase exploration and research.".to_string(),
             system_prompt_addendum: EXPLORE_PROMPT.to_string(),
-            default_model: None,
             max_turns: 20,
             allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
                 .into_iter()
@@ -78,7 +76,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             agent_type: "code-review".to_string(),
             description: "Review code changes with high signal-to-noise ratio.".to_string(),
             system_prompt_addendum: CODE_REVIEW_PROMPT.to_string(),
-            default_model: None,
             max_turns: 12,
             allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
                 .into_iter()
@@ -90,7 +87,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             agent_type: "task".to_string(),
             description: "Execute commands with verbose output tracking.".to_string(),
             system_prompt_addendum: TASK_PROMPT.to_string(),
-            default_model: None,
             max_turns: 30,
             allowed_tools: [
                 "bash",
@@ -110,7 +106,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             agent_type: "general-purpose".to_string(),
             description: "Full-capability agent for complex multi-step tasks.".to_string(),
             system_prompt_addendum: String::new(),
-            default_model: None,
             max_turns: 60,
             allowed_tools: ["*"].into_iter().map(String::from).collect(),
             read_only: false,
@@ -168,10 +163,6 @@ mod tests {
             .find(|def| def.agent_type == "code-review")
             .expect("builtins must include code-review");
         assert_eq!(code_review.max_turns, 12);
-        assert!(
-            code_review.default_model.is_none(),
-            "builtins must inherit the session/server default model unless explicitly overridden"
-        );
     }
 
     #[test]

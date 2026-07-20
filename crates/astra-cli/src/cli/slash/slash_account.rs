@@ -228,6 +228,7 @@ mod tests {
                 &astra_runtime::orchestration::SpawnContext {
                     parent_run_id: "root".into(),
                     parent_agent_id: "root".into(),
+                    resolved_model_name: None,
                     recursion_depth: 0,
                     parent_is_fork_child: false,
                     working_dir: std::path::PathBuf::from("/tmp"),

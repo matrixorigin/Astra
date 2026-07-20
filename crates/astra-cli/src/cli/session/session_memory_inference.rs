@@ -108,12 +108,28 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
         &self,
         request: MemoryInferenceRequest<'_>,
     ) -> Result<String, ClassifiedError> {
-        let mut completion = astra_thin_client::CompletionRequest::new(
-            request.purpose,
-            request.invocation_scope.clone(),
+        let operation = match request.purpose {
+            astra_turn_types::InferencePurpose::MemoryExtraction => {
+                astra_thin_client::CompletionOperation::MemoryExtraction
+            }
+            astra_turn_types::InferencePurpose::MemoryRetrievalRerank => {
+                astra_thin_client::CompletionOperation::MemoryRetrievalRerank
+            }
+            purpose => {
+                return Err(ClassifiedError::new(
+                    ErrorKind::InvalidRequest,
+                    format!("unsupported memory completion purpose {purpose}"),
+                ));
+            }
+        };
+        let mut completion = astra_thin_client::CompletionRequest::from_session_scope(
+            operation,
+            &request.invocation_scope,
             request.messages.to_vec(),
         )
-        .with_offering_id(&self.offering_id);
+        .map_err(|error| ClassifiedError::new(ErrorKind::InvalidRequest, error))?
+        .with_offering_id(&self.offering_id)
+        .with_timeout(request.deadline);
         completion.max_tokens = request.max_output_tokens.try_into().map_err(|_| {
             ClassifiedError::new(
                 ErrorKind::InvalidRequest,
@@ -121,18 +137,11 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
             )
         })?;
         completion.temperature = request.temperature;
-        let response = tokio::time::timeout(
-            request.deadline,
-            self.api.post_completions(&self.token, &completion),
-        )
-        .await
-        .map_err(|_| {
-            ClassifiedError::new(
-                ErrorKind::StreamIdle,
-                "Astra Server memory inference exceeded its deadline",
-            )
-        })?
-        .map_err(classify_thin_client_error)?;
+        let response = self
+            .api
+            .post_completions(&self.token, &completion)
+            .await
+            .map_err(classify_thin_client_error)?;
         response
             .choices
             .into_iter()

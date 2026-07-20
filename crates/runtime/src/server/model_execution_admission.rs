@@ -91,7 +91,7 @@ pub(crate) async fn admit_model_execution(
         ));
     }
     let offering = model_service
-        .resolve_model_offering(selection.offering_id.clone())
+        .revalidate_model_offering(selection.offering_id.clone())
         .await?;
     AdmittedModelExecution::from_offering(offering).map_err(internal_error)
 }

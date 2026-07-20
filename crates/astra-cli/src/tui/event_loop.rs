@@ -10183,6 +10183,7 @@ mod tests {
         astra_runtime::orchestration::SpawnContext {
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
+            resolved_model_name: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),

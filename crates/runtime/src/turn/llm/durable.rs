@@ -125,16 +125,23 @@ impl DurableInferenceLedger {
                 call.route.provider,
             )
             .await?;
+        let attempt_observer = invocation.attempt_observer_arc();
+        let settlement = NonstreamInvocationSupervisor::start(Arc::new(invocation));
         let result = crate::turn::llm::client::call_llm_nonstream_with_attempt_observer(
             client,
             call,
             timeout,
-            Some(invocation.attempt_observer()),
+            Some(attempt_observer.as_ref()),
         )
         .await;
         match result {
             Ok(result) => {
-                if let Err(e) = invocation.finish_result(&result).await {
+                if let Err(e) = settlement
+                    .settle(NonstreamSettlementCommand::Terminal(terminal_from_result(
+                        &result,
+                    )))
+                    .await
+                {
                     tracing::error!(
                         ?result.response_id,
                         %e,
@@ -145,7 +152,15 @@ impl DurableInferenceLedger {
                 Ok(result)
             }
             Err(error) => {
-                if let Err(e) = invocation.finish_error(&error).await {
+                let command = if is_ledger_error(&error) {
+                    // Provider delivery or its durable terminal is unknown.
+                    // Preserve the admitted row for reconciliation instead of
+                    // inventing a logical outcome.
+                    NonstreamSettlementCommand::LeaveAdmitted
+                } else {
+                    NonstreamSettlementCommand::Terminal(terminal_from_error(&error))
+                };
+                if let Err(e) = settlement.settle(command).await {
                     tracing::error!(
                         %error,
                         %e,
@@ -156,6 +171,81 @@ impl DurableInferenceLedger {
                 Err(error)
             }
         }
+    }
+}
+
+#[async_trait]
+trait NonstreamInvocationSettlement: Send + Sync + 'static {
+    async fn settle_terminal(
+        &self,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError>;
+
+    async fn settle_caller_drop(&self) -> Result<(), astra_core::ClassifiedError>;
+}
+
+enum NonstreamSettlementCommand {
+    Terminal(astra_services::InferenceInvocationTerminal),
+    LeaveAdmitted,
+}
+
+/// Owns logical settlement independently of the caller future.
+///
+/// Dropping the caller closes `command_tx`, but Tokio keeps the detached task
+/// alive so it can converge the durable attempt and invocation. Once a normal
+/// provider outcome is sent, the same task remains the sole terminal writer
+/// even if the caller is cancelled while awaiting the durable commit.
+struct NonstreamInvocationSupervisor {
+    command_tx: Option<tokio::sync::oneshot::Sender<NonstreamSettlementCommand>>,
+    task: tokio::task::JoinHandle<Result<(), astra_core::ClassifiedError>>,
+}
+
+impl NonstreamInvocationSupervisor {
+    fn start(owner: Arc<dyn NonstreamInvocationSettlement>) -> Self {
+        let (command_tx, command_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            match command_rx.await {
+                Ok(NonstreamSettlementCommand::Terminal(terminal)) => {
+                    owner.settle_terminal(&terminal).await
+                }
+                Ok(NonstreamSettlementCommand::LeaveAdmitted) => Ok(()),
+                Err(_) => {
+                    let result = owner.settle_caller_drop().await;
+                    if let Err(error) = &result {
+                        tracing::error!(
+                            %error,
+                            "detached non-streaming inference settlement failed after caller cancellation"
+                        );
+                    }
+                    result
+                }
+            }
+        });
+        Self {
+            command_tx: Some(command_tx),
+            task,
+        }
+    }
+
+    async fn settle(
+        mut self,
+        command: NonstreamSettlementCommand,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let command_tx = self.command_tx.take().ok_or_else(|| {
+            contract_error("settlement", "non-streaming invocation already settled")
+        })?;
+        command_tx.send(command).map_err(|_| {
+            contract_error(
+                "settlement",
+                "non-streaming settlement owner stopped before receiving its terminal",
+            )
+        })?;
+        self.task.await.map_err(|error| {
+            contract_error(
+                "settlement",
+                format!("non-streaming settlement owner failed: {error}"),
+            )
+        })?
     }
 }
 
@@ -209,17 +299,7 @@ impl DurableInferenceInvocation {
         &self,
         result: &LlmCallResult,
     ) -> Result<(), astra_core::ClassifiedError> {
-        let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
-        self.finish(&astra_services::InferenceInvocationTerminal::succeeded(
-            astra_services::InferenceUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cached_input_tokens,
-                cache_creation_tokens: usage.cache_creation_tokens,
-            },
-            result.response_id.clone(),
-        ))
-        .await
+        self.finish(&terminal_from_result(result)).await
     }
 
     pub(crate) async fn finish_error(
@@ -242,6 +322,24 @@ impl DurableInferenceInvocation {
         astra_services::finish_inference_invocation(&self.shared_pool, &self.plan, terminal)
             .await
             .map_err(|error| service_error("terminal commit", error))
+    }
+}
+
+#[async_trait]
+impl NonstreamInvocationSettlement for DurableInferenceInvocation {
+    async fn settle_terminal(
+        &self,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.finish(terminal).await
+    }
+
+    async fn settle_caller_drop(&self) -> Result<(), astra_core::ClassifiedError> {
+        let delivery_unknown = terminal_from_error(&astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "Non-streaming inference caller stopped after durable admission",
+        ));
+        self.finish_after_disconnect(&delivery_unknown).await
     }
 }
 
@@ -441,9 +539,57 @@ pub(crate) fn terminal_from_error(
     }
 }
 
+fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvocationTerminal {
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+    astra_services::InferenceInvocationTerminal::succeeded(
+        astra_services::InferenceUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cached_input_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+        },
+        result.response_id.clone(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingSettlementOwner {
+        dropped: tokio::sync::Notify,
+        drop_count: AtomicU32,
+    }
+
+    #[async_trait]
+    impl NonstreamInvocationSettlement for RecordingSettlementOwner {
+        async fn settle_terminal(
+            &self,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            Ok(())
+        }
+
+        async fn settle_caller_drop(&self) -> Result<(), astra_core::ClassifiedError> {
+            self.drop_count.fetch_add(1, Ordering::AcqRel);
+            self.dropped.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_settlement_outlives_a_dropped_caller() {
+        let owner = Arc::new(RecordingSettlementOwner::default());
+        let supervisor = NonstreamInvocationSupervisor::start(owner.clone());
+
+        drop(supervisor);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), owner.dropped.notified())
+            .await
+            .expect("dropped caller must wake the independent settlement owner");
+        assert_eq!(owner.drop_count.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn terminal_status_distinguishes_pre_delivery_failure_from_uncertain_delivery() {

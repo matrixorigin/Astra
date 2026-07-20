@@ -786,6 +786,14 @@ fn active_llm_model_resolution_cache_store(
         .insert(key, model, Instant::now());
 }
 
+fn active_llm_model_resolution_cache_remove(key: &ActiveLlmModelCacheKey) {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .entries
+        .remove(key);
+}
+
 fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
     ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
         .lock()
@@ -1277,6 +1285,39 @@ pub async fn resolve_active_llm_offering(
     }
 }
 
+/// Revalidate an Offering immediately before provider I/O.
+///
+/// Unlike catalog browsing and initial selection, this execution boundary
+/// never accepts a process-local cache hit or stale fallback. One exact DB
+/// read makes revocation and route/credential rotation visible across Server
+/// processes on the next provider request. The fresh result replaces the
+/// catalog cache; a failed revalidation evicts the corresponding entry.
+pub async fn revalidate_active_llm_offering(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    offering_id: &str,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedModelOffering, ModelOfferingResolutionError> {
+    let offering_id = validate_model_offering_id(offering_id)?;
+    let pool = require_pool(pool, matrixone)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+    match resolve_active_llm_offering_uncached(encryptor, offering_id, &pool).await {
+        Ok(model) => {
+            active_llm_model_resolution_cache_store(cache_key, model.clone());
+            Ok(ResolvedModelOffering {
+                offering_id: offering_id.to_string(),
+                model,
+            })
+        }
+        Err(error) => {
+            active_llm_model_resolution_cache_remove(&cache_key);
+            Err(error)
+        }
+    }
+}
+
 async fn resolve_active_llm_offering_uncached(
     encryptor: &FernetTokenEncryptor,
     offering_id: &str,
@@ -1329,12 +1370,10 @@ async fn resolve_active_llm_model_uncached(
     .await
     .map_err(|e| format!("DB query: {e}"))?;
 
-    // Class C fix: fall through to the alias resolver when exact
-    // match fails. The LLM often produces short names like
-    // `claude-sonnet` for `spawn_agent`'s `model_override`; doing
-    // a deterministic substring / case-insensitive match against
-    // active rows lets those calls succeed without forcing every
-    // case author to retrain the prompt. Ambiguity still errors.
+    // Legacy root-model selection may still arrive as a provider display
+    // name rather than an Offering id. Keep that compatibility inside the
+    // root selection adapter; child/skill/completion boundaries never call
+    // this alias resolver. Ambiguity still errors.
     //
     // Track canonical name separately so the `is_active` error
     // message below can name BOTH the requested alias and the
@@ -1689,6 +1728,16 @@ pub trait ModelService: Send + Sync {
         offering_id: String,
     ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Resolve execution material without accepting a catalog cache hit.
+    /// Provider request boundaries call this method so revocation, credential
+    /// rotation, and route rotation become visible before network I/O.
+    async fn revalidate_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        self.resolve_model_offering(offering_id).await
+    }
+
     async fn update_model(
         &self,
         model_name: String,
@@ -2041,6 +2090,20 @@ impl ModelService for DatabaseModelService {
         offering_id: String,
     ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
         resolve_active_llm_offering(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn revalidate_model_offering(
+        &self,
+        offering_id: String,
+    ) -> Result<ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_active_llm_offering(
             &self.matrixone,
             self.encryptor.as_ref(),
             &offering_id,

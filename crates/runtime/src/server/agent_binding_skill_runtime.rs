@@ -315,7 +315,6 @@ fn build_resolver(
         let resolved = ResolvedSkill {
             name: skill.name.clone(),
             instructions,
-            model: skill.model.clone(),
             max_tokens: skill.max_tokens,
             allowed_tools: skill.allowed_tools.clone(),
             execution_context: ExecutionContext::Inline,

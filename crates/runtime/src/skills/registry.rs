@@ -532,7 +532,6 @@ impl UnifiedSkillResolver {
         ResolvedSkill {
             name: loaded.manifest.name.clone(),
             instructions: loaded.instructions.clone(),
-            model: loaded.manifest.model.clone(),
             max_tokens: loaded.manifest.max_tokens,
             allowed_tools: loaded.manifest.allowed_tools.clone(),
             execution_context: loaded.manifest.execution_context.clone(),

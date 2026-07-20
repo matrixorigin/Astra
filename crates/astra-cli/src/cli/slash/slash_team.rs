@@ -65,7 +65,7 @@ pub(crate) struct TeamMember {
     pub role: String,
     pub description: String,
     pub skills: Vec<String>,
-    pub model_override: Option<String>,
+    pub model_selection: Option<astra_turn_types::ModelSelection>,
 }
 
 /// Registry of all defined teams (stored in SessionState).
@@ -114,7 +114,7 @@ impl TeamRegistry {
                             and edge cases."
                             .into(),
                         skills: vec![],
-                        model_override: None,
+                        model_selection: None,
                     },
                     TeamMember {
                         role: "reviewer".to_string(),
@@ -123,7 +123,7 @@ impl TeamRegistry {
                             Check if the producer missed bugs, security issues, or edge cases."
                             .into(),
                         skills: vec![],
-                        model_override: None,
+                        model_selection: None,
                     },
                 ],
                 shared_context: HashMap::new(),
@@ -146,13 +146,13 @@ impl TeamRegistry {
                         role: "explorer".to_string(),
                         description: "Searches codebase, reads docs, gathers information".into(),
                         skills: vec!["analyze-session".into()],
-                        model_override: None,
+                        model_selection: None,
                     },
                     TeamMember {
                         role: "synthesizer".to_string(),
                         description: "Synthesizes findings into coherent analysis".into(),
                         skills: vec![],
-                        model_override: None,
+                        model_selection: None,
                     },
                 ],
                 shared_context: HashMap::new(),
@@ -177,19 +177,19 @@ impl TeamRegistry {
                         description: "Decomposes task into subtasks with acceptance criteria"
                             .into(),
                         skills: vec![],
-                        model_override: None,
+                        model_selection: None,
                     },
                     TeamMember {
                         role: "implementer".to_string(),
                         description: "Implements code changes following the plan".into(),
                         skills: vec![],
-                        model_override: None,
+                        model_selection: None,
                     },
                     TeamMember {
                         role: "tester".to_string(),
                         description: "Writes and runs tests, verifies acceptance criteria".into(),
                         skills: vec!["verify-task".into()],
-                        model_override: None,
+                        model_selection: None,
                     },
                 ],
                 shared_context: HashMap::new(),
@@ -225,7 +225,7 @@ impl TeamRegistry {
                                 .clone()
                                 .unwrap_or_else(|| format!("{} agent", m.role)),
                             skills: m.skills.clone(),
-                            model_override: m.model_override.clone(),
+                            model_selection: m.model_selection.clone(),
                         })
                         .collect(),
                     shared_context: def.context,
@@ -371,7 +371,7 @@ fn cli_team_to_definition(
                 agent_id: None,
                 system_prompt: Some(m.description.clone()),
                 skills: m.skills.clone(),
-                model_override: m.model_override.clone(),
+                model_selection: m.model_selection.clone(),
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
@@ -694,7 +694,7 @@ pub(crate) async fn handle_team_command(
                     desc.to_string()
                 },
                 skills: Vec::new(),
-                model_override: None,
+                model_selection: None,
             };
             match state.team_registry.add_member(team, member) {
                 Ok(()) => {
@@ -749,8 +749,8 @@ pub(crate) async fn handle_team_command(
                         if !m.skills.is_empty() {
                             eprintln!("      {} {}", "Skills:".dim(), m.skills.join(", "));
                         }
-                        if let Some(ref model) = m.model_override {
-                            eprintln!("      {} {}", "Model:".dim(), model);
+                        if let Some(ref model) = m.model_selection {
+                            eprintln!("      {} {}", "Offering:".dim(), model.offering_id);
                         }
                     }
                     if !t.shared_context.is_empty() {
@@ -1586,7 +1586,7 @@ pub(crate) async fn handle_team_command(
                         "role": m.role,
                         "description": m.description,
                         "skills": m.skills,
-                        "model_override": m.model_override,
+                        "model_selection": m.model_selection,
                     })).collect::<Vec<_>>(),
                     "shared_context": t.shared_context,
                 })
@@ -1846,9 +1846,7 @@ pub(crate) async fn handle_team_command(
                 eprintln!("\n  {}{}", def.agent_type.as_str().magenta().bold(), tag,);
                 eprintln!("    {}", def.description.as_str().dim());
                 eprintln!(
-                    "    {} {} | {} {} | {}",
-                    "Model:".dim(),
-                    def.default_model.as_deref().unwrap_or("server default"),
+                    "    {} {} | {}",
                     "Max turns:".dim(),
                     def.max_turns,
                     if def.read_only {
@@ -1978,7 +1976,7 @@ mod tests {
                 role: "coder".into(),
                 description: "writes code".into(),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
             },
         )
         .unwrap();
@@ -1995,7 +1993,7 @@ mod tests {
             role: "coder".into(),
             description: "v1".into(),
             skills: vec![],
-            model_override: None,
+            model_selection: None,
         };
         reg.add_member("test", member.clone()).unwrap();
         assert!(reg.add_member("test", member).is_err());
@@ -2029,7 +2027,7 @@ mod tests {
                     role: r.to_string(),
                     description: format!("{r} agent"),
                     skills: vec![],
-                    model_override: None,
+                    model_selection: None,
                 })
                 .collect(),
             shared_context: HashMap::new(),
@@ -2490,7 +2488,7 @@ mod tests {
                 agent_id: None,
                 system_prompt: Some("does work".into()),
                 skills: vec![],
-                model_override: None,
+                model_selection: None,
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,

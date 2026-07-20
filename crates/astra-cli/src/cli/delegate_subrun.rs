@@ -267,10 +267,22 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 "delegated agent start was not delivered to the live workbench"
             );
         }
-        let effective_model = profile
-            .model_override
-            .clone()
-            .or_else(|| self.default_model.clone());
+        let model_selection = if let Some(selection) = profile.model_selection.as_ref() {
+            crate::cli::session::session_runtime::resolve_server_offering_selection(
+                &self.api,
+                &self.token,
+                &selection.offering_id,
+            )
+            .await?
+        } else {
+            crate::cli::skill_subrun::resolve_subrun_model_selection(
+                &self.api,
+                &self.token,
+                self.default_model.as_deref(),
+            )
+            .await?
+        };
+        let effective_model = Some(model_selection.name.clone());
         let child_thinking = effective_model
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
@@ -283,14 +295,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
-        let model_selection = crate::cli::skill_subrun::resolve_subrun_model_selection(
-            &self.api,
-            &self.token,
-            effective_model.as_deref(),
-        )
-        .await?;
-        let effective_model = Some(model_selection.name);
-
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
@@ -809,7 +813,7 @@ pub(crate) fn register_default_agents(
             tier: AgentTier::Orchestrator,
             system_prompt: None,
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: true,
             delegate_to: Vec::new(), // empty = all
             max_delegation_depth: 3,
@@ -828,7 +832,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,
@@ -847,7 +851,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,
@@ -866,7 +870,7 @@ pub(crate) fn register_default_agents(
                     .into(),
             ),
             skill_filter: Vec::new(),
-            model_override: None,
+            model_selection: None,
             can_delegate: false,
             delegate_to: Vec::new(),
             max_delegation_depth: 0,

@@ -14,6 +14,7 @@ use crate::orchestration_builtin_agents::{AgentTypeDefinition, get_builtin_agent
 
 /// YAML schema for a custom agent type definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentTypeConfig {
     /// Agent type name (must be unique across builtins + custom).
     pub name: String,
@@ -26,9 +27,6 @@ pub struct AgentTypeConfig {
     /// System prompt addendum (appended to base if extending).
     #[serde(default)]
     pub system_prompt: String,
-    /// Default model override.
-    #[serde(default)]
-    pub model: Option<String>,
     /// Max turns override.
     #[serde(default)]
     pub max_turns: Option<u32>,
@@ -148,7 +146,6 @@ impl AgentRegistry {
                 } else {
                     format!("{}\n{}", base.system_prompt_addendum, config.system_prompt)
                 },
-                default_model: config.model.or_else(|| base.default_model.clone()),
                 max_turns: config.max_turns.unwrap_or(base.max_turns),
                 allowed_tools: config
                     .allowed_tools
@@ -161,7 +158,6 @@ impl AgentRegistry {
                 agent_type: config.name,
                 description: config.description,
                 system_prompt_addendum: config.system_prompt,
-                default_model: config.model,
                 max_turns: config.max_turns.unwrap_or(30),
                 allowed_tools: config
                     .allowed_tools
@@ -224,7 +220,6 @@ mod tests {
             description: "Scan for vulnerabilities".to_string(),
             extends: None,
             system_prompt: "You are a security expert.".to_string(),
-            model: Some("claude-sonnet".to_string()),
             max_turns: Some(10),
             allowed_tools: Some(vec!["grep".to_string(), "read_file".to_string()]),
             read_only: Some(true),
@@ -244,7 +239,6 @@ mod tests {
             description: String::new(),
             extends: Some("explore".to_string()),
             system_prompt: "Focus on architecture.".to_string(),
-            model: None,
             max_turns: Some(40),
             allowed_tools: None,
             read_only: None,
@@ -253,7 +247,6 @@ mod tests {
         assert_eq!(def.agent_type, "deep-explore");
         assert_eq!(def.max_turns, 40);
         assert!(def.read_only); // inherited from explore
-        assert_eq!(def.default_model, None); // inherited server default
         assert!(def.system_prompt_addendum.contains("architecture"));
     }
 
@@ -266,7 +259,6 @@ mod tests {
             agent_type: "explore".to_string(),
             description: "Custom explore".to_string(),
             system_prompt_addendum: String::new(),
-            default_model: Some("claude-opus".to_string()),
             max_turns: 100,
             allowed_tools: ["*"].into_iter().map(String::from).collect(),
             read_only: false,

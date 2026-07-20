@@ -109,7 +109,6 @@ impl Default for SkillToolInfo {
 pub struct ResolvedSkill {
     pub name: String,
     pub instructions: String,
-    pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub allowed_tools: Vec<String>,
     pub execution_context: ExecutionContext,
