@@ -520,6 +520,20 @@ fn confirmed_purge_count(output: &str) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+fn direct_memoria_scope_user_id<'a>(
+    cloud_base: Option<&str>,
+    cloud_token: Option<&str>,
+    args: &'a Value,
+) -> Option<&'a str> {
+    if cloud_base.is_some() && cloud_token.is_some() {
+        return None;
+    }
+    args.get("user_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+}
+
 fn memory_status_counts_toward_circuit(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || matches!(
@@ -768,11 +782,32 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().record_recall(session_id, turn, memory_ids);
     }
 
+    pub fn record_recall_for_producer(
+        session_id: &str,
+        producer_id: &str,
+        turn: u32,
+        memory_ids: Vec<String>,
+    ) {
+        astra_memoria::memoria_runtime_state().record_recall_for_producer(
+            session_id,
+            producer_id,
+            turn,
+            memory_ids,
+        );
+    }
+
     /// Latest non-consuming selection receipt for a session. Feedback
     /// attribution drains a separate queue and therefore cannot erase this
     /// cross-turn referential identity.
     pub fn latest_recall(session_id: &str) -> Option<RecallSnapshot> {
         astra_memoria::memoria_runtime_state().latest_recall(session_id)
+    }
+
+    /// Close the referential receipt before processing a newer recall result.
+    /// The feedback queue is independent and remains available for outcome
+    /// attribution until its normal bounded drain.
+    pub fn clear_latest_recall(session_id: &str) {
+        astra_memoria::memoria_runtime_state().clear_latest_recall(session_id);
     }
 
     /// Render a compact typed selection receipt for dynamic runtime context.
@@ -860,6 +895,18 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().drain_recalls(session_id, max_age)
     }
 
+    pub fn drain_recalls_for_producer(
+        session_id: &str,
+        producer_id: &str,
+        max_age: Option<Duration>,
+    ) -> Vec<RecallSnapshot> {
+        astra_memoria::memoria_runtime_state().drain_recalls_for_producer(
+            session_id,
+            producer_id,
+            max_age,
+        )
+    }
+
     /// Number of unconsumed recall snapshots for a session (tests +
     /// observability).
     pub fn pending_recall_count(session_id: &str) -> usize {
@@ -890,13 +937,14 @@ impl MemoriaToolGateway {
     pub async fn feedback_pending_recalls(
         &self,
         session_id: &str,
+        producer_id: &str,
         signal: &str,
         context_prefix: &str,
     ) -> FeedbackDrainReport {
-        if session_id.is_empty() || signal.is_empty() {
+        if session_id.is_empty() || producer_id.is_empty() || signal.is_empty() {
             return FeedbackDrainReport::default();
         }
-        let snapshots = Self::drain_recalls(session_id, None);
+        let snapshots = Self::drain_recalls_for_producer(session_id, producer_id, None);
         let mut report = FeedbackDrainReport::default();
         for snap in snapshots {
             for id in snap.memory_ids {
@@ -1161,7 +1209,13 @@ impl MemoriaToolGateway {
         &self,
         new_content: &str,
         session_id: Option<&str>,
+        user_id: Option<&str>,
     ) -> Option<String> {
+        // Do not switch transports behind an authenticated cloud gateway.
+        // The cloud/edge path owns tenant routing and backend deduplication.
+        if self.cloud_base.is_some() && self.cloud_token.is_some() {
+            return None;
+        }
         // A narrow conflict query: use the new content as the query.
         // We don't want to spend 5s on a full retrieval here — the
         // write path must stay fast when there are no conflicts.
@@ -1176,13 +1230,14 @@ impl MemoriaToolGateway {
             .no_proxy()
             .build()
             .ok()?;
-        let resp = client
+        let request = client
             .post(format!("{}/v1/memories/retrieve", mem.base_url))
-            .header("Authorization", format!("Bearer {key}"))
-            .json(&body)
-            .send()
-            .await
-            .ok()?;
+            .header("Authorization", format!("Bearer {key}"));
+        let request = match user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
+            Some(user_id) => request.header("X-User-Id", user_id),
+            None => request,
+        };
+        let resp = request.json(&body).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1241,7 +1296,11 @@ impl MemoriaToolGateway {
             && !content.trim().is_empty()
         {
             let session_id = args.get("session_id").and_then(Value::as_str);
-            if let Some(conflict) = self.detect_remember_conflict(content, session_id).await {
+            let user_id = args.get("user_id").and_then(Value::as_str);
+            if let Some(conflict) = self
+                .detect_remember_conflict(content, session_id, user_id)
+                .await
+            {
                 return conflict;
             }
         }
@@ -1308,12 +1367,16 @@ impl MemoriaToolGateway {
                     HttpMethod::Put => client.put(&endpoint),
                     HttpMethod::Post => client.post(&endpoint),
                 };
-                match req
-                    .header("Authorization", &auth_header)
-                    .json(&payload)
-                    .send()
-                    .await
-                {
+                let req = req.header("Authorization", &auth_header);
+                let req = match direct_memoria_scope_user_id(
+                    self.cloud_base.as_deref(),
+                    self.cloud_token.as_deref(),
+                    args,
+                ) {
+                    Some(user_id) => req.header("X-User-Id", user_id),
+                    None => req,
+                };
+                match req.json(&payload).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         match resp.text().await {
@@ -1357,6 +1420,10 @@ impl MemoriaToolGateway {
         // carry the same signals as the bridge-side prefetch path.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
+            // Invocation order, not result cardinality, owns the active
+            // selection. A failed/empty/newly-deduplicated recall must not
+            // leave the prior result addressable as "these memories".
+            Self::clear_latest_recall(session_id);
             if let Err(error) = validate_strict_recall_response(&raw_text, args) {
                 tracing::error!(
                     target: "astra::memory::scope",
@@ -1388,7 +1455,13 @@ impl MemoriaToolGateway {
                 //     the next tool-result can route useful/irrelevant
                 //     feedback back to them. Closes the recall→feedback
                 //     loop the prompt promises.
-                Self::record_recall(session_id, turn, newly_surfaced);
+                let producer_id = args
+                    .get("_attribution_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|producer_id| !producer_id.is_empty())
+                    .unwrap_or("session");
+                Self::record_recall_for_producer(session_id, producer_id, turn, newly_surfaced);
             }
             return decorated;
         }
@@ -2121,29 +2194,6 @@ impl MemoriaToolGateway {
                     return Some(
                         json!({"error": "memory(action=forget) requires `memory_id` or `topic`"}),
                     );
-                }
-                let ids = exact_memory_ids_from_args(args);
-                if let Some(session_id) = args
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|session_id| !session_id.is_empty())
-                    && !ids.is_empty()
-                {
-                    let surfaced = Self::seen_snapshot(session_id);
-                    let unproven = ids
-                        .iter()
-                        .filter(|id| !surfaced.contains(*id))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !unproven.is_empty() {
-                        return Some(json!({
-                            "error": "destructive resource identities must come from producer-owned evidence surfaced in this session",
-                            "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
-                            "unproven_memory_ids": unproven,
-                            "recovery": "Use the exact latest selection_id, or recall once and use the returned identities."
-                        }));
-                    }
                 }
                 None
             }
@@ -3569,27 +3619,43 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
-    #[test]
-    fn destructive_identity_requires_session_surfaced_provenance() {
-        let session_id = "selection-provenance-rejection";
-        MemoriaToolGateway::reset_session_process_state(session_id);
-        MemoriaToolGateway::record_seen(session_id, ["real-id".into()]);
+    #[tokio::test]
+    async fn newer_empty_recall_cannot_leave_an_older_selection_active() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let error = MemoriaToolGateway::validate_before_side_effects(
-            "forget",
-            &json!({
-                "memory_ids": ["invented-id"],
-                "session_id": session_id,
-                "reason": "user requested cleanup"
-            }),
-        )
-        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/retrieve"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"memories": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session_id = "selection-empty-recall-boundary";
+        MemoriaToolGateway::reset_session_process_state(session_id);
+        MemoriaToolGateway::record_recall(session_id, 1, vec!["old-id".into()]);
+        let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("token".to_string()));
+
+        let output = gateway
+            .call_with_timeout(
+                "recall",
+                &json!({
+                    "session_id": session_id,
+                    "query": "new producer query",
+                    "turn": 2
+                }),
+                Duration::from_secs(1),
+            )
+            .await;
 
         assert_eq!(
-            error["error_kind"],
-            astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            serde_json::from_str::<Value>(&output).unwrap()["memories"],
+            json!([])
         );
-        assert_eq!(error["unproven_memory_ids"], json!(["invented-id"]));
+        assert!(MemoriaToolGateway::latest_recall(session_id).is_none());
+        server.verify().await;
         MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
@@ -3618,6 +3684,20 @@ mod memoria_http_client_tests {
             astra_core::ErrorKind::ToolInvalidArgs.as_str()
         );
         MemoriaToolGateway::reset_session_process_state(session_id);
+    }
+
+    #[test]
+    fn direct_master_key_transport_projects_scope_only_for_direct_calls() {
+        let args = json!({"user_id": " user-1 "});
+        assert_eq!(
+            direct_memoria_scope_user_id(None, None, &args),
+            Some("user-1")
+        );
+        assert_eq!(
+            direct_memoria_scope_user_id(Some("https://cloud"), Some("token"), &args),
+            None,
+            "the authenticated cloud proxy owns tenant projection"
+        );
     }
 
     #[test]
@@ -4062,14 +4142,14 @@ mod memoria_http_client_tests {
         let client =
             MemoriaToolGateway::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
         let attempted = client
-            .feedback_pending_recalls(session_id, "useful", "unit-test")
+            .feedback_pending_recalls(session_id, "session", "useful", "unit-test")
             .await;
         assert_eq!(attempted.attempted, 2);
         assert_eq!(attempted.failed, 2);
         assert_eq!(attempted.succeeded, 0);
         assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
         let attempted_again = client
-            .feedback_pending_recalls(session_id, "useful", "unit-test")
+            .feedback_pending_recalls(session_id, "session", "useful", "unit-test")
             .await;
         assert_eq!(attempted_again.attempted, 0);
     }

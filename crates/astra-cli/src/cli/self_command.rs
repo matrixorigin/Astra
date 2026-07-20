@@ -957,7 +957,18 @@ fn analysis_view_recent_event_previews(
             JournalEventType::AdaptivePerTurnApplied,
         ],
     };
-    recent_event_previews(events, journal_limit.clamp(1, 12), event_types)
+    let limit = journal_limit.clamp(1, 12);
+    if analysis_view == "execution_errors" {
+        return events
+            .iter()
+            .rev()
+            .filter(|event| event_types.iter().any(|kind| kind == &event.event_type))
+            .map(event_preview)
+            .filter(event_preview_has_adverse_signal)
+            .take(limit)
+            .collect();
+    }
+    recent_event_previews(events, limit, event_types)
 }
 
 fn restored_recent_turn_previews(
@@ -1371,6 +1382,24 @@ fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
                     "warning" | "error" | "critical"
                 )
             }),
+        "turn_guard_verdict" => {
+            metadata
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|severity| matches!(severity, "warning" | "error" | "critical"))
+                || metadata
+                    .get("advisory_threshold_reached")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                || metadata
+                    .get("avoid_tools_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > 0)
+                || metadata
+                    .get("nudge_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > 0)
+        }
         "session_memory_extraction" => {
             metadata
                 .get("outcome")
@@ -1412,9 +1441,9 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventPreview, build_reflect_response, cli_provider_visible_tool_names,
-        event_preview_has_adverse_signal, event_preview_summary, execute_self_command,
-        persist_config_override, replace_json_path, resolve_session_id,
+        EventPreview, analysis_view_recent_event_previews, build_reflect_response,
+        cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
+        execute_self_command, persist_config_override, replace_json_path, resolve_session_id,
         session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
@@ -2406,6 +2435,45 @@ mod tests {
         assert_eq!(projected_event_labels, vec!["tool_call_error"]);
         assert_eq!(response.evidence.len(), 1);
         assert_eq!(response.evidence[0].source, "local_journal");
+    }
+
+    #[test]
+    fn error_view_filters_non_adverse_events_before_applying_its_limit() {
+        let session_id = "reflect-error-window";
+        let mut events = vec![JournalEvent::tool_call_error(
+            Some(session_id),
+            1,
+            "memory",
+            "invalid arguments",
+            astra_services::session_journal::ToolCallRecord {
+                name: "memory".to_string(),
+                ok: false,
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                ..Default::default()
+            },
+        )];
+        for turn in 2..20 {
+            events.push(JournalEvent::turn_guard_verdict(
+                Some(session_id),
+                turn,
+                "info",
+                &[],
+                &[],
+                &[],
+                false,
+                0,
+                0,
+                0,
+                &[],
+                0,
+                0,
+            ));
+        }
+
+        let previews = analysis_view_recent_event_previews(&events, 1, "execution_errors");
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].event_type, "tool_call_error");
     }
 
     #[tokio::test]

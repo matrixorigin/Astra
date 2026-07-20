@@ -1681,6 +1681,20 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    /// Return only producer-owned tool arguments after the batch protocol has
+    /// consumed its transaction envelope. Transaction controls are not part of
+    /// any tool's advertised schema and must not leak into permission checks or
+    /// execution as if every tool independently owned them.
+    fn batch_tool_args(args: &Value) -> Value {
+        let Some(object) = args.as_object() else {
+            return args.clone();
+        };
+        let mut tool_args = object.clone();
+        tool_args.remove("transaction_id");
+        tool_args.remove("rollback_on_failure");
+        Value::Object(tool_args)
+    }
+
     fn batch_transaction_boundary_supported(tool: &str, args: &Value) -> bool {
         if tool == "bash" {
             return args
@@ -2385,8 +2399,9 @@ impl<'a> CliSseStreamHost<'a> {
                 }
             }
 
+            let tool_args = Self::batch_tool_args(&req.args);
             let mut result = self
-                .execute_tool(&req.request_id, &req.tool, &req.args)
+                .execute_tool(&req.request_id, &req.tool, &tool_args)
                 .await;
 
             if let Some(active) = active_tx.as_ref() {

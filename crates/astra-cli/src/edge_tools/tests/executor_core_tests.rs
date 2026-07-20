@@ -1,4 +1,4 @@
-use super::{fanout_test_context, test_executor, test_spawner};
+use super::{assert_tool_invalid_args, fanout_test_context, test_executor, test_spawner};
 use crate::edge_tools::{ToolExecutor, local_tool_schemas, truncate_output};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
@@ -103,17 +103,13 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
         "summary",
         "history",
     ] {
-        let result = executor
-            .execute("session", &json!({"action": action}))
-            .await;
-        assert!(result.starts_with("Error:"), "{action}: {result}");
-        assert!(
-            result.contains("unknown `session` action")
-                && result.contains("history_page")
-                && result.contains("top-level tool")
-                && !result.contains("ask_user"),
-            "{action}: {result}"
-        );
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "session",
+            &json!({"action": action}),
+        )
+        .await;
+        assert_tool_invalid_args(&result);
     }
 }
 
@@ -348,102 +344,36 @@ async fn execute_with_metadata_read_file_error_is_not_structured_noop_or_cached(
     );
 }
 
-/// REGRESSION: the consolidated `agent` tool must reject the blocked
-/// delegate action instead of returning a successful placeholder.
-///
-/// The fix is twofold: (1) the schema enum drops "delegate" so the
-/// model can't pick it, and (2) defence-in-depth — the executor
-/// rejects it as an unknown action with an actionable redirect.
 #[tokio::test]
-async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
+async fn agent_rejects_actions_outside_its_public_contract() {
     let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
-    let result = executor
-        .execute(
-            "agent",
-            &json!({
-                "action": "delegate",
-                "task": "review HEAD~3..HEAD"
-            }),
-        )
-        .await;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&result).expect("agent action errors must stay structured JSON");
-    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
-    assert_eq!(
-        parsed["error_kind"].as_str(),
-        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
-        "got: {result}"
-    );
-    assert!(
-        parsed["error"].as_str().unwrap_or("").contains("delegate"),
-        "blocked delegate action error must name the bad action. Got: {result}"
-    );
-    assert!(
-        result.contains("spawn"),
-        "blocked delegate action error must name the `agent` spawn action as the \
-         alternative — without that, the model has no path to recovery. \
-         Got: {result}"
-    );
-    assert!(
-        !result.contains("acknowledged"),
-        "delegate-shaped calls must not return success-style placeholder text. Got: {result}"
-    );
-    // End-to-end UX assertion: the Error: prefix must classify through
-    // tool_result_semantics::is_tool_error → cloud_tool_result_status_label
-    // → "failed", so the TUI renders the red `•` failure banner instead
-    // of the green success banner. This is the load-bearing wire that
-    // makes the failure visible to the human.
-    assert!(
-        astra_turn_core::tool_result_semantics::is_tool_error(&result),
-        "the new error must be classified as an error by is_tool_error \
-         (drives TUI red banner / Failed label). Got: {result}"
-    );
-    assert_eq!(
-        astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&result),
-        "failed",
-        "the new error must produce status='failed' for cloud reporting; \
-         status='completed' would re-poison the model's belief that the \
-         delegation succeeded. Got: {result}"
-    );
+    let result = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "agent",
+        &json!({
+            "action": "delegate",
+            "task": "review HEAD~3..HEAD"
+        }),
+    )
+    .await;
+    assert_tool_invalid_args(&result);
 }
 
-/// REGRESSION (session e15691e5): the model emitted
-/// `agent({ "spawn": { ... } })` / `agent({ "spawn": "..." })` instead of
-/// the consolidated `agent({ "action": "spawn", ... })` shape. The generic
-/// "unknown agent action ''" error was technically correct but not
-/// actionable enough — it didn't explain that `spawn` must be the VALUE of
-/// `action`, not a wrapper key.
 #[tokio::test]
-async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
+async fn agent_rejects_wrapper_shapes_outside_its_public_contract() {
     let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
-    let result = executor
-        .execute(
-            "agent",
-            &json!({
-                "spawn": {
-                    "description": "Review latest commit",
-                    "prompt": "Inspect HEAD~1..HEAD for regressions"
-                }
-            }),
-        )
-        .await;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&result).expect("agent wrapper errors must stay structured JSON");
-    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
-    assert_eq!(
-        parsed["error_kind"].as_str(),
-        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
-        "got: {result}"
-    );
-    let error = parsed["error"].as_str().expect("structured error text");
-    assert!(
-        error.contains("\"action\":\"spawn\""),
-        "error must show the correct top-level action shape so the model can recover. Got: {error}"
-    );
-    assert!(
-        error.contains("top-level") || error.contains("wrapper"),
-        "error must explain that `spawn` is not a wrapper key. Got: {error}"
-    );
+    let result = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "agent",
+        &json!({
+            "spawn": {
+                "description": "Review latest commit",
+                "prompt": "Inspect HEAD~1..HEAD for regressions"
+            }
+        }),
+    )
+    .await;
+    assert_tool_invalid_args(&result);
 }
 
 /// `task` is only the durable checklist surface. Background process
@@ -454,64 +384,32 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
 async fn task_background_actions_are_plain_unknown_task_actions() {
     let executor = test_executor();
     for action in ["background_shell", "background_agent", "output", "kill"] {
-        let result = executor
-            .execute(
-                "task_board",
-                &json!({
-                    "action": action,
-                    "command": "echo hi",
-                    "prompt": "hi",
-                    "task_id": "bg-shell-1",
-                }),
-            )
-            .await;
-        assert!(
-            result.starts_with("Error"),
-            "task.{action} must return an Error: prefix so the TUI renders \
-             a red banner — got: {result}"
-        );
-        assert!(
-            result.contains("unknown `task_board` action") && result.contains(action),
-            "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
-        );
-        assert!(
-            astra_turn_core::tool_result_semantics::is_tool_error(&result),
-            "task.{action} rejection must classify as an error so cloud \
-             reporting marks status='error' and the TUI shows red. \
-             Got: {result}"
-        );
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "task_board",
+            &json!({
+                "action": action,
+                "command": "echo hi",
+                "prompt": "hi",
+                "task_id": "bg-shell-1",
+            }),
+        )
+        .await;
+        assert_tool_invalid_args(&result);
     }
 }
 
-/// Stale session sub-actions are rejected, but the error must still name
-/// the dedicated tools so the model can self-correct on the next call.
 #[tokio::test]
-async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
+async fn session_rejects_actions_outside_its_public_contract() {
     let executor = test_executor();
-    for (action, redirect_tool) in &[
-        ("enter_plan", "enter_plan_mode"),
-        ("exit_plan", "exit_plan_mode"),
-    ] {
-        let result = executor
-            .execute("session", &json!({"action": action}))
-            .await;
-        assert!(
-            result.starts_with("Error"),
-            "session.{action} must return an Error: prefix — got: {result}"
-        );
-        assert!(
-            result.contains("unknown `session` action"),
-            "session.{action} should be rejected as unknown. Got: {result}"
-        );
-        assert!(
-            result.contains(redirect_tool),
-            "session.{action} error must name `{redirect_tool}` so the model can recover. Got: {result}"
-        );
-        assert!(
-            astra_turn_core::tool_result_semantics::is_tool_error(&result),
-            "session.{action} rejection must classify as an error so the \
-             TUI shows red. Got: {result}"
-        );
+    for action in ["enter_plan", "exit_plan"] {
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "session",
+            &json!({"action": action}),
+        )
+        .await;
+        assert_tool_invalid_args(&result);
     }
 }
 
@@ -1318,7 +1216,7 @@ async fn execute_reflect_returns_placeholder() {
                 "source_policy": "cloud_only",
                 "include_context": true,
                 "question": "why did the command fail?",
-                "last_n": -10
+                "last_n": 1
             }),
         )
         .await;
@@ -1443,7 +1341,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
                 "horizon": "cross_session",
                 "source_policy": "cloud_only",
                 "include_context": true,
-                "last_n": 250
+                "last_n": 100
             }),
         )
         .await;

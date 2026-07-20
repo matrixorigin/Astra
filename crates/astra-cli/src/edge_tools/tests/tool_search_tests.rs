@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::ToolExecutor;
+use super::{ToolExecutor, assert_tool_invalid_args};
 use serde_json::{Value, json};
 
 fn executor() -> ToolExecutor {
@@ -56,25 +56,22 @@ fn strings(names: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn tool_search_missing_or_blank_query_returns_exact_error() {
+async fn tool_search_missing_or_blank_query_returns_typed_contract_error() {
     let executor = executor();
     set_visible(&executor, &["tool_search"]);
 
-    let missing = executor.execute("tool_search", &json!({})).await;
-    let missing: Value = serde_json::from_str(&missing)
-        .unwrap_or_else(|error| panic!("tool_search error must be JSON, got {error}: {missing}"));
-    assert_eq!(missing["mode"].as_str(), Some("error"));
-    assert_eq!(missing["status"].as_str(), Some("failed"));
-    assert_eq!(missing["error"].as_str(), Some("'query' is required"));
+    let missing =
+        astra_tools::ToolExecutor::execute_with_metadata(&executor, "tool_search", &json!({}))
+            .await;
+    assert_tool_invalid_args(&missing);
 
-    let blank = executor
-        .execute("tool_search", &json!({"query": "   "}))
-        .await;
-    let blank: Value = serde_json::from_str(&blank)
-        .unwrap_or_else(|error| panic!("tool_search error must be JSON, got {error}: {blank}"));
-    assert_eq!(blank["mode"].as_str(), Some("error"));
-    assert_eq!(blank["status"].as_str(), Some("failed"));
-    assert_eq!(blank["error"].as_str(), Some("'query' is required"));
+    let blank = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "tool_search",
+        &json!({"query": "   "}),
+    )
+    .await;
+    assert_tool_invalid_args(&blank);
 }
 
 #[tokio::test]

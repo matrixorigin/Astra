@@ -1636,21 +1636,9 @@ fn finish_post_loop_memory_run_boundary(
     session_id: &str,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
 ) {
-    // A run boundary is not a session boundary. Drop only attribution work
-    // that cannot be causally credited after the run. The latest selection,
-    // seen identities, and focus remain session-scoped so the next user turn
-    // can refer to what was just shown. The shared runtime independently caps
-    // sessions/identities and evicts idle state.
-    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len();
-    if dropped > 0 {
-        tracing::debug!(
-            session_id,
-            dropped,
-            "dropped unattributed memory recalls at server run boundary"
-        );
-    }
-
-    // Release extraction service's per-run debounce.
+    // Recall attribution is producer/run-scoped and is settled by the turn
+    // that created it. A session-only post-loop hook must not drain another
+    // concurrent run's observations. Release only extraction debounce here.
     if let Some(svc) = extraction_service {
         svc.forget_session(session_id);
     }

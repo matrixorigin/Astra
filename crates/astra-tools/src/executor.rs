@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_write_file_delete_string_not_coerced() {
+    async fn dispatch_write_file_delete_string_is_rejected_by_schema() {
         let (tmp, exec) = test_executor();
         let result = exec
             .execute(
@@ -1057,10 +1057,18 @@ mod tests {
                 &serde_json::json!({"path": "test.txt", "content": "hello", "delete": "true"}),
             )
             .await;
-        assert!(!result.is_error, "got: {}", result.output);
+        assert!(result.is_error, "got: {}", result.output);
         assert!(
-            tmp.path().join("test.txt").exists(),
-            "delete=\\\"true\\\" (string) must not be coerced to boolean — should write"
+            !tmp.path().join("test.txt").exists(),
+            "schema-invalid delete strings must not reach filesystem side effects"
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
         );
     }
 
@@ -1792,11 +1800,14 @@ mod tests {
             result.is_error,
             "structured tool_search failure must be marked as a tool error"
         );
-        let parsed: serde_json::Value = serde_json::from_str(&result.output)
-            .unwrap_or_else(|error| panic!("tool_search error must stay JSON: {error}"));
-        assert_eq!(parsed["mode"].as_str(), Some("error"));
-        assert_eq!(parsed["status"].as_str(), Some("failed"));
-        assert_eq!(parsed["error"].as_str(), Some("'query' is required"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2071,7 +2082,14 @@ mod tests {
         let (_tmp, exec) = test_executor();
         let result = exec.execute("web_fetch", &serde_json::json!({})).await;
         assert!(result.is_error);
-        assert!(result.output.contains("Missing 'url'"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2274,8 +2292,14 @@ mod tests {
         let (_tmp, exec) = test_executor();
         let result = exec.execute("run_script", &serde_json::json!({})).await;
         assert!(result.is_error);
-        assert!(result.output.contains("requires a non-empty"));
-        assert!(result.output.contains("empty arguments"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
     }
 
     #[tokio::test]

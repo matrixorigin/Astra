@@ -985,10 +985,20 @@ fn drop_unattributed_memory_recalls_at_turn_end(state: &mut AgenticLoopState) {
     else {
         return;
     };
-    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len();
+    let producer_id = state
+        .current_run_id
+        .clone()
+        .unwrap_or_else(|| format!("cli-turn:{}", session_turn_number(state)));
+    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
+        session_id,
+        &producer_id,
+        None,
+    )
+    .len();
     if dropped > 0 {
         tracing::debug!(
             session_id = %session_id,
+            producer_id,
             dropped,
             "dropped unattributed memory recalls without changing their rank"
         );
@@ -2294,8 +2304,14 @@ mod tests {
             None,
         );
         astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(&session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall(&session_id, 1, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            &session_id,
+            "run-1",
+            1,
+            vec!["m1".into()],
+        );
         state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("run-1".to_string());
         state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         state.final_text = "Done.".into();
 

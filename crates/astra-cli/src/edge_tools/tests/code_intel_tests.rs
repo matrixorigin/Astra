@@ -1,4 +1,4 @@
-use super::test_executor;
+use super::{assert_tool_invalid_args, test_executor};
 use crate::edge_tools::{ToolExecutor, all_tool_schemas, code_intel};
 use serde_json::json;
 use std::path::PathBuf;
@@ -22,8 +22,9 @@ async fn symbols_tool_schema_in_catalog() {
 #[tokio::test]
 async fn symbols_missing_path_returns_error() {
     let executor = test_executor();
-    let result = executor.execute("symbols", &json!({})).await;
-    assert!(result.contains("missing 'path'"), "got: {result}");
+    let result =
+        astra_tools::ToolExecutor::execute_with_metadata(&executor, "symbols", &json!({})).await;
+    assert_tool_invalid_args(&result);
 }
 
 #[tokio::test]

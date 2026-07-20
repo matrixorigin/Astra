@@ -394,7 +394,7 @@ fn post_loop_memory_cleanup_permit_respects_limit() {
 }
 
 #[test]
-fn server_run_boundary_preserves_session_selection_and_drops_attribution_queue() {
+fn session_only_post_loop_boundary_does_not_consume_run_owned_attribution() {
     let session_id = "server-run-selection-boundary";
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
     astra_tools::memoria::MemoriaToolGateway::record_recall(
@@ -407,7 +407,8 @@ fn server_run_boundary_preserves_session_selection_and_drops_attribution_queue()
 
     assert_eq!(
         astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
-        0
+        1,
+        "a session-only hook cannot consume a concurrent run's recall"
     );
     assert!(
         astra_tools::memoria::MemoriaToolGateway::latest_selection_context(session_id).is_some(),

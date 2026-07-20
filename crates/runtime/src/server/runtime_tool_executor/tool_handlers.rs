@@ -152,12 +152,12 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
 #[derive(Debug, Clone, Copy, Default)]
 struct MemoryToolHandler;
 
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
-    async fn execute(
+impl MemoryToolHandler {
+    async fn execute_for_producer(
         &self,
         context: &RuntimeToolExecutor,
         args: &Value,
+        producer_id: Option<&str>,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
@@ -207,11 +207,14 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                 )),
             };
         }
+        let turn = context.journal_turn_index.load(Ordering::Relaxed);
+        let fallback_producer = format!("server-turn:{turn}");
         let isolated_args = memory_args_with_context(
             args,
             &context.session_id,
             &context.user_id,
-            context.journal_turn_index.load(Ordering::Relaxed),
+            turn,
+            producer_id.unwrap_or(&fallback_producer),
         );
         let output = context
             .memoria_client
@@ -222,6 +225,30 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
         } else {
             astra_tools::ToolResult::text(output)
         }
+    }
+}
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_for_producer(context, args, None, cancel_token)
+            .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_for_producer(context, args, invocation.run_id, cancel_token)
+            .await
     }
 }
 

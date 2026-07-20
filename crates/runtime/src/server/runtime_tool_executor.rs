@@ -65,8 +65,8 @@ use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJourn
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
-    record_preview_template_missing, run_local_tool_preflight, spawn_resource_tool_call_recording,
-    unknown_local_tool_result,
+    record_preview_template_missing, run_local_tool_policy_preflight,
+    spawn_resource_tool_call_recording, unknown_local_tool_result, validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
@@ -2781,6 +2781,7 @@ impl RuntimeToolExecutor {
 
         let lifecycle = LocalToolExecutionLifecycle {
             session_id: &self.session_id,
+            producer_id: non_empty_identity(&request.run_id).unwrap_or("server-run"),
             aggregate_output_bytes: &self.aggregate_output_bytes,
             memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),
@@ -2832,6 +2833,10 @@ impl RuntimeToolExecutor {
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
+        if let LocalToolPreflight::ShortCircuit(result) = validate_local_tool_arguments(name, args)
+        {
+            return LocalToolPreflight::ShortCircuit(result);
+        }
         if let Some(result) = self.executor_readiness_preflight_result(name, args) {
             return LocalToolPreflight::ShortCircuit(result);
         }
@@ -2847,7 +2852,7 @@ impl RuntimeToolExecutor {
         } else {
             false
         };
-        run_local_tool_preflight(
+        run_local_tool_policy_preflight(
             LocalToolPreflightContext {
                 session_id: &self.session_id,
                 workspace_root: &self.workspace_root,
@@ -3332,6 +3337,27 @@ mod tests {
     use crate::server::tool_workspace_path_guard::{
         server_sandbox_local_path_mismatch, server_sandbox_tool_path_mismatch,
     };
+
+    fn assert_tool_invalid_args(result: &astra_tools::ToolResult) {
+        assert!(result.is_error, "{result:?}");
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("typed argument failure must carry metadata");
+        assert_eq!(
+            metadata.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+            "{result:?}"
+        );
+        assert_eq!(
+            metadata
+                .get("recovery_evidence")
+                .and_then(|evidence| evidence.get("cause"))
+                .and_then(Value::as_str),
+            Some("invalid_arguments"),
+            "{result:?}"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingResultArtifactStore {
@@ -4113,6 +4139,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deterministic_argument_error_precedes_runtime_readiness_denial() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::ServerSandbox,
+                display_name: "Read-only server sandbox".to_string(),
+                cwd: Some(dir.path().display().to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let LocalToolPreflight::ShortCircuit(result) = exec
+            .run_local_tool_preflight("write_file", &json!({"content": "missing path"}))
+            .await
+        else {
+            panic!("invalid arguments must short-circuit before runtime readiness");
+        };
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
+    }
+
     #[test]
     fn provider_unavailable_denial_gives_reconnect_or_rebind_action() {
         let (mut exec, dir) = test_executor();
@@ -4859,8 +4914,7 @@ mod tests {
             .execute_with_metadata("notify", &json!({"message": "   "}))
             .await;
 
-        assert!(result.is_error, "{result:?}");
-        assert_eq!(result.output, "Error: notify requires a non-empty message");
+        assert_tool_invalid_args(&result);
     }
 
     #[tokio::test]
@@ -4880,8 +4934,7 @@ mod tests {
             .execute_with_metadata("web_search", &json!({"engine": "github"}))
             .await;
 
-        assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Missing or empty 'query' parameter"));
+        assert_tool_invalid_args(&result);
     }
 
     #[tokio::test]
@@ -4939,8 +4992,7 @@ mod tests {
         assert!(symbols.output.contains("sample_symbol"), "{symbols:?}");
 
         let web_fetch = exec.execute_with_metadata("web_fetch", &json!({})).await;
-        assert!(web_fetch.is_error, "{web_fetch:?}");
-        assert!(web_fetch.output.contains("Missing 'url'"), "{web_fetch:?}");
+        assert_tool_invalid_args(&web_fetch);
         assert!(
             web_fetch
                 .metadata
@@ -5011,11 +5063,7 @@ mod tests {
         let missing_path = exec
             .execute_with_metadata("write_file", &json!({"content": "missing path"}))
             .await;
-        assert!(missing_path.is_error, "{missing_path:?}");
-        assert!(
-            missing_path.output.contains("Missing 'path' parameter"),
-            "{missing_path:?}"
-        );
+        assert_tool_invalid_args(&missing_path);
         assert!(
             missing_path
                 .metadata
@@ -5033,7 +5081,9 @@ mod tests {
             "consolidated github should be registered in ToolEngine for server-local execution"
         );
 
-        let unavailable = exec.execute_with_metadata("github", &json!({})).await;
+        let unavailable = exec
+            .execute_with_metadata("github", &json!({"action": "list_prs"}))
+            .await;
         assert!(unavailable.is_error, "{unavailable:?}");
         assert!(
             unavailable.output.contains("provider"),
@@ -5062,13 +5112,7 @@ mod tests {
         )]));
         let result = exec.execute_with_metadata("github", &json!({})).await;
 
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("missing required parameter `action` for `github`"),
-            "{result:?}"
-        );
+        assert_tool_invalid_args(&result);
         assert!(
             result
                 .metadata
@@ -5145,9 +5189,7 @@ mod tests {
             "introspect should be registered in ToolEngine as a context-aware diagnostics handler"
         );
 
-        let result = exec
-            .execute_with_metadata("introspect", &json!({"detail": "summary"}))
-            .await;
+        let result = exec.execute_with_metadata("introspect", &json!({})).await;
 
         assert!(!result.is_error, "{result:?}");
         assert!(
@@ -5292,13 +5334,7 @@ mod tests {
         }
 
         let mo_query_missing_sql = exec.execute_with_metadata("mo_query", &json!({})).await;
-        assert!(mo_query_missing_sql.is_error, "{mo_query_missing_sql:?}");
-        assert!(
-            mo_query_missing_sql
-                .output
-                .contains("Missing 'sql' parameter"),
-            "{mo_query_missing_sql:?}"
-        );
+        assert_tool_invalid_args(&mo_query_missing_sql);
         assert!(
             mo_query_missing_sql
                 .metadata
@@ -5673,12 +5709,7 @@ mod tests {
         );
 
         let result = exec.execute_with_metadata("session", &json!({})).await;
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result.output.contains("missing required parameter")
-                && result.output.contains("action"),
-            "{result:?}"
-        );
+        assert_tool_invalid_args(&result);
         assert!(
             result
                 .metadata
@@ -6316,12 +6347,7 @@ esac
         );
 
         let result = exec.execute_with_metadata("task_board", &json!({})).await;
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result.output.contains("missing required parameter")
-                && result.output.contains("action"),
-            "{result:?}"
-        );
+        assert_tool_invalid_args(&result);
         assert!(
             result
                 .metadata
@@ -6359,45 +6385,26 @@ esac
     async fn consolidated_task_tool_rejects_bad_action_shape_on_server_executor() {
         let (exec, _dir) = test_executor();
 
-        let missing = exec.execute("task_board", &json!({})).await;
-        assert!(
-            missing.starts_with("Error:")
-                && missing.contains("missing required parameter")
-                && missing.contains("action")
-                && !missing.contains("\"count\""),
-            "server task tool must not default missing action to list: {missing}"
-        );
+        let missing = exec.execute_with_metadata("task_board", &json!({})).await;
+        assert_tool_invalid_args(&missing);
 
-        let wrong_type = exec.execute("task_board", &json!({"action": true})).await;
-        assert!(
-            wrong_type.starts_with("Error:")
-                && wrong_type.contains("field 'action'")
-                && wrong_type.contains("string"),
-            "server task tool should reject non-string action: {wrong_type}"
-        );
+        let wrong_type = exec
+            .execute_with_metadata("task_board", &json!({"action": true}))
+            .await;
+        assert_tool_invalid_args(&wrong_type);
 
         let unknown = exec
-            .execute("task_board", &json!({"action": "complete"}))
+            .execute_with_metadata("task_board", &json!({"action": "complete"}))
             .await;
-        assert!(
-            unknown.starts_with("Error:")
-                && unknown.contains("unknown `task_board` action")
-                && unknown.contains("update"),
-            "server task tool should mark unknown actions as tool errors: {unknown}"
-        );
+        assert_tool_invalid_args(&unknown);
 
         let hidden_alias = exec
-            .execute(
+            .execute_with_metadata(
                 "task_board",
                 &json!({"action": "cancel", "task_id": "task-1"}),
             )
             .await;
-        assert!(
-            hidden_alias.starts_with("Error:")
-                && hidden_alias.contains("unknown `task_board` action")
-                && hidden_alias.contains("cancel"),
-            "server must not accept schema-hidden task action aliases: {hidden_alias}"
-        );
+        assert_tool_invalid_args(&hidden_alias);
     }
 
     #[tokio::test]
@@ -6544,26 +6551,20 @@ esac
         );
 
         let typo = exec
-            .execute(
+            .execute_with_metadata(
                 "task_board",
                 &json!({"action": "list_user", "user_status": "cancelledd"}),
             )
             .await;
-        assert!(
-            typo.contains("invalid user_status") && typo.contains("cancelled"),
-            "invalid list_user status must not silently return an empty list: {typo}"
-        );
+        assert_tool_invalid_args(&typo);
 
         let wrong_type = exec
-            .execute(
+            .execute_with_metadata(
                 "task_board",
                 &json!({"action": "list_user", "user_status": true}),
             )
             .await;
-        assert!(
-            wrong_type.contains("user_status") && wrong_type.contains("string"),
-            "wrong-type user_status should be actionable: {wrong_type}"
-        );
+        assert_tool_invalid_args(&wrong_type);
     }
 
     #[tokio::test]
@@ -7951,21 +7952,7 @@ esac
             )
             .await;
 
-        assert!(result.is_error, "{result:?}");
-        let value: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(value["status"], "failed");
-        assert_eq!(
-            value["error_kind"].as_str(),
-            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("error_kind"))
-                .and_then(Value::as_str),
-            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
-        );
+        assert_tool_invalid_args(&result);
     }
 
     #[tokio::test]
@@ -7979,7 +7966,14 @@ esac
         }
 
         let delegate = exec
-            .execute_with_metadata("agent", &json!({"action": "delegate"}))
+            .execute_with_metadata(
+                "agent",
+                &json!({
+                    "action": "spawn",
+                    "description": "Review code",
+                    "prompt": "Review the current diff"
+                }),
+            )
             .await;
         assert!(delegate.is_error, "{delegate:?}");
         assert!(
@@ -7996,7 +7990,16 @@ esac
             "ToolEngine agent errors should still receive execution metadata"
         );
 
-        let fanout = exec.execute_with_metadata("agent_fanout", &json!({})).await;
+        let fanout = exec
+            .execute_with_metadata(
+                "agent_fanout",
+                &json!({
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{"description": "Review code", "prompt": "Review the diff"}]
+                }),
+            )
+            .await;
         assert!(fanout.is_error, "{fanout:?}");
         assert!(
             fanout
@@ -9036,8 +9039,8 @@ esac
     #[tokio::test]
     async fn read_file_missing_path_param_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.execute("read_file", &json!({})).await;
-        assert!(result.contains("missing required field `path`"));
+        let result = exec.execute_with_metadata("read_file", &json!({})).await;
+        assert_tool_invalid_args(&result);
     }
 
     #[tokio::test]
@@ -9477,7 +9480,7 @@ esac
     }
 
     #[tokio::test]
-    async fn tool_engine_failure_runs_post_execution_lifecycle() {
+    async fn invalid_argument_preflight_does_not_start_tool_lifecycle() {
         let (mut exec, _dir) = test_executor();
         let progress = Arc::new(ToolLifecycleProgressCallback::default());
         exec.set_progress_callback(progress.clone());
@@ -9486,29 +9489,23 @@ esac
             .execute_with_metadata("notify", &json!({"message": "   "}))
             .await;
 
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("notify requires a non-empty message"),
-            "{result:?}"
-        );
+        assert_tool_invalid_args(&result);
         assert_eq!(
             progress.started.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "registered tool should emit tool_started after preflight passes"
+            0,
+            "deterministic validation must run before execution lifecycle starts"
         );
         assert_eq!(
             progress
                 .completed
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "registered tool failure should still emit tool_completed through post-execution middleware"
+            0,
+            "a call that never started must not emit a synthetic completion"
         );
         assert_eq!(
             *progress.completed_success.lock().unwrap(),
-            vec![false],
-            "failed handler completion must be reported as unsuccessful"
+            Vec::<bool>::new(),
+            "preflight rejection is represented by its typed result, not execution events"
         );
     }
 
@@ -9572,8 +9569,7 @@ esac
     async fn bash_missing_command_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec.execute_with_metadata("bash", &json!({})).await;
-        assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Missing 'command'"));
+        assert_tool_invalid_args(&result);
         assert!(
             result
                 .metadata
@@ -10046,17 +10042,6 @@ esac
     }
 
     #[tokio::test]
-    async fn web_fetch_is_available_in_server_mode() {
-        let (exec, _dir) = test_executor();
-        let result = exec.execute("web_fetch", &json!({})).await;
-        assert!(result.contains("Missing 'url'"), "{result}");
-        assert!(
-            !result.contains("not available in server-side execution mode"),
-            "{result}"
-        );
-    }
-
-    #[tokio::test]
     async fn str_replace_multi_edit_is_available_in_server_mode() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
@@ -10099,12 +10084,9 @@ esac
     async fn session_enter_plan_retired_action_is_unknown() {
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute("session", &json!({"action": "enter_plan"}))
+            .execute_with_metadata("session", &json!({"action": "enter_plan"}))
             .await;
-        assert!(
-            result.contains("Error: unknown `session` action 'enter_plan'"),
-            "{result}"
-        );
+        assert_tool_invalid_args(&result);
     }
 
     #[tokio::test]
@@ -10406,12 +10388,7 @@ esac
 
         let result = exec.execute_with_metadata("memory", &json!({})).await;
 
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("missing required parameter `action`")
-        );
+        assert_tool_invalid_args(&result);
         assert!(
             result
                 .metadata
@@ -11084,7 +11061,7 @@ esac
         // The model may submit a plan, but it cannot approve its own plan.
         // Write unlock is owned by the trusted UI/control plane.
         let exit_result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Ship the plan"}))
             .await;
         assert!(
             exit_result.contains("submitted for trusted user approval"),
@@ -11139,7 +11116,7 @@ esac
         exec.user_id = "alice".to_string();
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Ship the plan"}))
             .await;
         assert!(
             result.contains("submitted for trusted user approval"),
@@ -11210,7 +11187,10 @@ esac
         assert!(!existing.starts_with("Error:"), "{existing}");
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute(
+                "exit_plan_mode",
+                &json!({"plan": "1. Preserve existing work"}),
+            )
             .await;
         assert!(
             result.contains("submitted for trusted user approval"),
@@ -11320,7 +11300,10 @@ esac
         exec.user_id = "alice".to_string();
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute(
+                "exit_plan_mode",
+                &json!({"plan": "1. Avoid task-board mutation"}),
+            )
             .await;
         assert!(
             result.contains("submitted for trusted user approval"),
@@ -11389,7 +11372,10 @@ esac
         assert!(unrelated.contains("created"), "{unrelated}");
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute(
+                "exit_plan_mode",
+                &json!({"plan": "1. Preserve background work"}),
+            )
             .await;
         assert!(
             result.contains("submitted for trusted user approval"),
@@ -11447,7 +11433,7 @@ esac
         exec.user_id = "alice".to_string();
 
         let _ = exec
-            .execute("exit_plan_mode", &json!({"approved": false}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Keep drafting"}))
             .await;
 
         assert!(
@@ -11476,7 +11462,7 @@ esac
         exec.user_id = "alice".to_string();
 
         let _ = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("exit_plan_mode", &json!({"plan": "No executable steps"}))
             .await;
 
         assert!(
@@ -11537,7 +11523,7 @@ esac
         exec.session_id = "planless-session".to_string();
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Ship feature"}))
             .await;
         assert!(
             result.contains("plan repository not configured"),
@@ -11559,7 +11545,7 @@ esac
         exec.set_plan_authoring_active_handle(Arc::clone(&stale_authoring));
 
         let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Finish current work"}))
             .await;
         assert!(
             result.contains("nothing to exit"),
@@ -11606,7 +11592,7 @@ esac
         exec.user_id = "alice".to_string();
 
         let exit = exec
-            .execute("exit_plan_mode", &json!({"approved": false}))
+            .execute("exit_plan_mode", &json!({"plan": "1. Continue drafting"}))
             .await;
         assert!(
             exit.contains("remain blocked"),

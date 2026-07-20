@@ -2188,18 +2188,23 @@ impl ToolExecutor {
                     &mut guard,
                     [activated_name.clone()],
                 );
-                return Some(EdgeToolRun::error(direct_deferred_call_activation_message(
-                    &activated_name,
-                )));
+                return Some(EdgeToolRun::classified_error(
+                    direct_deferred_call_activation_message(&activated_name),
+                    astra_core::ErrorKind::ToolBinding,
+                ));
             }
             DirectDeferredCallAdmission::NotAdmitted => {
-                return Some(EdgeToolRun::error(tool_not_admitted_message(name, true)));
+                return Some(EdgeToolRun::classified_error(
+                    tool_not_admitted_message(name, true),
+                    astra_core::ErrorKind::ToolBinding,
+                ));
             }
             DirectDeferredCallAdmission::Unknown => {}
         }
-        Some(EdgeToolRun::error(tool_not_admitted_message(
-            name, can_select,
-        )))
+        Some(EdgeToolRun::classified_error(
+            tool_not_admitted_message(name, can_select),
+            astra_core::ErrorKind::ToolBinding,
+        ))
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
@@ -2490,6 +2495,10 @@ impl ToolExecutor {
             obj.insert(
                 "turn".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(turn)),
+            );
+            obj.insert(
+                "_attribution_id".to_string(),
+                serde_json::Value::String(format!("cli-turn:{turn}")),
             );
         }
         clean_args
@@ -4322,10 +4331,6 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
-        if args.get("dimension").and_then(Value::as_str) == Some("capability") {
-            return self.capability_info_json().to_string();
-        }
-
         let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
 
         if !request.format.is_json() && request.source_policy.allows_edge_local_artifacts() {
@@ -5594,6 +5599,10 @@ impl ToolExecutor {
             && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
+            let turn = self
+                .journal_turn_index
+                .load(std::sync::atomic::Ordering::Acquire);
+            let producer_id = format!("cli-turn:{turn}");
             let client = astra_tools::memoria::MemoriaToolGateway::new(
                 self.cloud_base.clone(),
                 self.cloud_token(),
@@ -5601,7 +5610,7 @@ impl ToolExecutor {
             let ctx = format!("cli-tool:{name}");
             tokio::spawn(async move {
                 let report = client
-                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .feedback_pending_recalls(&session_id, &producer_id, "useful", &ctx)
                     .await;
                 if report.attempted > 0 {
                     tracing::debug!(
@@ -6359,6 +6368,23 @@ mod tests {
             .unwrap_or_else(|error| panic!("expected structured control result: {error}: {output}"))
     }
 
+    fn assert_tool_error_kind(result: &astra_tools::ToolResult, kind: astra_core::ErrorKind) {
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(kind.as_str()),
+            "{result:?}"
+        );
+    }
+
+    fn assert_tool_invalid_args(result: &astra_tools::ToolResult) {
+        assert_tool_error_kind(result, astra_core::ErrorKind::ToolInvalidArgs);
+    }
+
     #[test]
     fn structured_tool_output_lifts_the_shared_work_observation() {
         let observation = embedded_work_unit_observation(
@@ -6656,10 +6682,15 @@ mod tests {
     #[cfg(unix)]
     async fn cli_run_script_is_explicit_shared_tool_delegate() {
         let executor = test_executor();
-        let output = executor.execute("run_script", &serde_json::json!({})).await;
+        let output = executor
+            .execute(
+                "run_script",
+                &serde_json::json!({"script": "print('shared-delegate-ok')"}),
+            )
+            .await;
 
         assert!(
-            output.contains("run_script requires a non-empty top-level `script` string"),
+            output.contains("shared-delegate-ok"),
             "run_script must be handled by its shared contract, got: {output}"
         );
     }
@@ -7914,24 +7945,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_task_action_stays_inside_task_contract() {
+    async fn unknown_task_action_is_a_typed_contract_error() {
         let executor = test_executor();
-        let output = executor
-            .execute("task_board", &serde_json::json!({"action": "spawn_agents"}))
-            .await;
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "task_board",
+            &serde_json::json!({"action": "spawn_agents"}),
+        )
+        .await;
 
-        assert!(
-            output.contains("unknown `task_board` action 'spawn_agents'"),
-            "{output}"
-        );
-        assert!(output.contains("create, update, list"), "{output}");
-        assert!(
-            !output.contains("agent_fanout"),
-            "task must not route unknown actions to agent orchestration: {output}"
-        );
-        assert!(!output.contains("run_in_background: true"), "{output}");
-        assert!(!output.contains("run_in_background=true"), "{output}");
-        assert!(!output.contains("agent(action="), "{output}");
+        assert_tool_invalid_args(&result);
     }
 
     fn bg_snapshot(
@@ -8324,18 +8347,13 @@ mod tests {
         ]);
         executor.set_current_activatable_tool_names(HashSet::from(["session".to_string()]));
 
-        let before = executor
-            .execute(
-                "session",
-                &serde_json::json!({"action": "sleep", "seconds": 1}),
-            )
-            .await;
-        assert!(
-            before.contains("tool_search")
-                && before.contains("select:session")
-                && before.contains("not executed"),
-            "direct deferred call must become a non-executing activation hint; got: {before}"
-        );
+        let before = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "session",
+            &serde_json::json!({"action": "sleep", "duration_ms": 1}),
+        )
+        .await;
+        assert_tool_error_kind(&before, astra_core::ErrorKind::ToolBinding);
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["session".to_string()],
@@ -8359,13 +8377,13 @@ mod tests {
             vec!["session".to_string()]
         );
 
-        let after = executor.execute("session", &serde_json::json!({})).await;
-        assert!(
-            after.contains("tool_search")
-                && after.contains("select:session")
-                && after.contains("not executed"),
-            "activation state alone must not bypass current tools[] visibility; got: {after}"
-        );
+        let after = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "session",
+            &serde_json::json!({"action": "history_page"}),
+        )
+        .await;
+        assert_tool_error_kind(&after, astra_core::ErrorKind::ToolBinding);
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
             vec!["session".to_string()],
@@ -8393,10 +8411,20 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "session"}}),
         ]);
         executor.set_current_activatable_tool_names(HashSet::new());
-        let injected = executor.execute("session", &serde_json::json!({})).await;
-        assert!(
-            injected.contains("missing required parameter `action` for `session`"),
-            "visible schema must allow the real executor path; got: {injected}"
+        let injected = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "session",
+            &serde_json::json!({"action": "history_page"}),
+        )
+        .await;
+        assert_ne!(
+            injected
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str()),
+            "a visible tool call must reach its executor instead of the deferred binding gate: {injected:?}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
@@ -8414,16 +8442,13 @@ mod tests {
         ]);
         executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
 
-        let activation = executor
-            .execute(
-                "memory",
-                &serde_json::json!({"action": "remember", "content": "stale"}),
-            )
-            .await;
-        assert!(
-            activation.contains("not executed"),
-            "direct call must only activate, got: {activation}"
-        );
+        let activation = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "memory",
+            &serde_json::json!({"action": "remember", "content": "stale"}),
+        )
+        .await;
+        assert_tool_error_kind(&activation, astra_core::ErrorKind::ToolBinding);
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()]
@@ -8440,12 +8465,13 @@ mod tests {
             Vec::<String>::new(),
             "stale activation must be pruned once the tool is neither visible nor activatable"
         );
-        let denied = executor.execute("memory", &serde_json::json!({})).await;
-        assert!(
-            denied.contains("not available in this turn")
-                && denied.contains("visible in this turn's `tools[]`"),
-            "stale activation must not bypass the current surface; got: {denied}"
-        );
+        let denied = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "memory",
+            &serde_json::json!({"action": "recall", "query": "stale"}),
+        )
+        .await;
+        assert_tool_error_kind(&denied, astra_core::ErrorKind::ToolBinding);
     }
 
     #[tokio::test]
@@ -8649,11 +8675,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn introspect_capability_reports_inactive_agent_spawner() {
+    async fn agent_info_capability_reports_inactive_agent_spawner() {
         let executor = test_executor();
         let out = executor
             .execute(
-                "introspect",
+                "get_agent_info",
                 &serde_json::json!({"dimension": "capability"}),
             )
             .await;
@@ -8730,12 +8756,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn introspect_capability_reports_background_tasks_active_when_wired() {
+    async fn agent_info_capability_reports_background_tasks_active_when_wired() {
         let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let executor = test_executor().with_bg_task_commands(commands);
         let out = executor
             .execute(
-                "introspect",
+                "get_agent_info",
                 &serde_json::json!({"dimension": "capability"}),
             )
             .await;
@@ -8777,7 +8803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn introspect_capability_reports_stale_mcp_provider_unbound() {
+    async fn agent_info_capability_reports_stale_mcp_provider_unbound() {
         let mut executor = test_executor();
         executor.install_mcp_bundle(
             std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -8795,7 +8821,7 @@ mod tests {
 
         let out = executor
             .execute(
-                "introspect",
+                "get_agent_info",
                 &serde_json::json!({"dimension": "capability"}),
             )
             .await;
@@ -9465,6 +9491,7 @@ mod tests {
         assert!(args.get("action").is_none());
         assert_eq!(args["session_id"].as_str(), Some("mem-session"));
         assert_eq!(args["turn"].as_u64(), Some(9));
+        assert_eq!(args["_attribution_id"].as_str(), Some("cli-turn:9"));
     }
 
     #[tokio::test]

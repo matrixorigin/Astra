@@ -1,4 +1,6 @@
-use super::{ToolExecutor, fanout_test_context, test_executor, test_spawner};
+use super::{
+    ToolExecutor, assert_tool_invalid_args, fanout_test_context, test_executor, test_spawner,
+};
 use serde_json::json;
 
 // ── run_chain (end-to-end with real tool execution) ──────────────────────
@@ -309,16 +311,13 @@ async fn chain_via_agent_run_chain_tool() {
 #[tokio::test]
 async fn run_chain_invalid_format_returns_error() {
     let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
-    let result = executor
-        .execute(
-            "agent",
-            &json!({"action": "run_chain", "invalid": "no steps field"}),
-        )
-        .await;
-    assert!(
-        result.contains("Error: Invalid chain format"),
-        "should return error for invalid chain: {result}"
-    );
+    let result = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "agent",
+        &json!({"action": "run_chain", "invalid": "no steps field"}),
+    )
+    .await;
+    assert_tool_invalid_args(&result);
 }
 
 #[tokio::test]
@@ -326,28 +325,25 @@ async fn run_chain_blocks_recursive_child_chain() {
     let executor = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
     // `run_chain` as a step tool is no longer in TOOL_CATALOG (it's the `agent`
     // tool's action), so validation rejects it before recursion detection kicks in.
-    let result = executor
-        .execute(
-            "agent",
-            &json!({
-                "action": "run_chain",
-                "name": "outer",
-                "description": "outer",
-                "steps": [
-                    {
-                        "tool": "run_chain",
-                        "args": {"name": "inner", "description": "inner", "steps": []}
-                    }
-                ],
-                "input": {}
-            }),
-        )
-        .await;
+    let result = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "agent",
+        &json!({
+            "action": "run_chain",
+            "name": "outer",
+            "description": "outer",
+            "steps": [
+                {
+                    "tool": "run_chain",
+                    "args": {"name": "inner", "description": "inner", "steps": []}
+                }
+            ],
+            "input": {}
+        }),
+    )
+    .await;
     // Chain validation rejects unknown tool names (run_chain is not in TOOL_CATALOG)
-    assert!(
-        result.contains("Error: Invalid chain"),
-        "should return error for recursive/unknown tool chain: {result}"
-    );
+    assert!(result.is_error, "{result:?}");
 }
 
 #[tokio::test]

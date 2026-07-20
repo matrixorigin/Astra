@@ -1,3 +1,4 @@
+use super::assert_tool_invalid_args;
 use crate::edge_tools::ToolExecutor;
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskMutation, TaskStore};
@@ -23,6 +24,12 @@ fn setup() -> (tempfile::TempDir, ToolExecutor) {
     (dir, exe)
 }
 
+async fn assert_invalid_task_args(executor: &ToolExecutor, args: serde_json::Value) {
+    let result =
+        astra_tools::ToolExecutor::execute_with_metadata(executor, "task_board", &args).await;
+    assert_tool_invalid_args(&result);
+}
+
 // ── Task tool tests ─────────────────────────────────────────��────────────
 
 #[tokio::test]
@@ -44,41 +51,29 @@ async fn task_tool_create_is_executable() {
 async fn task_list_user_rejects_invalid_status_before_cloud_call() {
     let (_dir, exe) = setup();
 
-    let typo = exe
-        .execute(
-            "task_board",
-            &json!({"action": "list_user", "user_status": "cancelledd"}),
-        )
-        .await;
-    assert!(
-        typo.contains("invalid user_status") && typo.contains("cancelled"),
-        "invalid user_status should be rejected locally instead of turning into an empty cloud list: {typo}"
-    );
+    let typo = astra_tools::ToolExecutor::execute_with_metadata(
+        &exe,
+        "task_board",
+        &json!({"action": "list_user", "user_status": "cancelledd"}),
+    )
+    .await;
+    assert_tool_invalid_args(&typo);
 
-    let wrong_type = exe
-        .execute(
-            "task_board",
-            &json!({"action": "list_user", "user_status": true}),
-        )
-        .await;
-    assert!(
-        wrong_type.contains("user_status") && wrong_type.contains("string"),
-        "wrong-type user_status should be actionable before any cloud dependency: {wrong_type}"
-    );
+    let wrong_type = astra_tools::ToolExecutor::execute_with_metadata(
+        &exe,
+        "task_board",
+        &json!({"action": "list_user", "user_status": true}),
+    )
+    .await;
+    assert_tool_invalid_args(&wrong_type);
 
-    let unknown_field = exe
-        .execute(
-            "task_board",
-            &json!({"action": "list_user", "user_status": "active", "limit": 10}),
-        )
-        .await;
-    assert!(
-        unknown_field.starts_with("Error:")
-            && unknown_field.contains("unknown field")
-            && unknown_field.contains("limit")
-            && !unknown_field.contains("requires a cloud connection"),
-        "unknown list_user fields should be rejected before any cloud dependency: {unknown_field}"
-    );
+    let unknown_field = astra_tools::ToolExecutor::execute_with_metadata(
+        &exe,
+        "task_board",
+        &json!({"action": "list_user", "user_status": "active", "limit": 10}),
+    )
+    .await;
+    assert_tool_invalid_args(&unknown_field);
 }
 
 #[tokio::test]
@@ -257,116 +252,55 @@ async fn task_mutation_refuses_when_rollback_snapshot_load_fails() {
 async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
     let (_dir, exe) = setup();
 
-    let bad_action_type = exe
-        .execute("task_board", &json!({"action": true, "title": "Typo"}))
-        .await;
-    assert!(
-        bad_action_type.starts_with("Error:")
-            && bad_action_type.contains("field 'action'")
-            && bad_action_type.contains("string"),
-        "wrong-type action must be actionable: {bad_action_type}"
-    );
+    assert_invalid_task_args(&exe, json!({"action": true, "title": "Typo"})).await;
 
-    let missing_action = exe.execute("task_board", &json!({})).await;
-    assert!(
-        missing_action.starts_with("Error:")
-            && missing_action.contains("missing required parameter `action`")
-            && missing_action.contains("Retry the same `task_board` tool"),
-        "missing task action should be a recoverable argument-contract error: {missing_action}"
-    );
+    assert_invalid_task_args(&exe, json!({})).await;
 
-    let hidden_cancel_alias = exe
-        .execute(
-            "task_board",
-            &json!({"action": "cancel", "task_id": "task-1"}),
-        )
-        .await;
-    assert!(
-        hidden_cancel_alias.starts_with("Error:")
-            && hidden_cancel_alias.contains("unknown `task_board` action")
-            && hidden_cancel_alias.contains("cancel"),
-        "CLI must not accept schema-hidden task action aliases: {hidden_cancel_alias}"
-    );
+    assert_invalid_task_args(&exe, json!({"action": "cancel", "task_id": "task-1"})).await;
 
-    let create_typo = exe
-        .execute(
-            "task_board",
-            &json!({"action": "create", "title": "Typo", "titel": "wrong"}),
-        )
-        .await;
-    assert!(
-        create_typo.starts_with("Error:")
-            && create_typo.contains("unknown field")
-            && create_typo.contains("titel"),
-        "create typo must be actionable: {create_typo}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({"action": "create", "title": "Typo", "titel": "wrong"}),
+    )
+    .await;
 
-    let create_dependency_removal_field = exe
-        .execute(
-            "task_board",
-            &json!({
-                "action": "create",
-                "title": "Blocked task",
-                "remove_blocked_by": ["task-1"]
-            }),
-        )
-        .await;
-    assert!(
-        create_dependency_removal_field.starts_with("Error:")
-            && create_dependency_removal_field.contains("task_board.create")
-            && create_dependency_removal_field.contains("task_board.update")
-            && create_dependency_removal_field.contains("unknown field 'remove_blocked_by'"),
-        "create dependency-removal misuse should explain the two-step repair: {create_dependency_removal_field}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({
+            "action": "create",
+            "title": "Blocked task",
+            "remove_blocked_by": ["task-1"]
+        }),
+    )
+    .await;
 
     let too_many_subtasks = (0..=astra_tools::task_mgmt::MAX_CREATE_SUBTASKS)
         .map(|index| json!({ "id": format!("s{index}"), "title": format!("step {index}") }))
         .collect::<Vec<_>>();
-    let oversized = exe
-        .execute(
-            "task_board",
-            &json!({
-                "action": "create",
-                "title": "Oversized checklist",
-                "subtasks": too_many_subtasks
-            }),
-        )
-        .await;
-    assert!(
-        oversized.starts_with("Error:")
-            && oversized.contains("subtasks")
-            && oversized.contains("maximum"),
-        "oversized create should be rejected with an actionable limit: {oversized}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({
+            "action": "create",
+            "title": "Oversized checklist",
+            "subtasks": too_many_subtasks
+        }),
+    )
+    .await;
 
-    let oversized_title = exe
-        .execute(
-            "task_board",
-            &json!({
-                "action": "create",
-                "title": "x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1)
-            }),
-        )
-        .await;
-    assert!(
-        oversized_title.starts_with("Error:")
-            && oversized_title.contains("title")
-            && oversized_title.contains("exceeds"),
-        "oversized title should be rejected with an actionable limit: {oversized_title}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({
+            "action": "create",
+            "title": "x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1)
+        }),
+    )
+    .await;
 
-    let blank_owner = exe
-        .execute(
-            "task_board",
-            &json!({"action": "create", "title": "Blank owner", "owner": "   "}),
-        )
-        .await;
-    assert!(
-        blank_owner.starts_with("Error:")
-            && blank_owner.contains("owner")
-            && blank_owner.contains("non-empty"),
-        "blank owner should be rejected with an actionable error: {blank_owner}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({"action": "create", "title": "Blank owner", "owner": "   "}),
+    )
+    .await;
 
     let seed = exe
         .execute(
@@ -395,75 +329,36 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "task_board.create should accept dependency edges atomically: {create_with_dependency}"
     );
 
-    let update_typo = exe
-        .execute(
-            "task_board",
-            &json!({"action": "update", "task_id": "task-1", "state": "paused"}),
-        )
-        .await;
-    assert!(
-        update_typo.starts_with("Error:")
-            && update_typo.contains("unknown field")
-            && update_typo.contains("state"),
-        "update typo must be actionable before lookup/mutation: {update_typo}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({"action": "update", "task_id": "task-1", "state": "paused"}),
+    )
+    .await;
 
-    let update_status_field = exe
-        .execute(
-            "task_board",
-            &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
-        )
-        .await;
-    assert!(
-        update_status_field.starts_with("Error:")
-            && update_status_field.contains("unknown field")
-            && update_status_field.contains("status")
-            && update_status_field.contains("new_status"),
-        "task_board.update should reject the old status alias with an actionable hint: {update_status_field}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({"action": "update", "task_id": "task-1", "status": "paused"}),
+    )
+    .await;
 
-    let list_status_field = exe
-        .execute("task_board", &json!({"action": "list", "status": "active"}))
-        .await;
-    assert!(
-        list_status_field.starts_with("Error:")
-            && list_status_field.contains("unknown field")
-            && list_status_field.contains("status")
-            && !list_status_field.contains("status_filter, status"),
-        "status must not remain a recognized task_board.list argument: {list_status_field}"
-    );
+    assert_invalid_task_args(&exe, json!({"action": "list", "status": "active"})).await;
 
-    let adopt_typo = exe
-        .execute(
-            "task_board",
-            &json!({
-                "action": "adopt",
-                "source_session_id": "source",
-                "task_id": "task-1",
-                "copy_edges": true
-            }),
-        )
-        .await;
-    assert!(
-        adopt_typo.starts_with("Error:")
-            && adopt_typo.contains("unknown field")
-            && adopt_typo.contains("copy_edges")
-            && !adopt_typo.contains("requires a cloud connection"),
-        "adopt typo should be rejected locally before cloud checks: {adopt_typo}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({
+            "action": "adopt",
+            "source_session_id": "source",
+            "task_id": "task-1",
+            "copy_edges": true
+        }),
+    )
+    .await;
 
-    let unknown_background_action = exe
-        .execute(
-            "task_board",
-            &json!({"action": "background_shell", "command": "echo hi"}),
-        )
-        .await;
-    assert!(
-        unknown_background_action.starts_with("Error:")
-            && unknown_background_action.contains("unknown `task_board` action")
-            && unknown_background_action.contains("background_shell"),
-        "background_shell should be an ordinary unknown task action: {unknown_background_action}"
-    );
+    assert_invalid_task_args(
+        &exe,
+        json!({"action": "background_shell", "command": "echo hi"}),
+    )
+    .await;
 }
 
 #[tokio::test]

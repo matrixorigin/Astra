@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
 pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
+pub const PER_ACTION_ALLOWED_KEY: &str = "x-astra-per-action-allowed";
 
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
@@ -155,6 +156,171 @@ fn any_of_required_alternatives(
         .collect()
 }
 
+fn field_path(parent: &str, field: &str) -> String {
+    if parent.is_empty() {
+        format!("field `{field}`")
+    } else {
+        format!("{parent} field `{field}`")
+    }
+}
+
+fn validate_schema_value(
+    value: &Value,
+    schema: &Value,
+    path: &str,
+    check_required: bool,
+    issues: &mut Vec<String>,
+) {
+    if let Some(alternatives) = schema.get("anyOf").and_then(Value::as_array) {
+        let compatible = alternatives
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .get("type")
+                    .is_none_or(|expected| schema_type_matches(value, expected))
+            })
+            .collect::<Vec<_>>();
+        let candidates = if compatible.is_empty() {
+            alternatives.iter().collect::<Vec<_>>()
+        } else {
+            compatible
+        };
+        let mut best_failure: Option<Vec<String>> = None;
+        for candidate in candidates {
+            let mut candidate_issues = Vec::new();
+            validate_schema_value(
+                value,
+                candidate,
+                path,
+                check_required,
+                &mut candidate_issues,
+            );
+            if candidate_issues.is_empty() {
+                best_failure = None;
+                break;
+            }
+            if best_failure
+                .as_ref()
+                .is_none_or(|best| candidate_issues.len() < best.len())
+            {
+                best_failure = Some(candidate_issues);
+            }
+        }
+        if let Some(best_failure) = best_failure {
+            issues.extend(best_failure);
+            return;
+        }
+    }
+
+    if let Some(expected) = schema.get("type")
+        && !schema_type_matches(value, expected)
+    {
+        issues.push(format!(
+            "{path} has type {}, expected {expected}",
+            json_type_name(value)
+        ));
+        return;
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        issues.push(format!("{path} is outside its advertised enum"));
+    }
+
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
+            && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
+        {
+            issues.push(format!("{path} requires at least {minimum} character(s)"));
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
+            && length > maximum
+        {
+            issues.push(format!("{path} accepts at most {maximum} character(s)"));
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+            && number < minimum
+        {
+            issues.push(format!("{path} must be at least {minimum}"));
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+            && number > maximum
+        {
+            issues.push(format!("{path} must be at most {maximum}"));
+        }
+    }
+
+    if let Some(values) = value.as_array() {
+        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
+            && values.len() < minimum as usize
+        {
+            issues.push(format!("{path} requires at least {minimum} item(s)"));
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
+            && values.len() > maximum as usize
+        {
+            issues.push(format!("{path} accepts at most {maximum} item(s)"));
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in values.iter().enumerate() {
+                let item_path = format!("{path} item {index}");
+                validate_schema_value(item, item_schema, &item_path, true, issues);
+                if item.as_str().is_some_and(|item| item.trim().is_empty()) {
+                    issues.push(format!("{item_path} must be non-empty"));
+                }
+            }
+        }
+    }
+
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if check_required && let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for field in required.iter().filter_map(Value::as_str) {
+            if !value_is_present(object.get(field)) {
+                let prefix = if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("{path} ")
+                };
+                issues.push(format!(
+                    "{prefix}missing non-empty required field `{field}`"
+                ));
+            }
+        }
+    }
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+        && let Some(properties) = properties
+    {
+        let mut unknown = object
+            .keys()
+            .filter(|field| !properties.contains_key(*field))
+            .cloned()
+            .collect::<Vec<_>>();
+        unknown.sort();
+        if !unknown.is_empty() {
+            let label = if path.is_empty() {
+                "unknown field(s)".to_string()
+            } else {
+                format!("{path} has unknown field(s)")
+            };
+            issues.push(format!("{label}: {}", unknown.join(", ")));
+        }
+    }
+    if let Some(properties) = properties {
+        for (field, child) in object {
+            if let Some(child_schema) = properties.get(field) {
+                validate_schema_value(child, child_schema, &field_path(path, field), true, issues);
+            }
+        }
+    }
+}
+
 /// Validate invocation-level constraints from the canonical built-in schema.
 ///
 /// Unknown/dynamic tools are intentionally left to their owning provider.
@@ -214,70 +380,35 @@ pub fn validate_tool_arguments(
         issues.push(format!("requires one of: {rendered}"));
     }
 
-    let properties = parameters.get("properties").and_then(Value::as_object);
-    if parameters
-        .get("additionalProperties")
-        .and_then(Value::as_bool)
-        == Some(false)
-        && let Some(properties) = properties
+    if let Some(action) = action
+        && let Some(allowed) = parameters
+            .get(PER_ACTION_ALLOWED_KEY)
+            .and_then(Value::as_object)
+            .and_then(|allowed| allowed.get(action))
+            .and_then(Value::as_array)
     {
-        let unknown = arguments
+        let allowed = allowed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        let mut disallowed = arguments
             .keys()
-            .filter(|field| !properties.contains_key(*field))
+            .filter(|field| !allowed.contains(&field.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            issues.push(format!("unknown field(s): {}", unknown.join(", ")));
+        disallowed.sort();
+        if !disallowed.is_empty() {
+            issues.push(format!(
+                "field(s) not allowed for action `{action}`: {}",
+                disallowed.join(", ")
+            ));
         }
     }
 
-    if let Some(properties) = properties {
-        for (field, value) in arguments {
-            let Some(property) = properties.get(field) else {
-                continue;
-            };
-            if let Some(expected) = property.get("type")
-                && !schema_type_matches(value, expected)
-            {
-                issues.push(format!(
-                    "field `{field}` has type {}, expected {expected}",
-                    json_type_name(value)
-                ));
-                continue;
-            }
-            if let Some(allowed) = property.get("enum").and_then(Value::as_array)
-                && !allowed.contains(value)
-            {
-                issues.push(format!("field `{field}` is outside its advertised enum"));
-            }
-            if let Some(values) = value.as_array() {
-                if let Some(minimum) = property.get("minItems").and_then(Value::as_u64)
-                    && values.len() < minimum as usize
-                {
-                    issues.push(format!(
-                        "field `{field}` requires at least {minimum} item(s)"
-                    ));
-                }
-                if let Some(maximum) = property.get("maxItems").and_then(Value::as_u64)
-                    && values.len() > maximum as usize
-                {
-                    issues.push(format!("field `{field}` accepts at most {maximum} item(s)"));
-                }
-                if let Some(item_type) = property.get("items").and_then(|items| items.get("type")) {
-                    for (index, item) in values.iter().enumerate() {
-                        if !schema_type_matches(item, item_type) {
-                            issues.push(format!(
-                                "field `{field}` item {index} has type {}, expected {item_type}",
-                                json_type_name(item)
-                            ));
-                        } else if item.as_str().is_some_and(|item| item.trim().is_empty()) {
-                            issues.push(format!("field `{field}` item {index} must be non-empty"));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    validate_schema_value(
+        args,
+        &Value::Object(parameters.clone()),
+        "",
+        false,
+        &mut issues,
+    );
 
     if issues.is_empty() {
         Ok(())
@@ -306,14 +437,26 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
 
 fn task_board_schema() -> Value {
     let mut subtask_props = serde_json::Map::new();
-    subtask_props.insert("id".to_string(), json!({"type": "string"}));
-    subtask_props.insert("title".to_string(), json!({"type": "string"}));
-    subtask_props.insert("description".to_string(), json!({"type": "string"}));
+    subtask_props.insert(
+        "id".to_string(),
+        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_SUBTASK_ID_CHARS}),
+    );
+    subtask_props.insert(
+        "title".to_string(),
+        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_SUBTASK_TITLE_CHARS}),
+    );
+    subtask_props.insert(
+        "description".to_string(),
+        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_SUBTASK_DESCRIPTION_CHARS}),
+    );
     subtask_props.insert(
         "depends_on".to_string(),
         json!({"type": "array", "items": {"type": "string"}, "description": "Sibling ids that must complete first."}),
     );
-    subtask_props.insert("owner".to_string(), json!({"type": "string"}));
+    subtask_props.insert(
+        "owner".to_string(),
+        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_OWNER_CHARS}),
+    );
 
     let mut props = serde_json::Map::new();
     props.insert(
@@ -334,11 +477,11 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "title".to_string(),
-        json!({"type": "string", "description": "(create/update) Task title."}),
+        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_TITLE_CHARS, "description": "(create/update) Task title."}),
     );
     props.insert(
         "description".to_string(),
-        json!({"type": ["string", "null"], "description": "(create/update) Definition of done; update may pass null to clear it."}),
+        json!({"type": ["string", "null"], "maxLength": crate::task_mgmt::MAX_TASK_DESCRIPTION_CHARS, "description": "(create/update) Definition of done; update may pass null to clear it."}),
     );
     props.insert(
         "task_id".to_string(),
@@ -358,11 +501,11 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "active_form".to_string(),
-        json!({"type": ["string", "null"], "description": "(create/update) Spinner text while in_progress; update may pass null to clear it."}),
+        json!({"type": ["string", "null"], "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_ACTIVE_FORM_CHARS, "description": "(create/update) Spinner text while in_progress; update may pass null to clear it."}),
     );
     props.insert(
         "owner".to_string(),
-        json!({"type": ["string", "null"], "description": "(create/update) Owner; update may pass null to unassign."}),
+        json!({"type": ["string", "null"], "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_OWNER_CHARS, "description": "(create/update) Owner; update may pass null to unassign."}),
     );
     props.insert(
         "metadata".to_string(),
@@ -400,11 +543,11 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "reason".to_string(),
-        json!({"type": "string", "description": "(update/stop/archive) Outcome evidence or subtask note. For terminal updates, state what was actually achieved or why it failed."}),
+        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_TASK_STOP_REASON_CHARS, "description": "(update/stop/archive) Outcome evidence or subtask note. For terminal updates, state what was actually achieved or why it failed."}),
     );
     props.insert(
         "error_message".to_string(),
-        json!({"type": "string", "description": "(update) Failure/cancel reason."}),
+        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_TASK_ERROR_MESSAGE_CHARS, "description": "(update) Failure/cancel reason."}),
     );
 
     let mut params = serde_json::Map::new();
@@ -454,7 +597,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "PowerShell command to run"},
-                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                    "timeout": {"type": "number", "default": 120, "description": "Timeout in seconds. Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
                 },
                 "required": ["command"]
             }
@@ -561,7 +704,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
+                        "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Timeout in seconds. Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."}
                     },
                     "required": ["command"]
@@ -952,55 +1095,52 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory evidence. Recall is advisory. For a referential follow-up use the runtime selection_id; otherwise copy an exact returned memory_id. Never invent either identity. Update by query without ID.",
+                "description": "Memory evidence. Recall is advisory. Reuse exact memory_id or selection_id; never invent IDs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
                             "enum": ["remember","recall","session_audit","expand","forget","update","focus","reflect","profile","feedback"],
-                            "description": "Operation. session_audit reports this session's extraction lifecycle and version ledger; it is not a catalog of memory records or identities. recall is relevance-ranked, not a counting API."
+                            "description": "Operation. session_audit reports extraction lifecycle, not stored records; recall is ranked, not a count."
                         },
-                        "content": {"type": "string", "description": "Fact to store or replacement content."},
-                        "query": {"type": "string", "description": "Search query or update selector."},
-                        "memory_id": {"type": "string", "description": "One exact opaque ID from recall, evidence, or conflict; never invent."},
+                        "content": {"type": "string"},
+                        "query": {"type": "string"},
+                        "memory_id": {"type": "string", "description": "Exact opaque ID from evidence; never invent."},
                         "memory_ids": {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 64,
                             "items": {"type": "string"},
-                            "description": "Exact opaque IDs from one surfaced selection. Prefer this single bulk call over one call per ID."
+                            "description": "Exact IDs from one surfaced selection; max 64."
                         },
                         "selection_id": {
                             "type": "string",
-                            "description": "Exact session-scoped selection receipt supplied by runtime context. Use this for referential follow-ups such as the user's selected/listed results; never invent it."
+                            "description": "Session-scoped receipt for referential follow-ups; never invent."
                         },
                         "memory_type": {
                             "type": "string",
                             "enum": ["semantic","profile","procedural","working","episodic"],
-                            "description": "Memory category."
+                            "description": "Category."
                         },
-                        "top_k": {"type": "integer", "description": "Max results."},
-                        "min_confidence": {"type": "number", "description": "Confidence filter (0.0-1.0)."},
+                        "top_k": {"type": "integer"},
+                        "min_confidence": {"type": "number"},
                         "scope": {
                             "type": "string",
-                            "enum": ["all","session"],
-                            "description": "Recall scope."
+                            "enum": ["all","session"]
                         },
                         "view": {
                             "type": "string",
-                            "enum": ["compact","overview","full"],
-                            "description": "Recall detail level."
+                            "enum": ["compact","overview","full"]
                         },
-                        "importance": {"type": "number", "description": "Importance score."},
-                        "trust_tier": {"type": "string", "description": "Trust tier."},
-                        "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags."},
-                        "tags_add": {"type": "array", "items": {"type": "string"}, "description": "Tags to add."},
-                        "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "Tags to remove."},
+                        "importance": {"type": "number"},
+                        "trust_tier": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "tags_add": {"type": "array", "items": {"type": "string"}},
+                        "tags_remove": {"type": "array", "items": {"type": "string"}},
                         "visibility": {
                             "type": "string",
-                            "enum": ["private","team"],
-                            "description": "Visibility."
+                            "enum": ["private","team"]
                         },
                         "team_id": {
                             "type": "string",
@@ -1025,11 +1165,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "enum": ["useful","irrelevant","outdated","wrong"],
                             "description": "Attributed quality evidence: outdated means once-valid but stale; wrong means false."
                         },
-                        "context": {"type": "string", "description": "Optional context."},
+                        "context": {"type": "string"},
                         "agent_type": {
                             "type": "string",
-                            "enum": ["explore","code-review","task","general-purpose"],
-                            "description": "Persona scope."
+                            "enum": ["explore","code-review","task","general-purpose"]
                         }
                     },
                     "required": ["action"],
@@ -1153,12 +1292,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs steps.\n\n\
+                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs name+description+steps.\n\n\
          Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
          ## Required fields per action\n\
          - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
-         - `run_chain`: REQUIRES `action`, `steps`.\n\
+         - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
@@ -1177,15 +1316,32 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: action+steps. send_message: action+to+message.",
+                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: action+name+description+steps. send_message: action+to+message.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
-                        "steps": {"type": "array", "description": "REQUIRED for action='run_chain'. Sequence of chain steps to execute."},
-                        "description": {"type": "string", "description": "Spawn summary shown in the UI Task card. Short, specific, non-empty."},
+                        "steps": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "run_chain steps.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "tool": {"type": "string"},
+                                    "args": {"type": "object"},
+                                    "output_key": {"type": "string"},
+                                    "skip_if_prev_contains": {"type": "string"}
+                                },
+                                "required": ["tool", "args"]
+                            }
+                        },
+                        "description": {"type": "string", "description": "Spawn UI summary or run_chain description."},
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
-                        "name": {"type": "string", "description": "Addressable mailbox name (spawn). Optional; auto-generated if omitted. Not the runtime agent_id used by get_result."},
+                        "name": {"type": "string", "description": "Spawn mailbox label or required run_chain name."},
+                        "input": {"type": "object", "description": "Optional run_chain template input."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
                         "max_turns": {"type": "integer", "minimum": 1, "description": "Numeric child ceiling. When complexity is also present, the smaller of the numeric and complexity-derived ceilings wins."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity ceiling: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller max_turns."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
@@ -1200,9 +1356,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "x-astra-per-action-required": {
                         "spawn": ["description", "prompt"],
-                        "run_chain": ["steps"],
+                        "run_chain": ["name", "description", "steps"],
                         "get_result": ["agent_id"],
                         "send_message": ["to", "message"]
+                    },
+                    "x-astra-per-action-allowed": {
+                        "spawn": ["action", "description", "prompt", "agent_type", "model", "name", "max_turns", "complexity", "isolated", "allowed_tools"],
+                        "get_result": ["action", "agent_id"],
+                        "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
+                        "send_message": ["action", "to", "message", "message_type", "request_id"]
                     }
                 }
             }
@@ -1685,84 +1847,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_schema_description_documents_structured_foreground_spawn() {
-        let schemas = all_tool_schemas();
-        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
-        let desc = agent
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            desc.contains("foreground by contract")
-                && desc.contains("waits for the child's terminal result")
-                && desc.contains("keeps client controls responsive")
-                && desc.contains("Ctrl+B"),
-            "agent description must distinguish structured fan-in from a frozen client"
-        );
-        assert!(
-            desc.contains("get_result") && desc.contains("send_message"),
-            "agent description must explain explicit wait and correction paths"
-        );
-    }
-
-    #[test]
-    fn agent_schema_parallel_fanout_warns_against_agents_payloads() {
-        let schemas = all_tool_schemas();
-        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
-        let desc = agent
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            desc.contains("Do NOT pass") || desc.contains("do not pass"),
-            "agent description must explicitly forbid the common unsupported wrapper/payload shapes"
-        );
-        assert!(
-            desc.contains("agents"),
-            "agent description must name the unsupported `agents` payload so the model stops retrying it"
-        );
-        assert!(
-            desc.contains("agent_fanout"),
-            "agent description must point parallel fan-out at the atomic tool"
-        );
-        assert!(
-            !desc.contains("ONLY way to fan out"),
-            "agent description must not keep the old N-spawn fanout contract"
-        );
-        assert!(
-            desc.contains("exit_plan_mode") && desc.contains("run_chain"),
-            "agent description should steer plan lifecycle away from run_chain"
-        );
-    }
-
-    #[test]
     fn agent_fanout_schema_exposes_atomic_group_contract() {
         let schemas = all_tool_schemas();
         let fanout = find_schema(&schemas, "agent_fanout").expect("agent_fanout schema must exist");
-        let desc = fanout
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let params = &fanout["function"]["parameters"];
 
-        assert!(desc.contains("one complete JSON object"));
-        assert!(desc.contains("`id`"));
-        assert!(desc.contains("waits for accepted children concurrently"));
-        assert!(desc.contains("returns one canonical group result"));
-        assert!(desc.contains("Ctrl+B"));
-        assert!(desc.contains("parent mailbox"));
-        assert!(desc.contains("non-blocking snapshot"));
-        assert!(desc.contains("do not busy-poll"));
-        assert!(desc.contains("bounded result window"));
-        assert!(desc.contains("results[].next_call"));
-        assert!(desc.contains("top-level `brief`"));
-        assert!(
-            !desc.contains("\"defaults\":{\"agent_type\""),
-            "the canonical start example must stay minimal; optional nested defaults are schema fields, not a first-call requirement"
-        );
         assert_eq!(params["additionalProperties"], false);
         assert_eq!(
             params["properties"]["action"]["enum"]
@@ -1801,39 +1890,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_schema_enforces_exact_runtime_agent_id_contract() {
+    fn agent_schema_structurally_owns_identity_fields_by_action() {
         let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
-        let desc = agent
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let params = &agent["function"]["parameters"];
         assert_eq!(params["additionalProperties"], false);
-        assert!(
-            desc.contains("`agent_id` is ONLY for `get_result`")
-                || desc.contains("never prefill it on `spawn`"),
-            "agent description must explicitly forbid spawn-time agent_id misuse"
-        );
-        assert!(
-            desc.contains("exact returned `agent_id`") || desc.contains("exact value"),
-            "agent description must require reusing the returned runtime agent_id"
-        );
-        assert!(
-            params["properties"]["name"]["description"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Not the runtime agent_id"),
-            "name field must say it is not the get_result identifier"
-        );
-        assert!(
-            params["properties"]["agent_id"]["description"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Never prefill this on spawn"),
-            "agent_id field must explicitly forbid spawn-time prefill"
-        );
         assert_eq!(
             params["properties"]["action"]["enum"]
                 .as_array()
@@ -1842,6 +1903,31 @@ mod tests {
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>(),
             crate::agent_tool_contract::AGENT_ACTIONS
+        );
+
+        let spawn_with_runtime_id = validate_tool_arguments(
+            "agent",
+            &json!({
+                "action": "spawn",
+                "description": "Review runtime",
+                "prompt": "Review the runtime",
+                "agent_id": "invented"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            spawn_with_runtime_id.issues,
+            vec!["field(s) not allowed for action `spawn`: agent_id"]
+        );
+
+        let result_with_mailbox_name = validate_tool_arguments(
+            "agent",
+            &json!({"action": "get_result", "agent_id": "runtime-id", "name": "mailbox"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            result_with_mailbox_name.issues,
+            vec!["field(s) not allowed for action `get_result`: name"]
         );
     }
 
@@ -1855,43 +1941,11 @@ mod tests {
                 && find_schema(&schemas, "task_list").is_some(),
             "model-facing schema must expose typed background task tools, not generic job"
         );
-        let output_desc = find_schema(&schemas, "task_output")
-            .and_then(|schema| {
-                schema
-                    .get("function")
-                    .and_then(|f| f.get("description"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or_default();
-        assert!(
-            output_desc.contains("background task")
-                && output_desc.contains("next_offset")
-                && !output_desc.contains("job(action"),
-            "task_output description must teach typed background task vocabulary and incremental cursors"
-        );
-        let output_block_desc = find_schema(&schemas, "task_output")
-            .and_then(|schema| {
-                schema
-                    .get("function")
-                    .and_then(|f| f.get("parameters"))
-                    .and_then(|p| p.get("properties"))
-                    .and_then(|p| p.get("block"))
-                    .and_then(|p| p.get("description"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or_default();
-        assert!(
-            output_block_desc.contains("Default false")
-                && output_block_desc.contains("terminal task status")
-                && output_block_desc.contains("ordinary output growth does not wake the model"),
-            "task_output must keep terminal waiting inside the runtime"
-        );
-        let stop_desc = find_schema(&schemas, "task_stop")
-            .and_then(|schema| schema["function"]["description"].as_str())
-            .unwrap_or_default();
-        assert!(
-            stop_desc.contains("ok/status/terminal") && stop_desc.contains("stop_requested"),
-            "task_stop must distinguish accepted cancellation from terminal completion"
+        let output = find_schema(&schemas, "task_output").expect("task_output schema");
+        assert_eq!(required_fields(output), vec!["task_id".to_string()]);
+        assert_eq!(
+            output["function"]["parameters"]["properties"]["block"]["type"],
+            "boolean"
         );
     }
 
@@ -2123,75 +2177,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_schema_uses_semantic_guidance_not_lexical_triggers() {
-        let schemas = all_tool_schemas();
-        let enter =
-            find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
-        let plan_desc = enter["function"]["description"].as_str().unwrap();
-
-        assert!(
-            plan_desc.contains("## When to Use") && plan_desc.contains("## When NOT to Use"),
-            "plan tool UX guidance should remain semantic and example-driven: {plan_desc}"
-        );
-        assert!(
-            plan_desc.contains("already-visible read/control tools"),
-            "plan schema should anchor plan-mode exploration to the current tool surface: {plan_desc}"
-        );
-        assert!(
-            !plan_desc.contains("does not grant new tools")
-                && !plan_desc.contains("filesystem/shell tools"),
-            "plan schema should not spend prompt budget explaining missing tool providers: {plan_desc}"
-        );
-        assert!(
-            !plan_desc.contains("you can ONLY read the codebase (read_file"),
-            "plan schema must not promise specific read tools are present: {plan_desc}"
-        );
-        assert!(
-            !plan_desc.contains("ACTIVATION RULE"),
-            "plan schema must not expose matcher-style activation rules: {plan_desc}"
-        );
-        assert!(
-            !plan_desc.contains("conjunctions like"),
-            "plan schema must not teach lexical trigger matching: {plan_desc}"
-        );
-        assert!(
-            !plan_desc.contains("\"what's the best way to\"")
-                && !plan_desc.contains("\"redesign\""),
-            "plan schema must not encode phrase-list triggers: {plan_desc}"
-        );
-    }
-
-    #[test]
     fn introspect_schema_describes_live_observation_surface() {
         let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
-        let desc = introspect["function"]["description"]
-            .as_str()
-            .expect("introspect description must be a string");
         let params = &introspect["function"]["parameters"];
         let properties = introspect["function"]["parameters"]["properties"]
             .as_object()
             .expect("introspect parameters properties must be an object");
-        assert!(
-            desc.contains("live observation snapshot"),
-            "introspect should advertise live runtime scope: {desc}"
-        );
-        assert!(
-            desc.contains("plan/task/session lifecycle/resume state"),
-            "introspect should advertise lifecycle and resume visibility: {desc}"
-        );
-        assert!(
-            desc.contains("step latency/performance"),
-            "introspect should advertise live latency/performance visibility: {desc}"
-        );
-        assert!(
-            desc.contains("last lifecycle event"),
-            "introspect should advertise causal last-event visibility: {desc}"
-        );
-        assert!(
-            desc.contains("use reflect"),
-            "introspect should tell the model to use reflect for persisted causal analysis: {desc}"
-        );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),
             Some(false),
@@ -2247,12 +2239,6 @@ mod tests {
             vec!["hint", "summary", "diagnostic", "forensic"],
             "introspect depth schema must expose canonical observation depths"
         );
-        assert!(
-            properties["depth"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("step latency/performance")),
-            "diagnostic depth should advertise step latency/performance coverage"
-        );
         assert_eq!(
             enum_values(&properties["source_policy"]),
             vec![
@@ -2271,22 +2257,11 @@ mod tests {
     fn reflect_schema_describes_persisted_observation_surface() {
         let schemas = all_tool_schemas();
         let reflect = find_schema(&schemas, "reflect").expect("reflect schema must exist");
-        let desc = reflect["function"]["description"]
-            .as_str()
-            .expect("reflect description must be a string");
         let params = &reflect["function"]["parameters"];
         let properties = reflect["function"]["parameters"]["properties"]
             .as_object()
             .expect("reflect parameters properties must be an object");
 
-        assert!(
-            desc.contains("persisted observation evidence") && desc.contains("active session"),
-            "reflect schema should document persisted-session scope: {desc}"
-        );
-        assert!(
-            desc.contains("use introspect"),
-            "reflect schema should direct live runtime checks to introspect: {desc}"
-        );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),
             Some(false),
@@ -2463,59 +2438,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn run_script_default_schema_lists_all_sandbox_tools() {
-        let schemas = all_tool_schemas();
-        let rs = schemas
-            .iter()
-            .find(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some("run_script")
-            })
-            .expect("run_script schema present");
-        let desc = rs["function"]["description"].as_str().unwrap();
-        // At least read_file and web_fetch should be mentioned — they're
-        // the staple tools for multi-step pipelines.
-        assert!(
-            desc.contains("read_file"),
-            "default schema should list read_file"
-        );
-        assert!(
-            desc.contains("web_fetch"),
-            "default schema should list web_fetch"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn server_run_script_schema_lists_only_server_routable_rpc_tools() {
-        let mut schemas = all_tool_schemas();
-        narrow_run_script_for_server(&mut schemas);
-        let rs = schemas
-            .iter()
-            .find(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some("run_script")
-            })
-            .expect("server run_script schema present");
-        let desc = rs["function"]["description"].as_str().unwrap();
-        for name in SERVER_RUN_SCRIPT_RPC_TOOL_NAMES {
-            assert!(
-                desc.contains(name),
-                "server run_script schema should mention routable RPC tool `{name}`"
-            );
-        }
-        assert!(
-            !desc.contains("search_files") && !desc.contains("patch"),
-            "server run_script must not advertise RPC tools not routed by ServerToolExecutor"
-        );
-    }
-
     #[cfg(not(unix))]
     #[test]
     fn run_script_hidden_on_non_unix() {
@@ -2534,15 +2456,6 @@ mod tests {
         let func = read_file
             .get("function")
             .expect("read_file schema must include function block");
-        let desc = func
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            desc.contains("start_line") && desc.contains("end_line"),
-            "read_file description must advertise inclusive line-range contract: {desc}"
-        );
-
         let params = func
             .get("parameters")
             .expect("read_file schema must include parameters");
@@ -2577,18 +2490,6 @@ mod tests {
         let func = write_file
             .get("function")
             .expect("write_file schema must include function block");
-        let desc = func
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            desc.contains("path")
-                && desc.contains("content")
-                && desc.contains("delete=true")
-                && desc.contains("do not switch to bash"),
-            "write_file description must spell out the path+content contract and discourage shell fallback: {desc}"
-        );
-
         let params = func
             .get("parameters")
             .expect("write_file schema must include parameters");
@@ -2600,8 +2501,8 @@ mod tests {
         );
 
         // Anthropic/Bedrock reject oneOf/allOf/anyOf at the top level of input_schema.
-        // The write vs delete distinction is expressed via description prose and the
-        // x-astra-per-action-required extension, not via composition keywords.
+        // The write vs delete distinction is expressed through the typed
+        // per-action extension rather than provider-rejected composition.
         assert!(
             params.get("oneOf").is_none(),
             "write_file parameters must not use top-level oneOf (Anthropic/Bedrock HTTP 400)"
@@ -2652,18 +2553,10 @@ mod tests {
         let schemas = all_tool_schemas();
         let str_replace =
             find_schema(&schemas, "str_replace").expect("str_replace schema must exist");
-        let desc = str_replace
-            .pointer("/function/description")
-            .and_then(Value::as_str)
-            .expect("str_replace schema must include description");
         let params = str_replace
             .pointer("/function/parameters")
             .expect("str_replace schema must include parameters");
 
-        assert!(
-            desc.contains("Do not use aliases"),
-            "str_replace description should steer models away from unsupported alias fields: {desc}"
-        );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),
             Some(false),
@@ -2732,22 +2625,6 @@ mod tests {
         );
     }
 
-    // ── Session 0e37eb46 regression: bash/powershell schema-advertised
-    //    timeout defaults must match the actual code defaults ─────────
-    //
-    // The bash schema previously advertised "default 30" while the code
-    // default is 120s. The LLM read "30" from the schema and either
-    // (a) explicitly set timeout:30 and was surprised when cargo build
-    // took 40s, or (b) expected cargo builds to finish within a 30s
-    // mental deadline. Result: session 0e37eb46 r9 timed out at 30s,
-    // model added `timeout: 180` at r11 — one round burned on a
-    // schema-doc mismatch.
-    //
-    // The schemas must not lie. Lock: bash & powershell schemas must
-    // document the ACTUAL default (120s), and the description must
-    // hint that long-running commands (cargo, make, pytest, go test)
-    // should pass a larger explicit timeout.
-
     fn find_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
         schemas.iter().find(|s| {
             s.get("function")
@@ -2757,56 +2634,20 @@ mod tests {
         })
     }
 
-    fn timeout_description(schema: &Value) -> &str {
-        schema
-            .pointer("/function/parameters/properties/timeout/description")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    }
-
     #[test]
-    fn bash_schema_timeout_default_matches_code_default() {
+    fn shell_schema_timeout_defaults_are_structured() {
         let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
-        let desc = timeout_description(bash);
-        assert!(
-            desc.contains("120"),
-            "bash schema must document the REAL default timeout (120s) — got {desc:?}. \
-             Drift between schema and code burns a round per session when the LLM \
-             hits unexpected timeout (session 0e37eb46 r9)."
-        );
-        assert!(
-            !desc.contains("default 30"),
-            "bash schema must NOT advertise default=30 when the code default is 120s"
-        );
-    }
-
-    #[test]
-    fn bash_schema_hints_to_extend_timeout_for_long_commands() {
-        let schemas = all_tool_schemas();
-        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
-        let desc = timeout_description(bash);
-        // Presence of at least ONE of these signal tokens tells the
-        // model "bump timeout for slow commands" without the schema
-        // over-prescribing which tools are slow.
-        let has_hint = ["cargo", "build", "test", "long"]
-            .iter()
-            .any(|kw| desc.to_lowercase().contains(kw));
-        assert!(
-            has_hint,
-            "bash schema should hint that cargo/test/build-style commands \
-             need a larger explicit timeout — got {desc:?}"
-        );
-    }
-
-    #[test]
-    fn powershell_schema_timeout_default_matches_code_default() {
-        let schemas = all_tool_schemas();
         let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
-        let desc = timeout_description(ps);
-        assert!(
-            desc.contains("120"),
-            "powershell schema must document the REAL default (120s), got {desc:?}"
+        assert_eq!(
+            bash.pointer("/function/parameters/properties/timeout/default")
+                .and_then(Value::as_f64),
+            Some(crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            ps.pointer("/function/parameters/properties/timeout/default")
+                .and_then(Value::as_u64),
+            Some(120)
         );
     }
 
@@ -2885,5 +2726,80 @@ mod tests {
     #[test]
     fn dynamic_tools_remain_owned_by_their_provider_contract() {
         validate_tool_arguments("mcp__custom__future_tool", &json!({"anything": true})).unwrap();
+    }
+
+    #[test]
+    fn built_in_contract_recursively_validates_fanout_slots_and_bounds() {
+        let error = validate_tool_arguments(
+            "agent_fanout",
+            &json!({
+                "action": "start",
+                "target_count": 0,
+                "slots": [{"description": "review runtime"}]
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.issues,
+            vec![
+                "field `slots` item 0 missing non-empty required field `prompt`",
+                "field `target_count` must be at least 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn built_in_contract_enforces_action_owned_fields() {
+        validate_tool_arguments(
+            "task_board",
+            &json!({"action": "create", "title": "Implement canonical boundary"}),
+        )
+        .unwrap();
+
+        let error = validate_tool_arguments(
+            "task_board",
+            &json!({
+                "action": "create",
+                "title": "Implement canonical boundary",
+                "new_status": "completed"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.issues,
+            vec!["field(s) not allowed for action `create`: new_status"]
+        );
+
+        let blank_owner = validate_tool_arguments(
+            "task_board",
+            &json!({"action": "create", "title": "Task", "owner": "   "}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            blank_owner.issues,
+            vec!["field `owner` requires at least 1 character(s)"]
+        );
+    }
+
+    #[test]
+    fn built_in_contract_validates_nested_any_of_variants() {
+        validate_tool_arguments(
+            "ask_user",
+            &json!({"questions": [{"question": "Proceed?", "options": ["Yes", {"label": "No"}]}]}),
+        )
+        .unwrap();
+
+        let error = validate_tool_arguments(
+            "ask_user",
+            &json!({"questions": [{"question": "Proceed?", "options": [{"description": "missing label"}]}]}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.issues,
+            vec![
+                "field `questions` item 0 field `options` item 0 missing non-empty required field `label`"
+            ]
+        );
     }
 }

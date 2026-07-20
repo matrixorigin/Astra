@@ -927,20 +927,24 @@ impl ReqwestMemoriaForwarder {
         body: &serde_json::Value,
     ) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.base_url, endpoint);
+        let mut payload = body.clone();
+        let authenticated_user_id = payload
+            .as_object_mut()
+            .and_then(|object| object.remove("user_id"))
+            .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+            .filter(|user_id| !user_id.is_empty());
         let request = self
             .client
             .request(method, url)
             .header("Authorization", format!("Bearer {}", self.master_key))
-            .json(body);
+            .json(&payload);
         // Astra authenticates the caller before reaching this boundary and
         // overwrites body.user_id. Memoria's master-key mode derives its
         // storage scope from X-User-Id, not from arbitrary request fields.
-        // Project the authenticated principal into the transport header so
-        // reads and mutations share the same tenant boundary.
-        match body.get("user_id").and_then(serde_json::Value::as_str) {
-            Some(user_id) if !user_id.trim().is_empty() => {
-                request.header("X-User-Id", user_id.trim())
-            }
+        // Project the authenticated principal into the transport header, and
+        // keep that transport-only identity out of endpoint domain payloads.
+        match authenticated_user_id {
+            Some(user_id) => request.header("X-User-Id", user_id),
             _ => request,
         }
     }
@@ -1313,6 +1317,10 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("x-user-id: user-1\r\n"),
                 "authenticated owner must be projected to Memoria scope: {request}"
+            );
+            assert!(
+                !request.contains("\"user_id\""),
+                "transport identity must not leak into the Memoria domain body: {request}"
             );
             let _ = socket
                 .write_all(

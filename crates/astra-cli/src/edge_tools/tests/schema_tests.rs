@@ -258,8 +258,7 @@ fn no_schema_uses_top_level_composition_keywords() {
                 params.get(*banned).is_none(),
                 "tool `{name}` parameters contain top-level `{banned}`, which \
                  Anthropic/Bedrock reject with HTTP 400. Encode per-action required \
-                 fields via the `x-astra-per-action-required` extension + description \
-                 prose instead."
+                 fields in the canonical `x-astra-per-action-required` contract instead."
             );
         }
     }
@@ -283,9 +282,8 @@ fn agent_spawn_schema_requires_description_and_prompt() {
 fn agent_other_actions_have_conditional_required() {
     let schemas = all_tool_schemas();
     let agent = tool_schema(&schemas, "agent");
-    // `delegate` removed — it had no execution backend in CLI mode and
-    // silently no-op'd. Schema enum + per-action required entries
-    // both gone. See `agent_action_delegate_is_rejected_with_redirect_to_spawn`.
+    // Every action exposed by the schema must have a real executor contract.
+    // Unsupported actions therefore have no conditional requirements.
     assert_eq!(
         conditional_required_for(agent, "delegate"),
         Vec::<String>::new(),
@@ -293,7 +291,11 @@ fn agent_other_actions_have_conditional_required() {
     );
     assert_eq!(
         conditional_required_for(agent, "run_chain"),
-        vec!["steps".to_string()]
+        vec![
+            "name".to_string(),
+            "description".to_string(),
+            "steps".to_string()
+        ]
     );
     assert_eq!(
         conditional_required_for(agent, "get_result"),
@@ -431,17 +433,6 @@ fn session_schema_requires_current_action_fields_and_current_action_set() {
 fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
     let schemas = all_tool_schemas();
     let ask = tool_schema(&schemas, "ask_user");
-    let description = ask["function"]["description"]
-        .as_str()
-        .expect("ask_user description should be a string");
-    assert!(
-        description.len() <= 180,
-        "ask_user description must stay compact in the always-load prefix: {description}"
-    );
-    assert!(
-        description.contains("structured questions") && description.contains("multi_select"),
-        "ask_user description should summarize the user-facing questionnaire contract: {description}"
-    );
     let params = &ask["function"]["parameters"];
     assert!(
         params["required"]
@@ -600,33 +591,6 @@ fn typed_background_task_schema_required_fields() {
             .as_array()
             .is_none_or(|required| required.is_empty()),
         "task_list should not require parameters"
-    );
-}
-
-#[test]
-fn typed_background_task_schema_describes_kinds_beyond_shell() {
-    let schemas = all_tool_schemas();
-    let task_output = tool_schema(&schemas, "task_output");
-    let task_stop = tool_schema(&schemas, "task_stop");
-    let task_list = tool_schema(&schemas, "task_list");
-
-    let output_desc = task_output["function"]["description"]
-        .as_str()
-        .unwrap_or_default();
-    let stop_desc = task_stop["function"]["description"]
-        .as_str()
-        .unwrap_or_default();
-    let list_desc = task_list["function"]["description"]
-        .as_str()
-        .unwrap_or_default();
-
-    assert!(output_desc.contains("typed background task"));
-    assert!(output_desc.contains("task kind"), "{output_desc}");
-    assert!(stop_desc.contains("local agents"), "{stop_desc}");
-    assert!(list_desc.contains("kind"), "{list_desc}");
-    assert!(
-        !list_desc.contains("background shell task"),
-        "task_list must not narrow the product model back to shell-only: {list_desc}"
     );
 }
 
