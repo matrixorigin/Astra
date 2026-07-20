@@ -83,7 +83,7 @@ pub(crate) struct SubRunHost {
     pub(crate) api: astra_thin_client::ThinClient,
     pub(crate) token: String,
     pub(crate) model: Option<String>,
-    pub(crate) model_id: String,
+    pub(crate) offering_id: String,
     pub(crate) project_root: PathBuf,
     pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
@@ -416,8 +416,8 @@ impl AgenticLoopHost for SubRunHost {
             .model_override
             .as_deref()
             .or(self.model.as_deref());
-        let effective_model_id = if effective_model == self.model.as_deref() {
-            self.model_id.clone()
+        let effective_offering_id = if effective_model == self.model.as_deref() {
+            self.offering_id.clone()
         } else {
             resolve_subrun_model_selection(&self.api, &self.token, effective_model)
                 .await
@@ -427,7 +427,7 @@ impl AgenticLoopHost for SubRunHost {
                         error,
                     )
                 })?
-                .model_id
+                .offering_id
         };
         let thinking = effective_model
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
@@ -448,7 +448,7 @@ impl AgenticLoopHost for SubRunHost {
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             inference_purpose: state.inference_purpose,
-            model_id: Some(effective_model_id.as_str()),
+            offering_id: Some(effective_offering_id.as_str()),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
@@ -823,7 +823,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
-            model_id: model_selection.model_id,
+            offering_id: model_selection.offering_id,
             project_root: self.project_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -1238,7 +1238,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
-            model_id: "model-test".to_string(),
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1302,7 +1302,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
-            model_id: "model-test".to_string(),
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1335,7 +1335,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
-            model_id: "model-test".to_string(),
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1450,7 +1450,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
-            model_id: "model-test".to_string(),
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1484,7 +1484,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             token: String::new(),
             model: None,
-            model_id: "model-test".to_string(),
+            offering_id: "offer-test".to_string(),
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),

@@ -10,7 +10,7 @@ import {
   ensureChatBackendSession,
   getChat,
   resolveModelOfferingSelection,
-  selectedWebModel,
+  requireSelectedOfferingId,
   setChatActiveRun,
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
@@ -602,7 +602,7 @@ export async function POST(
       const workspaceBindings = resolveWorkspaceBindings(
         effectiveWorkspaceSelection,
       );
-      const requestedModel = selectedWebModel(
+      const requestedModel = requireSelectedOfferingId(
         body.options?.model ?? chat.chat.model,
       );
       const [ensuredSessionId, modelSelection] = await Promise.all([

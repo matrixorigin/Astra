@@ -237,7 +237,7 @@ export function Composer({
   const [runtimeCapabilities, setRuntimeCapabilities] =
     useState<RuntimeCapabilitiesResponse | null>(null);
   const [thinking, setThinking] = useState(true);
-  const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
+  const [model, setModel] = useState(initialModel ?? '');
   const [modelAvailable, setModelAvailable] = useState(false);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [activeTools, setActiveTools] = useState<string[]>([]);

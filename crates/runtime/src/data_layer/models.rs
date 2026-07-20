@@ -2,7 +2,7 @@ use astra_services::models::*;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use astra_core::{ErrorResponse, error_response};
+use astra_core::{ErrorResponse, error_response, internal_error};
 use axum::{
     Json,
     extract::{Path, State},
@@ -45,33 +45,77 @@ pub async fn list_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ModelListItemResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let principal = state.auth_service.current_principal(&headers).await?;
+    let catalog = effective_model_catalog(&state, &headers).await?;
+    Ok(Json(
+        catalog
+            .offerings
+            .into_iter()
+            .map(ModelListItemResponse::from)
+            .collect(),
+    ))
+}
+
+struct EffectiveModelCatalog {
+    declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItem>,
+}
+
+async fn effective_model_catalog(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<EffectiveModelCatalog, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state.auth_service.current_principal(headers).await?;
     if principal.is_edge_registration() {
         let catalog = state
             .auth_service
             .external_catalog_by_scope(&principal)
             .await?;
-        return Ok(Json(
-            catalog
+        return Ok(EffectiveModelCatalog {
+            declared: vec![DeclaredModelAccess {
+                id: "this-device".to_string(),
+                kind: ModelAccessKind::ThisDevice,
+                label: "This device".to_string(),
+                execution_placement: ModelExecutionPlacement::Edge,
+            }],
+            offerings: catalog
                 .models
                 .into_iter()
                 .map(ModelListItem::from)
-                .map(ModelListItemResponse::from)
                 .collect(),
-        ));
+        });
     }
     let user = principal.user;
     let is_admin = state.admin.authorizer.require_admin(&headers).await.is_ok();
-    let models = state
+    let offerings = state
         .model_service
         .list_models(user.user_id, is_admin)
         .await?;
-    Ok(Json(
-        models
-            .into_iter()
-            .map(ModelListItemResponse::from)
-            .collect(),
-    ))
+    Ok(EffectiveModelCatalog {
+        declared: vec![DeclaredModelAccess {
+            id: "self-hosted".to_string(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+        }],
+        offerings,
+    })
+}
+
+pub async fn get_model_access_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ModelAccessProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let catalog = effective_model_catalog(&state, &headers).await?;
+    let offerings = catalog
+        .offerings
+        .into_iter()
+        .filter(|offering| offering.is_active)
+        .map(ModelListItemResponse::from)
+        .collect();
+    let projection =
+        project_model_access(catalog.declared, offerings, chrono::Utc::now().to_rfc3339())
+            .map_err(internal_error)?;
+    Ok(Json(projection))
 }
 
 pub async fn get_model_handler(

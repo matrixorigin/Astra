@@ -2595,10 +2595,10 @@ fn model_catalog_error_message(
 pub(crate) async fn load_model_catalog(
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String> {
     let token =
         crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()).await;
-    match crate::cli::slash::slash_router::fetch_model_list_raw(&api, token.as_deref()).await {
+    match crate::cli::slash::slash_router::fetch_model_catalog(&api, token.as_deref()).await {
         Ok(models) => Ok(models),
         Err(error) => {
             if !error.is_authentication_failure() {
@@ -2610,7 +2610,7 @@ pub(crate) async fn load_model_catalog(
             {
                 let refreshed =
                     crate::cli::session::session_runtime::current_access_token(profile.as_deref());
-                match crate::cli::slash::slash_router::fetch_model_list_raw(
+                match crate::cli::slash::slash_router::fetch_model_catalog(
                     &api,
                     refreshed.as_deref(),
                 )
@@ -2657,14 +2657,14 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
-        crate::cli::slash::slash_config::set_active_model_id_for_request(None);
+        crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
     ctx.state.model = Some(name.to_string());
     crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
-    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
+    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -2674,7 +2674,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
-    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
+    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
@@ -4126,13 +4126,23 @@ mod model_catalog_loading_tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer fresh-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "offering_id": "offer-gpt-5",
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
                     "name": "gpt-5",
-                    "model_id": "provider-gpt-5",
-                    "is_active": true
-                }]
-            })))
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 128000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": "both"
+                }])),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -4143,7 +4153,7 @@ mod model_catalog_loading_tests {
             .expect("refreshed catalog");
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0]["model_id"], "provider-gpt-5");
+        assert_eq!(models[0].offering_id, "offer-gpt-5");
         let credentials = load_credentials();
         let profile = credentials.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
@@ -4169,14 +4179,9 @@ mod model_catalog_loading_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let error = load_model_catalog(api, None)
+        load_model_catalog(api, None)
             .await
             .expect_err("invalid catalog shape must fail visibly");
-
-        assert_eq!(
-            error,
-            "Failed to fetch models: model catalog response must be an array or an object with a `models` array"
-        );
         assert_eq!(
             load_credentials()
                 .profiles

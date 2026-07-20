@@ -80,20 +80,10 @@ pub(crate) mod tests {
     use axum::{Router, routing::get};
 
     async fn mock_models_response() -> axum::Json<serde_json::Value> {
-        axum::Json(serde_json::json!({
-            "models": [
-                {
-                    "name": "test-model",
-                    "is_active": true,
-                    "context_window": 200_000
-                },
-                {
-                    "name": "mock-model",
-                    "is_active": true,
-                    "context_window": 200_000
-                }
-            ]
-        }))
+        axum::Json(super::test_utils::mock_model_catalog_json(&[
+            "test-model",
+            "mock-model",
+        ]))
     }
 
     async fn spawn_mock_app(app: Router) -> String {

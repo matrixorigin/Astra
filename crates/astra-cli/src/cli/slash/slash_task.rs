@@ -394,7 +394,7 @@ pub(crate) async fn handle_task_command(
                     input_work_unit_observations: &[],
                     semantic_query_override: None,
                     session_id: bg_session_id.as_deref(),
-                    model_id: None,
+                    offering_id: None,
                     model: bg_model.as_deref(),
                     provider: None,
                     explain: ExplainMode::Off,

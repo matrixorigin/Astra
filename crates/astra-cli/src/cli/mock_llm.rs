@@ -781,26 +781,31 @@ async fn handle_chat_turn(
         .expect("valid HTTP response")
 }
 
+fn mock_model_catalog_entry(name: &str) -> Value {
+    serde_json::json!({
+        "offering_id": format!("offer-{name}"),
+        "access_id": "self-hosted",
+        "access_kind": "self_hosted",
+        "access_label": "Self-hosted",
+        "execution_placement": "server",
+        "name": name,
+        "provider": "mock",
+        "description": null,
+        "is_active": true,
+        "context_window": 200_000,
+        "max_completion_tokens": null,
+        "architecture": null,
+        "thinking_capability": null
+    })
+}
+
 async fn handle_models() -> axum::Json<Value> {
-    axum::Json(serde_json::json!({
-        "models": [
-            {
-                "name": "gpt-5",
-                "is_active": true,
-                "context_window": 200_000
-            },
-            {
-                "name": "test-model",
-                "is_active": true,
-                "context_window": 200_000
-            },
-            {
-                "name": "mock-model",
-                "is_active": true,
-                "context_window": 200_000
-            }
-        ]
-    }))
+    axum::Json(Value::Array(
+        ["gpt-5", "test-model", "mock-model"]
+            .into_iter()
+            .map(mock_model_catalog_entry)
+            .collect(),
+    ))
 }
 
 async fn handle_tool_result() -> axum::Json<Value> {

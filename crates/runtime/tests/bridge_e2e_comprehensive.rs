@@ -262,7 +262,11 @@ impl astra_services::ModelService for StubModelService {
         _: bool,
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(vec![astra_services::ModelListItem {
-            model_id: "model-mock-model".to_string(),
+            offering_id: "model-mock-model".to_string(),
+            access_id: "self-hosted".to_string(),
+            access_kind: astra_services::ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".to_string(),
+            execution_placement: astra_services::ModelExecutionPlacement::Server,
             name: "mock-model".to_string(),
             provider: "openai".to_string(),
             description: Some("Bridge E2E mock model".to_string()),

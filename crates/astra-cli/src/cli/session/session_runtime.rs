@@ -5,7 +5,7 @@ use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
 use crate::{manifest_loader, mcp_client};
-use astra_services::session_journal;
+use astra_services::{ModelListItemResponse, session_journal};
 #[cfg(test)]
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
@@ -424,7 +424,7 @@ fn create_pipeline_modules_inner(
 pub(crate) struct ServerModelSelection {
     pub name: String,
     pub context_window: Option<u32>,
-    pub model_id: String,
+    pub offering_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,72 +434,47 @@ pub(crate) enum ServerDefaultModel {
     Unavailable,
 }
 
-fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
-    entry
-        .get("is_active")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
+    entry.is_active
 }
 
-fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
-    entry
-        .get("name")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+fn model_list_entry_name(entry: &ModelListItemResponse) -> Option<&str> {
+    let name = entry.name.trim();
+    (!name.is_empty()).then_some(name)
 }
 
-fn positive_u32(value: &serde_json::Value) -> Option<u32> {
-    if let Some(value) = value.as_u64() {
-        return u32::try_from(value).ok().filter(|value| *value > 0);
-    }
-    value
-        .as_i64()
-        .and_then(|value| u32::try_from(value).ok())
+pub(crate) fn model_list_entry_context_window(entry: &ModelListItemResponse) -> Option<u32> {
+    u32::try_from(entry.context_window)
+        .ok()
         .filter(|value| *value > 0)
 }
 
-pub(crate) fn model_list_entry_context_window(entry: &serde_json::Value) -> Option<u32> {
-    entry.get("context_window").and_then(positive_u32)
-}
-
-pub(crate) fn default_model_selection_from_models_response(
-    body: &serde_json::Value,
+pub(crate) fn default_model_selection_from_catalog(
+    models: &[ModelListItemResponse],
 ) -> Option<ServerModelSelection> {
-    let models = body.as_array().or_else(|| {
-        body.get("models")
-            .or_else(|| body.get("items"))
-            .and_then(|value| value.as_array())
-    })?;
     models
         .iter()
         .filter(|entry| model_list_entry_is_active(entry))
         .find_map(model_selection_from_list_entry)
 }
 
-fn model_selection_from_list_entry(entry: &serde_json::Value) -> Option<ServerModelSelection> {
+fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<ServerModelSelection> {
+    let offering_id = entry.offering_id.trim();
+    if offering_id.is_empty() {
+        return None;
+    }
     Some(ServerModelSelection {
         name: model_list_entry_name(entry)?.to_string(),
         context_window: model_list_entry_context_window(entry),
-        model_id: entry
-            .get("model_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|model_id| !model_id.is_empty())?
-            .to_string(),
+        offering_id: offering_id.to_string(),
     })
 }
 
-pub(crate) fn model_selection_for_name_from_models_response(
-    body: &serde_json::Value,
+pub(crate) fn model_selection_for_name_from_catalog(
+    models: &[ModelListItemResponse],
     model: &str,
 ) -> Option<ServerModelSelection> {
     let registry_model = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
-    let models = body.as_array().or_else(|| {
-        body.get("models")
-            .or_else(|| body.get("items"))
-            .and_then(serde_json::Value::as_array)
-    })?;
     models
         .iter()
         .filter(|entry| model_list_entry_is_active(entry))
@@ -525,12 +500,12 @@ pub(crate) async fn resolve_server_model_selection(
             resp.status()
         ));
     }
-    let body: serde_json::Value = resp
+    let catalog: Vec<ModelListItemResponse> = resp
         .json()
         .await
         .map_err(|error| format!("server model registry response was not valid JSON: {error}"))?;
-    model_selection_for_name_from_models_response(&body, model).ok_or_else(|| {
-        format!("model '{model}' is not an active Server Offering with an exact model_id")
+    model_selection_for_name_from_catalog(&catalog, model).ok_or_else(|| {
+        format!("model '{model}' is not an active Server Offering with an exact offering_id")
     })
 }
 
@@ -567,7 +542,7 @@ pub(crate) async fn resolve_server_default_model(
             return ServerDefaultModel::Unavailable;
         }
     };
-    let body: serde_json::Value = match resp.json().await {
+    let catalog: Vec<ModelListItemResponse> = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -578,7 +553,7 @@ pub(crate) async fn resolve_server_default_model(
             return ServerDefaultModel::Unavailable;
         }
     };
-    let result = match default_model_selection_from_models_response(&body) {
+    let result = match default_model_selection_from_catalog(&catalog) {
         Some(selection) => ServerDefaultModel::Selected(selection),
         None => ServerDefaultModel::NoModels,
     };
@@ -598,8 +573,8 @@ pub(crate) async fn ensure_state_default_model(
     if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
         match resolve_server_model_selection(api, token, &model).await {
             Ok(selection) => {
-                crate::cli::slash::slash_config::set_active_model_id_for_request(Some(
-                    selection.model_id,
+                crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
+                    selection.offering_id,
                 ));
                 if let Some(context_window) = selection.context_window {
                     state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
@@ -624,8 +599,8 @@ pub(crate) async fn ensure_state_default_model(
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
             state.model = Some(selection.name.clone());
-            crate::cli::slash::slash_config::set_active_model_id_for_request(Some(
-                selection.model_id.clone(),
+            crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
+                selection.offering_id.clone(),
             ));
             if let Some(context_window) = selection.context_window {
                 state.context_budget =
@@ -1588,10 +1563,9 @@ mod tests {
         ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, SilentRefreshError,
         access_token_needs_refresh, applied_user_intents_from_turn_metadata,
         banner_session_display, banner_welcome_text, current_access_token, current_git_root,
-        default_model_selection_from_models_response, ensure_state_default_model,
-        fresh_access_token, initialize_session_state,
-        model_selection_for_name_from_models_response, pending_recovery_status_line,
-        resolve_server_model_selection, restore_history_from_journal,
+        default_model_selection_from_catalog, ensure_state_default_model, fresh_access_token,
+        initialize_session_state, model_selection_for_name_from_catalog,
+        pending_recovery_status_line, resolve_server_model_selection, restore_history_from_journal,
         restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
@@ -1600,7 +1574,9 @@ mod tests {
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::isolate_credentials;
-    use astra_services::session_journal;
+    use astra_services::{
+        ModelAccessKind, ModelExecutionPlacement, ModelListItemResponse, session_journal,
+    };
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1643,79 +1619,89 @@ mod tests {
         format!("{header}.{payload}.sig")
     }
 
+    fn catalog_entry(
+        offering_id: &str,
+        name: &str,
+        is_active: bool,
+        context_window: i32,
+    ) -> ModelListItemResponse {
+        ModelListItemResponse {
+            offering_id: offering_id.to_string(),
+            access_id: "self-hosted".to_string(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: name.to_string(),
+            provider: "openai".to_string(),
+            description: None,
+            is_active,
+            context_window,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        }
+    }
+
     #[test]
     fn default_model_selection_uses_first_active_offering() {
-        let body = serde_json::json!([
-            {"model_id": "model-inactive", "name": "inactive-model", "is_active": false},
-            {"model_id": "model-flash", "name": "  deepseek-v4-flash-anthropic  ", "is_active": true},
-            {"model_id": "model-pro", "name": "deepseek-v4-pro-official", "is_active": true}
-        ]);
+        let catalog = vec![
+            catalog_entry("offer-inactive", "inactive-model", false, 128_000),
+            catalog_entry(
+                "offer-flash",
+                "  deepseek-v4-flash-anthropic  ",
+                true,
+                128_000,
+            ),
+            catalog_entry("offer-pro", "deepseek-v4-pro-official", true, 128_000),
+        ];
 
-        let selection =
-            default_model_selection_from_models_response(&body).expect("active Offering");
+        let selection = default_model_selection_from_catalog(&catalog).expect("active Offering");
         assert_eq!(selection.name, "deepseek-v4-flash-anthropic");
+        assert_eq!(selection.offering_id, "offer-flash");
     }
 
     #[test]
     fn default_model_selection_carries_configured_context_window() {
-        let body = serde_json::json!([
-            {"model_id": "model-inactive", "name": "inactive-model", "is_active": false, "context_window": 999999},
-            {"model_id": "model-claude", "name": "claude-sonnet-4", "is_active": true, "context_window": 200000}
-        ]);
+        let catalog = vec![
+            catalog_entry("offer-inactive", "inactive-model", false, 999_999),
+            catalog_entry("offer-claude", "claude-sonnet-4", true, 200_000),
+        ];
 
         let selection =
-            default_model_selection_from_models_response(&body).expect("active model selection");
+            default_model_selection_from_catalog(&catalog).expect("active model selection");
         assert_eq!(selection.name, "claude-sonnet-4");
-        assert_eq!(selection.model_id, "model-claude");
+        assert_eq!(selection.offering_id, "offer-claude");
         assert_eq!(selection.context_window, Some(200_000));
     }
 
     #[test]
-    fn active_model_without_offering_identity_is_not_selectable() {
-        let body = serde_json::json!({
-            "models": [
-                {"name": "legacy-name-only", "is_active": true, "context_window": 128_000}
-            ]
-        });
-
-        assert!(default_model_selection_from_models_response(&body).is_none());
-        assert!(model_selection_for_name_from_models_response(&body, "legacy-name-only").is_none());
-    }
-
-    #[test]
     fn named_selection_uses_active_model_entry() {
-        let body = serde_json::json!({
-            "models": [
-                {"model_id": "offer-inactive", "name": "custom-model", "is_active": false, "context_window": 8_000},
-                {"model_id": "offer-active", "name": "custom-model", "is_active": true, "context_window": 500_000}
-            ]
-        });
+        let catalog = vec![
+            catalog_entry("offer-inactive", "custom-model", false, 8_000),
+            catalog_entry("offer-active", "custom-model", true, 500_000),
+        ];
 
-        let selection = model_selection_for_name_from_models_response(&body, "CUSTOM-MODEL")
+        let selection = model_selection_for_name_from_catalog(&catalog, "CUSTOM-MODEL")
             .expect("active Offering");
-        assert_eq!(selection.model_id, "offer-active");
+        assert_eq!(selection.offering_id, "offer-active");
         assert_eq!(selection.context_window, Some(500_000));
     }
 
     #[test]
     fn named_selection_strips_thinking_suffix_for_registry_match() {
-        let body = serde_json::json!({
-            "models": [
-                {
-                    "model_id": "offer-deepseek-pro",
-                    "name": "deepseek-v4-pro-official",
-                    "is_active": true,
-                    "context_window": 1_000_000
-                }
-            ]
-        });
+        let catalog = vec![catalog_entry(
+            "offer-deepseek-pro",
+            "deepseek-v4-pro-official",
+            true,
+            1_000_000,
+        )];
 
-        let selection = model_selection_for_name_from_models_response(
-            &body,
+        let selection = model_selection_for_name_from_catalog(
+            &catalog,
             "deepseek-v4-pro-official(thinking:high)",
         )
         .expect("active Offering");
-        assert_eq!(selection.model_id, "offer-deepseek-pro");
+        assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
     }
 
@@ -1724,17 +1710,15 @@ mod tests {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [
-                    {"model_id": "model-small", "name": "small-model", "is_active": true},
-                    {
-                        "model_id": "model-deepseek",
-                        "name": "deepseek-v4-pro-official",
-                        "is_active": true,
-                        "context_window": 1_000_000
-                    }
-                ]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                catalog_entry("offer-small", "small-model", true, 8_192),
+                catalog_entry(
+                    "offer-deepseek",
+                    "deepseek-v4-pro-official",
+                    true,
+                    1_000_000,
+                ),
+            ]))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -1742,8 +1726,8 @@ mod tests {
         let small = resolve_server_model_selection(&api, "token", "small-model")
             .await
             .expect("active Offering without optional context metadata");
-        assert_eq!(small.model_id, "model-small");
-        assert_eq!(small.context_window, None);
+        assert_eq!(small.offering_id, "offer-small");
+        assert_eq!(small.context_window, Some(8_192));
 
         let deepseek = resolve_server_model_selection(
             &api,
@@ -1752,7 +1736,7 @@ mod tests {
         )
         .await
         .expect("active Offering selected through thinking suffix");
-        assert_eq!(deepseek.model_id, "model-deepseek");
+        assert_eq!(deepseek.offering_id, "offer-deepseek");
         assert_eq!(deepseek.context_window, Some(1_000_000));
     }
 
@@ -1761,16 +1745,12 @@ mod tests {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [
-                    {
-                        "model_id": "model-deepseek",
-                        "name": "deepseek-v4-pro-official",
-                        "is_active": true,
-                        "context_window": 1_000_000
-                    }
-                ]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![catalog_entry(
+                "offer-deepseek",
+                "deepseek-v4-pro-official",
+                true,
+                1_000_000,
+            )]))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -1794,16 +1774,13 @@ mod tests {
 
     #[test]
     fn default_model_selection_filters_by_active_and_name() {
-        let body = serde_json::json!({
-            "models": [
-                {"model_id": "model-inactive", "name": "inactive-model", "is_active": false},
-                {"model_id": "model-active", "name": "active-model", "is_active": true},
-                {"model_id": "model-empty", "name": "", "is_active": true}
-            ]
-        });
+        let catalog = vec![
+            catalog_entry("offer-inactive", "inactive-model", false, 8_192),
+            catalog_entry("offer-active", "active-model", true, 8_192),
+            catalog_entry("offer-empty", "", true, 8_192),
+        ];
 
-        let selection =
-            default_model_selection_from_models_response(&body).expect("active Offering");
+        let selection = default_model_selection_from_catalog(&catalog).expect("active Offering");
         assert_eq!(selection.name, "active-model");
     }
 

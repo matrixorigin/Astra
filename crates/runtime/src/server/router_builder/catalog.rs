@@ -3,6 +3,10 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/model-access",
+            get(data_layer::models::get_model_access_handler),
+        )
+        .route(
             "/models",
             post(data_layer::models::create_model_handler)
                 .get(data_layer::models::list_models_handler),

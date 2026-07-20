@@ -9,9 +9,12 @@ vi.mock("@/lib/api/web-store", () => ({
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
   resolveModelOfferingSelection: vi.fn(),
-  selectedWebModel: vi.fn((model?: string | null) => {
+  requireSelectedOfferingId: vi.fn((model?: string | null) => {
     const normalized = model?.trim();
-    return normalized || "sonnet-4.6-adaptive";
+    if (!normalized) {
+      throw new Error("model offering required");
+    }
+    return normalized;
   }),
   setChatActiveRun: vi.fn(),
   updateChatWorkspaceSelection: vi.fn(),

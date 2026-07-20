@@ -38,6 +38,7 @@ import type {
   RuntimeArtifactListParams,
   RuntimeArtifactListResponse,
   RuntimeModelListItem,
+  RuntimeModelAccessProjection,
   RuntimeModelListResponse,
   RuntimeSessionCreateBody,
   RuntimeSessionListParams,
@@ -81,6 +82,7 @@ import {
   PATH_MEMORY_SEARCH,
   PATH_MEMORY_STORE,
   PATH_MODELS,
+  PATH_MODEL_ACCESS,
   PATH_MODEL_GATEWAYS,
   PATH_RUNS,
   PATH_SESSIONS,
@@ -951,18 +953,11 @@ export class AstraClient {
   // ─── Models ─────────────────────────────────────────────────────────
 
   async listModels(): Promise<RuntimeModelListItem[]> {
-    const payload = await this.fetch<RuntimeModelListResponse>(PATH_MODELS);
-    if (Array.isArray(payload)) {
-      return payload.filter(
-        (model): model is RuntimeModelListItem =>
-          Boolean(model) && typeof model === "object",
-      );
-    }
-    const items = payload.items ?? payload.models ?? [];
-    return items.filter(
-      (model): model is RuntimeModelListItem =>
-        Boolean(model) && typeof model === "object",
-    );
+    return this.fetch<RuntimeModelListResponse>(PATH_MODELS);
+  }
+
+  async getModelAccess(): Promise<RuntimeModelAccessProjection> {
+    return this.fetch<RuntimeModelAccessProjection>(PATH_MODEL_ACCESS);
   }
 
   // ─── Agent Binding Registry ───────────────────────────────────────

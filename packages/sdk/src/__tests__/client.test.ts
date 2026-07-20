@@ -917,10 +917,23 @@ describe("AstraClient — Memory", () => {
 // ─── Skills ─────────────────────────────────────────────────────────
 
 describe("AstraClient — Models", () => {
-  test("listModels accepts array payloads", async () => {
+  test("listModels uses the canonical Offering array", async () => {
     globalThis.fetch = mockFetch(200, [
-      { name: "m1", provider: "p1", is_active: true },
-      null,
+      {
+        offering_id: "m1",
+        access_id: "self-hosted",
+        access_kind: "self_hosted",
+        access_label: "Self-hosted",
+        execution_placement: "server",
+        name: "m1",
+        provider: "p1",
+        description: null,
+        is_active: true,
+        context_window: 8192,
+        max_completion_tokens: null,
+        architecture: null,
+        thinking_capability: null,
+      },
     ]);
 
     const result = await createClient().listModels();
@@ -931,13 +944,28 @@ describe("AstraClient — Models", () => {
     ).toContain("/models");
   });
 
-  test("listModels accepts envelope payloads", async () => {
+  test("getModelAccess preserves product source and execution placement", async () => {
     globalThis.fetch = mockFetch(200, {
-      models: [{ model_id: "m2", provider: "p2" }],
+      accesses: [
+        {
+          id: "self-hosted",
+          kind: "self_hosted",
+          label: "Self-hosted",
+          execution_placement: "server",
+          status: "unavailable",
+          available_model_count: 0,
+          actions: ["contact_administrator"],
+        },
+      ],
+      offerings: [],
+      observed_at: "2026-07-20T00:00:00Z",
     });
 
-    const result = await createClient().listModels();
-    expect(result[0].model_id).toBe("m2");
+    const result = await createClient().getModelAccess();
+    expect(result.accesses[0].execution_placement).toBe("server");
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/model-access");
   });
 });
 

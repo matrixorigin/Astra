@@ -194,7 +194,7 @@ pub(crate) async fn stream_chat_sse(
         match session_runtime::resolve_server_default_model(p.api, p.token).await {
             ServerDefaultModel::Selected(selection) => {
                 model_context_window = selection.context_window;
-                p.model_id = Some(selection.model_id);
+                p.offering_id = Some(selection.offering_id);
                 Some(selection.name)
             }
             ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
@@ -225,7 +225,7 @@ pub(crate) async fn stream_chat_sse(
         match session_runtime::resolve_server_model_selection(p.api, p.token, selected_model).await
         {
             Ok(selection) => {
-                p.model_id = Some(selection.model_id);
+                p.offering_id = Some(selection.offering_id);
                 model_context_window = selection.context_window;
             }
             Err(error) => {
@@ -262,14 +262,14 @@ pub(crate) async fn stream_chat_sse(
             },
         });
     };
-    if p.model_id.is_none() {
+    if p.offering_id.is_none() {
         let error = format!(
             "model '{selected_model}' is missing an exact Offering identity in the server registry"
         );
         tracing::error!(
             target: "astra_cli::model_selection",
             model = selected_model,
-            "turn failed before SSE stream because selected model did not include model_id"
+            "turn failed before SSE stream because selected model did not include offering_id"
         );
         return Err(crate::TurnFailure {
             error,
@@ -303,13 +303,13 @@ pub(crate) async fn stream_chat_sse(
     // parent capture never happened and fork-cache probes were dead.
     let parent_turn_run_id = format!("run-{}", uuid::Uuid::new_v4());
     let term_width = terminal_width_usize();
-    // Capture the model id up front for later `resolve_for_model` calls —
-    // `p.model` (Option<&str>) gets consumed into `host.model` below.
-    let model_id_for_policy = p.model_id.as_deref().or(p.model);
+    // Tool policy and cache behavior follow the resolved model name, never the
+    // opaque Offering identity used for admission.
+    let model_for_policy = p.model;
     let runtime_manifest =
-        runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_id_for_policy);
+        runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_for_policy);
     let tool_policy_config = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
-    let resolved_tool_policy = tool_policy_config.resolve_for_model(model_id_for_policy);
+    let resolved_tool_policy = tool_policy_config.resolve_for_model(model_for_policy);
     let circuit_breaker_config = circuit_breaker_config_from_tool_policy(&tool_policy_config);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
@@ -675,7 +675,7 @@ pub(crate) async fn stream_chat_sse(
         token: p.token.to_string(),
         auth_profile: p.auth_profile,
         model: p.model,
-        model_id: p.model_id.clone(),
+        offering_id: p.offering_id.clone(),
         context_window_tokens,
         explain: p.explain,
         render_md: p.render_md,
@@ -798,7 +798,7 @@ pub(crate) async fn stream_chat_sse(
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
-        context_manifest_model_name: model_id_for_policy.map(str::to_string),
+        context_manifest_model_name: model_for_policy.map(str::to_string),
         runtime_manifest,
         recursion_depth: 0,
         final_text: String::new(),

@@ -1573,7 +1573,7 @@ async fn plan_executor_task(
                     input_work_unit_observations: &[],
                     semantic_query_override: None,
                     session_id: ctx.session_id.as_deref(),
-                    model_id: None,
+                    offering_id: None,
                     model: ctx.model.as_deref(),
                     provider: None,
                     explain: crate::cli::session::session_state::ExplainMode::Off,

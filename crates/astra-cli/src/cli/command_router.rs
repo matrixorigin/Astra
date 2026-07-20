@@ -366,7 +366,7 @@ fn effective_one_shot_model<'a>(
 #[derive(Debug, PartialEq, Eq)]
 struct ResolvedOneShotModel {
     model: Option<String>,
-    model_id: Option<String>,
+    offering_id: Option<String>,
 }
 
 async fn resolve_one_shot_model(
@@ -390,41 +390,35 @@ async fn resolve_one_shot_model(
     let Some(model) = model else {
         return Ok(ResolvedOneShotModel {
             model: None,
-            model_id: None,
+            offering_id: None,
         });
     };
     let body = api
         .get_models_text(token)
         .await
         .map_err(|err| format!("failed to list models for selected model '{model}': {err}"))?;
-    let value: serde_json::Value = serde_json::from_str(&body)
+    let catalog: Vec<slash_router::ModelCatalogEntry> = serde_json::from_str(&body)
         .map_err(|err| format!("failed to parse model list response: {err}"))?;
-    resolve_one_shot_model_from_catalog_value(&model, &value)
+    resolve_one_shot_model_from_catalog(&model, &catalog)
 }
 
-fn resolve_one_shot_model_from_catalog_value(
+fn resolve_one_shot_model_from_catalog(
     model: &str,
-    value: &serde_json::Value,
+    catalog: &[slash_router::ModelCatalogEntry],
 ) -> Result<ResolvedOneShotModel, String> {
-    let models = value
-        .as_array()
-        .or_else(|| value.get("models").and_then(|value| value.as_array()))
-        .ok_or_else(|| "model list response did not include a models array".to_string())?;
-    let entry = slash_router::find_model_entry_by_name(models, model)
+    let entry = slash_router::find_model_entry_by_name(catalog, model)
         .ok_or_else(|| format!("selected model '{model}' was not returned by /models"))?;
     if !slash_router::entry_model_is_active(entry) {
         return Err(format!("selected model '{model}' is inactive"));
     }
-    let model_id = slash_router::entry_model_id(entry)
-        .ok_or_else(|| format!("selected model '{model}' did not include model_id in /models"))?
-        .to_string();
+    let offering_id = slash_router::entry_offering_id(entry).to_string();
     let model_name = slash_router::entry_model_name(entry)
         .unwrap_or(model)
         .to_string();
 
     Ok(ResolvedOneShotModel {
         model: Some(model_name),
-        model_id: Some(model_id),
+        offering_id: Some(offering_id),
     })
 }
 
@@ -564,7 +558,7 @@ async fn execute_headless_task_body(
     )
     .await?;
     let effective_model = resolved_model.model;
-    let effective_model_id = resolved_model.model_id;
+    let effective_offering_id = resolved_model.offering_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,
@@ -641,7 +635,7 @@ async fn execute_headless_task_body(
         auth_profile: profile,
         message: &prompt,
         model: effective_model.as_deref(),
-        model_id: effective_model_id.as_deref(),
+        offering_id: effective_offering_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: terminal::size().is_ok() && !options.quiet && !options.json,
@@ -1427,7 +1421,7 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let effective_model = resolved_model.model;
-            let effective_model_id = resolved_model.model_id;
+            let effective_offering_id = resolved_model.offering_id;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 None,
                 auto_approve,
@@ -1447,7 +1441,7 @@ async fn execute_cli_command_impl(
                 auth_profile: profile.as_deref(),
                 message: &message,
                 model: effective_model.as_deref(),
-                model_id: effective_model_id.as_deref(),
+                offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
@@ -1922,7 +1916,7 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let effective_model = resolved_model.model;
-            let effective_model_id = resolved_model.model_id;
+            let effective_offering_id = resolved_model.offering_id;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 args.permission_mode.as_deref(),
                 args.auto_approve || auto_approve,
@@ -2002,7 +1996,7 @@ async fn execute_cli_command_impl(
                 auth_profile: profile.as_deref(),
                 message: &message,
                 model: effective_model.as_deref(),
-                model_id: effective_model_id.as_deref(),
+                offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: explain_mode,
                 render_md,
@@ -2679,7 +2673,7 @@ pub(crate) async fn run_print_mode(
     let resolved_model =
         resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
     let effective_model = resolved_model.model;
-    let effective_model_id = resolved_model.model_id;
+    let effective_offering_id = resolved_model.offering_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,
@@ -2728,7 +2722,7 @@ pub(crate) async fn run_print_mode(
         auth_profile: profile,
         message: &message,
         model: effective_model.as_deref(),
-        model_id: effective_model_id.as_deref(),
+        offering_id: effective_offering_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: false,

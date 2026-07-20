@@ -11,11 +11,11 @@ const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 
 function runtimeClient(
   accessToken: string | undefined,
-  listModels: ReturnType<typeof vi.fn>,
+  getModelAccess: ReturnType<typeof vi.fn>,
 ) {
   return {
     config: { accessToken },
-    sdk: { listModels },
+    sdk: { getModelAccess },
   };
 }
 
@@ -24,7 +24,7 @@ describe("/api/models route", () => {
     vi.clearAllMocks();
   });
 
-  it("does not return fallback models when authenticated listModels fails", async () => {
+  it("does not return fallback models when Model Access fails", async () => {
     mockRequireRuntimeClient.mockResolvedValue(
       runtimeClient(
         "astra-access",
@@ -43,9 +43,21 @@ describe("/api/models route", () => {
     });
   });
 
-  it("does not return fallback models when authenticated listModels is empty", async () => {
+  it("returns typed recovery when no Offering is eligible", async () => {
     mockRequireRuntimeClient.mockResolvedValue(
-      runtimeClient("astra-access", vi.fn().mockResolvedValue([])) as never,
+      runtimeClient("astra-access", vi.fn().mockResolvedValue({
+        accesses: [{
+          id: "self-hosted",
+          kind: "self_hosted",
+          label: "Self-hosted",
+          execution_placement: "server",
+          status: "unavailable",
+          available_model_count: 0,
+          actions: ["contact_administrator"],
+        }],
+        offerings: [],
+        observed_at: "2026-07-20T00:00:00Z",
+      })) as never,
     );
 
     const response = await GET();
@@ -54,9 +66,19 @@ describe("/api/models route", () => {
     expect(response.status).toBe(200);
     expect(body).toEqual({
       items: [],
+      accesses: [{
+        id: "self-hosted",
+        kind: "self_hosted",
+        label: "Self-hosted",
+        execution_placement: "server",
+        status: "unavailable",
+        available_model_count: 0,
+        actions: ["contact_administrator"],
+      }],
+      observedAt: "2026-07-20T00:00:00Z",
       source: "astra",
       status: "unavailable",
-      action: "contact_admin",
+      actions: ["contact_administrator"],
     });
   });
 

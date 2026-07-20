@@ -38,7 +38,6 @@ import type {
   ComposerOptions,
   CreateProjectRequest,
   KnowledgeFile,
-  ModelSummary,
   ProjectDetail,
   ProjectListResponse,
   ProjectSummary,
@@ -97,7 +96,6 @@ const RUN_SYNC_PAGE_SIZE = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
 const WORKSPACE_SELECTION_METADATA_KEY = "workspace_selection";
-const DEFAULT_WEB_MODEL = "sonnet-4.6-adaptive";
 
 type StreamResult = {
   assistantText: string;
@@ -106,13 +104,35 @@ type StreamResult = {
   nextOffset?: number;
 };
 
+export type ModelOfferingSelectionErrorCode =
+  | "invalid_selection"
+  | "authentication_required"
+  | "catalog_unavailable"
+  | "offering_unavailable";
+
+export class ModelOfferingSelectionError extends Error {
+  constructor(
+    readonly code: ModelOfferingSelectionErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ModelOfferingSelectionError";
+  }
+}
+
 function runtimeOperationError(operation: string, error: unknown) {
   return new Error(`${operation}: ${runtimeErrorDetail(error)}`);
 }
 
-export function selectedWebModel(model?: string | null): string {
+export function requireSelectedOfferingId(model?: string | null): string {
   const normalized = model?.trim();
-  return normalized || DEFAULT_WEB_MODEL;
+  if (!normalized) {
+    throw new ModelOfferingSelectionError(
+      "invalid_selection",
+      "Select an available Model Offering before starting a turn.",
+    );
+  }
+  return normalized;
 }
 
 declare global {
@@ -534,29 +554,6 @@ export function getCurrentUser(): UserSummary {
   };
 }
 
-export function listModelSummaries(): ModelSummary[] {
-  return [
-    {
-      id: DEFAULT_WEB_MODEL,
-      name: "Sonnet 4.6",
-      subtitle: "Responsive everyday work",
-      tier: "included",
-    },
-    {
-      id: "opus-4.7",
-      name: "Opus 4.7",
-      subtitle: "Most capable for ambitious work",
-      tier: "upgrade",
-    },
-    {
-      id: "haiku-4.5",
-      name: "Haiku 4.5",
-      subtitle: "Fastest and most efficient",
-      tier: "included",
-    },
-  ];
-}
-
 export async function listChats(
   ownerUserId: string,
   params: {
@@ -928,7 +925,7 @@ export async function sendMessage(
   const agentResult = await callBackendAgent({
     sessionId: backendSessionId,
     text: payload.content,
-    model: selectedWebModel(payload.options?.model ?? chat.model),
+    model: requireSelectedOfferingId(payload.options?.model ?? chat.model),
     activeSkills: payload.options?.activeSkills,
     activeTools: payload.options?.activeTools,
     webSearch: payload.options?.webSearch,
@@ -1774,7 +1771,7 @@ export async function ensureChatBackendSession(
     return chat.backendSessionId;
   }
 
-  const model = selectedWebModel(params.model ?? chat.model);
+  const model = requireSelectedOfferingId(params.model ?? chat.model);
   const session = await createBackendSession({
     chatId: chat.id,
     title: chat.title,
@@ -2661,48 +2658,45 @@ export async function resolveModelOfferingSelection(
   offeringId: string,
 ): Promise<{ offeringId: string }> {
   if (!offeringId || offeringId.trim() !== offeringId) {
-    throw new Error("offeringId must be an exact non-empty identifier");
-  }
-
-  try {
-    const client =
-      runtime instanceof WebRuntimeClient
-        ? runtime
-        : new WebRuntimeClient(runtime);
-    const accessToken = client.config.accessToken;
-    if (!accessToken) {
-      throw new Error("authenticated model access is required");
-    }
-
-    const cached = modelCache.get(accessToken);
-    let modelsPromise: Promise<
-      Array<{
-        model_id?: string | null;
-        name?: string | null;
-        is_active?: boolean | null;
-      }>
-    >;
-    if (cached) {
-      modelsPromise = cached;
-    } else {
-      modelsPromise = client.sdk.listModels();
-      modelCache.set(accessToken, modelsPromise);
-    }
-
-    const models = await modelsPromise.catch((err) => {
-      modelCache.invalidate(accessToken);
-      throw err;
-    });
-    const matched = models.find(
-      (item) => item.model_id === offeringId && item.is_active !== false,
-    );
-    if (!matched) {
-      throw new Error(`Model Offering '${offeringId}' is not available`);
-    }
-    return { offeringId };
-  } catch (error) {
-    throw new Error(
-      `resolve model Offering failed: ${error instanceof Error ? error.message : String(error)}`,
+    throw new ModelOfferingSelectionError(
+      "invalid_selection",
+      "offeringId must be an exact non-empty identifier",
     );
   }
+
+  const client =
+    runtime instanceof WebRuntimeClient
+      ? runtime
+      : new WebRuntimeClient(runtime);
+  const accessToken = client.config.accessToken;
+  if (!accessToken) {
+    throw new ModelOfferingSelectionError(
+      "authentication_required",
+      "authenticated model access is required",
+    );
+  }
+
+  let modelsPromise = modelCache.get(accessToken);
+  if (!modelsPromise) {
+    modelsPromise = client.sdk.listModels();
+    modelCache.set(accessToken, modelsPromise);
+  }
+
+  const models = await modelsPromise.catch((error: unknown) => {
+    modelCache.invalidate(accessToken);
+    throw new ModelOfferingSelectionError(
+      "catalog_unavailable",
+      error instanceof Error ? error.message : "Model catalog is unavailable",
+    );
+  });
+  const matched = models.find(
+    (item) => item.offering_id === offeringId && item.is_active,
+  );
+  if (!matched) {
+    throw new ModelOfferingSelectionError(
+      "offering_unavailable",
+      `Model Offering '${offeringId}' is not available`,
+    );
+  }
+  return { offeringId };
 }

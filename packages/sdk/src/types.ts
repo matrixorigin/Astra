@@ -1126,24 +1126,47 @@ export type RuntimeTranscriptParams = {
   limit?: number;
 };
 
+export type RuntimeModelAccessKind =
+  | "astra_cloud"
+  | "workspace"
+  | "this_device"
+  | "self_hosted";
+
+export type RuntimeModelExecutionPlacement = "server" | "edge";
+
 export type RuntimeModelListItem = {
-  model_id?: string;
-  name?: string;
-  provider?: string;
-  description?: string | null;
-  is_active?: boolean;
-  context_window?: number;
-  max_completion_tokens?: number | null;
-  architecture?: string | null;
-  thinking_capability?: string | Record<string, unknown> | null;
+  offering_id: string;
+  access_id: string;
+  access_kind: RuntimeModelAccessKind;
+  access_label: string;
+  execution_placement: RuntimeModelExecutionPlacement;
+  name: string;
+  provider: string;
+  description: string | null;
+  is_active: boolean;
+  context_window: number;
+  max_completion_tokens: number | null;
+  architecture: unknown | null;
+  thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
 };
 
-export type RuntimeModelListResponse =
-  | RuntimeModelListItem[]
-  | {
-      items?: RuntimeModelListItem[];
-      models?: RuntimeModelListItem[];
-    };
+export type RuntimeModelListResponse = RuntimeModelListItem[];
+
+export type RuntimeModelAccessView = {
+  id: string;
+  kind: RuntimeModelAccessKind;
+  label: string;
+  execution_placement: RuntimeModelExecutionPlacement;
+  status: "ready" | "unavailable";
+  available_model_count: number;
+  actions: Array<"contact_administrator" | "reconnect_device">;
+};
+
+export type RuntimeModelAccessProjection = {
+  accesses: RuntimeModelAccessView[];
+  offerings: RuntimeModelListItem[];
+  observed_at: string;
+};
 
 export type RuntimeArtifactResponse = {
   artifact_id?: string;

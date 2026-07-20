@@ -7,6 +7,31 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+pub(crate) fn mock_model_catalog_json(names: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "offering_id": format!("offer-{name}"),
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": name,
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 200_000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                })
+            })
+            .collect(),
+    )
+}
+
 // ── Safe env helpers ───────────────────────────────────────────────────
 //
 // Centralised wrappers for `std::env::set_var` and `std::env::remove_var`.

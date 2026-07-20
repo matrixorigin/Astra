@@ -110,7 +110,7 @@ enum StartupUiEffect {
 /// structured through the handoff so picking a model does not trigger a
 /// second remote fetch just to recover provider/thinking metadata.
 enum ModelCatalogEffect {
-    Ready(Result<Vec<serde_json::Value>, String>),
+    Ready(Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String>),
 }
 
 /// A completed read-only slash action. The payload stays structured until it
@@ -226,7 +226,7 @@ fn apply_model_catalog_effect(
     state: &crate::cli::session::session_state::SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
-    cached_catalog: &mut Option<Vec<serde_json::Value>>,
+    cached_catalog: &mut Option<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>>,
 ) -> bool {
     match effect {
         ModelCatalogEffect::Ready(Ok(catalog)) => {
@@ -7708,8 +7708,8 @@ pub(crate) async fn run_tui_session(
                                             .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
                                         let provider =
                                             entry.and_then(crate::cli::slash::slash_router::entry_provider);
-                                        let model_id = entry
-                                            .and_then(crate::cli::slash::slash_router::entry_model_id)
+                                        let offering_id = entry
+                                            .map(crate::cli::slash::slash_router::entry_offering_id)
                                             .map(ToOwned::to_owned);
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
@@ -7721,8 +7721,8 @@ pub(crate) async fn run_tui_session(
                                             crate::cli::slash::slash_config::set_active_model_for_display(
                                                 Some(base_model.clone()),
                                             );
-                                            crate::cli::slash::slash_config::set_active_model_id_for_request(
-                                                model_id,
+                                            crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                                                offering_id,
                                             );
                                             bottom_pane.footer.model = Some(base_model.clone());
                                             chat_widget.commit_system(
@@ -7777,8 +7777,8 @@ pub(crate) async fn run_tui_session(
                                             &raw,
                                             &base_model,
                                         );
-                                        let model_id = entry
-                                            .and_then(crate::cli::slash::slash_router::entry_model_id)
+                                        let offering_id = entry
+                                            .map(crate::cli::slash::slash_router::entry_offering_id)
                                             .map(ToOwned::to_owned);
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
@@ -7786,8 +7786,8 @@ pub(crate) async fn run_tui_session(
                                         crate::cli::slash::slash_config::set_active_model_for_display(
                                             Some(composed.clone()),
                                         );
-                                        crate::cli::slash::slash_config::set_active_model_id_for_request(
-                                            model_id,
+                                        crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                                            offering_id,
                                         );
                                         bottom_pane.footer.model = Some(composed.clone());
                                         chat_widget.commit_system(
@@ -12955,13 +12955,21 @@ mod tests {
         let mut bottom_pane = BottomPane::new();
         let mut widget = chat_widget::ChatWidget::new("session-1");
         let mut cached_catalog = None;
-        let catalog = vec![serde_json::json!({
+        let catalog = serde_json::from_value(serde_json::json!([{
+            "offering_id": "offer-gpt-5",
+            "access_id": "self-hosted",
+            "access_kind": "self_hosted",
+            "access_label": "Self-hosted",
+            "execution_placement": "server",
             "name": "gpt-5",
-            "model_id": "provider-gpt-5",
             "provider": "openai",
-            "thinking_capability": "high",
+            "thinking_capability": "both",
             "is_active": true,
-        })];
+            "context_window": 128000,
+            "max_completion_tokens": null,
+            "architecture": null
+        }]))
+        .expect("canonical model catalog");
 
         assert!(apply_model_catalog_effect(
             ModelCatalogEffect::Ready(Ok(catalog)),
@@ -12974,9 +12982,8 @@ mod tests {
         assert_eq!(
             cached_catalog
                 .as_ref()
-                .and_then(|models| models[0].get("model_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("provider-gpt-5")
+                .map(|models| models[0].offering_id.as_str()),
+            Some("offer-gpt-5")
         );
         assert!(matches!(
             widget.history()[0].to_persist(),
@@ -12993,7 +13000,23 @@ mod tests {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut widget = chat_widget::ChatWidget::new("session-1");
-        let mut cached_catalog = Some(vec![serde_json::json!({ "name": "old" })]);
+        let stale = serde_json::from_value(serde_json::json!([{
+            "offering_id": "offer-old",
+            "access_id": "self-hosted",
+            "access_kind": "self_hosted",
+            "access_label": "Self-hosted",
+            "execution_placement": "server",
+            "name": "old",
+            "provider": "openai",
+            "description": null,
+            "is_active": true,
+            "context_window": 8192,
+            "max_completion_tokens": null,
+            "architecture": null,
+            "thinking_capability": null
+        }]))
+        .expect("canonical stale catalog");
+        let mut cached_catalog = Some(stale);
 
         assert!(!apply_model_catalog_effect(
             ModelCatalogEffect::Ready(Err("Cannot reach server — check connection".into())),

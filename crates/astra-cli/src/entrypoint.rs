@@ -336,7 +336,7 @@ pub async fn run() {
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());
-    slash_config::set_active_model_id_for_request(None);
+    slash_config::set_active_offering_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
@@ -467,20 +467,10 @@ mod tests {
     use cli::slash::{slash_health, slash_stats, slash_task, slash_tools};
 
     async fn mock_models_response() -> axum::Json<serde_json::Value> {
-        axum::Json(serde_json::json!({
-            "models": [
-                {
-                    "name": "test-model",
-                    "is_active": true,
-                    "context_window": 200_000
-                },
-                {
-                    "name": "mock-model",
-                    "is_active": true,
-                    "context_window": 200_000
-                }
-            ]
-        }))
+        axum::Json(crate::test_utils::mock_model_catalog_json(&[
+            "test-model",
+            "mock-model",
+        ]))
     }
 
     async fn spawn_mock_app(app: Router) -> String {
@@ -637,25 +627,33 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn slash_model_with_provider_model_id_preserves_request_id_and_display_model() {
+    async fn slash_model_with_offering_id_preserves_selection_and_display_model() {
         let app = Router::new().route(
             "/models",
             get(|| async {
-                axum::Json(serde_json::json!({
-                    "models": [{
-                        "model_id": "provider-model-id",
-                        "name": "Display Model",
-                        "is_active": true
-                    }]
-                }))
+                axum::Json(serde_json::json!([{
+                    "offering_id": "offer-model",
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": "Display Model",
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 128000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                }]))
             }),
         );
         let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState::default();
-        cli::slash::slash_config::set_active_model_id_for_request(None);
+        cli::slash::slash_config::set_active_offering_id_for_request(None);
         let exit = handle_slash_command(
-            "/model provider-model-id",
+            "/model offer-model",
             &api,
             None,
             &mut state,
@@ -667,10 +665,10 @@ mod tests {
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("Display Model"));
         assert_eq!(
-            cli::slash::slash_config::active_model_id_for_request().as_deref(),
-            Some("provider-model-id")
+            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
+            Some("offer-model")
         );
-        cli::slash::slash_config::set_active_model_id_for_request(None);
+        cli::slash::slash_config::set_active_offering_id_for_request(None);
     }
 
     #[serial_test::serial]
@@ -691,9 +689,9 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_model_id_for_request(Some("old-id".to_string()));
+        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
         let exit = handle_slash_command(
-            "/model provider-model-id",
+            "/model offer-model",
             &api,
             None,
             &mut state,
@@ -705,10 +703,10 @@ mod tests {
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
         assert_eq!(
-            cli::slash::slash_config::active_model_id_for_request().as_deref(),
-            Some("old-id")
+            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
+            Some("offer-old")
         );
-        cli::slash::slash_config::set_active_model_id_for_request(None);
+        cli::slash::slash_config::set_active_offering_id_for_request(None);
     }
 
     #[serial_test::serial]
@@ -716,7 +714,7 @@ mod tests {
     async fn slash_model_with_token_does_not_update_state_when_model_list_is_empty() {
         let app = Router::new().route(
             "/models",
-            get(|| async { axum::Json(serde_json::json!({"models": []})) }),
+            get(|| async { axum::Json(serde_json::json!([])) }),
         );
         let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -724,9 +722,9 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_model_id_for_request(Some("old-id".to_string()));
+        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
         let exit = handle_slash_command(
-            "/model provider-model-id",
+            "/model offer-model",
             &api,
             None,
             &mut state,
@@ -738,10 +736,10 @@ mod tests {
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
         assert_eq!(
-            cli::slash::slash_config::active_model_id_for_request().as_deref(),
-            Some("old-id")
+            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
+            Some("offer-old")
         );
-        cli::slash::slash_config::set_active_model_id_for_request(None);
+        cli::slash::slash_config::set_active_offering_id_for_request(None);
     }
 
     #[tokio::test]

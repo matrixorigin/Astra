@@ -133,7 +133,7 @@ impl<'a> CompactCtx<'a> {
             input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id: self.state.session_id.as_deref(),
-            model_id: None,
+            offering_id: None,
             model: self.state.model.as_deref(),
             provider: None,
             explain: ExplainMode::Off,

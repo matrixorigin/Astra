@@ -349,7 +349,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model.clone(),
-            model_id: model_selection.model_id,
+            offering_id: model_selection.offering_id,
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,

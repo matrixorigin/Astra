@@ -15,6 +15,7 @@ export const PATH_CHAT = "/chat";
 export const PATH_CHAT_STREAM = "/chat/stream";
 
 export const PATH_MODELS = "/models";
+export const PATH_MODEL_ACCESS = "/model-access";
 export const PATH_AGENT_BINDINGS = "/agent-bindings";
 export const PATH_MODEL_GATEWAYS = "/model-gateways";
 

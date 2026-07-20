@@ -11,11 +11,11 @@ const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 
 function runtimeClient(
   accessToken: string | undefined,
-  listModels: ReturnType<typeof vi.fn>,
+  getModelAccess: ReturnType<typeof vi.fn>,
 ) {
   return {
     config: { accessToken },
-    sdk: { listModels },
+    sdk: { getModelAccess },
   };
 }
 
@@ -24,32 +24,63 @@ describe("/api/models", () => {
     vi.clearAllMocks();
   });
 
-  it("exposes active runtime models using model_id as id and name as display label", async () => {
-    const listModels = vi.fn().mockResolvedValue([
-      {
-        model_id: "row-flash",
+  it("exposes effective Offerings with their Model Access placement", async () => {
+    const getModelAccess = vi.fn().mockResolvedValue({
+      accesses: [{
+        id: "self-hosted",
+        kind: "self_hosted",
+        label: "Self-hosted",
+        execution_placement: "server",
+        status: "ready",
+        available_model_count: 3,
+        actions: [],
+      }],
+      observed_at: "2026-07-20T00:00:00Z",
+      offerings: [{
+        offering_id: "row-flash",
+        access_id: "self-hosted",
+        access_kind: "self_hosted",
+        access_label: "Self-hosted",
+        execution_placement: "server",
         name: "deepseek-v4-flash-anthropic",
         provider: "anthropic",
         description: "Flash endpoint",
         architecture: "deepseek-v4",
         context_window: 128_000,
-        thinking_capability: { kind: "native" },
+        thinking_capability: "native_only",
         is_active: true,
       },
       {
-        model_id: "row-only",
+        offering_id: "row-only",
+        access_id: "self-hosted",
+        access_kind: "self_hosted",
+        access_label: "Self-hosted",
+        execution_placement: "server",
+        name: "row-only",
         provider: "openai",
+        description: null,
+        architecture: null,
+        context_window: 8192,
+        max_completion_tokens: null,
         is_active: true,
       },
       {
-        model_id: "row-inactive",
+        offering_id: "row-inactive",
+        access_id: "self-hosted",
+        access_kind: "self_hosted",
+        access_label: "Self-hosted",
+        execution_placement: "server",
         name: "inactive-model",
         provider: "openai",
+        description: null,
+        architecture: null,
+        context_window: 8192,
+        max_completion_tokens: null,
         is_active: false,
       },
-    ]);
+    ]});
     mockRequireRuntimeClient.mockResolvedValue(
-      runtimeClient("astra-access", listModels) as never,
+      runtimeClient("astra-access", getModelAccess) as never,
     );
 
     const response = await GET();
@@ -63,14 +94,16 @@ describe("/api/models", () => {
       name: "deepseek-v4-flash-anthropic",
       tier: "included",
     });
-    expect(payload.items[0].subtitle).toContain("anthropic");
+    expect(payload.items[0].subtitle).toContain("Self-hosted");
+    expect(payload.items[0].subtitle).toContain("Runs on server");
     expect(payload.items[0].subtitle).toContain("128k context");
     expect(payload.items[1]).toMatchObject({
       id: "row-only",
       name: "row-only",
       tier: "included",
     });
-    expect(payload.items[1].subtitle).toContain("openai");
+    expect(payload.items[1].subtitle).toContain("Self-hosted");
+    expect(payload.observedAt).toBe("2026-07-20T00:00:00Z");
   });
 
   it("surfaces Model Access failure instead of inventing static Offerings", async () => {

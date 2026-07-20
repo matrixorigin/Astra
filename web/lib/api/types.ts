@@ -312,6 +312,8 @@ export type ModelSummary = {
   name: string;
   subtitle: string;
   tier: 'included' | 'upgrade';
+  accessLabel: string;
+  executionPlacement: 'server' | 'edge';
 };
 
 export type SkillSummary = {

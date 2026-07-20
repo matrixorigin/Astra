@@ -7,13 +7,6 @@ import { listModels } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
 
-const fallbackModels: ModelSummary[] = [
-  { id: 'sonnet-4.6-adaptive', name: 'Sonnet 4.6', subtitle: 'Responsive everyday work', tier: 'included' },
-  { id: 'opus-4.7', name: 'Opus 4.7', subtitle: 'Most capable for ambitious work', tier: 'upgrade' },
-  { id: 'haiku-4.5', name: 'Haiku 4.5', subtitle: 'Fastest and most efficient', tier: 'included' },
-];
-const fallbackModelIds = new Set(fallbackModels.map((model) => model.id));
-
 export function ModelSwitcher({
   value,
   onChange,
@@ -27,7 +20,7 @@ export function ModelSwitcher({
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
-  const [models, setModels] = useState<ModelSummary[]>(fallbackModels);
+  const [models, setModels] = useState<ModelSummary[]>([]);
   const [loadedModels, setLoadedModels] = useState(false);
 
   useEffect(() => {
@@ -37,16 +30,14 @@ export function ModelSwitcher({
         setLoadedModels(true);
       })
       .catch(() => {
-        setModels(fallbackModels);
+        setModels([]);
         setLoadedModels(true);
       });
   }, []);
 
   const selected = models.find((model) => model.id === value);
   const defaultModel = loadedModels ? models[0] : undefined;
-  const shouldSelectDefault =
-    Boolean(defaultModel) &&
-    (!value || (!selected && fallbackModelIds.has(value)));
+  const shouldSelectDefault = Boolean(defaultModel) && !value;
   const visibleSelected = selected ?? (shouldSelectDefault ? defaultModel : undefined);
   const modelUnavailable = loadedModels && Boolean(value) && !visibleSelected;
 
@@ -73,7 +64,11 @@ export function ModelSwitcher({
         >
           <span className="truncate">
             {visibleSelected?.name ??
-              (modelUnavailable ? 'Unavailable model' : value || 'Model')}
+              (modelUnavailable
+                ? 'Unavailable model'
+                : !loadedModels
+                  ? 'Loading models…'
+                  : 'No models available')}
           </span>
           <ChevronDown className="size-4" />
         </button>
@@ -82,6 +77,11 @@ export function ModelSwitcher({
     >
       <div className="flex flex-col">
         <div className="max-h-[25vh] min-h-0 space-y-1 overflow-y-auto overscroll-contain p-2 pr-1">
+          {loadedModels && models.length === 0 ? (
+            <div className="px-3 py-4 text-sm text-text-muted">
+              No eligible models. Check Model Access or ask an administrator.
+            </div>
+          ) : null}
           {models.map((model) => {
             const checked = model.id === (visibleSelected?.id ?? value);
             return (

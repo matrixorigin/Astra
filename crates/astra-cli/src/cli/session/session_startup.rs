@@ -779,8 +779,8 @@ pub(crate) async fn complete_session_startup(
                             Some(&selection.name),
                             selection.context_window,
                         );
-                    crate::cli::slash::slash_config::set_active_model_id_for_request(Some(
-                        selection.model_id,
+                    crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
+                        selection.offering_id,
                     ));
                     state.model = Some(selection.name);
                 }

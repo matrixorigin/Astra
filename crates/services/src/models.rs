@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Row, query};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -277,6 +277,16 @@ pub enum ThinkingCapability {
 }
 
 impl ThinkingCapability {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::EffortOnly => "effort_only",
+            Self::NativeOnly => "native_only",
+            Self::None => "none",
+        }
+    }
+
     pub fn from_db(s: Option<&str>) -> Option<Self> {
         match s? {
             "both" => Some(Self::Both),
@@ -343,7 +353,11 @@ pub struct ModelRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelListItem {
-    pub model_id: String,
+    pub offering_id: String,
+    pub access_id: String,
+    pub access_kind: ModelAccessKind,
+    pub access_label: String,
+    pub execution_placement: ModelExecutionPlacement,
     pub name: String,
     pub provider: String,
     pub description: Option<String>,
@@ -403,7 +417,7 @@ pub struct ResolvedModelOffering {
 /// This is intentionally independent from provider identity. A provider model
 /// can be exposed through personal Cloud, a Workspace, a local device, or a
 /// self-hosted deployment without changing the agent runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelAccessKind {
     AstraCloud,
@@ -424,7 +438,7 @@ impl ModelAccessKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelExecutionPlacement {
     Server,
@@ -1973,7 +1987,11 @@ impl ModelService for DatabaseModelService {
             let context_window =
                 model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
             models.push(ModelListItem {
-                model_id: row.try_get("model_id").map_err(internal_error)?,
+                offering_id: row.try_get("model_id").map_err(internal_error)?,
+                access_id: "self-hosted".to_string(),
+                access_kind: ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".to_string(),
+                execution_placement: ModelExecutionPlacement::Server,
                 name,
                 provider: row.try_get("provider").map_err(internal_error)?,
                 description: row.try_get("description").map_err(internal_error)?,
@@ -3002,9 +3020,14 @@ pub struct ModelResponse {
     pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelListItemResponse {
-    pub model_id: String,
+    pub offering_id: String,
+    pub access_id: String,
+    pub access_kind: ModelAccessKind,
+    pub access_label: String,
+    pub execution_placement: ModelExecutionPlacement,
     pub name: String,
     pub provider: String,
     pub description: Option<String>,
@@ -3044,7 +3067,11 @@ impl From<ModelRecord> for ModelResponse {
 impl From<ModelListItem> for ModelListItemResponse {
     fn from(r: ModelListItem) -> Self {
         Self {
-            model_id: r.model_id,
+            offering_id: r.offering_id,
+            access_id: r.access_id,
+            access_kind: r.access_kind,
+            access_label: r.access_label,
+            execution_placement: r.execution_placement,
             name: r.name,
             provider: r.provider,
             description: r.description,
@@ -3055,6 +3082,129 @@ impl From<ModelListItem> for ModelListItemResponse {
             thinking_capability: r.thinking_capability,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredModelAccess {
+    pub id: String,
+    pub kind: ModelAccessKind,
+    pub label: String,
+    pub execution_placement: ModelExecutionPlacement,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessStatus {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessAction {
+    ContactAdministrator,
+    ReconnectDevice,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAccessViewResponse {
+    pub id: String,
+    pub kind: ModelAccessKind,
+    pub label: String,
+    pub execution_placement: ModelExecutionPlacement,
+    pub status: ModelAccessStatus,
+    pub available_model_count: u32,
+    pub actions: Vec<ModelAccessAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAccessProjectionResponse {
+    pub accesses: Vec<ModelAccessViewResponse>,
+    pub offerings: Vec<ModelListItemResponse>,
+    pub observed_at: String,
+}
+
+/// Build the user-facing Model Access projection from declared product
+/// sources and the effective Offerings admitted for this principal.
+///
+/// An Offering cannot silently redefine the kind, label, or placement of its
+/// access source. That mismatch is a contract error rather than a UI guess.
+pub fn project_model_access(
+    declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItemResponse>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    let mut accesses = BTreeMap::new();
+    for access in declared {
+        if let Some(existing) = accesses.insert(access.id.clone(), access.clone())
+            && existing != access
+        {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "Model Access '{}' was declared with inconsistent product facts",
+                access.id
+            )));
+        }
+    }
+
+    let mut counts = BTreeMap::<String, u32>::new();
+    for offering in &offerings {
+        let Some(access) = accesses.get(&offering.access_id) else {
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "Offering '{}' references undeclared Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        };
+        if access.kind != offering.access_kind
+            || access.label != offering.access_label
+            || access.execution_placement != offering.execution_placement
+        {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "Offering '{}' conflicts with Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        }
+        let count = counts.entry(offering.access_id.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    let accesses = accesses
+        .into_values()
+        .map(|access| {
+            let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
+            let status = if available_model_count > 0 {
+                ModelAccessStatus::Ready
+            } else {
+                ModelAccessStatus::Unavailable
+            };
+            let actions = match (status, access.kind) {
+                (ModelAccessStatus::Ready, _) => Vec::new(),
+                (ModelAccessStatus::Unavailable, ModelAccessKind::ThisDevice) => {
+                    vec![ModelAccessAction::ReconnectDevice]
+                }
+                (ModelAccessStatus::Unavailable, _) => {
+                    vec![ModelAccessAction::ContactAdministrator]
+                }
+            };
+            ModelAccessViewResponse {
+                id: access.id,
+                kind: access.kind,
+                label: access.label,
+                execution_placement: access.execution_placement,
+                status,
+                available_model_count,
+                actions,
+            }
+        })
+        .collect();
+
+    Ok(ModelAccessProjectionResponse {
+        accesses,
+        offerings,
+        observed_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3953,7 +4103,11 @@ mod tests {
     #[test]
     fn model_list_item_to_response_preserves_fields() {
         let item = ModelListItem {
-            model_id: "m1".into(),
+            offering_id: "m1".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "gpt-4o".into(),
             provider: "openai".into(),
             description: Some("fast".into()),
@@ -3964,7 +4118,9 @@ mod tests {
             thinking_capability: Some(ThinkingCapability::Both),
         };
         let resp = ModelListItemResponse::from(item.clone());
-        assert_eq!(resp.model_id, item.model_id);
+        assert_eq!(resp.offering_id, item.offering_id);
+        assert_eq!(resp.access_id, "self-hosted");
+        assert_eq!(resp.execution_placement, ModelExecutionPlacement::Server);
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
         assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
@@ -3973,7 +4129,11 @@ mod tests {
     #[test]
     fn model_list_item_with_none_optionals() {
         let item = ModelListItem {
-            model_id: "m2".into(),
+            offering_id: "m2".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "test".into(),
             provider: "local".into(),
             description: None,
@@ -3988,6 +4148,82 @@ mod tests {
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
         assert!(resp.thinking_capability.is_none());
+    }
+
+    #[test]
+    fn model_access_projection_reports_effective_offerings_and_recovery() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+        };
+        let offering = ModelListItemResponse::from(ModelListItem {
+            offering_id: "offer-1".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Model One".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: Some(8_192),
+            architecture: None,
+            thinking_capability: None,
+        });
+
+        let ready = project_model_access(
+            vec![declared.clone()],
+            vec![offering],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("ready projection");
+        assert_eq!(ready.accesses.len(), 1);
+        assert_eq!(ready.accesses[0].status, ModelAccessStatus::Ready);
+        assert_eq!(ready.accesses[0].available_model_count, 1);
+        assert!(ready.accesses[0].actions.is_empty());
+        assert_eq!(ready.offerings[0].offering_id, "offer-1");
+
+        let unavailable =
+            project_model_access(vec![declared], Vec::new(), "2026-07-20T00:00:01Z".into())
+                .expect("unavailable projection");
+        assert_eq!(
+            unavailable.accesses[0].actions,
+            vec![ModelAccessAction::ContactAdministrator]
+        );
+    }
+
+    #[test]
+    fn model_access_projection_rejects_offering_scope_drift() {
+        let error = project_model_access(
+            vec![DeclaredModelAccess {
+                id: "self-hosted".into(),
+                kind: ModelAccessKind::SelfHosted,
+                label: "Self-hosted".into(),
+                execution_placement: ModelExecutionPlacement::Server,
+            }],
+            vec![ModelListItemResponse {
+                offering_id: "offer-1".into(),
+                access_id: "self-hosted".into(),
+                access_kind: ModelAccessKind::ThisDevice,
+                access_label: "This device".into(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                name: "Drifted".into(),
+                provider: "openai".into(),
+                description: None,
+                is_active: true,
+                context_window: 8_192,
+                max_completion_tokens: None,
+                architecture: None,
+                thinking_capability: None,
+            }],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect_err("Offering cannot redefine its access boundary");
+
+        assert_eq!(error.kind, crate::service_error::ServiceErrorKind::Conflict);
     }
 
     /// After the thinking probe UPDATE writes `thinking_capability` and
@@ -4227,7 +4463,11 @@ mod tests {
     #[test]
     fn model_list_item_response_json_uses_is_active_snake_case() {
         let item = ModelListItem {
-            model_id: "m3".into(),
+            offering_id: "m3".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
             name: "probe".into(),
             provider: "openai".into(),
             description: None,

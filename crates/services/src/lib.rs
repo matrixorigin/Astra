@@ -244,14 +244,15 @@ pub use model_gateways::{
     UnconfiguredModelGatewayService,
 };
 pub use models::{
-    AdmittedModelExecution, DatabaseModelService, ModelAccessKind, ModelCreateRequestData,
-    ModelExecutionPlacement, ModelListItem, ModelOfferingResolutionError, ModelRecord,
-    ModelService, ModelUpdateRequestData, PricingData, PromptCacheCapabilityData,
-    PromptCacheProtocolData, PromptCacheReuseScopeData, PromptCacheVolatilePlacementData,
-    QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
-    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
-    resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
-    validate_model_offering_id,
+    AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
+    ModelAccessKind, ModelAccessProjectionResponse, ModelAccessStatus, ModelAccessViewResponse,
+    ModelCreateRequestData, ModelExecutionPlacement, ModelListItem, ModelListItemResponse,
+    ModelOfferingResolutionError, ModelRecord, ModelService, ModelUpdateRequestData, PricingData,
+    PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
+    PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
+    UnconfiguredModelService, project_model_access, prompt_cache_capability_from_models_yaml,
+    resolve_active_llm_model, resolve_active_llm_offering, resolve_memory_offerings,
+    resolve_reasoning_offering, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,

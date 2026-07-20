@@ -1,7 +1,7 @@
 //! Slash command fallback routing for the interactive session.
 
 use astra_runtime::prompts;
-use astra_services::session_journal;
+use astra_services::{ModelListItemResponse, session_journal};
 use crossterm::style::Stylize;
 use std::{io::IsTerminal, path::PathBuf};
 
@@ -31,40 +31,36 @@ use crate::cli::{
     theme,
 };
 
-/// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
-fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
-    entry
-        .get("is_active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+pub(crate) type ModelCatalogEntry = ModelListItemResponse;
+
+fn model_list_entry_is_active(entry: &ModelCatalogEntry) -> bool {
+    entry.is_active
 }
 
-fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
-    entry
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+fn model_list_entry_name(entry: &ModelCatalogEntry) -> Option<&str> {
+    let name = entry.name.trim();
+    (!name.is_empty()).then_some(name)
 }
 
-fn model_list_entry_id(entry: &serde_json::Value) -> Option<&str> {
-    entry.get("model_id").and_then(|v| v.as_str())
+fn model_list_entry_offering_id(entry: &ModelCatalogEntry) -> &str {
+    entry.offering_id.as_str()
 }
 
-fn model_list_entry_thinking_capability(entry: &serde_json::Value) -> Option<&str> {
-    entry.get("thinking_capability").and_then(|v| v.as_str())
+fn model_list_entry_thinking_capability(entry: &ModelCatalogEntry) -> Option<&'static str> {
+    entry.thinking_capability.map(|value| value.as_str())
 }
 
-fn model_list_entry_provider(entry: &serde_json::Value) -> Option<&str> {
-    entry.get("provider").and_then(|v| v.as_str())
+fn model_list_entry_provider(entry: &ModelCatalogEntry) -> Option<&str> {
+    let provider = entry.provider.trim();
+    (!provider.is_empty()).then_some(provider)
 }
 
 fn find_model_list_entry<'a>(
-    models: &'a [serde_json::Value],
+    models: &'a [ModelCatalogEntry],
     name: &str,
-) -> Option<&'a serde_json::Value> {
+) -> Option<&'a ModelCatalogEntry> {
     models.iter().find(|m| {
-        model_list_entry_id(m).is_some_and(|id| id == name)
+        model_list_entry_offering_id(m) == name
             || model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name))
     })
 }
@@ -127,12 +123,7 @@ pub(crate) async fn handle_slash_command(
             };
             let body = api.get_models_text(tok).await.map_err(map_thin_err)?;
             {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                let models = value
-                    .as_array()
-                    .cloned()
-                    .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
-                    .unwrap_or_default();
+                let models = parse_model_catalog(&body).map_err(|error| error.to_string())?;
 
                 let items: Vec<(String, String)> = models
                     .iter()
@@ -141,11 +132,7 @@ pub(crate) async fn handle_slash_command(
                         if !model_list_entry_is_active(m) {
                             return None;
                         }
-                        let desc = m
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let desc = m.description.clone().unwrap_or_default();
                         Some((name.to_string(), desc))
                     })
                     .collect();
@@ -210,13 +197,10 @@ pub(crate) async fn handle_slash_command(
                     };
 
                     state.model = Some(model_with_suffix.clone());
-                    slash_config::set_active_model_id_for_request(
-                        selected_model
-                            .and_then(model_list_entry_id)
-                            .map(ToOwned::to_owned),
+                    slash_config::set_active_offering_id_for_request(
+                        selected_model.map(|entry| entry.offering_id.clone()),
                     );
-                    state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
-                        .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
+                    state.cached_pricing = slash_stats::fallback_pricing(&chosen);
                     let context_window =
                         selected_model.and_then(session_runtime::model_list_entry_context_window);
                     state.context_budget =
@@ -237,14 +221,14 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/model" => {
-            let mut selected_model_id: Option<String> = None;
+            let mut selected_offering_id: Option<String> = None;
             let mut selected_model_name: Option<String> = None;
             let mut context_window = None;
             if let Some(tok) = token {
                 match api.get_models_text(tok).await {
                     Ok(body) => {
-                        let value: serde_json::Value = match serde_json::from_str(&body) {
-                            Ok(value) => value,
+                        let models = match parse_model_catalog(&body) {
+                            Ok(models) => models,
                             Err(err) => {
                                 eprintln!(
                                     "{}",
@@ -254,17 +238,6 @@ pub(crate) async fn handle_slash_command(
                                 return Ok(false);
                             }
                         };
-                        let Some(models) = value
-                            .as_array()
-                            .or_else(|| value.get("models").and_then(|v| v.as_array()))
-                        else {
-                            eprintln!(
-                                "{}",
-                                "  Model list response did not include a models array.".yellow()
-                            );
-                            return Ok(false);
-                        };
-                        let models = models.clone();
                         if models.is_empty() {
                             eprintln!("{}", "  No models returned by the server.".yellow());
                             return Ok(false);
@@ -284,7 +257,7 @@ pub(crate) async fn handle_slash_command(
                                 );
                                 return Ok(false);
                             }
-                            selected_model_id = model_list_entry_id(entry).map(ToOwned::to_owned);
+                            selected_offering_id = Some(entry.offering_id.clone());
                             selected_model_name =
                                 model_list_entry_name(entry).map(ToOwned::to_owned);
                             context_window =
@@ -340,7 +313,7 @@ pub(crate) async fn handle_slash_command(
 
             let selected_model = selected_model_name.unwrap_or_else(|| arg.to_string());
             state.model = Some(selected_model.clone());
-            slash_config::set_active_model_id_for_request(selected_model_id);
+            slash_config::set_active_offering_id_for_request(selected_offering_id);
             slash_config::set_active_model_for_display(Some(selected_model.clone()));
             let base_model =
                 astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;
@@ -624,8 +597,6 @@ pub(crate) enum ModelCatalogError {
     Request(#[from] astra_thin_client::ThinClientError),
     #[error("invalid model catalog JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
-    #[error("model catalog response must be an array or an object with a `models` array")]
-    InvalidPayload,
 }
 
 impl ModelCatalogError {
@@ -643,70 +614,83 @@ impl ModelCatalogError {
     }
 }
 
-/// Fetch the full JSON catalog (used when the caller needs
-/// `thinking_capability` / `provider` / pricing alongside the
-/// name).  Returns only active entries so downstream lookups don't
-/// have to re-filter.
-pub(crate) async fn fetch_model_list_raw(
+fn parse_model_catalog(body: &str) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
+    Ok(serde_json::from_str(body)?)
+}
+
+/// Fetch the exact public model catalog. Only active Offerings reach the
+/// picker; administration surfaces use the server catalog directly.
+pub(crate) async fn fetch_model_catalog(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-) -> Result<Vec<serde_json::Value>, ModelCatalogError> {
+) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
     let tok = token.ok_or(ModelCatalogError::NotAuthenticated)?;
     let body = api.get_models_text(tok).await?;
-    let value: serde_json::Value = serde_json::from_str(&body)?;
-    let models = value
-        .as_array()
-        .cloned()
-        .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
-        .ok_or(ModelCatalogError::InvalidPayload)?;
-    Ok(models
+    Ok(parse_model_catalog(&body)?
         .into_iter()
         .filter(model_list_entry_is_active)
         .collect())
 }
 
-/// Lookup a model entry by name in a raw list.
+/// Lookup a model entry by canonical Offering ID or display name.
 pub(crate) fn find_model_entry_by_name<'a>(
-    models: &'a [serde_json::Value],
+    models: &'a [ModelCatalogEntry],
     name: &str,
-) -> Option<&'a serde_json::Value> {
+) -> Option<&'a ModelCatalogEntry> {
     find_model_list_entry(models, name)
 }
 
 /// Public accessor for a model entry's `thinking_capability`
 /// field.  Used by the TUI to decide whether to show the
 /// thinking-mode picker after the main model picker.
-pub(crate) fn entry_thinking_capability(entry: &serde_json::Value) -> Option<&str> {
+pub(crate) fn entry_thinking_capability(entry: &ModelCatalogEntry) -> Option<&'static str> {
     model_list_entry_thinking_capability(entry)
 }
 
-/// Public accessor for a model entry's provider-issued `model_id`.
-pub(crate) fn entry_model_id(entry: &serde_json::Value) -> Option<&str> {
-    model_list_entry_id(entry)
+/// Public accessor for the stable Offering identity selected by clients.
+pub(crate) fn entry_offering_id(entry: &ModelCatalogEntry) -> &str {
+    model_list_entry_offering_id(entry)
 }
 
 /// Public accessor for a model entry's display name.
-pub(crate) fn entry_model_name(entry: &serde_json::Value) -> Option<&str> {
+pub(crate) fn entry_model_name(entry: &ModelCatalogEntry) -> Option<&str> {
     model_list_entry_name(entry)
 }
 
 /// Public accessor for a model entry's active state.
-pub(crate) fn entry_model_is_active(entry: &serde_json::Value) -> bool {
+pub(crate) fn entry_model_is_active(entry: &ModelCatalogEntry) -> bool {
     model_list_entry_is_active(entry)
 }
 
 /// Public accessor for a model entry's `provider` field.
-pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
+pub(crate) fn entry_provider(entry: &ModelCatalogEntry) -> Option<&str> {
     model_list_entry_provider(entry)
 }
 
 #[cfg(test)]
 mod model_list_json_tests {
     use super::{
-        ModelCatalogError, entry_model_id, entry_model_is_active, entry_model_name,
-        find_model_entry_by_name, model_list_entry_is_active, model_list_entry_name,
-        model_list_entry_thinking_capability,
+        ModelCatalogError, entry_model_is_active, entry_model_name, entry_offering_id,
+        find_model_entry_by_name, model_list_entry_thinking_capability, parse_model_catalog,
     };
+
+    fn canonical_catalog_json() -> serde_json::Value {
+        serde_json::json!([{
+            "offering_id": "offer-coding",
+            "access_id": "self-hosted",
+            "access_kind": "self_hosted",
+            "access_label": "Self-hosted",
+            "execution_placement": "server",
+            "name": "Coding Model",
+            "provider": "openai",
+            "description": "Primary coding model",
+            "is_active": true,
+            "context_window": 128000,
+            "max_completion_tokens": 8192,
+            "architecture": null,
+            "thinking_capability": "both"
+        }])
+    }
 
     #[test]
     fn model_catalog_auth_classification_uses_http_status_not_body_text() {
@@ -726,84 +710,31 @@ mod model_list_json_tests {
     #[test]
     fn missing_token_is_an_authentication_failure() {
         assert!(ModelCatalogError::NotAuthenticated.is_authentication_failure());
-        assert!(!ModelCatalogError::InvalidPayload.is_authentication_failure());
     }
 
     #[test]
-    fn respects_is_active_false() {
-        let v = serde_json::json!({"name": "m", "is_active": false});
-        assert!(!model_list_entry_is_active(&v));
-    }
-
-    #[test]
-    fn ignores_legacy_active_field() {
-        let v = serde_json::json!({"name": "m", "active": true});
-        assert!(!model_list_entry_is_active(&v));
-    }
-
-    #[test]
-    fn is_active_wins_over_active_when_both_present() {
-        let v = serde_json::json!({"name": "m", "is_active": false, "active": true});
-        assert!(!model_list_entry_is_active(&v));
-    }
-
-    #[test]
-    fn missing_is_active_fails_closed() {
-        let v = serde_json::json!({"name": "m"});
-        assert!(!model_list_entry_is_active(&v));
-    }
-
-    #[test]
-    fn non_bool_is_active_fails_closed() {
-        let v = serde_json::json!({"name": "m", "is_active": 1});
-        assert!(!model_list_entry_is_active(&v));
-    }
-
-    #[test]
-    fn model_name_uses_canonical_name_only() {
-        let canonical = serde_json::json!({"name": "m", "model_name": "old"});
-        let legacy = serde_json::json!({"model_name": "old"});
-        assert_eq!(model_list_entry_name(&canonical), Some("m"));
-        assert_eq!(model_list_entry_name(&legacy), None);
-    }
-
-    #[test]
-    fn reads_thinking_capability_both() {
-        let v = serde_json::json!({"name": "claude", "thinking_capability": "both"});
-        assert_eq!(model_list_entry_thinking_capability(&v), Some("both"));
-    }
-
-    #[test]
-    fn finds_model_entry_by_provider_model_id() {
-        let models = vec![serde_json::json!({
-            "model_id": "provider-model-id",
-            "name": "Display Model",
-            "is_active": true
-        })];
-        let entry = find_model_entry_by_name(&models, "provider-model-id").expect("model entry");
-        assert_eq!(entry_model_id(entry), Some("provider-model-id"));
-        assert_eq!(entry_model_name(entry), Some("Display Model"));
+    fn canonical_catalog_preserves_offering_and_model_facts() {
+        let models =
+            parse_model_catalog(&canonical_catalog_json().to_string()).expect("canonical catalog");
+        let entry = find_model_entry_by_name(&models, "offer-coding").expect("offering entry");
+        assert_eq!(entry_offering_id(entry), "offer-coding");
+        assert_eq!(entry_model_name(entry), Some("Coding Model"));
+        assert_eq!(model_list_entry_thinking_capability(entry), Some("both"));
         assert!(entry_model_is_active(entry));
+        assert!(find_model_entry_by_name(&models, "coding model").is_some());
     }
 
     #[test]
-    fn reads_thinking_capability_native_only() {
-        let v = serde_json::json!({"name": "glm", "thinking_capability": "native_only"});
-        assert_eq!(
-            model_list_entry_thinking_capability(&v),
-            Some("native_only")
-        );
-    }
+    fn obsolete_catalog_shapes_are_rejected_at_the_boundary() {
+        let item = canonical_catalog_json()[0].clone();
+        let envelope = serde_json::json!({"models": [item.clone()]});
+        parse_model_catalog(&envelope.to_string()).expect_err("envelopes are not the contract");
 
-    #[test]
-    fn missing_thinking_capability_returns_none() {
-        let v = serde_json::json!({"name": "minimax"});
-        assert_eq!(model_list_entry_thinking_capability(&v), None);
-    }
-
-    #[test]
-    fn null_thinking_capability_returns_none() {
-        let v = serde_json::json!({"name": "x", "thinking_capability": null});
-        assert_eq!(model_list_entry_thinking_capability(&v), None);
+        let mut obsolete = item;
+        let object = obsolete.as_object_mut().expect("catalog item object");
+        object.remove("offering_id");
+        object.insert("model_id".into(), serde_json::json!("provider-model-id"));
+        parse_model_catalog(&serde_json::json!([obsolete]).to_string())
+            .expect_err("provider model ids cannot select an Offering");
     }
 }

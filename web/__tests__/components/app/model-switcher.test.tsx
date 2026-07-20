@@ -19,14 +19,18 @@ describe("ModelSwitcher", () => {
         {
           id: "deepseek-v4-flash-anthropic",
           name: "deepseek-v4-flash-anthropic",
-          subtitle: "anthropic",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
         {
           id: "deepseek-v4-pro-official",
           name: "deepseek-v4-pro-official",
-          subtitle: "openai",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
       ],
     });
@@ -60,14 +64,18 @@ describe("ModelSwitcher", () => {
         {
           id: "deepseek-v4-flash-anthropic",
           name: "deepseek-v4-flash-anthropic",
-          subtitle: "anthropic",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
         {
           id: "deepseek-v4-pro-official",
           name: "deepseek-v4-pro-official",
-          subtitle: "openai",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
       ],
     });
@@ -101,14 +109,18 @@ describe("ModelSwitcher", () => {
         {
           id: "deepseek-v4-flash-anthropic",
           name: "deepseek-v4-flash-anthropic",
-          subtitle: "anthropic",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
         {
           id: "deepseek-v4-pro-official",
           name: "deepseek-v4-pro-official",
-          subtitle: "openai",
+          subtitle: "Self-hosted · Runs on server",
           tier: "included",
+          accessLabel: "Self-hosted",
+          executionPlacement: "server",
         },
       ],
     });
@@ -136,33 +148,25 @@ describe("ModelSwitcher", () => {
     );
   });
 
-  it("replaces the static web fallback with the first runtime model", async () => {
-    mockListModels.mockResolvedValue({
-      items: [
-        {
-          id: "deepseek-v4-flash-anthropic",
-          name: "deepseek-v4-flash-anthropic",
-          subtitle: "anthropic",
-          tier: "included",
-        },
-      ],
-    });
+  it("keeps selection unavailable when Model Access has no eligible Offering", async () => {
+    mockListModels.mockResolvedValue({ items: [] });
     const onChange = vi.fn();
+    const onModelAvailabilityChange = vi.fn();
 
     render(
       <ModelSwitcher
-        value="sonnet-4.6-adaptive"
+        value=""
         onChange={onChange}
+        onModelAvailabilityChange={onModelAvailabilityChange}
         thinking={false}
         onThinkingChange={vi.fn()}
       />,
     );
 
+    expect(await screen.findByText("No models available")).toBeVisible();
+    expect(onChange).not.toHaveBeenCalled();
     await waitFor(() =>
-      expect(onChange).toHaveBeenCalledWith("deepseek-v4-flash-anthropic"),
+      expect(onModelAvailabilityChange).toHaveBeenCalledWith(false),
     );
-    expect(
-      screen.getByRole("button", { name: /deepseek-v4-flash-anthropic/i }),
-    ).not.toHaveAttribute("aria-invalid");
   });
 });

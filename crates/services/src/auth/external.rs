@@ -149,7 +149,11 @@ pub struct ExternalCatalogModel {
 impl ExternalCatalogModel {
     fn into_model_list_item(self) -> ModelListItem {
         ModelListItem {
-            model_id: self.id,
+            offering_id: self.id,
+            access_id: "this-device".to_string(),
+            access_kind: crate::models::ModelAccessKind::ThisDevice,
+            access_label: "This device".to_string(),
+            execution_placement: crate::models::ModelExecutionPlacement::Edge,
             name: self.display_name.unwrap_or(self.name),
             provider: self.provider_ref.unwrap_or_default(),
             description: string_value(&self.metadata, "description"),
@@ -1297,7 +1301,15 @@ mod tests {
             .expect("list_catalog should parse MOI catalog");
         assert_eq!(catalog.models[0].id, "model-qwen");
         let model = ModelListItem::from(catalog.models.into_iter().next().unwrap());
-        assert_eq!(model.model_id, "model-qwen");
+        assert_eq!(model.offering_id, "model-qwen");
+        assert_eq!(
+            model.access_kind,
+            crate::models::ModelAccessKind::ThisDevice
+        );
+        assert_eq!(
+            model.execution_placement,
+            crate::models::ModelExecutionPlacement::Edge
+        );
         assert_eq!(model.name, "Qwen 2.5");
 
         let runtime_context = client

@@ -51,12 +51,16 @@ const deepseekModels = [
     name: "deepseek-v4-flash-anthropic",
     subtitle: "anthropic",
     tier: "included" as const,
+    accessLabel: "Self-hosted",
+    executionPlacement: "server" as const,
   },
   {
     id: "deepseek-v4-pro-official",
     name: "deepseek-v4-pro-official",
     subtitle: "openai",
     tier: "included" as const,
+    accessLabel: "Self-hosted",
+    executionPlacement: "server" as const,
   },
 ];
 

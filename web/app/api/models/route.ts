@@ -16,35 +16,32 @@ function formatTokens(tokens?: number) {
 }
 
 function formatThinking(value: RuntimeModelListItem["thinking_capability"]) {
-  if (!value) {
-    return null;
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  const kind = value.kind;
-  return typeof kind === "string" ? kind : "thinking";
+  return value;
 }
 
 function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
-  const id = model.model_id;
-  if (!id) {
+  const id = model.offering_id;
+  const name = model.name.trim();
+  if (!id || !name) {
     return null;
   }
 
   const parts = [
-    model.provider,
+    model.access_label,
+    model.execution_placement === "edge" ? "Runs on this device" : "Runs on server",
     model.description,
-    model.architecture,
+    typeof model.architecture === "string" ? model.architecture : null,
     formatTokens(model.context_window),
     formatThinking(model.thinking_capability),
   ].filter((part): part is string => Boolean(part));
 
   return {
     id,
-    name: model.name ?? id,
-    subtitle: parts.length > 0 ? parts.join(" · ") : "Imported Astra model",
+    name,
+    subtitle: parts.join(" · "),
     tier: "included",
+    accessLabel: model.access_label,
+    executionPlacement: model.execution_placement,
   };
 }
 
@@ -54,20 +51,29 @@ export async function GET() {
       auth: "required",
       operation: "list runtime models",
     });
-    const items = (await runtime.sdk.listModels())
-      .filter((model) => model.is_active !== false)
+    const projection = await runtime.sdk.getModelAccess();
+    const items = projection.offerings
+      .filter((model) => model.is_active)
       .map(toModelSummary)
       .filter((model): model is ModelSummary => model !== null);
 
     if (items.length === 0) {
       return NextResponse.json({
         items: [],
+        accesses: projection.accesses,
+        observedAt: projection.observed_at,
         source: "astra",
         status: "unavailable",
-        action: "contact_admin",
+        actions: projection.accesses.flatMap((access) => access.actions),
       });
     }
-    return NextResponse.json({ items, source: "astra", status: "ready" });
+    return NextResponse.json({
+      items,
+      accesses: projection.accesses,
+      observedAt: projection.observed_at,
+      source: "astra",
+      status: "ready",
+    });
   } catch (error) {
     return NextResponse.json(
       {

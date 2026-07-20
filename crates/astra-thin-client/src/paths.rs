@@ -190,6 +190,7 @@ pub const AUTH_ME: &str = "/auth/me";
 pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
+pub const MODEL_ACCESS: &str = "/model-access";
 
 #[inline]
 pub fn model(name: &str) -> String {
@@ -582,6 +583,7 @@ mod tests {
     #[test]
     fn model_path() {
         assert_eq!(model("gpt-4"), "/models/gpt-4");
+        assert_eq!(MODEL_ACCESS, "/model-access");
     }
 
     #[test]
