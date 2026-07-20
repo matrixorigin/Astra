@@ -1475,6 +1475,22 @@ fn strip_internal_schema_extensions(value: &mut Value) {
                     }
                 }
             }
+            if let Some(per_action) = object
+                .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
+                .and_then(Value::as_object)
+            {
+                for (action, fields) in per_action {
+                    let fields = fields
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    if !fields.is_empty() {
+                        requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
+                    }
+                }
+            }
             if !requirements.is_empty() {
                 let contract = format!("Action contract: {}.", requirements.join("; "));
                 let description = object
@@ -10408,6 +10424,9 @@ mod tests {
                     "required": ["action"],
                     "allOf": [{"required": ["description"]}],
                     "x-astra-per-action-required": {"spawn": ["description"]},
+                    "x-astra-per-action-allowed": {
+                        "spawn": ["action", "description"]
+                    },
                     "x-astra-discovery-summary": "spawn needs description"
                 }
             }
@@ -10423,7 +10442,7 @@ mod tests {
         assert_eq!(schema["required"], json!(["action"]));
         assert_eq!(
             schema["description"],
-            "Action contract: spawn requires description."
+            "Action contract: spawn requires description; spawn accepts only action + description."
         );
     }
 
