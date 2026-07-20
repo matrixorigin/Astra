@@ -397,8 +397,9 @@ fn post_loop_memory_cleanup_permit_respects_limit() {
 fn session_only_post_loop_boundary_does_not_consume_run_owned_attribution() {
     let session_id = "server-run-selection-boundary";
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
-    astra_tools::memoria::MemoriaToolGateway::record_recall(
+    astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
         session_id,
+        "run-1",
         1,
         vec!["memory-1".to_string()],
     );

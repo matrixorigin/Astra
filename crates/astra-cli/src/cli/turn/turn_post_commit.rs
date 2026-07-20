@@ -58,10 +58,13 @@ pub(crate) fn prepare_turn_post_commit_job(
     csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
 ) -> TurnPostCommitJob {
-    let dropped = drop_unattributed_memory_recalls_at_turn_end(state.session_id.as_deref());
+    let producer_id = format!("cli-turn:{}", state.turn);
+    let dropped =
+        drop_unattributed_memory_recalls_at_turn_end(state.session_id.as_deref(), &producer_id);
     if dropped > 0 {
         tracing::debug!(
             session_id = ?state.session_id,
+            producer_id,
             dropped,
             "dropped unattributed memory recalls without changing their rank"
         );
@@ -546,8 +549,14 @@ mod tests {
         let mut state = SessionState::default();
         let session_id = "sess-memory-drain";
         state.session_id = Some(session_id.to_string());
-        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 1, vec!["m1".into()]);
+        state.turn = 1;
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            session_id,
+            "cli-turn:1",
+            1,
+            vec!["m1".into()],
+        );
         let api = test_api();
         let _job = prepare_turn_post_commit_job(
             &mut state,

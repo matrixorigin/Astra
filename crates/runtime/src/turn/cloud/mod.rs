@@ -28,7 +28,6 @@ pub mod compaction_engine;
 pub(crate) mod helpers;
 pub mod layers;
 pub mod memoria_compact;
-pub mod memory_orchestrator;
 pub mod session_end_governance;
 
 /// Re-export the pipeline entry point for callers throughout the runtime.

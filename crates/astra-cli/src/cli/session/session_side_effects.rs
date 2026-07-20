@@ -109,14 +109,25 @@ pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
     enqueue_ingestion_batch_without_runtime(std::slice::from_ref(event));
 }
 
-pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {
+pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(
+    session_id: Option<&str>,
+    producer_id: &str,
+) -> usize {
     let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
         return 0;
     };
+    if producer_id.trim().is_empty() {
+        return 0;
+    }
     // A completed turn is not proof that a surfaced memory helped. Successful
     // tool-result hooks already close causally adjacent recalls; anything left
     // here is unattributed and must be dropped without reinforcing its rank.
-    astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len()
+    astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
+        session_id,
+        producer_id,
+        None,
+    )
+    .len()
 }
 
 #[derive(Clone)]
@@ -493,16 +504,28 @@ mod tests {
     #[test]
     fn turn_end_drops_unattributed_recalls_without_sending_positive_feedback() {
         let session_id = "chat-turn-close-feedback";
-        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 4, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            session_id,
+            "cli-turn:4",
+            4,
+            vec!["m1".into()],
+        );
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+            session_id,
+            "concurrent-run",
+            4,
+            vec!["m2".into()],
+        );
 
-        let dropped = drop_unattributed_memory_recalls_at_turn_end(Some(session_id));
+        let dropped = drop_unattributed_memory_recalls_at_turn_end(Some(session_id), "cli-turn:4");
 
         assert_eq!(dropped, 1);
         assert_eq!(
             astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
-            0
+            1
         );
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
     }
 
     #[test]

@@ -2303,7 +2303,7 @@ mod tests {
             None,
             None,
         );
-        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(&session_id);
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
             "run-1",

@@ -2365,8 +2365,9 @@ mod context_cache_contract_tests {
     fn bridge_context_carries_the_latest_resource_selection_only_with_its_tool() {
         let session_id = "bridge-resource-selection";
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall(
+        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            "bridge-turn",
             3,
             vec!["memory-1".to_string(), "memory-2".to_string()],
         );

@@ -268,15 +268,8 @@ pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
         let _ = hub.end_session(session_id);
     }
     if let Some(sid) = state.session_id.as_deref() {
-        let dropped =
-            super::session_side_effects::drop_unattributed_memory_recalls_at_turn_end(Some(sid));
-        if dropped > 0 {
-            tracing::debug!(
-                session_id = %sid,
-                dropped,
-                "dropped unattributed memory recalls during session cleanup"
-            );
-        }
+        // This is the actual session boundary, so the canonical reset owns all
+        // remaining producer state. Per-turn cleanup must stay producer-scoped.
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
     clear_panic_guard();
