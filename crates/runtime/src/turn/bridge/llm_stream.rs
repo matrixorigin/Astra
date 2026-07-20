@@ -1,9 +1,9 @@
-//! LLM streaming call with retry logic, rate-limit cooldown, and idle-timeout fallback.
+//! LLM streaming call with delivery-aware retry logic and rate-limit cooldown.
 //!
 //! This module encapsulates the HTTP streaming call to the LLM provider, including:
 //! - SSE chunk parsing and forwarding (text_delta, reasoning_delta, tool_call_start, usage)
-//! - Idle-timeout detection with automatic non-stream fallback
-//! - Retry with exponential backoff for transient errors (429, 5xx, network)
+//! - Typed idle/transport terminals that never hide a second inference request
+//! - Retry with exponential backoff only for known failures (429, 5xx, connect)
 //! - Per-model rate-limit cooldown tracking
 //! - Degraded tool-call recovery from XML-like text content
 
@@ -17,16 +17,17 @@ use uuid::Uuid;
 
 use crate::turn::bridge::sse_helpers::render_sse;
 use crate::turn::llm::client::{
-    LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, apply_llm_header_overrides,
-    apply_provider_auth, build_provider_request_body_with_overrides, llm_request_url,
-    llm_retry_base_ms, parse_openai_sse_json_stream, provider_uses_anthropic_messages,
+    LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, ProviderAttemptObserver,
+    apply_llm_header_overrides, apply_provider_auth, build_provider_request_body_with_overrides,
+    classify_provider_send_error, finish_observed_provider_attempt, finish_observed_provider_error,
+    llm_request_url, llm_retry_base_ms, parse_openai_sse_json_stream,
+    provider_attempt_terminal_from_result, provider_uses_anthropic_messages,
     provider_uses_bedrock_converse, sleep_ms_or_llm_cancel, split_think_chunks,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
-use astra_turn_core::edge_ledger::ensure_tool_call_ids;
 use futures_util::StreamExt;
 use std::sync::OnceLock;
 
@@ -94,32 +95,6 @@ pub(crate) fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Optio
     Some(event)
 }
 
-fn streamed_suffix(already_streamed: &str, recovered_full: &str) -> Option<String> {
-    if recovered_full.is_empty() {
-        None
-    } else if already_streamed.is_empty() {
-        Some(recovered_full.to_string())
-    } else {
-        recovered_full
-            .strip_prefix(already_streamed)
-            .filter(|suffix| !suffix.is_empty())
-            .map(ToString::to_string)
-    }
-}
-
-fn tool_call_start_already_emitted(
-    existing_tool_calls: &std::collections::HashMap<usize, Map<String, Value>>,
-    index: usize,
-) -> bool {
-    existing_tool_calls
-        .get(&index)
-        .and_then(|tc| tc.get("function"))
-        .and_then(Value::as_object)
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-        .is_some_and(|name| !name.is_empty())
-}
-
 /// Per-model rate-limit cooldown tracker (global singleton).
 pub(crate) fn rate_limit_cooldown() -> &'static PerModelCooldown {
     static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
@@ -133,21 +108,66 @@ fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
     }
 }
 
-/// Build the canonical `usage` SSE event JSON from an `LlmCallResult::usage`
-/// map (which uses our canonical keys). Returns `None` when the map is empty.
-fn usage_sse_event_from_result_map(m: &Map<String, Value>) -> Option<Value> {
-    if m.is_empty() {
-        return None;
+type SharedAttemptObserver = Arc<dyn ProviderAttemptObserver>;
+
+fn bridge_stream_error(
+    kind: astra_core::ErrorKind,
+    message: impl Into<String>,
+) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(kind, message)
+}
+
+fn bridge_cancelled_error() -> astra_core::ClassifiedError {
+    bridge_stream_error(
+        astra_core::ErrorKind::Cancelled,
+        "LLM stream cancelled by client disconnect",
+    )
+}
+
+fn bridge_delivery_unknown_error(message: impl Into<String>) -> astra_core::ClassifiedError {
+    bridge_stream_error(astra_core::ErrorKind::StreamTransport, message)
+}
+
+async fn begin_observed_attempt(
+    observer: Option<&SharedAttemptObserver>,
+) -> Result<Option<u32>, astra_core::ClassifiedError> {
+    match observer {
+        Some(observer) => observer.begin_attempt().await.map(Some),
+        None => Ok(None),
     }
-    let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(m);
-    Some(json!({
-        "type": "usage",
-        "input_tokens": u.input_tokens,
-        "cached_input_tokens": u.cached_input_tokens,
-        "cache_creation_tokens": u.cache_creation_tokens,
-        "output_tokens": u.output_tokens,
-        "total_tokens": u.total_tokens(),
-    }))
+}
+
+async fn finish_stream_success(
+    observer: Option<&SharedAttemptObserver>,
+    attempt_index: Option<u32>,
+    result: &crate::turn::llm::client::LlmCallResult,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_attempt(
+        observer.map(AsRef::as_ref),
+        attempt_index,
+        &provider_attempt_terminal_from_result(result),
+    )
+    .await
+}
+
+async fn finish_stream_error(
+    observer: Option<&SharedAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_error(observer.map(AsRef::as_ref), attempt_index, error).await
+}
+
+fn classified_stream_error_event(error: &astra_core::ClassifiedError, code: &str) -> Bytes {
+    // Once a streaming response exists, delivery may already have happened.
+    // The current invocation must never invite an automatic reissue. Explicit
+    // HTTP/provider rejections are handled before this streaming boundary.
+    let mut event = crate::build_stream_error_event(&error.message, code, false);
+    event.insert(
+        "error_kind".to_string(),
+        Value::String(error.kind.as_str().to_string()),
+    );
+    render_sse(&Value::Object(event))
 }
 
 fn turn_timeout_s() -> f64 {
@@ -222,7 +242,8 @@ fn classify_non_success_and_record_cooldown(
 /// - HTTP 429 → `record_429` on the cooldown tracker + retry with backoff.
 /// - HTTP 5xx → record via `record_529` for overload (529 / 503) or plain
 ///   retry otherwise, bounded by `LLM_MAX_RETRIES`.
-/// - Network errors → retry with exponential backoff.
+/// - Connect failures known to precede delivery → retry with exponential backoff.
+/// - Other send/stream failures → terminalize as delivery-unknown without reissue.
 /// - On the first 2xx response, hand the body to
 ///   [`bedrock_transport::bedrock_stream_response_bytes`] and return the
 ///   canonical internal SSE stream.
@@ -230,7 +251,11 @@ async fn bedrock_stream_with_retry(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    attempt_observer: Option<SharedAttemptObserver>,
+) -> Result<
+    Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>,
+    astra_core::ClassifiedError,
+> {
     let LlmCall {
         purpose,
         messages,
@@ -278,19 +303,37 @@ async fn bedrock_stream_with_retry(
     let total_budget = crate::turn::llm::client::llm_total_budget();
     let started = std::time::Instant::now();
     let mut last_err = String::new();
+    let mut last_kind = astra_core::ErrorKind::Unknown;
 
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 && started.elapsed() > total_budget {
-            return Err(format!(
-                "bedrock stream total budget exhausted ({:.0}s): {last_err}",
-                total_budget.as_secs_f64()
+            return Err(bridge_stream_error(
+                astra_core::ErrorKind::BudgetExhausted,
+                format!(
+                    "bedrock stream total budget exhausted ({:.0}s): {last_err}",
+                    total_budget.as_secs_f64()
+                ),
             ));
         }
         if attempt > 0 {
             let delay = bridge_retry_backoff_ms(attempt);
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
-                .await
-                .map_err(|e| e.to_string())?;
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
+        }
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(bridge_cancelled_error());
+        }
+
+        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            let error = bridge_cancelled_error();
+            finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+            return Err(error);
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -323,12 +366,19 @@ async fn bedrock_stream_with_retry(
         let response = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                last_err = format!("bedrock converse-stream send failed: {e}");
-                astra_core::agent_warn!(
-                    "llm",
-                    "bedrock network retry: attempt={attempt} model={model_name} err={e}"
-                );
-                continue;
+                let (error, retry_safe) =
+                    classify_provider_send_error("bedrock converse-stream send failed", &e);
+                finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+                last_err = error.message.clone();
+                last_kind = error.kind;
+                if retry_safe {
+                    astra_core::agent_warn!(
+                        "llm",
+                        "bedrock connect retry: attempt={attempt} model={model_name} err={e}"
+                    );
+                    continue;
+                }
+                return Err(error);
             }
         };
 
@@ -343,6 +393,8 @@ async fn bedrock_stream_with_retry(
                     request_started,
                     client_cancel,
                     idle,
+                    attempt_observer,
+                    observed_attempt,
                 ),
             ));
         }
@@ -357,6 +409,21 @@ async fn bedrock_stream_with_retry(
             .await
             .unwrap_or_else(|e| format!("<body read error: {e}>"));
         last_err = format!("bedrock converse-stream HTTP {status}: {text}");
+        last_kind = if is_rate_limit_status(status) {
+            astra_core::ErrorKind::RateLimit
+        } else if is_overload_status(status) || status >= 500 {
+            astra_core::ErrorKind::ServerError
+        } else if status == 401 || status == 403 {
+            astra_core::ErrorKind::Auth
+        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
+            astra_core::ErrorKind::ContextWindow
+        } else if status == 400 {
+            astra_core::ErrorKind::InvalidRequest
+        } else {
+            astra_core::ErrorKind::Unknown
+        };
+        let observed_error = bridge_stream_error(last_kind, last_err.clone());
+        finish_stream_error(attempt_observer.as_ref(), observed_attempt, &observed_error).await?;
 
         match classify_non_success_and_record_cooldown(
             status,
@@ -368,18 +435,17 @@ async fn bedrock_stream_with_retry(
         ) {
             RetryDecision::Retry { delay_ms } => {
                 if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
             }
-            RetryDecision::Terminal => return Err(last_err),
+            RetryDecision::Terminal => return Err(observed_error),
         }
     }
 
-    Err(format!(
-        "bedrock stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"
+    Err(bridge_stream_error(
+        last_kind,
+        format!("bedrock stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"),
     ))
 }
 
@@ -410,7 +476,11 @@ async fn anthropic_stream_with_retry(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    attempt_observer: Option<SharedAttemptObserver>,
+) -> Result<
+    Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>,
+    astra_core::ClassifiedError,
+> {
     let LlmCall {
         purpose,
         messages,
@@ -458,19 +528,37 @@ async fn anthropic_stream_with_retry(
     let total_budget = crate::turn::llm::client::llm_total_budget();
     let started = std::time::Instant::now();
     let mut last_err = String::new();
+    let mut last_kind = astra_core::ErrorKind::Unknown;
 
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 && started.elapsed() > total_budget {
-            return Err(format!(
-                "anthropic stream total budget exhausted ({:.0}s): {last_err}",
-                total_budget.as_secs_f64()
+            return Err(bridge_stream_error(
+                astra_core::ErrorKind::BudgetExhausted,
+                format!(
+                    "anthropic stream total budget exhausted ({:.0}s): {last_err}",
+                    total_budget.as_secs_f64()
+                ),
             ));
         }
         if attempt > 0 {
             let delay = bridge_retry_backoff_ms(attempt);
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
-                .await
-                .map_err(|e| e.to_string())?;
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
+        }
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(bridge_cancelled_error());
+        }
+
+        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            let error = bridge_cancelled_error();
+            finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+            return Err(error);
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -491,8 +579,15 @@ async fn anthropic_stream_with_retry(
         let response = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                last_err = format!("anthropic stream send failed: {e}");
-                continue;
+                let (error, retry_safe) =
+                    classify_provider_send_error("anthropic stream send failed", &e);
+                finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+                last_err = error.message.clone();
+                last_kind = error.kind;
+                if retry_safe {
+                    continue;
+                }
+                return Err(error);
             }
         };
 
@@ -503,22 +598,10 @@ async fn anthropic_stream_with_retry(
             let idle_pre = crate::turn::llm::client::stream_idle_timeout();
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
             let cc = client_cancel.clone();
-            let client_for_fallback = client.clone();
-            let messages_for_fallback: Arc<[Value]> = Arc::from(messages);
-            let tools_for_fallback: Arc<[Value]> = Arc::from(tools);
-            let model_for_fallback = model_name.to_string();
-            let wire_model_for_fallback = wire_model_name.map(str::to_string);
-            let api_key_for_fallback = api_key.to_string();
-            let base_url_for_fallback = base_url.to_string();
-            let provider_for_fallback = provider.to_string();
-            let header_overrides_for_fallback = header_overrides.cloned();
-            let max_out_for_fallback = max_output_tokens;
-            let request_body_overrides_for_fallback = request_body_overrides.cloned();
-            let completions_url_override_for_fallback =
-                completions_url_override.map(str::to_string);
-            let request_timeout_for_fallback = request_timeout;
-            let thinking_for_fallback = thinking.clone();
+            let model_name_for_summary = model_name.to_string();
+            let attempt_observer_for_stream = attempt_observer.clone();
             let out = stream! {
+                let mut streaming_attempt = observed_attempt;
                 let sse = parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
                 // Accumulate state for the final `_inprocess_summary` event.
@@ -528,8 +611,10 @@ async fn anthropic_stream_with_retry(
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
+                let mut provider_response_id: Option<String> = None;
                 let mut made_progress = false;
                 let mut had_terminal_error = false;
+                let mut saw_terminal = false;
 
                 loop {
                     let idle = if made_progress { idle_post } else { idle_pre };
@@ -540,7 +625,25 @@ async fn anthropic_stream_with_retry(
                                 "llm",
                                 "anthropic SSE cancelled (client disconnect)"
                             );
-                            break;
+                            let error = bridge_delivery_unknown_error(
+                                "Anthropic stream delivery became unknown after client disconnect",
+                            );
+                            if let Err(ledger_error) = finish_stream_error(
+                                attempt_observer_for_stream.as_ref(),
+                                streaming_attempt.take(),
+                                &error,
+                            ).await {
+                                yield classified_stream_error_event(
+                                    &ledger_error,
+                                    "inference_ledger",
+                                );
+                                return;
+                            }
+                            yield classified_stream_error_event(
+                                &error,
+                                "client_disconnect",
+                            );
+                            return;
                         }
                         tick = tokio::time::timeout(idle, sse.next()) => {
                             let Ok(next) = tick else {
@@ -550,215 +653,70 @@ async fn anthropic_stream_with_retry(
                                     idle.as_millis(),
                                     made_progress,
                                 );
-                                if made_progress {
-                                    let streamed_text = full_text.clone();
-                                    let streamed_reasoning = reasoning.clone();
-                                    let existing_tool_calls = tool_calls_map.clone();
-                                    let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
-                                    match crate::turn::llm::client::call_llm_nonstream(
-                                        &client_for_fallback,
-                                        LlmCall {
-                                            purpose,
-                                            messages: &messages_for_fallback,
-                                            tools: &tools_for_fallback,
-                                            route: LlmExecutionRoute {
-                                                model_name: &model_for_fallback,
-                                                wire_model_name: wire_model_for_fallback.as_deref(),
-                                                api_key: &api_key_for_fallback,
-                                                base_url: &base_url_for_fallback,
-                                                provider: &provider_for_fallback,
-                                                header_overrides: header_overrides_for_fallback.as_ref(),
-                                                request_body_overrides: request_body_overrides_for_fallback.as_ref(),
-                                                completions_url_override: completions_url_override_for_fallback.as_deref(),
-                                                request_timeout: request_timeout_for_fallback,
-                                            },
-                                            max_output_tokens: max_out_for_fallback,
-                                            temperature,
-                                            has_fallback,
-                                            thinking: &thinking_for_fallback,
-                                        },
-                                        fb_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut result) => {
-                                            ensure_tool_call_ids(&mut result.tool_calls);
-                                            full_text = result.full_text.clone();
-                                            reasoning = result.reasoning.clone();
-                                            if !result.reasoning_signature.is_empty() {
-                                                reasoning_signature = result.reasoning_signature.clone();
-                                            }
-                                            usage = result.usage.clone();
-                                            tool_calls_map.clear();
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if let Value::Object(m) = tc {
-                                                    tool_calls_map.insert(i, m.clone());
-                                                }
-                                            }
-                                            if result.tool_calls.is_empty()
-                                                && let Some(suffix) =
-                                                    streamed_suffix(&streamed_text, &result.full_text)
-                                            {
-                                                yield render_sse(&json!({"type":"text_delta","content": suffix}));
-                                            }
-                                            if let Some(suffix) =
-                                                streamed_suffix(&streamed_reasoning, &result.reasoning)
-                                            {
-                                                yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
-                                            }
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if tool_call_start_already_emitted(&existing_tool_calls, i) {
-                                                    continue;
-                                                }
-                                                if let Some(obj) = tc.as_object() {
-                                                    let mut tc = obj.clone();
-                                                    if let Some(event) = tool_call_start_event(&mut tc) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            }
-                                            if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
-                                                yield render_sse(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            had_terminal_error = true;
-                                            yield render_sse(&Value::Object(
-                                                crate::build_stream_error_event(
-                                                    &format!("anthropic stream stalled; non-stream recovery failed: {e}"),
-                                                    "stream_transport",
-                                                    true,
-                                                ),
-                                            ));
-                                            tool_calls_map.clear();
-                                            full_text.clear();
-                                            reasoning.clear();
-                                            reasoning_signature.clear();
-                                        }
-                                    }
-                                } else {
-                                    had_terminal_error = true;
-                                    yield render_sse(&Value::Object(
-                                        crate::build_stream_error_event(
-                                            "anthropic SSE idle before any response data",
-                                            "stream_idle",
-                                            true,
-                                        ),
-                                    ));
+                                let stream_error = bridge_stream_error(
+                                    astra_core::ErrorKind::StreamIdle,
+                                    format!("anthropic SSE idle after {}ms", idle.as_millis()),
+                                );
+                                if let Err(ledger_error) = finish_stream_error(
+                                    attempt_observer_for_stream.as_ref(),
+                                    streaming_attempt.take(),
+                                    &stream_error,
+                                ).await {
+                                    yield classified_stream_error_event(
+                                        &ledger_error,
+                                        "inference_ledger",
+                                    );
+                                    return;
                                 }
+                                had_terminal_error = true;
+                                yield classified_stream_error_event(
+                                    &stream_error,
+                                    "stream_idle",
+                                );
                                 break;
                             };
                             let Some(chunk) = next else { break };
                             let chunk = match chunk {
-                                Ok(v) => v,
+                                Ok(crate::turn::llm::client::ParsedSseEvent::Done) => {
+                                    saw_terminal = true;
+                                    break;
+                                }
+                                Ok(crate::turn::llm::client::ParsedSseEvent::Data(v)) => v,
                                 Err(e) => {
-                                    if made_progress {
-                                        astra_core::agent_warn!(
-                                            "llm",
-                                            "anthropic SSE transport error after progress: {e} — attempting non-stream fallback"
+                                    let stream_error = bridge_delivery_unknown_error(format!(
+                                        "anthropic SSE transport error: {e}"
+                                    ));
+                                    if let Err(ledger_error) = finish_stream_error(
+                                        attempt_observer_for_stream.as_ref(),
+                                        streaming_attempt.take(),
+                                        &stream_error,
+                                    ).await {
+                                        yield classified_stream_error_event(
+                                            &ledger_error,
+                                            "inference_ledger",
                                         );
-                                        let streamed_text = full_text.clone();
-                                        let streamed_reasoning = reasoning.clone();
-                                        let existing_tool_calls = tool_calls_map.clone();
-                                        let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
-                                        match crate::turn::llm::client::call_llm_nonstream(
-                                            &client_for_fallback,
-                                            LlmCall {
-                                                purpose,
-                                                messages: &messages_for_fallback,
-                                                tools: &tools_for_fallback,
-                                                route: LlmExecutionRoute {
-                                                    model_name: &model_for_fallback,
-                                                    wire_model_name: wire_model_for_fallback.as_deref(),
-                                                    api_key: &api_key_for_fallback,
-                                                    base_url: &base_url_for_fallback,
-                                                    provider: &provider_for_fallback,
-                                                    header_overrides: header_overrides_for_fallback.as_ref(),
-                                                    request_body_overrides: request_body_overrides_for_fallback.as_ref(),
-                                                    completions_url_override: completions_url_override_for_fallback.as_deref(),
-                                                    request_timeout: request_timeout_for_fallback,
-                                                },
-                                                max_output_tokens: max_out_for_fallback,
-                                                temperature,
-                                                has_fallback,
-                                                thinking: &thinking_for_fallback,
-                                            },
-                                            fb_timeout,
-                                        )
-                                        .await
-                                        {
-                                            Ok(mut result) => {
-                                                ensure_tool_call_ids(&mut result.tool_calls);
-                                                full_text = result.full_text.clone();
-                                                reasoning = result.reasoning.clone();
-                                                if !result.reasoning_signature.is_empty() {
-                                                    reasoning_signature = result.reasoning_signature.clone();
-                                                }
-                                                usage = result.usage.clone();
-                                                tool_calls_map.clear();
-                                                for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                    if let Value::Object(m) = tc {
-                                                        tool_calls_map.insert(i, m.clone());
-                                                    }
-                                                }
-                                                if result.tool_calls.is_empty()
-                                                    && let Some(suffix) =
-                                                        streamed_suffix(&streamed_text, &result.full_text)
-                                                {
-                                                    yield render_sse(&json!({"type":"text_delta","content": suffix}));
-                                                }
-                                                if let Some(suffix) =
-                                                    streamed_suffix(&streamed_reasoning, &result.reasoning)
-                                                {
-                                                    yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
-                                                }
-                                                for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                    if tool_call_start_already_emitted(&existing_tool_calls, i) {
-                                                        continue;
-                                                    }
-                                                    if let Some(obj) = tc.as_object() {
-                                                        let mut tc = obj.clone();
-                                                        if let Some(event) = tool_call_start_event(&mut tc) {
-                                                            yield render_sse(&event);
-                                                        }
-                                                    }
-                                                }
-                                                if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
-                                                    yield render_sse(&event);
-                                                }
-                                            }
-                                            Err(error) => {
-                                                had_terminal_error = true;
-                                                yield render_sse(&Value::Object(
-                                                    crate::build_stream_error_event(
-                                                        &format!("anthropic stream transport failed; non-stream recovery failed: {error}"),
-                                                        "stream_transport",
-                                                        true,
-                                                    ),
-                                                ));
-                                                tool_calls_map.clear();
-                                                full_text.clear();
-                                                reasoning.clear();
-                                                reasoning_signature.clear();
-                                            }
-                                        }
-                                    } else {
-                                        had_terminal_error = true;
-                                        yield render_sse(&Value::Object(
-                                            crate::build_stream_error_event(
-                                                &format!("anthropic SSE transport error: {e}"),
-                                                "stream_transport",
-                                                true,
-                                            ),
-                                        ));
-                                        tool_calls_map.clear();
-                                        full_text.clear();
-                                        reasoning.clear();
-                                        reasoning_signature.clear();
+                                        return;
                                     }
+                                    had_terminal_error = true;
+                                    yield classified_stream_error_event(
+                                        &stream_error,
+                                        "stream_transport",
+                                    );
                                     break;
                                 }
                             };
+                            if provider_response_id.is_none() {
+                                provider_response_id = chunk
+                                    .pointer("/message/id")
+                                    .or_else(|| chunk.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string);
+                            }
+                            let message_stopped =
+                                chunk.get("type").and_then(Value::as_str) == Some("message_stop");
+                            if message_stopped {
+                                saw_terminal = true;
+                            }
                             for emitted in apply_anthropic_event(
                                 &chunk,
                                 &mut full_text,
@@ -770,11 +728,35 @@ async fn anthropic_stream_with_retry(
                             ) {
                                 yield emitted;
                             }
+                            if message_stopped {
+                                break;
+                            }
                         }
                     }
                 }
 
                 if had_terminal_error {
+                    return;
+                }
+                if !saw_terminal {
+                    let error = bridge_delivery_unknown_error(
+                        "Anthropic SSE ended without message_stop",
+                    );
+                    if let Err(ledger_error) = finish_stream_error(
+                        attempt_observer_for_stream.as_ref(),
+                        streaming_attempt.take(),
+                        &error,
+                    ).await {
+                        yield classified_stream_error_event(
+                            &ledger_error,
+                            "inference_ledger",
+                        );
+                        return;
+                    }
+                    yield classified_stream_error_event(
+                        &error,
+                        "stream_transport",
+                    );
                     return;
                 }
 
@@ -783,13 +765,36 @@ async fn anthropic_stream_with_retry(
                     entries.sort_by_key(|(i, _)| *i);
                     entries.into_iter().map(|(_, m)| Value::Object(m)).collect()
                 };
+                let result = crate::turn::llm::client::LlmCallResult {
+                    response_id: provider_response_id,
+                    full_text,
+                    reasoning,
+                    reasoning_signature,
+                    tool_calls,
+                    usage,
+                    model_used: model_name_for_summary,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    finish_reason: None,
+                };
+                if let Err(ledger_error) = finish_stream_success(
+                    attempt_observer_for_stream.as_ref(),
+                    streaming_attempt.take(),
+                    &result,
+                ).await {
+                    yield classified_stream_error_event(
+                        &ledger_error,
+                        "inference_ledger",
+                    );
+                    return;
+                }
                 yield render_sse(&json!({
                     "type": "_inprocess_summary",
-                    "full_text": full_text,
-                    "reasoning": reasoning,
-                    "reasoning_signature": reasoning_signature,
-                    "tool_calls": tool_calls,
-                    "usage": Value::Object(usage),
+                    "full_text": result.full_text,
+                    "reasoning": result.reasoning,
+                    "reasoning_signature": result.reasoning_signature,
+                    "tool_calls": result.tool_calls,
+                    "usage": Value::Object(result.usage),
+                    "provider_response_id": result.response_id,
                 }));
             };
             return Ok(Box::pin(out));
@@ -805,6 +810,21 @@ async fn anthropic_stream_with_retry(
             .await
             .unwrap_or_else(|e| format!("<body read error: {e}>"));
         last_err = format!("anthropic stream HTTP {status}: {text}");
+        last_kind = if is_rate_limit_status(status) {
+            astra_core::ErrorKind::RateLimit
+        } else if is_overload_status(status) || status >= 500 {
+            astra_core::ErrorKind::ServerError
+        } else if status == 401 || status == 403 {
+            astra_core::ErrorKind::Auth
+        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
+            astra_core::ErrorKind::ContextWindow
+        } else if status == 400 {
+            astra_core::ErrorKind::InvalidRequest
+        } else {
+            astra_core::ErrorKind::Unknown
+        };
+        let observed_error = bridge_stream_error(last_kind, last_err.clone());
+        finish_stream_error(attempt_observer.as_ref(), observed_attempt, &observed_error).await?;
 
         match classify_non_success_and_record_cooldown(
             status,
@@ -816,17 +836,16 @@ async fn anthropic_stream_with_retry(
         ) {
             RetryDecision::Retry { delay_ms } => {
                 if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
             }
-            RetryDecision::Terminal => return Err(last_err),
+            RetryDecision::Terminal => return Err(observed_error),
         }
     }
-    Err(format!(
-        "anthropic stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"
+    Err(bridge_stream_error(
+        last_kind,
+        format!("anthropic stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"),
     ))
 }
 
@@ -1016,9 +1035,9 @@ fn apply_anthropic_event(
 /// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
 ///
-/// **Stream resilience (same as [`super::llm::client::call_llm_and_collect`])**:
-/// per-chunk idle watchdog on parsed SSE; if the provider stops sending, partial state is
-/// discarded and a **single non-stream** `/chat/completions` request attempts recovery.
+/// Per-chunk idle and transport failures preserve partial evidence, end the
+/// physical attempt as `delivery_unknown`, and never issue a hidden recovery
+/// request.
 ///
 /// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
 /// with exponential backoff.
@@ -1026,11 +1045,14 @@ fn apply_anthropic_event(
 /// **Note**: Caller must check rate-limit cooldown state and handle fallback model
 /// resolution BEFORE calling this function. This function only handles retries for
 /// transient errors within a single model.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn call_llm_stream(
+pub(crate) async fn call_llm_stream_with_attempt_observer(
     call: LlmCall<'_>,
     client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    attempt_observer: Option<SharedAttemptObserver>,
+) -> Result<
+    Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>,
+    astra_core::ClassifiedError,
+> {
     let LlmCall {
         purpose,
         messages,
@@ -1067,7 +1089,12 @@ pub(crate) async fn call_llm_stream(
         .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10));
     // Honour HTTPS_PROXY / https_proxy / ALL_PROXY env vars (same as global_llm_client).
     client_builder = crate::turn::llm::client::apply_env_proxy(client_builder);
-    let client = client_builder.build().map_err(|e| e.to_string())?;
+    let client = client_builder.build().map_err(|error| {
+        bridge_stream_error(
+            astra_core::ErrorKind::Network,
+            format!("failed to build LLM streaming client: {error}"),
+        )
+    })?;
 
     let messages =
         crate::turn::llm::client::consolidate_system_messages_for_provider(messages, provider);
@@ -1095,6 +1122,7 @@ pub(crate) async fn call_llm_stream(
                 thinking,
             },
             client_cancel,
+            attempt_observer,
         )
         .await;
     }
@@ -1122,6 +1150,7 @@ pub(crate) async fn call_llm_stream(
                 thinking,
             },
             client_cancel,
+            attempt_observer,
         )
         .await;
     }
@@ -1151,22 +1180,40 @@ pub(crate) async fn call_llm_stream(
     let total_budget = crate::turn::llm::client::llm_total_budget();
     let started = std::time::Instant::now();
 
-    // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
+    // Retry loop for known failures (429, 5xx, and connect-before-delivery).
     let mut last_err = String::new();
+    let mut last_kind = astra_core::ErrorKind::Unknown;
     for attempt in 0..=LLM_MAX_RETRIES {
         // Check total budget before each attempt
         if attempt > 0 && started.elapsed() > total_budget {
-            return Err(format!(
-                "LLM total budget exhausted ({:.0}s): {last_err}",
-                total_budget.as_secs_f64()
+            return Err(bridge_stream_error(
+                astra_core::ErrorKind::BudgetExhausted,
+                format!(
+                    "LLM total budget exhausted ({:.0}s): {last_err}",
+                    total_budget.as_secs_f64()
+                ),
             ));
         }
 
         if attempt > 0 {
             let delay = bridge_retry_backoff_ms(attempt);
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
-                .await
-                .map_err(|e| e.to_string())?;
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
+        }
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(bridge_cancelled_error());
+        }
+
+        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        if client_cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            let error = bridge_cancelled_error();
+            finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+            return Err(error);
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -1206,9 +1253,14 @@ pub(crate) async fn call_llm_stream(
                     model_name,
                     attempt,
                 );
-                last_err = format!("LLM request failed: {e}");
-                // Network errors are always retryable
-                continue;
+                let (error, retry_safe) = classify_provider_send_error("LLM request failed", &e);
+                finish_stream_error(attempt_observer.as_ref(), observed_attempt, &error).await?;
+                last_err = error.message.clone();
+                last_kind = error.kind;
+                if retry_safe {
+                    continue;
+                }
+                return Err(error);
             }
         };
 
@@ -1218,25 +1270,12 @@ pub(crate) async fn call_llm_stream(
             cooldown.with(model_key, |c| c.record_success());
             let byte_stream = response.bytes_stream();
             let model_name = model_name.to_string();
-            let wire_model_for_fallback = wire_model_name.map(str::to_string);
-
-            let client_for_fallback = client.clone();
-            let messages_for_fallback: Arc<[Value]> = Arc::from(messages.as_slice());
-            let tools_for_fallback: Arc<[Value]> = Arc::from(tools);
-            let api_key_for_fallback = api_key.to_string();
-            let base_url_for_fallback = base_url.to_string();
-            let provider_for_fallback = provider.to_string();
-            let header_overrides_for_fallback = header_overrides.cloned();
-            let request_body_overrides_for_fallback = request_body_overrides.cloned();
-            let completions_url_override_for_fallback =
-                completions_url_override.map(str::to_string);
-            let request_timeout_for_fallback = request_timeout;
-            let max_out_for_fallback = max_output_tokens;
-            let thinking_for_fallback = thinking.clone();
             let idle_pre = crate::turn::llm::client::stream_idle_timeout();
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
+            let attempt_observer_for_stream = attempt_observer.clone();
 
             let out = stream! {
+                let mut streaming_attempt = observed_attempt;
                 let cc = client_cancel.clone();
                 let mut full_text = String::new();
                 let mut reasoning = String::new();
@@ -1244,237 +1283,123 @@ pub(crate) async fn call_llm_stream(
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
+                let mut provider_response_id: Option<String> = None;
                 let mut made_progress = false;
                 let mut had_terminal_error = false;
+                let mut saw_terminal = false;
+                let mut finish_reason: Option<String> = None;
 
                 let sse = crate::turn::llm::client::parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
 
                 loop {
-                    let idle = if made_progress { idle_post } else { idle_pre };
+                    let ordinary_idle = if made_progress { idle_post } else { idle_pre };
+                    let idle = if saw_terminal {
+                        crate::turn::llm::client::stream_terminal_drain_timeout(ordinary_idle)
+                    } else {
+                        ordinary_idle
+                    };
                     tokio::select! {
                         biased;
                         _ = crate::turn::llm::client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                            if saw_terminal {
+                                break;
+                            }
                             astra_core::agent_warn!(
                                 "llm",
                                 "in-process LLM SSE cancelled (client disconnect)"
                             );
-                            tool_calls_map.clear();
-                            full_text.clear();
-                            reasoning.clear();
-                            break;
+                            let error = bridge_delivery_unknown_error(
+                                "LLM stream delivery became unknown after client disconnect",
+                            );
+                            if let Err(ledger_error) = finish_stream_error(
+                                attempt_observer_for_stream.as_ref(),
+                                streaming_attempt.take(),
+                                &error,
+                            ).await {
+                                yield classified_stream_error_event(
+                                    &ledger_error,
+                                    "inference_ledger",
+                                );
+                                return;
+                            }
+                            yield classified_stream_error_event(
+                                &error,
+                                "client_disconnect",
+                            );
+                            return;
                         }
                         tick = tokio::time::timeout(idle, sse.next()) => {
                             let next = tick;
                             let chunk = match next {
                                 Ok(c) => c,
                                 Err(_) => {
+                                    if saw_terminal {
+                                        break;
+                                    }
                                     astra_core::agent_warn!(
                                         "llm",
-                                        "in-process stream idle after {}ms (made_progress={}) — attempting non-stream fallback",
+                                        "in-process stream idle after {}ms (made_progress={})",
                                         idle.as_millis(),
                                         made_progress
                                     );
-                                    let streamed_text = full_text.clone();
-                                    let streamed_reasoning = reasoning.clone();
-                                    let existing_tool_calls = tool_calls_map.clone();
-                                    let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
-                                    match crate::turn::llm::client::call_llm_nonstream(
-                                        &client_for_fallback,
-                                        LlmCall {
-                                            purpose,
-                                            messages: &messages_for_fallback,
-                                            tools: &tools_for_fallback,
-                                            route: LlmExecutionRoute {
-                                                model_name: &model_name,
-                                                wire_model_name: wire_model_for_fallback.as_deref(),
-                                                api_key: &api_key_for_fallback,
-                                                base_url: &base_url_for_fallback,
-                                                provider: &provider_for_fallback,
-                                                header_overrides: header_overrides_for_fallback.as_ref(),
-                                                request_body_overrides: request_body_overrides_for_fallback.as_ref(),
-                                                completions_url_override: completions_url_override_for_fallback.as_deref(),
-                                                request_timeout: request_timeout_for_fallback,
-                                            },
-                                            max_output_tokens: max_out_for_fallback,
-                                            temperature,
-                                            has_fallback,
-                                            thinking: &thinking_for_fallback,
-                                        },
-                                        fb_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut result) => {
-                                            ensure_tool_call_ids(&mut result.tool_calls);
-                                            full_text = result.full_text.clone();
-                                            reasoning = result.reasoning.clone();
-                                            usage = result.usage.clone();
-                                            tool_calls_map.clear();
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if let Value::Object(m) = tc {
-                                                    tool_calls_map.insert(i, m.clone());
-                                                }
-                                            }
-                                            if result.tool_calls.is_empty()
-                                                && let Some(suffix) =
-                                                    streamed_suffix(&streamed_text, &result.full_text)
-                                            {
-                                                yield render_sse(
-                                                    &json!({"type":"text_delta","content": suffix}),
-                                                );
-                                            }
-                                            if let Some(suffix) =
-                                                streamed_suffix(&streamed_reasoning, &result.reasoning)
-                                            {
-                                                yield render_sse(
-                                                    &json!({"type":"reasoning_delta","content": suffix}),
-                                                );
-                                            }
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if tool_call_start_already_emitted(
-                                                    &existing_tool_calls,
-                                                    i,
-                                                ) {
-                                                    continue;
-                                                }
-                                                if let Some(obj) = tc.as_object() {
-                                                    let mut tc = obj.clone();
-                                                    if let Some(event) = tool_call_start_event(&mut tc)
-                                                    {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            }
-                                            if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
-                                                yield render_sse(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            had_terminal_error = true;
-                                            yield render_sse(&Value::Object(
-                                                crate::build_stream_error_event(
-                                                    &format!(
-                                                        "stream stalled; non-stream recovery failed: {e}"
-                                                    ),
-                                                    "stream_idle",
-                                                    true,
-                                                ),
-                                            ));
-                                            tool_calls_map.clear();
-                                            full_text.clear();
-                                            reasoning.clear();
-                                        }
+                                    let stream_error = bridge_stream_error(
+                                        astra_core::ErrorKind::StreamIdle,
+                                        format!("LLM stream idle after {}ms", idle.as_millis()),
+                                    );
+                                    if let Err(ledger_error) = finish_stream_error(
+                                        attempt_observer_for_stream.as_ref(),
+                                        streaming_attempt.take(),
+                                        &stream_error,
+                                    ).await {
+                                        yield classified_stream_error_event(
+                                            &ledger_error,
+                                            "inference_ledger",
+                                        );
+                                        return;
                                     }
+                                    had_terminal_error = true;
+                                    yield classified_stream_error_event(
+                                        &stream_error,
+                                        "stream_idle",
+                                    );
                                     break;
                                 }
                             };
                             let Some(item) = chunk else { break };
                             let chunk = match item {
-                                Ok(v) => v,
+                                Ok(crate::turn::llm::client::ParsedSseEvent::Done) => {
+                                    saw_terminal = true;
+                                    break;
+                                }
+                                Ok(crate::turn::llm::client::ParsedSseEvent::Data(v)) => v,
                                 Err(e) => {
-                                    if made_progress {
-                                        astra_core::agent_warn!(
-                                            "llm",
-                                            "in-process stream transport error after progress: {e} — attempting non-stream fallback"
-                                        );
-                                        let streamed_text = full_text.clone();
-                                        let streamed_reasoning = reasoning.clone();
-                                        let existing_tool_calls = tool_calls_map.clone();
-                                        let fb_timeout = crate::turn::llm::client::llm_nonstream_timeout();
-                                        match crate::turn::llm::client::call_llm_nonstream(
-                                            &client_for_fallback,
-                                            LlmCall {
-                                                purpose,
-                                                messages: &messages_for_fallback,
-                                                tools: &tools_for_fallback,
-                                                route: LlmExecutionRoute {
-                                                    model_name: &model_name,
-                                                    wire_model_name: wire_model_for_fallback.as_deref(),
-                                                    api_key: &api_key_for_fallback,
-                                                    base_url: &base_url_for_fallback,
-                                                    provider: &provider_for_fallback,
-                                                    header_overrides: header_overrides_for_fallback.as_ref(),
-                                                    request_body_overrides: request_body_overrides_for_fallback.as_ref(),
-                                                    completions_url_override: completions_url_override_for_fallback.as_deref(),
-                                                    request_timeout: request_timeout_for_fallback,
-                                                },
-                                                max_output_tokens: max_out_for_fallback,
-                                                temperature,
-                                                has_fallback,
-                                                thinking: &thinking_for_fallback,
-                                            },
-                                            fb_timeout,
-                                        )
-                                        .await
-                                        {
-                                            Ok(mut result) => {
-                                                ensure_tool_call_ids(&mut result.tool_calls);
-                                                full_text = result.full_text.clone();
-                                                reasoning = result.reasoning.clone();
-                                                usage = result.usage.clone();
-                                                tool_calls_map.clear();
-                                                for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                    if let Value::Object(m) = tc {
-                                                        tool_calls_map.insert(i, m.clone());
-                                                    }
-                                                }
-                                                if result.tool_calls.is_empty()
-                                                    && let Some(suffix) = streamed_suffix(&streamed_text, &result.full_text)
-                                                {
-                                                    yield render_sse(&json!({"type":"text_delta","content": suffix}));
-                                                }
-                                                if let Some(suffix) = streamed_suffix(&streamed_reasoning, &result.reasoning) {
-                                                    yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
-                                                }
-                                                for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                    if tool_call_start_already_emitted(&existing_tool_calls, i) {
-                                                        continue;
-                                                    }
-                                                    if let Some(obj) = tc.as_object() {
-                                                        let mut tc = obj.clone();
-                                                        if let Some(event) = tool_call_start_event(&mut tc) {
-                                                            yield render_sse(&event);
-                                                        }
-                                                    }
-                                                }
-                                                if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
-                                                    yield render_sse(&event);
-                                                }
-                                            }
-                                            Err(error) => {
-                                                had_terminal_error = true;
-                                                yield render_sse(&Value::Object(
-                                                    crate::build_stream_error_event(
-                                                        &format!(
-                                                            "stream transport failed; non-stream recovery failed: {error}"
-                                                        ),
-                                                        "stream_transport",
-                                                        true,
-                                                    ),
-                                                ));
-                                                tool_calls_map.clear();
-                                                full_text.clear();
-                                                reasoning.clear();
-                                            }
-                                        }
-                                    } else {
-                                        astra_core::agent_warn!(
-                                            "llm",
-                                            "in-process stream transport error: {e}"
-                                        );
-                                        had_terminal_error = true;
-                                        yield render_sse(&Value::Object(
-                                            crate::build_stream_error_event(
-                                                &format!("LLM stream transport error: {e}"),
-                                                "stream_transport",
-                                                true,
-                                            ),
-                                        ));
-                                        tool_calls_map.clear();
-                                        full_text.clear();
-                                        reasoning.clear();
+                                    if saw_terminal {
+                                        break;
                                     }
+                                    let stream_error = bridge_delivery_unknown_error(format!(
+                                        "LLM stream transport error: {e}"
+                                    ));
+                                    if let Err(ledger_error) = finish_stream_error(
+                                        attempt_observer_for_stream.as_ref(),
+                                        streaming_attempt.take(),
+                                        &stream_error,
+                                    ).await {
+                                        yield classified_stream_error_event(
+                                            &ledger_error,
+                                            "inference_ledger",
+                                        );
+                                        return;
+                                    }
+                                    astra_core::agent_warn!(
+                                        "llm",
+                                        "in-process stream transport error: {e}"
+                                    );
+                                    had_terminal_error = true;
+                                    yield classified_stream_error_event(
+                                        &stream_error,
+                                        "stream_transport",
+                                    );
                                     break;
                                 }
                             };
@@ -1482,6 +1407,12 @@ pub(crate) async fn call_llm_stream(
                             // so parse usage first on every chunk. Streaming endpoints are
                             // OpenAI-compatible; Bedrock is intercepted earlier.
                             made_progress = true;
+                            if provider_response_id.is_none() {
+                                provider_response_id = chunk
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string);
+                            }
                             if let Some(u) = chunk.get("usage").and_then(Value::as_object)
                                 && let Some(extracted) = crate::turn::token_usage::extract_usage(
                                     crate::turn::token_usage::UsageDialect::OpenAi,
@@ -1498,15 +1429,32 @@ pub(crate) async fn call_llm_stream(
                                     "total_tokens": extracted.total_tokens(),
                                 }));
                             }
+                            if saw_terminal && !usage.is_empty() {
+                                break;
+                            }
 
                             let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
                                 continue;
                             };
 
-                            let Some(delta) = choices.first()
-                                .and_then(|c| c.get("delta"))
+                            let Some(choice) = choices.first() else {
+                                continue;
+                            };
+                            if let Some(reason) = choice
+                                .get("finish_reason")
+                                .and_then(Value::as_str)
+                            {
+                                finish_reason = Some(reason.to_string());
+                                saw_terminal = true;
+                            }
+                            let Some(delta) = choice.get("delta")
                                 .and_then(Value::as_object)
-                            else { continue };
+                            else {
+                                if saw_terminal && !usage.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            };
 
                             // Text content
                             if let Some(content) = delta.get("content").and_then(Value::as_str)
@@ -1578,11 +1526,35 @@ pub(crate) async fn call_llm_stream(
                                         }
                                     }
                                 }
+                            if saw_terminal && !usage.is_empty() {
+                                break;
+                            }
                         }
                     }
                 }
 
                 if had_terminal_error {
+                    return;
+                }
+                if !saw_terminal {
+                    let error = bridge_delivery_unknown_error(
+                        "LLM SSE ended without a terminal marker",
+                    );
+                    if let Err(ledger_error) = finish_stream_error(
+                        attempt_observer_for_stream.as_ref(),
+                        streaming_attempt.take(),
+                        &error,
+                    ).await {
+                        yield classified_stream_error_event(
+                            &ledger_error,
+                            "inference_ledger",
+                        );
+                        return;
+                    }
+                    yield classified_stream_error_event(
+                        &error,
+                        "stream_transport",
+                    );
                     return;
                 }
 
@@ -1604,13 +1576,36 @@ pub(crate) async fn call_llm_stream(
                     }
                 }
 
+                let result = crate::turn::llm::client::LlmCallResult {
+                    response_id: provider_response_id,
+                    full_text,
+                    reasoning,
+                    reasoning_signature: String::new(),
+                    tool_calls,
+                    usage,
+                    model_used: model_name,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    finish_reason,
+                };
+                if let Err(ledger_error) = finish_stream_success(
+                    attempt_observer_for_stream.as_ref(),
+                    streaming_attempt.take(),
+                    &result,
+                ).await {
+                    yield classified_stream_error_event(
+                        &ledger_error,
+                        "inference_ledger",
+                    );
+                    return;
+                }
                 yield render_sse(&json!({
                     "type": "_inprocess_summary",
-                    "full_text": full_text,
-                    "reasoning": reasoning,
-                    "tool_calls": tool_calls,
-                    "usage": usage,
-                    "model_used": model_name,
+                    "full_text": result.full_text,
+                    "reasoning": result.reasoning,
+                    "tool_calls": result.tool_calls,
+                    "usage": result.usage,
+                    "model_used": result.model_used,
+                    "provider_response_id": result.response_id,
                 }));
             };
 
@@ -1629,6 +1624,21 @@ pub(crate) async fn call_llm_stream(
             .await
             .unwrap_or_else(|e| format!("<body read error: {e}>"));
         last_err = format!("LLM error {status}: {text}");
+        last_kind = if is_rate_limit_status(status) {
+            astra_core::ErrorKind::RateLimit
+        } else if is_overload_status(status) || status >= 500 {
+            astra_core::ErrorKind::ServerError
+        } else if status == 401 || status == 403 {
+            astra_core::ErrorKind::Auth
+        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
+            astra_core::ErrorKind::ContextWindow
+        } else if status == 400 {
+            astra_core::ErrorKind::InvalidRequest
+        } else {
+            astra_core::ErrorKind::Unknown
+        };
+        let observed_error = bridge_stream_error(last_kind, last_err.clone());
+        finish_stream_error(attempt_observer.as_ref(), observed_attempt, &observed_error).await?;
 
         match classify_non_success_and_record_cooldown(
             status,
@@ -1640,21 +1650,22 @@ pub(crate) async fn call_llm_stream(
         ) {
             RetryDecision::Retry { delay_ms } => {
                 if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
             }
             // 4xx (except 429) is not retryable — fail immediately.
             // Context-window errors are detected by content at the call site
             // (bridge_inprocess forward()), not here.
-            RetryDecision::Terminal => return Err(last_err),
+            RetryDecision::Terminal => return Err(observed_error),
         }
     }
 
     // All retries exhausted
-    Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
+    Err(bridge_stream_error(
+        last_kind,
+        format!("{last_err} (after {} retries)", LLM_MAX_RETRIES),
+    ))
 }
 
 #[cfg(test)]
@@ -1670,6 +1681,51 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedAttemptEvent {
+        Began(u32),
+        Finished(u32, astra_services::InferenceInvocationTerminal),
+    }
+
+    #[derive(Default)]
+    struct RecordingAttemptObserver {
+        next_attempt: AtomicU32,
+        events: Mutex<Vec<RecordedAttemptEvent>>,
+    }
+
+    impl RecordingAttemptObserver {
+        fn events(&self) -> Vec<RecordedAttemptEvent> {
+            self.events.lock().expect("attempt events").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAttemptObserver for RecordingAttemptObserver {
+        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+            let attempt = self.next_attempt.fetch_add(1, Ordering::AcqRel);
+            self.events
+                .lock()
+                .expect("attempt events")
+                .push(RecordedAttemptEvent::Began(attempt));
+            Ok(attempt)
+        }
+
+        async fn finish_attempt(
+            &self,
+            attempt_index: u32,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            self.events
+                .lock()
+                .expect("attempt events")
+                .push(RecordedAttemptEvent::Finished(
+                    attempt_index,
+                    terminal.clone(),
+                ));
+            Ok(())
+        }
+    }
 
     #[test]
     fn is_valid_tool_name_rejects_xml_artifacts() {
@@ -1792,7 +1848,7 @@ mod tests {
         });
         let base = format!("http://{addr}");
 
-        let stream = call_llm_stream(
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
@@ -1813,6 +1869,7 @@ mod tests {
                 has_fallback: false,
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
+            None,
             None,
         )
         .await
@@ -1870,7 +1927,7 @@ mod tests {
         });
         let base = format!("http://{addr}");
 
-        let stream = call_llm_stream(
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
@@ -1892,6 +1949,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            None,
         )
         .await
         .expect("stream");
@@ -1903,6 +1961,90 @@ mod tests {
             Some("gpt-5-mini"),
             "with no alias, request body.model must equal the local name. seen={seen:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_terminalizes_the_admitted_physical_attempt() {
+        async fn handler() -> Response {
+            let pending = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(pending))
+                .expect("response")
+        }
+
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let base = format!("http://{addr}");
+        let cancel = Arc::new(CancellationToken::new());
+        let observer = Arc::new(RecordingAttemptObserver::default());
+        let stream = call_llm_stream_with_attempt_observer(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &[json!({"role": "user", "content": "hi"})],
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "gpt-5-mini",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
+            Some(cancel.clone()),
+            Some(observer.clone()),
+        )
+        .await
+        .expect("stream admitted");
+
+        assert_eq!(observer.events(), vec![RecordedAttemptEvent::Began(0)]);
+        cancel.cancel();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .collect::<String>()
+        })
+        .await
+        .expect("cancelled stream must settle");
+
+        assert!(body.contains("\"code\":\"client_disconnect\""), "{body}");
+        assert!(!body.contains("_inprocess_summary"), "{body}");
+        let events = observer.events();
+        assert_eq!(
+            events.len(),
+            2,
+            "cancel must close the open attempt: {events:?}"
+        );
+        assert!(matches!(
+            &events[1],
+            RecordedAttemptEvent::Finished(
+                0,
+                astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::DeliveryUnknown,
+                    error_kind: Some(kind),
+                    ..
+                }
+            ) if kind == "stream_transport"
+        ));
     }
 
     // ── anthropic-sse stream parser ─────────────────────────────────────
@@ -1972,7 +2114,8 @@ mod tests {
         });
         let base = format!("http://{addr}");
 
-        let stream = call_llm_stream(
+        let observer = Arc::new(RecordingAttemptObserver::default());
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
@@ -1994,6 +2137,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            Some(observer.clone()),
         )
         .await
         .expect("stream started");
@@ -2067,6 +2211,31 @@ mod tests {
                 >= 7,
             "output_tokens must reflect message_delta update — got {last_usage}",
         );
+        assert!(raw.contains("\"provider_response_id\":\"msg_1\""), "{raw}");
+        let events = observer.events();
+        assert_eq!(
+            events.len(),
+            2,
+            "one physical request must have one terminal: {events:?}"
+        );
+        assert_eq!(events[0], RecordedAttemptEvent::Began(0));
+        assert!(matches!(
+            &events[1],
+            RecordedAttemptEvent::Finished(
+                0,
+                astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::Succeeded,
+                    usage: astra_services::InferenceUsage {
+                        input_tokens: 42,
+                        output_tokens: 7,
+                        cache_read_tokens: 10,
+                        cache_creation_tokens: 2,
+                    },
+                    provider_response_id: Some(response_id),
+                    ..
+                }
+            ) if response_id == "msg_1"
+        ));
     }
 
     // ── anthropic-sse thinking + signature ──────────────────────────────
@@ -2147,7 +2316,7 @@ mod tests {
         });
         let base = format!("http://{addr}");
 
-        let stream = call_llm_stream(
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
@@ -2168,6 +2337,7 @@ mod tests {
                 has_fallback: false,
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
+            None,
             None,
         )
         .await
@@ -2263,7 +2433,7 @@ mod tests {
             json!({"role":"user","content":"hi"}),
         ];
 
-        let stream = call_llm_stream(
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
@@ -2285,6 +2455,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            None,
         )
         .await
         .expect("stream");
@@ -2296,30 +2467,14 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TransportFallbackHits {
+    struct TransportRequestHits {
         stream_hits: Arc<AtomicU32>,
-        fallback_hits: Arc<AtomicU32>,
+        nonstream_hits: Arc<AtomicU32>,
     }
 
     async fn spawn_raw_partial_transport_server(
-        hits: TransportFallbackHits,
-        fallback_status: u16,
-        fallback_body: &'static str,
-    ) -> String {
-        spawn_raw_partial_transport_server_with_content(
-            hits,
-            "partial",
-            fallback_status,
-            fallback_body,
-        )
-        .await
-    }
-
-    async fn spawn_raw_partial_transport_server_with_content(
-        hits: TransportFallbackHits,
+        hits: TransportRequestHits,
         stream_content: &'static str,
-        fallback_status: u16,
-        fallback_body: &'static str,
     ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2352,14 +2507,11 @@ mod tests {
                             .expect("write partial stream response");
                         let _ = socket.shutdown().await;
                     } else {
-                        hits.fallback_hits.fetch_add(1, Ordering::SeqCst);
-                        let status_text = if fallback_status == 200 {
-                            "OK"
-                        } else {
-                            "Internal Server Error"
-                        };
+                        hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                        let fallback_body =
+                            r#"{"choices":[{"message":{"content":"unexpected second request"}}]}"#;
                         let response = format!(
-                            "HTTP/1.1 {fallback_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
                             fallback_body.len()
                         );
                         socket
@@ -2375,11 +2527,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn spawn_raw_anthropic_partial_transport_server(
-        hits: TransportFallbackHits,
-        fallback_status: u16,
-        fallback_body: &'static str,
-    ) -> String {
+    async fn spawn_raw_anthropic_partial_transport_server(hits: TransportRequestHits) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind raw mock anthropic listener");
@@ -2415,14 +2563,11 @@ mod tests {
                             .expect("write partial anthropic stream response");
                         let _ = socket.shutdown().await;
                     } else {
-                        hits.fallback_hits.fetch_add(1, Ordering::SeqCst);
-                        let status_text = if fallback_status == 200 {
-                            "OK"
-                        } else {
-                            "Internal Server Error"
-                        };
+                        hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                        let fallback_body =
+                            r#"{"content":[{"type":"text","text":"unexpected second request"}]}"#;
                         let response = format!(
-                            "HTTP/1.1 {fallback_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
                             fallback_body.len()
                         );
                         socket
@@ -2439,18 +2584,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_llm_stream_falls_back_after_partial_stream_transport_error() {
-        let hits = TransportFallbackHits {
+    async fn openai_stream_transport_error_preserves_partial_without_reissuing() {
+        let hits = TransportRequestHits {
             stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
+            nonstream_hits: Arc::new(AtomicU32::new(0)),
         };
-        let base = spawn_raw_partial_transport_server(
-            hits.clone(),
-            200,
-            r#"{"choices":[{"message":{"content":"from-transport-fallback"}}]}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
+        let base = spawn_raw_partial_transport_server(hits.clone(), "partial").await;
+        let observer = Arc::new(RecordingAttemptObserver::default());
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
@@ -2472,6 +2613,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            Some(observer.clone()),
         )
         .await
         .expect("bridge stream");
@@ -2482,97 +2624,45 @@ mod tests {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .collect::<String>();
         assert!(
-            !body.contains("\"type\":\"error\""),
-            "transport-after-progress should recover via fallback instead of emitting an error: {body}"
+            body.contains("\"content\":\"partial\""),
+            "partial provider output must remain visible: {body}"
         );
         assert!(
-            body.contains("from-transport-fallback"),
-            "fallback content should reach the client: {body}"
+            body.contains("\"code\":\"stream_transport\"")
+                && body.contains("\"error_kind\":\"stream_transport\"")
+                && body.contains("\"retryable\":false"),
+            "uncertain delivery must end in a structured error: {body}"
         );
+        assert!(!body.contains("_inprocess_summary"), "{body}");
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn anthropic_stream_transport_falls_back_after_partial_stream_transport_error() {
-        let hits = TransportFallbackHits {
-            stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
-        };
-        let base = spawn_raw_anthropic_partial_transport_server(
-            hits.clone(),
-            200,
-            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"partial recovered"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
-            LlmCall {
-                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-                messages: &[json!({"role":"user","content":"hi"})],
-                tools: &[],
-                route: LlmExecutionRoute {
-                    model_name: "claude-test",
-                    wire_model_name: None,
-                    api_key: "k",
-                    base_url: &base,
-                    provider: "anthropic",
-                    header_overrides: None,
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-                max_output_tokens: None,
-                temperature: None,
-                has_fallback: false,
-                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            },
-            None,
-        )
-        .await
-        .expect("anthropic bridge stream");
-        let body = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .collect::<String>();
-        assert!(
-            !body.contains("\"type\":\"error\""),
-            "anthropic transport-after-progress should recover via fallback instead of emitting an error: {body}"
-        );
-        let stitched_text = body
-            .split("\n\n")
-            .filter_map(|frame| frame.trim().strip_prefix("data: "))
-            .filter_map(|json_line| serde_json::from_str::<Value>(json_line).ok())
-            .filter(|event| event.get("type").and_then(Value::as_str) == Some("text_delta"))
-            .filter_map(|event| {
-                event
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect::<String>();
+        assert_eq!(hits.nonstream_hits.load(Ordering::SeqCst), 0);
+        let events = observer.events();
         assert_eq!(
-            stitched_text, "partial recovered",
-            "fallback should only emit the missing anthropic suffix: {body}"
+            events.len(),
+            2,
+            "uncertain delivery must close exactly one physical attempt: {events:?}"
         );
-        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(events[0], RecordedAttemptEvent::Began(0));
+        assert!(matches!(
+            &events[1],
+            RecordedAttemptEvent::Finished(
+                0,
+                astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::DeliveryUnknown,
+                    ..
+                }
+            )
+        ));
     }
 
     #[tokio::test]
-    async fn anthropic_stream_transport_fallback_failure_emits_structured_error_code() {
-        let hits = TransportFallbackHits {
+    async fn anthropic_stream_transport_error_preserves_partial_without_reissuing() {
+        let hits = TransportRequestHits {
             stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
+            nonstream_hits: Arc::new(AtomicU32::new(0)),
         };
-        let base = spawn_raw_anthropic_partial_transport_server(
-            hits.clone(),
-            500,
-            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
+        let base = spawn_raw_anthropic_partial_transport_server(hits.clone()).await;
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
@@ -2594,6 +2684,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            None,
         )
         .await
         .expect("anthropic bridge stream");
@@ -2605,33 +2696,28 @@ mod tests {
             .collect::<String>();
         assert!(
             body.contains("\"content\":\"partial\""),
-            "partial anthropic text should reach the client before fallback failure: {body}"
+            "partial anthropic output must remain visible: {body}"
         );
         assert!(
-            body.contains("\"code\":\"stream_transport\""),
-            "anthropic transport fallback failure should emit structured stream_transport code: {body}"
+            body.contains("\"code\":\"stream_transport\"")
+                && body.contains("\"error_kind\":\"stream_transport\"")
+                && body.contains("\"retryable\":false"),
+            "uncertain anthropic delivery must end in a structured error: {body}"
         );
-        assert!(
-            body.contains("\"retryable\":true"),
-            "anthropic transport fallback failure should stay retryable: {body}"
-        );
+        assert!(!body.contains("_inprocess_summary"), "{body}");
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.nonstream_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn call_llm_stream_transport_fallback_failure_emits_structured_error_code() {
-        let hits = TransportFallbackHits {
+    async fn stream_transport_preserves_preceding_inline_reasoning_without_reissuing() {
+        let hits = TransportRequestHits {
             stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
+            nonstream_hits: Arc::new(AtomicU32::new(0)),
         };
-        let base = spawn_raw_partial_transport_server(
-            hits.clone(),
-            500,
-            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
+        let base =
+            spawn_raw_partial_transport_server(hits.clone(), "<think>hidden reasoning").await;
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
@@ -2653,65 +2739,6 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
-        )
-        .await
-        .expect("bridge stream");
-        let body = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .collect::<String>();
-        assert!(
-            body.contains("\"content\":\"partial\""),
-            "partial streamed text should still reach the client before the failure: {body}"
-        );
-        assert!(
-            body.contains("\"code\":\"stream_transport\""),
-            "transport fallback failure should emit a structured stream_transport code: {body}"
-        );
-        assert!(
-            body.contains("\"retryable\":true"),
-            "transport fallback failure should stay retryable: {body}"
-        );
-        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn call_llm_stream_routes_inline_think_to_reasoning_before_fallback_failure() {
-        let hits = TransportFallbackHits {
-            stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
-        };
-        let base = spawn_raw_partial_transport_server_with_content(
-            hits.clone(),
-            "<think>hidden reasoning",
-            500,
-            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
-            LlmCall {
-                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-                messages: &[json!({"role":"user","content":"hi"})],
-                tools: &[],
-                route: LlmExecutionRoute {
-                    model_name: "gpt-5-mini",
-                    wire_model_name: None,
-                    api_key: "k",
-                    base_url: &base,
-                    provider: "openai",
-                    header_overrides: None,
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-                max_output_tokens: None,
-                temperature: None,
-                has_fallback: false,
-                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            },
             None,
         )
         .await
@@ -2729,75 +2756,14 @@ mod tests {
         assert!(
             body.contains("\"type\":\"reasoning_delta\"")
                 && body.contains("\"content\":\"hidden reasoning\""),
-            "inline think content should be routed to reasoning_delta before fallback failure: {body}"
+            "inline think content should be routed before the terminal error: {body}"
         );
         assert!(
             body.contains("\"code\":\"stream_transport\""),
-            "transport fallback failure should still surface structured error: {body}"
+            "uncertain delivery should surface a structured error: {body}"
         );
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn call_llm_stream_transport_fallback_emits_only_missing_text_suffix() {
-        let hits = TransportFallbackHits {
-            stream_hits: Arc::new(AtomicU32::new(0)),
-            fallback_hits: Arc::new(AtomicU32::new(0)),
-        };
-        let base = spawn_raw_partial_transport_server(
-            hits,
-            200,
-            r#"{"choices":[{"message":{"content":"partial done"}}]}"#,
-        )
-        .await;
-        let stream = call_llm_stream(
-            LlmCall {
-                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-                messages: &[json!({"role":"user","content":"hi"})],
-                tools: &[],
-                route: LlmExecutionRoute {
-                    model_name: "gpt-5-mini",
-                    wire_model_name: None,
-                    api_key: "k",
-                    base_url: &base,
-                    provider: "openai",
-                    header_overrides: None,
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-                max_output_tokens: None,
-                temperature: None,
-                has_fallback: false,
-                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            },
-            None,
-        )
-        .await
-        .expect("bridge stream");
-        let body = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .collect::<String>();
-        let stitched_text = body
-            .split("\n\n")
-            .filter_map(|frame| frame.trim().strip_prefix("data: "))
-            .filter_map(|json_line| serde_json::from_str::<Value>(json_line).ok())
-            .filter(|event| event.get("type").and_then(Value::as_str) == Some("text_delta"))
-            .filter_map(|event| {
-                event
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect::<String>();
-        assert_eq!(
-            stitched_text, "partial done",
-            "fallback should only emit the missing suffix, not duplicate already-streamed text: {body}"
-        );
+        assert_eq!(hits.nonstream_hits.load(Ordering::SeqCst), 0);
     }
 
     // ── Bedrock streaming retry contract ────────────────────────────────
@@ -2987,7 +2953,8 @@ mod tests {
         let base_url = spawn_bedrock_retry_server(hits.clone()).await;
 
         let messages = vec![json!({"role":"user","content":"say hi"})];
-        let stream = call_llm_stream(
+        let observer = Arc::new(RecordingAttemptObserver::default());
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
@@ -3009,6 +2976,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
+            Some(observer.clone()),
         )
         .await
         .expect("stream should succeed after retry");
@@ -3033,6 +3001,35 @@ mod tests {
             2,
             "server must have seen 2 POSTs (the 429 + the successful retry)"
         );
+        let events = observer.events();
+        assert_eq!(
+            events.len(),
+            4,
+            "every physical request must terminate: {events:?}"
+        );
+        assert_eq!(events[0], RecordedAttemptEvent::Began(0));
+        assert!(matches!(
+            &events[1],
+            RecordedAttemptEvent::Finished(
+                0,
+                astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::Failed,
+                    error_kind: Some(kind),
+                    ..
+                }
+            ) if kind == "rate_limit"
+        ));
+        assert_eq!(events[2], RecordedAttemptEvent::Began(1));
+        assert!(matches!(
+            &events[3],
+            RecordedAttemptEvent::Finished(
+                1,
+                astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::Succeeded,
+                    ..
+                }
+            )
+        ));
     }
 
     /// Bedrock delivers `metadata` (carrying usage) in a SEPARATE TCP chunk
@@ -3117,7 +3114,7 @@ mod tests {
     async fn bedrock_stream_drains_metadata_after_message_stop() {
         let base_url = spawn_bedrock_split_meta_server().await;
         let messages = vec![json!({"role":"user","content":"hi"})];
-        let stream = call_llm_stream(
+        let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
@@ -3138,6 +3135,7 @@ mod tests {
                 has_fallback: false,
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
+            None,
             None,
         )
         .await

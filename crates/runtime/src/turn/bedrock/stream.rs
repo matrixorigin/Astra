@@ -68,7 +68,7 @@ struct ToolCallInProgress {
 }
 
 /// Bedrock Converse streaming aggregator.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct BedrockStreamAccumulator {
     full_text: String,
     reasoning: String,
@@ -103,12 +103,6 @@ pub(crate) fn is_retryable_exception(kind: &str) -> RetryKind {
     }
 }
 
-/// Convenience: shorthand for `is_retryable_exception(kind).is_retryable()`.
-/// Use this at call sites that only need the boolean decision.
-pub(crate) fn retryable_exception(kind: &str) -> bool {
-    is_retryable_exception(kind).is_retryable()
-}
-
 /// How an exception kind should be treated by the retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryKind {
@@ -138,6 +132,13 @@ impl BedrockStreamAccumulator {
     /// stream until EOS is required for correct token accounting.
     pub fn has_exception(&self) -> bool {
         self.exception.is_some()
+    }
+
+    /// Whether Bedrock supplied the semantic `messageStop` terminal. The
+    /// transport must still drain trailing metadata after this becomes true,
+    /// but a clean socket EOF while it remains false is a truncated response.
+    pub fn has_message_stop(&self) -> bool {
+        self.finish_reason.is_some()
     }
 
     /// Consume one frame and return any canonical incremental events it produced.
@@ -716,23 +717,6 @@ mod tests {
             is_retryable_exception("INTERNALSERVERERROR"),
             RetryKind::Transient
         );
-    }
-
-    #[test]
-    fn retryable_exception_wrapper_matches_classifier() {
-        // The wrapper must agree with the classifier's `is_retryable()` for
-        // every case — it's just a boolean convenience layer.
-        for (k, want) in [
-            ("throttlingException", true),
-            ("internalServerError", true),
-            ("serviceUnavailableException", true),
-            ("modelStreamErrorException", true),
-            ("validationException", false),
-            ("accessDeniedException", false),
-            ("resourceNotFoundException", false),
-        ] {
-            assert_eq!(retryable_exception(k), want, "kind={k}");
-        }
     }
 
     #[test]

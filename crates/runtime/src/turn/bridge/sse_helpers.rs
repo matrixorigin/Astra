@@ -147,10 +147,12 @@ pub(crate) fn extend_forward_from_validated_sse_block(
     loop_tool_calls: &mut Vec<Value>,
     usage: &mut Map<String, Value>,
     resolved_model: &mut String,
+    provider_response_id: &mut Option<String>,
 ) -> Result<Vec<Bytes>, String> {
     let events = validated_json_events_from_sse_block(block)?;
     let mut out = Vec::new();
     for ev in events {
+        capture_provider_response_id(&ev, provider_response_id);
         out.extend(apply_forward_llm_sse_event(
             &ev,
             saw_inprocess_summary,
@@ -175,6 +177,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
     loop_tool_calls: &mut Vec<Value>,
     usage: &mut Map<String, Value>,
     resolved_model: &mut String,
+    provider_response_id: &mut Option<String>,
 ) -> Result<Vec<Bytes>, String> {
     if !buf.trim().is_empty() {
         validate_sse_event_block_json(buf)?;
@@ -182,6 +185,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
     let mut out = Vec::new();
     let d = drain_sse_data_lines(buf, "");
     for ev in d.events {
+        capture_provider_response_id(&ev, provider_response_id);
         out.extend(apply_forward_llm_sse_event(
             &ev,
             saw_inprocess_summary,
@@ -198,6 +202,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
     }
     let fin = finish_sse_data_buffer(buf);
     for ev in fin.events {
+        capture_provider_response_id(&ev, provider_response_id);
         out.extend(apply_forward_llm_sse_event(
             &ev,
             saw_inprocess_summary,
@@ -210,6 +215,15 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
         )?);
     }
     Ok(out)
+}
+
+fn capture_provider_response_id(event: &Value, target: &mut Option<String>) {
+    if event.get("type").and_then(Value::as_str) == Some("_inprocess_summary") {
+        *target = event
+            .get("provider_response_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +322,41 @@ mod tests {
             result.is_empty(),
             "summary should not produce forwarded bytes"
         );
+    }
+
+    #[test]
+    fn validated_summary_preserves_provider_response_identity() {
+        let block = concat!(
+            "data: {\"type\":\"_inprocess_summary\",",
+            "\"full_text\":\"ok\",\"reasoning\":\"\",\"tool_calls\":[],",
+            "\"usage\":{},\"model_used\":\"gpt-test\",",
+            "\"provider_response_id\":\"resp-42\"}\n\n",
+        );
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_signature = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let mut provider_response_id = None;
+
+        let forwarded = extend_forward_from_validated_sse_block(
+            block,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut reasoning_signature,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+            &mut provider_response_id,
+        )
+        .expect("valid summary");
+
+        assert!(forwarded.is_empty());
+        assert!(saw);
+        assert_eq!(provider_response_id.as_deref(), Some("resp-42"));
     }
 
     #[test]

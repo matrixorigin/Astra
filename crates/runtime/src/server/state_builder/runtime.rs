@@ -83,7 +83,6 @@ pub(super) async fn build_runtime_wiring(
     astra_turn_core::ws_user_prompt_gate::set_ws_user_prompt_metrics_registry(
         state.metrics_registry(),
     );
-    crate::turn::llm::client::set_llm_nonstream_fallback_metrics_registry(state.metrics_registry());
     crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
         state.metrics_registry(),
     );

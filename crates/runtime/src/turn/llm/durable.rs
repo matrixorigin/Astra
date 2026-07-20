@@ -4,7 +4,13 @@
 //! that route/invocation admission happens before provider I/O, every physical
 //! request is observed, and the logical terminal matches the provider terminal.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -94,7 +100,10 @@ impl DurableInferenceLedger {
             .await
             .map_err(|error| service_error("admission", error))?;
         Ok(DurableInferenceInvocation {
-            observer: DurableProviderAttemptObserver::new(self.shared_pool.clone(), plan.clone()),
+            observer: Arc::new(DurableProviderAttemptObserver::new(
+                self.shared_pool.clone(),
+                plan.clone(),
+            )),
             shared_pool: self.shared_pool.clone(),
             plan,
         })
@@ -139,12 +148,47 @@ impl DurableInferenceLedger {
 pub(crate) struct DurableInferenceInvocation {
     shared_pool: SharedPool,
     plan: astra_services::InferenceInvocationPlan,
-    observer: DurableProviderAttemptObserver,
+    observer: Arc<DurableProviderAttemptObserver>,
 }
 
 impl DurableInferenceInvocation {
     pub(crate) fn attempt_observer(&self) -> &dyn ProviderAttemptObserver {
-        &self.observer
+        self.observer.as_ref()
+    }
+
+    pub(crate) fn attempt_observer_arc(&self) -> Arc<dyn ProviderAttemptObserver> {
+        self.observer.clone()
+    }
+
+    /// Close every physical attempt that was admitted but has not reached a
+    /// durable terminal yet.
+    ///
+    /// This is used by the client-disconnect supervisor after the response
+    /// stream itself has been dropped. The supervisor cannot claim that the
+    /// provider did not receive the request, so callers must pass a
+    /// `delivery_unknown` terminal rather than inventing success or failure.
+    pub(crate) async fn finish_open_attempts(
+        &self,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.observer.finish_open_attempts(terminal).await
+    }
+
+    /// Converge a logical invocation after its response consumer disappears.
+    ///
+    /// An open provider attempt is necessarily delivery-unknown. If the
+    /// physical attempt already reached a durable terminal, preserve that exact
+    /// terminal (including usage and response id). If provider I/O never began,
+    /// the logical invocation is simply cancelled.
+    pub(crate) async fn finish_after_disconnect(
+        &self,
+        delivery_unknown: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let logical_terminal = self
+            .observer
+            .terminal_after_disconnect(delivery_unknown)
+            .await?;
+        self.finish(&logical_terminal).await
     }
 
     pub(crate) async fn finish_result(
@@ -191,6 +235,13 @@ struct DurableProviderAttemptObserver {
     shared_pool: SharedPool,
     invocation: astra_services::InferenceInvocationPlan,
     next_attempt: AtomicU32,
+    state: tokio::sync::Mutex<ProviderAttemptState>,
+}
+
+#[derive(Default)]
+struct ProviderAttemptState {
+    open_attempts: BTreeSet<u32>,
+    latest_terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
 impl DurableProviderAttemptObserver {
@@ -199,19 +250,80 @@ impl DurableProviderAttemptObserver {
             shared_pool,
             invocation,
             next_attempt: AtomicU32::new(0),
+            state: tokio::sync::Mutex::new(ProviderAttemptState::default()),
         }
+    }
+
+    async fn finish_open_attempts(
+        &self,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let mut state = self.state.lock().await;
+        let attempts = state.open_attempts.iter().copied().collect::<Vec<_>>();
+        for attempt_index in attempts {
+            let attempt =
+                astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
+            astra_services::finish_inference_provider_attempt(
+                &self.shared_pool,
+                &attempt,
+                terminal,
+            )
+            .await
+            .map_err(|error| service_error("provider attempt terminal commit", error))?;
+            state.open_attempts.remove(&attempt_index);
+            state.latest_terminal = Some(terminal.clone());
+        }
+        Ok(())
+    }
+
+    async fn terminal_after_disconnect(
+        &self,
+        delivery_unknown: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<astra_services::InferenceInvocationTerminal, astra_core::ClassifiedError> {
+        let mut state = self.state.lock().await;
+        let attempts = state.open_attempts.iter().copied().collect::<Vec<_>>();
+        if !attempts.is_empty() {
+            for attempt_index in attempts {
+                let attempt = astra_services::plan_inference_provider_attempt(
+                    &self.invocation,
+                    attempt_index,
+                );
+                astra_services::finish_inference_provider_attempt(
+                    &self.shared_pool,
+                    &attempt,
+                    delivery_unknown,
+                )
+                .await
+                .map_err(|error| service_error("provider attempt terminal commit", error))?;
+                state.open_attempts.remove(&attempt_index);
+            }
+            state.latest_terminal = Some(delivery_unknown.clone());
+            return Ok(delivery_unknown.clone());
+        }
+
+        Ok(state.latest_terminal.clone().unwrap_or_else(|| {
+            terminal_from_error(&astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Inference cancelled before provider delivery",
+            ))
+        }))
     }
 }
 
 #[async_trait]
 impl ProviderAttemptObserver for DurableProviderAttemptObserver {
     async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+        // Serialize admission with disconnect cleanup. Once this method
+        // returns, the attempt is both durable and visible in `open_attempts`;
+        // cleanup can therefore never miss the window between those facts.
+        let mut state = self.state.lock().await;
         let attempt_index = self.next_attempt.fetch_add(1, Ordering::AcqRel);
         let attempt =
             astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
         astra_services::begin_inference_provider_attempt(&self.shared_pool, &attempt)
             .await
             .map_err(|error| service_error("provider attempt admission", error))?;
+        state.open_attempts.insert(attempt_index);
         Ok(attempt_index)
     }
 
@@ -220,11 +332,19 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
         attempt_index: u32,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError> {
+        // The same lock makes a normal stream terminal and disconnect cleanup
+        // mutually exclusive. The durable service remains idempotent for a
+        // repeated identical terminal, but two owners cannot race different
+        // terminal claims through this in-process observer.
+        let mut state = self.state.lock().await;
         let attempt =
             astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
         astra_services::finish_inference_provider_attempt(&self.shared_pool, &attempt, terminal)
             .await
-            .map_err(|error| service_error("provider attempt terminal commit", error))
+            .map_err(|error| service_error("provider attempt terminal commit", error))?;
+        state.open_attempts.remove(&attempt_index);
+        state.latest_terminal = Some(terminal.clone());
+        Ok(())
     }
 }
 
@@ -290,9 +410,7 @@ pub(crate) fn terminal_from_error(
 ) -> astra_services::InferenceInvocationTerminal {
     let status = match error.kind {
         astra_core::ErrorKind::Cancelled => astra_services::InferenceTerminalStatus::Cancelled,
-        astra_core::ErrorKind::Network
-        | astra_core::ErrorKind::StreamIdle
-        | astra_core::ErrorKind::StreamTransport => {
+        astra_core::ErrorKind::StreamIdle | astra_core::ErrorKind::StreamTransport => {
             astra_services::InferenceTerminalStatus::DeliveryUnknown
         }
         _ => astra_services::InferenceTerminalStatus::Failed,
@@ -306,5 +424,31 @@ pub(crate) fn terminal_from_error(
         error_message: Some(
             astra_text_utils::str_preview::truncate_str(&message, 1_000).to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_status_distinguishes_pre_delivery_failure_from_uncertain_delivery() {
+        let connect_failure = terminal_from_error(&astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Network,
+            "connection refused",
+        ));
+        let stream_failure = terminal_from_error(&astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "connection reset after delivery",
+        ));
+
+        assert_eq!(
+            connect_failure.status,
+            astra_services::InferenceTerminalStatus::Failed
+        );
+        assert_eq!(
+            stream_failure.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
     }
 }

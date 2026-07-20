@@ -695,33 +695,38 @@ impl TurnAuxiliaryEventWriter for NoopTurnAuxiliaryEventWriter {
 }
 
 #[cfg(test)]
+static LIVE_TEST_SETTINGS: tokio::sync::OnceCell<MatrixOneSettings> =
+    tokio::sync::OnceCell::const_new();
+
+#[cfg(test)]
+pub(crate) async fn setup_live_pool_for_test() -> SharedPool {
+    assert_eq!(
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+        Ok("1"),
+        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+    );
+    let settings = LIVE_TEST_SETTINGS
+        .get_or_init(|| async {
+            let settings = MatrixOneSettings::from_env();
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".to_string());
+            astra_services::ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema");
+            settings
+        })
+        .await;
+    // SQLx pools own runtime-bound maintenance tasks. Each #[tokio::test]
+    // therefore receives a fresh pool even though schema bootstrap is shared.
+    SharedPool::new(settings).await.expect("SharedPool::new")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use sqlx::Row;
     use uuid::Uuid;
-
-    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
-
-    async fn setup_live_pool() -> SharedPool {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-        );
-        SHARED_BOOTSTRAP
-            .get_or_init(|| async {
-                let settings = MatrixOneSettings::from_env();
-                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
-                    .unwrap_or_else(|_| "mysql".to_string());
-                astra_services::ensure_core_schema(&settings, &catalog)
-                    .await
-                    .expect("ensure_core_schema");
-                SharedPool::new(&settings).await.expect("SharedPool::new")
-            })
-            .await
-            .clone()
-    }
 
     #[test]
     fn metadata_tool_name_none() {
@@ -915,7 +920,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn turn_event_writers_increment_event_count_by_insert_delta_on_live_matrixone() {
-        let shared = setup_live_pool().await;
+        let shared = setup_live_pool_for_test().await;
         let pool = shared.get().clone();
         let settings = MatrixOneSettings::from_env();
         let suffix = Uuid::new_v4().to_string();
