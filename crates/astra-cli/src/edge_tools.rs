@@ -243,7 +243,6 @@ mod self_mod_tools;
 mod session_state;
 use astra_tools::task_mgmt;
 use file_state::FileState;
-pub(crate) use file_state::{ReadCoverage, ReadDedupKey};
 pub(crate) use task_mgmt::TaskManager;
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.

@@ -2,12 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadCoverage, ReadDedupKey,
-    SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer,
-    nonexecuted_tool_result_fields, tool_output_limit, truncate_output,
+    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel,
+    fuzzy_replacer, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::validate_path;
-use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
     str_replace_fail, validate_read_file_args,
@@ -223,16 +221,10 @@ impl ToolExecutor {
         &self,
         args: &Value,
     ) -> (String, Option<serde_json::Map<String, Value>>) {
-        let mut tool_result_fields = None;
-        let output = self.read_file_impl(args, &mut tool_result_fields);
-        (output, tool_result_fields)
+        (self.read_file_impl(args), None)
     }
 
-    fn read_file_impl(
-        &self,
-        args: &Value,
-        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
-    ) -> String {
+    fn read_file_impl(&self, args: &Value) -> String {
         if let Err(error) = validate_read_file_args(args) {
             return error;
         }
@@ -286,7 +278,7 @@ impl ToolExecutor {
                             "webp" => "image/webp",
                             _ => "application/octet-stream",
                         };
-                        self.record_read(&path, false, ReadDedupKey::Full);
+                        self.record_read(&path, false);
                         return format!("data:{mime};base64,{b64}");
                     }
                     Err(e) => return format!("Error reading image: {e}"),
@@ -308,48 +300,6 @@ impl ToolExecutor {
             .get("outline")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let dedup_key = if has_outline {
-            ReadDedupKey::Outline
-        } else if has_range {
-            ReadDedupKey::Range {
-                start_line: start_raw,
-                end_line: end_raw,
-            }
-        } else {
-            ReadDedupKey::Full
-        };
-        let is_internal_artifact_read = is_internal_safe_path(&path.to_string_lossy()).is_some();
-
-        // Consecutive identical outline/range request + unchanged file → stub before I/O.
-        if !is_internal_artifact_read && self.can_dedup_identical_partial_read(&path, &dedup_key) {
-            *tool_result_fields = Some(nonexecuted_tool_result_fields(
-                astra_services::session_journal::ToolCallDisposition::Suppressed,
-            ));
-            return format!(
-                "[Same read_file request as immediately before — file unchanged. \
-                 Refer to the earlier read_file result for {path_str}.]"
-            );
-        }
-
-        // Range-overlap dedup: if the requested line range is fully covered by
-        // the union of all prior reads (and file is unchanged), return a stub.
-        // This catches the pattern where the agent pages through a large file
-        // in different ranges — once all lines have been seen, re-reads are pure waste.
-        if has_range {
-            let s = start_raw.unwrap_or(1);
-            let e = end_raw.unwrap_or(u64::MAX);
-            if !is_internal_artifact_read && self.is_range_already_read(&path, s, e) {
-                *tool_result_fields = Some(nonexecuted_tool_result_fields(
-                    astra_services::session_journal::ToolCallDisposition::Suppressed,
-                ));
-                return format!(
-                    "[Lines {s}–{e} of {path_str} were already read in earlier requests \
-                     and the file is unchanged. Refer to those earlier read_file results \
-                     instead of re-reading.]"
-                );
-            }
-        }
-
         // Pre-read size gate: large files without a line range auto-degrade
         // to outline mode + guidance. Old behavior was a hard refusal ("Error:
         // file is too large") which gave the LLM no useful content — it then
@@ -445,12 +395,7 @@ impl ToolExecutor {
                                 }
                             };
                         let total_lines = content_for_outline.lines().count();
-                        self.record_read_cached(
-                            &path,
-                            true,
-                            ReadDedupKey::Outline,
-                            content_for_outline.clone(),
-                        );
+                        self.record_read_cached(&path, true, content_for_outline.clone());
 
                         if let Some(ts_lang) = code_intel::detect_language(&path) {
                             let outline =
@@ -544,7 +489,7 @@ impl ToolExecutor {
             let total_lines = content.lines().count();
 
             // Record as partial read (outline), caching full content
-            self.record_read_cached(&path, true, ReadDedupKey::Outline, content.clone());
+            self.record_read_cached(&path, true, content.clone());
 
             // Try tree-sitter first for accurate AST-based extraction
             if let Some(ts_lang) = code_intel::detect_language(&path) {
@@ -583,28 +528,6 @@ impl ToolExecutor {
                 content.lines().count(),
             )
         });
-        // Dedup: if file was fully read earlier in this turn and hasn't
-        // changed, return a stub. Later turns may need the content again after
-        // prompt compaction, so cross-turn reads still return the file body.
-        if !is_internal_artifact_read && self.can_dedup_read(&path) {
-            *tool_result_fields = Some(nonexecuted_tool_result_fields(
-                astra_services::session_journal::ToolCallDisposition::Suppressed,
-            ));
-            let msg = if is_ranged {
-                format!(
-                    "[File already fully read earlier in this turn and unchanged — \
-                     refer to the earlier read_file result for {path_str}. Do not \
-                     re-read the same file in multiple small ranges.]"
-                )
-            } else {
-                format!(
-                    "[File unchanged since the earlier read in this turn — refer \
-                     to the earlier read_file result for {path_str}]"
-                )
-            };
-            return msg;
-        }
-
         // Auto-expand: promote ranged reads to full-file reads when the file
         // is small enough. This eliminates fragmented multi-range reads that
         // waste tool calls (e.g., 6 read_file calls for different hunks of
@@ -629,41 +552,21 @@ impl ToolExecutor {
                      {numbered}"
                 );
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
-                    // Upgrade to full read — future reads will hit can_dedup_read.
-                    self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
+                    self.record_read_cached(&path, false, content.clone());
                     return expanded;
                 }
             }
         }
-
-        let request_key = if is_ranged {
-            ReadDedupKey::Range {
-                start_line: normalized_range
-                    .as_ref()
-                    .map(|range| range.start_line as u64)
-                    .or(start_raw),
-                end_line: normalized_range
-                    .as_ref()
-                    .map(|range| range.end_line as u64)
-                    .or(end_raw),
-            }
-        } else {
-            ReadDedupKey::Full
-        };
 
         if !is_ranged {
             let lines: Vec<&str> = content.split('\n').collect();
             let total_lines = lines.len();
             let numbered = add_line_numbers(&content, 1);
             let mut output;
-            let coverage;
-            let dedup_eligible;
             let is_partial_delivery;
 
             if numbered.chars().count() <= self.read_file_model_output_limit() {
                 output = numbered;
-                coverage = ReadCoverage::Full;
-                dedup_eligible = true;
                 is_partial_delivery = false;
             } else {
                 let delivery =
@@ -684,26 +587,10 @@ impl ToolExecutor {
                     )
                 };
                 push_suffix_if_fits(&mut output, &marker, self.read_file_model_output_limit());
-                coverage = if delivered_end > 0 {
-                    ReadCoverage::Range {
-                        start_line: 1,
-                        end_line: delivered_end,
-                    }
-                } else {
-                    ReadCoverage::None
-                };
-                dedup_eligible = false;
                 is_partial_delivery = true;
             }
 
-            self.record_read_cached_with_coverage(
-                &path,
-                is_partial_delivery,
-                request_key,
-                dedup_eligible,
-                coverage,
-                content.clone(),
-            );
+            self.record_read_cached(&path, is_partial_delivery, content.clone());
 
             let read_warning = self.read_warning_for(&path, false);
             push_suffix_if_fits(
@@ -739,16 +626,9 @@ impl ToolExecutor {
         let requested_lines = &lines[s..e];
         let numbered = add_line_numbers(&requested_lines.join("\n"), actual_start_line);
         let mut result;
-        let coverage;
-        let dedup_eligible;
 
         if numbered.chars().count() <= self.read_file_model_output_limit() {
             result = numbered;
-            coverage = ReadCoverage::Range {
-                start_line: actual_start_line as u64,
-                end_line: e as u64,
-            };
-            dedup_eligible = true;
         } else {
             let delivery = add_line_numbers_budgeted(
                 requested_lines,
@@ -775,24 +655,8 @@ impl ToolExecutor {
                 )
             };
             push_suffix_if_fits(&mut result, &marker, self.read_file_model_output_limit());
-            coverage = if let Some(end_line) = delivered_end {
-                ReadCoverage::Range {
-                    start_line: actual_start_line as u64,
-                    end_line,
-                }
-            } else {
-                ReadCoverage::None
-            };
-            dedup_eligible = false;
         }
-        self.record_read_cached_with_coverage(
-            &path,
-            true,
-            request_key,
-            dedup_eligible,
-            coverage,
-            content.clone(),
-        );
+        self.record_read_cached(&path, true, content.clone());
 
         let read_warning = self.read_warning_for(&path, true);
         push_suffix_if_fits(
@@ -4047,12 +3911,13 @@ type Handler interface {
         assert!(r1.contains("alpha"), "should contain all lines");
         assert!(r1.contains("epsilon"), "should contain all lines");
 
-        // Second read should dedup (already fully read)
+        // A later request is served from cached bytes but still returns
+        // evidence to the caller.
         let r2 = executor
             .read_file(&serde_json::json!({"path": "small.txt", "start_line": 4, "end_line": 5}));
         assert!(
-            r2.contains("already fully read") || r2.contains("unchanged"),
-            "second read should dedup: {r2}"
+            r2.contains("delta") && r2.contains("epsilon"),
+            "second read should return the requested content: {r2}"
         );
     }
 
@@ -4208,10 +4073,10 @@ type Handler interface {
         );
     }
 
-    // ── Consecutive identical partial read dedup ───────────
+    // ── Repeated reads replay evidence from the content cache ───────────
 
     #[test]
-    fn read_file_consecutive_identical_range_dedups() {
+    fn read_file_consecutive_identical_range_replays_content() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "dup.txt", 200);
 
@@ -4221,26 +4086,29 @@ type Handler interface {
             "start_line": 1,
             "end_line": 5
         });
-        let first = executor.read_file(&args);
+        let (first, first_metadata) = executor.read_file_with_metadata(&args);
         assert!(
-            first.contains("line 1") && !first.contains("Same read_file request"),
+            first.contains("line 1"),
             "first read should return content: {first}"
         );
+        assert!(first_metadata.is_none());
 
-        let second = executor.read_file(&args);
+        let (second, second_metadata) = executor.read_file_with_metadata(&args);
         assert!(
-            second.contains("Same read_file request"),
-            "second identical range should stub: {second}"
+            second.contains("line 1"),
+            "second identical range should replay content: {second}"
+        );
+        assert!(
+            second_metadata.is_none(),
+            "content-cache replay must not be classified as suppression"
         );
     }
 
     #[test]
-    fn read_file_full_read_dedups_across_turns_when_mtime_unchanged() {
-        // Dedup is mtime-scoped, not turn-scoped. The prior tool_result is
-        // still in the prompt across turn boundaries; re-emitting full file
-        // content there waste tokens and breaks prompt-cache prefix matching.
-        // Compaction (which evicts prior tool_results) calls clear_file_state
-        // to invalidate dedup state.
+    fn read_file_full_read_reemits_content_across_turns_when_mtime_unchanged() {
+        // Disk content remains cached by mtime, but a new visible turn is a
+        // new model boundary. The file body must be delivered again rather
+        // than replaced by a claim that prior tool output is still visible.
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("full.txt");
         std::fs::write(&file_path, "MARK_A\nMARK_B\n").unwrap();
@@ -4248,7 +4116,7 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         executor
             .journal_turn_index
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+            .store(1, std::sync::atomic::Ordering::Release);
 
         let first = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
         assert!(
@@ -4258,53 +4126,23 @@ type Handler interface {
 
         let second_same_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
         assert!(
-            second_same_turn.contains("earlier read"),
-            "same-turn repeat should stub: {second_same_turn}"
+            second_same_turn.contains("MARK_A"),
+            "same-turn repeat must replay the file body: {second_same_turn}"
         );
 
         executor
             .journal_turn_index
-            .store(2, std::sync::atomic::Ordering::Relaxed);
+            .store(2, std::sync::atomic::Ordering::Release);
 
         let next_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
         assert!(
-            next_turn.contains("earlier read"),
-            "later turn with unchanged mtime must still stub (prior tool_result is still in prompt): {next_turn}"
+            next_turn.contains("MARK_A"),
+            "later turn must receive the unchanged file body: {next_turn}"
         );
     }
 
     #[test]
-    fn read_file_internal_tool_result_artifacts_bypass_dedup_stubs() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact_path = dir
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
-        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, "AGENT_RESULT\nline 2\n").unwrap();
-
-        let executor = test_executor_in(dir.path());
-        let args = serde_json::json!({
-            "path": ".astra/sessions/session-1/tool-results/call_abc.txt",
-            "start_line": 1,
-            "end_line": 2,
-        });
-
-        let first = executor.read_file(&args);
-        let second = executor.read_file(&args);
-
-        assert!(first.contains("AGENT_RESULT"), "first read: {first}");
-        assert!(
-            second.contains("AGENT_RESULT"),
-            "internal tool-result artifacts must re-emit content instead of a stale-context stub: {second}"
-        );
-        assert!(
-            !second.contains("already read") && !second.contains("earlier read_file"),
-            "internal tool-result read must not return a dedup stub: {second}"
-        );
-    }
-
-    #[test]
-    fn read_file_consecutive_identical_outline_dedups() {
+    fn read_file_consecutive_identical_outline_replays_content() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("o.rs");
         std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").unwrap();
@@ -4316,19 +4154,15 @@ type Handler interface {
             first.contains("Outline") || first.contains("fn "),
             "first outline read: {first}"
         );
-        assert!(!first.contains("Same read_file request"));
-
         let second = executor.read_file(&args);
         assert!(
-            second.contains("Same read_file request"),
-            "second outline should stub: {second}"
+            second.contains("Outline") || second.contains("fn "),
+            "second outline should replay content: {second}"
         );
     }
 
     #[test]
-    fn read_file_nonconsecutive_same_range_deduped_by_overlap() {
-        // When lines 1-2 and 3-4 have both been read, re-reading 1-2 should
-        // be caught by range-overlap dedup (the content is already in context).
+    fn read_file_nonconsecutive_same_range_replays_content() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("ab.txt");
         let mut f = std::fs::File::create(&file_path).unwrap();
@@ -4361,20 +4195,20 @@ type Handler interface {
             "end_line": 2
         }));
         assert!(
-            r_a_again.contains("already read"),
-            "range 1-2 was already read — should stub: {r_a_again}"
+            r_a_again.contains("MARK_A"),
+            "range 1-2 should replay its content: {r_a_again}"
         );
     }
 
     #[test]
-    fn read_file_range_dedup_persists_across_turns_when_mtime_unchanged() {
+    fn read_file_replays_covered_ranges_across_model_turns() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "turns.txt", 200);
 
         let executor = test_executor_in(dir.path());
         executor
             .journal_turn_index
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+            .store(1, std::sync::atomic::Ordering::Release);
         let args = serde_json::json!({
             "path": "turns.txt",
             "start_line": 1,
@@ -4389,25 +4223,26 @@ type Handler interface {
 
         let second_same_turn = executor.read_file(&args);
         assert!(
-            second_same_turn.contains("Same read_file request"),
-            "same-turn repeat should stub: {second_same_turn}"
+            second_same_turn.contains("line 1"),
+            "same-turn repeat should replay content: {second_same_turn}"
         );
 
         executor
             .journal_turn_index
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-        let next_turn = executor.read_file(&args);
-        // Range was already covered; mtime unchanged; later turn must still
-        // dedup (prior tool_result is still in the prompt).
+            .store(2, std::sync::atomic::Ordering::Release);
+        let next_turn = executor.read_file(&serde_json::json!({
+            "path": "turns.txt",
+            "start_line": 2,
+            "end_line": 4
+        }));
         assert!(
-            next_turn.contains("Same read_file request") || next_turn.contains("already read"),
-            "later turn with unchanged mtime must still stub: {next_turn}"
+            next_turn.contains("line 2"),
+            "a range covered only in a prior turn must be delivered again: {next_turn}"
         );
     }
 
     #[test]
-    fn read_file_range_overlap_partial_not_deduped() {
-        // Lines 1-5 read, then request 3-10 — only partially covered, should NOT dedup.
+    fn read_file_partially_overlapping_range_returns_requested_content() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "partial.txt", 200);
 
@@ -4429,7 +4264,7 @@ type Handler interface {
     }
 
     #[test]
-    fn truncated_full_read_does_not_cover_unseen_ranges() {
+    fn truncated_full_read_allows_targeted_tail_and_prefix_reads() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "budgeted.txt", 260);
 
@@ -4450,8 +4285,8 @@ type Handler interface {
             "end_line": 205
         }));
         assert!(
-            later.contains("line 200") && !later.contains("already read"),
-            "unseen tail range must still be readable: {later}"
+            later.contains("line 200"),
+            "tail range must remain readable: {later}"
         );
 
         let covered = executor.read_file(&serde_json::json!({
@@ -4460,13 +4295,13 @@ type Handler interface {
             "end_line": 5
         }));
         assert!(
-            covered.contains("already read"),
-            "delivered prefix can still dedup: {covered}"
+            covered.contains("line 1"),
+            "a previously delivered prefix must still return evidence: {covered}"
         );
     }
 
     #[test]
-    fn truncated_ranged_read_records_only_delivered_prefix() {
+    fn truncated_ranged_read_allows_a_later_targeted_tail_read() {
         let dir = tempfile::tempdir().unwrap();
         write_large_file(dir.path(), "range-budgeted.txt", 260);
 
@@ -4491,8 +4326,8 @@ type Handler interface {
             "end_line": 205
         }));
         assert!(
-            later.contains("line 200") && !later.contains("already read"),
-            "undelivered part of truncated range must not be considered read: {later}"
+            later.contains("line 200"),
+            "later targeted range must return content: {later}"
         );
     }
 

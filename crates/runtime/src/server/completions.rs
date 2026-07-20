@@ -375,6 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn completion_response_id_preserves_provider_identity_and_generates_unique_fallbacks() {
+        assert_eq!(
+            completion_response_id(Some("provider-response")),
+            "provider-response"
+        );
+
+        let first = completion_response_id(None);
+        let second = completion_response_id(None);
+        assert!(first.starts_with("chatcmpl-proxy-"), "{first}");
+        assert!(second.starts_with("chatcmpl-proxy-"), "{second}");
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn completions_handler_strips_empty_assistant_tool_calls_before_forwarding() {
         let mut messages = vec![
             serde_json::json!({"role": "assistant", "content": "Done.", "tool_calls": []}),

@@ -138,7 +138,7 @@ impl DurableInferenceLedger {
                     tracing::error!(
                         ?result.response_id,
                         %e,
-                        "LLM call succeeded but ledger write failed; delivery evidence lost"
+                        "LLM call succeeded and its provider attempt terminal was recorded, but logical invocation settlement failed"
                     );
                     return Err(e);
                 }
@@ -149,7 +149,7 @@ impl DurableInferenceLedger {
                     tracing::error!(
                         %error,
                         %e,
-                        "LLM call failed and ledger write also failed; delivery evidence lost"
+                        "LLM call failed and its provider attempt terminal was recorded, but logical invocation settlement failed"
                     );
                     return Err(e);
                 }

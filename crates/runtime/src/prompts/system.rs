@@ -240,21 +240,27 @@ fn build_skill_listing_section_with_budget_and_caps(
     );
     if agent_spawn_available {
         body.push_str(
-            "EXCEPTION: when the user explicitly asks for parallel / \
-             multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
-             agents\", \"parallel review\", \"different angles in parallel\"), \
-             route through `agent_fanout` instead of skill execution or an \
-             `agents:[...]` payload. If `agent_fanout` is not present in \
-             `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
-             to fetch its full schema. Then call the native `agent_fanout` tool \
+            "PARALLEL ORCHESTRATION: `agent_fanout` controls execution topology; \
+             it does not replace a matching skill's workflow. When the user \
+             explicitly asks for parallel / multi-agent / multiple-agent \
+             fan-out (e.g. \"多agents\", \"N agents\", \"parallel review\", \
+             \"different angles in parallel\") and the request matches a listed \
+             skill, load that skill first and follow its instructions, including \
+             any required validation or synthesis. Use the `agent_fanout` tool \
+             exposed by the loaded skill. When no listed skill matches, use the \
+             native `agent_fanout` tool directly. If `agent_fanout` is not \
+             present in `tools[]` after any required skill load, first call \
+             `tool_search(query=\"select:agent_fanout\")` to fetch its full \
+             schema. Then call `agent_fanout` \
              with one complete JSON argument object. Never write function-call \
              text such as `agent_fanout(...)` into the arguments field. For a \
              start call, use an argument object such as \
              `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
              Put each child's full brief in that slot's `prompt`, then collect \
              by calling the same native tool with \
-             `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. Skills usually run sequentially inside the \
-             parent turn, which contradicts the user's explicit fan-out intent.",
+             `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. The \
+             skill owns the quality and validation contract; fanout only runs \
+             the assigned work concurrently and returns its results.",
         );
     } else {
         body.push_str(
@@ -2366,6 +2372,11 @@ mod tests {
                 .expect("skill listing should render when fanout is unavailable");
 
         assert!(with_fanout.text.contains("\"action\":\"start\""));
+        assert!(
+            with_fanout
+                .text
+                .contains("does not replace a matching skill's workflow")
+        );
         assert!(!without_fanout.text.contains("\"action\":\"start\""));
         assert!(
             without_fanout

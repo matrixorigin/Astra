@@ -1,7 +1,7 @@
-//! File state tracking for staleness detection and read deduplication.
+//! File state tracking for staleness detection and content caching.
 //!
 //! Tracks mtime after each read/write/edit to prevent overwriting user edits
-//! and skip re-reading unchanged files.
+//! and avoid disk I/O when unchanged file content is requested again.
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,61 +15,20 @@ use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
 const MAX_FILE_STATE_ENTRIES: usize = 200;
 
 /// Maximum size of a single file's cached content (256 KB).
-/// Larger files are tracked for dedup/staleness but content is not cached.
+/// Larger files are tracked for staleness but content is not cached.
 const MAX_CACHED_FILE_BYTES: usize = 256 * 1024;
 
 /// Maximum total size of all cached file content (8 MB).
 /// When exceeded, cached content is evicted from the oldest entries first,
-/// keeping metadata intact for dedup/staleness tracking.
+/// keeping metadata intact for staleness tracking.
 const MAX_TOTAL_CACHED_BYTES: usize = 8 * 1024 * 1024;
 
-/// Shape of the last `read_file` call, for consecutive-request dedup (same
-/// line range + unchanged mtime → stub before I/O).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReadDedupKey {
-    Full,
-    Outline,
-    /// Raw `start_line` / `end_line` JSON (absent key = `None`).
-    Range {
-        start_line: Option<u64>,
-        end_line: Option<u64>,
-    },
-}
-
-/// Line coverage actually delivered to the model.
-///
-/// This is deliberately separate from the bytes read from disk or stored in
-/// `cached_content`: a full internal cache does not mean the model saw every
-/// line after tool-result budgeting.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReadCoverage {
-    None,
-    Full,
-    Range { start_line: u64, end_line: u64 },
-}
-
-impl ReadCoverage {
-    fn from_complete_request(key: &ReadDedupKey) -> Self {
-        match key {
-            ReadDedupKey::Full => ReadCoverage::Full,
-            ReadDedupKey::Outline => ReadCoverage::None,
-            ReadDedupKey::Range {
-                start_line,
-                end_line,
-            } => ReadCoverage::Range {
-                start_line: start_line.unwrap_or(1),
-                end_line: end_line.unwrap_or(u64::MAX),
-            },
-        }
-    }
-}
-
-/// Tracks the last-read state of a file for staleness detection and dedup.
+/// Tracks the last-read state of a file for staleness detection and caching.
 pub(crate) struct FileState {
     /// mtime (milliseconds) at the time of last read/write.
     pub(super) timestamp_ms: u128,
     /// True if the last operation was a read (not a write/edit).
-    /// Dedup only fires when the previous op was a read.
+    /// Read-before-write validation only accepts a preceding read.
     pub(super) from_read: bool,
     /// True if the last read was a partial view (outline, line range).
     pub(super) is_partial: bool,
@@ -79,46 +38,11 @@ pub(crate) struct FileState {
     /// How many times this file has been read with different ranges.
     /// Used to nudge the model toward grep for large files.
     pub(super) ranged_read_count: u32,
-    /// Last read_file request shape (updated on every successful read).
-    pub(super) last_dedup_key: ReadDedupKey,
-    /// Whether repeating `last_dedup_key` can safely be stubbed. False when
-    /// the requested payload was truncated before it reached the model.
-    pub(super) last_read_dedup_eligible: bool,
     /// Cached full file content. Stored on reads/writes when the full content
     /// is available and fits within `MAX_CACHED_FILE_BYTES`. Serves subsequent
-    /// reads without disk I/O when mtime is unchanged.
+    /// reads without disk I/O when mtime is unchanged. Cached bytes are still
+    /// returned to the caller; cache state never implies prompt visibility.
     pub(super) cached_content: Option<String>,
-    /// Merged line ranges actually delivered to the model (sorted,
-    /// non-overlapping).
-    /// Used to detect when a new ranged read is fully covered by prior reads.
-    /// Reset on write or mtime change. Persists across turn boundaries:
-    /// compaction (which evicts prior tool_results from the prompt) calls
-    /// `clear_file_state` to invalidate this state.
-    pub(super) read_ranges: Vec<(u64, u64)>,
-}
-
-/// Merge a new `(start, end)` into a sorted, non-overlapping range list.
-/// Adjacent ranges (e.g. `1..100` + `101..200`) are coalesced.
-fn merge_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
-    ranges.push((start, end));
-    ranges.sort_unstable();
-    let mut merged = Vec::with_capacity(ranges.len());
-    for &(s, e) in ranges.iter() {
-        if let Some(last) = merged.last_mut() {
-            let (_, le): &mut (u64, u64) = last;
-            if s <= le.saturating_add(1) {
-                *le = (*le).max(e);
-                continue;
-            }
-        }
-        merged.push((s, e));
-    }
-    *ranges = merged;
-}
-
-/// Check if `(start, end)` is fully covered by the merged range list.
-fn ranges_cover(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
-    ranges.iter().any(|&(s, e)| s <= start && end <= e)
 }
 
 impl ToolExecutor {
@@ -205,60 +129,18 @@ impl ToolExecutor {
     }
 
     /// Record file state after a read.
-    pub(super) fn record_read(&self, path: &Path, is_partial: bool, last_dedup_key: ReadDedupKey) {
-        let coverage = ReadCoverage::from_complete_request(&last_dedup_key);
-        self.record_read_impl(path, is_partial, last_dedup_key, true, coverage, None);
+    pub(super) fn record_read(&self, path: &Path, is_partial: bool) {
+        self.record_read_impl(path, is_partial, None);
     }
 
     /// Record file state after a read, caching the full file content for
     /// subsequent reads without disk I/O. Content is only cached if it fits
     /// within the per-file size limit (`MAX_CACHED_FILE_BYTES`).
-    pub(super) fn record_read_cached(
-        &self,
-        path: &Path,
-        is_partial: bool,
-        last_dedup_key: ReadDedupKey,
-        content: String,
-    ) {
-        let coverage = ReadCoverage::from_complete_request(&last_dedup_key);
-        self.record_read_impl(
-            path,
-            is_partial,
-            last_dedup_key,
-            true,
-            coverage,
-            Some(content),
-        );
+    pub(super) fn record_read_cached(&self, path: &Path, is_partial: bool, content: String) {
+        self.record_read_impl(path, is_partial, Some(content));
     }
 
-    pub(super) fn record_read_cached_with_coverage(
-        &self,
-        path: &Path,
-        is_partial: bool,
-        last_dedup_key: ReadDedupKey,
-        last_read_dedup_eligible: bool,
-        delivered_coverage: ReadCoverage,
-        content: String,
-    ) {
-        self.record_read_impl(
-            path,
-            is_partial,
-            last_dedup_key,
-            last_read_dedup_eligible,
-            delivered_coverage,
-            Some(content),
-        );
-    }
-
-    fn record_read_impl(
-        &self,
-        path: &Path,
-        is_partial: bool,
-        last_dedup_key: ReadDedupKey,
-        last_read_dedup_eligible: bool,
-        delivered_coverage: ReadCoverage,
-        content: Option<String>,
-    ) {
+    fn record_read_impl(&self, path: &Path, is_partial: bool, content: Option<String>) {
         let ts = Self::file_mtime_ms(path);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
@@ -266,28 +148,6 @@ impl ToolExecutor {
             let prev = state.get(&key);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
-            // Carry forward read_ranges across turns as long as the file
-            // hasn't changed on disk. Compaction (which wipes the prompt and
-            // therefore prior read tool_results) calls clear_file_state to
-            // invalidate this state.
-            let mut ranges = prev
-                .filter(|fs| fs.from_read && fs.timestamp_ms == ts)
-                .map(|fs| fs.read_ranges.clone())
-                .unwrap_or_default();
-            match delivered_coverage {
-                ReadCoverage::Range {
-                    start_line,
-                    end_line,
-                } => {
-                    if start_line <= end_line {
-                        merge_range(&mut ranges, start_line, end_line);
-                    }
-                }
-                ReadCoverage::Full => {
-                    ranges = vec![(1, u64::MAX)];
-                }
-                ReadCoverage::None => {}
-            }
             let new_count = if is_partial {
                 prev_count
             } else {
@@ -306,10 +166,7 @@ impl ToolExecutor {
                     is_partial,
                     read_count: new_count,
                     ranged_read_count: new_ranged,
-                    last_dedup_key,
-                    last_read_dedup_eligible,
                     cached_content,
-                    read_ranges: ranges,
                 },
             );
             enforce_limits(&mut state);
@@ -344,10 +201,7 @@ impl ToolExecutor {
                     is_partial: false,
                     read_count: 0,
                     ranged_read_count: 0,
-                    last_dedup_key: ReadDedupKey::Full,
-                    last_read_dedup_eligible: false,
                     cached_content,
-                    read_ranges: vec![],
                 },
             );
             enforce_limits(&mut state);
@@ -355,7 +209,7 @@ impl ToolExecutor {
     }
 
     /// Record file state after a write/edit when only the path is known.
-    /// Uses from_read=false to distinguish from reads — dedup won't fire after writes.
+    /// Uses from_read=false so a write does not masquerade as read evidence.
     pub(super) fn record_write(&self, path: &Path) {
         self.record_write_impl(path, None);
     }
@@ -407,7 +261,7 @@ impl ToolExecutor {
         } else {
             self.project_root.join(path)
         };
-        self.record_read(&abs, false, ReadDedupKey::Full);
+        self.record_read(&abs, false);
     }
 
     /// Check if a file was read as a full view (not partial/outline).
@@ -418,82 +272,6 @@ impl ToolExecutor {
             .ok()
             .and_then(|s| s.get(&key).map(|fs| !fs.is_partial))
             .unwrap_or(false)
-    }
-
-    /// Identical partial read (outline or same raw line range) with unchanged
-    /// mtime — stub **before** disk read for the same line range as a prior
-    /// read. Dedup is mtime-scoped (not turn-scoped): the prior read's
-    /// tool_result remains in the model's prompt across turn boundaries until
-    /// compaction, which calls `clear_file_state` to invalidate dedup state.
-    pub(super) fn can_dedup_identical_partial_read(
-        &self,
-        path: &Path,
-        requested: &ReadDedupKey,
-    ) -> bool {
-        if matches!(requested, ReadDedupKey::Full) {
-            return false;
-        }
-        let current_ts = Self::file_mtime_ms(path);
-        if current_ts == 0 {
-            return false;
-        }
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.get(&key).and_then(|fs| {
-                    (fs.from_read
-                        && fs.timestamp_ms == current_ts
-                        && fs.last_read_dedup_eligible
-                        && fs.last_dedup_key == *requested)
-                        .then_some(())
-                })
-            })
-            .is_some()
-    }
-
-    /// Check if we can dedup a full read (previous op was a full read,
-    /// unchanged mtime). Mtime-scoped, not turn-scoped — see
-    /// `can_dedup_identical_partial_read` for rationale.
-    pub(super) fn can_dedup_read(&self, path: &Path) -> bool {
-        let current_ts = Self::file_mtime_ms(path);
-        if current_ts == 0 {
-            return false;
-        }
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.get(&key)
-                    .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
-            })
-            .unwrap_or(false)
-    }
-
-    /// Check if a ranged read is fully covered by previously read ranges
-    /// (file unchanged). Returns true when the requested `start..end` is a
-    /// subset of the union of all prior reads — the content is already in
-    /// the conversation context. Mtime-scoped, not turn-scoped.
-    pub(super) fn is_range_already_read(&self, path: &Path, start: u64, end: u64) -> bool {
-        let current_ts = Self::file_mtime_ms(path);
-        if current_ts == 0 {
-            return false;
-        }
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.get(&key).and_then(|fs| {
-                    (fs.from_read
-                        && fs.timestamp_ms == current_ts
-                        && ranges_cover(&fs.read_ranges, start, end))
-                    .then_some(())
-                })
-            })
-            .is_some()
     }
 
     /// How many times this file has been read in the current session.
@@ -520,8 +298,8 @@ impl ToolExecutor {
     /// - The content was small enough to be cached
     /// - The file mtime hasn't changed since caching
     ///
-    /// This avoids disk I/O for repeated reads of unchanged files, even when
-    /// dedup stubs don't apply (e.g., outline → full read, write → read).
+    /// This avoids disk I/O for repeated reads of unchanged files while still
+    /// returning the requested content to every caller.
     pub(super) fn get_cached_content(&self, path: &Path) -> Option<String> {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
@@ -539,7 +317,7 @@ impl ToolExecutor {
         })
     }
 
-    /// Clear all file state (call after compaction to avoid stale dedup).
+    /// Clear staleness and content-cache state after a workspace baseline reset.
     pub fn clear_file_state(&self) {
         if let Ok(mut state) = self.file_state.lock() {
             state.clear();
@@ -618,38 +396,7 @@ fn enforce_limits(state: &mut HashMap<PathBuf, FileState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadDedupKey, merge_range, ranges_cover};
     use crate::lock_recovery::LockRecovery;
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn merge_range_u64_max_no_overflow() {
-        // Full read sets (1, u64::MAX). Merging a new range must not overflow.
-        let mut ranges = vec![(1, u64::MAX)];
-        merge_range(&mut ranges, 50, 100);
-        assert_eq!(ranges, vec![(1, u64::MAX)]);
-    }
-
-    #[test]
-    fn ranges_cover_after_full_read() {
-        let ranges = vec![(1, u64::MAX)];
-        assert!(ranges_cover(&ranges, 1, 500));
-        assert!(ranges_cover(&ranges, 100, u64::MAX));
-    }
-
-    #[test]
-    fn merge_range_adjacent_coalesces() {
-        let mut ranges = vec![(1, 100)];
-        merge_range(&mut ranges, 101, 200);
-        assert_eq!(ranges, vec![(1, 200)]);
-    }
-
-    #[test]
-    fn merge_range_gap_stays_separate() {
-        let mut ranges = vec![(1, 100)];
-        merge_range(&mut ranges, 103, 200);
-        assert_eq!(ranges, vec![(1, 100), (103, 200)]);
-    }
 
     // ── Shared file-state across subtask turns ───────────────────────────
 
@@ -663,7 +410,7 @@ mod tests {
 
         // Subtask 1: create executor, read the file
         let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
-        exe1.record_read(&file, false, ReadDedupKey::Full);
+        exe1.record_read(&file, false);
 
         // Extract shared state
         let shared = exe1.shared_file_state();
@@ -686,7 +433,7 @@ mod tests {
         std::fs::write(&file, "fn main() {}").unwrap();
 
         let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
-        exe1.record_read(&file, false, ReadDedupKey::Full);
+        exe1.record_read(&file, false);
 
         // Fresh executor without sharing — should reject
         let exe2 = crate::edge_tools::ToolExecutor::new(dir.path());
@@ -723,7 +470,7 @@ mod tests {
         std::fs::write(&file, "v1").unwrap();
 
         let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
-        exe1.record_read(&file, false, ReadDedupKey::Full);
+        exe1.record_read(&file, false);
 
         // Simulate external modification (user edit, linter, etc.)
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -739,68 +486,22 @@ mod tests {
     }
 
     #[test]
-    fn read_ranges_persist_across_turns_when_mtime_unchanged() {
-        // Dedup is mtime-scoped, not turn-scoped. The prior read's tool_result
-        // is still in the model's prompt across turn boundaries until
-        // compaction (which calls clear_file_state). Per-turn invalidation
-        // forced redundant re-reads (observed in session 949c8350: turn 16
-        // re-read the same file 5x because each turn started with empty
-        // dedup state).
+    fn cached_file_bytes_remain_available_while_mtime_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ranges.rs");
-        std::fs::write(&file, "line1\nline2\nline3\nline4\n").unwrap();
+        let file = dir.path().join("cached.rs");
+        std::fs::write(&file, "fn cached() {}\n").unwrap();
 
         let exe = crate::edge_tools::ToolExecutor::new(dir.path());
-        let key = exe.file_state_key(&file);
+        exe.record_read_cached(&file, false, "fn cached() {}\n".to_string());
 
-        exe.journal_turn_index.store(1, Ordering::Release);
-        exe.record_read(
-            &file,
-            true,
-            ReadDedupKey::Range {
-                start_line: Some(1),
-                end_line: Some(2),
-            },
-        );
-
-        exe.journal_turn_index.store(2, Ordering::Release);
-        exe.record_read(
-            &file,
-            true,
-            ReadDedupKey::Range {
-                start_line: Some(3),
-                end_line: Some(4),
-            },
-        );
-
-        let state = exe.file_state.lock_recover();
-        let fs = state.get(&key).unwrap();
-        // Both ranges persist across the turn boundary because mtime is
-        // unchanged. They merge into [(1, 4)].
-        assert_eq!(fs.read_ranges, vec![(1, 4)]);
-    }
-
-    #[test]
-    fn dedup_fires_across_turn_boundary_when_mtime_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("dedup.rs");
-        std::fs::write(&file, "fn x() {}\n").unwrap();
-
-        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
-
-        exe.journal_turn_index.store(1, Ordering::Release);
-        exe.record_read(&file, false, ReadDedupKey::Full);
-
-        // Different turn, same mtime — dedup must still fire.
-        exe.journal_turn_index.store(5, Ordering::Release);
-        assert!(
-            exe.can_dedup_read(&file),
-            "full re-read in a later turn with unchanged mtime must dedup"
+        assert_eq!(
+            exe.get_cached_content(&file).as_deref(),
+            Some("fn cached() {}\n")
         );
     }
 
     #[test]
-    fn record_write_clears_last_successful_read_turn() {
+    fn record_write_replaces_prior_read_state() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("write.rs");
         std::fs::write(&file, "fn before() {}\n").unwrap();
@@ -808,13 +509,12 @@ mod tests {
         let exe = crate::edge_tools::ToolExecutor::new(dir.path());
         let key = exe.file_state_key(&file);
 
-        exe.journal_turn_index.store(7, Ordering::Release);
-        exe.record_read(&file, false, ReadDedupKey::Full);
+        exe.record_read(&file, false);
         exe.record_write(&file);
 
         let state = exe.file_state.lock_recover();
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
-        assert!(fs.read_ranges.is_empty());
+        assert_eq!(fs.read_count, 0);
     }
 }

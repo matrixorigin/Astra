@@ -19,8 +19,8 @@ pub struct LocalSkillProvider {
 impl LocalSkillProvider {
     /// Create with standard CLI search paths.
     ///
-    /// This includes project walk-up paths (`.astra/skills/`, `.claude/skills/`,
-    /// `.agent/skills/`) plus user-level HOME paths. Use this for standalone CLI
+    /// This includes project walk-up paths (`.astra/skills/`, `.agent/skills/`,
+    /// `.claude/skills/`) plus user-level HOME paths. Use this for standalone CLI
     /// execution, where project-local skills are part of the local workspace.
     pub fn standard() -> Self {
         Self {
@@ -309,6 +309,43 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "agent"),
             "review-changes must not expose a competing per-agent lifecycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_astra_priority_prefers_agent_contract_over_claude_compatibility() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let agent_skills = root.path().join(".agent/skills");
+        let claude_skills = root.path().join(".claude/skills");
+
+        create_test_skill(
+            &agent_skills,
+            "review_changes",
+            "---\nname: review-changes\ndescription: Astra review contract\nallowed_tools:\n  - agent_fanout\n---\nVerify every child finding before synthesis.",
+        );
+        create_test_skill(
+            &claude_skills,
+            "review_changes",
+            "---\nname: review-changes\ndescription: Compatibility review contract\nallowed_tools:\n  - read_file\n---\nCompatibility instructions.",
+        );
+
+        let provider =
+            LocalSkillProvider::with_paths(loader::skill_search_paths_from(root.path(), None));
+        let loaded = provider.load("review-changes").await.unwrap();
+
+        assert_eq!(loaded.manifest.description, "Astra review contract");
+        assert!(
+            loaded
+                .manifest
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "agent_fanout")
+        );
+        assert!(
+            loaded
+                .instructions
+                .contains("Verify every child finding before synthesis")
         );
     }
 }

@@ -483,11 +483,11 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 /// Standard skill directory search order (high -> low priority):
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
-/// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
-/// 3. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
+/// 2. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
+/// 3. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
 /// 4. `~/.astra/skills/`      — user-level global skills
-/// 5. `~/.claude/skills/`     — user-level Agent Skills compatibility path
-/// 6. `~/.agent/skills/`      — user-level Agent-compatible path
+/// 5. `~/.agent/skills/`      — user-level Agent-compatible path
+/// 6. `~/.claude/skills/`     — user-level Claude-compatible path
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
@@ -502,8 +502,8 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
     let mut paths = vec![
         PathBuf::from(".astra/skills"),
-        PathBuf::from(".claude/skills"),
         PathBuf::from(".agent/skills"),
+        PathBuf::from(".claude/skills"),
     ];
     if let Some(home) = home {
         for global in home_skill_search_paths_from(&home) {
@@ -524,13 +524,13 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(12);
 
-    // Single walk-up collecting .astra/skills/, .claude/skills/, and
-    // .agent/skills/. Native .astra paths keep priority over compatibility
-    // roots when names collide.
+    // Single walk-up collecting native .astra/skills/, Astra-agent
+    // .agent/skills/, and Claude-compatible .claude/skills/. Native contracts
+    // keep priority over compatibility roots when names collide.
     let (astra, claude, agent) = walk_up_skill_paths_from(cwd, home);
     paths.extend(astra);
-    paths.extend(claude);
     paths.extend(agent);
+    paths.extend(claude);
 
     if let Some(home) = home {
         for global in home_skill_search_paths_from(home) {
@@ -554,8 +554,8 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
 pub fn home_skill_search_paths_from(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".astra").join("skills"),
-        home.join(".claude").join("skills"),
         home.join(".agent").join("skills"),
+        home.join(".claude").join("skills"),
     ]
 }
 
@@ -1006,8 +1006,8 @@ Hooked body."#;
             paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills"),
-                home.join(".agent").join("skills")
+                home.join(".agent").join("skills"),
+                home.join(".claude").join("skills")
             ],
             "api-server local skill discovery must be restricted to HOME-level catalogs"
         );
@@ -1065,8 +1065,8 @@ Hooked body."#;
             server_paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills"),
-                home.join(".agent").join("skills")
+                home.join(".agent").join("skills"),
+                home.join(".claude").join("skills")
             ],
             "Web/server discovery must be restricted to API-server HOME catalogs"
         );

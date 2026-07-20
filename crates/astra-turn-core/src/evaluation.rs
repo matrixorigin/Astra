@@ -554,7 +554,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     // typed audit evidence but must not be mislabeled as execution failures.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| record_was_executed(record) || counts_as_noop_metric_record(record))
+        .filter(|record| record_contributes_tool_evidence(record))
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
@@ -590,7 +590,10 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             ms: record.ms,
             error: record.error.clone(),
             output_bytes: record.output_bytes,
-            no_op: record.is_noop_or_cached_result(),
+            // A validated cache hit re-delivers the requested evidence.
+            // Suppression only points at evidence already delivered in this
+            // model boundary, so it remains a no-op for progress evaluation.
+            no_op: record_is_suppressed_noop(record),
         })
         .collect::<Vec<_>>();
     let is_live_query = records_include_live_query(tool_call_records);
@@ -711,17 +714,32 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     eval
 }
 
-fn counts_as_noop_metric_record(record: &ToolCallRecord) -> bool {
+fn record_is_suppressed_noop(record: &ToolCallRecord) -> bool {
     record.ok
-        && record.is_noop_or_cached_result()
-        && matches!(
-            record.effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Reused
-                | astra_services::session_journal::ToolCallDisposition::Suppressed
-        )
-        && record.surgically_removed != Some(true)
+        && record.effective_disposition()
+            == astra_services::session_journal::ToolCallDisposition::Suppressed
+        && record_is_model_visible_result(record)
+}
+
+fn record_is_validated_reuse(record: &ToolCallRecord) -> bool {
+    record.ok
+        && record.effective_disposition()
+            == astra_services::session_journal::ToolCallDisposition::Reused
+        && record_is_model_visible_result(record)
+}
+
+fn record_is_model_visible_result(record: &ToolCallRecord) -> bool {
+    // Skill routing and surgical-removal records are audit placeholders, not
+    // evidence delivered at the model boundary.
+    record.surgically_removed != Some(true)
         && record.skill_reentry_count.is_none()
         && record.skill_locked_out != Some(true)
+}
+
+fn record_contributes_tool_evidence(record: &ToolCallRecord) -> bool {
+    record_was_executed(record)
+        || record_is_validated_reuse(record)
+        || record_is_suppressed_noop(record)
 }
 
 fn record_was_executed(record: &ToolCallRecord) -> bool {
@@ -2090,24 +2108,38 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_tool_call_records_counts_cached_read_as_noop() {
+    fn evaluate_tool_call_records_treats_validated_cache_reuse_as_delivered_evidence() {
         let mut record = journal_ok_call("read_file");
-        record.error = Some("cached_cross_turn".to_string());
-        record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
-        record.result_class =
-            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Reused);
+        record.result_preview = Some("reused file contents".to_string());
 
         let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
 
-        assert!(eval.signals.contains(&EvalSignal::NoOpToolResults(1)));
         assert!(
-            !eval
-                .signals
+            eval.signals
                 .iter()
                 .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
             "{:?}",
             eval.signals
         );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::NoOpToolResults(_))),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_counts_suppressed_result_as_noop() {
+        let mut record = journal_ok_call("read_file");
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Suppressed);
+
+        let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
+
+        assert!(eval.signals.contains(&EvalSignal::NoOpToolResults(1)));
     }
 
     #[test]
