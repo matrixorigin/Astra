@@ -51,7 +51,10 @@ describe("/api/models route", () => {
           kind: "self_hosted",
           label: "Self-hosted",
           execution_placement: "server",
-          status: "unavailable",
+          status: "action_required",
+          reason: "no_eligible_offerings",
+          usable: false,
+          retry_after_seconds: null,
           available_model_count: 0,
           actions: ["contact_administrator"],
         }],
@@ -73,7 +76,10 @@ describe("/api/models route", () => {
         kind: "self_hosted",
         label: "Self-hosted",
         execution_placement: "server",
-        status: "unavailable",
+        status: "action_required",
+        reason: "no_eligible_offerings",
+        usable: false,
+        retry_after_seconds: null,
         available_model_count: 0,
         actions: ["contact_administrator"],
       }],
@@ -81,8 +87,6 @@ describe("/api/models route", () => {
       catalogRevision: "sha256:empty",
       observedAt: "2026-07-20T00:00:00Z",
       source: "astra",
-      status: "unavailable",
-      actions: ["contact_administrator"],
     });
   });
 

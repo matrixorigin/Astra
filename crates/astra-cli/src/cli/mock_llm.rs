@@ -819,6 +819,9 @@ async fn handle_model_access() -> axum::Json<Value> {
             "label": "Self-hosted",
             "execution_placement": "server",
             "status": "ready",
+            "reason": null,
+            "usable": true,
+            "retry_after_seconds": null,
             "available_model_count": offerings.len(),
             "actions": []
         }],

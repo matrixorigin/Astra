@@ -57,9 +57,6 @@ export async function GET() {
       .map(toModelSummary)
       .filter((model): model is ModelSummary => model !== null);
     const defaultOfferingId = projection.default_offering_id;
-    const actions = Array.from(
-      new Set(projection.accesses.flatMap((access) => access.actions)),
-    );
     if (
       (items.length === 0 && defaultOfferingId !== null) ||
       (items.length > 0 &&
@@ -71,18 +68,6 @@ export async function GET() {
       );
     }
 
-    if (items.length === 0) {
-      return NextResponse.json({
-        items: [],
-        accesses: projection.accesses,
-        defaultOfferingId,
-        catalogRevision: projection.catalog_revision,
-        observedAt: projection.observed_at,
-        source: "astra",
-        status: "unavailable",
-        actions,
-      });
-    }
     return NextResponse.json({
       items,
       accesses: projection.accesses,
@@ -90,8 +75,6 @@ export async function GET() {
       catalogRevision: projection.catalog_revision,
       observedAt: projection.observed_at,
       source: "astra",
-      status: "ready",
-      actions,
     });
   } catch (error) {
     return NextResponse.json(

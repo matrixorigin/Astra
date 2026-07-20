@@ -1152,14 +1152,43 @@ export type RuntimeModelListItem = {
 
 export type RuntimeModelListResponse = RuntimeModelListItem[];
 
+export type RuntimeModelAccessStatus =
+  | "setting_up"
+  | "ready"
+  | "degraded"
+  | "action_required"
+  | "unavailable"
+  | "disabled";
+
+export type RuntimeModelAccessReason =
+  | "provisioning"
+  | "no_eligible_offerings"
+  | "reauthentication_required"
+  | "billing_action_required"
+  | "connection_degraded"
+  | "connection_unavailable"
+  | "device_offline"
+  | "policy_disabled";
+
+export type RuntimeModelAccessAction =
+  | "contact_administrator"
+  | "reconnect_device"
+  | "configure_device_models"
+  | "reauthenticate"
+  | "manage_billing"
+  | "retry";
+
 export type RuntimeModelAccessView = {
   id: string;
   kind: RuntimeModelAccessKind;
   label: string;
   execution_placement: RuntimeModelExecutionPlacement;
-  status: "ready" | "unavailable";
+  status: RuntimeModelAccessStatus;
+  reason: RuntimeModelAccessReason | null;
+  usable: boolean;
+  retry_after_seconds: number | null;
   available_model_count: number;
-  actions: Array<"contact_administrator" | "reconnect_device">;
+  actions: RuntimeModelAccessAction[];
 };
 
 export type RuntimeModelAccessProjection = {

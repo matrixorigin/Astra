@@ -46,7 +46,14 @@ pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
             "kind": "self_hosted",
             "label": "Self-hosted",
             "execution_placement": "server",
-            "status": if names.is_empty() { "unavailable" } else { "ready" },
+            "status": if names.is_empty() { "action_required" } else { "ready" },
+            "reason": if names.is_empty() {
+                serde_json::Value::String("no_eligible_offerings".to_string())
+            } else {
+                serde_json::Value::Null
+            },
+            "usable": !names.is_empty(),
+            "retry_after_seconds": null,
             "available_model_count": names.len(),
             "actions": if names.is_empty() {
                 serde_json::json!(["contact_administrator"])

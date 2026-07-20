@@ -1,7 +1,7 @@
 'use client';
 
 import { Check, ChevronDown, Circle } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Popover } from '@/components/ui/popover';
 import { listModels, type ModelCatalogResponse } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
@@ -12,14 +12,71 @@ type CatalogLoadState =
   | { kind: 'loaded'; catalog: ModelCatalogResponse }
   | { kind: 'error' };
 
+const ACCESS_STATUS_PRIORITY = {
+  action_required: 0,
+  disabled: 1,
+  unavailable: 2,
+  degraded: 3,
+  setting_up: 4,
+  ready: 5,
+} satisfies Record<ModelCatalogResponse['accesses'][number]['status'], number>;
+
+function primaryUnavailableAccess(catalog: ModelCatalogResponse) {
+  return catalog.accesses
+    .filter((access) => !access.usable)
+    .sort(
+      (left, right) =>
+        ACCESS_STATUS_PRIORITY[left.status] - ACCESS_STATUS_PRIORITY[right.status],
+    )[0];
+}
+
 function unavailableMessage(catalog: ModelCatalogResponse) {
-  if (catalog.actions.includes('reconnect_device')) {
-    return 'Reconnect this device in Model Access.';
+  const access = primaryUnavailableAccess(catalog);
+  if (!access) return 'No eligible models are available.';
+
+  if (access.status === 'setting_up') {
+    return `${access.label} is being set up. Models will appear when it is ready.`;
   }
-  if (catalog.actions.includes('contact_administrator')) {
-    return 'Ask an administrator to enable a model.';
+  if (access.actions.includes('reauthenticate')) {
+    return `Reconnect ${access.label} to continue.`;
+  }
+  if (access.actions.includes('manage_billing')) {
+    return `Update billing for ${access.label} to continue.`;
+  }
+  if (access.actions.includes('configure_device_models')) {
+    return 'Add an eligible model on this device.';
+  }
+  if (access.actions.includes('reconnect_device')) {
+    return 'Reconnect this device to use its models.';
+  }
+  if (access.actions.includes('contact_administrator')) {
+    return access.status === 'disabled'
+      ? `${access.label} is disabled by policy.`
+      : 'Ask an administrator to enable an eligible model.';
+  }
+  if (access.actions.includes('retry')) {
+    return access.retry_after_seconds
+      ? `${access.label} is temporarily unavailable. Try again in ${access.retry_after_seconds}s.`
+      : `${access.label} is temporarily unavailable. Try again.`;
   }
   return 'No eligible models are available.';
+}
+
+function emptyCatalogLabel(catalog: ModelCatalogResponse) {
+  const status = primaryUnavailableAccess(catalog)?.status;
+  switch (status) {
+    case 'setting_up':
+      return 'Setting up model access';
+    case 'action_required':
+      return 'Model access needs attention';
+    case 'disabled':
+      return 'Model access disabled';
+    case 'degraded':
+    case 'unavailable':
+      return 'Models temporarily unavailable';
+    default:
+      return 'No models available';
+  }
 }
 
 export function ModelSwitcher({
@@ -39,13 +96,18 @@ export function ModelSwitcher({
     kind: 'loading',
   });
 
-  useEffect(() => {
+  const loadCatalog = useCallback(() => {
+    setCatalogState({ kind: 'loading' });
     listModels()
       .then((catalog) => setCatalogState({ kind: 'loaded', catalog }))
       .catch(() => {
         setCatalogState({ kind: 'error' });
       });
   }, []);
+
+  useEffect(() => {
+    loadCatalog();
+  }, [loadCatalog]);
 
   const catalog = catalogState.kind === 'loaded' ? catalogState.catalog : undefined;
   const models: ModelSummary[] = catalog?.items ?? [];
@@ -88,7 +150,9 @@ export function ModelSwitcher({
                   ? 'Loading models…'
                   : catalogState.kind === 'error'
                     ? 'Model access unavailable'
-                  : 'No models available')}
+                  : catalog
+                    ? emptyCatalogLabel(catalog)
+                    : 'No models available')}
           </span>
           <ChevronDown className="size-4" />
         </button>
@@ -98,13 +162,34 @@ export function ModelSwitcher({
       <div className="flex flex-col">
         <div className="max-h-[25vh] min-h-0 space-y-1 overflow-y-auto overscroll-contain p-2 pr-1">
           {catalogState.kind === 'error' ? (
+            <div className="space-y-3 px-3 py-4 text-sm text-text-muted">
+              <p>Model Access could not be loaded. Sign in again or retry.</p>
+              <button
+                type="button"
+                onClick={loadCatalog}
+                className="font-medium text-text hover:text-accent"
+              >
+                Retry
+              </button>
+            </div>
+          ) : null}
+          {catalogState.kind === 'loading' ? (
             <div className="px-3 py-4 text-sm text-text-muted">
-              Model Access could not be loaded. Sign in again or retry.
+              Loading model access…
             </div>
           ) : null}
           {catalog && models.length === 0 ? (
-            <div className="px-3 py-4 text-sm text-text-muted">
-              {unavailableMessage(catalog)}
+            <div className="space-y-3 px-3 py-4 text-sm text-text-muted">
+              <p>{unavailableMessage(catalog)}</p>
+              {primaryUnavailableAccess(catalog)?.actions.includes('retry') ? (
+                <button
+                  type="button"
+                  onClick={loadCatalog}
+                  className="font-medium text-text hover:text-accent"
+                >
+                  Retry
+                </button>
+              ) : null}
             </div>
           ) : null}
           {models.map((model) => {

@@ -79,6 +79,9 @@ struct ModelAccessView {
     execution: ExecutionPlacementView,
     billing: BillingSummaryView,
     status: ModelAccessStatus,
+    reason: Option<ModelAccessReason>,
+    usable: bool,
+    retry_after_seconds: Option<u32>,
     available_model_count: u32,
     actions: Vec<ModelAccessAction>,
     observed_at: Timestamp,
@@ -285,10 +288,21 @@ They project deterministically to:
 enum ModelAccessStatus {
     SettingUp,
     Ready,
-    Degraded { usable: bool, reason: TypedAccessReason },
-    ActionRequired { reason: TypedAccessReason },
-    Unavailable { reason: TypedAccessReason, retry_after: Option<Duration> },
-    Disabled { reason: TypedAccessReason },
+    Degraded,
+    ActionRequired,
+    Unavailable,
+    Disabled,
+}
+
+enum ModelAccessReason {
+    Provisioning,
+    NoEligibleOfferings,
+    ReauthenticationRequired,
+    BillingActionRequired,
+    ConnectionDegraded,
+    ConnectionUnavailable,
+    DeviceOffline,
+    PolicyDisabled,
 }
 ```
 
@@ -300,7 +314,14 @@ Projection rules include:
 - administrator policy denial → `Disabled`;
 - `Ready` requires usable entitlement, credential materialization, and at least one effective Offering.
 
-Each status carries a typed reason, allowed actions, revision/freshness, and affected scope. Error-message matching is not a state machine.
+The wire projection keeps `status`, optional typed `reason`, `usable`, optional
+`retry_after_seconds`, and allowed actions as separate fields. This avoids a
+client-specific tagged-union encoding while preserving the same state
+semantics. A source declared `Ready` with no effective Offering projects to
+`ActionRequired / NoEligibleOfferings`; a non-usable source that still exposes
+an effective Offering is a contract error. Error-message matching is not a
+state machine. The projection revision and observation timestamp provide
+freshness for the complete snapshot.
 
 ## Model and access data model
 

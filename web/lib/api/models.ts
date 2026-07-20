@@ -9,8 +9,6 @@ export type ModelCatalogResponse = {
   catalogRevision: string;
   observedAt: string;
   source: 'astra';
-  status: 'ready' | 'unavailable';
-  actions: Array<'contact_administrator' | 'reconnect_device'>;
 };
 
 export function listModels() {

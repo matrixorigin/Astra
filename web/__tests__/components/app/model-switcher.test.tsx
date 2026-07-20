@@ -15,17 +15,28 @@ const mockListModels = vi.mocked(listModels);
 function modelCatalog(
   items: ModelSummary[],
   defaultOfferingId: string | null = items[0]?.id ?? null,
-  actions: ModelCatalogResponse["actions"] = [],
+  accesses: ModelCatalogResponse["accesses"] = items.length > 0
+    ? [{
+        id: "self-hosted",
+        kind: "self_hosted",
+        label: "Self-hosted",
+        execution_placement: "server",
+        status: "ready",
+        reason: null,
+        usable: true,
+        retry_after_seconds: null,
+        available_model_count: items.length,
+        actions: [],
+      }]
+    : [],
 ): ModelCatalogResponse {
   return {
     items,
-    accesses: [],
+    accesses,
     defaultOfferingId,
     catalogRevision: "sha256:catalog",
     observedAt: "2026-07-20T00:00:00Z",
     source: "astra",
-    status: items.length > 0 ? "ready" : "unavailable",
-    actions,
   };
 }
 
@@ -171,7 +182,18 @@ describe("ModelSwitcher", () => {
 
   it("keeps selection unavailable when Model Access has no eligible Offering", async () => {
     mockListModels.mockResolvedValue(
-      modelCatalog([], null, ["contact_administrator"]),
+      modelCatalog([], null, [{
+        id: "self-hosted",
+        kind: "self_hosted",
+        label: "Self-hosted",
+        execution_placement: "server",
+        status: "action_required",
+        reason: "no_eligible_offerings",
+        usable: false,
+        retry_after_seconds: null,
+        available_model_count: 0,
+        actions: ["contact_administrator"],
+      }]),
     );
     const onChange = vi.fn();
     const onModelAvailabilityChange = vi.fn();
@@ -186,15 +208,97 @@ describe("ModelSwitcher", () => {
       />,
     );
 
-    expect(await screen.findByText("No models available")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "No models available" }));
+    expect(await screen.findByText("Model access needs attention")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Model access needs attention" }));
     expect(
-      await screen.findByText("Ask an administrator to enable a model."),
+      await screen.findByText("Ask an administrator to enable an eligible model."),
     ).toBeVisible();
     expect(onChange).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(onModelAvailabilityChange).toHaveBeenCalledWith(false),
     );
+  });
+
+  it("distinguishes provisioning from a repairable outage", async () => {
+    mockListModels.mockResolvedValue(
+      modelCatalog([], null, [{
+        id: "astra-cloud",
+        kind: "astra_cloud",
+        label: "Astra Cloud",
+        execution_placement: "server",
+        status: "setting_up",
+        reason: "provisioning",
+        usable: false,
+        retry_after_seconds: null,
+        available_model_count: 0,
+        actions: [],
+      }]),
+    );
+
+    render(
+      <ModelSwitcher
+        value=""
+        onChange={vi.fn()}
+        thinking={false}
+        onThinkingChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Setting up model access" }),
+    );
+    expect(
+      await screen.findByText(
+        "Astra Cloud is being set up. Models will appear when it is ready.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("prioritizes actionable access over passive setup state", async () => {
+    mockListModels.mockResolvedValue(
+      modelCatalog([], null, [
+        {
+          id: "astra-cloud",
+          kind: "astra_cloud",
+          label: "Astra Cloud",
+          execution_placement: "server",
+          status: "setting_up",
+          reason: "provisioning",
+          usable: false,
+          retry_after_seconds: null,
+          available_model_count: 0,
+          actions: [],
+        },
+        {
+          id: "workspace",
+          kind: "workspace",
+          label: "Workspace",
+          execution_placement: "server",
+          status: "action_required",
+          reason: "no_eligible_offerings",
+          usable: false,
+          retry_after_seconds: null,
+          available_model_count: 0,
+          actions: ["contact_administrator"],
+        },
+      ]),
+    );
+
+    render(
+      <ModelSwitcher
+        value=""
+        onChange={vi.fn()}
+        thinking={false}
+        onThinkingChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Model access needs attention" }),
+    );
+    expect(
+      await screen.findByText("Ask an administrator to enable an eligible model."),
+    ).toBeVisible();
   });
 
   it("distinguishes catalog failure from an unavailable Offering", async () => {
@@ -220,6 +324,8 @@ describe("ModelSwitcher", () => {
         "Model Access could not be loaded. Sign in again or retry.",
       ),
     ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(mockListModels).toHaveBeenCalledTimes(2));
     await waitFor(() =>
       expect(onModelAvailabilityChange).toHaveBeenCalledWith(false),
     );

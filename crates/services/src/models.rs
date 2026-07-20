@@ -3091,13 +3091,60 @@ pub struct DeclaredModelAccess {
     pub kind: ModelAccessKind,
     pub label: String,
     pub execution_placement: ModelExecutionPlacement,
+    pub availability: ModelAccessAvailability,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelAccessStatus {
+    SettingUp,
     Ready,
+    Degraded,
+    ActionRequired,
     Unavailable,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccessReason {
+    Provisioning,
+    NoEligibleOfferings,
+    ReauthenticationRequired,
+    BillingActionRequired,
+    ConnectionDegraded,
+    ConnectionUnavailable,
+    DeviceOffline,
+    PolicyDisabled,
+}
+
+/// Source-owned availability facts used to build the user-facing projection.
+///
+/// Effective Offerings remain a separate fact: `Ready` without any eligible
+/// Offering projects to `ActionRequired`, while non-usable states must not
+/// expose an Offering that clients could select.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelAccessAvailability {
+    Ready,
+    SettingUp {
+        reason: ModelAccessReason,
+    },
+    Degraded {
+        reason: ModelAccessReason,
+        usable: bool,
+        retry_after_seconds: Option<u32>,
+    },
+    ActionRequired {
+        reason: ModelAccessReason,
+    },
+    Unavailable {
+        reason: ModelAccessReason,
+        retry_after_seconds: Option<u32>,
+    },
+    Disabled {
+        reason: ModelAccessReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3105,6 +3152,10 @@ pub enum ModelAccessStatus {
 pub enum ModelAccessAction {
     ContactAdministrator,
     ReconnectDevice,
+    ConfigureDeviceModels,
+    Reauthenticate,
+    ManageBilling,
+    Retry,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3115,6 +3166,9 @@ pub struct ModelAccessViewResponse {
     pub label: String,
     pub execution_placement: ModelExecutionPlacement,
     pub status: ModelAccessStatus,
+    pub reason: Option<ModelAccessReason>,
+    pub usable: bool,
+    pub retry_after_seconds: Option<u32>,
     pub available_model_count: u32,
     pub actions: Vec<ModelAccessAction>,
 }
@@ -3127,6 +3181,179 @@ pub struct ModelAccessProjectionResponse {
     pub default_offering_id: Option<String>,
     pub catalog_revision: String,
     pub observed_at: String,
+}
+
+struct ProjectedModelAccessAvailability {
+    status: ModelAccessStatus,
+    reason: Option<ModelAccessReason>,
+    usable: bool,
+    retry_after_seconds: Option<u32>,
+    actions: Vec<ModelAccessAction>,
+}
+
+fn model_access_projection_conflict(
+    access: &DeclaredModelAccess,
+    detail: &str,
+) -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::conflict(format!(
+        "Model Access '{}' has inconsistent availability: {detail}",
+        access.id
+    ))
+}
+
+fn validate_retry_after(
+    access: &DeclaredModelAccess,
+    retry_after_seconds: Option<u32>,
+) -> crate::service_error::ServiceResult<()> {
+    if retry_after_seconds == Some(0) {
+        return Err(model_access_projection_conflict(
+            access,
+            "retry_after_seconds must be positive when present",
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_actions(
+    kind: ModelAccessKind,
+    status: ModelAccessStatus,
+    reason: Option<ModelAccessReason>,
+) -> Vec<ModelAccessAction> {
+    match (status, reason, kind) {
+        (ModelAccessStatus::Ready | ModelAccessStatus::SettingUp, _, _) => Vec::new(),
+        (_, Some(ModelAccessReason::ReauthenticationRequired), _) => {
+            vec![ModelAccessAction::Reauthenticate]
+        }
+        (_, Some(ModelAccessReason::BillingActionRequired), _) => {
+            vec![ModelAccessAction::ManageBilling]
+        }
+        (_, Some(ModelAccessReason::DeviceOffline), _) => {
+            vec![ModelAccessAction::ReconnectDevice]
+        }
+        (_, Some(ModelAccessReason::NoEligibleOfferings), ModelAccessKind::ThisDevice) => {
+            vec![ModelAccessAction::ConfigureDeviceModels]
+        }
+        (
+            _,
+            Some(ModelAccessReason::NoEligibleOfferings | ModelAccessReason::PolicyDisabled),
+            _,
+        ) => {
+            vec![ModelAccessAction::ContactAdministrator]
+        }
+        (
+            ModelAccessStatus::Degraded | ModelAccessStatus::Unavailable,
+            Some(ModelAccessReason::ConnectionDegraded | ModelAccessReason::ConnectionUnavailable),
+            _,
+        ) => vec![ModelAccessAction::Retry],
+        _ => Vec::new(),
+    }
+}
+
+fn project_access_availability(
+    access: &DeclaredModelAccess,
+    available_model_count: u32,
+) -> crate::service_error::ServiceResult<ProjectedModelAccessAvailability> {
+    let has_offerings = available_model_count > 0;
+    let (status, reason, usable, retry_after_seconds) = match &access.availability {
+        ModelAccessAvailability::Ready if has_offerings => {
+            (ModelAccessStatus::Ready, None, true, None)
+        }
+        ModelAccessAvailability::Ready => (
+            ModelAccessStatus::ActionRequired,
+            Some(ModelAccessReason::NoEligibleOfferings),
+            false,
+            None,
+        ),
+        ModelAccessAvailability::SettingUp { reason } => {
+            if *reason != ModelAccessReason::Provisioning || has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "setting_up requires provisioning with no effective Offerings",
+                ));
+            }
+            (ModelAccessStatus::SettingUp, Some(*reason), false, None)
+        }
+        ModelAccessAvailability::Degraded {
+            reason,
+            usable,
+            retry_after_seconds,
+        } => {
+            if *reason != ModelAccessReason::ConnectionDegraded || *usable != has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "degraded requires a connection_degraded reason and usable must match effective Offering availability",
+                ));
+            }
+            validate_retry_after(access, *retry_after_seconds)?;
+            (
+                ModelAccessStatus::Degraded,
+                Some(*reason),
+                *usable,
+                *retry_after_seconds,
+            )
+        }
+        ModelAccessAvailability::ActionRequired { reason } => {
+            if has_offerings
+                || !matches!(
+                    reason,
+                    ModelAccessReason::NoEligibleOfferings
+                        | ModelAccessReason::ReauthenticationRequired
+                        | ModelAccessReason::BillingActionRequired
+                )
+            {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "action_required has an invalid reason or still exposes an effective Offering",
+                ));
+            }
+            (
+                ModelAccessStatus::ActionRequired,
+                Some(*reason),
+                false,
+                None,
+            )
+        }
+        ModelAccessAvailability::Unavailable {
+            reason,
+            retry_after_seconds,
+        } => {
+            if has_offerings
+                || !matches!(
+                    reason,
+                    ModelAccessReason::ConnectionUnavailable | ModelAccessReason::DeviceOffline
+                )
+            {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "unavailable has an invalid reason or still exposes an effective Offering",
+                ));
+            }
+            validate_retry_after(access, *retry_after_seconds)?;
+            (
+                ModelAccessStatus::Unavailable,
+                Some(*reason),
+                false,
+                *retry_after_seconds,
+            )
+        }
+        ModelAccessAvailability::Disabled { reason } => {
+            if *reason != ModelAccessReason::PolicyDisabled || has_offerings {
+                return Err(model_access_projection_conflict(
+                    access,
+                    "disabled requires policy_disabled with no effective Offerings",
+                ));
+            }
+            (ModelAccessStatus::Disabled, Some(*reason), false, None)
+        }
+    };
+    let actions = recovery_actions(access.kind, status, reason);
+    Ok(ProjectedModelAccessAvailability {
+        status,
+        reason,
+        usable,
+        retry_after_seconds,
+        actions,
+    })
 }
 
 /// Build the user-facing Model Access projection from declared product
@@ -3203,31 +3430,21 @@ pub fn project_model_access(
         .into_values()
         .map(|access| {
             let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
-            let status = if available_model_count > 0 {
-                ModelAccessStatus::Ready
-            } else {
-                ModelAccessStatus::Unavailable
-            };
-            let actions = match (status, access.kind) {
-                (ModelAccessStatus::Ready, _) => Vec::new(),
-                (ModelAccessStatus::Unavailable, ModelAccessKind::ThisDevice) => {
-                    vec![ModelAccessAction::ReconnectDevice]
-                }
-                (ModelAccessStatus::Unavailable, _) => {
-                    vec![ModelAccessAction::ContactAdministrator]
-                }
-            };
-            ModelAccessViewResponse {
+            let availability = project_access_availability(&access, available_model_count)?;
+            Ok(ModelAccessViewResponse {
                 id: access.id,
                 kind: access.kind,
                 label: access.label,
                 execution_placement: access.execution_placement,
-                status,
+                status: availability.status,
+                reason: availability.reason,
+                usable: availability.usable,
+                retry_after_seconds: availability.retry_after_seconds,
                 available_model_count,
-                actions,
-            }
+                actions: availability.actions,
+            })
         })
-        .collect();
+        .collect::<crate::service_error::ServiceResult<_>>()?;
 
     // Phase 0 has one deterministic Server-owned default policy: the first
     // canonical active Offering. Clients receive the decision and never
@@ -4215,6 +4432,7 @@ mod tests {
             kind: ModelAccessKind::SelfHosted,
             label: "Self-hosted".into(),
             execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
         };
         let offering = ModelListItemResponse::from(ModelListItem {
             offering_id: "offer-1".into(),
@@ -4240,6 +4458,9 @@ mod tests {
         .expect("ready projection");
         assert_eq!(ready.accesses.len(), 1);
         assert_eq!(ready.accesses[0].status, ModelAccessStatus::Ready);
+        assert_eq!(ready.accesses[0].reason, None);
+        assert!(ready.accesses[0].usable);
+        assert_eq!(ready.accesses[0].retry_after_seconds, None);
         assert_eq!(ready.accesses[0].available_model_count, 1);
         assert!(ready.accesses[0].actions.is_empty());
         assert_eq!(ready.offerings[0].offering_id, "offer-1");
@@ -4255,15 +4476,152 @@ mod tests {
         assert_eq!(same_catalog_later.catalog_revision, ready.catalog_revision);
         assert_ne!(same_catalog_later.observed_at, ready.observed_at);
 
-        let unavailable =
+        let action_required =
             project_model_access(vec![declared], Vec::new(), "2026-07-20T00:00:01Z".into())
-                .expect("unavailable projection");
+                .expect("action-required projection");
         assert_eq!(
-            unavailable.accesses[0].actions,
+            action_required.accesses[0].status,
+            ModelAccessStatus::ActionRequired
+        );
+        assert_eq!(
+            action_required.accesses[0].reason,
+            Some(ModelAccessReason::NoEligibleOfferings)
+        );
+        assert!(!action_required.accesses[0].usable);
+        assert_eq!(
+            action_required.accesses[0].actions,
             vec![ModelAccessAction::ContactAdministrator]
         );
-        assert!(unavailable.default_offering_id.is_none());
-        assert_ne!(unavailable.catalog_revision, ready.catalog_revision);
+        assert!(action_required.default_offering_id.is_none());
+        assert_ne!(action_required.catalog_revision, ready.catalog_revision);
+
+        let device = project_model_access(
+            vec![DeclaredModelAccess {
+                id: "this-device".into(),
+                kind: ModelAccessKind::ThisDevice,
+                label: "This device".into(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
+            }],
+            Vec::new(),
+            "2026-07-20T00:00:02Z".into(),
+        )
+        .expect("device without models is repairable configuration state");
+        assert_eq!(
+            device.accesses[0].actions,
+            vec![ModelAccessAction::ConfigureDeviceModels]
+        );
+    }
+
+    #[test]
+    fn model_access_projection_preserves_typed_recovery_without_fake_offerings() {
+        let access = |availability| DeclaredModelAccess {
+            id: "access-1".into(),
+            kind: ModelAccessKind::AstraCloud,
+            label: "Astra Cloud".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability,
+        };
+
+        for (availability, status, reason, action, retry_after_seconds) in [
+            (
+                ModelAccessAvailability::SettingUp {
+                    reason: ModelAccessReason::Provisioning,
+                },
+                ModelAccessStatus::SettingUp,
+                ModelAccessReason::Provisioning,
+                None,
+                None,
+            ),
+            (
+                ModelAccessAvailability::ActionRequired {
+                    reason: ModelAccessReason::ReauthenticationRequired,
+                },
+                ModelAccessStatus::ActionRequired,
+                ModelAccessReason::ReauthenticationRequired,
+                Some(ModelAccessAction::Reauthenticate),
+                None,
+            ),
+            (
+                ModelAccessAvailability::ActionRequired {
+                    reason: ModelAccessReason::BillingActionRequired,
+                },
+                ModelAccessStatus::ActionRequired,
+                ModelAccessReason::BillingActionRequired,
+                Some(ModelAccessAction::ManageBilling),
+                None,
+            ),
+            (
+                ModelAccessAvailability::Unavailable {
+                    reason: ModelAccessReason::ConnectionUnavailable,
+                    retry_after_seconds: Some(30),
+                },
+                ModelAccessStatus::Unavailable,
+                ModelAccessReason::ConnectionUnavailable,
+                Some(ModelAccessAction::Retry),
+                Some(30),
+            ),
+            (
+                ModelAccessAvailability::Disabled {
+                    reason: ModelAccessReason::PolicyDisabled,
+                },
+                ModelAccessStatus::Disabled,
+                ModelAccessReason::PolicyDisabled,
+                Some(ModelAccessAction::ContactAdministrator),
+                None,
+            ),
+        ] {
+            let projection = project_model_access(
+                vec![access(availability)],
+                Vec::new(),
+                "2026-07-20T00:00:00Z".into(),
+            )
+            .expect("valid source state");
+            let projected = &projection.accesses[0];
+            assert_eq!(projected.status, status);
+            assert_eq!(projected.reason, Some(reason));
+            assert!(!projected.usable);
+            assert_eq!(projected.actions.first().copied(), action);
+            assert_eq!(projected.retry_after_seconds, retry_after_seconds);
+            assert!(projection.offerings.is_empty());
+            assert!(projection.default_offering_id.is_none());
+        }
+    }
+
+    #[test]
+    fn model_access_projection_rejects_non_usable_source_with_effective_offering() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Disabled {
+                reason: ModelAccessReason::PolicyDisabled,
+            },
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-1".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Model One".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+
+        let error = project_model_access(
+            vec![declared],
+            vec![offering],
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect_err("disabled access cannot expose a selectable Offering");
+        assert_eq!(error.kind, crate::service_error::ServiceErrorKind::Conflict);
     }
 
     #[test]
@@ -4273,6 +4631,7 @@ mod tests {
             kind: ModelAccessKind::SelfHosted,
             label: "Self-hosted".into(),
             execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
         };
         let offering = |id: &str, name: &str| ModelListItemResponse {
             offering_id: id.into(),
@@ -4319,6 +4678,7 @@ mod tests {
                 kind: ModelAccessKind::SelfHosted,
                 label: "Self-hosted".into(),
                 execution_placement: ModelExecutionPlacement::Server,
+                availability: ModelAccessAvailability::Ready,
             }],
             vec![ModelListItemResponse {
                 offering_id: "offer-1".into(),

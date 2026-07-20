@@ -952,7 +952,10 @@ describe("AstraClient — Models", () => {
           kind: "self_hosted",
           label: "Self-hosted",
           execution_placement: "server",
-          status: "unavailable",
+          status: "action_required",
+          reason: "no_eligible_offerings",
+          usable: false,
+          retry_after_seconds: null,
           available_model_count: 0,
           actions: ["contact_administrator"],
         },
@@ -965,6 +968,11 @@ describe("AstraClient — Models", () => {
 
     const result = await createClient().getModelAccess();
     expect(result.accesses[0].execution_placement).toBe("server");
+    expect(result.accesses[0]).toMatchObject({
+      status: "action_required",
+      reason: "no_eligible_offerings",
+      usable: false,
+    });
     expect(result.default_offering_id).toBeNull();
     expect(result.catalog_revision).toBe("sha256:catalog");
     expect(

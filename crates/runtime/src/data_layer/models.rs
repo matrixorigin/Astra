@@ -76,6 +76,7 @@ async fn effective_model_catalog(
                 kind: ModelAccessKind::ThisDevice,
                 label: "This device".to_string(),
                 execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
             }],
             offerings: catalog
                 .models
@@ -96,6 +97,7 @@ async fn effective_model_catalog(
             kind: ModelAccessKind::SelfHosted,
             label: "Self-hosted".to_string(),
             execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
         }],
         offerings,
     })

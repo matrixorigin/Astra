@@ -47,6 +47,10 @@ pub async fn run_chat_route_and_models_smoke() {
     assert_eq!(accesses[0]["id"], "self-hosted");
     assert_eq!(accesses[0]["kind"], "self_hosted");
     assert_eq!(accesses[0]["execution_placement"], "server");
+    assert_eq!(accesses[0]["status"], "ready");
+    assert_eq!(accesses[0]["reason"], serde_json::Value::Null);
+    assert_eq!(accesses[0]["usable"], true);
+    assert_eq!(accesses[0]["retry_after_seconds"], serde_json::Value::Null);
 
     let effective_offerings = access_j["offerings"]
         .as_array()

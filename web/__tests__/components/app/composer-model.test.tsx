@@ -79,8 +79,6 @@ describe("Composer model selection", () => {
       catalogRevision: "sha256:catalog",
       observedAt: "2026-07-20T00:00:00Z",
       source: "astra",
-      status: "ready",
-      actions: [],
     });
     const onSubmit = vi.fn().mockResolvedValue(undefined);
 
