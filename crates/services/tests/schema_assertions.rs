@@ -1130,23 +1130,17 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "retry_of"],
         "retry lineage lookups must be owner-bound"
     );
-    assert_eq!(
-        index_columns(&pool, &schema, "agent_runs", "idx_agent_runs_recovery_scan").await,
-        [
-            "status",
-            "owner_lease_expires_at",
-            "updated_at",
-            "user_id",
-            "run_id"
-        ],
-        "restart recovery must use a bounded lease-aware ordered scan"
-    );
-    assert!(
-        index_columns(&pool, &schema, "agent_runs", "idx_agent_runs_status_lease")
-            .await
-            .is_empty(),
-        "the shorter recovery index must not duplicate the covering scan index"
-    );
+    for removed_index in [
+        "idx_agent_runs_recovery_scan",
+        "idx_agent_runs_status_lease",
+    ] {
+        assert!(
+            index_columns(&pool, &schema, "agent_runs", removed_index)
+                .await
+                .is_empty(),
+            "restart recovery must not depend on mutable-status-leading index {removed_index}"
+        );
+    }
     assert_eq!(
         index_columns(&pool, &schema, "agent_session_execution_slots", "PRIMARY").await,
         ["user_id", "session_id"],
@@ -2098,39 +2092,18 @@ async fn phase4_state_projection_schema_contract() {
         ["user_id", "status", "updated_at"],
         "cross-session user todo views must stay owner-bound"
     );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_status_updated_owner"
-        )
-        .await,
-        ["status", "updated_at", "user_id", "session_id", "todo_id"],
-        "global lifecycle sweeps must not full-scan every user's task history"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_archived_gc_owner"
-        )
-        .await,
-        ["status", "archived_at", "user_id", "session_id", "todo_id"],
-        "archived task GC must have a bounded global candidate path"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_session_status_updated"
-        )
-        .await
-        .is_empty(),
-        "session_todos must not keep the obsolete session-only status index"
-    );
+    for removed_index in [
+        "idx_session_todos_status_updated_owner",
+        "idx_session_todos_archived_gc_owner",
+        "idx_session_todos_session_status_updated",
+    ] {
+        assert!(
+            index_columns(&pool, &schema, "session_todos", removed_index)
+                .await
+                .is_empty(),
+            "global todo lifecycle must not depend on obsolete index {removed_index}"
+        );
+    }
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_todo_idempotency").await,
         ["user_id", "session_id", "action", "idempotency_key"],

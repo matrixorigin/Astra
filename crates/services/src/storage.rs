@@ -2105,7 +2105,6 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
             INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
             INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
-            INDEX idx_agent_runs_recovery_scan (status, owner_lease_expires_at, updated_at, user_id, run_id),
             INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
             INDEX idx_agent_runs_binding (agent_binding_id, created_at),
             INDEX idx_agent_runs_model_offering (model_offering_id, created_at)
@@ -2135,6 +2134,11 @@ async fn ensure_core_schema_while_leased(
         "idx_agent_runs_retry_of",
         "idx_agent_runs_user_updated",
         "idx_agent_runs_status_lease",
+        // Cross-owner recovery must observe the canonical table state. A
+        // mutable-status-leading secondary index can omit eligible lifecycle
+        // rows in MatrixOne, turning a bounded recovery scan into a false "no
+        // active work" result.
+        "idx_agent_runs_recovery_scan",
     ] {
         drop_index_if_present(&pool, &settings.database, "agent_runs", removed_index).await?;
     }
@@ -2163,17 +2167,6 @@ async fn ensure_core_schema_while_leased(
             "idx_agent_runs_owner_retry_of",
             &["user_id", "retry_of"][..],
             "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_owner_retry_of (user_id, retry_of)",
-        ),
-        (
-            "idx_agent_runs_recovery_scan",
-            &[
-                "status",
-                "owner_lease_expires_at",
-                "updated_at",
-                "user_id",
-                "run_id",
-            ][..],
-            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_recovery_scan (status, owner_lease_expires_at, updated_at, user_id, run_id)",
         ),
     ] {
         ensure_index_shape(
@@ -5423,9 +5416,7 @@ async fn ensure_core_schema_while_leased(
             PRIMARY KEY (user_id, session_id, todo_id),
             INDEX idx_session_todos_owner_session_ordinal (user_id, session_id, ordinal),
             INDEX idx_session_todos_owner_session_status_updated (user_id, session_id, status, updated_at),
-            INDEX idx_session_todos_user_status_updated (user_id, status, updated_at),
-            INDEX idx_session_todos_status_updated_owner (status, updated_at, user_id, session_id, todo_id),
-            INDEX idx_session_todos_archived_gc_owner (status, archived_at, user_id, session_id, todo_id)
+            INDEX idx_session_todos_user_status_updated (user_id, status, updated_at)
         )",
     )
     .execute(&pool)
@@ -5438,7 +5429,14 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_todos ADD PRIMARY KEY (user_id, session_id, todo_id)",
     )
     .await?;
-    for removed_index in ["idx_session_todos_session_status_updated"] {
+    for removed_index in [
+        "idx_session_todos_session_status_updated",
+        // Global sweepers own lifecycle convergence and therefore must read
+        // canonical rows rather than a mutable-status-leading secondary
+        // projection that can omit eligible work.
+        "idx_session_todos_status_updated_owner",
+        "idx_session_todos_archived_gc_owner",
+    ] {
         drop_index_if_present(&pool, &settings.database, "session_todos", removed_index).await?;
     }
     for (index, expected_columns, ddl) in [
@@ -5456,16 +5454,6 @@ async fn ensure_core_schema_while_leased(
             "idx_session_todos_user_status_updated",
             &["user_id", "status", "updated_at"][..],
             "ALTER TABLE session_todos ADD INDEX idx_session_todos_user_status_updated (user_id, status, updated_at)",
-        ),
-        (
-            "idx_session_todos_status_updated_owner",
-            &["status", "updated_at", "user_id", "session_id", "todo_id"][..],
-            "ALTER TABLE session_todos ADD INDEX idx_session_todos_status_updated_owner (status, updated_at, user_id, session_id, todo_id)",
-        ),
-        (
-            "idx_session_todos_archived_gc_owner",
-            &["status", "archived_at", "user_id", "session_id", "todo_id"][..],
-            "ALTER TABLE session_todos ADD INDEX idx_session_todos_archived_gc_owner (status, archived_at, user_id, session_id, todo_id)",
         ),
     ] {
         ensure_index_shape(
