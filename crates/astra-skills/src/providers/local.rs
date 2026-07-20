@@ -153,7 +153,7 @@ mod tests {
         create_test_skill(
             dir.path(),
             "review",
-            "---\nname: review\ndescription: Code review\ntriggers:\n  - review\n---\nReview the code.",
+            "---\nname: review\ndescription: Code review\n---\nReview the code.",
         );
         create_test_skill(
             dir.path(),

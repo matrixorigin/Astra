@@ -11,10 +11,6 @@ allowed_tools:
   - memoria-memory_retrieve
   - memoria-memory_store
   - memoria-memory_governance
-triggers:
-  - remember
-  - memories
-  - "clean up memories"
 when_to_use: "When the user explicitly wants to review stored memories, clean up stale knowledge, or organize what the agent remembers across sessions"
 category: meta
 tags:

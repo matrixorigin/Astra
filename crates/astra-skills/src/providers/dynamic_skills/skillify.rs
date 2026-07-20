@@ -7,11 +7,6 @@ allowed_tools:
   - read_file
   - write_file
   - bash
-triggers:
-  - skillify
-  - "make a skill"
-  - "save as skill"
-  - "create skill"
 when_to_use: "When the user explicitly wants to capture a useful workflow, prompt pattern, or set of instructions as a reusable skill"
 category: meta
 arguments:

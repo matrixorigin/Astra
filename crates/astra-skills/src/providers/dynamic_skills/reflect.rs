@@ -6,12 +6,6 @@ version: "1.0.0"
 allowed_tools:
   - bash
   - read_file
-triggers:
-  - reflect
-  - "step back"
-  - "what are you doing"
-  - "why did you"
-  - reconsider
 when_to_use: "When you sense you might be going down the wrong path, when the user questions your approach, or after multiple failed attempts at a task"
 category: meta
 tags:

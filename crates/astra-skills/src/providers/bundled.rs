@@ -140,9 +140,6 @@ mod tests {
     const SAMPLE_SKILL: &str = r#"---
 name: builtin-review
 description: "Built-in code review skill"
-triggers:
-  - review
-  - audit
 ---
 # Review Process
 

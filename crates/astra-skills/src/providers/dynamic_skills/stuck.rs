@@ -7,12 +7,6 @@ allowed_tools:
   - bash
   - read_file
   - delegate
-triggers:
-  - stuck
-  - "can't figure out"
-  - "going in circles"
-  - "tried everything"
-  - "not making progress"
 when_to_use: "When you or the user is stuck on a problem after multiple failed attempts, going in circles, or not making progress despite trying"
 category: diagnostics
 arguments:

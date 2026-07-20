@@ -15,11 +15,8 @@ mod verify;
 /// Returns all dynamic skill contents as `(frontmatter_yaml + body)` strings
 /// ready to be parsed by `parse_skill_md`.
 ///
-/// `batch` was deleted: its instructions told the model to call the
-/// removed `delegate` action, and its triggers (`parallel`, `bulk`,
-/// `for each`) auto-fired on read-only review requests. With
-/// the native fanout schema is advertised by the calling surface, parallel
-/// orchestration belongs to that surface rather than a broadly triggered skill.
+/// Parallel orchestration is owned by the native fanout surface rather than a
+/// skill-layer lifecycle.
 pub fn all_dynamic_skills() -> Vec<String> {
     vec![
         debug::skill_content(),
@@ -37,27 +34,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn returns_seven_skills() {
-        // Was 8 — `batch` removed (referenced removed `delegate` action,
-        // and its triggers auto-fired on read-only review requests).
-        assert_eq!(all_dynamic_skills().len(), 7);
-    }
+    fn dynamic_skills_are_valid_unique_manifests() {
+        let expected = [
+            "debug", "reflect", "remember", "review", "skillify", "stuck", "verify",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut actual = std::collections::BTreeSet::new();
 
-    /// Regression: the dynamic `batch` skill must NOT come back. It
-    /// referenced the removed `delegate` action and matched on overly
-    /// broad triggers like "parallel" / "bulk" / "for each", which
-    /// caused it to auto-fire on read-only multi-angle review requests
-    /// (session f3c4b457). Guarding against silent reintroduction.
-    #[test]
-    fn batch_dynamic_skill_is_not_reintroduced() {
-        let all = all_dynamic_skills().join("\n");
-        assert!(
-            !all.contains("name: batch\n"),
-            "the `batch` dynamic skill was deleted; do not reintroduce \
-             without first proving it doesn't auto-fire on read-only \
-             multi-angle review and that it does not reference removed \
-             tool actions"
-        );
+        for content in all_dynamic_skills() {
+            let (manifest, instructions) = crate::loader::parse_skill_md(&content)
+                .expect("every dynamic skill must satisfy the canonical manifest contract");
+            assert!(
+                actual.insert(manifest.name),
+                "dynamic skill names must be unique"
+            );
+            assert!(
+                !instructions.trim().is_empty(),
+                "dynamic skill instructions must not be empty"
+            );
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -68,45 +67,5 @@ mod tests {
             manifest.allowed_tools,
             vec!["bash", "read_file", "write_file"]
         );
-    }
-
-    #[test]
-    fn all_start_with_frontmatter() {
-        for (i, content) in all_dynamic_skills().into_iter().enumerate() {
-            assert!(
-                content.starts_with("---"),
-                "skill {i} should start with YAML frontmatter"
-            );
-        }
-    }
-
-    #[test]
-    fn all_contain_name_field() {
-        for (i, content) in all_dynamic_skills().into_iter().enumerate() {
-            assert!(
-                content.contains("name:"),
-                "skill {i} should contain name field"
-            );
-        }
-    }
-
-    #[test]
-    fn no_empty_skills() {
-        for content in all_dynamic_skills() {
-            assert!(content.len() > 50, "skill content should be substantial");
-        }
-    }
-
-    #[test]
-    fn individual_skill_names_present() {
-        let all = all_dynamic_skills().join("\n");
-        for name in [
-            "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
-        ] {
-            assert!(
-                all.contains(&format!("name: {name}")),
-                "missing skill: {name}"
-            );
-        }
     }
 }
