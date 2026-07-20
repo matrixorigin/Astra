@@ -1,7 +1,7 @@
 # Model access and inference
 
 > Status: target design contract.
-> Last updated: 2026-07-19.
+> Last updated: 2026-07-20.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
@@ -373,6 +373,14 @@ enum CredentialRequirement {
 
 The resolver selects the exact personal, Workspace, or deployment binding for an invocation and records it in the route.
 
+There is no independently writable `Model Gateway` registry. Server-owned
+endpoints are governed `InferenceConnection` facts. Provider- or Edge-owned
+endpoints arrive as authenticated, leased runtime capabilities and become
+route inputs only after admission. They are neither durable global gateway
+rows nor client-selectable routing identities. This keeps endpoint authority
+with its actual owner and prevents an administrative resource that appears
+configurable but has no effect on inference.
+
 ### Offering definition and effective Offering
 
 A shared catalog definition and a user's currently selectable product are different facts.
@@ -572,7 +580,7 @@ Client / Web / CLI
 Astra Server ── account/link/entitlement/billing/credential ──▶ TaaS control API
 ```
 
-TaaS account, OAuth, billing, and credential APIs remain on the control/materialization path. Prompt, tool schema, and inference stream go only to the resolved model endpoint. If TaaS itself serves the model endpoint, it is handled by a normal provider/gateway adapter.
+TaaS account, OAuth, billing, and credential APIs remain on the control/materialization path. Prompt, tool schema, and inference stream go only to the resolved model endpoint. If TaaS itself serves the model endpoint, it is handled by a normal provider adapter.
 
 The agent loop does not branch on whether a credential originated from TaaS, a Server vault, workload identity, or an Edge vault.
 

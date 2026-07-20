@@ -24,16 +24,11 @@ class SchemaInventoryTest(unittest.TestCase):
         }
         cls.summary = cls.inventory["summary"]
 
-    def test_core_storage_table_count_is_current_baseline(self) -> None:
-        core_tables = [
-            table
-            for table in self.inventory["tables"]
-            if table["domain"] == "core_storage"
-        ]
+    def test_every_production_table_has_semantic_metadata(self) -> None:
+        self.assertEqual(0, self.summary["unclassified_table_count"])
         self.assertEqual(
-            len(core_tables),
-            90,
-            "core storage DDL count changed; update the schema plan and inventory baseline",
+            self.summary["unique_table_count"],
+            self.summary["classified_table_count"],
         )
 
     def test_inventory_includes_non_storage_schema_owners(self) -> None:
@@ -250,7 +245,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "auth_tokens",
             "auth_audit_logs",
             "infra_llm_models",
-            "model_gateways",
             "runtime_llm_trusted_domains",
         }
         for table in config_security_tables:
@@ -320,14 +314,6 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn(
             "structured model registry",
             self.tables["infra_llm_models"]["merge_guidance"],
-        )
-        self.assertIn(
-            "disable instead of deleting",
-            self.tables["model_gateways"]["retention_policy"],
-        )
-        self.assertIn(
-            "distinct from concrete model credentials",
-            self.tables["model_gateways"]["merge_guidance"],
         )
         self.assertIn(
             "host/port trust policy",

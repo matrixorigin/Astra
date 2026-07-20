@@ -29,7 +29,6 @@ pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
-pub mod model_gateways;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
@@ -237,11 +236,6 @@ pub use mcp_registry::{
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
     McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
     UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
-};
-pub use model_gateways::{
-    DatabaseModelGatewayService, InMemoryModelGatewayService, ModelGatewayCreateRequestData,
-    ModelGatewayRecord, ModelGatewayService, ModelGatewayStatus, ModelProtocol,
-    UnconfiguredModelGatewayService,
 };
 pub use models::{
     AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,

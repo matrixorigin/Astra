@@ -935,32 +935,6 @@ export type AgentBindingRecord = {
   disabled_at?: string | null;
 };
 
-export type ModelProtocol = "openai_chat_completions";
-export type ModelGatewayStatus = "active" | "disabled" | "invalid";
-
-export type ModelGatewayCreateRequest = {
-  id: string;
-  resolve_url: string;
-  model_protocol: ModelProtocol;
-  metadata?: Record<string, unknown> | null;
-};
-
-export type ModelGatewayCreateResponse = {
-  id: string;
-  status: ModelGatewayStatus;
-};
-
-export type ModelGatewayRecord = {
-  id: string;
-  resolve_url: string;
-  model_protocol: ModelProtocol;
-  status: ModelGatewayStatus;
-  metadata?: Record<string, unknown> | null;
-  created_at: string;
-  updated_at: string;
-  disabled_at?: string | null;
-};
-
 export type RunStatus = {
   runId: string;
   sessionId: string;

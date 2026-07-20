@@ -17,7 +17,6 @@ export const PATH_CHAT_STREAM = "/chat/stream";
 export const PATH_MODELS = "/models";
 export const PATH_MODEL_ACCESS = "/model-access";
 export const PATH_AGENT_BINDINGS = "/agent-bindings";
-export const PATH_MODEL_GATEWAYS = "/model-gateways";
 
 export const PATH_MEMORY_STORE = "/memory/store";
 export const PATH_MEMORY_SEARCH = "/memory/search";
@@ -207,14 +206,6 @@ export function agentBindingPath(agentBindingId: string): string {
 
 export function agentBindingDisablePath(agentBindingId: string): string {
   return `${agentBindingPath(agentBindingId)}/disable`;
-}
-
-export function modelGatewayPath(modelGatewayId: string): string {
-  return `${PATH_MODEL_GATEWAYS}/${encodeURIComponent(modelGatewayId)}`;
-}
-
-export function modelGatewayDisablePath(modelGatewayId: string): string {
-  return `${modelGatewayPath(modelGatewayId)}/disable`;
 }
 
 /** Build `?a=1&b=2` from plain values (skips undefined / null). */

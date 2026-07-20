@@ -4474,22 +4474,6 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    query(
-        "CREATE TABLE IF NOT EXISTS model_gateways (
-            id VARCHAR(128) PRIMARY KEY,
-            resolve_url LONGTEXT NOT NULL,
-            model_protocol VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            metadata_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            disabled_at DATETIME(6) NULL,
-            INDEX idx_model_gateways_status_created (status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
     query(

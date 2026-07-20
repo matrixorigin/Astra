@@ -2322,8 +2322,6 @@ pub struct AgenticRunLifecycleService {
     mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Immutable Agent Binding snapshots for binding-backed chat loops.
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
-    /// Optional model gateway registry for per-turn model resolution.
-    model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
@@ -2395,7 +2393,6 @@ impl AgenticRunLifecycleService {
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
-            model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -2529,14 +2526,6 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::AgentBindingService>,
     ) -> Self {
         self.agent_binding_service = service;
-        self
-    }
-
-    pub fn with_model_gateway_service(
-        mut self,
-        service: Arc<dyn astra_services::ModelGatewayService>,
-    ) -> Self {
-        self.model_gateway_service = service;
         self
     }
 

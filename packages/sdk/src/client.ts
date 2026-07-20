@@ -19,9 +19,6 @@ import type {
   EventResponse,
   MemoryEntry,
   MemorySearchResult,
-  ModelGatewayCreateRequest,
-  ModelGatewayCreateResponse,
-  ModelGatewayRecord,
   ReflectQueryParams,
   ReflectReport,
   RegisterSkillBody,
@@ -83,7 +80,6 @@ import {
   PATH_MEMORY_STORE,
   PATH_MODELS,
   PATH_MODEL_ACCESS,
-  PATH_MODEL_GATEWAYS,
   PATH_RUNS,
   PATH_SESSIONS,
   PATH_SKILLS,
@@ -108,8 +104,6 @@ import {
   eventsCausalChainPath,
   eventsSessionPath,
   joinApiPath,
-  modelGatewayDisablePath,
-  modelGatewayPath,
   sessionActivityPath,
   sessionArtifactsPath,
   sessionAuditSummaryPath,
@@ -977,30 +971,6 @@ export class AstraClient {
   ): Promise<AgentBindingRecord> {
     return this.post<AgentBindingRecord>(
       agentBindingDisablePath(agentBindingId),
-      {},
-    );
-  }
-
-  // ─── Model Gateway Registry ───────────────────────────────────────
-
-  /** Admin-only: register global model execution infrastructure. */
-  async createModelGateway(
-    body: ModelGatewayCreateRequest,
-  ): Promise<ModelGatewayCreateResponse> {
-    return this.post<ModelGatewayCreateResponse>(PATH_MODEL_GATEWAYS, body);
-  }
-
-  /** Admin-only: inspect global model execution infrastructure. */
-  async getModelGateway(modelGatewayId: string): Promise<ModelGatewayRecord> {
-    return this.fetch<ModelGatewayRecord>(modelGatewayPath(modelGatewayId));
-  }
-
-  /** Admin-only: prevent new resolutions through a global model gateway. */
-  async disableModelGateway(
-    modelGatewayId: string,
-  ): Promise<ModelGatewayRecord> {
-    return this.post<ModelGatewayRecord>(
-      modelGatewayDisablePath(modelGatewayId),
       {},
     );
   }
