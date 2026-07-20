@@ -31,6 +31,8 @@ pub(super) struct ChatTurnRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     inference_purpose: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    round_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_turn: Option<serde_json::Value>,
@@ -379,9 +381,13 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_bridge_payload_fields(payload_object)?;
-    let Ok(mut request) = serde_json::from_value::<ChatTurnRequestBody>(payload) else {
-        return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
-    };
+    let mut request = serde_json::from_value::<ChatTurnRequestBody>(payload).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "chat turn request contains a field with an invalid type",
+            "chat_turn_request_invalid",
+        )
+    })?;
     validate_model_selection_shape(&request)?;
     validate_inference_purpose_shape(&request)?;
     validate_session_id_shape(&request)?;
@@ -1179,6 +1185,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "model_selection": model_selection(),
                 "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
+                "round_index": 4,
                 "messages": [{"role": "user", "content": "hello"}]
             }))
             .expect("body should serialize"),
@@ -1204,7 +1211,39 @@ mod tests {
             "offer-deepseek-v4-pro"
         );
         assert_eq!(payload["inference_purpose"], "primary_agent");
+        assert_eq!(payload["round_index"], 4);
         assert!(payload.get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_invalid_round_before_session_side_effects() {
+        let sessions = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(sessions.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "session_id": "bound-session",
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::SubAgent,
+                "round_index": -1,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, error) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                Ok(_) => panic!("negative round must fail at the typed request boundary"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.0.error_code.as_deref(),
+            Some("chat_turn_request_invalid")
+        );
+        assert_eq!(sessions.create_calls(), 0);
+        assert_eq!(sessions.get_calls(), 0);
     }
 
     #[tokio::test]
@@ -1842,6 +1881,8 @@ mod tests {
             "edge_profile": {"cwd": "/tmp"},
             "project_rules": {"max_tokens": 1000},
             "model_selection": {"offering_id": "offer-gpt-4"},
+            "inference_purpose": "sub_agent",
+            "round_index": 3,
             "execution_state": {"pending_tools": []},
             "custom_field": "preserved"
         });
@@ -1855,11 +1896,13 @@ mod tests {
         assert!(request.has_tool_results());
         assert_eq!(request.edge_tools_vec().unwrap().len(), 2);
         assert_eq!(request.offering_id(), Some("offer-gpt-4"));
+        assert_eq!(request.round_index, Some(3));
         assert!(serialized.get("model").is_none());
         assert!(request.execution_state_obj().is_some());
 
         // Forward-compat: unknown fields preserved
         assert_eq!(serialized.get("custom_field").unwrap(), &json!("preserved"));
+        assert_eq!(serialized.get("round_index"), Some(&json!(3)));
     }
 
     #[test]

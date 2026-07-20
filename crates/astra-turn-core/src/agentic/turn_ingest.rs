@@ -61,7 +61,9 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
         cache_creation_tokens: accum.cache_creation_tokens,
         has_usage: accum.has_usage,
         error_message: &accum.error_message,
-        error_kind,
+        // A host-side kind is an authoritative override, but absence must not
+        // erase the typed kind already decoded from the SSE producer.
+        error_kind: error_kind.or(accum.error_kind),
     }
 }
 
@@ -479,6 +481,37 @@ mod tests {
             snap.error_kind,
             Some(astra_core::ErrorKind::MissingModelSelection)
         );
+    }
+
+    #[test]
+    fn absent_host_error_kind_does_not_erase_sse_classification() {
+        let accum = ChatTurnSseAccum {
+            error_message: Some("durable inference conflict".into()),
+            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            ..Default::default()
+        };
+
+        let snap = agentic_turn_stream_snapshot_with_kind(&accum, None, None);
+        assert_eq!(
+            snap.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+    }
+
+    #[test]
+    fn host_error_kind_overrides_sse_classification_when_present() {
+        let accum = ChatTurnSseAccum {
+            error_message: Some("provider rejected request".into()),
+            error_kind: Some(astra_core::ErrorKind::Unknown),
+            ..Default::default()
+        };
+
+        let snap = agentic_turn_stream_snapshot_with_kind(
+            &accum,
+            None,
+            Some(astra_core::ErrorKind::InvalidRequest),
+        );
+        assert_eq!(snap.error_kind, Some(astra_core::ErrorKind::InvalidRequest));
     }
 
     #[test]

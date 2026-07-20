@@ -29,6 +29,18 @@ pub(crate) fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
 }
 
+pub(crate) fn render_classified_error_sse(
+    error: &astra_core::ClassifiedError,
+    code: &str,
+    retryable: bool,
+) -> Bytes {
+    render_sse_map(
+        &astra_turn_core::stream_events::build_classified_stream_error_event(
+            error, code, retryable,
+        ),
+    )
+}
+
 /// Emit a `reasoning_done` SSE event if reasoning text is non-empty.
 ///
 /// For Bedrock thinking mode, `signature` must travel with the reasoning back

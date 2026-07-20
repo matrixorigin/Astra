@@ -2253,9 +2253,6 @@ pub(crate) fn should_emit_search_fanout_advisory(
     if state.stall.search_fanout_advisory_emitted {
         return false;
     }
-    if !state.task_profile.mutates_workspace {
-        return false;
-    }
     astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records) >= threshold
 }
 
@@ -2283,7 +2280,7 @@ pub(crate) fn cache_waste_advisory_message(
 pub(crate) fn search_fanout_advisory_message(count: usize, original_query: &str) -> String {
     format!(
         "{SEARCH_FANOUT_MARKER}\n\
-         Observation: {count} grep/rg/find-like search calls occurred in an implementation turn. \
+         Observation: {count} grep/rg/find-like search calls occurred in the current investigation. \
          Broad search has crossed the low-yield threshold: more search is likely to expand context instead of finishing the task.\n\n\
          Recommendation: consider synthesizing the current evidence before widening \
          discovery. A specific edit, narrow validation, exact file/range read, or final \
@@ -4994,7 +4991,7 @@ mod tests {
     }
 
     #[test]
-    fn search_fanout_advisory_skips_read_only_review() {
+    fn search_fanout_advisory_fires_for_read_only_review() {
         let mut state = make_state();
         state.message = "review the branch".into();
         state.user_intent = state.message.clone();
@@ -5003,7 +5000,7 @@ mod tests {
             push_search_call(&mut state, idx);
         }
 
-        assert!(!should_emit_search_fanout_advisory(&state, 8));
+        assert!(should_emit_search_fanout_advisory(&state, 8));
     }
 
     #[test]

@@ -17,6 +17,11 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub inference_purpose: astra_turn_types::InferencePurpose,
+    /// Producer-owned index of the current model invocation within the
+    /// agentic turn. Durable inference admission uses this coordinate to
+    /// distinguish adjacent tool rounds while keeping transport retries of
+    /// the same round idempotent.
+    pub round_index: u32,
     pub offering_id: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
@@ -40,6 +45,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         session_id,
         agent_id,
         inference_purpose,
+        round_index,
         offering_id,
         interaction_mode,
         explain_verbose,
@@ -56,6 +62,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "session_id": session_id,
         "agent_id": agent_id,
         "inference_purpose": inference_purpose,
+        "round_index": round_index,
         "interaction_mode": interaction_mode,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
@@ -171,6 +178,7 @@ mod tests {
             session_id: None,
             agent_id: Some("test-agent"),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
+            round_index: 7,
             offering_id: Some("offer-gpt-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
@@ -186,6 +194,7 @@ mod tests {
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
         assert_eq!(p["inference_purpose"], "sub_agent");
+        assert_eq!(p["round_index"], 7);
         assert!(p.get("model").is_none());
         assert_eq!(p["model_selection"]["offering_id"], "offer-gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
@@ -212,6 +221,7 @@ mod tests {
             session_id: Some("sess-1"),
             agent_id: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
             offering_id: None,
             interaction_mode: None,
             explain_verbose: true,
@@ -236,6 +246,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
             offering_id: None,
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
@@ -260,6 +271,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
             offering_id: None,
             interaction_mode: None,
             explain_verbose: false,

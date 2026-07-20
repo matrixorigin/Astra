@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::turn::bridge::sse_helpers::render_sse;
+use crate::turn::bridge::sse_helpers::{render_classified_error_sse, render_sse};
 use crate::turn::llm::client::{
     LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, ProviderAttemptObserver,
     apply_llm_header_overrides, apply_provider_auth, build_provider_request_body_with_overrides,
@@ -162,12 +162,7 @@ fn classified_stream_error_event(error: &astra_core::ClassifiedError, code: &str
     // Once a streaming response exists, delivery may already have happened.
     // The current invocation must never invite an automatic reissue. Explicit
     // HTTP/provider rejections are handled before this streaming boundary.
-    let mut event = crate::build_stream_error_event(&error.message, code, false);
-    event.insert(
-        "error_kind".to_string(),
-        Value::String(error.kind.as_str().to_string()),
-    );
-    render_sse(&Value::Object(event))
+    render_classified_error_sse(error, code, false)
 }
 
 fn turn_timeout_s() -> f64 {

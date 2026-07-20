@@ -659,7 +659,7 @@ fn bridge_prompt_snapshot_from_messages(
 // ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
 use super::sse_helpers::{
     extend_forward_from_validated_sse_block, flush_tail_buf_into_llm_forward,
-    reasoning_done_sse_bytes_if_needed, render_sse, render_sse_map,
+    reasoning_done_sse_bytes_if_needed, render_classified_error_sse, render_sse, render_sse_map,
 };
 
 fn preview_chars(value: &str, limit: usize) -> String {
@@ -2936,11 +2936,15 @@ impl InProcessChatTurnBridge {
                         futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
                     } else {
                         let Some(pool) = shared_pool.clone() else {
-                            yield render_sse_map(&build_stream_error_event(
+                            let error = bridge_stream_terminal_error(
+                                astra_core::ErrorKind::DatabaseError,
                                 "Durable inference storage is unavailable",
+                            );
+                            yield render_classified_error_sse(
+                                &error,
                                 "inference_ledger",
-                                true,
-                            ));
+                                error.kind.is_retryable(),
+                            );
                             mark_disconnect_capture_finalized(&disconnect_capture_state);
                             return;
                         };
@@ -3001,11 +3005,11 @@ impl InProcessChatTurnBridge {
                                     astra_core::ErrorKind::ContractViolation,
                                     format!("durable inference admission task failed: {error}"),
                                 );
-                                yield render_sse_map(&build_stream_error_event(
-                                    &error.message,
+                                yield render_classified_error_sse(
+                                    &error,
                                     "inference_ledger",
-                                    true,
-                                ));
+                                    error.kind.is_retryable(),
+                                );
                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                 return;
                             }
@@ -3020,11 +3024,11 @@ impl InProcessChatTurnBridge {
                                 } else {
                                     error.kind.as_str()
                                 };
-                                yield render_sse_map(&build_stream_error_event(
-                                    &error.message,
+                                yield render_classified_error_sse(
+                                    &error,
                                     code,
                                     error.kind.is_retryable(),
-                                ));
+                                );
                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                 return;
                             }
@@ -3259,11 +3263,11 @@ impl InProcessChatTurnBridge {
                                         finish_active_bridge_inference_error(&active_inference, &e2)
                                             .await
                                     {
-                                        yield render_sse_map(&build_stream_error_event(
-                                            &ledger_error.message,
+                                        yield render_classified_error_sse(
+                                            &ledger_error,
                                             "inference_ledger",
                                             false,
-                                        ));
+                                        );
                                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                                         return;
                                     }
@@ -3340,11 +3344,11 @@ impl InProcessChatTurnBridge {
                             if let Err(ledger_error) =
                                 finish_active_bridge_inference_error(&active_inference, &e).await
                             {
-                                yield render_sse_map(&build_stream_error_event(
-                                    &ledger_error.message,
+                                yield render_classified_error_sse(
+                                    &ledger_error,
                                     "inference_ledger",
                                     false,
-                                ));
+                                );
                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                 return;
                             }
@@ -3534,11 +3538,11 @@ impl InProcessChatTurnBridge {
                                                 )
                                                 .await
                                             {
-                                                yield render_sse_map(&build_stream_error_event(
-                                                    &ledger_error.message,
+                                                yield render_classified_error_sse(
+                                                    &ledger_error,
                                                     "inference_ledger",
                                                     false,
-                                                ));
+                                                );
                                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                                 return;
                                             }
@@ -3679,11 +3683,11 @@ impl InProcessChatTurnBridge {
                             )
                             .await
                             {
-                                yield render_sse_map(&build_stream_error_event(
-                                    &ledger_error.message,
+                                yield render_classified_error_sse(
+                                    &ledger_error,
                                     "inference_ledger",
                                     false,
-                                ));
+                                );
                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                 return;
                             }
@@ -3778,11 +3782,11 @@ impl InProcessChatTurnBridge {
                             )
                             .await
                             {
-                                yield render_sse_map(&build_stream_error_event(
-                                    &ledger_error.message,
+                                yield render_classified_error_sse(
+                                    &ledger_error,
                                     "inference_ledger",
                                     false,
-                                ));
+                                );
                                 mark_disconnect_capture_finalized(&disconnect_capture_state);
                                 return;
                             }
@@ -3856,11 +3860,11 @@ impl InProcessChatTurnBridge {
                         )
                         .await
                         {
-                            yield render_sse_map(&build_stream_error_event(
-                                &ledger_error.message,
+                            yield render_classified_error_sse(
+                                &ledger_error,
                                 "inference_ledger",
                                 false,
-                            ));
+                            );
                             mark_disconnect_capture_finalized(&disconnect_capture_state);
                             return;
                         }
@@ -3941,11 +3945,11 @@ impl InProcessChatTurnBridge {
                     if let Err(ledger_error) =
                         finish_active_bridge_inference(&active_inference, &terminal).await
                     {
-                        yield render_sse_map(&build_stream_error_event(
-                            &ledger_error.message,
+                        yield render_classified_error_sse(
+                            &ledger_error,
                             "inference_ledger",
                             false,
-                        ));
+                        );
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }

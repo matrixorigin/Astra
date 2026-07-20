@@ -126,7 +126,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     };
     let plan = plan_inference_invocation(input.clone()).expect("plan invocation");
 
-    let mut wrong_owner_input = input;
+    let mut wrong_owner_input = input.clone();
     wrong_owner_input.user_id = format!("other-{suffix}");
     let wrong_owner = plan_inference_invocation(wrong_owner_input).expect("wrong-owner plan");
     assert_eq!(
@@ -302,6 +302,36 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
             .kind,
         ServiceErrorKind::Conflict
     );
+
+    // The adjacent agentic round is a different logical invocation even when
+    // every other causal coordinate is unchanged. This is the online contract
+    // that prevents a successful tool round from blocking the model call that
+    // consumes its result.
+    let mut next_round_input = input;
+    let InferenceInvocationScope::Run { round, .. } = &mut next_round_input.scope else {
+        unreachable!("test input uses run scope");
+    };
+    *round = round.saturating_add(1);
+    let next_round = plan_inference_invocation(next_round_input).expect("plan adjacent round");
+    assert_ne!(plan.invocation_id(), next_round.invocation_id());
+    admit_inference_invocation(&shared_pool, &next_round)
+        .await
+        .expect("adjacent round must admit independently");
+
+    let durable_rounds = sqlx::query(
+        "SELECT round_index FROM inference_invocations
+         WHERE user_id = ? AND session_id = ? AND turn_index = 4
+         ORDER BY round_index",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("load adjacent durable rounds")
+    .into_iter()
+    .map(|row| row.get::<i64, _>("round_index"))
+    .collect::<Vec<_>>();
+    assert_eq!(durable_rounds, vec![2, 3]);
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

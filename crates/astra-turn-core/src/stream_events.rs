@@ -19,6 +19,24 @@ pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> M
     event
 }
 
+/// Build an SSE error while preserving both the product/protocol `code` and
+/// the producer's typed runtime classification.
+///
+/// A code such as `inference_ledger` identifies the failing boundary; it is
+/// deliberately not required to duplicate [`astra_core::ErrorKind`].
+pub fn build_classified_stream_error_event(
+    error: &astra_core::ClassifiedError,
+    code: &str,
+    retryable: bool,
+) -> Map<String, Value> {
+    let mut event = build_stream_error_event(&error.message, code, retryable);
+    event.insert(
+        "error_kind".to_string(),
+        Value::String(error.kind.as_str().to_string()),
+    );
+    event
+}
+
 /// Configuration for a single error kind: the SSE error code, whether it is retryable,
 /// and the retry-after delay (if any).
 struct ErrorKindConfig {
@@ -637,6 +655,54 @@ mod tests {
         assert_eq!(
             ev.get("error_kind").and_then(Value::as_str),
             Some("missing_model_selection")
+        );
+    }
+
+    #[test]
+    fn classified_stream_error_keeps_boundary_code_and_typed_kind_distinct() {
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "duplicate inference identity",
+        );
+        let ev = build_classified_stream_error_event(&error, "inference_ledger", false);
+
+        assert_eq!(
+            ev.get("code").and_then(Value::as_str),
+            Some("inference_ledger")
+        );
+        assert_eq!(
+            ev.get("error_kind").and_then(Value::as_str),
+            Some("contract_violation")
+        );
+        assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn classified_stream_error_survives_sse_decode_and_host_snapshot() {
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "duplicate inference identity",
+        );
+        let event = Value::Object(build_classified_stream_error_event(
+            &error,
+            "inference_ledger",
+            false,
+        ));
+        let block = format!("data: {event}\n\n");
+        let mut accum = crate::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        let mut edge_pending = Vec::new();
+
+        crate::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &block,
+            &mut accum,
+            &mut edge_pending,
+        );
+        let snapshot =
+            crate::agentic::turn_ingest::agentic_turn_stream_snapshot_with_kind(&accum, None, None);
+
+        assert_eq!(
+            snapshot.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
         );
     }
 

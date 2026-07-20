@@ -505,6 +505,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+        round_index: ctx.round_index,
         offering_id: ctx.offering_id,
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
@@ -971,10 +972,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ctx.skill_effort.as_deref(),
         ctx.skill_agent_type.as_deref(),
     );
-    // Inject round_index so the bridge can add tool round directives.
-    if let Some(root) = payload.as_object_mut() {
-        root.insert("round_index".into(), json!(ctx.round_index));
-    }
     inject_bridge_turn_identity(
         &mut payload,
         ctx.session_turn,
