@@ -983,16 +983,19 @@ export class AstraClient {
 
   // ─── Model Gateway Registry ───────────────────────────────────────
 
+  /** Admin-only: register global model execution infrastructure. */
   async createModelGateway(
     body: ModelGatewayCreateRequest,
   ): Promise<ModelGatewayCreateResponse> {
     return this.post<ModelGatewayCreateResponse>(PATH_MODEL_GATEWAYS, body);
   }
 
+  /** Admin-only: inspect global model execution infrastructure. */
   async getModelGateway(modelGatewayId: string): Promise<ModelGatewayRecord> {
     return this.fetch<ModelGatewayRecord>(modelGatewayPath(modelGatewayId));
   }
 
+  /** Admin-only: prevent new resolutions through a global model gateway. */
   async disableModelGateway(
     modelGatewayId: string,
   ): Promise<ModelGatewayRecord> {

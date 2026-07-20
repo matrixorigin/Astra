@@ -96,8 +96,8 @@
 //!   estimate fields); 401 without auth (no DDL branch ops).
 //! - **`e2e_matrix_delegate_http_boundaries`** — `POST /chat` → `run_id`; `GET .../delegations`;
 //!   `POST .../delegate` fails at validation (`400`) without executing sub-runs.
-//! - **`e2e_matrix_admin_tokens_smoke`** — `GET /admin/tokens`: `403` without `astra_admin`,
-//!   then `200` + JSON array after `grant_astra_admin_role`.
+//! - **`e2e_matrix_admin_control_plane_rbac`** — global token and model-gateway control-plane
+//!   routes reject normal users, then work after `grant_astra_admin_role`.
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -590,9 +590,9 @@ async fn e2e_matrix_delegate_http_boundaries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_admin_tokens_smoke() {
+async fn e2e_matrix_admin_control_plane_rbac() {
     require_system_e2e_env();
-    journey_admin_smoke_matrix::run_admin_tokens_smoke().await;
+    journey_admin_smoke_matrix::run_admin_control_plane_rbac().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

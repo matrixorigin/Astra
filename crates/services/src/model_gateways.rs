@@ -22,6 +22,19 @@ pub enum ModelProtocol {
     OpenAiChatCompletions,
 }
 
+impl ModelProtocol {
+    pub fn from_wire_value(raw: &str) -> Result<Self, (StatusCode, Json<ErrorResponse>)> {
+        match raw {
+            "openai_chat_completions" => Ok(Self::OpenAiChatCompletions),
+            _ => Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model gateway protocol is not implemented",
+                "model_gateway_protocol_unsupported",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelGatewayStatus {
@@ -349,17 +362,6 @@ fn model_protocol_wire(protocol: &ModelProtocol) -> &'static str {
     }
 }
 
-fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, (StatusCode, Json<ErrorResponse>)> {
-    match raw {
-        "openai_chat_completions" => Ok(ModelProtocol::OpenAiChatCompletions),
-        _ => Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "model gateway protocol is not implemented",
-            "model_gateway_protocol_unsupported",
-        )),
-    }
-}
-
 async fn load_gateway_row(
     pool: &sqlx::Pool<MySql>,
     id: &str,
@@ -409,7 +411,7 @@ fn model_gateway_from_row(
     Ok(ModelGatewayRecord {
         id: row.try_get("id").map_err(internal_error)?,
         resolve_url: row.try_get("resolve_url").map_err(internal_error)?,
-        model_protocol: parse_model_protocol(&protocol)?,
+        model_protocol: ModelProtocol::from_wire_value(&protocol)?,
         status: ModelGatewayStatus::from_db_value(
             &row.try_get::<String, _>("status").map_err(internal_error)?,
         )?,

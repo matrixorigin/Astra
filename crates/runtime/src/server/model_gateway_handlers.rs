@@ -15,37 +15,43 @@ impl From<&astra_services::ModelGatewayRecord> for ModelGatewayCreateResponse {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelGatewayCreateWireRequest {
+    id: String,
+    resolve_url: String,
+    model_protocol: String,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+fn decode_model_gateway_create_request(
+    body: &[u8],
+) -> Result<astra_services::ModelGatewayCreateRequestData, (StatusCode, Json<ErrorResponse>)> {
+    let wire = serde_json::from_slice::<ModelGatewayCreateWireRequest>(body).map_err(|error| {
+        astra_core::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("model gateway request payload is invalid: {error}"),
+            "model_gateway_invalid",
+        )
+    })?;
+    Ok(astra_services::ModelGatewayCreateRequestData {
+        id: wire.id,
+        resolve_url: wire.resolve_url,
+        model_protocol: astra_services::ModelProtocol::from_wire_value(&wire.model_protocol)?,
+        metadata: wire.metadata,
+    })
+}
+
 pub(super) async fn create_model_gateway_handler(
     State(state): State<AppState>,
-    method: Method,
-    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ModelGatewayCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _principal = state
-        .auth_service
-        .current_principal_for_request(
-            &headers,
-            external_request_descriptor(&method, &uri, &headers, "/model-gateways", &body),
-        )
-        .await?;
-    let request = serde_json::from_slice::<astra_services::ModelGatewayCreateRequestData>(&body)
-        .map_err(|error| model_gateway_json_error_from_body_text(&error.to_string()))?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
+    let request = decode_model_gateway_create_request(&body)?;
     let record = state.model_gateway_service.create_gateway(request).await?;
     Ok(Json((&record).into()))
-}
-
-fn model_gateway_json_error_from_body_text(detail: &str) -> (StatusCode, Json<ErrorResponse>) {
-    let code = if detail.contains("unknown variant") {
-        "model_gateway_protocol_unsupported"
-    } else {
-        "model_gateway_invalid"
-    };
-    astra_core::error_response_coded(
-        StatusCode::BAD_REQUEST,
-        format!("model gateway request payload is invalid: {detail}"),
-        code,
-    )
 }
 
 pub(super) async fn get_model_gateway_handler(
@@ -53,7 +59,7 @@ pub(super) async fn get_model_gateway_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<astra_services::ModelGatewayRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let record = state.model_gateway_service.get_gateway(id).await?;
     Ok(Json(record))
 }
@@ -63,7 +69,7 @@ pub(super) async fn disable_model_gateway_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<astra_services::ModelGatewayRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let record = state.model_gateway_service.disable_gateway(id).await?;
     Ok(Json(record))
 }
@@ -73,10 +79,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_gateway_unknown_protocol_json_error_maps_to_contract_code() {
-        let err = model_gateway_json_error_from_body_text(
-            "unknown variant `legacy`, expected `openai_chat_completions` at line 1 column 42 while parsing field model_protocol",
-        );
+    fn model_gateway_unknown_protocol_has_typed_contract_error() {
+        let err = decode_model_gateway_create_request(
+            br#"{"id":"gateway-a","resolve_url":"https://gateway.example/v1","model_protocol":"legacy"}"#,
+        )
+        .expect_err("unsupported protocol");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             err.1.error_code.as_deref(),
@@ -85,9 +92,27 @@ mod tests {
     }
 
     #[test]
-    fn model_gateway_other_json_error_maps_to_invalid() {
-        let err = model_gateway_json_error_from_body_text("missing field `resolve_url`");
+    fn malformed_model_gateway_payload_has_shape_error() {
+        let err = decode_model_gateway_create_request(
+            br#"{"id":"gateway-a","model_protocol":"openai_chat_completions"}"#,
+        )
+        .expect_err("missing endpoint");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1.error_code.as_deref(), Some("model_gateway_invalid"));
+    }
+
+    #[test]
+    fn model_gateway_wire_request_decodes_without_transport_fields_leaking() {
+        let request = decode_model_gateway_create_request(
+            br#"{"id":"gateway-a","resolve_url":"https://gateway.example/v1","model_protocol":"openai_chat_completions","metadata":{"region":"cn"}}"#,
+        )
+        .expect("valid request");
+        assert_eq!(request.id, "gateway-a");
+        assert_eq!(request.resolve_url, "https://gateway.example/v1");
+        assert_eq!(
+            request.model_protocol,
+            astra_services::ModelProtocol::OpenAiChatCompletions
+        );
+        assert_eq!(request.metadata, Some(serde_json::json!({"region": "cn"})));
     }
 }
