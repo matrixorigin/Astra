@@ -219,27 +219,6 @@ pub fn read_git_branch_abbrev() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Runtime memory-provider binding for the cross-process request envelope.
-/// This is transport configuration, not prompt context, so callers must keep
-/// it outside `edge_profile`.
-pub fn build_runtime_memory_binding_value() -> Value {
-    let mem = astra_core::MemoriaSettings::from_env();
-    json!({
-        "provider": "memoria",
-        "base_url": mem.base_url,
-        "api_key": mem.master_key.unwrap_or_default(),
-        "retrieval_top_k": retrieval_top_k_from_env(),
-    })
-}
-
-/// Retrieval top_k from environment (same semantics as RuntimeConfig).
-fn retrieval_top_k_from_env() -> u32 {
-    std::env::var("ASTRA_RETRIEVAL_TOP_K")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(5) // default same as RuntimeConfig
-}
-
 /// Static `edge_profile` object before optional `active_skills` / skill context.
 pub fn build_base_edge_profile_value(
     cwd: &str,

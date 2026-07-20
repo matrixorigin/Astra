@@ -261,44 +261,6 @@ impl CachedSessionStartMemory {
     }
 }
 
-fn resolve_bridge_memory_provider(
-    server_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
-    request_binding: &Map<String, Value>,
-) -> (
-    Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
-    Option<&'static str>,
-) {
-    if let Some(client) = server_client {
-        return (Some(client), Some("server_config"));
-    }
-    if request_binding.get("provider").and_then(Value::as_str) != Some("memoria") {
-        return (None, None);
-    }
-    let Some(base_url) = request_binding
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-    let Some(api_key) = request_binding
-        .get("api_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return (None, None);
-    };
-    (
-        Some(crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
-            base_url.to_string(),
-            api_key.to_string(),
-        )),
-        Some("request_binding"),
-    )
-}
-
 async fn cached_first_turn_session_start_memory<F, Fut>(
     cache: &tokio::sync::Mutex<HashMap<String, CachedSessionStartMemory>>,
     session_id: &str,
@@ -1641,8 +1603,6 @@ impl InProcessChatTurnBridge {
                 )
                 .and_then(Value::as_array)
                 .is_some_and(|texts| !texts.is_empty());
-        let runtime_memory_binding =
-            optional_nested_payload_object(&payload, "runtime_bindings", "memory")?;
         let explain = explain_requested(&payload);
         let model_offering_id = Some(admitted_model_execution.offering_id.clone());
         let round_index = bridge_round_index(&payload)?;
@@ -2028,16 +1988,12 @@ impl InProcessChatTurnBridge {
             // CLI-local recall may still inform tool selection, but it does
             // not provide an alternate prompt-text format.
             let mut memoria_prefetch_entries = Vec::new();
-            // Runtime configuration owns the provider. A server-configured
-            // client covers Server Only and takes precedence; an edge-
-            // supplied runtime binding is a capability fallback for
-            // CLI+Server / Edge+Server. Credentials never enter prompt
-            // assembly.
-            let (memoria_client_for_turn, memory_provider_source) =
-                resolve_bridge_memory_provider(
-                    memoria_client_owned.clone(),
-                    &runtime_memory_binding,
-                );
+            // Runtime configuration owns the memory provider. Client and Edge
+            // requests may contribute typed memory evidence, but cannot supply
+            // an endpoint or credential for Server to execute.
+            let memoria_client_for_turn = memoria_client_owned.clone();
+            let memory_provider_source =
+                memoria_client_for_turn.as_ref().map(|_| "server_config");
             // First-turn profile/episode prewarm and query-relevant per-turn
             // recall both enter the same typed Memory lane. Recall never
             // becomes a rendered stable-prefix block.
@@ -2054,10 +2010,10 @@ impl InProcessChatTurnBridge {
                     .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
                     .and_then(|m| m.get("content").and_then(Value::as_str))
                     .unwrap_or("");
-                let top_k = runtime_memory_binding
-                    .get("retrieval_top_k")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(5) as u32;
+                let top_k = astra_config::runtime_config::RuntimeConfig::cached()
+                    .memory
+                    .retrieval_top_k
+                    .clamp(1, 20);
 
                 // Per-turn hybrid recall runs every turn; session-start
                 // (profile + episodes) only on turn 1.
@@ -4866,14 +4822,13 @@ fn parse_bridge_payload(body: &Bytes) -> Result<Value, (StatusCode, String)> {
             format!("invalid bridge request JSON: {error}"),
         )
     })?;
-    if payload.is_object() {
-        Ok(payload)
-    } else {
-        Err((
+    if !payload.is_object() {
+        return Err((
             StatusCode::BAD_REQUEST,
             "bridge request body must be a JSON object".to_string(),
-        ))
+        ));
     }
+    Ok(payload)
 }
 
 fn bridge_round_index(payload: &Value) -> Result<u32, (StatusCode, String)> {
@@ -4912,22 +4867,6 @@ fn optional_payload_object(
         Some(_) => Err((
             StatusCode::BAD_REQUEST,
             format!("bridge payload field `{field}` must be an object"),
-        )),
-        None => Ok(Map::new()),
-    }
-}
-
-fn optional_nested_payload_object(
-    payload: &Value,
-    parent_field: &'static str,
-    field: &'static str,
-) -> Result<Map<String, Value>, (StatusCode, String)> {
-    let parent = optional_payload_object(payload, parent_field)?;
-    match parent.get(field) {
-        Some(Value::Object(values)) => Ok(values.clone()),
-        Some(_) => Err((
-            StatusCode::BAD_REQUEST,
-            format!("bridge payload field `{parent_field}.{field}` must be an object"),
         )),
         None => Ok(Map::new()),
     }
@@ -5225,41 +5164,6 @@ mod tests {
 
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert_eq!(second, first);
-    }
-
-    #[test]
-    fn bridge_memory_provider_supports_request_binding_and_prefers_server_config() {
-        let request_binding = json!({
-            "provider": "memoria",
-            "base_url": "http://request-memory",
-            "api_key": "request-key",
-            "retrieval_top_k": 7,
-        })
-        .as_object()
-        .expect("binding")
-        .clone();
-
-        let (request_client, request_source) =
-            resolve_bridge_memory_provider(None, &request_binding);
-        assert!(request_client.is_some());
-        assert_eq!(request_source, Some("request_binding"));
-
-        let server_client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
-            "http://server-memory".into(),
-            "server-key".into(),
-        );
-        let (resolved, source) =
-            resolve_bridge_memory_provider(Some(server_client), &request_binding);
-        assert!(resolved.is_some());
-        assert_eq!(source, Some("server_config"));
-
-        let invalid = json!({"provider": "memoria", "base_url": "http://memory"})
-            .as_object()
-            .expect("invalid binding")
-            .clone();
-        let (missing, source) = resolve_bridge_memory_provider(None, &invalid);
-        assert!(missing.is_none());
-        assert!(source.is_none());
     }
 
     #[tokio::test]

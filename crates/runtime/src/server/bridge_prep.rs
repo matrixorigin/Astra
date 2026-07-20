@@ -275,6 +275,16 @@ fn validate_inference_purpose_shape(
 fn validate_bridge_payload_fields(
     payload: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(field) = astra_turn_types::client_direct_execution_field(payload) {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "client field `{field}` cannot select an execution endpoint, credential, or placement"
+            ),
+            "client_execution_override_forbidden",
+        ));
+    }
+
     match payload.get("messages") {
         Some(serde_json::Value::Array(_)) => {}
         Some(_) => {
@@ -1349,6 +1359,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_body_rejects_request_scoped_credentials_before_session_lookup() {
+        let session_service = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model_selection": model_selection(),
+                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
+                "session_id": "existing-session",
+                "messages": [{"role": "user", "content": "hello"}],
+                "runtime_bindings": {
+                    "memory": {
+                        "provider": "memoria",
+                        "base_url": "https://untrusted.invalid",
+                        "api_key": "must-not-cross-the-boundary"
+                    }
+                }
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                Ok(_) => panic!("request-scoped credentials must be rejected"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("client_execution_override_forbidden")
+        );
+        assert_eq!(session_service.create_calls(), 0);
+        assert_eq!(session_service.get_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn prepare_body_reuses_cached_session_turn_for_continuation() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
@@ -1933,6 +1980,21 @@ mod tests {
                     panic!("{raw} should be valid, got {:?}", err.1.0.detail)
                 }),
             }
+        }
+    }
+
+    #[test]
+    fn bridge_payload_rejects_every_client_execution_override_field() {
+        for field in astra_turn_types::CLIENT_DIRECT_EXECUTION_FIELDS {
+            let payload = serde_json::Map::from_iter([(field.to_string(), json!({}))]);
+            let (status, body) = validate_bridge_payload_fields(&payload)
+                .expect_err("client execution overrides must fail closed");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "field={field}");
+            assert_eq!(
+                body.0.error_code.as_deref(),
+                Some("client_execution_override_forbidden"),
+                "field={field}"
+            );
         }
     }
 

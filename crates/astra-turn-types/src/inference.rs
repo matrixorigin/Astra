@@ -1,4 +1,33 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Client request fields that would bypass Offering admission by selecting
+/// execution material directly.
+///
+/// Exact object-key matching is intentional: this is a wire-schema boundary,
+/// not prose classification. Server-owned resolved route fields use different
+/// names and are added only after authenticated admission.
+pub const CLIENT_DIRECT_EXECUTION_FIELDS: [&str; 12] = [
+    "runtime_bindings",
+    "api_key",
+    "authorization",
+    "base_url",
+    "provider",
+    "gateway",
+    "gateway_id",
+    "connection_id",
+    "execution_placement",
+    "endpoint",
+    "endpoint_url",
+    "request_headers",
+];
+
+#[must_use]
+pub fn client_direct_execution_field(payload: &Map<String, Value>) -> Option<&'static str> {
+    CLIENT_DIRECT_EXECUTION_FIELDS
+        .into_iter()
+        .find(|field| payload.contains_key(*field))
+}
 
 /// Opaque product-level model choice shared by every client and Server API.
 ///
@@ -208,6 +237,21 @@ impl std::fmt::Display for InferencePurpose {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_execution_material_is_outside_the_inference_selection_contract() {
+        for field in CLIENT_DIRECT_EXECUTION_FIELDS {
+            let payload = Map::from_iter([(field.to_string(), Value::Null)]);
+            assert_eq!(client_direct_execution_field(&payload), Some(field));
+        }
+        assert_eq!(
+            client_direct_execution_field(&Map::from_iter([(
+                "model_selection".to_string(),
+                serde_json::json!({"offering_id": "offer-1"}),
+            )])),
+            None
+        );
+    }
 
     #[test]
     fn wire_identity_round_trips_every_purpose() {

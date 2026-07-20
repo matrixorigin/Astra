@@ -5,9 +5,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::chat_turn_edge_profile::{
-    build_base_edge_profile_value, build_runtime_memory_binding_value,
-};
+use crate::chat_turn_edge_profile::build_base_edge_profile_value;
 use crate::chat_turn_explain_wire::chat_turn_explain_field_json;
 use crate::edge_prompt_context::detect_workspace_context;
 use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
@@ -62,9 +60,6 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
         "capabilities": capabilities,
-        "runtime_bindings": {
-            "memory": build_runtime_memory_binding_value(),
-        },
         "edge_profile": build_base_edge_profile_value(
             project_root.to_string_lossy().as_ref(),
             git_branch,
@@ -201,9 +196,10 @@ mod tests {
         assert_eq!(p["edge_profile"]["cwd"], "/tmp");
         assert_eq!(p["edge_profile"]["git_branch"], "main");
         assert!(p["edge_profile"].get("memoria_url").is_none());
-        assert_eq!(p["runtime_bindings"]["memory"]["provider"], "memoria");
-        assert!(p["runtime_bindings"]["memory"].get("base_url").is_some());
-        assert!(p["runtime_bindings"]["memory"].get("api_key").is_some());
+        assert!(
+            p.get("runtime_bindings").is_none(),
+            "request payloads must not carry execution endpoints or credentials"
+        );
         // thinking = Off → field absent
         assert!(p.get("thinking").is_none());
     }

@@ -10,7 +10,7 @@ use astra_services::{
 };
 use astra_turn_types::ModelSelection;
 use axum::{Json, body::Bytes, http::StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 
 use crate::{error_response_coded, internal_error};
 
@@ -131,6 +131,15 @@ pub(crate) async fn admit_model_execution_from_body(
             "chat_request_invalid",
         )
     })?;
+    if let Some(field) = fields.direct_execution_field() {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "client field `{field}` cannot select an execution endpoint, credential, or placement"
+            ),
+            "client_execution_override_forbidden",
+        ));
+    }
     let selection = fields.model_selection.ok_or_else(|| {
         error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -197,6 +206,59 @@ struct ModelExecutionAdmissionFields {
     capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
     runtime_auth: Option<RuntimeAuthRequest>,
+    #[serde(default, deserialize_with = "field_is_present")]
+    runtime_bindings: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    api_key: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    authorization: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    base_url: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    provider: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    gateway: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    gateway_id: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    connection_id: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    execution_placement: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    endpoint: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    endpoint_url: bool,
+    #[serde(default, deserialize_with = "field_is_present")]
+    request_headers: bool,
+}
+
+impl ModelExecutionAdmissionFields {
+    fn direct_execution_field(&self) -> Option<&'static str> {
+        [
+            ("runtime_bindings", self.runtime_bindings),
+            ("api_key", self.api_key),
+            ("authorization", self.authorization),
+            ("base_url", self.base_url),
+            ("provider", self.provider),
+            ("gateway", self.gateway),
+            ("gateway_id", self.gateway_id),
+            ("connection_id", self.connection_id),
+            ("execution_placement", self.execution_placement),
+            ("endpoint", self.endpoint),
+            ("endpoint_url", self.endpoint_url),
+            ("request_headers", self.request_headers),
+        ]
+        .into_iter()
+        .find_map(|(field, present)| present.then_some(field))
+    }
+}
+
+fn field_is_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -379,6 +441,34 @@ mod tests {
             error.1.error_code.as_deref(),
             Some("provider_runtime_context_required")
         );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_every_direct_execution_field_before_catalog_access() {
+        let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
+        for field in astra_turn_types::CLIENT_DIRECT_EXECUTION_FIELDS {
+            let body = Bytes::from(
+                json!({
+                    "model_selection": {"offering_id": "offer-server"},
+                    (field): null,
+                })
+                .to_string(),
+            );
+            let error = admit_model_execution_from_body(
+                &service,
+                &body,
+                ModelExecutionAdmissionAuthority::Catalog,
+            )
+            .await
+            .expect_err("direct execution fields must fail before catalog resolution");
+
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "field={field}");
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("client_execution_override_forbidden"),
+                "field={field}"
+            );
+        }
     }
 
     #[tokio::test]

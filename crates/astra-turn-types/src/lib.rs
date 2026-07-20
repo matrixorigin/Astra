@@ -33,7 +33,10 @@ pub use context_identity::{
     PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
-pub use inference::{InferenceInvocationScope, InferencePurpose, ModelSelection};
+pub use inference::{
+    CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
+    client_direct_execution_field,
+};
 pub use memory_ranking::{
     PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
     is_persistent_type, partition_by_scope, sort_by_retrieval_score,
