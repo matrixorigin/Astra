@@ -235,6 +235,8 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
     let user_id = format!("reaper-user-{}", Uuid::new_v4());
     let request_id = format!("promptreq-{}", Uuid::new_v4().simple());
     let run_id = format!("run-{}", Uuid::new_v4().simple());
+    let route_id = format!("route-{}", Uuid::new_v4().simple());
+    let invocation_id = format!("inv-{}", Uuid::new_v4().simple());
     let run_event_row_id = format!("run-event-row-{}", Uuid::new_v4().simple());
     let run_event_id = format!("run-event-{}", Uuid::new_v4().simple());
     let batch_id = format!("batch-{}", Uuid::new_v4().simple());
@@ -310,6 +312,50 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
     .execute(&pool)
     .await
     .expect("insert agent run");
+    sqlx::query(
+        "INSERT INTO inference_routes
+         (route_id, user_id, scope_kind, session_id, run_id, harness_run_id,
+          offering_id, resolved_model_name, upstream_model_name, provider,
+          execution_placement, access_kind, purpose)
+         VALUES (?, ?, 'run', ?, ?, NULL, 'reaper-offering', 'reaper-model',
+                 'reaper-model', 'test-provider', 'server', 'self_hosted', 'primary_agent')",
+    )
+    .bind(&route_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("insert inference route");
+    sqlx::query(
+        "INSERT INTO inference_invocations
+         (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+          harness_run_id, turn_index, round_index, operation_id, logical_attempt,
+          purpose, status)
+         VALUES (?, ?, ?, ?, 'run', ?, NULL, 1, 0, 'reaper-delete', 0,
+                 'primary_agent', 'admitted')",
+    )
+    .bind(&invocation_id)
+    .bind(&route_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("insert inference invocation");
+    sqlx::query(
+        "INSERT INTO inference_invocation_settlement_debts
+         (user_id, invocation_id, session_id, harness_run_id,
+          terminal_status, terminal_fingerprint,
+          error_kind, error_message)
+         VALUES (?, ?, ?, NULL, 'failed', REPEAT('d', 64), 'cancelled', 'session ended')",
+    )
+    .bind(&user_id)
+    .bind(&invocation_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("insert inference settlement debt");
     sqlx::query(
         "INSERT INTO agent_run_events
          (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json)
@@ -425,6 +471,28 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
             "reaper must delete {table}"
         );
     }
+    let remaining_inference_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&invocation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count inference settlement debts after session delete");
+    sqlx::query(
+        "DELETE FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&invocation_id)
+    .execute(&pool)
+    .await
+    .expect("clean orphaned inference settlement debt after assertion capture");
+    assert_eq!(
+        remaining_inference_debts, 0,
+        "session deletion must not leave an unreachable inference settlement debt"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

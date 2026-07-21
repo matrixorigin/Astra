@@ -35,6 +35,12 @@ const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str = "DELETE FROM agent_event_edge
          ORDER BY child_event_id ASC, parent_event_id ASC, relation_kind ASC
          LIMIT ?";
 
+const SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL: &str =
+    "DELETE FROM inference_invocation_settlement_debts
+         WHERE session_id = ? AND user_id = ?
+         ORDER BY created_at ASC, invocation_id ASC
+         LIMIT ?";
+
 const SESSION_DELETE_TASK_LEASES_SQL: &str = "DELETE FROM task_leases
          WHERE user_id = ?
            AND task_id IN (
@@ -275,6 +281,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
     SessionBatchDeleteStatement {
+        label: "inference_invocation_settlement_debts",
+        sql: SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
+    },
+    SessionBatchDeleteStatement {
         label: "inference_provider_attempts",
         sql: "DELETE FROM inference_provider_attempts
              WHERE session_id = ? AND user_id = ?
@@ -379,6 +389,7 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[&str] = &[
     "agent_event_edges",
     "agent_runs",
     "agent_tasks",
+    "inference_invocation_settlement_debts",
     "task_contracts",
 ];
 
@@ -712,6 +723,24 @@ pub(crate) async fn hard_delete_session_rows(
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
     }
 
+    // A provider terminal that already owned the invocation lock can publish a
+    // debt while hard-delete waits. The second owner-scoped pass runs after the
+    // parent invocation rows are gone, closing that race without guessing from
+    // terminal status.
+    let rows_deleted = delete_session_rows_session_user_batched(
+        tx,
+        "inference_invocation_settlement_debts",
+        SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
+        session_id,
+        user_id,
+    )
+    .await?;
+    record_table_delete(
+        &mut outcome,
+        "inference_invocation_settlement_debts",
+        rows_deleted,
+    )?;
+
     let rows_deleted = delete_session_rows_session_user_batched(
         tx,
         "agent_event_edges",
@@ -1038,6 +1067,7 @@ mod tests {
                 "agent_events",
                 "agent_run_events",
                 "conversation_log",
+                "inference_invocation_settlement_debts",
                 "inference_invocations",
                 "inference_provider_attempts",
                 "inference_routes",

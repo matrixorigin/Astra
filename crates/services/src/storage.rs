@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v8";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v9";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -74,14 +74,6 @@ const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX idx_schema_table_contract_component (component, contract_version, table_name)
 )";
-const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
-    "SELECT 1 FROM agent_sessions LIMIT 0",
-    "SELECT 1 FROM prompt_deltas LIMIT 0",
-    "SELECT 1 FROM tool_invocation_ledger LIMIT 0",
-    "SELECT 1 FROM workspace_records LIMIT 0",
-    "SELECT 1 FROM config_versions LIMIT 0",
-];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreSchemaTableSpec {
     pub name: String,
@@ -623,7 +615,10 @@ async fn mark_core_schema_contract_current(
     Ok(())
 }
 
-async fn verify_core_schema_visible(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
+async fn verify_core_schema_visible(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
     let persisted: Option<String> = sqlx::query_scalar(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
@@ -635,10 +630,10 @@ async fn verify_core_schema_visible(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx
             "core schema completion marker is not visible on a fresh connection".to_string(),
         ));
     }
-    for probe in CORE_SCHEMA_VISIBILITY_PROBES {
-        query(probe).execute(pool).await?;
-    }
-    Ok(())
+    // The published table authority is the readiness boundary. A fixed probe
+    // list inevitably drifts whenever a new runtime table is added and can
+    // report ready while a fresh connection still cannot see that table.
+    verify_core_schema_catalog(pool, database).await
 }
 
 fn is_schema_catalog_visibility_lag(error: &sqlx::Error) -> bool {
@@ -655,17 +650,21 @@ async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let verify_pool = DedicatedPool::new(connect_matrixone(&verify_settings).await?, 1);
-        let visibility_result = verify_core_schema_visible(&verify_pool).await;
+        let visibility_result = verify_core_schema_visible(&verify_pool, &settings.database).await;
         verify_pool.close().await;
         match visibility_result {
             Ok(()) => return Ok(()),
             Err(error)
-                if is_schema_catalog_visibility_lag(&error)
+                if (is_schema_catalog_visibility_lag(&error)
+                    || matches!(error, sqlx::Error::Protocol(_)))
                     && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(error) if is_schema_catalog_visibility_lag(&error) => {
+            Err(error)
+                if is_schema_catalog_visibility_lag(&error)
+                    || matches!(error, sqlx::Error::Protocol(_)) =>
+            {
                 return Err(sqlx::Error::Protocol(format!(
                     "core schema contract was published but canonical tables remained invisible to fresh connections: {error}"
                 )));
@@ -4440,6 +4439,8 @@ async fn ensure_core_schema_while_leased(
         "CREATE TABLE IF NOT EXISTS inference_invocation_settlement_debts (
             user_id VARCHAR(128) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
+            harness_run_id VARCHAR(128) NULL,
             terminal_status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NOT NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -4451,12 +4452,34 @@ async fn ensure_core_schema_while_leased(
             error_message TEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, invocation_id),
+            CONSTRAINT chk_inference_invocation_settlement_debts_scope_owner
+                CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
+                    OR (session_id IS NULL AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_invocation_settlement_debts_status
                 CHECK (terminal_status IN ('succeeded', 'failed', 'cancelled', 'delivery_unknown'))
         )",
     )
     .execute(&pool)
     .await?;
+    for (column, ddl) in [
+        (
+            "session_id",
+            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN session_id VARCHAR(64) NULL",
+        ),
+        (
+            "harness_run_id",
+            "ALTER TABLE inference_invocation_settlement_debts ADD COLUMN harness_run_id VARCHAR(128) NULL",
+        ),
+    ] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            "inference_invocation_settlement_debts",
+            column,
+            ddl,
+        )
+        .await?;
+    }
 
     // Lifecycle writes are exact owner+identity transitions. MatrixOne can
     // omit eligible rows when it plans those transitions through a secondary
@@ -4516,6 +4539,10 @@ async fn ensure_core_schema_while_leased(
         (
             "inference_provider_attempts",
             &["session_id", "run_id", "harness_run_id"][..],
+        ),
+        (
+            "inference_invocation_settlement_debts",
+            &["session_id", "harness_run_id"][..],
         ),
     ] {
         fail_if_required_columns_missing_or_not_nullable(

@@ -938,6 +938,7 @@ mod tests {
         .expect("detached settlement must converge after caller cancellation");
 
         for statement in [
+            "DELETE FROM inference_invocation_settlement_debts WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM inference_provider_attempts WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM inference_invocations WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM inference_routes WHERE user_id = 'test-user' AND session_id = ?",

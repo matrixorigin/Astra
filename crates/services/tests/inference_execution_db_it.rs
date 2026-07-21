@@ -11,6 +11,7 @@ use astra_services::{
     ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind, admit_inference_invocation,
     begin_inference_provider_attempt, finish_inference_invocation,
     finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
+    reconcile_inference_invocation_settlement,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
@@ -48,27 +49,109 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     .expect("seed inference run");
 }
 
-async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
-    let invocation_ids = sqlx::query_scalar::<_, String>(
-        "SELECT invocation_id FROM inference_invocations WHERE user_id = ? AND session_id = ?",
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn targeted_settlement_recovery_does_not_process_another_invocation() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("targeted-recovery-user-{suffix}");
+    let session_id = format!("targeted-recovery-session-{suffix}");
+    let run_id = format!("targeted-recovery-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let mut plans = Vec::new();
+    for round in 0..2 {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 1,
+                round,
+                operation_id: "targeted_settlement_recovery".to_string(),
+                logical_attempt: 0,
+            },
+            offering_id: "targeted-recovery-offering".to_string(),
+            resolved_model_name: "targeted-recovery-model".to_string(),
+            upstream_model_name: "targeted-recovery-model".to_string(),
+            provider: "openai".to_string(),
+            purpose: InferencePurpose::PrimaryAgent,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+        })
+        .expect("plan targeted recovery invocation");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit targeted recovery invocation");
+        let attempt = plan_inference_provider_attempt(&plan, 0);
+        begin_inference_provider_attempt(&shared_pool, &attempt)
+            .await
+            .expect("begin targeted recovery attempt");
+        finish_inference_provider_attempt(
+            &shared_pool,
+            &attempt,
+            &InferenceInvocationTerminal::succeeded(
+                InferenceUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                Some(format!("targeted-response-{round}")),
+            ),
+        )
+        .await
+        .expect("persist targeted recovery attempt");
+        plans.push(plan);
+    }
+
+    reconcile_inference_invocation_settlement(&shared_pool, &user_id, plans[0].invocation_id())
+        .await
+        .expect("reconcile only the requested invocation");
+
+    let rows = sqlx::query(
+        "SELECT invocation_id, status,
+                (SELECT COUNT(*) FROM inference_invocation_settlement_debts AS debt
+                 WHERE debt.user_id = invocation.user_id
+                   AND debt.invocation_id = invocation.invocation_id) AS debt_count
+         FROM inference_invocations AS invocation
+         WHERE user_id = ? AND invocation_id IN (?, ?)",
     )
-    .bind(user_id)
-    .bind(session_id)
+    .bind(&user_id)
+    .bind(plans[0].invocation_id())
+    .bind(plans[1].invocation_id())
     .fetch_all(pool)
     .await
-    .unwrap_or_else(|error| panic!("list inference debts for cleanup: {error}"));
-    for invocation_id in invocation_ids {
-        sqlx::query(
-            "DELETE FROM inference_invocation_settlement_debts
-             WHERE user_id = ? AND invocation_id = ?",
-        )
-        .bind(user_id)
-        .bind(invocation_id)
-        .execute(pool)
-        .await
-        .unwrap_or_else(|error| panic!("clean up inference settlement debt: {error}"));
+    .expect("load targeted recovery outcomes");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let invocation_id = row.get::<String, _>("invocation_id");
+        let status = row.get::<String, _>("status");
+        let debt_count = row.get::<i64, _>("debt_count");
+        if invocation_id == plans[0].invocation_id() {
+            assert_eq!(status, "succeeded");
+            assert_eq!(debt_count, 0);
+        } else {
+            assert_eq!(invocation_id, plans[1].invocation_id());
+            assert_eq!(status, "admitted");
+            assert_eq!(debt_count, 1);
+        }
     }
+
+    reconcile_inference_invocation_settlement(&shared_pool, &user_id, plans[1].invocation_id())
+        .await
+        .expect("drain the second invocation before cleanup");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
+        (
+            "DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
         (
             "DELETE FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
             session_id,
@@ -509,8 +592,8 @@ async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts
     finish_inference_provider_attempt(&shared_pool, &attempt, &succeeded)
         .await
         .expect("persist successful provider attempt");
-    let pending_success_debts: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+    let pending_success_debt = sqlx::query(
+        "SELECT session_id, harness_run_id FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
@@ -519,8 +602,16 @@ async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts
     .await
     .expect("load successful provider recovery debt");
     assert_eq!(
-        pending_success_debts, 1,
-        "a durable success must publish recovery evidence before logical settlement"
+        pending_success_debt
+            .get::<Option<String>, _>("session_id")
+            .as_deref(),
+        Some(session_id.as_str()),
+        "recovery evidence must carry the canonical session owner"
+    );
+    assert_eq!(
+        pending_success_debt.get::<Option<String>, _>("harness_run_id"),
+        None,
+        "session recovery evidence must not fabricate a harness owner"
     );
     assert_eq!(
         begin_inference_provider_attempt(&shared_pool, &plan_inference_provider_attempt(&plan, 1))
@@ -786,6 +877,7 @@ async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
     );
 
     for table in [
+        "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",
         "inference_routes",

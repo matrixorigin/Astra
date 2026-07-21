@@ -234,6 +234,7 @@ async fn cleanup_session(pool: &SharedPool, user_id: &str, session_id: &str) {
         "DELETE FROM prompt_deltas WHERE user_id = ? AND session_id = ?",
         "DELETE FROM prompt_request_records WHERE user_id = ? AND session_id = ?",
         "DELETE FROM agent_events WHERE user_id = ? AND session_id = ?",
+        "DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND session_id = ?",
         "DELETE FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
         "DELETE FROM inference_invocations WHERE user_id = ? AND session_id = ?",
         "DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?",

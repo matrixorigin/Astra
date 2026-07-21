@@ -742,6 +742,7 @@ mod tests {
         assert_eq!(row.get::<i64, _>("output_tokens"), 3);
 
         for table in [
+            "inference_invocation_settlement_debts",
             "inference_provider_attempts",
             "inference_invocations",
             "inference_routes",
