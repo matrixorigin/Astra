@@ -12,7 +12,7 @@ use astra_server_types::edge_ws_protocol::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -144,13 +144,30 @@ async fn handle_edge_connection(
         return;
     }
 
-    // Validate token
+    // ── Phase 1: Resolve principal (single provider call) ────────────
+    // Request-aware authentication calls the external provider once with the
+    // actual WebSocket route and stores the edge binding
+    // (edge_agent_id, provider_scope_id) in the returned AuthPrincipal.
+    // Callers here never need to inspect the raw token format.
     let mut headers = HeaderMap::new();
     if let Ok(hv) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
         headers.insert(axum::http::header::AUTHORIZATION, hv);
     }
-    let user = match state.auth_service.current_user(&headers).await {
-        Ok(user) => user,
+    let principal = match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            astra_services::ProviderRequestDescriptor {
+                method: "GET".to_string(),
+                path: "/edge/ws".to_string(),
+                route: Some("/edge/ws".to_string()),
+                request_id: None,
+                body_digest: None,
+            },
+        )
+        .await
+    {
+        Ok(p) => p,
         Err(_) => {
             tracing::warn!(
                 target: "astra_runtime::edge_ws",
@@ -168,70 +185,120 @@ async fn handle_edge_connection(
         }
     };
 
-    let user_id = user.user_id.clone();
+    let user_id = principal.user.user_id.clone();
 
     // ── Phase 1.5: Verify self-reported edge_agent_id matches token binding ──
-    // For moi-user-token-v1 tokens, ask the provider to confirm which
-    // edge_agent_id the token is bound to. A legitimate edge will always
-    // match; a forged or replayed token with a fabricated edge_agent_id is
-    // rejected here before it can hijack another edge's connection slot.
-    let workspace_id: Option<String> = if token.starts_with("moi-user-token-v1") {
-        match state.auth_service.edge_registration_binding(&token).await {
-            Ok(Some((bound_edge_agent_id, bound_workspace_id))) => {
-                if bound_edge_agent_id != edge_agent_id {
+    // Resolve the edge binding from one of two sources, then run a SINGLE
+    // verification below so the check can never be silently skipped:
+    //
+    //   • Fast path — a provider-authorized principal already carries the
+    //     binding resolved during Phase 1 (no second provider call).
+    //   • Compatibility path — AuthService impls that expose the binding only
+    //     through `edge_registration_binding()` (the default `current_principal`
+    //     returns an Internal origin) are still honored via a fallback call.
+    //     Without this, such backends would fall through and accept any
+    //     self-reported edge_agent_id with no workspace binding.
+    //
+    // The returned `workspace_id` is `provider_scope_id`; the MOI provider maps
+    // its workspace identity 1:1 onto that opaque scope key. If a future
+    // provider uses a different mapping, revisit it in AuthService, not here.
+    let binding: Option<(String, String)> = match &principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) => {
+            match ctx.edge_agent_id.as_deref() {
+                Some(bound_edge_agent_id) => Some((
+                    bound_edge_agent_id.to_string(),
+                    ctx.provider_scope_id.clone(),
+                )),
+                None => {
+                    // Provider-authorized but no edge_agent_id binding means this is
+                    // a runtime token (server-to-server), which must not be accepted
+                    // on the WebSocket path — only edge-registration tokens are valid here.
                     tracing::warn!(
                         target: "astra_runtime::edge_ws",
                         edge_agent_id = %edge_agent_id,
-                        bound_edge_agent_id = %bound_edge_agent_id,
-                        "edge WebSocket auth failed: self-reported edge_agent_id does not match token binding"
+                        "edge WebSocket auth failed: provider token has no edge_agent_id binding (runtime token on WS path)"
                     );
                     let _ = send_edge_msg(
                         &ws_sink,
                         EdgeServerMessage::AuthError {
-                            message: "edge_agent_id does not match token binding".into(),
+                            message: "edge registration token required; runtime token not accepted on WebSocket path".into(),
                         },
                     )
                     .await;
                     return;
                 }
-                Some(bound_workspace_id)
-            }
-            Ok(None) => {
-                // moi-user-token-v1 tokens must always carry an edge_agent_id binding.
-                // Ok(None) means the provider issued a runtime token (server-to-server),
-                // which must never be accepted on the WebSocket path.
-                tracing::warn!(
-                    target: "astra_runtime::edge_ws",
-                    edge_agent_id = %edge_agent_id,
-                    "edge WebSocket auth failed: moi-user-token-v1 token has no edge_agent_id binding (runtime token on WS path)"
-                );
-                let _ = send_edge_msg(
-                    &ws_sink,
-                    EdgeServerMessage::AuthError {
-                        message: "edge registration token required; runtime token not accepted on WebSocket path".into(),
-                    },
-                )
-                .await;
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "astra_runtime::edge_ws",
-                    edge_agent_id = %edge_agent_id,
-                    "edge WebSocket auth failed: edge token binding verification failed"
-                );
-                let _ = send_edge_msg(
-                    &ws_sink,
-                    EdgeServerMessage::AuthError {
-                        message: "edge token binding verification failed".into(),
-                    },
-                )
-                .await;
-                return;
             }
         }
-    } else {
-        None
+        _ => {
+            // Not provider-authorized in the principal: consult the explicit
+            // edge-binding contract, which distinguishes a first-party token
+            // (accept, no binding) from a runtime token with no agent binding
+            // (reject) — a plain `None` would conflate the two and fail open.
+            match state.auth_service.edge_registration_binding(&token).await {
+                Ok(astra_services::EdgeTokenBinding::Bound {
+                    edge_agent_id: bound_edge_agent_id,
+                    workspace_id,
+                }) => Some((bound_edge_agent_id, workspace_id)),
+                Ok(astra_services::EdgeTokenBinding::NotEdgeToken) => None,
+                Ok(astra_services::EdgeTokenBinding::MissingBinding) => {
+                    // Recognized provider token without an edge_agent_id binding
+                    // (runtime server-to-server token): not valid on the WS path.
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        edge_agent_id = %edge_agent_id,
+                        "edge WebSocket auth failed: token has no edge_agent_id binding (runtime token on WS path)"
+                    );
+                    let _ = send_edge_msg(
+                        &ws_sink,
+                        EdgeServerMessage::AuthError {
+                            message: "edge registration token required; runtime token not accepted on WebSocket path".into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        edge_agent_id = %edge_agent_id,
+                        "edge WebSocket auth failed: edge token binding verification failed"
+                    );
+                    let _ = send_edge_msg(
+                        &ws_sink,
+                        EdgeServerMessage::AuthError {
+                            message: "edge token binding verification failed".into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    };
+
+    let workspace_id: Option<String> = match binding {
+        Some((bound_edge_agent_id, workspace_id)) => {
+            if bound_edge_agent_id != edge_agent_id {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    edge_agent_id = %edge_agent_id,
+                    bound_edge_agent_id = %bound_edge_agent_id,
+                    "edge WebSocket auth failed: self-reported edge_agent_id does not match token binding"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "edge_agent_id does not match token binding".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+            Some(workspace_id)
+        }
+        // First-party (astra-native JWT) tokens carry no binding and are
+        // accepted without an edge_agent_id check.
+        None => None,
     };
 
     // ── Phase 1a: Validate & sanitize self-reported capabilities ─────
@@ -248,70 +315,344 @@ async fn handle_edge_connection(
         "Edge agent connected"
     );
 
-    // ── Phase 2: Register in pool ────────────────────────────────────
-    let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
-        astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
-    );
-    // Capture the connection incarnation so cleanup cannot remove a faster
-    // reconnect that has already replaced this socket.
-    let pool_generation = state.edge_connection_pool.register_with_capabilities(
-        &user_id,
-        &edge_agent_id,
-        hostname.clone(),
-        workspace_dir.clone(),
-        capabilities.clone(),
-        workspace_id.clone(),
-        pool_tx,
-    );
-
-    // ── Phase 2a: Register in DB edge registry for cross-pod routing ─
-    // B2: if DB registration fails, roll back the pool entry and reject the
-    // WebSocket connection. This ensures there is no "online in-memory but
-    // invisible to other pods" split-brain state.
-    // B4 counterpart: UnconfiguredEdgeRegistryService always returns Ok here,
-    // so single-pod deployments without a DB registry are unaffected.
+    // ── Phase 2: Begin a transactional reconnect ─────────────────────
+    // Serialize the whole reconnect (begin → DB → commit/abort) for this key so
+    // two concurrent reconnects cannot interleave their DB registration and pool
+    // commit (which could leave the DB pointing at one incarnation and the pool
+    // at another). The guard is released right after commit/abort, NOT held for
+    // the connection's lifetime — a later reconnect must be able to supersede.
     let edge_registry = state.execution.edge_registry_service.clone();
     let edge_id_for_registry = format!("ws-{}", uuid::Uuid::new_v4());
-    if let Err(e) = edge_registry
-        .register_or_update(
-            &user_id,
-            &edge_agent_id,
-            &edge_id_for_registry,
-            hostname.as_deref(),
-            workspace_dir.as_deref(),
-            capabilities,
-            workspace_id.as_deref(),
-        )
-        .await
-    {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            user_id = %user_id,
-            edge_agent_id = %edge_agent_id,
-            error = %e,
-            "edge WebSocket: DB registry registration failed; rejecting connection"
-        );
+    let reconnect_mutex = state
+        .edge_connection_pool
+        .reconnect_lock(&user_id, &edge_agent_id);
+    // Watch for the socket closing WHILE queued for the lock: a connection that
+    // died in the queue must not go on to overwrite a healthy peer.
+    let reconnect_guard = loop {
+        tokio::select! {
+            guard = reconnect_mutex.lock() => break guard,
+            frame = ws_stream.next() => {
+                if !handle_edge_setup_frame(frame, &ws_sink).await {
+                    // Socket closed before we acquired the lock; nothing was touched.
+                    state
+                        .edge_connection_pool
+                        .gc_reconnect_lock(&user_id, &edge_agent_id);
+                    return;
+                }
+            }
+        }
+    };
+
+    // If the socket already closed before we could register, bail out before
+    // touching the pool or the DB so a dead connection never evicts a peer.
+    if edge_socket_appears_closed(&mut ws_stream, &ws_sink).await {
+        drop(reconnect_guard);
         state
             .edge_connection_pool
-            .unregister_generation(&user_id, &edge_agent_id, pool_generation);
+            .gc_reconnect_lock(&user_id, &edge_agent_id);
+        return;
+    }
+
+    // Do NOT touch the pool yet: any existing connection stays active and
+    // selectable throughout the DB registration below, so it is never a
+    // half-ready/zombie entry and dispatch never selects a connection whose
+    // forward loop is not yet running. The reservation marks the key so a
+    // concurrent cleanup of the previous connection preserves (rather than
+    // clears) its pending-result map, and captures that map so it survives even
+    // if the previous entry is removed mid-reconnect.
+    let reconnect = state
+        .edge_connection_pool
+        .begin_reconnect(&user_id, &edge_agent_id);
+
+    // ── Phase 2a: Register in DB edge registry for cross-pod routing ─
+    // B4 counterpart: UnconfiguredEdgeRegistryService always returns Ok here,
+    // so single-pod deployments without a DB registry are unaffected.
+    //
+    // The durable registry returns a generation lease containing the exact row
+    // replaced by this connection. Its DB implementation uses an edge_id CAS,
+    // so this predecessor remains correct even when another pod reconnects the
+    // same edge concurrently.
+    let mut registration = Box::pin(edge_registry.register_or_update_with_lease(
+        &user_id,
+        &edge_agent_id,
+        &edge_id_for_registry,
+        hostname.as_deref(),
+        workspace_dir.as_deref(),
+        capabilities.clone(),
+        workspace_id.as_deref(),
+    ));
+    let mut socket_closed_during_registration = false;
+    let registration_result = loop {
+        tokio::select! {
+            result = &mut registration => break result,
+            frame = ws_stream.next() => {
+                if !handle_edge_setup_frame(frame, &ws_sink).await {
+                    // Keep driving the DB future to a known outcome. Dropping it
+                    // here could leave an outcome-unknown write with no lease to
+                    // reconcile conditionally.
+                    socket_closed_during_registration = true;
+                    break registration.await;
+                }
+            }
+        }
+    };
+    let registration_lease = match registration_result {
+        Ok(lease) => lease,
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                error = %e,
+                "edge WebSocket: DB registry registration failed; rejecting connection"
+            );
+            // Abort the reconnect: leave any still-active previous connection in
+            // place (no zombie, no rollback), fail its waiters only if it was
+            // cleaned up during the window.
+            state
+                .edge_connection_pool
+                .abort_reconnect(reconnect, &user_id, &edge_agent_id);
+            drop(reconnect_guard);
+            state
+                .edge_connection_pool
+                .gc_reconnect_lock(&user_id, &edge_agent_id);
+            let _ = send_edge_msg(
+                &ws_sink,
+                EdgeServerMessage::AuthError {
+                    message: "edge registry registration failed".into(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    // If the socket closed during DB registration, do NOT commit (which would
+    // evict a healthy peer). Abort the reconnect, keeping the previous in-memory
+    // connection, and reconcile the DB row we just overwrote:
+    //   • If a previous connection owned the row, restore its edge_id so its next
+    //     heartbeat is not superseded — merely deleting our row would strand it.
+    //   • Otherwise (we were the first registration) delete our row.
+    if socket_closed_during_registration
+        || edge_socket_appears_closed(&mut ws_stream, &ws_sink).await
+    {
+        state
+            .edge_connection_pool
+            .abort_reconnect(reconnect, &user_id, &edge_agent_id);
+        if let Err(error) = edge_registry
+            .rollback_registration(&registration_lease)
+            .await
+        {
+            tracing::error!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: failed to roll back durable registration after dead reconnect"
+            );
+        }
+        drop(reconnect_guard);
+        state
+            .edge_connection_pool
+            .gc_reconnect_lock(&user_id, &edge_agent_id);
+        return;
+    }
+
+    // Publish the durable generation while retaining the DB claim. Existing
+    // routing fields stayed untouched during claim acquisition; finalize moves
+    // the row to a non-routable handoff state until pool commit releases it.
+    let mut finalization = Box::pin(edge_registry.finalize_registration(&registration_lease));
+    let mut socket_closed_during_finalization = false;
+    let finalization_result = loop {
+        tokio::select! {
+            result = &mut finalization => break result,
+            frame = ws_stream.next() => {
+                if !handle_edge_setup_frame(frame, &ws_sink).await {
+                    socket_closed_during_finalization = true;
+                    break finalization.await;
+                }
+            }
+        }
+    };
+    if !matches!(&finalization_result, Ok(true)) {
+        state
+            .edge_connection_pool
+            .abort_reconnect(reconnect, &user_id, &edge_agent_id);
+        if let Err(error) = edge_registry
+            .rollback_registration(&registration_lease)
+            .await
+        {
+            tracing::error!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: failed to roll back rejected durable finalization"
+            );
+        }
+        drop(reconnect_guard);
+        state
+            .edge_connection_pool
+            .gc_reconnect_lock(&user_id, &edge_agent_id);
+        let message = match finalization_result {
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    user_id = %user_id,
+                    edge_agent_id = %edge_agent_id,
+                    %error,
+                    "edge WebSocket: durable registration finalization failed"
+                );
+                "edge registry finalization failed"
+            }
+            _ => "edge registry registration claim lost",
+        };
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
-                message: "edge registry registration failed".into(),
+                message: message.into(),
             },
         )
         .await;
         return;
     }
 
-    // Auth + pool + DB all succeeded — notify the edge client.
-    let _ = send_edge_msg(
+    if socket_closed_during_finalization
+        || edge_socket_appears_closed(&mut ws_stream, &ws_sink).await
+    {
+        state
+            .edge_connection_pool
+            .abort_reconnect(reconnect, &user_id, &edge_agent_id);
+        if let Err(error) = edge_registry
+            .rollback_registration(&registration_lease)
+            .await
+        {
+            tracing::error!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: failed to roll back finalized dead reconnect"
+            );
+        }
+        drop(reconnect_guard);
+        state
+            .edge_connection_pool
+            .gc_reconnect_lock(&user_id, &edge_agent_id);
+        return;
+    }
+
+    // The client requires edge_auth_ok to be the first server application
+    // frame. Send it before publishing the pool sender so ToolRequest can never
+    // overtake authentication while claim release is awaiting the database.
+    if send_edge_msg(
         &ws_sink,
         EdgeServerMessage::AuthOk {
             user_id: user_id.clone(),
         },
     )
-    .await;
+    .await
+    .is_err()
+    {
+        state
+            .edge_connection_pool
+            .abort_reconnect(reconnect, &user_id, &edge_agent_id);
+        if let Err(error) = edge_registry
+            .rollback_registration(&registration_lease)
+            .await
+        {
+            tracing::error!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: failed to roll back after auth_ok send failure"
+            );
+        }
+        drop(reconnect_guard);
+        state
+            .edge_connection_pool
+            .gc_reconnect_lock(&user_id, &edge_agent_id);
+        return;
+    }
+
+    // ── Phase 2b: Start the forward loop BEFORE publishing the sender ─
+    // The forward task drains pool_rx into the socket. Spawning it before the
+    // pool commit guarantees the connection is never selectable for dispatch
+    // while its forward loop is not yet running, so a message admitted right
+    // after commit cannot sit undrained (and be lost on teardown).
+    let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
+        astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
+    );
+    let ws_sink_fwd = ws_sink.clone();
+    let forward_task = tokio::spawn(async move {
+        while let Some(msg) = pool_rx.recv().await {
+            if send_edge_msg(&ws_sink_fwd, msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // ── Phase 2c: Commit — atomically install the new connection ─────
+    // Only after DB success and with the forward loop already running: the new
+    // sender becomes selectable inheriting the pending map. Release the reconnect
+    // lock immediately afterward so it never spans the connection's lifetime.
+    let pool_generation = state.edge_connection_pool.commit_reconnect(
+        reconnect,
+        &user_id,
+        &edge_agent_id,
+        hostname.clone(),
+        workspace_dir.clone(),
+        capabilities,
+        workspace_id.clone(),
+        pool_tx,
+    );
+    match edge_registry
+        .release_registration(&registration_lease)
+        .await
+    {
+        Ok(false) if registration_lease.claim_id.is_some() => {
+            // A definite claim mismatch means another pod already owns the
+            // durable generation. Fail closed instead of publishing a local
+            // connection that cross-pod routing cannot consistently target.
+            state.edge_connection_pool.unregister_generation(
+                &user_id,
+                &edge_agent_id,
+                pool_generation,
+            );
+            forward_task.abort();
+            drop(reconnect_guard);
+            state
+                .edge_connection_pool
+                .gc_reconnect_lock(&user_id, &edge_agent_id);
+            let _ = send_edge_msg(
+                &ws_sink,
+                EdgeServerMessage::AuthError {
+                    message: "edge registry registration claim lost".into(),
+                },
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            // The claim has a DB-side expiry, so an outcome-unknown release
+            // delays another cross-pod reconnect but cannot fence this healthy
+            // connection forever.
+            tracing::error!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: failed to release durable registration claim"
+            );
+        }
+        _ => {}
+    }
+    drop(reconnect_guard);
+    // Release the per-key reconnect lock entry now that the reconnect is done.
+    state
+        .edge_connection_pool
+        .gc_reconnect_lock(&user_id, &edge_agent_id);
 
     // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
     let inflight_dispatches = InflightEdgeDispatchTracker::default();
@@ -416,16 +757,6 @@ async fn handle_edge_connection(
     let edge_id_for_registry_cleanup = edge_id_for_registry.clone();
     let read_inflight = inflight_dispatches.clone();
 
-    // Task: forward server → edge messages from the pool channel
-    let ws_sink_fwd = ws_sink.clone();
-    let forward_task = tokio::spawn(async move {
-        while let Some(msg) = pool_rx.recv().await {
-            if send_edge_msg(&ws_sink_fwd, msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
     // Task: read edge → server messages + heartbeat
     let read_loop = async {
         let mut heartbeat = tokio::time::interval(heartbeat_interval);
@@ -452,8 +783,8 @@ async fn handle_edge_connection(
                                     if request_id != identity.storage_key() {
                                         tracing::warn!(
                                             target: "astra_runtime::edge_ws",
-                                            authenticated_user_id = %user_id,
-                                            result_user_id = %identity.user_id,
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
                                             request_id = %request_id,
                                             "Edge WS: rejected result with mismatched durable identity"
                                         );
@@ -795,6 +1126,50 @@ impl InflightEdgeDispatchTracker {
             .drain()
             .map(|(_, dispatch)| dispatch)
             .collect()
+    }
+}
+
+/// Best-effort, non-blocking check for a socket close/error already surfaced on
+/// the read stream. Used during reconnect setup so a connection that has already
+/// disconnected does not commit into the pool and evict a healthy peer.
+///
+/// Process a frame received while the edge handshake is still being installed.
+/// Ping/Pong are legal at any point in a WebSocket session. Every application
+/// frame, Close, stream error, or EOF ends setup before the connection is
+/// published into the pool.
+async fn handle_edge_setup_frame(
+    frame: Option<Result<Message, axum::Error>>,
+    ws_sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+) -> bool {
+    match frame {
+        Some(Ok(Message::Ping(_))) => {
+            // tungstenite queues the automatic Pong while reading the Ping;
+            // flush the split sink so a long DB registration cannot delay it.
+            use futures_util::SinkExt;
+            ws_sink.lock().await.flush().await.is_ok()
+        }
+        Some(Ok(Message::Pong(_))) => true,
+        _ => false,
+    }
+}
+
+/// Drain every control frame that is already ready and report whether setup has
+/// observed a close/error. Draining prevents a queued `Ping -> Close` sequence
+/// from publishing a dead connection.
+async fn edge_socket_appears_closed(
+    ws_stream: &mut SplitStream<WebSocket>,
+    ws_sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+) -> bool {
+    use futures_util::future::FutureExt;
+    loop {
+        match ws_stream.next().now_or_never() {
+            Some(frame) => {
+                if !handle_edge_setup_frame(frame, ws_sink).await {
+                    return true;
+                }
+            }
+            None => return false,
+        }
     }
 }
 

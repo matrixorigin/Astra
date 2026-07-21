@@ -350,6 +350,40 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
 
 // ─── Proxy helpers ───────────────────────────────────────────────────────────
 
+fn first_nonempty(values: impl IntoIterator<Item = String>) -> Option<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    first_nonempty(names.iter().filter_map(|name| std::env::var(name).ok()))
+}
+
+fn select_proxy_candidate(values: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut first_unsupported = None;
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        if value.starts_with("http://") {
+            return Some(value);
+        }
+        if first_unsupported.is_none() {
+            first_unsupported = Some(value);
+        }
+    }
+    // Preserve the explicit unsupported-proxy error instead of silently
+    // bypassing egress policy when no HTTP fallback exists.
+    first_unsupported
+}
+
+fn select_proxy_candidate_from_env(names: &[&str]) -> Option<String> {
+    select_proxy_candidate(names.iter().filter_map(|name| std::env::var(name).ok()))
+}
+
 /// Parse `host` and `port` from a WebSocket URL (`ws://` or `wss://`).
 ///
 /// Handles IPv6 bracket notation (`[::1]:port`) and strips any path/query
@@ -381,23 +415,135 @@ fn ws_target_is_loopback(ws_url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Parse `host` and `port` from an HTTP(S) proxy URL.
+/// Parse `host`, `port`, and optional `userinfo` from an HTTP(S) proxy URL.
 ///
 /// Accepts `http://` and `https://` schemes, strips userinfo (e.g.
 /// `user:pass@`), handles IPv6 bracket notation, and defaults to port 3128
 /// when no explicit port is present.
-fn parse_proxy_addr(proxy_url: &str) -> Option<(String, u16)> {
+///
+/// Returns `(host, port, Option<userinfo>)`.
+fn parse_proxy_addr(proxy_url: &str) -> Option<(String, u16, Option<String>)> {
     let rest = proxy_url
         .strip_prefix("http://")
         .or_else(|| proxy_url.strip_prefix("https://"))?;
     // Drop path/query/fragment.
     let authority = rest.split('/').next()?;
-    // Strip optional userinfo (`user:pass@`).
-    let host_port = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
+    // Split optional userinfo (`user:pass@`).
+    let (userinfo, host_port) = match authority.rfind('@') {
+        Some(at) => (Some(authority[..at].to_string()), &authority[at + 1..]),
+        None => (None, authority),
     };
-    parse_host_port(host_port, 3128)
+    let (host, port) = parse_host_port(host_port, 3128)?;
+    Some((host, port, userinfo))
+}
+
+/// Returns `true` when `host` matches the NO_PROXY/no_proxy exclusion list.
+///
+/// Supports exact hostname matches and domain suffix matches (`.suffix` or
+/// `suffix` both match `foo.suffix`). Port-specific entries (host:port) are
+/// not supported and are matched on the host part only.
+fn host_matches_no_proxy(host: &str, no_proxy: &str) -> bool {
+    for entry in no_proxy.split(',') {
+        let entry = entry.trim().trim_start_matches('.');
+        // Ignore empty entries (stray/trailing commas, lone dots) — matching
+        // curl/reqwest behavior. Only an explicit "*" is a catch-all wildcard.
+        if entry.is_empty() {
+            continue;
+        }
+        if entry == "*" {
+            return true;
+        }
+        // Extract the host from the entry, tolerating bracketed/bare IPv6 and an
+        // optional `:port` suffix. A bare IPv6 literal like `fd00::1` must NOT be
+        // split on ':' — only strip a port when the form is unambiguous.
+        let entry_host = if let Some(rest) = entry.strip_prefix('[') {
+            // Bracketed IPv6: `[fd00::1]` or `[fd00::1]:port`.
+            rest.split(']').next().unwrap_or(rest)
+        } else if entry.matches(':').count() == 1 {
+            // Exactly one colon → `host:port`.
+            entry.split(':').next().unwrap_or(entry)
+        } else {
+            // No colon, or multiple colons (bare IPv6 such as `fd00::1`).
+            entry
+        };
+        // DNS names are case-insensitive; normalize both sides for the exact and
+        // domain-suffix comparisons.
+        let host_lc = host.to_ascii_lowercase();
+        let entry_lc = entry_host.to_ascii_lowercase();
+        if host_lc == entry_lc
+            || host_lc
+                .strip_suffix(&entry_lc)
+                .map(|prefix| prefix.ends_with('.'))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip `user:pass@` credentials from a proxy URL so it is safe to log or
+/// embed in error messages. Keeps the scheme and authority host:port.
+fn redact_proxy_url(proxy_url: &str) -> String {
+    match proxy_url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.rsplit('@').next().unwrap_or(rest);
+            format!("{scheme}://{host}")
+        }
+        None => proxy_url
+            .rsplit('@')
+            .next()
+            .unwrap_or(proxy_url)
+            .to_string(),
+    }
+}
+
+/// Percent-decode a single URL component (`%XX` → byte). Invalid escapes are
+/// left verbatim. Used to recover proxy credentials before Basic auth.
+fn percent_decode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Build a `Proxy-Authorization: Basic ...` header value from URL userinfo.
+///
+/// Per RFC 3986 the userinfo components are percent-encoded, so decode the
+/// username and password before base64 — otherwise credentials containing
+/// reserved characters (`@`, `:`, `/`, …) authenticate with the literal `%XX`
+/// text instead of the real value.
+fn basic_proxy_auth(userinfo: &str) -> String {
+    use base64::Engine as _;
+    // Basic auth is always `username:password`; a userinfo with no ':' means an
+    // empty password, which must still be encoded as `username:` (not bare
+    // `username`).
+    let decoded = match userinfo.split_once(':') {
+        Some((user, pass)) => format!("{}:{}", percent_decode(user), percent_decode(pass)),
+        None => format!("{}:", percent_decode(userinfo)),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(decoded.as_bytes());
+    format!("Basic {encoded}")
 }
 
 /// Parse `host:port` from an authority string, handling IPv6 bracket notation.
@@ -421,6 +567,9 @@ fn parse_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
     }
 }
 
+/// Timeout for the HTTP CONNECT handshake and TLS setup inside the tunnel.
+const PROXY_CONNECT_TIMEOUT_SECS: u64 = 30;
+
 // Connect to the WebSocket server via HTTP CONNECT proxy.
 // Returns the same type as `connect_async` so callers stay uniform.
 async fn connect_via_proxy(
@@ -431,38 +580,61 @@ async fn connect_via_proxy(
         return Err(format!(
             "HTTPS proxies are not supported for WebSocket CONNECT \
              (the CONNECT handshake is sent in plaintext over a raw TCP connection). \
-             Configure an http:// proxy instead: {proxy_url}"
+             Configure an http:// proxy instead: {}",
+            redact_proxy_url(proxy_url)
         )
         .into());
     }
     let (ws_host, ws_port) =
         parse_ws_target(ws_url).ok_or_else(|| format!("Cannot parse WebSocket URL: {ws_url}"))?;
-    let (proxy_host, proxy_port) = parse_proxy_addr(proxy_url)
-        .ok_or_else(|| format!("Cannot parse proxy URL: {proxy_url}"))?;
+    let (proxy_host, proxy_port, userinfo) = parse_proxy_addr(proxy_url)
+        .ok_or_else(|| format!("Cannot parse proxy URL: {}", redact_proxy_url(proxy_url)))?;
 
     tracing::info!(proxy_host = %proxy_host, proxy_port, target = %format!("{ws_host}:{ws_port}"), "CONNECT via proxy");
 
-    let mut tcp = tokio::net::TcpStream::connect(format!("{proxy_host}:{proxy_port}")).await?;
+    let connect_timeout = Duration::from_secs(PROXY_CONNECT_TIMEOUT_SECS);
 
-    // HTTP CONNECT handshake
-    let req = format!("CONNECT {ws_host}:{ws_port} HTTP/1.1\r\nHost: {ws_host}:{ws_port}\r\n\r\n");
-    tcp.write_all(req.as_bytes()).await?;
+    let mut tcp = tokio::time::timeout(
+        connect_timeout,
+        tokio::net::TcpStream::connect(format!("{proxy_host}:{proxy_port}")),
+    )
+    .await
+    .map_err(|_| format!("Proxy TCP connect timed out after {PROXY_CONNECT_TIMEOUT_SECS}s"))??;
+
+    // HTTP CONNECT handshake — include Proxy-Authorization if userinfo present.
+    let auth_header = userinfo
+        .as_deref()
+        .map(|ui| format!("Proxy-Authorization: {}\r\n", basic_proxy_auth(ui)))
+        .unwrap_or_default();
+    let req = format!(
+        "CONNECT {ws_host}:{ws_port} HTTP/1.1\r\nHost: {ws_host}:{ws_port}\r\n{auth_header}\r\n"
+    );
+    tokio::time::timeout(connect_timeout, tcp.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "Proxy CONNECT write timed out")??;
 
     // Read proxy response headers (200 Connection Established). Read until
     // end-of-headers (\r\n\r\n) so we don't mis-parse when the status line is
     // split across TCP packets.
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 1024];
-    while buf.len() < 16 * 1024 {
-        let n = tcp.read(&mut tmp).await?;
-        if n == 0 {
-            break;
+    let read_response = async {
+        while buf.len() < 16 * 1024 {
+            let n = tcp.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::time::timeout(connect_timeout, read_response)
+        .await
+        .map_err(|_| "Proxy CONNECT response timed out")??;
+
     let resp = String::from_utf8_lossy(&buf);
     if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
         let first_line = resp.lines().next().unwrap_or("(empty)").to_string();
@@ -479,12 +651,16 @@ async fn connect_via_proxy(
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let connector = Connector::Rustls(std::sync::Arc::new(tls_config));
-        let (ws_stream, _) =
-            client_async_tls_with_config(ws_url, tcp, None, Some(connector)).await?;
+        let tls_and_ws = client_async_tls_with_config(ws_url, tcp, None, Some(connector));
+        let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
+            .await
+            .map_err(|_| "TLS+WebSocket upgrade timed out")??;
         Ok(ws_stream)
     } else {
-        let (ws_stream, _) =
-            tokio_tungstenite::client_async(ws_url, MaybeTlsStream::Plain(tcp)).await?;
+        let ws_upgrade = tokio_tungstenite::client_async(ws_url, MaybeTlsStream::Plain(tcp));
+        let (ws_stream, _) = tokio::time::timeout(connect_timeout, ws_upgrade)
+            .await
+            .map_err(|_| "WebSocket upgrade timed out")??;
         Ok(ws_stream)
     }
 }
@@ -496,14 +672,30 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
 
-    // Use the sandbox HTTP proxy for remote endpoints. Process-local control
-    // plane traffic is always direct even when the parent environment injects
-    // HTTP_PROXY without a matching NO_PROXY entry.
-    let proxy = std::env::var("http_proxy")
-        .or_else(|_| std::env::var("HTTP_PROXY"))
-        .ok()
-        .filter(|p| !p.is_empty())
-        .filter(|_| !ws_target_is_loopback(&url));
+    // Prefer the scheme-appropriate proxy and select the first non-empty value;
+    // an explicitly present but empty lowercase variable must not shadow a
+    // populated uppercase fallback.
+    let proxy_names: &[&str] = if url.starts_with("wss://") {
+        &["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]
+    } else {
+        &["http_proxy", "HTTP_PROXY"]
+    };
+    let proxy = select_proxy_candidate_from_env(proxy_names)
+        .filter(|_| !ws_target_is_loopback(&url))
+        .and_then(|proxy_url| {
+            // Extract the WS target host for NO_PROXY matching.
+            let (ws_host, _) = parse_ws_target(&url)?;
+            let no_proxy = first_nonempty_env(&["no_proxy", "NO_PROXY"]).unwrap_or_default();
+            if !no_proxy.is_empty() && host_matches_no_proxy(&ws_host, &no_proxy) {
+                tracing::debug!(
+                    target: "astra.edge",
+                    host = %ws_host,
+                    "Skipping proxy: host matches NO_PROXY"
+                );
+                return None;
+            }
+            Some(proxy_url)
+        });
 
     let ws_stream = if let Some(ref proxy_url) = proxy {
         connect_via_proxy(&url, proxy_url).await.map_err(|e| {
@@ -1126,6 +1318,35 @@ mod tests {
                 "{url} must retain sandbox proxy routing"
             );
         }
+    }
+
+    #[test]
+    fn proxy_value_selection_skips_present_but_empty_values() {
+        assert_eq!(
+            first_nonempty([
+                "  ".to_string(),
+                " https://proxy.example:8443 ".to_string(),
+                "http://fallback.example:8080".to_string(),
+            ]),
+            Some("https://proxy.example:8443".to_string())
+        );
+        assert_eq!(first_nonempty(["".to_string(), "  ".to_string()]), None);
+    }
+
+    #[test]
+    fn proxy_selection_skips_unsupported_https_proxy_and_uses_http_fallback() {
+        assert_eq!(
+            select_proxy_candidate([
+                "https://unsupported.example:8443".to_string(),
+                "  ".to_string(),
+                "http://fallback.example:8080".to_string(),
+            ]),
+            Some("http://fallback.example:8080".to_string())
+        );
+        assert_eq!(
+            select_proxy_candidate(["https://unsupported.example:8443".to_string()]),
+            Some("https://unsupported.example:8443".to_string())
+        );
     }
 
     #[test]

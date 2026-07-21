@@ -52,7 +52,7 @@ pub(crate) async fn execute_edge_bound(
         executor_status = ?request.executor.status,
         connected_edges = edge_connection_pool
             .as_ref()
-            .map(|p| p.get_user_edges(&request.user_id).len())
+            .map(|p| p.get_all_user_edges(&request.user_id).len())
             .unwrap_or(0),
         "edge_dispatch: begin edge-bound tool execution"
     );
@@ -154,7 +154,14 @@ async fn try_edge_websocket(
         // unless the same invocation first has a durable dispatch row.
         return EdgeTransportAttempt::Unavailable;
     };
-    let edges = pool.get_user_edges(&request.user_id);
+    // Workspace isolation: both same-user and cross-user lookups use the same
+    // requesting workspace_id so that workspace-B requests cannot select an
+    // edge that belongs to workspace-A even when both are owned by the same user.
+    let requesting_workspace_id = request
+        .workspace_record
+        .as_ref()
+        .map(|w| w.workspace_id.as_str());
+    let edges = pool.get_user_edges(&request.user_id, requesting_workspace_id);
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
         tool = %request.tool_name,
@@ -167,14 +174,17 @@ async fn try_edge_websocket(
     // requested, attempt a cross-user lookup by agent ID.  This handles the
     // case where a sandbox edge agent connects using a service-account user ID
     // that is different from the workspace user issuing the chat request.
-    // The requesting workspace_id is passed so that the pool can enforce that
-    // the edge agent belongs to the same workspace (workspace-level authorization).
-    let requesting_workspace_id = request
-        .workspace_record
-        .as_ref()
-        .map(|w| w.workspace_id.as_str());
     let (edge, edge_owner_user_id) = if edges.is_empty() {
         if let Some(agent_id) = plan.selected_executor_id() {
+            if requesting_workspace_id.is_none() {
+                tracing::warn!(
+                    target: "astra_runtime::edge_dispatch_diag",
+                    tool = %request.tool_name,
+                    selected_executor_id = %agent_id,
+                    "edge_dispatch: refusing unscoped cross-user edge lookup"
+                );
+                return EdgeTransportAttempt::Unavailable;
+            }
             match pool.find_edge_by_agent_id(agent_id, requesting_workspace_id) {
                 Some((owner_user_id, found_edge)) => {
                     // Enforce capability surface checks even on cross-user lookups.
@@ -237,6 +247,15 @@ async fn try_edge_websocket(
                 // case where the edge agent connects under a service-account
                 // user ID different from the workspace user issuing the request.
                 if let Some(agent_id) = plan.selected_executor_id() {
+                    if requesting_workspace_id.is_none() {
+                        tracing::warn!(
+                            target: "astra_runtime::edge_dispatch_diag",
+                            tool = %request.tool_name,
+                            selected_executor_id = %agent_id,
+                            "edge_dispatch: refusing unscoped cross-user edge fallback"
+                        );
+                        return EdgeTransportAttempt::Unavailable;
+                    }
                     match pool.find_edge_by_agent_id(agent_id, requesting_workspace_id) {
                         Some((owner_user_id, found_edge)) => {
                             match select_capable_connected_edge(
@@ -425,8 +444,22 @@ async fn try_edge_dispatch(
         .as_ref()
         .map(|w| w.workspace_id.as_str());
     let agent = if let Some(executor_id) = plan.selected_executor_id() {
-        let find_agent =
-            registry.find_by_agent_id_and_workspace(executor_id, requesting_workspace_id);
+        let find_agent = async {
+            if let Some(workspace_id) = requesting_workspace_id {
+                registry
+                    .find_by_agent_id_and_workspace(executor_id, Some(workspace_id))
+                    .await
+            } else {
+                // Without an authorization scope, a pinned executor may only be
+                // resolved within the requesting user. Never scan other users by
+                // an unowned, self-reported edge_agent_id.
+                registry.list_by_user(&request.user_id).await.map(|agents| {
+                    agents
+                        .into_iter()
+                        .find(|agent| agent.edge_agent_id == executor_id)
+                })
+            }
+        };
         let agent_result = if let Some(token) = cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {

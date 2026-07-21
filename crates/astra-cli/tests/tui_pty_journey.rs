@@ -391,7 +391,7 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
 async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     let _journey = pty_journey_lock().lock().await;
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
+        astra_cli::cli::mock_llm::MockScenario::CancellationPending,
     )
     .await
     .expect("start scripted slow LLM server");
@@ -401,7 +401,10 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
 
     astra.wait_for("Enter send", Duration::from_secs(15));
     astra.write(b"hold this turn open\r");
-    astra.wait_for("Working", UI_TRANSITION_TIMEOUT);
+    // Cancel while the request is observably pending. Waiting for `Working`
+    // would require the delayed mock handler to return its response first,
+    // creating a race between natural completion and the Ctrl+C input.
+    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x03]); // Ctrl+C through the real raw-mode input boundary.
 
     astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);

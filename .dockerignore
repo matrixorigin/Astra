@@ -27,6 +27,11 @@ dist
 build
 target
 rust/
+# Re-include prebuilt binaries for Dockerfile.prebuilt. The prebuilt image
+# build (cargo zigbuild output) lives under target/; all other build artefacts
+# (incremental, debug, deps) are still excluded by the patterns below.
+!target/x86_64-unknown-linux-gnu/release/astra-server
+!target/x86_64-unknown-linux-gnu/release/astra
 tmp/
 *.patch
 .runtime

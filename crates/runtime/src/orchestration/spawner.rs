@@ -4084,6 +4084,13 @@ fn cleanup_agent_worktree(worktree_path: Option<&PathBuf>, agent_id: &str) {
 }
 
 fn remove_git_agent_worktree(path: &Path) -> Result<bool, std::io::Error> {
+    // A linked worktree has a `.git` file pointing at its parent repository.
+    // Fallback isolation directories have no such marker and can be removed
+    // directly by `cleanup_agent_worktree`, without spawning Git first.
+    if !path.join(".git").is_file() {
+        return Ok(false);
+    }
+
     let Some(worktree_base) = path.parent() else {
         return Ok(false);
     };

@@ -26,6 +26,20 @@ pub struct EdgeAgentRecord {
     pub last_heartbeat_at: String,
 }
 
+/// Result of claiming an edge registry generation.
+///
+/// `previous` is the exact published generation replaced by `current`.
+/// Database-backed implementations hold `claim_id` until the in-memory pool
+/// commit, serializing this setup window across pods.
+#[derive(Clone, Debug)]
+pub struct EdgeRegistrationLease {
+    pub current: EdgeAgentRecord,
+    pub previous: Option<EdgeAgentRecord>,
+    /// Database claim held across durable registration and in-memory pool
+    /// commit. `None` for backends that do not implement cross-pod fencing.
+    pub claim_id: Option<String>,
+}
+
 /// Structured error for `EdgeRegistryService::heartbeat`.
 ///
 /// Callers must treat these two variants differently:
@@ -66,6 +80,75 @@ pub trait EdgeRegistryService: Send + Sync {
         workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String>;
 
+    /// Claim the registry generation and retain the exact predecessor for a
+    /// conditional rollback. Backends without durable generation support fall
+    /// back to ordinary registration and report no predecessor.
+    #[allow(clippy::too_many_arguments)]
+    async fn register_or_update_with_lease(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let current = self
+            .register_or_update(
+                user_id,
+                edge_agent_id,
+                edge_id_header,
+                hostname,
+                worktree_path,
+                capabilities,
+                workspace_id,
+            )
+            .await?;
+        Ok(EdgeRegistrationLease {
+            current,
+            previous: None,
+            claim_id: None,
+        })
+    }
+
+    /// Undo a claimed generation only if it still owns the registry row.
+    /// Returns false when a newer generation has already taken over.
+    async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        match &lease.previous {
+            Some(previous) => {
+                self.restore_superseded_edge_id(
+                    &lease.current.user_id,
+                    &lease.current.edge_agent_id,
+                    &previous.edge_id,
+                    &lease.current.edge_id,
+                )
+                .await
+            }
+            None => {
+                self.unregister_generation(
+                    &lease.current.user_id,
+                    &lease.current.edge_agent_id,
+                    &lease.current.edge_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Release the cross-pod setup claim after the connection is published.
+    /// Backends without durable claim support have nothing to release.
+    async fn release_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Finalize the durable generation while retaining the cross-pod claim.
+    /// The default registration path is already final, so non-claiming
+    /// backends have nothing else to do.
+    async fn finalize_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn heartbeat(
         &self,
         user_id: &str,
@@ -101,6 +184,38 @@ pub trait EdgeRegistryService: Send + Sync {
         edge_agent_id: &str,
         edge_id_header: &str,
     ) -> Result<bool, String>;
+
+    /// Return the `edge_id` that currently owns the registry row for this
+    /// `(user_id, edge_agent_id)`, or `None` if no row exists. A reconnect
+    /// captures this BEFORE `register_or_update` (which overwrites it) so it can
+    /// restore the previous owner if its own socket turns out to be dead.
+    ///
+    /// The default returns `Ok(None)` for backends without a durable registry.
+    async fn current_edge_id(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Restore the registry row's `edge_id` to a previously-captured owner, but
+    /// only while `expected_current_edge_id` still owns it (so a newer reconnect
+    /// that has since taken over is never clobbered). Used to undo a reconnect
+    /// whose socket died after it had already overwritten the previous owner's
+    /// row, preventing that healthy previous connection from being superseded.
+    /// Returns whether the row was restored.
+    ///
+    /// The default returns `Ok(false)` for backends without a durable registry.
+    async fn restore_superseded_edge_id(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _restore_to_edge_id: &str,
+        _expected_current_edge_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 pub struct DatabaseEdgeRegistryService {
@@ -126,6 +241,167 @@ impl DatabaseEdgeRegistryService {
     pub fn with_metrics(mut self, metrics: SharedMultiAgentMetrics) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn claim_registration(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let cap_json = capabilities
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("capabilities json: {e}"))?;
+        const MAX_RETRIES: u32 = 5;
+        let claim_id = uuid::Uuid::new_v4().to_string();
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.registry_retry_total.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25 * (1 << (attempt - 1))))
+                    .await;
+            }
+
+            let row = sqlx::query(
+                "SELECT registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+                 capabilities_json, workspace_id, registration_state, \
+                 CAST(registered_at AS CHAR) AS registered_at, \
+                 CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
+                 FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+            )
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry lease lookup (attempt {attempt}): {e}"))?;
+            let previous = row.as_ref().map(decode_edge_agent_record).transpose()?;
+            let registration_state = row
+                .as_ref()
+                .map(|row| row.i8_column("registration_state"))
+                .transpose()
+                .map_err(|e| {
+                    edge_registry_decode_error("lease lookup row", "registration_state", e)
+                })?
+                .unwrap_or(1);
+
+            if let Some(previous) = previous {
+                // Acquire only the setup claim. Keep every active routing field
+                // unchanged until finalize_registration(), so the published
+                // predecessor remains heartbeatable and routable while setup is
+                // pending.
+                let updated = sqlx::query(
+                    "UPDATE edge_agent_registry \
+                     SET registration_claim_id = ?, \
+                         registration_claim_expires_at = DATE_ADD(NOW(6), INTERVAL 120 SECOND) \
+                     WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
+                       AND (registration_claim_id IS NULL \
+                            OR registration_claim_expires_at < NOW(6))",
+                )
+                .bind(&claim_id)
+                .bind(user_id)
+                .bind(&previous.registry_id)
+                .bind(&previous.edge_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("edge_registry lease update (attempt {attempt}): {e}"))?
+                .rows_affected();
+                if updated == 0 {
+                    continue;
+                }
+
+                let now = chrono::Utc::now()
+                    .format("%Y-%m-%d %H:%M:%S%.6f")
+                    .to_string();
+                // State 1 is the only published state. State 0 is a never-
+                // published insert and state 2 is a finalized generation whose
+                // owner crashed before releasing its claim; neither is safe to
+                // resurrect as a rollback target.
+                let published_previous = (registration_state == 1).then_some(previous.clone());
+                let current = EdgeAgentRecord {
+                    registry_id: previous.registry_id.clone(),
+                    user_id: user_id.to_string(),
+                    edge_agent_id: edge_agent_id.to_string(),
+                    edge_id: edge_id_header.to_string(),
+                    hostname: hostname.map(ToString::to_string),
+                    worktree_path: worktree_path.map(ToString::to_string),
+                    capabilities: capabilities.clone(),
+                    workspace_id: workspace_id.map(ToString::to_string).or_else(|| {
+                        published_previous
+                            .as_ref()
+                            .and_then(|record| record.workspace_id.clone())
+                    }),
+                    registered_at: previous.registered_at.clone(),
+                    last_heartbeat_at: now,
+                };
+                return Ok(EdgeRegistrationLease {
+                    current,
+                    previous: published_previous,
+                    claim_id: Some(claim_id),
+                });
+            }
+
+            let registry_id = uuid::Uuid::new_v4().to_string();
+            let inserted = sqlx::query(
+                "INSERT INTO edge_agent_registry \
+                 (registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+                  capabilities_json, workspace_id, registered_at, last_heartbeat_at, \
+                  registration_claim_id, registration_claim_expires_at, registration_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), ?, \
+                         DATE_ADD(NOW(6), INTERVAL 120 SECOND), 0)",
+            )
+            .bind(&registry_id)
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .bind(edge_id_header)
+            .bind(hostname)
+            .bind(worktree_path)
+            .bind(&cap_json)
+            .bind(workspace_id)
+            .bind(&claim_id)
+            .execute(&self.pool)
+            .await;
+            match inserted {
+                Ok(_) => {
+                    let now = chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M:%S%.6f")
+                        .to_string();
+                    return Ok(EdgeRegistrationLease {
+                        current: EdgeAgentRecord {
+                            registry_id,
+                            user_id: user_id.to_string(),
+                            edge_agent_id: edge_agent_id.to_string(),
+                            edge_id: edge_id_header.to_string(),
+                            hostname: hostname.map(ToString::to_string),
+                            worktree_path: worktree_path.map(ToString::to_string),
+                            capabilities: capabilities.clone(),
+                            workspace_id: workspace_id.map(ToString::to_string),
+                            registered_at: now.clone(),
+                            last_heartbeat_at: now,
+                        },
+                        previous: None,
+                        claim_id: Some(claim_id),
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.contains("1062") || message.contains("Duplicate entry") {
+                        continue;
+                    }
+                    return Err(format!("edge_registry lease insert: {error}"));
+                }
+            }
+        }
+
+        Err("edge_registry: exhausted generation-claim retries".to_string())
     }
 }
 
@@ -234,8 +510,12 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                      SET edge_id = ?, hostname = ?, worktree_path = ?, \
                          capabilities_json = ?, \
                          workspace_id = COALESCE(?, workspace_id), \
-                         last_heartbeat_at = NOW(6) \
-                     WHERE user_id = ? AND registry_id = ?",
+                         last_heartbeat_at = NOW(6), registration_claim_id = NULL, \
+                         registration_claim_expires_at = NULL, registration_state = 1, \
+                         registration_previous_edge_id = NULL \
+                     WHERE user_id = ? AND registry_id = ? \
+                       AND (registration_claim_id IS NULL \
+                            OR registration_claim_expires_at < NOW(6))",
                 )
                 .bind(edge_id_header)
                 .bind(hostname)
@@ -288,9 +568,17 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .await
             {
                 Ok(_) => {
-                    // Read back DB timestamps for consistency (both INSERT and
-                    // UPDATE paths return DB-authored timestamps).
-                    let (registered_at, last_heartbeat_at): (String, String) = sqlx::query_as(
+                    // The row is now persisted. Read back DB-authored timestamps
+                    // for consistency, but do NOT fail the whole call if only the
+                    // readback fails: the INSERT already succeeded, and returning
+                    // Err here would break the caller's contract ("Err ⟹ not
+                    // persisted") — the edge WS handler would keep the previous
+                    // connection while the DB already points at this new one,
+                    // leaving them inconsistent. Fall back to a local timestamp.
+                    let (registered_at, last_heartbeat_at) = match sqlx::query_as::<
+                        _,
+                        (String, String),
+                    >(
                         "SELECT CAST(registered_at AS CHAR), \
                              CAST(last_heartbeat_at AS CHAR) \
                              FROM edge_agent_registry WHERE user_id = ? AND registry_id = ?",
@@ -299,7 +587,23 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     .bind(&registry_id)
                     .fetch_one(&self.pool)
                     .await
-                    .map_err(|e| format!("edge_registry timestamp readback: {e}"))?;
+                    {
+                        Ok(timestamps) => timestamps,
+                        Err(e) => {
+                            tracing::warn!(
+                                user_id,
+                                edge_agent_id,
+                                registry_id = %registry_id,
+                                error = %e,
+                                "edge_registry: INSERT succeeded but timestamp readback failed; \
+                                 returning local timestamps"
+                            );
+                            let now = chrono::Utc::now()
+                                .format("%Y-%m-%d %H:%M:%S%.6f")
+                                .to_string();
+                            (now.clone(), now)
+                        }
+                    };
                     return Ok(EdgeAgentRecord {
                         registry_id,
                         user_id: user_id.to_string(),
@@ -326,6 +630,29 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         Err("edge_registry: exhausted retries".into())
     }
 
+    #[tracing::instrument(skip(self, capabilities), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn register_or_update_with_lease(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        self.claim_registration(
+            user_id,
+            edge_agent_id,
+            edge_id_header,
+            hostname,
+            worktree_path,
+            capabilities,
+            workspace_id,
+        )
+        .await
+    }
+
     #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
     async fn heartbeat(
         &self,
@@ -341,10 +668,13 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         // the stale connection's heartbeat correctly returns Superseded.
         let n = sqlx::query(
             "UPDATE edge_agent_registry SET last_heartbeat_at = NOW(6) \
-             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
+             WHERE user_id = ? AND edge_agent_id = ? \
+               AND ((registration_state = 1 AND edge_id = ?) \
+                    OR (registration_state = 2 AND registration_previous_edge_id = ?))",
         )
         .bind(user_id)
         .bind(edge_agent_id)
+        .bind(edge_id_header)
         .bind(edge_id_header)
         .execute(&self.pool)
         .await
@@ -381,6 +711,156 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         Ok(deleted.rows_affected() > 0)
     }
 
+    async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        let Some(claim_id) = lease.claim_id.as_deref() else {
+            return EdgeRegistryService::unregister_generation(
+                self,
+                &lease.current.user_id,
+                &lease.current.edge_agent_id,
+                &lease.current.edge_id,
+            )
+            .await;
+        };
+        let Some(previous) = &lease.previous else {
+            let deleted = sqlx::query(
+                "DELETE FROM edge_agent_registry \
+                 WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+            )
+            .bind(&lease.current.user_id)
+            .bind(&lease.current.registry_id)
+            .bind(claim_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry rollback inserted registration: {e}"))?;
+            return Ok(deleted.rows_affected() > 0);
+        };
+        let capabilities_json = previous
+            .capabilities
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("edge_registry rollback capabilities json: {e}"))?;
+        let restored = sqlx::query(
+            "UPDATE edge_agent_registry \
+             SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
+                 workspace_id = ?, last_heartbeat_at = NOW(6), \
+                 registration_claim_id = NULL, registration_claim_expires_at = NULL, \
+                 registration_state = 1, registration_previous_edge_id = NULL \
+             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+        )
+        .bind(&previous.edge_id)
+        .bind(&previous.hostname)
+        .bind(&previous.worktree_path)
+        .bind(&capabilities_json)
+        .bind(&previous.workspace_id)
+        .bind(&lease.current.user_id)
+        .bind(&lease.current.registry_id)
+        .bind(claim_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry rollback registration: {e}"))?;
+        Ok(restored.rows_affected() > 0)
+    }
+
+    async fn finalize_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        let Some(claim_id) = lease.claim_id.as_deref() else {
+            return Ok(true);
+        };
+        let capabilities_json = lease
+            .current
+            .capabilities
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("edge_registry finalize capabilities json: {e}"))?;
+        let finalized = sqlx::query(
+            "UPDATE edge_agent_registry \
+             SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
+                 workspace_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
+                 registration_previous_edge_id = ? \
+             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+        )
+        .bind(&lease.current.edge_id)
+        .bind(&lease.current.hostname)
+        .bind(&lease.current.worktree_path)
+        .bind(&capabilities_json)
+        .bind(&lease.current.workspace_id)
+        .bind(
+            lease
+                .previous
+                .as_ref()
+                .map(|previous| previous.edge_id.as_str()),
+        )
+        .bind(&lease.current.user_id)
+        .bind(&lease.current.registry_id)
+        .bind(claim_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry finalize registration: {e}"))?;
+        Ok(finalized.rows_affected() > 0)
+    }
+
+    async fn release_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
+        let Some(claim_id) = lease.claim_id.as_deref() else {
+            return Ok(false);
+        };
+        let released = sqlx::query(
+            "UPDATE edge_agent_registry \
+             SET registration_claim_id = NULL, registration_claim_expires_at = NULL, \
+                 registration_state = 1, registration_previous_edge_id = NULL \
+             WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
+               AND registration_claim_id = ? AND registration_state = 2",
+        )
+        .bind(&lease.current.user_id)
+        .bind(&lease.current.registry_id)
+        .bind(&lease.current.edge_id)
+        .bind(claim_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry release registration claim: {e}"))?;
+        Ok(released.rows_affected() > 0)
+    }
+
+    async fn current_edge_id(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Option<String>, String> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT edge_id FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ?",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry current_edge_id: {e}"))?;
+        Ok(row.map(|(edge_id,)| edge_id))
+    }
+
+    async fn restore_superseded_edge_id(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        restore_to_edge_id: &str,
+        expected_current_edge_id: &str,
+    ) -> Result<bool, String> {
+        // Restore only while our incarnation still owns the row (guard on
+        // edge_id = expected_current), so a newer reconnect is never clobbered.
+        let restored = sqlx::query(
+            "UPDATE edge_agent_registry SET edge_id = ?, last_heartbeat_at = NOW(6) \
+             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
+        )
+        .bind(restore_to_edge_id)
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .bind(expected_current_edge_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("edge_registry restore_superseded_edge_id: {e}"))?;
+        Ok(restored.rows_affected() > 0)
+    }
+
     #[tracing::instrument(skip(self), fields(edge_agent_id = %edge_agent_id))]
     async fn find_by_agent_id_and_workspace(
         &self,
@@ -400,6 +880,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
              CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
              FROM edge_agent_registry \
              WHERE edge_agent_id = ? \
+               AND registration_state = 1 \
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              ORDER BY last_heartbeat_at DESC LIMIT 1",
         )
@@ -421,7 +902,9 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
              capabilities_json, workspace_id, \
              CAST(registered_at AS CHAR) AS registered_at, \
              CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at \
-             FROM edge_agent_registry WHERE user_id = ? ORDER BY last_heartbeat_at DESC",
+             FROM edge_agent_registry \
+             WHERE user_id = ? AND registration_state = 1 \
+             ORDER BY last_heartbeat_at DESC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)

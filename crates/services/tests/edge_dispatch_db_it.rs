@@ -716,6 +716,313 @@ async fn edge_registry_concurrent_register() {
 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_registration_lease_restores_the_exact_predecessor() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let svc = DatabaseEdgeRegistryService::new(pool);
+
+    let user_id = format!("user_{}", unique_suffix());
+    let edge_agent_id = format!("agent_{}", unique_suffix());
+    let old_edge_id = format!("edge_old_{}", unique_suffix());
+    let new_edge_id = format!("edge_new_{}", unique_suffix());
+    let old_capabilities = serde_json::json!({"generation": "old"});
+    let new_capabilities = serde_json::json!({"generation": "new"});
+
+    let predecessor = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            &old_edge_id,
+            Some("old-host"),
+            Some("/old/worktree"),
+            Some(old_capabilities.clone()),
+            Some("workspace-old"),
+        )
+        .await
+        .expect("register predecessor");
+    assert!(
+        svc.finalize_registration(&predecessor)
+            .await
+            .expect("finalize predecessor")
+    );
+    assert!(
+        svc.release_registration(&predecessor)
+            .await
+            .expect("publish predecessor")
+    );
+    let replacement = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            &new_edge_id,
+            Some("new-host"),
+            Some("/new/worktree"),
+            Some(new_capabilities),
+            Some("workspace-new"),
+        )
+        .await
+        .expect("register replacement");
+
+    assert_eq!(
+        replacement
+            .previous
+            .as_ref()
+            .map(|record| record.edge_id.as_str()),
+        Some(old_edge_id.as_str())
+    );
+    assert!(
+        svc.finalize_registration(&replacement)
+            .await
+            .expect("finalize replacement")
+    );
+    assert!(
+        svc.rollback_registration(&replacement)
+            .await
+            .expect("rollback replacement")
+    );
+
+    let restored = svc
+        .list_by_user(&user_id)
+        .await
+        .expect("list restored predecessor")
+        .into_iter()
+        .next()
+        .expect("restored predecessor record");
+    assert_eq!(restored.edge_id, old_edge_id);
+    assert_eq!(restored.hostname.as_deref(), Some("old-host"));
+    assert_eq!(restored.worktree_path.as_deref(), Some("/old/worktree"));
+    assert_eq!(restored.capabilities, Some(old_capabilities));
+    assert_eq!(restored.workspace_id.as_deref(), Some("workspace-old"));
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_two_phase_registration_keeps_pending_metadata_unroutable() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let svc = DatabaseEdgeRegistryService::new(pool);
+    let user_id = format!("user_{}", unique_suffix());
+    let edge_agent_id = format!("agent_{}", unique_suffix());
+
+    let published = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-old",
+            Some("old-host"),
+            Some("/workspace-old"),
+            Some(serde_json::json!({"generation": "old"})),
+            Some("workspace-old"),
+        )
+        .await
+        .expect("claim old generation");
+    assert!(svc.finalize_registration(&published).await.unwrap());
+    assert!(svc.release_registration(&published).await.unwrap());
+
+    let pending = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-new",
+            Some("new-host"),
+            Some("/workspace-new"),
+            Some(serde_json::json!({"generation": "new"})),
+            Some("workspace-new"),
+        )
+        .await
+        .expect("claim new generation");
+    let still_published = svc.list_by_user(&user_id).await.unwrap();
+    assert_eq!(still_published.len(), 1);
+    assert_eq!(still_published[0].edge_id, "edge-old");
+    assert_eq!(
+        still_published[0].workspace_id.as_deref(),
+        Some("workspace-old")
+    );
+    svc.heartbeat(&user_id, &edge_agent_id, "edge-old")
+        .await
+        .expect("published predecessor remains healthy during claim");
+
+    assert!(svc.finalize_registration(&pending).await.unwrap());
+    assert!(
+        svc.list_by_user(&user_id).await.unwrap().is_empty(),
+        "finalized generation stays unroutable until pool commit releases the claim"
+    );
+    assert!(svc.release_registration(&pending).await.unwrap());
+    let current = svc.list_by_user(&user_id).await.unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].edge_id, "edge-new");
+    assert_eq!(current[0].workspace_id.as_deref(), Some("workspace-new"));
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_stale_lease_rollback_does_not_clobber_a_newer_generation() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let svc = DatabaseEdgeRegistryService::new(pool);
+
+    let user_id = format!("user_{}", unique_suffix());
+    let edge_agent_id = format!("agent_{}", unique_suffix());
+    let first_edge_id = format!("edge_first_{}", unique_suffix());
+    let second_edge_id = format!("edge_second_{}", unique_suffix());
+    let third_edge_id = format!("edge_third_{}", unique_suffix());
+
+    let first = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            &first_edge_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("register first generation");
+    assert!(
+        svc.finalize_registration(&first)
+            .await
+            .expect("finalize first generation")
+    );
+    assert!(
+        svc.release_registration(&first)
+            .await
+            .expect("publish first generation")
+    );
+    let stale_lease = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            &second_edge_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("register second generation");
+    assert!(
+        svc.finalize_registration(&stale_lease)
+            .await
+            .expect("finalize second generation")
+    );
+    assert!(
+        svc.release_registration(&stale_lease)
+            .await
+            .expect("publish second generation")
+    );
+    let third = svc
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            &third_edge_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("register third generation");
+    assert!(
+        svc.finalize_registration(&third)
+            .await
+            .expect("finalize third generation")
+    );
+    assert!(
+        svc.release_registration(&third)
+            .await
+            .expect("publish third generation")
+    );
+
+    assert!(
+        !svc.rollback_registration(&stale_lease)
+            .await
+            .expect("stale rollback is a successful no-op"),
+        "a rollback must only restore the generation it replaced"
+    );
+    let current = svc
+        .list_by_user(&user_id)
+        .await
+        .expect("list current generation")
+        .into_iter()
+        .next()
+        .expect("current generation record");
+    assert_eq!(current.edge_id, third_edge_id);
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_registration_claim_serializes_cross_pod_setup() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let first_pod = DatabaseEdgeRegistryService::new(pool.clone());
+    let second_pod = DatabaseEdgeRegistryService::new(pool);
+    let user_id = format!("user_{}", unique_suffix());
+    let edge_agent_id = format!("agent_{}", unique_suffix());
+
+    let held = first_pod
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-first",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first pod claims setup");
+    let blocked = second_pod
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-second",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        blocked.is_err(),
+        "another pod must not build a rollback chain through an unpublished generation"
+    );
+
+    assert!(
+        first_pod
+            .finalize_registration(&held)
+            .await
+            .expect("finalize first pod claim")
+    );
+    assert!(
+        first_pod
+            .release_registration(&held)
+            .await
+            .expect("release first pod claim")
+    );
+    let successor = second_pod
+        .register_or_update_with_lease(
+            &user_id,
+            &edge_agent_id,
+            "edge-second",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("second pod claims after release");
+    assert_eq!(
+        successor
+            .previous
+            .as_ref()
+            .map(|record| record.edge_id.as_str()),
+        Some("edge-first")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn edge_registry_register_twice_updates() {
     require_env();
     let pool = common::setup_pool().await.get().clone();

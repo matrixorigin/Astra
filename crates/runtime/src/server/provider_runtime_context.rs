@@ -90,7 +90,7 @@ async fn inject_edge_registration_runtime_context_body(
             principal,
             astra_services::ExternalRuntimeContextRequestData {
                 requested_model_id,
-                requested_tool_ids,
+                requested_tool_ids: requested_tool_ids.clone(),
                 requested_skill_ids: requested_skill_ids.clone(),
                 requested_knowledge_base_ids: Vec::new(),
             },
@@ -103,6 +103,21 @@ async fn inject_edge_registration_runtime_context_body(
     let authorization = context.runtime_auth.authorization.clone();
     let selected_model = context.selected_model.to_selected_model_request();
     let runtime_auth = context.runtime_auth.to_runtime_auth_request();
+    let allowed_tool_ids = effective_allowed_tool_ids(
+        &requested_tool_ids,
+        context
+            .runtime_scope
+            .allowed_tools
+            .iter()
+            .map(|tool| tool.id.as_str()),
+    );
+    // The provider grant may narrow the caller's request but must never broaden
+    // it. Persist the effective intersection into the request consumed by the
+    // rest of Astra's tool admission pipeline.
+    object.insert(
+        "allow_tools".to_string(),
+        serde_json::to_value(allowed_tool_ids).map_err(internal_error)?,
+    );
     if let Some(runtime_system_prompt) = context.runtime_system_prompt {
         object.insert(
             "runtime_system_prompt".to_string(),
@@ -156,6 +171,20 @@ async fn inject_edge_registration_runtime_context_body(
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(internal_error)
+}
+
+fn effective_allowed_tool_ids<'a>(
+    requested_tool_ids: &[String],
+    provider_allowed_tool_ids: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let provider_allowed_tool_ids = provider_allowed_tool_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    requested_tool_ids
+        .iter()
+        .filter(|tool_id| provider_allowed_tool_ids.contains(tool_id.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn string_array_field(
@@ -342,6 +371,55 @@ mod tests {
         ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
             unreachable!()
         }
+
+        async fn external_runtime_context_by_scope(
+            &self,
+            _principal: &AuthPrincipal,
+            request: astra_services::ExternalRuntimeContextRequestData,
+        ) -> Result<
+            astra_services::ExternalRuntimeContextResponse,
+            (StatusCode, axum::Json<ErrorResponse>),
+        > {
+            use astra_services::auth::external::{
+                ExternalCatalogTool, ExternalRuntimeAuthResponse,
+                ExternalRuntimeCapabilityDescriptors, ExternalRuntimeScopeResponse,
+                ExternalSelectedModelResponse,
+            };
+
+            assert_eq!(request.requested_model_id, "model-requested");
+            assert_eq!(request.requested_tool_ids, ["bash", "read_file"]);
+            Ok(astra_services::ExternalRuntimeContextResponse {
+                selected_model: ExternalSelectedModelResponse {
+                    id: "model-requested".to_string(),
+                    model: "provider-model".to_string(),
+                },
+                runtime_auth: ExternalRuntimeAuthResponse {
+                    auth_type: "moi_runtime_grant".to_string(),
+                    authorization: "Bearer runtime-grant".to_string(),
+                    expires_at: "2026-07-21T00:00:00Z".to_string(),
+                },
+                capability_descriptors: ExternalRuntimeCapabilityDescriptors::default(),
+                runtime_scope: ExternalRuntimeScopeResponse {
+                    allowed_model_id: "model-requested".to_string(),
+                    allowed_tools: vec![ExternalCatalogTool {
+                        id: "read_file".to_string(),
+                        name: "Read file".to_string(),
+                        kind: "tool".to_string(),
+                        description: None,
+                        side_effect_class: "read".to_string(),
+                        input_schema: serde_json::Map::new(),
+                        output_schema: serde_json::Map::new(),
+                        metadata: serde_json::Map::new(),
+                    }],
+                    allowed_skills: Vec::new(),
+                    allowed_knowledge_bases: Vec::new(),
+                },
+                runtime_system_prompt: None,
+                task_id: "task-1".to_string(),
+                manifest_id: "manifest-1".to_string(),
+                provider_scope_id: "ws-1".to_string(),
+            })
+        }
     }
 
     fn edge_principal() -> AuthPrincipal {
@@ -415,5 +493,53 @@ mod tests {
             "must fail on missing selected_model.id, not on injected fields: {:?}",
             err.1.0.detail
         );
+    }
+
+    #[tokio::test]
+    async fn injected_body_uses_intersection_of_requested_and_provider_allowed_tools() {
+        let state = test_state();
+        let principal = edge_principal();
+        let body = Bytes::from(
+            serde_json::json!({
+                "selected_model": {"id": "model-requested", "model": "caller-model"},
+                "allow_tools": ["bash", "read_file"]
+            })
+            .to_string(),
+        );
+
+        let body = inject_edge_registration_runtime_context_body(&state, &principal, body)
+            .await
+            .expect("provider runtime context should be injected");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
+
+        assert_eq!(value["allow_tools"], serde_json::json!(["read_file"]));
+        assert_eq!(value["selected_model"]["model"], "provider-model");
+        assert_eq!(
+            value["runtime_auth"]["authorization"],
+            "Bearer runtime-grant"
+        );
+    }
+
+    #[test]
+    fn provider_tool_grant_only_narrows_requested_tools() {
+        let requested = vec![
+            "bash".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string(),
+        ];
+
+        let effective =
+            effective_allowed_tool_ids(&requested, ["read_file", "provider_only", "write_file"]);
+
+        assert_eq!(effective, vec!["read_file", "write_file"]);
+    }
+
+    #[test]
+    fn missing_provider_tool_grants_fail_closed() {
+        let requested = vec!["bash".to_string()];
+
+        let effective = effective_allowed_tool_ids(&requested, std::iter::empty());
+
+        assert!(effective.is_empty());
     }
 }

@@ -3207,6 +3207,13 @@ mod tests {
     }
 
     // ── HTTP client proxy policy ──────────────────────────────────────────────
+    //
+    // The SSE chat-turn stream (`post_chat_turn`) and the model-list pre-flight
+    // (`get_models_response_timeout`) both use `http_stream`, which is built by
+    // `streaming_http_client()`.  Remote endpoints retain proxy-aware routing so
+    // that sandbox environments with HTTP_PROXY as the only egress path continue
+    // to work.  Loopback endpoints bypass the proxy so local Astra servers and
+    // test harnesses cannot be redirected to an infrastructure proxy.
 
     #[test]
     fn proxy_policy_bypasses_only_process_local_base_urls() {

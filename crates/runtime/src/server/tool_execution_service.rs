@@ -401,7 +401,7 @@ impl ToolExecutionService {
         let Some(pool) = self.edge_connection_pool.as_ref() else {
             return;
         };
-        for edge in pool.get_user_edges(user_id) {
+        for edge in pool.get_all_user_edges(user_id) {
             let advertised_tools = edge
                 .capabilities
                 .and_then(|value| {

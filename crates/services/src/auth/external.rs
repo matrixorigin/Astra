@@ -940,8 +940,15 @@ fn map_provider_error_status(
 pub fn validate_provider_runtime_context(
     provider: &ExternalAuthProviderConfig,
     requested_model_id: &str,
+    expected_provider_scope_id: &str,
     context: &ExternalRuntimeContextResponse,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if context.provider_scope_id != expected_provider_scope_id {
+        return Err(provider_context_conflict(format!(
+            "external provider '{}' returned runtime context for scope '{}' while scope '{}' was authorized",
+            provider.id, context.provider_scope_id, expected_provider_scope_id
+        )));
+    }
     if context.selected_model.id != requested_model_id {
         return Err(error_response_coded(
             StatusCode::FORBIDDEN,
@@ -1461,6 +1468,7 @@ mod tests {
         let err = validate_provider_runtime_context(
             &provider("http://127.0.0.1/external-auth".to_string()),
             "model-qwen",
+            "ws-1",
             &context,
         )
         .expect_err("model gateway descriptor is required");
@@ -1469,6 +1477,46 @@ mod tests {
         assert_eq!(
             err.1.error_code.as_deref(),
             Some("external_provider_runtime_context_invalid")
+        );
+    }
+
+    #[test]
+    fn runtime_context_rejects_scope_different_from_authorized_principal() {
+        let context = ExternalRuntimeContextResponse {
+            selected_model: ExternalSelectedModelResponse {
+                id: "model-qwen".to_string(),
+                model: "qwen".to_string(),
+            },
+            runtime_auth: ExternalRuntimeAuthResponse {
+                auth_type: "moi_runtime_grant".to_string(),
+                authorization: "Bearer runtime-grant".to_string(),
+                expires_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            capability_descriptors: ExternalRuntimeCapabilityDescriptors::default(),
+            runtime_scope: ExternalRuntimeScopeResponse {
+                allowed_model_id: "model-qwen".to_string(),
+                allowed_tools: Vec::new(),
+                allowed_skills: Vec::new(),
+                allowed_knowledge_bases: Vec::new(),
+            },
+            runtime_system_prompt: None,
+            task_id: "task-1".to_string(),
+            manifest_id: "manifest-1".to_string(),
+            provider_scope_id: "ws-other".to_string(),
+        };
+
+        let err = validate_provider_runtime_context(
+            &provider("http://127.0.0.1/external-auth".to_string()),
+            "model-qwen",
+            "ws-authorized",
+            &context,
+        )
+        .expect_err("provider must not switch the authorized scope");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            err.1.error_code.as_deref(),
+            Some("external_provider_runtime_context_disallowed")
         );
     }
 

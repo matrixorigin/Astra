@@ -843,9 +843,14 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
 
     async fn list_by_user(
         &self,
-        _user_id: &str,
+        user_id: &str,
     ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
-        Ok(self.agents.clone())
+        Ok(self
+            .agents
+            .iter()
+            .filter(|agent| agent.user_id == user_id)
+            .cloned()
+            .collect())
     }
 
     async fn unregister_generation(
@@ -2680,6 +2685,60 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 }
 
 #[tokio::test]
+async fn unscoped_edge_binding_does_not_route_to_another_users_connected_edge() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-2",
+        "edge-selected",
+        Some("Other user's laptop".to_string()),
+        Some("/Users/other/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert!(
+        rx.try_recv().is_err(),
+        "an unscoped edge_agent_id must not authorize cross-user socket delivery"
+    );
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "an unscoped cross-user connection must not be durably admitted"
+    );
+}
+
+#[tokio::test]
 async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
@@ -2999,6 +3058,49 @@ async fn edge_dispatch_result_reports_edge_ledger_transport() {
             .lock()
             .expect("inserted edge agent ids lock"),
         vec!["edge-selected".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn unscoped_edge_dispatch_does_not_route_to_another_users_registry_record() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let mut other_users_agent = edge_agent_record("edge-selected");
+    other_users_agent.user_id = "user-2".to_string();
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![other_users_agent],
+        }))
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "an unscoped durable lookup must remain within the requesting user"
     );
 }
 

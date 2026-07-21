@@ -280,6 +280,7 @@ dependencies = [
  "astra-server-types",
  "astra-tools",
  "astra-turn-types",
+ "base64",
  "clap",
  "fastrand",
  "fs2",
