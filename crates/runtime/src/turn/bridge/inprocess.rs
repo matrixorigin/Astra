@@ -78,6 +78,20 @@ const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 type ActiveBridgeInference =
     Arc<tokio::sync::Mutex<Option<Arc<crate::turn::llm::durable::DurableInferenceInvocation>>>>;
 
+async fn settle_active_bridge_inference<T, F, Fut, E>(
+    active: &Arc<tokio::sync::Mutex<Option<T>>>,
+    settle: F,
+) -> Result<(), E>
+where
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let Some(invocation) = active.lock().await.take() else {
+        return Ok(());
+    };
+    settle(invocation).await
+}
+
 fn bridge_inference_operation_id(user_query_event_id: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(user_query_event_id.as_bytes()));
     format!("bridge_chat_{}", &digest[..32])
@@ -101,48 +115,35 @@ async fn finish_active_bridge_inference_error(
     active: &ActiveBridgeInference,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
-    let mut slot = active.lock().await;
-    let Some(invocation) = slot.as_ref() else {
-        return Ok(());
-    };
-    if crate::turn::llm::durable::is_ledger_error(error) {
-        return Ok(());
-    }
-    let terminal = crate::turn::llm::durable::terminal_from_error(error);
-    invocation.finish_open_attempts(&terminal).await?;
-    invocation.finish(&terminal).await?;
-    slot.take();
-    Ok(())
+    settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish_error(error).await
+    })
+    .await
 }
 
 async fn finish_active_bridge_inference(
     active: &ActiveBridgeInference,
     terminal: &astra_services::InferenceInvocationTerminal,
 ) -> Result<(), astra_core::ClassifiedError> {
-    let mut slot = active.lock().await;
-    let Some(invocation) = slot.as_ref() else {
-        return Ok(());
-    };
-    invocation.finish(terminal).await?;
-    slot.take();
-    Ok(())
+    settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish(terminal).await
+    })
+    .await
 }
 
 async fn finish_disconnected_bridge_inference(active: &ActiveBridgeInference) {
     let terminal =
         crate::turn::llm::durable::terminal_from_error(&bridge_client_disconnect_error());
-    let mut slot = active.lock().await;
-    let Some(invocation) = slot.as_ref() else {
-        return;
-    };
-    if let Err(error) = invocation.finish_after_disconnect(&terminal).await {
+    if let Err(error) = settle_active_bridge_inference(active, |invocation| async move {
+        invocation.finish_after_disconnect(&terminal).await
+    })
+    .await
+    {
         astra_core::agent_error!(
             "bridge",
             "failed to converge inference invocation after client disconnect: {error}"
         );
-        return;
     }
-    slot.take();
 }
 
 /// Completion link in a per-session asynchronous persistence chain. The link
@@ -5044,6 +5045,24 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn active_inference_is_transferred_before_terminal_io() {
+        let active = Arc::new(tokio::sync::Mutex::new(Some("invocation")));
+
+        let settlement = settle_active_bridge_inference(&active, |owned| async move {
+            assert_eq!(owned, "invocation");
+            Err::<(), _>("database unavailable")
+        })
+        .await
+        .expect_err("settlement failure must remain observable");
+
+        assert_eq!(settlement, "database unavailable");
+        assert!(
+            active.lock().await.is_none(),
+            "a failed terminal write must not leave a stale invocation in the session slot"
+        );
+    }
 
     fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
         crate::turn::prompt_cache::resolve_always_load_tool_names_for_config(

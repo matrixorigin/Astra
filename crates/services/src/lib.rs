@@ -205,9 +205,9 @@ pub use harness::{
 pub use inference_execution::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
     InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
-    admit_inference_invocation, begin_inference_provider_attempt, finish_inference_invocation,
-    finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
-    reconcile_inference_settlements,
+    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
+    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlements,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,

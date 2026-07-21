@@ -67,7 +67,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
-    FallbackOutcome, RateLimitAction, try_resolve_fallback,
+    CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
@@ -539,6 +539,42 @@ impl ResolvedTurnLlmConfig {
             request_timeout: self.request_timeout,
         }
     }
+
+    fn shares_credential_owner_with(&self, candidate: &Self) -> bool {
+        self.provider == candidate.provider
+            && self.api_key == candidate.api_key
+            && self.base_url == candidate.base_url
+            && self.header_overrides == candidate.header_overrides
+            && self.completions_url_override == candidate.completions_url_override
+    }
+}
+
+async fn try_resolve_same_owner_fallback(
+    cooldown: &PerModelCooldown,
+    chain: &[String],
+    reason: CooldownReason,
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+    credential_owner: &ResolvedTurnLlmConfig,
+) -> FallbackOutcome<ResolvedTurnLlmConfig> {
+    try_resolve_fallback(cooldown, chain, reason, |fallback_name| async move {
+        let candidate = resolve_llm_model_for_turn(
+            matrixone,
+            encryptor,
+            Some(fallback_name.as_str()),
+            pool,
+            None,
+        )
+        .await?;
+        if !credential_owner.shares_credential_owner_with(&candidate) {
+            return Err(
+                "fallback Offering belongs to a different provider credential owner".to_string(),
+            );
+        }
+        Ok(candidate)
+    })
+    .await
 }
 
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
@@ -5142,7 +5178,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ));
             }
         };
-        let has_fallback = !llm_cfg.fallback_chain.is_empty();
+        let fallback_chain = llm_cfg.fallback_chain.clone();
+        let credential_owner = llm_cfg.clone();
+        let has_fallback = !fallback_chain.is_empty();
 
         // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
         let cooldown = rate_limit_cooldown();
@@ -5159,14 +5197,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 let mx = &self.matrixone;
                 let enc = self.encryptor.as_ref();
                 let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-                match try_resolve_fallback(
+                match try_resolve_same_owner_fallback(
                     cooldown,
-                    &llm_cfg.fallback_chain,
+                    &fallback_chain,
                     reason,
-                    |fb_name| async move {
-                        resolve_llm_model_for_turn(mx, enc, Some(fb_name.as_str()), pool_ref, None)
-                            .await
-                    },
+                    mx,
+                    enc,
+                    pool_ref,
+                    &credential_owner,
                 )
                 .await
                 {
@@ -5181,12 +5219,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         );
                     }
                     FallbackOutcome::AllExhausted { chain_len } => {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "rate-limit cooldown: all {} fallback models exhausted ({})",
-                            chain_len,
-                            reason.as_str()
-                        );
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::RateLimit,
+                            format!(
+                                "Rate limit cooldown requires a same-owner fallback, but all {chain_len} configured candidates are unavailable ({})",
+                                reason.as_str()
+                            ),
+                        ));
                     }
                 }
             }
@@ -5703,6 +5742,54 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // Fatal handler can trigger auto-compaction + retry.
             let r = match r {
                 Ok(r) => r,
+                Err(e)
+                    if let Some(reason) =
+                        crate::turn::bridge::llm_stream::fallback_required_reason(&e) =>
+                {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(&e),
+                        admission_estimated_tokens as u64,
+                    );
+                    record_full_llm_response_event(
+                        state,
+                        self.full_llm_capture,
+                        &self.session_id,
+                        "server_loop_host",
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        attempt_in_round,
+                        "fallback_required",
+                        llm_capture_error_response(&e),
+                    );
+                    if let Some(invocation) = durable_invocation.as_ref() {
+                        invocation.finish_error(&e).await?;
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            "admitted Offering attempted to cross its credential-owner boundary",
+                        ));
+                    }
+                    match try_resolve_same_owner_fallback(
+                        rate_limit_cooldown(),
+                        &fallback_chain,
+                        reason,
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        self.shared_pool.as_ref().map(SharedPool::get),
+                        &credential_owner,
+                    )
+                    .await
+                    {
+                        FallbackOutcome::Resolved(fallback) => {
+                            llm_cfg = fallback;
+                            attempt_in_round = attempt_in_round.saturating_add(1);
+                            continue;
+                        }
+                        FallbackOutcome::NoFallbackConfigured
+                        | FallbackOutcome::AllExhausted { .. } => return Err(e),
+                    }
+                }
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
                     if let Some(invocation) = durable_invocation.as_ref() {
                         invocation.finish_error(e).await?;
@@ -11741,6 +11828,51 @@ mod tests {
             resolved.fallback_chain.is_empty(),
             "legacy model-name fallback must not bypass Offering admission"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_route_cannot_change_credential_owner_material() {
+        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
+            .expect("valid Offering material");
+        let primary = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            None,
+            None,
+            Some(&execution),
+        )
+        .await
+        .expect("resolve credential owner");
+        let mut same_owner = primary.clone();
+        same_owner.model_name = "alternate-model".to_string();
+        same_owner.wire_model_name = Some("alternate-upstream".to_string());
+        assert!(primary.shares_credential_owner_with(&same_owner));
+
+        for candidate in [
+            ResolvedTurnLlmConfig {
+                api_key: "different-secret".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                provider: "anthropic".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                base_url: "https://other-provider.example/v1".to_string(),
+                ..same_owner.clone()
+            },
+            ResolvedTurnLlmConfig {
+                completions_url_override: Some(
+                    "https://other-gateway.example/v1/chat/completions".to_string(),
+                ),
+                ..same_owner.clone()
+            },
+        ] {
+            assert!(
+                !primary.shares_credential_owner_with(&candidate),
+                "fallback must never change the provider credential owner"
+            );
+        }
     }
 
     #[tokio::test]

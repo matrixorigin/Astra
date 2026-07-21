@@ -275,6 +275,9 @@ impl DurableInferenceInvocation {
         &self,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError> {
+        astra_services::declare_inference_settlement(&self.shared_pool, &self.plan, terminal)
+            .await
+            .map_err(|error| service_error("settlement declaration", error))?;
         self.observer.finish_open_attempts(terminal).await
     }
 
@@ -306,13 +309,13 @@ impl DurableInferenceInvocation {
         &self,
         error: &astra_core::ClassifiedError,
     ) -> Result<(), astra_core::ClassifiedError> {
-        // An observer/ledger failure means provider delivery or the durable
-        // provider terminal may be unknown. Keep the logical invocation in
-        // `admitted` for reconciliation instead of inventing an outcome.
-        if is_ledger_error(error) {
-            return Ok(());
-        }
-        self.finish(&terminal_from_error(error)).await
+        let terminal = if is_ledger_error(error) {
+            unsettled_attempt_terminal()
+        } else {
+            terminal_from_error(error)
+        };
+        self.finish_open_attempts(&terminal).await?;
+        self.finish(&terminal).await
     }
 
     pub(crate) async fn finish(
@@ -356,6 +359,31 @@ struct ProviderAttemptState {
     latest_terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
+async fn finish_attempt_batch<F, Fut>(
+    attempts: Vec<u32>,
+    mut finish: F,
+) -> (Vec<u32>, Option<astra_core::ClassifiedError>)
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), astra_core::ClassifiedError>>,
+{
+    let mut completed = Vec::with_capacity(attempts.len());
+    let mut first_error = None;
+    for attempt_index in attempts {
+        match finish(attempt_index).await {
+            Ok(()) => completed.push(attempt_index),
+            Err(error) => {
+                astra_core::agent_error!(
+                    "llm",
+                    "provider attempt {attempt_index} terminal commit failed: {error}"
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    (completed, first_error)
+}
+
 impl DurableProviderAttemptObserver {
     fn new(shared_pool: SharedPool, invocation: astra_services::InferenceInvocationPlan) -> Self {
         Self {
@@ -372,18 +400,26 @@ impl DurableProviderAttemptObserver {
     ) -> Result<(), astra_core::ClassifiedError> {
         let mut state = self.state.lock().await;
         let attempts = state.open_attempts.iter().copied().collect::<Vec<_>>();
-        for attempt_index in attempts {
+        let (completed, first_error) = finish_attempt_batch(attempts, |attempt_index| {
             let attempt =
                 astra_services::plan_inference_provider_attempt(&self.invocation, attempt_index);
-            astra_services::finish_inference_provider_attempt(
-                &self.shared_pool,
-                &attempt,
-                terminal,
-            )
-            .await
-            .map_err(|error| service_error("provider attempt terminal commit", error))?;
+            async move {
+                astra_services::finish_inference_provider_attempt(
+                    &self.shared_pool,
+                    &attempt,
+                    terminal,
+                )
+                .await
+                .map_err(|error| service_error("provider attempt terminal commit", error))
+            }
+        })
+        .await;
+        for attempt_index in completed {
             state.open_attempts.remove(&attempt_index);
             state.latest_terminal = Some(terminal.clone());
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -395,19 +431,34 @@ impl DurableProviderAttemptObserver {
         let mut state = self.state.lock().await;
         let attempts = state.open_attempts.iter().copied().collect::<Vec<_>>();
         if !attempts.is_empty() {
-            for attempt_index in attempts {
+            astra_services::declare_inference_settlement(
+                &self.shared_pool,
+                &self.invocation,
+                delivery_unknown,
+            )
+            .await
+            .map_err(|error| service_error("disconnect settlement declaration", error))?;
+            let (completed, first_error) = finish_attempt_batch(attempts, |attempt_index| {
                 let attempt = astra_services::plan_inference_provider_attempt(
                     &self.invocation,
                     attempt_index,
                 );
-                astra_services::finish_inference_provider_attempt(
-                    &self.shared_pool,
-                    &attempt,
-                    delivery_unknown,
-                )
-                .await
-                .map_err(|error| service_error("provider attempt terminal commit", error))?;
+                async move {
+                    astra_services::finish_inference_provider_attempt(
+                        &self.shared_pool,
+                        &attempt,
+                        delivery_unknown,
+                    )
+                    .await
+                    .map_err(|error| service_error("provider attempt terminal commit", error))
+                }
+            })
+            .await;
+            for attempt_index in completed {
                 state.open_attempts.remove(&attempt_index);
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
             state.latest_terminal = Some(delivery_unknown.clone());
             return Ok(delivery_unknown.clone());
@@ -539,6 +590,18 @@ pub(crate) fn terminal_from_error(
     }
 }
 
+fn unsettled_attempt_terminal() -> astra_services::InferenceInvocationTerminal {
+    astra_services::InferenceInvocationTerminal {
+        status: astra_services::InferenceTerminalStatus::DeliveryUnknown,
+        usage: astra_services::InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some("inference_ledger".to_string()),
+        error_message: Some(
+            "provider attempt terminal state could not be committed durably".to_string(),
+        ),
+    }
+}
+
 fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvocationTerminal {
     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
     astra_services::InferenceInvocationTerminal::succeeded(
@@ -555,6 +618,34 @@ fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attempt_batch_continues_after_an_individual_terminal_failure() {
+        let visited = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed = visited.clone();
+        let (completed, error) = finish_attempt_batch(vec![0, 1, 2], move |attempt_index| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().await.push(attempt_index);
+                if attempt_index == 0 {
+                    Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::DatabaseError,
+                        "first terminal write failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(*visited.lock().await, vec![0, 1, 2]);
+        assert_eq!(completed, vec![1, 2]);
+        assert_eq!(
+            error.expect("the first error remains observable").message,
+            "first terminal write failed"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingSettlementOwner {
@@ -646,6 +737,11 @@ mod tests {
         assert_eq!(
             stream_failure.status,
             astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+        assert_eq!(
+            unsettled_attempt_terminal().status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown,
+            "a lost durable provider terminal must never be reported as safely retryable"
         );
     }
 }

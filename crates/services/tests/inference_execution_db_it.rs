@@ -9,7 +9,7 @@ mod common;
 use astra_services::{
     InferenceInvocationInput, InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage,
     ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind, admit_inference_invocation,
-    begin_inference_provider_attempt, finish_inference_invocation,
+    begin_inference_provider_attempt, declare_inference_settlement, finish_inference_invocation,
     finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
     reconcile_inference_settlements,
 };
@@ -238,6 +238,107 @@ async fn recovery_discards_unproven_success_without_blocking_later_settlement() 
         assert_eq!(row.get::<String, _>("status"), expected_status);
         assert_eq!(row.get::<i64, _>("debt_count"), 0);
     }
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("orphan-attempt-user-{suffix}");
+    let session_id = format!("orphan-attempt-session-{suffix}");
+    let run_id = format!("orphan-attempt-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "orphan_attempt_recovery".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "orphan-attempt-offering".to_string(),
+        resolved_model_name: "orphan-attempt-model".to_string(),
+        upstream_model_name: "orphan-attempt-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan orphan-attempt invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit orphan-attempt invocation");
+    let attempt = plan_inference_provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin orphaned physical attempt");
+
+    declare_inference_settlement(
+        &shared_pool,
+        &plan,
+        &InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Failed,
+            usage: InferenceUsage::default(),
+            provider_response_id: None,
+            error_kind: Some("provider_unavailable".to_string()),
+            error_message: Some("logical retry policy exhausted".to_string()),
+        },
+    )
+    .await
+    .expect("seed authoritative settlement decision");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &plan_inference_provider_attempt(&plan, 1))
+            .await
+            .expect_err("a durable settlement decision must fence provider redelivery")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 256)
+            .await
+            .expect("recovery must converge the orphaned provider attempt"),
+        1
+    );
+
+    let attempt_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load recovered provider attempt");
+    assert_eq!(attempt_status, "delivery_unknown");
+    let invocation_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load recovered logical invocation");
+    assert_eq!(invocation_status, "failed");
+    let debt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load recovered settlement debt");
+    assert_eq!(debt_count, 0);
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

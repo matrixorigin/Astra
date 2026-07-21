@@ -280,6 +280,15 @@ impl RateLimitCooldown {
         reason: CooldownReason,
         has_fallback: bool,
     ) -> RateLimitAction {
+        // A short provider hint controls *when* to retry the same route, but it
+        // must not suppress the configured route-switch policy forever. Once
+        // the error threshold is reached, transfer control to the fallback
+        // owner before considering another same-route delay.
+        if consecutive >= CONSECUTIVE_ERROR_THRESHOLD && has_fallback {
+            self.enter_cooldown_with_fallback(reason);
+            return RateLimitAction::UseFallback { reason };
+        }
+
         // Short retry-after: just wait and retry
         if let Some(delay) = retry_after_ms
             && delay < SHORT_RETRY_THRESHOLD_MS
@@ -292,14 +301,10 @@ impl RateLimitCooldown {
             let cooldown_ms = self.calculate_cooldown_ms(retry_after_ms);
             self.enter_cooldown(cooldown_ms, reason);
 
-            if has_fallback {
-                return RateLimitAction::UseFallback { reason };
-            } else {
-                return RateLimitAction::Reject {
-                    reason,
-                    reset_in_ms: cooldown_ms,
-                };
-            }
+            return RateLimitAction::Reject {
+                reason,
+                reset_in_ms: cooldown_ms,
+            };
         }
 
         // Below threshold: wait and retry. When the provider omitted the
@@ -689,6 +694,27 @@ mod tests {
     }
 
     #[test]
+    fn repeated_short_retry_after_transfers_to_configured_fallback() {
+        let rl = RateLimitCooldown::new();
+
+        assert!(matches!(
+            rl.record_429(Some(0), true),
+            RateLimitAction::WaitAndRetry { delay_ms: 0 }
+        ));
+        assert!(matches!(
+            rl.record_429(Some(0), true),
+            RateLimitAction::WaitAndRetry { delay_ms: 0 }
+        ));
+        assert!(matches!(
+            rl.record_429(Some(0), true),
+            RateLimitAction::UseFallback {
+                reason: CooldownReason::RateLimit
+            }
+        ));
+        assert_eq!(rl.metrics().fallbacks_triggered, 1);
+    }
+
+    #[test]
     fn consecutive_errors_trigger_cooldown_no_fallback() {
         let rl = RateLimitCooldown::new();
 
@@ -987,7 +1013,9 @@ mod tests {
     fn state_reflects_fallback_triggered() {
         let rl = RateLimitCooldown::new();
 
-        // 429-triggered cooldown (no fallback metric)
+        // Both rate-limit families report the route transfer in state and
+        // metrics; callers must not receive UseFallback while telemetry says
+        // no fallback happened.
         rl.record_429(None, true);
         rl.record_429(None, true);
         rl.record_429(None, true);
@@ -997,8 +1025,8 @@ mod tests {
         } = rl.state()
         {
             assert!(
-                !fallback_triggered,
-                "429 cooldown should not set fallback_triggered"
+                fallback_triggered,
+                "429 fallback cooldown should set fallback_triggered"
             );
         } else {
             panic!("expected cooldown state");

@@ -25,7 +25,7 @@ use crate::turn::llm::client::{
     provider_uses_bedrock_converse, sleep_ms_or_llm_cancel, split_think_chunks,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
-    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
+    CooldownReason, PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
 use futures_util::StreamExt;
@@ -179,6 +179,9 @@ enum RetryDecision {
     /// sleep that long before attempting again. Applies to 429, 529/503
     /// (overload), and generic 5xx.
     Retry { delay_ms: Option<u64> },
+    /// The current physical route must stop. The caller may resolve a different
+    /// route only at its model-admission boundary.
+    UseFallback { reason: CooldownReason },
     /// Terminal error — caller must return `Err(last_err)`.
     Terminal,
 }
@@ -207,11 +210,13 @@ fn classify_non_success_and_record_cooldown(
             "llm",
             "{log_tag} rate limit (429) on {model_key}: action={action:?}"
         );
-        let delay_ms = match action {
-            RateLimitAction::WaitAndRetry { delay_ms } => Some(delay_ms),
-            _ => None,
+        return match action {
+            RateLimitAction::WaitAndRetry { delay_ms } => RetryDecision::Retry {
+                delay_ms: Some(delay_ms),
+            },
+            RateLimitAction::UseFallback { reason } => RetryDecision::UseFallback { reason },
+            RateLimitAction::Proceed | RateLimitAction::Reject { .. } => RetryDecision::Terminal,
         };
-        return RetryDecision::Retry { delay_ms };
     }
     if is_overload_status(status) {
         let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
@@ -219,16 +224,47 @@ fn classify_non_success_and_record_cooldown(
             "llm",
             "{log_tag} overload ({status}) on {model_key}: action={action:?}"
         );
-        let delay_ms = match action {
-            RateLimitAction::WaitAndRetry { delay_ms } => Some(delay_ms),
-            _ => None,
+        return match action {
+            RateLimitAction::WaitAndRetry { delay_ms } => RetryDecision::Retry {
+                delay_ms: Some(delay_ms),
+            },
+            RateLimitAction::UseFallback { reason } => RetryDecision::UseFallback { reason },
+            RateLimitAction::Proceed | RateLimitAction::Reject { .. } => RetryDecision::Terminal,
         };
-        return RetryDecision::Retry { delay_ms };
     }
     if status >= 500 {
         return RetryDecision::Retry { delay_ms: None };
     }
     RetryDecision::Terminal
+}
+
+const FALLBACK_REQUIRED_SOURCE: &str = "llm_fallback_required";
+
+fn fallback_required_error(
+    cause: astra_core::ClassifiedError,
+    reason: CooldownReason,
+) -> astra_core::ClassifiedError {
+    cause.with_details_json(
+        json!({
+            "source": FALLBACK_REQUIRED_SOURCE,
+            "reason": reason.as_str(),
+        })
+        .to_string(),
+    )
+}
+
+pub(crate) fn fallback_required_reason(
+    error: &astra_core::ClassifiedError,
+) -> Option<CooldownReason> {
+    let details = serde_json::from_str::<Value>(error.details_json.as_deref()?).ok()?;
+    if details.get("source").and_then(Value::as_str) != Some(FALLBACK_REQUIRED_SOURCE) {
+        return None;
+    }
+    match details.get("reason").and_then(Value::as_str) {
+        Some("rate_limit") => Some(CooldownReason::RateLimit),
+        Some("overloaded") => Some(CooldownReason::Overloaded),
+        _ => None,
+    }
 }
 
 /// Bedrock Converse streaming POST with the same retry + cooldown discipline
@@ -433,6 +469,9 @@ async fn bedrock_stream_with_retry(
                     sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
+            }
+            RetryDecision::UseFallback { reason } => {
+                return Err(fallback_required_error(observed_error, reason));
             }
             RetryDecision::Terminal => return Err(observed_error),
         }
@@ -834,6 +873,9 @@ async fn anthropic_stream_with_retry(
                     sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
+            }
+            RetryDecision::UseFallback { reason } => {
+                return Err(fallback_required_error(observed_error, reason));
             }
             RetryDecision::Terminal => return Err(observed_error),
         }
@@ -1648,6 +1690,9 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                     sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
                 }
                 continue;
+            }
+            RetryDecision::UseFallback { reason } => {
+                return Err(fallback_required_error(observed_error, reason));
             }
             // 4xx (except 429) is not retryable — fail immediately.
             // Context-window errors are detected by content at the call site
@@ -2873,6 +2918,9 @@ mod tests {
                 // Cooldown's own delay can override our hint; just assert SOME delay came back.
                 assert!(delay_ms.is_some(), "429 should yield a wait delay");
             }
+            RetryDecision::UseFallback { .. } => {
+                panic!("fallback is disabled for this classification")
+            }
             RetryDecision::Terminal => panic!("429 must be retryable"),
         }
     }
@@ -2886,6 +2934,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_fallback_is_a_route_switch_signal_not_a_same_model_retry() {
+        let cooldown = PerModelCooldown::new();
+        let mut decision = RetryDecision::Terminal;
+        for _ in 0..3 {
+            decision = classify_non_success_and_record_cooldown(
+                429,
+                Some(0),
+                &cooldown,
+                "primary-model",
+                true,
+                "unit",
+            );
+        }
+        assert!(matches!(
+            decision,
+            RetryDecision::UseFallback {
+                reason: CooldownReason::RateLimit
+            }
+        ));
+        let error = fallback_required_error(
+            bridge_stream_error(
+                astra_core::ErrorKind::RateLimit,
+                "provider rejected request",
+            ),
+            CooldownReason::RateLimit,
+        );
+        assert_eq!(
+            fallback_required_reason(&error),
+            Some(CooldownReason::RateLimit)
+        );
+    }
+
+    #[test]
     fn classify_generic_5xx_retries_without_cooldown() {
         let cd = PerModelCooldown::new();
         let d =
@@ -2895,6 +2976,9 @@ mod tests {
                 delay_ms.is_none(),
                 "plain 5xx should not request a cooldown-imposed delay"
             ),
+            RetryDecision::UseFallback { .. } => {
+                panic!("fallback is disabled for this classification")
+            }
             RetryDecision::Terminal => panic!("5xx must be retryable"),
         }
     }
@@ -2924,6 +3008,9 @@ mod tests {
             match self {
                 RetryDecision::Retry { delay_ms } => {
                     write!(f, "Retry {{ delay_ms: {delay_ms:?} }}")
+                }
+                RetryDecision::UseFallback { reason } => {
+                    write!(f, "UseFallback {{ reason: {reason:?} }}")
                 }
                 RetryDecision::Terminal => write!(f, "Terminal"),
             }
