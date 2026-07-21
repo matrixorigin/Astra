@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v7";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v8";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1728,13 +1728,10 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        // A process can terminate after recording a provider terminal but
-        // before mirroring it to the logical invocation. Reconcile only
-        // facts already durable; this is safe to repeat on every startup and
-        // does not reissue provider I/O.
+        // Recovery consumes only explicit settlement debts. It never scans
+        // physical attempts and guesses whether an active retry loop is done.
         let reconciled =
-            crate::inference_execution::reconcile_admitted_inference_terminals_on_bootstrap(&pool)
-                .await?;
+            crate::inference_execution::reconcile_inference_settlement_debts(&pool).await?;
         if reconciled > 0 {
             tracing::warn!(
                 reconciled,
@@ -4435,6 +4432,32 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    // A settlement debt is written by the logical lifecycle owner, or by a
+    // successful provider attempt (which is itself a final fact). It is the
+    // only recovery input: a failed physical attempt may still be retried and
+    // therefore must never be inferred as a failed logical invocation.
+    query(
+        "CREATE TABLE IF NOT EXISTS inference_invocation_settlement_debts (
+            user_id VARCHAR(128) NOT NULL,
+            invocation_id VARCHAR(64) NOT NULL,
+            terminal_status VARCHAR(32) NOT NULL,
+            terminal_fingerprint CHAR(64) NOT NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+            provider_response_id VARCHAR(255) NULL,
+            error_kind VARCHAR(64) NULL,
+            error_message TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, invocation_id),
+            CONSTRAINT chk_inference_invocation_settlement_debts_status
+                CHECK (terminal_status IN ('succeeded', 'failed', 'cancelled', 'delivery_unknown'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Lifecycle writes are exact owner+identity transitions. MatrixOne can
     // omit eligible rows when it plans those transitions through a secondary
     // index led by mutable status, so remove the old scan indexes from both
@@ -4451,9 +4474,9 @@ async fn ensure_core_schema_while_leased(
     ] {
         drop_index_if_present(&pool, &settings.database, table, index).await?;
     }
+    crate::inference_execution::backfill_inference_settlement_debts(&pool).await?;
     let reconciled =
-        crate::inference_execution::reconcile_admitted_inference_terminals_on_bootstrap(&pool)
-            .await?;
+        crate::inference_execution::reconcile_inference_settlement_debts(&pool).await?;
     if reconciled > 0 {
         tracing::warn!(
             reconciled,

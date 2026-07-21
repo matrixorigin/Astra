@@ -49,6 +49,25 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
 }
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
+    let invocation_ids = sqlx::query_scalar::<_, String>(
+        "SELECT invocation_id FROM inference_invocations WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| panic!("list inference debts for cleanup: {error}"));
+    for invocation_id in invocation_ids {
+        sqlx::query(
+            "DELETE FROM inference_invocation_settlement_debts
+             WHERE user_id = ? AND invocation_id = ?",
+        )
+        .bind(user_id)
+        .bind(invocation_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|error| panic!("clean up inference settlement debt: {error}"));
+    }
     for (statement, identity) in [
         (
             "DELETE FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
@@ -191,6 +210,26 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         error_kind: Some("rate_limit".to_string()),
         error_message: Some("rate limited".to_string()),
     };
+    assert_eq!(
+        finish_inference_invocation(&shared_pool, &plan, &first_failure)
+            .await
+            .expect_err("a logical terminal cannot overtake an open provider attempt")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+    let premature_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load premature settlement debt");
+    assert_eq!(
+        premature_debts, 0,
+        "rejected finalization must not block the active attempt with a debt"
+    );
     let (first_terminal, concurrent_terminal) = tokio::join!(
         finish_inference_provider_attempt(&shared_pool, &first_attempt, &first_failure),
         finish_inference_provider_attempt(&shared_pool, &first_attempt, &first_failure)
@@ -339,7 +378,91 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn inference_bootstrap_recovers_terminal_attempts_left_admitted() {
+async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("inference-race-user-{suffix}");
+    let session_id = format!("inference-race-session-{suffix}");
+    let run_id = format!("inference-race-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 9,
+            round: 1,
+            operation_id: "settlement_retry_race".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-race".to_string(),
+        resolved_model_name: "race-model".to_string(),
+        upstream_model_name: "race-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan race invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit race invocation");
+    let first_attempt = plan_inference_provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &first_attempt)
+        .await
+        .expect("begin first attempt");
+    let failure = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some("retryable".to_string()),
+        error_message: Some("provider retry decision racing final settlement".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &first_attempt, &failure)
+        .await
+        .expect("finish first physical attempt");
+
+    let retry_attempt = plan_inference_provider_attempt(&plan, 1);
+    let (settlement, retry) = tokio::join!(
+        finish_inference_invocation(&shared_pool, &plan, &failure),
+        begin_inference_provider_attempt(&shared_pool, &retry_attempt)
+    );
+    match (settlement, retry) {
+        (Ok(()), Err(error)) if error.kind == ServiceErrorKind::Conflict => {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+            )
+            .bind(&user_id)
+            .bind(plan.invocation_id())
+            .fetch_one(pool)
+            .await
+            .expect("load settled race invocation");
+            assert_eq!(status, "failed");
+        }
+        (Err(error), Ok(())) if error.kind == ServiceErrorKind::Conflict => {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+            )
+            .bind(&user_id)
+            .bind(plan.invocation_id())
+            .fetch_one(pool)
+            .await
+            .expect("load retried race invocation");
+            assert_eq!(status, "admitted");
+        }
+        (settlement, retry) => panic!(
+            "settlement and retry must have one authoritative winner: settlement={settlement:?}, retry={retry:?}"
+        ),
+    }
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -386,6 +509,26 @@ async fn inference_bootstrap_recovers_terminal_attempts_left_admitted() {
     finish_inference_provider_attempt(&shared_pool, &attempt, &succeeded)
         .await
         .expect("persist successful provider attempt");
+    let pending_success_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load successful provider recovery debt");
+    assert_eq!(
+        pending_success_debts, 1,
+        "a durable success must publish recovery evidence before logical settlement"
+    );
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &plan_inference_provider_attempt(&plan, 1))
+            .await
+            .expect_err("a successful delivery must fence duplicate provider requests")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
 
     let failed_plan = plan_inference_invocation(InferenceInvocationInput {
         user_id: user_id.clone(),
@@ -449,25 +592,49 @@ async fn inference_bootstrap_recovers_terminal_attempts_left_admitted() {
         invocation.get::<Option<String>, _>("provider_response_id"),
         Some("provider-reconciled".to_string())
     );
+    let success_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load settled success debt");
+    assert_eq!(success_debts, 0, "recovery must drain the settled debt");
 
     let failed_invocation = sqlx::query(
-        "SELECT status, error_kind, error_message
+        "SELECT status
          FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
     .bind(failed_plan.invocation_id())
     .fetch_one(pool)
     .await
-    .expect("load failed reconciled invocation");
-    assert_eq!(failed_invocation.get::<String, _>("status"), "failed");
+    .expect("load retryable invocation after bootstrap");
     assert_eq!(
-        failed_invocation.get::<Option<String>, _>("error_kind"),
-        Some("provider_unavailable".to_string())
+        failed_invocation.get::<String, _>("status"),
+        "admitted",
+        "a failed physical attempt is not the logical retry decision"
     );
+    let failed_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(failed_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load retryable invocation debts");
     assert_eq!(
-        failed_invocation.get::<Option<String>, _>("error_message"),
-        Some("provider failed after delivery".to_string())
+        failed_debts, 0,
+        "a retryable attempt must not enqueue settlement"
     );
+
+    let retry_attempt = plan_inference_provider_attempt(&failed_plan, 1);
+    begin_inference_provider_attempt(&shared_pool, &retry_attempt)
+        .await
+        .expect("bootstrap recovery must not prevent the caller's retry");
 
     let obsolete_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
