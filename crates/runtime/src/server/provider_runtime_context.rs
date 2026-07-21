@@ -545,7 +545,7 @@ mod tests {
         let principal = edge_principal();
         let body = Bytes::from(
             serde_json::json!({
-                "selected_model": {"id": "model-requested", "model": "caller-model"},
+                "model_selection": {"offering_id": "model-requested"},
                 "allow_tools": ["bash", "read_file"]
             })
             .to_string(),
@@ -557,7 +557,17 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
 
         assert_eq!(value["allow_tools"], serde_json::json!(["read_file"]));
-        assert_eq!(value["selected_model"]["model"], "provider-model");
+        assert_eq!(
+            value["model_selection"],
+            serde_json::json!({"offering_id": "model-requested"})
+        );
+        assert_eq!(
+            value["resolved_model_selection"],
+            serde_json::json!({
+                "offering_id": "model-requested",
+                "model_name": "provider-model"
+            })
+        );
         assert_eq!(
             value["runtime_auth"]["authorization"],
             "Bearer runtime-grant"
