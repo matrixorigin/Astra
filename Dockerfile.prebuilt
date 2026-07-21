@@ -1,17 +1,16 @@
 # Dockerfile.prebuilt — astra-server runtime image (no Rust compilation)
 #
 # Prerequisites: pre-built binaries must exist at:
-#   rust/target/x86_64-unknown-linux-gnu/release/astra-server
-#   rust/target/x86_64-unknown-linux-gnu/release/astra
+#   target/x86_64-unknown-linux-gnu/release/astra-server
+#   target/x86_64-unknown-linux-gnu/release/astra
 #
-# Build with cargo-zigbuild first:
-#   cd rust
+# Build with cargo-zigbuild first (run from the repo root):
 #   cargo zigbuild --release --no-default-features \
 #     --target x86_64-unknown-linux-gnu \
 #     -p astra-runtime --bin astra-server \
 #     -p astra-cli --bin astra
 #
-# Then build the image:
+# Then build the image (build context = repo root):
 #   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t astra-server:TAG .
 
 FROM debian:bookworm-slim
@@ -54,8 +53,8 @@ RUN set -eux; \
     useradd --system --create-home --home-dir /home/appuser \
             --shell /usr/sbin/nologin -g appgroup appuser
 
-COPY rust/target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
-COPY rust/target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
+COPY target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
+COPY target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
 
 RUN chown root:appgroup /app && chmod 0770 /app
 

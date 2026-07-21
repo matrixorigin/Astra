@@ -16,6 +16,8 @@ use hmac::{Hmac, Mac};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+const MOI_USER_TOKEN_PREFIX: &str = "moi-user-token-v1";
+
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
 /// production leaves the env var unset. Cached after first read via OnceLock.
@@ -283,6 +285,29 @@ fn verify_provider_request_signature(
     mac.verify_slice(&signature).is_ok()
 }
 
+/// Outcome of resolving the edge-registration binding for a credential.
+///
+/// Distinguishing "not an edge token" from "edge token with no agent binding"
+/// matters on the edge WebSocket path: the former is a first-party credential
+/// accepted with no binding, the latter is a runtime (server-to-server) token
+/// that must be rejected. Collapsing both into `None` would let a runtime token
+/// through with an unverified, self-reported `edge_agent_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeTokenBinding {
+    /// Not an edge-registration token (internal/first-party credential, or a
+    /// backend without external-provider edge support). Accept with no binding.
+    NotEdgeToken,
+    /// An edge-registration token bound to a specific agent and workspace.
+    Bound {
+        edge_agent_id: String,
+        /// Owning workspace (`provider_scope_id` from the external auth response).
+        workspace_id: String,
+    },
+    /// A recognized provider token that carries no `edge_agent_id` binding (e.g.
+    /// a runtime server-to-server token). Must be rejected on the edge WS path.
+    MissingBinding,
+}
+
 #[async_trait]
 pub trait AuthService: Send + Sync {
     async fn register(
@@ -327,23 +352,22 @@ pub trait AuthService: Send + Sync {
         self.current_principal(headers).await
     }
 
-    /// Resolve the edge binding for the presented credential when it is an
-    /// edge-registration token.  Returns `Ok(Some((edge_agent_id, workspace_id)))`
-    /// on success, `Ok(None)` when the token carries no binding (internal tokens,
-    /// backends without external-provider edge support), and `Err` when the
+    /// Resolve the edge binding for the presented credential.
+    ///
+    /// Returns [`EdgeTokenBinding::Bound`] for an edge-registration token bound
+    /// to an agent + workspace, [`EdgeTokenBinding::MissingBinding`] for a
+    /// recognized provider token with no agent binding (a runtime token, which
+    /// the edge WS path must reject), [`EdgeTokenBinding::NotEdgeToken`] for a
+    /// first-party credential (accepted with no binding), and `Err` when the
     /// credential is rejected (revoked or invalid).
     ///
-    /// The `workspace_id` in the tuple is the owning workspace (`provider_scope_id`
-    /// from the external auth response).  Callers store it in the edge connection
-    /// pool for workspace-level authorization of cross-user lookups.
-    ///
-    /// The default returns `Ok(None)` so backends and test stubs that do not
-    /// support edge registration impose no binding.
+    /// The default returns [`EdgeTokenBinding::NotEdgeToken`] so backends and
+    /// test stubs that do not support edge registration impose no binding.
     async fn edge_registration_binding(
         &self,
         _token: &str,
-    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(None)
+    ) -> Result<EdgeTokenBinding, (StatusCode, Json<ErrorResponse>)> {
+        Ok(EdgeTokenBinding::NotEdgeToken)
     }
 
     async fn external_providers(
@@ -483,11 +507,20 @@ pub enum AuthPrincipalOrigin {
 pub struct AuthProviderAuthorizedRequestContext {
     pub provider_id: String,
     pub external_subject: String,
+    /// Opaque scope key returned by the external provider in `authorize_request`.
+    ///
+    /// **Mapping assumption (MOI provider only):** the MOI provider maps its
+    /// workspace identity 1:1 onto this field, so callers that need a workspace
+    /// identity (e.g. edge pool workspace isolation) read it as `workspace_id`.
+    /// This assumption lives in the auth service (`principal_from_edge_token`
+    /// and `edge_ws_handler`) and must be revisited if a different provider
+    /// uses a non-identity scope mapping.
     pub provider_scope_id: String,
     pub request_authorization_id: String,
     /// Present when the token is an edge-registration token; the bound edge
-    /// agent id verified by Phase 1.5 of edge WebSocket auth. `None` for
-    /// runtime tokens (matrixflow server-to-server calls).
+    /// agent id resolved from the provider during Phase 1 (`current_principal`).
+    /// Phase 1.5 in `edge_ws_handler` reads this directly — no second provider
+    /// call is needed. `None` for runtime tokens (matrixflow server-to-server).
     pub edge_agent_id: Option<String>,
 }
 
@@ -1095,11 +1128,16 @@ impl DatabaseAuthService {
     }
 
     /// Resolve an [`AuthPrincipal`] from a moi-backend edge-registration token
-    /// (`moi-user-token-v1.*`) via the external auth provider.  Called from
-    /// [`current_principal`] when the Bearer token is not an astra session JWT.
+    /// (`moi-user-token-v1.*`) via the external auth provider.
+    ///
+    /// The caller must supply the request that is actually being authorized.
+    /// This keeps route/method policy in the provider meaningful and prevents a
+    /// long-lived edge credential from being authorized against a synthetic
+    /// catch-all request.
     async fn principal_from_edge_token(
         &self,
         token: &str,
+        request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let provider = self
             .ext_providers
@@ -1121,11 +1159,11 @@ impl DatabaseAuthService {
                     provider_id: provider.id.clone(),
                     token: format!("Bearer {token}"),
                     request: ExternalRequestDescriptor {
-                        method: "GET".to_string(),
-                        path: "/api".to_string(),
-                        route: Some("/api".to_string()),
-                        request_id: None,
-                        body_digest: None,
+                        method: request.method,
+                        path: request.path,
+                        route: request.route,
+                        request_id: request.request_id,
+                        body_digest: request.body_digest,
                     },
                 },
             )
@@ -1134,7 +1172,7 @@ impl DatabaseAuthService {
             target: "astra_services::auth",
             provider_id = %authorized.provider_id,
             external_subject = %authorized.external_subject,
-            "principal_from_edge_token: edge token authorized for HTTP API"
+            "principal_from_edge_token: edge token authorized for request"
         );
         let user_id = format!(
             "external_authorized:{}:{}",
@@ -1589,13 +1627,15 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let token = bearer_token(headers)?;
-        // Edge-registration tokens (moi-user-token-v1.*) are issued by
-        // moi-backend and cannot be decoded with the astra JWT secret.
-        // Verify them via the external auth provider instead so that astra CLI
-        // running inside a sandbox can access HTTP APIs with the same token
-        // it uses for the WebSocket /chat/stream connection.
-        if token.starts_with("moi-user-token-v1") {
-            return self.principal_from_edge_token(token).await;
+        // Long-lived edge-registration tokens must only be accepted by handlers
+        // that supply the real request descriptor. Otherwise the provider has
+        // no method/path information with which to enforce token purpose.
+        if token.starts_with(MOI_USER_TOKEN_PREFIX) {
+            return Err(error_response_coded(
+                StatusCode::UNAUTHORIZED,
+                "Edge registration token requires request-aware authorization",
+                "edge_token_request_context_required",
+            ));
         }
         let claims = decode_jwt_claims(token, &self.jwt)?;
 
@@ -1651,6 +1691,10 @@ impl AuthService for DatabaseAuthService {
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
         else {
+            let token = bearer_token(headers)?;
+            if token.starts_with(MOI_USER_TOKEN_PREFIX) {
+                return self.principal_from_edge_token(token, request).await;
+            }
             return self.current_principal(headers).await;
         };
         let provider = self.provider_config(&provider_id)?.clone();
@@ -1707,17 +1751,16 @@ impl AuthService for DatabaseAuthService {
     async fn edge_registration_binding(
         &self,
         token: &str,
-    ) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<EdgeTokenBinding, (StatusCode, Json<ErrorResponse>)> {
         // Only moi-issued tokens carry an edge_agent_id binding. Anything else
         // (e.g. an Astra JWT used by a managed sandbox) imposes no binding and
         // keeps its existing identity resolution untouched.
-        const MOI_USER_TOKEN_PREFIX: &str = "moi-user-token-v1";
         if !token.starts_with(MOI_USER_TOKEN_PREFIX) {
-            return Ok(None);
+            return Ok(EdgeTokenBinding::NotEdgeToken);
         }
-        // Resolve the MOI external provider. Without one configured we cannot
-        // verify the binding via authorize_request; impose none rather than
-        // failing closed (matches deployments where external auth is disabled).
+        // Resolve the MOI external provider. An edge-token-shaped credential
+        // cannot be downgraded to an unbound first-party token when its verifier
+        // is unavailable; that would turn configuration loss into authorization.
         let provider = match self
             .ext_providers
             .iter()
@@ -1726,11 +1769,14 @@ impl AuthService for DatabaseAuthService {
         {
             Some(provider) => provider.clone(),
             None => {
-                tracing::warn!(
+                tracing::error!(
                     target: "astra_services::auth",
                     "edge_registration_binding: no external provider configured; cannot verify edge binding"
                 );
-                return Ok(None);
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "No external provider configured for edge token auth",
+                ));
             }
         };
         // authorize_request verifies the token (signature, expiry, jti
@@ -1779,9 +1825,15 @@ impl AuthService for DatabaseAuthService {
             workspace_id = %authorized.provider_scope_id,
             "edge_registration_binding: provider accepted edge token"
         );
-        Ok(authorized
-            .edge_agent_id
-            .map(|eid| (eid, authorized.provider_scope_id)))
+        match authorized.edge_agent_id {
+            Some(edge_agent_id) => Ok(EdgeTokenBinding::Bound {
+                edge_agent_id,
+                workspace_id: authorized.provider_scope_id,
+            }),
+            // A recognized moi token that authorized without an edge_agent_id is
+            // a runtime (server-to-server) token, not an edge-registration token.
+            None => Ok(EdgeTokenBinding::MissingBinding),
+        }
     }
 
     async fn external_providers(
@@ -1836,7 +1888,12 @@ impl AuthService for DatabaseAuthService {
                 request,
             )
             .await?;
-        validate_provider_runtime_context(&provider, &requested_model_id, &runtime_context)?;
+        validate_provider_runtime_context(
+            &provider,
+            &requested_model_id,
+            &context.provider_scope_id,
+            &runtime_context,
+        )?;
         Ok(runtime_context)
     }
 }
@@ -1971,16 +2028,18 @@ mod tests {
             request: ExternalAuthorizeRequestData,
         ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)> {
             assert_eq!(provider.id, "moi");
-            assert_eq!(request.token, "Bearer provider-token");
+            assert_eq!(request.token, "Bearer moi-user-token-v1.payload.signature");
             assert_eq!(request.request.method, "POST");
             assert_eq!(request.request.path, "/chat/stream");
-            assert!(request.request.body_digest.is_none());
+            assert_eq!(request.request.route.as_deref(), Some("/chat/stream"));
+            assert_eq!(request.request.request_id.as_deref(), Some("request-1"));
+            assert_eq!(request.request.body_digest.as_deref(), Some("sha256-body"));
             Ok(ExternalAuthorizedRequest {
                 provider_id: "moi".to_string(),
                 external_subject: "moi-user-1".to_string(),
                 provider_scope_id: "workspace-1".to_string(),
                 request_authorization_id: "authz-1".to_string(),
-                edge_agent_id: None,
+                edge_agent_id: Some("edge-1".to_string()),
             })
         }
 
@@ -2099,6 +2158,36 @@ mod tests {
         }])
     }
 
+    fn edge_provider_service() -> DatabaseAuthService {
+        let mut service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_external_providers(vec![ExternalAuthProviderConfig {
+            id: "moi".to_string(),
+            display_name: "MOI".to_string(),
+            external_auth_endpoint: "http://127.0.0.1/unused".to_string(),
+        }]);
+        service.external_client = Arc::new(AuthorizingProviderClient);
+        service
+    }
+
+    fn edge_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer moi-user-token-v1.payload.signature"
+                .parse()
+                .expect("authorization header"),
+        );
+        headers
+    }
+
     #[test]
     fn provider_request_hmac_golden_vector_uses_encoded_key_bytes() {
         let mut parts = GOLDEN_PROVIDER_TOKEN.split('.');
@@ -2149,6 +2238,54 @@ mod tests {
             request_id: Some("request-1".to_string()),
             body_digest: Some("sha256-body".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn edge_token_authorization_forwards_the_actual_request_descriptor() {
+        let principal = edge_provider_service()
+            .current_principal_for_request(&edge_headers(), chat_stream_descriptor())
+            .await
+            .expect("edge token should be authorized for the described request");
+
+        assert_eq!(principal.user.user_id, "external_authorized:moi:moi-user-1");
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = principal.origin else {
+            panic!("expected provider-authorized principal");
+        };
+        assert_eq!(context.provider_scope_id, "workspace-1");
+        assert_eq!(context.edge_agent_id.as_deref(), Some("edge-1"));
+    }
+
+    #[tokio::test]
+    async fn edge_token_is_rejected_without_request_context() {
+        let err = edge_provider_service()
+            .current_principal(&edge_headers())
+            .await
+            .expect_err("context-free auth must not accept an edge token");
+
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            err.1.error_code.as_deref(),
+            Some("edge_token_request_context_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_fails_closed_without_provider() {
+        let service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        );
+
+        let error = service
+            .edge_registration_binding("moi-user-token-v1.payload.signature")
+            .await
+            .expect_err("an unverifiable edge token must be rejected");
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

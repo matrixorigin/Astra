@@ -430,7 +430,7 @@ struct SessionRuntimeState {
     recalls: VecDeque<RecallSnapshot>,
     latest_recall: Option<RecallSnapshot>,
     active_recall_token: Option<String>,
-    in_flight_recall_tokens: HashSet<String>,
+    in_flight_recall_tokens: HashMap<String, Instant>,
     recall_revision: u64,
     last_touched: Instant,
 }
@@ -444,7 +444,7 @@ impl SessionRuntimeState {
             recalls: VecDeque::new(),
             latest_recall: None,
             active_recall_token: None,
-            in_flight_recall_tokens: HashSet::new(),
+            in_flight_recall_tokens: HashMap::new(),
             recall_revision: 0,
             last_touched: now,
         }
@@ -478,7 +478,26 @@ impl MemoriaRuntimeState {
 
     fn prune_idle_sessions(sessions: &mut HashMap<String, SessionRuntimeState>, now: Instant) {
         sessions.retain(|_, state| {
+            state.recalls.retain(|snapshot| {
+                now.saturating_duration_since(snapshot.at) <= RUNTIME_SESSION_IDLE_TTL
+            });
+            if state.latest_recall.as_ref().is_some_and(|snapshot| {
+                now.saturating_duration_since(snapshot.at) > RUNTIME_SESSION_IDLE_TTL
+            }) {
+                state.latest_recall = None;
+            }
+            state.in_flight_recall_tokens.retain(|_, started_at| {
+                now.saturating_duration_since(*started_at) <= RUNTIME_SESSION_IDLE_TTL
+            });
+            if state
+                .active_recall_token
+                .as_ref()
+                .is_some_and(|token| !state.in_flight_recall_tokens.contains_key(token))
+            {
+                state.active_recall_token = None;
+            }
             now.saturating_duration_since(state.last_touched) <= RUNTIME_SESSION_IDLE_TTL
+                && !state.is_empty()
         });
     }
 
@@ -622,7 +641,9 @@ impl MemoriaRuntimeState {
         let token = uuid::Uuid::now_v7().to_string();
         state.latest_recall = None;
         state.active_recall_token = Some(token.clone());
-        state.in_flight_recall_tokens.insert(token.clone());
+        state
+            .in_flight_recall_tokens
+            .insert(token.clone(), Instant::now());
         Some(token)
     }
 
@@ -669,7 +690,11 @@ impl MemoriaRuntimeState {
             return;
         };
         state.last_touched = Instant::now();
-        if !state.in_flight_recall_tokens.remove(invocation_token) {
+        if state
+            .in_flight_recall_tokens
+            .remove(invocation_token)
+            .is_none()
+        {
             return;
         }
         let owns_latest = state.active_recall_token.as_deref() == Some(invocation_token);
@@ -1114,5 +1139,31 @@ mod tests {
                 .seen_snapshot(&format!("session-{}", MAX_RUNTIME_SESSIONS + 7))
                 .contains("m")
         );
+    }
+
+    #[test]
+    fn stale_pending_and_inflight_recalls_expire_even_when_session_is_active() {
+        let state = MemoriaRuntimeState::default();
+        state.record_recall_for_producer("active", "producer", 1, vec!["memory".to_string()]);
+        let inflight = state.begin_recall("active").expect("recall token");
+        let expired_at = Instant::now()
+            .checked_sub(RUNTIME_SESSION_IDLE_TTL + Duration::from_secs(1))
+            .expect("representable test instant");
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            let session = sessions.get_mut("active").unwrap();
+            for recall in &mut session.recalls {
+                recall.at = expired_at;
+            }
+            if let Some(latest) = &mut session.latest_recall {
+                latest.at = expired_at;
+            }
+            session.in_flight_recall_tokens.insert(inflight, expired_at);
+            session.last_touched = Instant::now();
+        }
+
+        assert_eq!(state.pending_recall_count("active"), 0);
+        assert_eq!(state.in_flight_recall_count("active"), 0);
+        assert!(state.latest_recall("active").is_none());
     }
 }

@@ -3049,18 +3049,20 @@ mod tests {
     }
 
     #[test]
-    fn render_background_task_list_orders_attention_before_running() {
+    fn render_background_task_list_orders_stably_by_start_time() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut running, _running_dir) = test_handle_with_status(BgTaskStatus::Running);
         running.id = "bg-running".into();
         running.description = "npm run dev".into();
         running.started_at = Instant::now() - Duration::from_secs(30);
+        running.started_at_ms = 100;
 
         let (mut failed, _failed_dir) = test_handle_with_status(BgTaskStatus::Failed);
         failed.id = "bg-failed".into();
         failed.description = "npm test".into();
         failed.started_at = Instant::now() - Duration::from_secs(10);
+        failed.started_at_ms = 200;
 
         reg.tasks.insert(running.id.clone(), running);
         reg.tasks.insert(failed.id.clone(), failed);
@@ -3068,7 +3070,7 @@ mod tests {
         let xml = reg.render_background_task_list_xml();
         let failed_pos = xml.find("id=\"bg-failed\"").expect("failed row");
         let running_pos = xml.find("id=\"bg-running\"").expect("running row");
-        assert!(failed_pos < running_pos, "{xml}");
+        assert!(running_pos < failed_pos, "{xml}");
     }
 
     #[test]

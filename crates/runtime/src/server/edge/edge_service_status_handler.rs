@@ -68,7 +68,9 @@ pub(crate) async fn edge_service_status_handler(
     }
 
     // Build in-memory pool lookup for connected_secs enrichment (this-pod connections).
-    let in_memory_edges = state.edge_connection_pool.get_user_edges(&query.user_id);
+    let in_memory_edges = state
+        .edge_connection_pool
+        .get_all_user_edges(&query.user_id);
     let in_memory: std::collections::HashMap<String, std::time::Instant> = in_memory_edges
         .into_iter()
         .map(|info| (info.edge_agent_id.clone(), info.connected_at))
@@ -107,7 +109,7 @@ pub(crate) async fn edge_service_status_handler(
     if db_records.is_empty() && !in_memory.is_empty() {
         let edges: Vec<edge_status_handler::EdgeInfo> = state
             .edge_connection_pool
-            .get_user_edges(&query.user_id)
+            .get_all_user_edges(&query.user_id)
             .into_iter()
             .map(|info| edge_status_handler::EdgeInfo {
                 connected_secs: info.connected_at.elapsed().as_secs(),

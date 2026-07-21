@@ -8,7 +8,10 @@
 //! 5. Multiple edges per user tracked correctly
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -19,7 +22,11 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::sync::Notify;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 
 // ── Stubs ────────────────────────────────────────────────────────────
 
@@ -324,17 +331,32 @@ async fn spawn_test_server_with_dispatch(
 }
 
 /// Perform WS auth and return the authenticated connection.
+fn ws_request(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut request = format!("ws://{addr}/edge/ws")
+        .into_client_request()
+        .expect("edge websocket request");
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("edge bearer header"),
+    );
+    request
+}
+
 async fn ws_auth(
     addr: std::net::SocketAddr,
     edge_id: &str,
     hostname: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let url = format!("ws://{addr}/edge/ws");
-    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
 
     let auth_msg = json!({
         "type": "edge_auth",
-        "token": "test-edge-token",
         "edge_agent_id": edge_id,
         "hostname": hostname,
         "workspace_dir": "/home/test/project"
@@ -416,7 +438,9 @@ async fn edge_ws_auth_and_pool_registration() {
 
     // Pool should have 1 edge
     assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].edge_agent_id, "edge-001");
     assert_eq!(edges[0].hostname.as_deref(), Some("dev-laptop"));
@@ -439,21 +463,15 @@ async fn edge_ws_auth_and_pool_registration() {
 async fn edge_ws_bad_token_rejected() {
     let (addr, _state, server) = spawn_test_server().await;
 
-    let url = format!("ws://{addr}/edge/ws");
-    let (mut ws, _resp) = connect_async(&url).await.expect("WS connect");
-
-    let auth_msg = json!({
-        "type": "edge_auth",
-        "token": "wrong-token",
-        "edge_agent_id": "edge-bad"
-    });
-    ws.send(Message::Text(auth_msg.to_string().into()))
+    let error = connect_async(ws_request(addr, "wrong-token"))
         .await
-        .unwrap();
-
-    let resp = ws.next().await.expect("msg").expect("ok");
-    let resp_json: serde_json::Value = serde_json::from_str(&resp.into_text().unwrap()).unwrap();
-    assert_eq!(resp_json["type"], "edge_auth_error");
+        .expect_err("invalid credentials must reject the HTTP upgrade");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        other => panic!("expected an HTTP authentication rejection, got {other}"),
+    }
 
     server.abort();
 }
@@ -686,7 +704,9 @@ async fn edge_ws_multiple_edges_per_user() {
     let ws2 = ws_auth(addr, "edge-b", "host-b").await;
 
     // Pool should show 2
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 2);
 
     // Disconnect first
@@ -694,7 +714,9 @@ async fn edge_ws_multiple_edges_per_user() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Should have 1 left
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].edge_agent_id, "edge-b");
 
@@ -710,13 +732,17 @@ async fn stale_socket_cleanup_cannot_unregister_its_replacement() {
     let (addr, state, server) = spawn_test_server().await;
     let old = ws_auth(addr, "edge-replaced", "old-host").await;
     let replacement = ws_auth(addr, "edge-replaced", "new-host").await;
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].hostname.as_deref(), Some("new-host"));
 
     drop(old);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].hostname.as_deref(), Some("new-host"));
 
@@ -828,7 +854,9 @@ async fn edge_reconnect_after_disconnect() {
     // Reconnect with same edge_agent_id
     let ws2 = ws_auth(addr, "edge-rc", "rc-host").await;
     assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
-    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    let edges = state
+        .edge_connection_pool
+        .get_user_edges("test-user-1", None);
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].edge_agent_id, "edge-rc");
 
@@ -875,8 +903,9 @@ async fn edge_reconnect_after_disconnect() {
 async fn edge_invalid_first_message_rejected() {
     let (addr, _state, server) = spawn_test_server().await;
 
-    let url = format!("ws://{addr}/edge/ws");
-    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
 
     // Send a non-auth message first
     let bad_msg = json!({ "type": "edge_ping" });
@@ -955,11 +984,15 @@ async fn edge_deliver_result_for_unknown_request_returns_false() {
 
 // ── Edge agent id binding enforcement ────────────────────────────────
 
-/// Auth service that authenticates the token and reports a fixed edge_agent_id
+/// Auth service that authenticates the token and reports a configurable edge
 /// binding, exercising the edge WS handler's self-reported-id verification.
+///
+/// It deliberately does NOT override `current_principal` (so it returns an
+/// Internal origin), forcing the handler down its `edge_registration_binding`
+/// fallback path.
 #[derive(Clone)]
 struct BindingAuthService {
-    bound_edge_agent_id: String,
+    binding: astra_services::EdgeTokenBinding,
 }
 
 #[async_trait]
@@ -1002,24 +1035,29 @@ impl AuthService for BindingAuthService {
     async fn edge_registration_binding(
         &self,
         _token: &str,
-    ) -> Result<Option<(String, String)>, (StatusCode, axum::Json<ErrorResponse>)> {
-        Ok(Some((
-            self.bound_edge_agent_id.clone(),
-            "test-workspace".to_string(),
-        )))
+    ) -> Result<astra_services::EdgeTokenBinding, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(self.binding.clone())
     }
 }
 
 async fn spawn_binding_server(
     bound_edge_agent_id: &str,
 ) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
+    spawn_binding_server_with(astra_services::EdgeTokenBinding::Bound {
+        edge_agent_id: bound_edge_agent_id.to_string(),
+        workspace_id: "test-workspace".to_string(),
+    })
+    .await
+}
+
+async fn spawn_binding_server_with(
+    binding: astra_services::EdgeTokenBinding,
+) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
     let state = AppState::new(
         ServiceInfo::new("edge-bind-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
     )
-    .with_auth_service(Arc::new(BindingAuthService {
-        bound_edge_agent_id: bound_edge_agent_id.to_string(),
-    }));
+    .with_auth_service(Arc::new(BindingAuthService { binding }));
     let state_clone = state.clone();
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1034,11 +1072,11 @@ async fn spawn_binding_server(
 }
 
 async fn edge_auth_result(addr: std::net::SocketAddr, edge_id: &str) -> serde_json::Value {
-    let url = format!("ws://{addr}/edge/ws");
-    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
+    let (mut ws, _) = connect_async(ws_request(addr, "moi-user-token-v1.payload.sig"))
+        .await
+        .expect("WS connect");
     let auth_msg = json!({
         "type": "edge_auth",
-        "token": "moi-user-token-v1.payload.sig",
         "edge_agent_id": edge_id,
         "hostname": "host",
         "workspace_dir": "/home/test/project"
@@ -1074,7 +1112,356 @@ async fn edge_ws_accepts_matching_edge_agent_id() {
     server.abort();
 }
 
+#[tokio::test]
+async fn edge_ws_rejects_runtime_token_without_binding() {
+    // A recognized provider token that carries no edge_agent_id binding
+    // (MissingBinding, e.g. a runtime server-to-server token) must be rejected
+    // on the WS path — it must not fall through and be accepted with an
+    // unverified self-reported edge_agent_id.
+    let (addr, state, server) =
+        spawn_binding_server_with(astra_services::EdgeTokenBinding::MissingBinding).await;
+
+    let resp = edge_auth_result(addr, "anything").await;
+    assert_eq!(
+        resp["type"], "edge_auth_error",
+        "runtime token without binding must be rejected: {resp}"
+    );
+    assert!(!state.edge_connection_pool.has_connected_edge("test-user-1"));
+
+    server.abort();
+}
+
 // ── B2: DB registration failure rejects WS connection ────────────────
+
+struct BlockingLeaseEdgeRegistry {
+    registration_started: Notify,
+    release_registration: Notify,
+    claim_release_started: Notify,
+    claim_release_gate: Notify,
+    rollback_count: AtomicUsize,
+    release_succeeds: bool,
+}
+
+impl BlockingLeaseEdgeRegistry {
+    fn new() -> Self {
+        Self {
+            registration_started: Notify::new(),
+            release_registration: Notify::new(),
+            claim_release_started: Notify::new(),
+            claim_release_gate: Notify::new(),
+            rollback_count: AtomicUsize::new(0),
+            release_succeeds: true,
+        }
+    }
+
+    fn with_claim_loss() -> Self {
+        Self {
+            release_succeeds: false,
+            ..Self::new()
+        }
+    }
+}
+
+#[async_trait]
+impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegistry {
+    async fn register_or_update(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+        _hostname: Option<&str>,
+        _worktree_path: Option<&str>,
+        _capabilities: Option<serde_json::Value>,
+        _workspace_id: Option<&str>,
+    ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+        Err("test must use registration leases".to_string())
+    }
+
+    async fn register_or_update_with_lease(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+    ) -> Result<astra_services::multi_agent::EdgeRegistrationLease, String> {
+        self.registration_started.notify_one();
+        self.release_registration.notified().await;
+        let current = astra_services::multi_agent::EdgeAgentRecord {
+            registry_id: "registry-blocked".to_string(),
+            user_id: user_id.to_string(),
+            edge_agent_id: edge_agent_id.to_string(),
+            edge_id: edge_id_header.to_string(),
+            hostname: hostname.map(ToString::to_string),
+            worktree_path: worktree_path.map(ToString::to_string),
+            capabilities,
+            workspace_id: workspace_id.map(ToString::to_string),
+            registered_at: "2026-07-17 00:00:00.000000".to_string(),
+            last_heartbeat_at: "2026-07-17 00:00:00.000000".to_string(),
+        };
+        Ok(astra_services::multi_agent::EdgeRegistrationLease {
+            current,
+            previous: None,
+            claim_id: Some("blocked-test-claim".to_string()),
+        })
+    }
+
+    async fn rollback_registration(
+        &self,
+        _lease: &astra_services::multi_agent::EdgeRegistrationLease,
+    ) -> Result<bool, String> {
+        self.rollback_count.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn release_registration(
+        &self,
+        _lease: &astra_services::multi_agent::EdgeRegistrationLease,
+    ) -> Result<bool, String> {
+        self.claim_release_started.notify_one();
+        self.claim_release_gate.notified().await;
+        Ok(self.release_succeeds)
+    }
+
+    async fn heartbeat(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+    ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+        Ok(())
+    }
+
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        _edge_agent_id: &str,
+        _workspace_id: Option<&str>,
+    ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        Ok(None)
+    }
+
+    async fn list_by_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn unregister_generation(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn edge_ws_close_during_registration_rolls_back_without_pool_commit() {
+    let registry = Arc::new(BlockingLeaseEdgeRegistry::new());
+    let state = AppState::new(
+        ServiceInfo::new("edge-registration-close-test", "0.0.0-test", ""),
+        Arc::new(StubHealthChecker),
+    )
+    .with_auth_service(Arc::new(StubAuthService))
+    .with_edge_registry_service(registry.clone());
+    let state_clone = state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, astra_runtime::build_app(state))
+            .await
+            .unwrap()
+    });
+
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(
+        json!({
+            "type": "edge_auth",
+            "edge_agent_id": "edge-registration-close",
+            "hostname": "host",
+            "workspace_dir": "/workspace"
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        registry.registration_started.notified(),
+    )
+    .await
+    .expect("registration started");
+
+    ws.send(Message::Ping(b"setup-ping".to_vec().into()))
+        .await
+        .expect("ping during registration");
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("pong timeout")
+        .expect("pong frame")
+        .expect("valid pong");
+    assert!(matches!(pong, Message::Pong(_)));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("close during registration");
+    // Keep the mocked DB write blocked until the server-side setup loop has
+    // consumed the Close frame. The real regression is specifically the
+    // registration-await window, not a close that races after DB completion.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    registry.release_registration.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while registry.rollback_count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("registration rollback");
+
+    assert!(
+        !state_clone
+            .edge_connection_pool
+            .has_connected_edge("test-user-1")
+    );
+    assert_eq!(registry.rollback_count.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_auth_ok_precedes_claim_release_wait() {
+    let registry = Arc::new(BlockingLeaseEdgeRegistry::new());
+    let state = AppState::new(
+        ServiceInfo::new("edge-auth-order-test", "0.0.0-test", ""),
+        Arc::new(StubHealthChecker),
+    )
+    .with_auth_service(Arc::new(StubAuthService))
+    .with_edge_registry_service(registry.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, astra_runtime::build_app(state))
+            .await
+            .unwrap()
+    });
+
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(
+        json!({
+            "type": "edge_auth",
+            "edge_agent_id": "edge-auth-order",
+            "hostname": "host",
+            "workspace_dir": "/workspace"
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        registry.registration_started.notified(),
+    )
+    .await
+    .expect("registration started");
+    registry.release_registration.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        registry.claim_release_started.notified(),
+    )
+    .await
+    .expect("claim release started");
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("auth response timeout")
+        .expect("auth response frame")
+        .expect("valid auth response");
+    let Message::Text(first) = first else {
+        panic!("first server application frame must be auth_ok");
+    };
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["type"], "edge_auth_ok");
+
+    registry.claim_release_gate.notify_one();
+    ws.close(None).await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn claim_loss_after_pool_commit_removes_the_unpublished_connection() {
+    let registry = Arc::new(BlockingLeaseEdgeRegistry::with_claim_loss());
+    let state = AppState::new(
+        ServiceInfo::new("edge-claim-loss-test", "0.0.0-test", ""),
+        Arc::new(StubHealthChecker),
+    )
+    .with_auth_service(Arc::new(StubAuthService))
+    .with_edge_registry_service(registry.clone());
+    let observed_state = state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, astra_runtime::build_app(state))
+            .await
+            .unwrap()
+    });
+
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(
+        json!({
+            "type": "edge_auth",
+            "edge_agent_id": "edge-claim-loss",
+            "hostname": "host",
+            "workspace_dir": "/workspace"
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    registry.registration_started.notified().await;
+    registry.release_registration.notify_one();
+    registry.claim_release_started.notified().await;
+
+    assert!(
+        observed_state
+            .edge_connection_pool
+            .has_connected_edge("test-user-1"),
+        "the test must observe the post-pool-commit release window"
+    );
+    registry.claim_release_gate.notify_one();
+
+    let first = ws.next().await.unwrap().unwrap();
+    let first: astra_server_types::edge_ws_protocol::EdgeServerMessage =
+        serde_json::from_str(&first.into_text().unwrap()).unwrap();
+    assert!(matches!(
+        first,
+        astra_server_types::edge_ws_protocol::EdgeServerMessage::AuthOk { .. }
+    ));
+    let second = ws.next().await.unwrap().unwrap();
+    let second: astra_server_types::edge_ws_protocol::EdgeServerMessage =
+        serde_json::from_str(&second.into_text().unwrap()).unwrap();
+    assert!(matches!(
+        second,
+        astra_server_types::edge_ws_protocol::EdgeServerMessage::AuthError { .. }
+    ));
+    assert!(
+        !observed_state
+            .edge_connection_pool
+            .has_connected_edge("test-user-1")
+    );
+    server.abort();
+}
 
 struct FailingEdgeRegistry;
 
@@ -1142,12 +1529,12 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url = format!("ws://{addr}/edge/ws");
-    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
     ws.send(Message::Text(
         json!({
             "type": "edge_auth",
-            "token": "test-edge-token",
             "edge_agent_id": "edge-b2",
             "hostname": "host",
             "workspace_dir": "/workspace"
@@ -1179,6 +1566,7 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
 struct RecordingEdgeRegistry {
     heartbeats: std::sync::Mutex<Vec<(String, String, String)>>,
     notify: tokio::sync::Notify,
+    fail_heartbeats: bool,
 }
 
 #[async_trait]
@@ -1223,7 +1611,13 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
         // currently registered, turning this behavior test into a scheduler
         // timing test.
         self.notify.notify_one();
-        Ok(())
+        if self.fail_heartbeats {
+            Err(astra_services::multi_agent::HeartbeatError::StorageFailure(
+                "persistent test failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     async fn find_by_agent_id_and_workspace(
@@ -1267,19 +1661,19 @@ async fn edge_ws_heartbeat_tick_updates_db_registry() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     // Yield to let axum's accept loop start before we attempt to connect.
-    // In current_thread+start_paused mode there is no real sleep; we just
-    // need the server task to reach its accept().await before we send the
-    // auth message.
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
 
-    // Connect and auth normally.
+    // Complete the real socket handshake before pausing Tokio time. Starting
+    // the runtime paused makes timeout() eligible for automatic time advance
+    // while real TCP I/O is still pending, which can spuriously expire auth
+    // when the full workspace suite is under load.
     let mut ws = ws_auth(addr, "edge-b3", "host-b3").await;
 
-    // AuthOk is emitted before the server constructs its heartbeat interval.
-    // A protocol round-trip proves that the bidirectional loop (and therefore
-    // the ticker) is live before virtual time moves.
+    // AuthOk is deliberately sent before the connection is published and the
+    // read loop starts. Use an application ping/pong as a readiness barrier so
+    // the heartbeat interval is guaranteed to exist before advancing time.
     ws.send(Message::Text(
         json!({ "type": "edge_ping" }).to_string().into(),
     ))
@@ -1323,6 +1717,57 @@ async fn edge_ws_heartbeat_tick_updates_db_registry() {
         "heartbeat must be called after advancing mock clock 31s: {beats:?}"
     );
 
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistent_heartbeat_storage_failure_opens_circuit_and_closes_connection() {
+    let registry = Arc::new(RecordingEdgeRegistry {
+        fail_heartbeats: true,
+        ..Default::default()
+    });
+    let state = AppState::new(
+        ServiceInfo::new("edge-heartbeat-budget-test", "0.0.0-test", ""),
+        Arc::new(StubHealthChecker),
+    )
+    .with_auth_service(Arc::new(StubAuthService))
+    .with_edge_registry_service(registry.clone());
+    let app = astra_runtime::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut ws = ws_auth(addr, "edge-heartbeat-budget", "host").await;
+
+    ws.send(Message::Text(
+        json!({ "type": "edge_ping" }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let _ = ws.next().await.expect("readiness frame").expect("pong");
+
+    tokio::time::pause();
+    for _ in 0..3 {
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+    }
+    tokio::time::resume();
+
+    let closing = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let frame = ws.next().await.expect("server closes explicitly")?;
+            if let Message::Text(text) = frame
+                && let astra_server_types::edge_ws_protocol::EdgeServerMessage::Closing { reason } =
+                    serde_json::from_str(&text).expect("typed edge server message")
+            {
+                break Ok::<_, tokio_tungstenite::tungstenite::Error>(reason);
+            }
+        }
+    })
+    .await
+    .expect("heartbeat circuit breaker response")
+    .expect("valid closing frame");
+    assert_eq!(closing, "edge registry heartbeat unavailable");
+    assert_eq!(registry.heartbeats.lock().unwrap().len(), 3);
     server.abort();
 }
 

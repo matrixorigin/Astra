@@ -21,7 +21,7 @@ pub(crate) async fn edge_status_handler(
 ) -> Result<Json<EdgeStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
-    let infos = state.edge_connection_pool.get_user_edges(&user.user_id);
+    let infos = state.edge_connection_pool.get_all_user_edges(&user.user_id);
     let edges = infos
         .into_iter()
         .map(|info| EdgeInfo {

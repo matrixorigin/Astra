@@ -534,7 +534,20 @@ async fn authenticate_with_token(
         HeaderValue::from_str(&bearer).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
-    match state.auth_service.current_principal(&headers).await {
+    match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            astra_services::ProviderRequestDescriptor {
+                method: "GET".to_string(),
+                path: "/chat/ws".to_string(),
+                route: Some("/chat/ws".to_string()),
+                request_id: None,
+                body_digest: None,
+            },
+        )
+        .await
+    {
         Ok(principal) => {
             forward_headers.insert("authorization".to_string(), bearer.clone());
             send_msg(

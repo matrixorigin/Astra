@@ -41,6 +41,9 @@ pub enum MockScenario {
     Fail,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
+    /// Agent remains pending long enough for cancellation journeys to prove
+    /// that Ctrl+C, rather than a naturally completed response, settles the turn.
+    CancellationPending,
     /// Root activates and calls one foreground child agent, then synthesizes
     /// the child's completion.
     AgentThenComplete,
@@ -78,6 +81,7 @@ impl MockScenario {
             "multi_turn" | "multi" => Some(Self::MultiTurn),
             "fail" | "error" => Some(Self::Fail),
             "slow" => Some(Self::Slow),
+            "cancellation_pending" => Some(Self::CancellationPending),
             "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
             "fanout_then_complete" | "fanout" => Some(Self::FanoutThenComplete),
             "fanout_partial_then_complete" | "fanout_partial" => {
@@ -98,6 +102,7 @@ impl MockScenario {
             Self::MultiTurn => "two LLM turns: think then complete",
             Self::Fail => "agent returns error",
             Self::Slow => "3s delay before response (tests progress display)",
+            Self::CancellationPending => "pending response for cancellation journeys",
             Self::AgentThenComplete => "one foreground child agent, then parent synthesis",
             Self::FanoutThenComplete => {
                 "three foreground fanout slots, one structured parent synthesis"
@@ -122,6 +127,10 @@ impl MockScenario {
             ("multi_turn", "two LLM turns: think then complete"),
             ("fail", "agent returns error"),
             ("slow", "3s delay before response (tests progress display)"),
+            (
+                "cancellation_pending",
+                "pending response for cancellation journeys",
+            ),
             (
                 "agent_then_complete",
                 "one foreground child agent, then parent synthesis",
@@ -330,6 +339,14 @@ async fn body_slow(
         Some(release) => release.notified().await,
         None => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
     }
+    body_complete(agent_id, turn)
+}
+
+async fn body_cancellation_pending(agent_id: &str, turn: u32) -> String {
+    // This is deliberately longer than the journey's own settlement timeout.
+    // A passing cancellation journey must therefore be released by Ctrl+C and
+    // cannot accidentally pass or fail because a short mock delay elapsed.
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     body_complete(agent_id, turn)
 }
 
@@ -775,6 +792,7 @@ async fn handle_chat_turn(
         MockScenario::Slow => {
             body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
         }
+        MockScenario::CancellationPending => body_cancellation_pending(&agent_id, turn).await,
         MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
         MockScenario::FanoutThenComplete => {
             body_fanout_then_complete(

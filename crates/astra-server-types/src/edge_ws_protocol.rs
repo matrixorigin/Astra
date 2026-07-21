@@ -8,7 +8,7 @@
 //!
 //! **Edge → Server** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth", "token": "Bearer ...", "edge_agent_id": "...", "hostname": "...", "workspace_dir": "..."}
+//! {"type": "edge_auth", "edge_agent_id": "...", "hostname": "...", "workspace_dir": "..."}
 //! {"type": "edge_tool_result", "request_id": "...", "output": "...", "is_error": false, "tool_result_fields": {"exit_code": 0}}
 //! {"type": "edge_ping"}
 //! ```
@@ -40,10 +40,12 @@ pub const EDGE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum EdgeClientMessage {
-    /// Authenticate the edge agent (must be first message).
+    /// Declare the authenticated edge agent's identity and capabilities.
+    ///
+    /// HTTP authentication is completed before the WebSocket upgrade; secrets
+    /// must never be repeated in an application frame.
     #[serde(rename = "edge_auth")]
     Auth {
-        token: String,
         edge_agent_id: String,
         #[serde(default)]
         hostname: Option<String>,
@@ -157,7 +159,6 @@ mod tests {
     fn edge_auth_deserializes() {
         let msg: EdgeClientMessage = serde_json::from_value(json!({
             "type": "edge_auth",
-            "token": "Bearer abc",
             "edge_agent_id": "my-edge",
             "hostname": "laptop",
             "workspace_dir": "/home/user/project"
@@ -165,12 +166,10 @@ mod tests {
         .unwrap();
         match msg {
             EdgeClientMessage::Auth {
-                token,
                 edge_agent_id,
                 hostname,
                 ..
             } => {
-                assert_eq!(token, "Bearer abc");
                 assert_eq!(edge_agent_id, "my-edge");
                 assert_eq!(hostname.as_deref(), Some("laptop"));
             }
@@ -251,7 +250,6 @@ mod tests {
     #[test]
     fn edge_client_auth_serializes() {
         let msg = EdgeClientMessage::Auth {
-            token: "Bearer tok".into(),
             edge_agent_id: "e1".into(),
             hostname: Some("h".into()),
             workspace_dir: None,
@@ -264,7 +262,7 @@ mod tests {
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth");
-        assert_eq!(v["token"], "Bearer tok");
+        assert!(v.get("token").is_none());
         assert_eq!(v["edge_agent_id"], "e1");
         assert_eq!(v["capabilities"]["schema_version"], 1);
     }

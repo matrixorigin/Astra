@@ -80,6 +80,53 @@ struct PendingEdgeResult {
     sender: oneshot::Sender<EdgeToolResult>,
 }
 
+/// In-progress transactional reconnect for one edge key.
+///
+/// Created by [`EdgeConnectionPool::begin_reconnect`] BEFORE the reconnect's
+/// async DB registration; the previous connection is left active and selectable
+/// throughout. On success [`EdgeConnectionPool::commit_reconnect`] atomically
+/// swaps in the new connection (inheriting the pending-result map); on failure
+/// [`EdgeConnectionPool::abort_reconnect`] leaves the previous connection
+/// untouched. Either way the reservation's `Drop` clears the intent marker as a
+/// backstop against an early return or panic.
+#[must_use = "a reconnect reservation must be committed or aborted"]
+pub struct ReconnectReservation {
+    key: String,
+    /// Pending-result map captured when the reservation was opened (if a
+    /// connection existed), held alive across the DB await so a concurrent
+    /// cleanup of the previous connection cannot drop its waiters.
+    pending: Option<Arc<DashMap<String, PendingEdgeResult>>>,
+    connections: Arc<DashMap<String, EdgeConnection>>,
+    intents: Arc<DashMap<String, ()>>,
+}
+
+impl Drop for ReconnectReservation {
+    fn drop(&mut self) {
+        // Resolve the reservation and clear its intent under the same
+        // connection-shard lock used by registration and cleanup. If another
+        // registration won the race but did not inherit this reservation's
+        // pending map, those waiters have no delivery owner and must fail now.
+        match self.connections.entry(self.key.clone()) {
+            Entry::Occupied(connection) => {
+                let inherited = self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &connection.get().pending_results));
+                if !inherited && let Some(pending) = &self.pending {
+                    pending.clear();
+                }
+                self.intents.remove(&self.key);
+            }
+            Entry::Vacant(_) => {
+                if let Some(pending) = &self.pending {
+                    pending.clear();
+                }
+                self.intents.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Result from an edge tool execution.
 #[derive(Debug, Clone)]
 pub struct EdgeToolResult {
@@ -115,6 +162,17 @@ pub struct EdgeConnectionPool {
     max_pending_per_user: usize,
     next_connection_generation: Arc<AtomicU64>,
     next_delivery_generation: Arc<AtomicU64>,
+    /// Keys with a reconnect in progress. While a key is present, a concurrent
+    /// cleanup of the previous connection must NOT clear its pending-result map
+    /// (the reconnect will inherit it on commit, or fail it on abort). Enables
+    /// the transactional reconnect: the previous connection stays active and
+    /// selectable throughout the reconnect's async DB registration.
+    reconnect_intents: Arc<DashMap<String, ()>>,
+    /// Per-key async lock serializing concurrent reconnects for the same edge
+    /// key across the whole begin→DB→commit/abort region, so two handlers cannot
+    /// interleave their DB registration and pool commit (which could leave the
+    /// DB pointing at one incarnation and the pool at another).
+    reconnect_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +192,38 @@ impl EdgeConnectionPool {
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
             next_connection_generation: Arc::new(AtomicU64::new(0)),
             next_delivery_generation: Arc::new(AtomicU64::new(0)),
+            reconnect_intents: Arc::new(DashMap::new()),
+            reconnect_locks: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Acquire the per-key reconnect lock. The edge WS handler holds this across
+    /// its entire reconnect (begin → DB registration → commit/abort) so
+    /// concurrent reconnects for the same key are serialized.
+    pub fn reconnect_lock(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.reconnect_locks
+            .entry(pool_key(user_id, edge_agent_id))
+            .or_default()
+            .clone()
+    }
+
+    /// Drop the per-key reconnect lock once no reconnect is using it, bounding
+    /// the lock map's growth. Called by the handler after its reconnect finishes
+    /// (with its own `Arc` clone still alive). Removes the entry only when the
+    /// sole strong references are the map's and the caller's — a concurrent
+    /// waiter holds its own clone, raising the count above 2, so it is never
+    /// removed out from under an in-progress reconnect. The `remove_if` predicate
+    /// runs under the shard lock, making this atomic with a racing
+    /// `reconnect_lock`.
+    pub fn gc_reconnect_lock(&self, user_id: &str, edge_agent_id: &str) {
+        self.reconnect_locks
+            .remove_if(&pool_key(user_id, edge_agent_id), |_, lock| {
+                Arc::strong_count(lock) <= 2
+            });
     }
 
     /// Register a new edge connection. Replaces any existing connection for the same key.
@@ -177,22 +266,17 @@ impl EdgeConnectionPool {
         sender: EdgeWsSender,
     ) -> u64 {
         let key = pool_key(user_id, edge_agent_id);
-        let generation = self
-            .next_connection_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let mut connection = EdgeConnection {
+        let generation = self.next_generation();
+        let mut connection = self.new_connection(
             generation,
-            user_id: user_id.to_string(),
-            edge_agent_id: edge_agent_id.to_string(),
+            user_id,
+            edge_agent_id,
             hostname,
             workspace_dir,
             capabilities,
             workspace_id,
             sender,
-            connected_at: std::time::Instant::now(),
-            pending_results: Arc::new(DashMap::new()),
-        };
+        );
         match self.connections.entry(key) {
             Entry::Occupied(mut entry) => {
                 // A reconnect changes delivery ownership, not invocation
@@ -208,6 +292,136 @@ impl EdgeConnectionPool {
         generation
     }
 
+    fn next_generation(&self) -> u64 {
+        self.next_connection_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_connection(
+        &self,
+        generation: u64,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> EdgeConnection {
+        EdgeConnection {
+            generation,
+            user_id: user_id.to_string(),
+            edge_agent_id: edge_agent_id.to_string(),
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            sender,
+            connected_at: std::time::Instant::now(),
+            pending_results: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Open a transactional reconnect for `(user_id, edge_agent_id)`.
+    ///
+    /// This does NOT touch the pool: any existing connection stays active and
+    /// selectable while the caller performs its async DB registration. The
+    /// returned reservation marks the key so a concurrent cleanup of the
+    /// previous connection preserves (rather than clears) its pending-result
+    /// map, and captures that map so it survives even if the previous entry is
+    /// removed mid-reconnect. Finish with [`Self::commit_reconnect`] on success
+    /// or [`Self::abort_reconnect`] on failure.
+    pub fn begin_reconnect(&self, user_id: &str, edge_agent_id: &str) -> ReconnectReservation {
+        let key = pool_key(user_id, edge_agent_id);
+        // Set the intent and capture the pending map atomically w.r.t. cleanup:
+        // hold the connections shard lock (via `entry`) across BOTH operations.
+        // `unregister_generation` reads the intent under the same lock, so a
+        // cleanup can never interleave between "set intent" and "capture map" —
+        // which would otherwise skip the clear yet leave the reservation with no
+        // map, orphaning the in-flight waiters.
+        let pending = match self.connections.entry(key.clone()) {
+            Entry::Occupied(occupied) => {
+                let pending = occupied.get().pending_results.clone();
+                self.reconnect_intents.insert(key.clone(), ());
+                Some(pending)
+            }
+            Entry::Vacant(_) => {
+                self.reconnect_intents.insert(key.clone(), ());
+                None
+            }
+        };
+        ReconnectReservation {
+            key,
+            pending,
+            connections: self.connections.clone(),
+            intents: self.reconnect_intents.clone(),
+        }
+    }
+
+    /// Commit a reconnect: atomically install the new connection, inheriting the
+    /// pending-result map from the still-present previous connection or, if it
+    /// was cleaned up during the reconnect, from the reservation. Returns the new
+    /// generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_reconnect(
+        &self,
+        reservation: ReconnectReservation,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
+        let key = pool_key(user_id, edge_agent_id);
+        let generation = self.next_generation();
+        let mut connection = self.new_connection(
+            generation,
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            sender,
+        );
+        // Inherit the pending map: prefer a live previous connection's map, else
+        // the one captured by the reservation (previous was cleaned up mid-
+        // reconnect but the intent kept its waiters alive). Take a clone and drop
+        // the read guard before insert() to avoid a same-shard lock conflict.
+        let inherited = self
+            .connections
+            .get(&key)
+            .map(|previous| previous.pending_results.clone())
+            .or_else(|| reservation.pending.clone());
+        if let Some(pending) = inherited {
+            connection.pending_results = pending;
+        }
+        self.connections.insert(key, connection);
+        // `reservation` drops here, clearing the intent.
+        generation
+    }
+
+    /// Abort a reconnect: leave any still-active previous connection untouched.
+    /// If the previous connection was cleaned up during the reconnect window,
+    /// its waiters were preserved by the intent but will now never be delivered
+    /// (the reconnect failed), so fail them here.
+    pub fn abort_reconnect(
+        &self,
+        reservation: ReconnectReservation,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) {
+        debug_assert_eq!(reservation.key, pool_key(user_id, edge_agent_id));
+        // `ReconnectReservation::drop` performs the atomic abort and clears the
+        // intent. Keeping the failure behavior on the reservation also covers
+        // early returns and panics that bypass this explicit method.
+        drop(reservation);
+    }
+
     /// Remove only the connection incarnation registered by the caller.
     /// Returns false when a newer socket already replaced it.
     pub fn unregister_generation(
@@ -217,14 +431,21 @@ impl EdgeConnectionPool {
         generation: u64,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
-        let removed = self
-            .connections
-            .remove_if(&key, |_, connection| connection.generation == generation);
-        if let Some((_, connection)) = removed {
-            connection.pending_results.clear();
-            true
-        } else {
-            false
+        // Hold the connections shard lock (via `entry`) while reading the intent
+        // so this is atomic with `begin_reconnect` (which sets the intent under
+        // the same lock). Preserve the pending map while a reconnect is in
+        // progress — the reconnect will inherit it on commit, or fail it on
+        // abort. Clearing here would orphan tool calls admitted before it.
+        match self.connections.entry(key.clone()) {
+            Entry::Occupied(occupied) if occupied.get().generation == generation => {
+                let reconnecting = self.reconnect_intents.contains_key(&key);
+                let (_, connection) = occupied.remove_entry();
+                if !reconnecting {
+                    connection.pending_results.clear();
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -277,13 +498,16 @@ impl EdgeConnectionPool {
                     workspace_dir: conn.workspace_dir.clone(),
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
+                    workspace_id: conn.workspace_id.clone(),
                 };
                 (conn.user_id.clone(), info)
             })
     }
 
-    /// Get all connected edge agents for a user.
-    pub fn get_user_edges(&self, user_id: &str) -> Vec<EdgeConnectionInfo> {
+    /// Get all connected edge agents for a user, regardless of workspace.
+    /// Use this for status/display queries; use [`get_user_edges`] for dispatch
+    /// to enforce workspace isolation.
+    pub fn get_all_user_edges(&self, user_id: &str) -> Vec<EdgeConnectionInfo> {
         self.connections
             .iter()
             .filter(|entry| entry.value().user_id == user_id && !entry.value().sender.is_closed())
@@ -295,6 +519,45 @@ impl EdgeConnectionPool {
                     workspace_dir: conn.workspace_dir.clone(),
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
+                    workspace_id: conn.workspace_id.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Get connected edge agents for a user, filtered by workspace.
+    ///
+    /// Workspace isolation is fail-closed (same semantics as
+    /// [`find_edge_by_agent_id`]):
+    /// - `workspace_id = Some(ws)` → only edges whose `workspace_id == Some(ws)`
+    /// - `workspace_id = None`     → only edges whose `workspace_id` is `None`
+    pub fn get_user_edges(
+        &self,
+        user_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Vec<EdgeConnectionInfo> {
+        self.connections
+            .iter()
+            .filter(|entry| {
+                let conn = entry.value();
+                if conn.user_id != user_id || conn.sender.is_closed() {
+                    return false;
+                }
+                match (workspace_id, conn.workspace_id.as_deref()) {
+                    (Some(req_ws), Some(edge_ws)) => req_ws == edge_ws,
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .map(|entry| {
+                let conn = entry.value();
+                EdgeConnectionInfo {
+                    edge_agent_id: conn.edge_agent_id.clone(),
+                    hostname: conn.hostname.clone(),
+                    workspace_dir: conn.workspace_dir.clone(),
+                    capabilities: conn.capabilities.clone(),
+                    connected_at: conn.connected_at,
+                    workspace_id: conn.workspace_id.clone(),
                 }
             })
             .collect()
@@ -727,6 +990,9 @@ pub struct EdgeConnectionInfo {
     pub workspace_dir: Option<String>,
     pub capabilities: Option<Value>,
     pub connected_at: std::time::Instant,
+    /// Owning workspace, captured from the edge registration token at connect
+    /// time. Used to enforce workspace isolation on the same-user hot path.
+    pub workspace_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -817,6 +1083,257 @@ mod tests {
         );
     }
 
+    /// Admit a durable invocation on `edge-a` and return its (request_id,
+    /// delivery_generation) once the ToolRequest reaches the socket.
+    async fn admit_on_edge_a(
+        pool: &EdgeConnectionPool,
+        label: &str,
+        socket_rx: &mut mpsc::Receiver<EdgeServerMessage>,
+    ) -> (tokio::task::JoinHandle<Option<EdgeToolResult>>, String, u64) {
+        let identity = admitted_identity(label);
+        let caller_pool = pool.clone();
+        let caller = tokio::spawn(async move {
+            caller_pool
+                .execute_durably_admitted_invocation_with_cancel(
+                    &identity,
+                    "edge-a",
+                    "bash",
+                    &json!({ "command": "effect" }),
+                    None,
+                )
+                .await
+        });
+        let request = socket_rx.recv().await.expect("socket request");
+        match request {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                ..
+            } => (caller, request_id, delivery_generation),
+            other => panic!("expected tool request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_commit_preserves_pending_across_cleanup_window() {
+        // Transactional reconnect: begin → the previous connection is cleaned up
+        // mid-window (must NOT clear its pending map because the intent is set) →
+        // commit inherits the preserved map → the admitted caller is delivered.
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+        let (caller, request_id, delivery_generation) =
+            admit_on_edge_a(&pool, "reconnect-window-result", &mut old_rx).await;
+
+        // Handler opens the reconnect before its DB await.
+        let reconnect = pool.begin_reconnect("user-1", "edge-a");
+
+        // Previous connection's cleanup runs during the window: entry removed,
+        // but the pending map must be preserved (intent set).
+        assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
+
+        // DB succeeds → commit installs the new connection, inheriting the map.
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        pool.commit_reconnect(
+            reconnect, "user-1", "edge-a", None, None, None, None, new_tx,
+        );
+
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output: "reconnect-replay".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            }
+        ));
+        assert_eq!(
+            caller.await.unwrap().unwrap().output,
+            "reconnect-replay",
+            "commit after a cleanup window must preserve pending waiters"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_previous_connection_selectable_until_commit() {
+        // During the reconnect window the previous connection stays active and
+        // selectable; commit then atomically swaps in the new one.
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-a",
+            Some("old-host".into()),
+            None,
+            None,
+            None,
+            old_tx,
+        );
+
+        let reconnect = pool.begin_reconnect("user-1", "edge-a");
+        // Old connection is still the one selected for dispatch mid-window.
+        let during = pool.get_user_edges("user-1", None);
+        assert_eq!(during.len(), 1);
+        assert_eq!(during[0].hostname.as_deref(), Some("old-host"));
+
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        pool.commit_reconnect(
+            reconnect,
+            "user-1",
+            "edge-a",
+            Some("new-host".into()),
+            None,
+            None,
+            None,
+            new_tx,
+        );
+        let after = pool.get_user_edges("user-1", None);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].hostname.as_deref(), Some("new-host"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_abort_leaves_previous_connection_active() {
+        // DB failure → abort must leave the still-active previous connection in
+        // place (no zombie, no rollback) and keep its waiters deliverable.
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-a",
+            Some("old-host".into()),
+            None,
+            None,
+            None,
+            old_tx,
+        );
+        let (caller, request_id, delivery_generation) =
+            admit_on_edge_a(&pool, "abort-result", &mut old_rx).await;
+
+        let reconnect = pool.begin_reconnect("user-1", "edge-a");
+        pool.abort_reconnect(reconnect, "user-1", "edge-a");
+
+        let edges = pool.get_user_edges("user-1", None);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].hostname.as_deref(), Some("old-host"));
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output: "still-alive".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            }
+        ));
+        assert_eq!(caller.await.unwrap().unwrap().output, "still-alive");
+    }
+
+    #[tokio::test]
+    async fn reconnect_abort_fails_waiters_when_previous_was_cleaned_up() {
+        // If the previous connection was cleaned up during the window and the
+        // reconnect then fails, the preserved waiters must be failed (not left
+        // hanging until timeout).
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+        let (caller, _request_id, _delivery_generation) =
+            admit_on_edge_a(&pool, "abort-cleanup-result", &mut old_rx).await;
+
+        let reconnect = pool.begin_reconnect("user-1", "edge-a");
+        assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
+        pool.abort_reconnect(reconnect, "user-1", "edge-a");
+
+        assert!(!pool.has_connected_edge("user-1"));
+        // The caller resolves to a failure promptly (sender dropped), not a hang.
+        assert!(caller.await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_abort_racing_with_plain_registration_never_strands_waiters() {
+        for iteration in 0..64 {
+            let pool = EdgeConnectionPool::new();
+            let (old_tx, mut old_rx) = mpsc::channel(1);
+            let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+            let (caller, _, _) =
+                admit_on_edge_a(&pool, &format!("abort-race-{iteration}"), &mut old_rx).await;
+
+            let reservation = pool.begin_reconnect("user-1", "edge-a");
+            assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let abort_barrier = barrier.clone();
+            let abort = std::thread::spawn(move || {
+                abort_barrier.wait();
+                drop(reservation);
+            });
+
+            let register_pool = pool.clone();
+            let register_barrier = barrier.clone();
+            let (new_tx, _new_rx) = mpsc::channel(1);
+            let register = std::thread::spawn(move || {
+                register_barrier.wait();
+                register_pool
+                    .register_with_capabilities("user-1", "edge-a", None, None, None, None, new_tx)
+            });
+
+            abort.join().expect("abort thread");
+            register.join().expect("registration thread");
+            let result = tokio::time::timeout(Duration::from_secs(1), caller)
+                .await
+                .expect("aborted waiter must resolve")
+                .expect("tool task must not panic");
+            assert!(
+                result.is_none(),
+                "iteration {iteration}: a non-inheriting registration cannot own the old waiter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn first_connection_abort_leaves_pool_empty() {
+        // A first-time connection (no previous) whose DB step fails leaves the
+        // pool empty.
+        let pool = EdgeConnectionPool::new();
+        let reconnect = pool.begin_reconnect("user-1", "edge-a");
+        pool.abort_reconnect(reconnect, "user-1", "edge-a");
+        assert!(!pool.has_connected_edge("user-1"));
+    }
+
+    #[test]
+    fn gc_reconnect_lock_removes_idle_entry() {
+        // With no other reconnect holding the lock, GC drops the map entry so a
+        // long-lived process cannot accumulate one mutex per historical edge id.
+        let pool = EdgeConnectionPool::new();
+        let l1 = pool.reconnect_lock("user-1", "edge-a");
+        pool.gc_reconnect_lock("user-1", "edge-a");
+        let l2 = pool.reconnect_lock("user-1", "edge-a");
+        assert!(
+            !Arc::ptr_eq(&l1, &l2),
+            "an idle reconnect lock must be GC'd and re-created fresh"
+        );
+    }
+
+    #[test]
+    fn gc_reconnect_lock_keeps_entry_held_by_a_waiter() {
+        // A concurrent reconnect holding its own clone raises the strong count
+        // above the map's + caller's, so GC must NOT remove the shared lock.
+        let pool = EdgeConnectionPool::new();
+        let l1 = pool.reconnect_lock("user-1", "edge-a");
+        let _waiter = pool.reconnect_lock("user-1", "edge-a");
+        pool.gc_reconnect_lock("user-1", "edge-a");
+        let l2 = pool.reconnect_lock("user-1", "edge-a");
+        assert!(
+            Arc::ptr_eq(&l1, &l2),
+            "a reconnect lock still held by a waiter must not be GC'd"
+        );
+    }
+
     #[test]
     fn get_user_edges_returns_info() {
         let pool = EdgeConnectionPool::new();
@@ -825,7 +1342,7 @@ mod tests {
         pool.register("user-1", "edge-a", Some("laptop".into()), None, tx1);
         pool.register("user-1", "edge-b", Some("desktop".into()), None, tx2);
 
-        let edges = pool.get_user_edges("user-1");
+        let edges = pool.get_user_edges("user-1", None);
         assert_eq!(edges.len(), 2);
         let names: Vec<&str> = edges.iter().map(|e| e.edge_agent_id.as_str()).collect();
         assert!(names.contains(&"edge-a"));
@@ -852,7 +1369,7 @@ mod tests {
             tx,
         );
 
-        let edges = pool.get_user_edges("user-1");
+        let edges = pool.get_user_edges("user-1", None);
 
         assert_eq!(edges.len(), 1);
         assert_eq!(
@@ -1377,5 +1894,105 @@ mod tests {
 
         // edge-a's gen-2 is still present.
         assert!(pool.has_connected_edge("user-1"));
+    }
+
+    // ── workspace isolation in get_user_edges ─────────────────────────
+
+    #[test]
+    fn get_user_edges_same_user_two_workspaces_isolation() {
+        let pool = EdgeConnectionPool::new();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-ws-a",
+            None,
+            None,
+            None,
+            Some("ws-a".into()),
+            tx_a,
+        );
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-ws-b",
+            None,
+            None,
+            None,
+            Some("ws-b".into()),
+            tx_b,
+        );
+
+        let ws_a_edges = pool.get_user_edges("user-1", Some("ws-a"));
+        assert_eq!(ws_a_edges.len(), 1);
+        assert_eq!(ws_a_edges[0].edge_agent_id, "edge-ws-a");
+
+        let ws_b_edges = pool.get_user_edges("user-1", Some("ws-b"));
+        assert_eq!(ws_b_edges.len(), 1);
+        assert_eq!(ws_b_edges[0].edge_agent_id, "edge-ws-b");
+
+        // unscoped request must not see workspace-bound edges
+        let unscoped = pool.get_user_edges("user-1", None);
+        assert!(
+            unscoped.is_empty(),
+            "unscoped request must not see workspace-bound edges"
+        );
+    }
+
+    #[test]
+    fn get_all_user_edges_returns_across_workspaces() {
+        let pool = EdgeConnectionPool::new();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-ws-a",
+            None,
+            None,
+            None,
+            Some("ws-a".into()),
+            tx_a,
+        );
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-ws-b",
+            None,
+            None,
+            None,
+            Some("ws-b".into()),
+            tx_b,
+        );
+
+        let all = pool.get_all_user_edges("user-1");
+        assert_eq!(all.len(), 2, "status query must see all workspace edges");
+    }
+
+    #[test]
+    fn get_user_edges_workspace_filter_does_not_cross_users() {
+        let pool = EdgeConnectionPool::new();
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-a",
+            None,
+            None,
+            None,
+            Some("ws-shared".into()),
+            tx1,
+        );
+        pool.register_with_capabilities(
+            "user-2",
+            "edge-b",
+            None,
+            None,
+            None,
+            Some("ws-shared".into()),
+            tx2,
+        );
+
+        // Same workspace but different user — must not see other user's edge.
+        let edges = pool.get_user_edges("user-1", Some("ws-shared"));
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge_agent_id, "edge-a");
     }
 }

@@ -20,8 +20,8 @@ pub use edge_dispatch::{
     refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{
-    DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistryService, HeartbeatError,
-    UnconfiguredEdgeRegistryService,
+    DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistrationLease, EdgeRegistryService,
+    HeartbeatError, UnconfiguredEdgeRegistryService,
 };
 pub use hold_cache::TaskLeaseHoldCache;
 pub use lease_renewal::{LeaseRenewalConfig, LeaseRenewalTask};

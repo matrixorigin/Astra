@@ -141,7 +141,7 @@ pub use auth::{
     AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
     DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
     DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-    DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
+    DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding,
     ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
     ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
     ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
@@ -253,10 +253,10 @@ pub use models::{
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
     EdgeAgentRecord, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
-    EdgeRegistryService, HeartbeatError, LeaseClaimResult, LeaseRenewalConfig, LeaseRenewalTask,
-    NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView,
-    TasksPackPushResult, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
-    UnconfiguredTaskLeaseService,
+    EdgeRegistrationLease, EdgeRegistryService, HeartbeatError, LeaseClaimResult,
+    LeaseRenewalConfig, LeaseRenewalTask, NextClaimableLeaseClaimResult, TaskLeaseHoldCache,
+    TaskLeaseService, TaskLeaseView, TasksPackPushResult, UnconfiguredEdgeDispatchService,
+    UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,

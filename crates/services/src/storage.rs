@@ -4826,6 +4826,10 @@ async fn ensure_core_schema_while_leased(
             worktree_path VARCHAR(512) NULL,
             capabilities_json TEXT NULL,
             workspace_id VARCHAR(512) NULL,
+            registration_claim_id VARCHAR(64) NULL,
+            registration_claim_expires_at DATETIME(6) NULL,
+            registration_state TINYINT NOT NULL DEFAULT 1,
+            registration_previous_edge_id VARCHAR(128) NULL,
             registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
@@ -4850,6 +4854,38 @@ async fn ensure_core_schema_while_leased(
         "edge_agent_registry",
         "workspace_id",
         "ALTER TABLE edge_agent_registry ADD COLUMN workspace_id VARCHAR(512) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "registration_state",
+        "ALTER TABLE edge_agent_registry ADD COLUMN registration_state TINYINT NOT NULL DEFAULT 1",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "registration_previous_edge_id",
+        "ALTER TABLE edge_agent_registry ADD COLUMN registration_previous_edge_id VARCHAR(128) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "registration_claim_id",
+        "ALTER TABLE edge_agent_registry ADD COLUMN registration_claim_id VARCHAR(64) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "registration_claim_expires_at",
+        "ALTER TABLE edge_agent_registry ADD COLUMN registration_claim_expires_at DATETIME(6) NULL",
     )
     .await?;
     add_index_if_missing(
