@@ -661,7 +661,10 @@ describe("WorkSurfacePanel", () => {
     expect(
       screen.getAllByText("latest card live output").length,
     ).toBeGreaterThan(0);
-    expect(screen.getByText("Runtime")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(loadAgentRun).toHaveBeenCalledWith("run-new");
+    });
+    expect(await screen.findByText("Runtime")).toBeInTheDocument();
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
     expect(screen.getByText("Files")).toBeInTheDocument();
     expect(
@@ -671,9 +674,6 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getByText("edge ws")).toBeInTheDocument();
     expect(screen.getByText("Policy")).toBeInTheDocument();
     expect(screen.getByText("disabled")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(loadAgentRun).toHaveBeenCalledWith("run-new");
-    });
   });
 
   it("presents agent turns as budget usage rather than completion progress", () => {
