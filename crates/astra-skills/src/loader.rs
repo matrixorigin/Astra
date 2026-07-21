@@ -24,9 +24,9 @@ use super::version::{Dependency, Version};
 
 /// Intermediate deserialization target for SKILL.md YAML frontmatter.
 ///
-/// Skill manifest loaded from YAML/JSON.
+/// Unknown top-level fields are intentionally ignored so skills produced by a
+/// newer tool remain loadable. Declared fields are still type-checked by Serde.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawFrontmatter {
     name: String,
     #[serde(default)]
@@ -702,6 +702,40 @@ Analyze the code thoroughly.
         assert_eq!(manifest.category.as_deref(), Some("code-review"));
         assert_eq!(manifest.tags, vec!["review", "security"]);
         assert!(instructions.contains("Analyze the code thoroughly"));
+    }
+
+    #[test]
+    fn parse_ignores_unsupported_frontmatter_fields() {
+        let content = r#"---
+name: forward-compatible
+description: "Uses fields from a newer skill producer"
+metadata:
+  owner: matrixone
+future_runtime:
+  mode: experimental
+---
+Keep loading this skill.
+"#;
+
+        let (manifest, instructions) = parse_skill_md(content).unwrap();
+
+        assert_eq!(manifest.name, "forward-compatible");
+        assert!(manifest.metadata.is_empty());
+        assert_eq!(instructions, "Keep loading this skill.");
+    }
+
+    #[test]
+    fn parse_rejects_invalid_declared_frontmatter_fields() {
+        let content = r#"---
+name: invalid-known-field
+max_tokens: unlimited
+---
+Do not load this skill.
+"#;
+
+        let error = parse_skill_md(content).unwrap_err().to_string();
+
+        assert!(error.contains("invalid type"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1389,14 +1423,6 @@ Hooked body."#;
     }
 
     // ── Aliases / effort / agent_type frontmatter tests ─────────────────
-
-    #[test]
-    fn skill_manifest_rejects_model_selection_authority() {
-        parse_skill_md(
-            "---\nname: governed-skill\ndescription: uses product policy\nmodel: provider-model\n---\nInstructions.",
-        )
-        .expect_err("skills declare requirements; they cannot select model execution");
-    }
 
     #[test]
     fn parse_cc_fields() {
