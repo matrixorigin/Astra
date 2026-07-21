@@ -143,6 +143,11 @@ pub(crate) fn spawn_runtime_sweepers(
             std::sync::Arc::clone(&lease),
             cancel.clone(),
         ),
+        crate::server::inference_settlement_sweeper::spawn_inference_settlement_sweeper(
+            shared_pool.clone(),
+            std::sync::Arc::clone(&lease),
+            cancel.clone(),
+        ),
         crate::server::session::session_todo_sweeper::spawn_session_todo_stale_sweeper(
             shared_pool.clone(),
             std::sync::Arc::clone(&lease),

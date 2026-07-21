@@ -365,7 +365,7 @@ pub struct DatabaseWorkspaceRecordStore {
     pool: SharedPool,
 }
 
-const WORKSPACE_RECORDS_CREATE_SQL: &str = r#"
+pub(crate) const WORKSPACE_RECORDS_CREATE_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS workspace_records (
                 workspace_id        VARCHAR(255) PRIMARY KEY,
                 owner_id            VARCHAR(255) NOT NULL,
@@ -386,7 +386,7 @@ const WORKSPACE_RECORDS_CREATE_SQL: &str = r#"
             )
             "#;
 
-const WORKSPACE_CLEANUP_DEBTS_CREATE_SQL: &str = r#"
+pub(crate) const WORKSPACE_CLEANUP_DEBTS_CREATE_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS workspace_cleanup_debts (
                 debt_id            VARCHAR(255) PRIMARY KEY,
                 owner_id           VARCHAR(255) NOT NULL,
@@ -402,14 +402,6 @@ const WORKSPACE_CLEANUP_DEBTS_CREATE_SQL: &str = r#"
                 resolved_at        DATETIME(6)  NULL
             )
             "#;
-
-/// Actual declarations owned by the workspace-record lifecycle. Core schema
-/// bootstrap executes these statements through its authority-tracking
-/// executor; standalone callers use the same slice below.
-pub(crate) const WORKSPACE_RECORD_TABLE_DDLS: &[&str] = &[
-    WORKSPACE_RECORDS_CREATE_SQL,
-    WORKSPACE_CLEANUP_DEBTS_CREATE_SQL,
-];
 
 impl DatabaseWorkspaceRecordStore {
     pub fn new(pool: SharedPool) -> Self {

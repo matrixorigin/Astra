@@ -207,7 +207,7 @@ pub use inference_execution::{
     InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
     admit_inference_invocation, begin_inference_provider_attempt, finish_inference_invocation,
     finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
-    reconcile_inference_invocation_settlement,
+    reconcile_inference_settlements,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,

@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v9";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v10";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -92,14 +92,11 @@ struct CoreSchemaDeclaration {
 struct CoreSchemaAuthority(Arc<StdMutex<BTreeMap<String, CoreSchemaDeclaration>>>);
 
 impl CoreSchemaAuthority {
-    fn observe(&self, owner: &str, sql: &str) {
-        let Some(table_name) = created_table_name(sql) else {
-            return;
-        };
+    fn declare(&self, owner: &str, table_name: &str, sql: &str) {
         let ddl_sha256 = format!("{:x}", sha2::Sha256::digest(sql.trim().as_bytes()));
         let mut declarations = self.0.lock().unwrap_or_else(|error| error.into_inner());
         declarations
-            .entry(table_name)
+            .entry(table_name.to_string())
             .and_modify(|declaration| declaration.count = declaration.count.saturating_add(1))
             .or_insert_with(|| CoreSchemaDeclaration {
                 owner: owner.to_string(),
@@ -132,29 +129,12 @@ impl CoreSchemaAuthority {
     }
 }
 
-fn created_table_name(sql: &str) -> Option<String> {
-    let tokens = sql.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() < 3
-        || !tokens[0].eq_ignore_ascii_case("create")
-        || !tokens[1].eq_ignore_ascii_case("table")
-    {
-        return None;
-    }
-    let name_index = if tokens.get(2..5).is_some_and(|tokens| {
-        tokens[0].eq_ignore_ascii_case("if")
-            && tokens[1].eq_ignore_ascii_case("not")
-            && tokens[2].eq_ignore_ascii_case("exists")
-    }) {
-        5
-    } else {
-        2
-    };
-    tokens.get(name_index).map(|name| {
-        name.trim_matches(|character: char| {
-            character == '`' || character == '(' || character == ';'
-        })
-        .to_string()
-    })
+macro_rules! core_schema_create {
+    ($pool:expr, $table_name:literal, $ddl:expr $(,)?) => {{
+        let ddl = $ddl;
+        ($pool).authority.declare(($pool).owner, $table_name, ddl);
+        query(ddl)
+    }};
 }
 
 #[derive(Clone, Debug)]
@@ -204,7 +184,6 @@ impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
         'c: 'e,
         E: 'q + Execute<'q, Self::Database>,
     {
-        self.authority.observe(self.owner, query.sql());
         (&self.pool).fetch_many(query)
     }
 
@@ -216,7 +195,6 @@ impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
         'c: 'e,
         E: 'q + Execute<'q, Self::Database>,
     {
-        self.authority.observe(self.owner, query.sql());
         (&self.pool).fetch_optional(query)
     }
 
@@ -503,10 +481,17 @@ pub async fn load_core_schema_table_contracts(
     .collect()
 }
 
-async fn verify_core_schema_catalog(
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoreSchemaCatalogState {
+    Ready,
+    Missing(Vec<String>),
+    Invalid(String),
+}
+
+async fn inspect_core_schema_catalog(
     pool: &sqlx::Pool<MySql>,
     database: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<CoreSchemaCatalogState, sqlx::Error> {
     let rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?")
         .bind(database)
         .fetch_all(pool)
@@ -517,7 +502,7 @@ async fn verify_core_schema_catalog(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let contracts = load_core_schema_table_contracts(pool).await?;
     if contracts.is_empty() {
-        return Err(sqlx::Error::Protocol(
+        return Ok(CoreSchemaCatalogState::Invalid(
             "core schema table authority is empty for the current contract".to_string(),
         ));
     }
@@ -531,7 +516,7 @@ async fn verify_core_schema_catalog(
         .map(|table| table.name.clone())
         .collect::<Vec<_>>();
     if !malformed.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
+        return Ok(CoreSchemaCatalogState::Invalid(format!(
             "core schema table authority contains malformed claims: {}",
             malformed.join(", ")
         )));
@@ -542,12 +527,23 @@ async fn verify_core_schema_catalog(
         .map(|table| format!("{} (owner={})", table.name, table.owner))
         .collect::<Vec<_>>();
     if missing.is_empty() {
-        Ok(())
+        Ok(CoreSchemaCatalogState::Ready)
     } else {
-        Err(sqlx::Error::Protocol(format!(
+        Ok(CoreSchemaCatalogState::Missing(missing))
+    }
+}
+
+async fn verify_core_schema_catalog(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    match inspect_core_schema_catalog(pool, database).await? {
+        CoreSchemaCatalogState::Ready => Ok(()),
+        CoreSchemaCatalogState::Missing(missing) => Err(sqlx::Error::Protocol(format!(
             "core schema catalog is incomplete after bootstrap: missing {}",
             missing.join(", ")
-        )))
+        ))),
+        CoreSchemaCatalogState::Invalid(message) => Err(sqlx::Error::Protocol(message)),
     }
 }
 
@@ -615,10 +611,16 @@ async fn mark_core_schema_contract_current(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoreSchemaVisibility {
+    Visible,
+    Lag(String),
+}
+
 async fn verify_core_schema_visible(
     pool: &sqlx::Pool<MySql>,
     database: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<CoreSchemaVisibility, sqlx::Error> {
     let persisted: Option<String> = sqlx::query_scalar(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
@@ -626,21 +628,21 @@ async fn verify_core_schema_visible(
     .fetch_optional(pool)
     .await?;
     if persisted.as_deref() != Some(CORE_SCHEMA_CONTRACT_VERSION) {
-        return Err(sqlx::Error::Protocol(
+        return Ok(CoreSchemaVisibility::Lag(
             "core schema completion marker is not visible on a fresh connection".to_string(),
         ));
     }
     // The published table authority is the readiness boundary. A fixed probe
     // list inevitably drifts whenever a new runtime table is added and can
     // report ready while a fresh connection still cannot see that table.
-    verify_core_schema_catalog(pool, database).await
-}
-
-fn is_schema_catalog_visibility_lag(error: &sqlx::Error) -> bool {
-    let detail = error.to_string().to_ascii_lowercase();
-    detail.contains("does not exist")
-        || detail.contains("unknown table")
-        || detail.contains("no such table")
+    match inspect_core_schema_catalog(pool, database).await? {
+        CoreSchemaCatalogState::Ready => Ok(CoreSchemaVisibility::Visible),
+        CoreSchemaCatalogState::Missing(missing) => Ok(CoreSchemaVisibility::Lag(format!(
+            "canonical tables are not visible: {}",
+            missing.join(", ")
+        ))),
+        CoreSchemaCatalogState::Invalid(message) => Err(sqlx::Error::Protocol(message)),
+    }
 }
 
 async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
@@ -653,20 +655,13 @@ async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result
         let visibility_result = verify_core_schema_visible(&verify_pool, &settings.database).await;
         verify_pool.close().await;
         match visibility_result {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if (is_schema_catalog_visibility_lag(&error)
-                    || matches!(error, sqlx::Error::Protocol(_)))
-                    && tokio::time::Instant::now() < deadline =>
-            {
+            Ok(CoreSchemaVisibility::Visible) => return Ok(()),
+            Ok(CoreSchemaVisibility::Lag(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(error)
-                if is_schema_catalog_visibility_lag(&error)
-                    || matches!(error, sqlx::Error::Protocol(_)) =>
-            {
+            Ok(CoreSchemaVisibility::Lag(reason)) => {
                 return Err(sqlx::Error::Protocol(format!(
-                    "core schema contract was published but canonical tables remained invisible to fresh connections: {error}"
+                    "core schema contract was published but remained invisible to fresh connections: {reason}"
                 )));
             }
             Err(error) => return Err(error),
@@ -1727,16 +1722,6 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        // Recovery consumes only explicit settlement debts. It never scans
-        // physical attempts and guesses whether an active retry loop is done.
-        let reconciled =
-            crate::inference_execution::reconcile_inference_settlement_debts(&pool).await?;
-        if reconciled > 0 {
-            tracing::warn!(
-                reconciled,
-                "reconciled admitted inference invocations from durable provider terminals"
-            );
-        }
         return verify_core_schema_catalog(&pool, &settings.database).await;
     }
 
@@ -1749,16 +1734,21 @@ async fn ensure_core_schema_while_leased(
     // executes. This makes DDL the declaration and the ownership catalog its
     // generated contract, rather than maintaining a second list of names.
     let pool = CoreSchemaExecutor::new(pool);
-    for ddl in [
-        CORE_SCHEMA_CONTRACT_TABLE_SQL,
-        CORE_SCHEMA_LEASE_TABLE_SQL,
-        CORE_SCHEMA_TABLE_CONTRACT_SQL,
+    for (table_name, ddl) in [
+        ("astra_schema_contracts", CORE_SCHEMA_CONTRACT_TABLE_SQL),
+        ("astra_schema_bootstrap_leases", CORE_SCHEMA_LEASE_TABLE_SQL),
+        (
+            "astra_schema_table_contracts",
+            CORE_SCHEMA_TABLE_CONTRACT_SQL,
+        ),
     ] {
-        pool.authority.observe("storage", ddl);
+        pool.authority.declare("storage", table_name, ddl);
     }
 
     // Auth
-    query(
+    core_schema_create!(
+        pool,
+        "auth_users",
         "CREATE TABLE IF NOT EXISTS auth_users (
             user_id VARCHAR(128) PRIMARY KEY,
             username VARCHAR(128) NOT NULL UNIQUE,
@@ -1772,7 +1762,9 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "auth_roles",
         "CREATE TABLE IF NOT EXISTS auth_roles (
             role_id VARCHAR(64) PRIMARY KEY,
             role_name VARCHAR(50) NOT NULL UNIQUE,
@@ -1783,7 +1775,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "auth_user_roles",
         "CREATE TABLE IF NOT EXISTS auth_user_roles (
             user_id VARCHAR(128) NOT NULL,
             role_id VARCHAR(64) NOT NULL,
@@ -1828,7 +1822,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "auth_refresh_tokens",
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -1865,7 +1861,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "auth_tokens",
         "CREATE TABLE IF NOT EXISTS auth_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
             type VARCHAR(50) NOT NULL,
@@ -1885,7 +1883,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "auth_provider_request_replay",
         "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (
             provider VARCHAR(64) NOT NULL,
             request_authorization_id VARCHAR(512) NOT NULL,
@@ -1901,7 +1899,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "auth_audit_logs",
         "CREATE TABLE IF NOT EXISTS auth_audit_logs (
             log_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -1919,7 +1917,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // Sessions / events core
-    query(
+    core_schema_create!(
+        pool,
+        "agent_sessions",
         "CREATE TABLE IF NOT EXISTS agent_sessions (
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -1968,6 +1968,8 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     let agent_events_sql = agent_events_create_sql();
+    pool.authority
+        .declare("storage", "agent_events", &agent_events_sql);
     query(&agent_events_sql).execute(&pool).await?;
     fail_if_varchar_columns_shorter_than(
         &pool,
@@ -2060,13 +2062,25 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
     let workspace_schema = pool.owned_by("workspace_records");
-    for ddl in crate::workspace_records::WORKSPACE_RECORD_TABLE_DDLS {
+    for (table_name, ddl) in [
+        (
+            "workspace_records",
+            crate::workspace_records::WORKSPACE_RECORDS_CREATE_SQL,
+        ),
+        (
+            "workspace_cleanup_debts",
+            crate::workspace_records::WORKSPACE_CLEANUP_DEBTS_CREATE_SQL,
+        ),
+    ] {
+        workspace_schema
+            .authority
+            .declare(workspace_schema.owner, table_name, ddl);
         query(ddl).execute(&workspace_schema).await?;
     }
     crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
-    query(
+    core_schema_create!(pool, "agent_runs",
         "CREATE TABLE IF NOT EXISTS agent_runs (
             run_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -2250,7 +2264,9 @@ async fn ensure_core_schema_while_leased(
         drop_column_if_present(&pool, &settings.database, "agent_runs", obsolete_column).await?;
     }
 
-    query(
+    core_schema_create!(
+        pool,
+        "agent_session_execution_slots",
         "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -2291,7 +2307,7 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(pool, "agent_run_events",
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
@@ -2393,7 +2409,7 @@ async fn ensure_core_schema_while_leased(
     ] {
         drop_index_if_present(&pool, &settings.database, "agent_run_events", removed_index).await?;
     }
-    query(
+    core_schema_create!(pool, "run_checkpoints",
         "CREATE TABLE IF NOT EXISTS run_checkpoints (
             checkpoint_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
@@ -2449,7 +2465,7 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(pool, "run_display_projections",
         "CREATE TABLE IF NOT EXISTS run_display_projections (
             run_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -2499,7 +2515,7 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(pool, "session_tool_output_batches",
         "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
             batch_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -2563,7 +2579,7 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    query(
+    core_schema_create!(pool, "session_tool_outputs",
         "CREATE TABLE IF NOT EXISTS session_tool_outputs (
             output_id VARCHAR(64) NOT NULL,
             batch_id VARCHAR(64) NOT NULL,
@@ -2663,7 +2679,9 @@ async fn ensure_core_schema_while_leased(
     // side-effect evidence is an explicit administrative lifecycle action,
     // not schema bootstrap. No compatibility read or migration is performed.
 
-    query(
+    core_schema_create!(
+        pool,
+        "tool_invocation_ledger",
         "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (
             user_id             VARCHAR(128) NOT NULL,
             session_id          VARCHAR(128) NOT NULL,
@@ -2713,7 +2731,9 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE tool_invocation_ledger ADD INDEX idx_tool_invocation_run_compaction (user_id, session_id, run_id, state, identity_key)",
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "tool_invocation_archive_chunks",
         "CREATE TABLE IF NOT EXISTS tool_invocation_archive_chunks (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -2798,7 +2818,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "semantic_read_observation_budgets",
         "CREATE TABLE IF NOT EXISTS semantic_read_observation_budgets (
             user_id             VARCHAR(128) NOT NULL,
             session_id          VARCHAR(128) NOT NULL,
@@ -2810,7 +2832,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "semantic_read_observations",
         "CREATE TABLE IF NOT EXISTS semantic_read_observations (
             user_id             VARCHAR(128) NOT NULL,
             session_id          VARCHAR(128) NOT NULL,
@@ -2833,7 +2857,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
-    query(
+    core_schema_create!(
+        pool,
+        "session_transcript_items",
         "CREATE TABLE IF NOT EXISTS session_transcript_items (
             session_id VARCHAR(64) NOT NULL,
             item_seq BIGINT NOT NULL,
@@ -2887,7 +2913,9 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id)",
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "transcript_pages",
         "CREATE TABLE IF NOT EXISTS transcript_pages (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -2935,7 +2963,7 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
-    query(
+    core_schema_create!(pool, "prompt_request_records",
         "CREATE TABLE IF NOT EXISTS prompt_request_records (
             request_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -3065,7 +3093,7 @@ async fn ensure_core_schema_while_leased(
         ],
     )
     .await?;
-    query(
+    core_schema_create!(pool, "prompt_deltas",
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -3085,7 +3113,9 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "session_state_revisions",
         "CREATE TABLE IF NOT EXISTS session_state_revisions (
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -3111,7 +3141,9 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_state_revisions ADD PRIMARY KEY (user_id, session_id)",
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "session_device_leases",
         "CREATE TABLE IF NOT EXISTS session_device_leases (
             lease_id VARCHAR(128) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -3144,7 +3176,7 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_device_leases ADD PRIMARY KEY (user_id, lease_id)",
     )
     .await?;
-    query(
+    core_schema_create!(pool, "session_device_lease_events",
         "CREATE TABLE IF NOT EXISTS session_device_lease_events (
             lease_event_id VARCHAR(128) NOT NULL,
             lease_id VARCHAR(128) NOT NULL,
@@ -3187,7 +3219,9 @@ async fn ensure_core_schema_while_leased(
     // multi-pod deployments). One row per sweeper type; pods CAS-update
     // the lease every TTL/2 seconds. Only the lease holder runs work.
     // Table created idempotently via IF NOT EXISTS — no DROP, no data loss.
-    query(
+    core_schema_create!(
+        pool,
+        "sweeper_leases",
         "CREATE TABLE IF NOT EXISTS sweeper_leases (
             sweeper_name VARCHAR(128) PRIMARY KEY,
             owner_pod_id VARCHAR(256) NOT NULL,
@@ -3203,7 +3237,9 @@ async fn ensure_core_schema_while_leased(
     // Durable keyset cursors keep bounded maintenance jobs fair across pod
     // changes and process restarts. The cursor is progress, never authority:
     // every mutation performed by a sweeper remains independently idempotent.
-    query(
+    core_schema_create!(
+        pool,
+        "maintenance_sweep_cursors",
         "CREATE TABLE IF NOT EXISTS maintenance_sweep_cursors (
             sweep_name VARCHAR(128) PRIMARY KEY,
             cursor_updated_at DATETIME(6) NOT NULL,
@@ -3218,7 +3254,7 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
-    query(
+    core_schema_create!(pool, "context_manifests",
         "CREATE TABLE IF NOT EXISTS context_manifests (
             manifest_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -3287,7 +3323,9 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
-    query(
+    core_schema_create!(
+        pool,
+        "context_manifest_items",
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
             manifest_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -3345,7 +3383,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "preview_template_registry",
         "CREATE TABLE IF NOT EXISTS preview_template_registry (
             tool_name VARCHAR(128) NOT NULL,
             version VARCHAR(64) NOT NULL,
@@ -3365,7 +3405,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "raw_ref_scheme_registry",
         "CREATE TABLE IF NOT EXISTS raw_ref_scheme_registry (
             scheme VARCHAR(64) PRIMARY KEY,
             resolver_name VARCHAR(128) NOT NULL,
@@ -3489,7 +3531,7 @@ async fn ensure_core_schema_while_leased(
     }
 
     // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
-    query(
+    core_schema_create!(pool, "session_state_items",
         "CREATE TABLE IF NOT EXISTS session_state_items (
             item_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -3564,7 +3606,7 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
-    query(
+    core_schema_create!(pool, "session_state_item_events",
         "CREATE TABLE IF NOT EXISTS session_state_item_events (
             event_id VARCHAR(64) NOT NULL,
             item_id VARCHAR(128) NOT NULL,
@@ -3643,7 +3685,7 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(pool, "session_delegations",
         "CREATE TABLE IF NOT EXISTS session_delegations (
             delegation_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -3716,7 +3758,7 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    query(
+    core_schema_create!(pool, "session_history_chunks",
         "CREATE TABLE IF NOT EXISTS session_history_chunks (
             chunk_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -3779,7 +3821,7 @@ async fn ensure_core_schema_while_leased(
         .execute(&pool)
         .await?;
 
-    query(
+    core_schema_create!(pool, "session_artifacts_grants",
         "CREATE TABLE IF NOT EXISTS session_artifacts_grants (
             grant_id VARCHAR(128) PRIMARY KEY,
             artifact_id VARCHAR(128) NOT NULL,
@@ -3877,7 +3919,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "agent_event_edges",
         "CREATE TABLE IF NOT EXISTS agent_event_edges (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -3907,7 +3951,9 @@ async fn ensure_core_schema_while_leased(
 
     // Harness diagnostic snapshots — separated from agent_events to avoid
     // polluting session event counts and to carry causal_chain_id natively.
-    query(
+    core_schema_create!(
+        pool,
+        "harness_snapshots",
         "CREATE TABLE IF NOT EXISTS harness_snapshots (
             snapshot_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
@@ -3968,7 +4014,9 @@ async fn ensure_core_schema_while_leased(
     // Product harness workflow state. This is separate from the diagnostic
     // `harness_snapshots` table above: these rows are the durable product model
     // for reusable user workflows such as Skillify.
-    query(
+    core_schema_create!(
+        pool,
+        "harness_runs",
         "CREATE TABLE IF NOT EXISTS harness_runs (
             harness_run_id VARCHAR(128) PRIMARY KEY,
             harness_id VARCHAR(128) NOT NULL,
@@ -4008,7 +4056,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "harness_items",
         "CREATE TABLE IF NOT EXISTS harness_items (
             item_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
@@ -4031,7 +4081,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "harness_skill_drafts",
         "CREATE TABLE IF NOT EXISTS harness_skill_drafts (
             skill_draft_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
@@ -4056,7 +4108,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "harness_skill_rules",
         "CREATE TABLE IF NOT EXISTS harness_skill_rules (
             skill_rule_id VARCHAR(128) PRIMARY KEY,
             skill_draft_id VARCHAR(128) NOT NULL,
@@ -4078,7 +4132,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "harness_citations",
         "CREATE TABLE IF NOT EXISTS harness_citations (
             citation_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
@@ -4105,7 +4161,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // Context / decisions / evaluation essentials used by turn persistence
-    query(
+    core_schema_create!(
+        pool,
+        "ctx_snapshots",
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
             context_capture_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -4163,7 +4221,7 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    query(
+    core_schema_create!(pool, "ctx_decision_audits",
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
             decision_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -4237,7 +4295,9 @@ async fn ensure_core_schema_while_leased(
         &["user_id"],
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "skill_selection_events",
         "CREATE TABLE IF NOT EXISTS skill_selection_events (
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
@@ -4276,7 +4336,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "infra_llm_models",
         "CREATE TABLE IF NOT EXISTS infra_llm_models (
             model_id VARCHAR(64) PRIMARY KEY,
             model_name VARCHAR(100) NOT NULL UNIQUE,
@@ -4310,7 +4372,7 @@ async fn ensure_core_schema_while_leased(
     // and logical invocation together; each physical attempt is then committed
     // before its provider I/O. Route rows contain no credential or endpoint
     // material and remain safe to project after execution.
-    query(
+    core_schema_create!(pool, "inference_routes",
         "CREATE TABLE IF NOT EXISTS inference_routes (
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -4345,7 +4407,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "inference_invocations",
         "CREATE TABLE IF NOT EXISTS inference_invocations (
             invocation_id VARCHAR(64) NOT NULL,
             route_id VARCHAR(64) NOT NULL,
@@ -4394,7 +4456,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "inference_provider_attempts",
         "CREATE TABLE IF NOT EXISTS inference_provider_attempts (
             attempt_id VARCHAR(64) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
@@ -4435,7 +4497,9 @@ async fn ensure_core_schema_while_leased(
     // successful provider attempt (which is itself a final fact). It is the
     // only recovery input: a failed physical attempt may still be retried and
     // therefore must never be inferred as a failed logical invocation.
-    query(
+    core_schema_create!(
+        pool,
+        "inference_invocation_settlement_debts",
         "CREATE TABLE IF NOT EXISTS inference_invocation_settlement_debts (
             user_id VARCHAR(128) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
@@ -4452,6 +4516,10 @@ async fn ensure_core_schema_while_leased(
             error_message TEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, invocation_id),
+            INDEX idx_inference_settlement_owner_session_created
+                (user_id, session_id, created_at, invocation_id),
+            INDEX idx_inference_settlement_owner_harness_created
+                (user_id, harness_run_id, created_at, invocation_id),
             CONSTRAINT chk_inference_invocation_settlement_debts_scope_owner
                 CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
                     OR (session_id IS NULL AND harness_run_id IS NOT NULL)),
@@ -4480,6 +4548,28 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
+    for (index, columns, ddl) in [
+        (
+            "idx_inference_settlement_owner_session_created",
+            &["user_id", "session_id", "created_at", "invocation_id"][..],
+            "ALTER TABLE inference_invocation_settlement_debts ADD INDEX idx_inference_settlement_owner_session_created (user_id, session_id, created_at, invocation_id)",
+        ),
+        (
+            "idx_inference_settlement_owner_harness_created",
+            &["user_id", "harness_run_id", "created_at", "invocation_id"][..],
+            "ALTER TABLE inference_invocation_settlement_debts ADD INDEX idx_inference_settlement_owner_harness_created (user_id, harness_run_id, created_at, invocation_id)",
+        ),
+    ] {
+        ensure_index_shape(
+            &pool,
+            &settings.database,
+            "inference_invocation_settlement_debts",
+            index,
+            columns,
+            ddl,
+        )
+        .await?;
+    }
 
     // Lifecycle writes are exact owner+identity transitions. MatrixOne can
     // omit eligible rows when it plans those transitions through a secondary
@@ -4497,16 +4587,6 @@ async fn ensure_core_schema_while_leased(
     ] {
         drop_index_if_present(&pool, &settings.database, table, index).await?;
     }
-    crate::inference_execution::backfill_inference_settlement_debts(&pool).await?;
-    let reconciled =
-        crate::inference_execution::reconcile_inference_settlement_debts(&pool).await?;
-    if reconciled > 0 {
-        tracing::warn!(
-            reconciled,
-            "reconciled admitted inference invocations from durable provider terminals"
-        );
-    }
-
     fail_if_required_columns_missing_or_nullable(
         &pool,
         &settings.database,
@@ -4556,7 +4636,9 @@ async fn ensure_core_schema_while_leased(
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
-    query(
+    core_schema_create!(
+        pool,
+        "admin_config",
         "CREATE TABLE IF NOT EXISTS admin_config (
             config_key VARCHAR(100) PRIMARY KEY,
             config_value TEXT NOT NULL,
@@ -4567,7 +4649,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "user_preferences",
         "CREATE TABLE IF NOT EXISTS user_preferences (
             pref_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
@@ -4595,7 +4679,7 @@ async fn ensure_core_schema_while_leased(
     // The paired visibility indexes below support that union without forcing
     // MatrixOne to scan every active skill when a user has many private skills
     // and the public catalog is also large.
-    query(
+    core_schema_create!(pool, "skills_registry",
         "CREATE TABLE IF NOT EXISTS skills_registry (
             skill_id VARCHAR(64) PRIMARY KEY,
             skill_name VARCHAR(255) NOT NULL,
@@ -4639,7 +4723,9 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE skills_registry ADD INDEX idx_skill_active_name_ver (is_active, skill_name, version)",
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "skill_metrics",
         "CREATE TABLE IF NOT EXISTS skill_metrics (
             metric_id            VARCHAR(255) PRIMARY KEY,
             skill_name           VARCHAR(255) NOT NULL,
@@ -4670,7 +4756,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
     // ── Long-task orchestration (Phase H) ──
 
-    query(
+    core_schema_create!(
+        pool,
+        "agent_tasks",
         "CREATE TABLE IF NOT EXISTS agent_tasks (
             task_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -4726,7 +4814,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "edge_agent_registry",
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
             user_id VARCHAR(128) NOT NULL,
             registry_id VARCHAR(64) NOT NULL,
@@ -4772,7 +4862,7 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database).await?;
-    query(
+    core_schema_create!(pool, "edge_pending_dispatch",
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -4837,7 +4927,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "agent_bindings",
         "CREATE TABLE IF NOT EXISTS agent_bindings (
             id VARCHAR(64) PRIMARY KEY,
             binding_name VARCHAR(255) NOT NULL,
@@ -4859,7 +4951,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "mcp_servers",
         "CREATE TABLE IF NOT EXISTS mcp_servers (
             id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
@@ -4906,7 +5000,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "mcp_bindings",
         "CREATE TABLE IF NOT EXISTS mcp_bindings (
             id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
@@ -4974,7 +5070,9 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)",
     )
     .await?;
-    query(
+    core_schema_create!(
+        pool,
+        "mcp_tools",
         "CREATE TABLE IF NOT EXISTS mcp_tools (
             owner_user_id VARCHAR(128) NOT NULL,
             binding_id VARCHAR(64) NOT NULL,
@@ -5042,7 +5140,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "task_leases",
         "CREATE TABLE IF NOT EXISTS task_leases (
             task_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -5084,7 +5184,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Plan templates table (learning successful patterns) ──
-    query(
+    core_schema_create!(
+        pool,
+        "plan_templates",
         "CREATE TABLE IF NOT EXISTS plan_templates (
             template_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -5115,7 +5217,9 @@ async fn ensure_core_schema_while_leased(
     // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
     // `subtask_count` is denormalized so list endpoints don't need to parse
     // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
-    query(
+    core_schema_create!(
+        pool,
+        "plans",
         "CREATE TABLE IF NOT EXISTS plans (
             user_id       VARCHAR(128) NOT NULL,
             plan_id       VARCHAR(64) NOT NULL,
@@ -5158,7 +5262,9 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Plan step runs: append-only attempt chain for every subtask ──
-    query(
+    core_schema_create!(
+        pool,
+        "plan_step_runs",
         "CREATE TABLE IF NOT EXISTS plan_step_runs (
             run_id       VARCHAR(64) NOT NULL,
             user_id      VARCHAR(128) NOT NULL,
@@ -5205,7 +5311,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "session_checkpoints",
         "CREATE TABLE IF NOT EXISTS session_checkpoints (
             checkpoint_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -5274,7 +5382,7 @@ async fn ensure_core_schema_while_leased(
         .await?;
     }
 
-    query(
+    core_schema_create!(pool, "session_artifacts",
         "CREATE TABLE IF NOT EXISTS session_artifacts (
             artifact_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -5394,7 +5502,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "session_artifact_references",
         "CREATE TABLE IF NOT EXISTS session_artifact_references (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -5482,7 +5592,7 @@ async fn ensure_core_schema_while_leased(
     // instances are caches over this table. The uniqueness boundary is
     // owner-first, matching the rest of the session schema and avoiding
     // session-id-only ownership assumptions.
-    query(
+    core_schema_create!(pool, "session_todos",
         "CREATE TABLE IF NOT EXISTS session_todos (
             session_id VARCHAR(64) NOT NULL,
             todo_id VARCHAR(64) NOT NULL,
@@ -5557,7 +5667,9 @@ async fn ensure_core_schema_while_leased(
     // Per owner/session monotonic counter used to mint `task-<n>` ids. Kept in
     // a separate table (not on `session_todos`) because a todo can be deleted
     // but its id must never be reused for that owner/session board.
-    query(
+    core_schema_create!(
+        pool,
+        "session_todo_counters",
         "CREATE TABLE IF NOT EXISTS session_todo_counters (
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
@@ -5569,7 +5681,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "session_todo_idempotency",
         "CREATE TABLE IF NOT EXISTS session_todo_idempotency (
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -5596,7 +5710,9 @@ async fn ensure_core_schema_while_leased(
     // ── Durable Task System ─────────────────────────────────────────────────
 
     // Task contracts: verifiable acceptance criteria for long-term tasks
-    query(
+    core_schema_create!(
+        pool,
+        "task_contracts",
         "CREATE TABLE IF NOT EXISTS task_contracts (
             contract_id    VARCHAR(64) NOT NULL,
             task_id        VARCHAR(64) NOT NULL,
@@ -5641,7 +5757,7 @@ async fn ensure_core_schema_while_leased(
     // are query axes with explicit indexes, not part of the result identity.
     // Final table name is `verification_results`; the old
     // `task_verification_results` shape is intentionally dropped below.
-    query(
+    core_schema_create!(pool, "verification_results",
         "CREATE TABLE IF NOT EXISTS verification_results (
             result_id      VARCHAR(64) NOT NULL,
             contract_id    VARCHAR(64) NOT NULL,
@@ -5673,7 +5789,7 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Skill management tables ─────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(pool, "user_skill_sources",
         "CREATE TABLE IF NOT EXISTS user_skill_sources (
             source_id VARCHAR(128) PRIMARY KEY,
             owner_user_id VARCHAR(128) NOT NULL,
@@ -5693,7 +5809,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "user_skill_versions",
         "CREATE TABLE IF NOT EXISTS user_skill_versions (
             version_id VARCHAR(128) PRIMARY KEY,
             source_id VARCHAR(128) NOT NULL,
@@ -5743,7 +5859,9 @@ async fn ensure_core_schema_while_leased(
     )
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "user_skill_evaluations",
         "CREATE TABLE IF NOT EXISTS user_skill_evaluations (
             evaluation_id VARCHAR(128) PRIMARY KEY,
             owner_user_id VARCHAR(128) NOT NULL,
@@ -5763,7 +5881,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
             user_id          VARCHAR(128) NOT NULL,
@@ -5786,7 +5904,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "skill_settings",
         "CREATE TABLE IF NOT EXISTS skill_settings (
             setting_id    VARCHAR(36) PRIMARY KEY,
             skill_id      VARCHAR(36),
@@ -5806,7 +5924,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "runtime_llm_trusted_domains",
         "CREATE TABLE IF NOT EXISTS runtime_llm_trusted_domains (
             domain_id     VARCHAR(36) PRIMARY KEY,
             domain_host   VARCHAR(255) NOT NULL,
@@ -5824,7 +5942,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "skill_resource_bindings",
         "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
             binding_id    VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(128) NOT NULL,
@@ -5844,7 +5962,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "skill_user_credentials",
         "CREATE TABLE IF NOT EXISTS skill_user_credentials (
             credential_id   VARCHAR(36) PRIMARY KEY,
             user_id         VARCHAR(128) NOT NULL,
@@ -5859,7 +5977,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "wf_triggers",
         "CREATE TABLE IF NOT EXISTS wf_triggers (
             trigger_id   VARCHAR(36) PRIMARY KEY,
             user_id      VARCHAR(128) NOT NULL,
@@ -5884,7 +6002,7 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Agent management tables ─────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(pool, "agent_agents",
         "CREATE TABLE IF NOT EXISTS agent_agents (
             agent_id       VARCHAR(255) PRIMARY KEY,
             agent_name     VARCHAR(128) NOT NULL,
@@ -5904,7 +6022,7 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Infrastructure tables ───────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(pool, "infra_sandbox_metadata",
         "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
             sandbox_name VARCHAR(128) PRIMARY KEY,
             user_id      VARCHAR(128) NOT NULL,
@@ -5922,7 +6040,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "data_versioning_checkpoints",
         "CREATE TABLE IF NOT EXISTS data_versioning_checkpoints (
             checkpoint_id   VARCHAR(36) PRIMARY KEY,
             checkpoint_name VARCHAR(128) NOT NULL,
@@ -5937,7 +6057,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Evaluation tables ───────────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "eval_gate_results",
         "CREATE TABLE IF NOT EXISTS eval_gate_results (
             gate_id         VARCHAR(36) PRIMARY KEY,
             user_id         VARCHAR(128) NULL,
@@ -5956,7 +6078,7 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(pool, "eval_quality_assessments",
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
             assessment_id VARCHAR(64) PRIMARY KEY,
             user_id       VARCHAR(128) NULL,
@@ -5975,9 +6097,13 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL)
-        .execute(&pool)
-        .await?;
+    core_schema_create!(
+        pool,
+        "eval_calibration_assessments",
+        EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL
+    )
+    .execute(&pool)
+    .await?;
     fail_if_varchar_columns_shorter_than(
         &pool,
         &settings.database,
@@ -6021,7 +6147,7 @@ async fn ensure_core_schema_while_leased(
         }
     }
 
-    query(
+    core_schema_create!(pool, "eval_training_datasets",
         "CREATE TABLE IF NOT EXISTS eval_training_datasets (
             dataset_id        VARCHAR(36) PRIMARY KEY,
             user_id           VARCHAR(128) NOT NULL,
@@ -6038,7 +6164,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    query(
+    core_schema_create!(
+        pool,
+        "eval_user_feedback",
         "CREATE TABLE IF NOT EXISTS eval_user_feedback (
             feedback_id   VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(128) NOT NULL,
@@ -6077,7 +6205,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Team definitions ───────────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "team_definitions",
         "CREATE TABLE IF NOT EXISTS team_definitions (
             team_id       VARCHAR(64)  PRIMARY KEY,
             user_id       VARCHAR(128)  NOT NULL,
@@ -6099,7 +6229,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Team execution history ─────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "team_execution_history",
         "CREATE TABLE IF NOT EXISTS team_execution_history (
             execution_id  VARCHAR(64)  PRIMARY KEY,
             team_id       VARCHAR(64)  NOT NULL,
@@ -6118,7 +6250,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Team snapshots ─────────────────────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "team_snapshots",
         "CREATE TABLE IF NOT EXISTS team_snapshots (
             snapshot_id          VARCHAR(64)  PRIMARY KEY,
             team_name            VARCHAR(128) NOT NULL,
@@ -6136,7 +6270,9 @@ async fn ensure_core_schema_while_leased(
 
     // ─── Conversation State Log (CSL) ──────────────────────────────────────────
 
-    query(
+    core_schema_create!(
+        pool,
+        "conversation_log",
         "CREATE TABLE IF NOT EXISTS conversation_log (
             user_id       VARCHAR(128) NOT NULL,
             session_id    VARCHAR(64) NOT NULL,
@@ -6162,8 +6298,14 @@ async fn ensure_core_schema_while_leased(
     // `crate::config_version_cloud` for the DDL string and bind helpers
     // that the push / pull pipeline uses.
 
+    let config_version_schema = pool.owned_by("config_version_cloud");
+    config_version_schema.authority.declare(
+        config_version_schema.owner,
+        "config_versions",
+        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
+    );
     query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
-        .execute(&pool.owned_by("config_version_cloud"))
+        .execute(&config_version_schema)
         .await?;
 
     let declarations = pool.authority.declarations()?;
@@ -7064,15 +7206,12 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_authority_is_derived_from_executed_ddl() {
+    fn core_schema_authority_uses_typed_declarations() {
         let authority = CoreSchemaAuthority::default();
-        authority.observe(
+        authority.declare(
             "storage",
+            "canonical_table",
             "CREATE TABLE IF NOT EXISTS canonical_table (id BIGINT PRIMARY KEY)",
-        );
-        authority.observe(
-            "storage",
-            "ALTER TABLE canonical_table ADD COLUMN value TEXT",
         );
 
         let declarations = authority.declarations().unwrap();
@@ -7085,9 +7224,14 @@ mod tests {
     #[test]
     fn core_schema_authority_rejects_multiple_lifecycle_producers() {
         let authority = CoreSchemaAuthority::default();
-        authority.observe("storage", "CREATE TABLE duplicate_owner (id BIGINT)");
-        authority.observe(
+        authority.declare(
+            "storage",
+            "duplicate_owner",
+            "CREATE TABLE duplicate_owner (id BIGINT)",
+        );
+        authority.declare(
             "another_module",
+            "duplicate_owner",
             "CREATE TABLE IF NOT EXISTS duplicate_owner (id BIGINT)",
         );
 

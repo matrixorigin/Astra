@@ -963,13 +963,52 @@ async fn record_inference_settlement_debt(
             error,
         )
     })?;
-    lock_admitted_inference_invocation(
-        &mut tx,
-        user_id,
-        invocation_id,
-        "record a terminal settlement",
+    let invocation = sqlx::query(
+        "SELECT status, terminal_fingerprint FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?
+         FOR UPDATE",
     )
-    .await?;
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "lock inference invocation settlement",
+            error,
+        )
+    })?;
+    let Some(invocation) = invocation else {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} is unavailable; cannot record a terminal settlement"
+        )));
+    };
+    let status = invocation.try_get::<String, _>("status").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode locked inference invocation status",
+            error,
+        )
+    })?;
+    if status != "admitted" {
+        let durable_fingerprint = invocation
+            .try_get::<Option<String>, _>("terminal_fingerprint")
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode locked inference invocation fingerprint",
+                    error,
+                )
+            })?;
+        return if durable_fingerprint.as_deref() == terminal.terminal_fingerprint.as_deref() {
+            Ok(())
+        } else {
+            Err(ServiceError::conflict(format!(
+                "inference invocation {invocation_id} is {status} with a different terminal result"
+            )))
+        };
+    }
     let has_open_attempt = sqlx::query(
         "SELECT 1 FROM inference_provider_attempts
          WHERE user_id = ? AND invocation_id = ? AND status = 'started'
@@ -1008,23 +1047,16 @@ async fn clear_inference_settlement_debt(
     invocation_id: &str,
     terminal_fingerprint: &str,
 ) -> ServiceResult<()> {
-    sqlx::query(
-        "DELETE FROM inference_invocation_settlement_debts
-         WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?",
-    )
-    .bind(user_id)
-    .bind(invocation_id)
-    .bind(terminal_fingerprint)
-    .execute(db)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "clear inference settlement debt",
-            error,
-        )
-    })?;
-    Ok(())
+    delete_inference_settlement_debt(db, user_id, invocation_id, terminal_fingerprint)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "clear inference settlement debt",
+                error,
+            )
+        })
+        .map(|_| ())
 }
 
 async fn apply_inference_terminal_if_quiescent(
@@ -1111,51 +1143,32 @@ async fn matching_successful_provider_attempt(
     .transpose()
 }
 
-/// Insert recovery debt for successful terminals left behind by the v7
-/// lifecycle. This one-time migration backfill deliberately excludes failures:
-/// a failed physical request is not proof that retry policy has settled.
-pub(crate) async fn backfill_inference_settlement_debts(
+async fn delete_inference_settlement_debt(
     db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    fingerprint: &str,
 ) -> Result<u64, sqlx::Error> {
     sqlx::query(
-        "INSERT IGNORE INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
-          terminal_status, terminal_fingerprint,
-          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          provider_response_id, error_kind, error_message)
-         SELECT attempt.user_id, attempt.invocation_id,
-                invocation.session_id, invocation.harness_run_id,
-                attempt.status, attempt.terminal_fingerprint,
-                attempt.input_tokens, attempt.output_tokens, attempt.cache_read_tokens,
-                attempt.cache_creation_tokens, attempt.provider_response_id,
-                attempt.error_kind, attempt.error_message
-         FROM inference_provider_attempts AS attempt
-         JOIN inference_invocations AS invocation
-           ON invocation.user_id = attempt.user_id
-          AND invocation.invocation_id = attempt.invocation_id
-         WHERE invocation.status = 'admitted'
-           AND attempt.status = 'succeeded'
-           AND NOT EXISTS (
-                SELECT 1
-                FROM inference_provider_attempts AS open_attempt
-                WHERE open_attempt.user_id = attempt.user_id
-                  AND open_attempt.invocation_id = attempt.invocation_id
-                  AND open_attempt.status = 'started'
-           )
-           AND NOT EXISTS (
-                SELECT 1
-                FROM inference_provider_attempts AS later_attempt
-                WHERE later_attempt.user_id = attempt.user_id
-                  AND later_attempt.invocation_id = attempt.invocation_id
-                  AND later_attempt.attempt_index > attempt.attempt_index
-           )",
+        "DELETE FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?",
     )
+    .bind(user_id)
+    .bind(invocation_id)
+    .bind(fingerprint)
     .execute(db)
     .await
     .map(|result| result.rows_affected())
 }
 
 const INFERENCE_SETTLEMENT_RECOVERY_BATCH: i64 = 256;
+
+fn is_record_local_recovery_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Protocol(_) | sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)
+    )
+}
 
 async fn reconcile_inference_settlement_debt(
     db: &sqlx::Pool<sqlx::MySql>,
@@ -1195,20 +1208,19 @@ async fn reconcile_inference_settlement_debt(
                 .await?
                 .is_none()
         {
+            tracing::error!(
+                %user_id,
+                %invocation_id,
+                debt_fingerprint = %fingerprint,
+                "discarding inference success debt without a matching provider terminal"
+            );
+            delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
             return Ok(0);
         }
         let updated =
             apply_inference_terminal_if_quiescent(db, user_id, invocation_id, terminal).await?;
         if updated == 1 {
-            sqlx::query(
-                "DELETE FROM inference_invocation_settlement_debts
-                 WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?",
-            )
-            .bind(user_id)
-            .bind(invocation_id)
-            .bind(&fingerprint)
-            .execute(db)
-            .await?;
+            delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
         }
         return Ok(updated);
     }
@@ -1218,105 +1230,78 @@ async fn reconcile_inference_settlement_debt(
         .as_deref()
         == Some(fingerprint.as_str())
     {
-        sqlx::query(
-            "DELETE FROM inference_invocation_settlement_debts
-             WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?",
-        )
-        .bind(user_id)
-        .bind(invocation_id)
-        .bind(&fingerprint)
-        .execute(db)
-        .await?;
+        delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
     } else {
         tracing::error!(
             %user_id,
             %invocation_id,
             debt_fingerprint = %fingerprint,
             invocation_status,
-            "inference settlement debt conflicts with terminal invocation state"
+            "discarding inference settlement debt that conflicts with terminal invocation state"
         );
+        delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
     }
     Ok(0)
 }
 
-/// Reconcile one invocation without coupling its caller latency to the global
-/// recovery backlog.
-pub async fn reconcile_inference_invocation_settlement(
-    pool: &SharedPool,
-    user_id: &str,
-    invocation_id: &str,
-) -> ServiceResult<()> {
-    if user_id.trim().is_empty() || invocation_id.trim().is_empty() {
-        return Err(ServiceError::invalid(
-            "inference settlement recovery requires user_id and invocation_id",
-        ));
-    }
-    reconcile_inference_settlement_debt(pool.get(), user_id, invocation_id)
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "reconcile inference invocation settlement",
-                error,
-            )
-        })
-}
-
-/// Recover only explicit settlement decisions. The queue stays proportional to
-/// interrupted work, not to the complete inference history, and its producer
-/// contract prevents a retryable physical failure from becoming a logical
-/// terminal state.
-pub(crate) async fn reconcile_inference_settlement_debts(
+async fn reconcile_inference_settlement_debts_batch(
     db: &sqlx::Pool<sqlx::MySql>,
+    limit: i64,
 ) -> Result<u64, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT user_id, invocation_id
+         FROM inference_invocation_settlement_debts
+         ORDER BY user_id ASC, invocation_id ASC
+         LIMIT ?",
+    )
+    .bind(limit.clamp(1, INFERENCE_SETTLEMENT_RECOVERY_BATCH))
+    .fetch_all(db)
+    .await?;
     let mut reconciled = 0;
-    let mut cursor: Option<(String, String)> = None;
-    loop {
-        let rows = match cursor.as_ref() {
-            None => {
-                sqlx::query(
-                    "SELECT user_id, invocation_id
-                 FROM inference_invocation_settlement_debts
-                 ORDER BY user_id ASC, invocation_id ASC
-                 LIMIT ?",
-                )
-                .bind(INFERENCE_SETTLEMENT_RECOVERY_BATCH)
-                .fetch_all(db)
-                .await?
-            }
-            Some((cursor_user_id, cursor_invocation_id)) => {
-                sqlx::query(
-                    "SELECT user_id, invocation_id
-                 FROM inference_invocation_settlement_debts
-                 WHERE user_id > ? OR (user_id = ? AND invocation_id > ?)
-                 ORDER BY user_id ASC, invocation_id ASC
-                 LIMIT ?",
-                )
-                .bind(cursor_user_id)
-                .bind(cursor_user_id)
-                .bind(cursor_invocation_id)
-                .bind(INFERENCE_SETTLEMENT_RECOVERY_BATCH)
-                .fetch_all(db)
-                .await?
+    for row in rows {
+        let user_id = match row.try_get::<String, _>("user_id") {
+            Ok(user_id) => user_id,
+            Err(error) => {
+                tracing::warn!(%error, "skip malformed inference settlement debt owner");
+                continue;
             }
         };
-        if rows.is_empty() {
-            break;
-        }
-        for row in &rows {
-            let user_id = row.try_get::<String, _>("user_id")?;
-            let invocation_id = row.try_get::<String, _>("invocation_id")?;
-            reconciled += reconcile_inference_settlement_debt(db, &user_id, &invocation_id).await?;
-        }
-        if let Some(last) = rows.last() {
-            cursor = Some((
-                last.try_get::<String, _>("user_id")?,
-                last.try_get::<String, _>("invocation_id")?,
-            ));
+        let invocation_id = match row.try_get::<String, _>("invocation_id") {
+            Ok(invocation_id) => invocation_id,
+            Err(error) => {
+                tracing::warn!(%user_id, %error, "skip malformed inference settlement debt identity");
+                continue;
+            }
+        };
+        match reconcile_inference_settlement_debt(db, &user_id, &invocation_id).await {
+            Ok(count) => reconciled += count,
+            Err(error) if is_record_local_recovery_error(&error) => {
+                tracing::warn!(
+                    %user_id,
+                    %invocation_id,
+                    %error,
+                    "inference settlement debt reconciliation failed; later debts remain eligible"
+                );
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(reconciled)
+}
+
+/// Reconcile at most one bounded batch of explicit settlement decisions.
+/// Runtime workers call this repeatedly; schema readiness never waits for the
+/// operational backlog to drain.
+pub async fn reconcile_inference_settlements(pool: &SharedPool, limit: u32) -> ServiceResult<u64> {
+    reconcile_inference_settlement_debts_batch(pool.get(), i64::from(limit.max(1)))
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "reconcile inference settlement batch",
+                error,
+            )
+        })
 }
 
 /// Resolve an ambiguous terminal transaction from its durable settlement debt.
@@ -1635,6 +1620,14 @@ mod tests {
         assert_ne!(run.invocation_id(), session.invocation_id());
         assert_ne!(run.invocation_id(), harness.invocation_id());
         assert_ne!(session.invocation_id(), harness.invocation_id());
+    }
+
+    #[test]
+    fn recovery_continues_only_for_record_local_decode_failures() {
+        assert!(is_record_local_recovery_error(&sqlx::Error::Protocol(
+            "malformed settlement debt".to_string()
+        )));
+        assert!(!is_record_local_recovery_error(&sqlx::Error::PoolTimedOut));
     }
 
     #[test]

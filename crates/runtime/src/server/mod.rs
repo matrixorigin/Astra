@@ -37,6 +37,7 @@ mod edge;
 pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
+mod inference_settlement_sweeper;
 mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;

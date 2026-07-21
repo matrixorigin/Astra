@@ -11,7 +11,7 @@ use astra_services::{
     ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind, admit_inference_invocation,
     begin_inference_provider_attempt, finish_inference_invocation,
     finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
-    reconcile_inference_invocation_settlement,
+    reconcile_inference_settlements,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
@@ -52,7 +52,7 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn targeted_settlement_recovery_does_not_process_another_invocation() {
+async fn bounded_settlement_recovery_processes_only_one_batch() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -106,10 +106,11 @@ async fn targeted_settlement_recovery_does_not_process_another_invocation() {
         .expect("persist targeted recovery attempt");
         plans.push(plan);
     }
+    plans.sort_by(|left, right| left.invocation_id().cmp(right.invocation_id()));
 
-    reconcile_inference_invocation_settlement(&shared_pool, &user_id, plans[0].invocation_id())
+    reconcile_inference_settlements(&shared_pool, 1)
         .await
-        .expect("reconcile only the requested invocation");
+        .expect("reconcile one bounded invocation batch");
 
     let rows = sqlx::query(
         "SELECT invocation_id, status,
@@ -140,9 +141,104 @@ async fn targeted_settlement_recovery_does_not_process_another_invocation() {
         }
     }
 
-    reconcile_inference_invocation_settlement(&shared_pool, &user_id, plans[1].invocation_id())
+    reconcile_inference_settlements(&shared_pool, 1)
         .await
         .expect("drain the second invocation before cleanup");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn recovery_discards_unproven_success_without_blocking_later_settlement() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("recovery-isolation-user-{suffix}");
+    let session_id = format!("recovery-isolation-session-{suffix}");
+    let run_id = format!("recovery-isolation-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let mut plans = Vec::new();
+    for round in 0..2 {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 1,
+                round,
+                operation_id: "recovery_failure_isolation".to_string(),
+                logical_attempt: 0,
+            },
+            offering_id: "recovery-isolation-offering".to_string(),
+            resolved_model_name: "recovery-isolation-model".to_string(),
+            upstream_model_name: "recovery-isolation-model".to_string(),
+            provider: "openai".to_string(),
+            purpose: InferencePurpose::PrimaryAgent,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+        })
+        .expect("plan recovery isolation invocation");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit recovery isolation invocation");
+        plans.push(plan);
+    }
+
+    for (plan, status, fingerprint, error_kind) in [
+        (&plans[0], "succeeded", "a", None),
+        (&plans[1], "failed", "b", Some("provider_unavailable")),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_invocation_settlement_debts
+             (user_id, invocation_id, session_id, harness_run_id,
+              terminal_status, terminal_fingerprint, error_kind)
+             VALUES (?, ?, ?, NULL, ?, REPEAT(?, 64), ?)",
+        )
+        .bind(&user_id)
+        .bind(plan.invocation_id())
+        .bind(&session_id)
+        .bind(status)
+        .bind(fingerprint)
+        .bind(error_kind)
+        .execute(pool)
+        .await
+        .expect("seed explicit recovery evidence");
+    }
+
+    let reconciled = reconcile_inference_settlements(&shared_pool, 256)
+        .await
+        .expect("one invalid debt must not block a later valid settlement");
+    assert_eq!(reconciled, 1);
+
+    let rows = sqlx::query(
+        "SELECT invocation_id, status,
+                (SELECT COUNT(*) FROM inference_invocation_settlement_debts AS debt
+                 WHERE debt.user_id = invocation.user_id
+                   AND debt.invocation_id = invocation.invocation_id) AS debt_count
+         FROM inference_invocations AS invocation
+         WHERE user_id = ? AND invocation_id IN (?, ?)",
+    )
+    .bind(&user_id)
+    .bind(plans[0].invocation_id())
+    .bind(plans[1].invocation_id())
+    .fetch_all(pool)
+    .await
+    .expect("load isolated recovery outcomes");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let invocation_id = row.get::<String, _>("invocation_id");
+        let expected_status = if invocation_id == plans[0].invocation_id() {
+            "admitted"
+        } else {
+            assert_eq!(invocation_id, plans[1].invocation_id());
+            "failed"
+        };
+        assert_eq!(row.get::<String, _>("status"), expected_status);
+        assert_eq!(row.get::<i64, _>("debt_count"), 0);
+    }
+
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
@@ -368,6 +464,9 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     );
     first_terminal.expect("finish logical invocation");
     concurrent_terminal.expect("concurrent exact invocation terminal is idempotent");
+    finish_inference_provider_attempt(&shared_pool, &second_attempt, &success)
+        .await
+        .expect("an exact provider terminal replay remains idempotent after logical settlement");
 
     let attempts = sqlx::query(
         "SELECT attempt_index, status, input_tokens, output_tokens,
@@ -545,7 +644,7 @@ async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts() {
+async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -658,11 +757,9 @@ async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts
         .await
         .expect("persist failed provider attempt");
 
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
-    astra_services::ensure_core_schema(&settings, &catalog)
+    reconcile_inference_settlements(&shared_pool, 256)
         .await
-        .expect("bootstrap must reconcile durable inference");
+        .expect("bounded worker must reconcile durable inference");
 
     let invocation = sqlx::query(
         "SELECT status, input_tokens, output_tokens, cache_read_tokens,
@@ -702,7 +799,7 @@ async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts
     .bind(failed_plan.invocation_id())
     .fetch_one(pool)
     .await
-    .expect("load retryable invocation after bootstrap");
+    .expect("load retryable invocation after recovery");
     assert_eq!(
         failed_invocation.get::<String, _>("status"),
         "admitted",
@@ -725,7 +822,7 @@ async fn inference_bootstrap_recovers_success_without_closing_retryable_attempts
     let retry_attempt = plan_inference_provider_attempt(&failed_plan, 1);
     begin_inference_provider_attempt(&shared_pool, &retry_attempt)
         .await
-        .expect("bootstrap recovery must not prevent the caller's retry");
+        .expect("background recovery must not prevent the caller's retry");
 
     let obsolete_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
