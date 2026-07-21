@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Server-wide safety cap for an auxiliary completion response.
+pub const MAX_COMPLETION_OUTPUT_TOKENS: u32 = 8_192;
+
 /// Server-owned auxiliary operations available through the authenticated
 /// non-streaming completion endpoint.
 ///
@@ -133,6 +136,17 @@ impl CompletionRequest {
         self
     }
 
+    /// Reject caller-provided resource requests that exceed the Server-owned
+    /// auxiliary completion envelope.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 || self.max_tokens > MAX_COMPLETION_OUTPUT_TOKENS {
+            return Err(format!(
+                "max_tokens must be between 1 and {MAX_COMPLETION_OUTPUT_TOKENS}"
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn purpose(&self) -> astra_turn_types::InferencePurpose {
         self.operation.purpose()
@@ -253,6 +267,25 @@ mod tests {
             }),
         ] {
             assert!(serde_json::from_value::<CompletionRequest>(forbidden).is_err());
+        }
+    }
+
+    #[test]
+    fn request_validation_keeps_output_budget_server_bounded() {
+        let mut request = CompletionRequest::new(
+            CompletionOperation::MemoryExtraction,
+            "session-1",
+            1,
+            0,
+            0,
+            vec![],
+        );
+        request.max_tokens = MAX_COMPLETION_OUTPUT_TOKENS;
+        request.validate().expect("server cap is accepted");
+
+        for invalid in [0, MAX_COMPLETION_OUTPUT_TOKENS + 1] {
+            request.max_tokens = invalid;
+            assert!(request.validate().is_err(), "{invalid} must be rejected");
         }
     }
 }

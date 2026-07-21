@@ -339,6 +339,160 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn inference_bootstrap_recovers_terminal_attempts_left_admitted() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("reconcile-user-{suffix}");
+    let session_id = format!("reconcile-session-{suffix}");
+    let run_id = format!("reconcile-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "reconcile_after_terminal_commit".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-reconcile".to_string(),
+        resolved_model_name: "reconcile-model".to_string(),
+        upstream_model_name: "reconcile-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan reconciliation invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit reconciliation invocation");
+    let attempt = plan_inference_provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin successful provider attempt");
+    let succeeded = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input_tokens: 9,
+            output_tokens: 4,
+            cache_read_tokens: 2,
+            cache_creation_tokens: 1,
+        },
+        Some("provider-reconciled".to_string()),
+    );
+    finish_inference_provider_attempt(&shared_pool, &attempt, &succeeded)
+        .await
+        .expect("persist successful provider attempt");
+
+    let failed_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "reconcile_after_terminal_commit".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-reconcile".to_string(),
+        resolved_model_name: "reconcile-model".to_string(),
+        upstream_model_name: "reconcile-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan failed reconciliation invocation");
+    admit_inference_invocation(&shared_pool, &failed_plan)
+        .await
+        .expect("admit failed reconciliation invocation");
+    let failed_attempt = plan_inference_provider_attempt(&failed_plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &failed_attempt)
+        .await
+        .expect("begin failed provider attempt");
+    let failed = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some("provider_unavailable".to_string()),
+        error_message: Some("provider failed after delivery".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &failed_attempt, &failed)
+        .await
+        .expect("persist failed provider attempt");
+
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
+    astra_services::ensure_core_schema(&settings, &catalog)
+        .await
+        .expect("bootstrap must reconcile durable inference");
+
+    let invocation = sqlx::query(
+        "SELECT status, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, provider_response_id
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load reconciled invocation");
+    assert_eq!(invocation.get::<String, _>("status"), "succeeded");
+    assert_eq!(invocation.get::<i64, _>("input_tokens"), 9);
+    assert_eq!(invocation.get::<i64, _>("output_tokens"), 4);
+    assert_eq!(invocation.get::<i64, _>("cache_read_tokens"), 2);
+    assert_eq!(invocation.get::<i64, _>("cache_creation_tokens"), 1);
+    assert_eq!(
+        invocation.get::<Option<String>, _>("provider_response_id"),
+        Some("provider-reconciled".to_string())
+    );
+
+    let failed_invocation = sqlx::query(
+        "SELECT status, error_kind, error_message
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(failed_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load failed reconciled invocation");
+    assert_eq!(failed_invocation.get::<String, _>("status"), "failed");
+    assert_eq!(
+        failed_invocation.get::<Option<String>, _>("error_kind"),
+        Some("provider_unavailable".to_string())
+    );
+    assert_eq!(
+        failed_invocation.get::<Option<String>, _>("error_message"),
+        Some("provider failed after delivery".to_string())
+    );
+
+    let obsolete_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ?
+           AND ((TABLE_NAME = 'inference_invocations'
+                 AND INDEX_NAME = 'idx_inference_invocations_status_created')
+             OR (TABLE_NAME = 'inference_provider_attempts'
+                 AND INDEX_NAME = 'idx_inference_attempts_status_started'))",
+    )
+    .bind(&settings.database)
+    .fetch_one(pool)
+    .await
+    .expect("inspect inference lifecycle indexes");
+    assert_eq!(
+        obsolete_indexes, 0,
+        "lifecycle updates must not depend on mutable-status-leading indexes"
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();

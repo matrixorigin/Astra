@@ -234,22 +234,30 @@ struct ModelExecutionAdmissionFields {
 
 impl ModelExecutionAdmissionFields {
     fn direct_execution_field(&self) -> Option<&'static str> {
-        [
-            ("runtime_bindings", self.runtime_bindings),
-            ("api_key", self.api_key),
-            ("authorization", self.authorization),
-            ("base_url", self.base_url),
-            ("provider", self.provider),
-            ("gateway", self.gateway),
-            ("gateway_id", self.gateway_id),
-            ("connection_id", self.connection_id),
-            ("execution_placement", self.execution_placement),
-            ("endpoint", self.endpoint),
-            ("endpoint_url", self.endpoint_url),
-            ("request_headers", self.request_headers),
-        ]
-        .into_iter()
-        .find_map(|(field, present)| present.then_some(field))
+        astra_turn_types::CLIENT_DIRECT_EXECUTION_FIELDS
+            .into_iter()
+            .find(|&field| self.is_field_present(field))
+    }
+
+    fn is_field_present(&self, field: &str) -> bool {
+        match field {
+            "runtime_bindings" => self.runtime_bindings,
+            "api_key" => self.api_key,
+            "authorization" => self.authorization,
+            "base_url" => self.base_url,
+            "provider" => self.provider,
+            "gateway" => self.gateway,
+            "gateway_id" => self.gateway_id,
+            "connection_id" => self.connection_id,
+            "execution_placement" => self.execution_placement,
+            "endpoint" => self.endpoint,
+            "endpoint_url" => self.endpoint_url,
+            "request_headers" => self.request_headers,
+            // Fail-closed: any field in CLIENT_DIRECT_EXECUTION_FIELDS that
+            // lacks a match arm here is treated as present, so admission
+            // rejects unknown additions rather than silently passing them.
+            _unknown => true,
+        }
     }
 }
 
@@ -557,5 +565,25 @@ mod tests {
             error.1.error_code.as_deref(),
             Some("model_execution_protocol_unsupported")
         );
+    }
+
+    #[test]
+    fn test_all_client_direct_execution_fields_have_explicit_match_arms() {
+        // Every field in CLIENT_DIRECT_EXECUTION_FIELDS MUST have an explicit
+        // match arm in is_field_present(). The fail-closed fallback
+        // (_unknown => true) returns true on an empty struct (all bools false),
+        // so we assert false for every known field. If a new field is added to
+        // the constant without a match arm, this test FAILS.
+        let fields: ModelExecutionAdmissionFields =
+            serde_json::from_str("{}").expect("empty JSON should deserialize");
+
+        for &field in astra_turn_types::CLIENT_DIRECT_EXECUTION_FIELDS.iter() {
+            assert!(
+                !fields.is_field_present(field),
+                "field '{field}' has no explicit match arm in is_field_present() — \
+                 the fail-closed fallback returned true on an empty struct. \
+                 Add an explicit match arm for this field."
+            );
+        }
     }
 }

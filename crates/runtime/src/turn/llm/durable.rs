@@ -591,6 +591,43 @@ mod tests {
         assert_eq!(owner.drop_count.load(Ordering::Acquire), 1);
     }
 
+    struct FailingTerminalSettlementOwner;
+
+    #[async_trait]
+    impl NonstreamInvocationSettlement for FailingTerminalSettlementOwner {
+        async fn settle_terminal(
+            &self,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::DatabaseError,
+                "terminal commit rejected",
+            ))
+        }
+
+        async fn settle_caller_drop(&self) -> Result<(), astra_core::ClassifiedError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_settlement_failure_is_returned_to_the_caller() {
+        let supervisor =
+            NonstreamInvocationSupervisor::start(Arc::new(FailingTerminalSettlementOwner));
+        let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+            astra_services::InferenceUsage::default(),
+            None,
+        );
+
+        let error = supervisor
+            .settle(NonstreamSettlementCommand::Terminal(terminal))
+            .await
+            .expect_err("a logical terminal commit failure must fail the call");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(error.message, "terminal commit rejected");
+    }
+
     #[test]
     fn terminal_status_distinguishes_pre_delivery_failure_from_uncertain_delivery() {
         let connect_failure = terminal_from_error(&astra_core::ClassifiedError::new(

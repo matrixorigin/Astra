@@ -898,6 +898,10 @@ export async function sendMessage(
   if (!chat) {
     return null;
   }
+  // Validate model selection before mutating chat state
+  const selectedModel = requireSelectedOfferingId(
+    payload.options?.model ?? chat.model,
+  );
   const timestamp = nowIso();
   const userMessage: ChatMessage = {
     id: crypto.randomUUID(),
@@ -919,13 +923,17 @@ export async function sendMessage(
     chat.model = payload.options.model;
   }
 
-  const backendSessionId = await ensureChatBackendSession(ownerUserId, chat.id, {
-    model: payload.options?.model ?? chat.model,
-  });
+  const backendSessionId = await ensureChatBackendSession(
+    ownerUserId,
+    chat.id,
+    {
+      model: selectedModel,
+    },
+  );
   const agentResult = await callBackendAgent({
     sessionId: backendSessionId,
     text: payload.content,
-    model: requireSelectedOfferingId(payload.options?.model ?? chat.model),
+    model: selectedModel,
     activeSkills: payload.options?.activeSkills,
     activeTools: payload.options?.activeTools,
     webSearch: payload.options?.webSearch,
@@ -2455,7 +2463,10 @@ async function callBackendAgent(params: {
       auth: "required",
       operation: "start web chat turn",
     });
-    const modelSelection = await resolveModelOfferingSelection(client, params.model);
+    const modelSelection = await resolveModelOfferingSelection(
+      client,
+      params.model,
+    );
     const activeSkills = normalizedActiveSkills(params.activeSkills);
     const activeTools = normalizedActiveTools(
       params.activeTools,
@@ -2471,14 +2482,15 @@ async function callBackendAgent(params: {
         enabledTools: activeTools,
         context: {
           source: "web_v1",
-          edge_profile: activeSkills.length || activeTools.length
-            ? {
-                ...(activeSkills.length
-                  ? { active_skills: activeSkills }
-                  : {}),
-                ...(activeTools.length ? { active_tools: activeTools } : {}),
-              }
-            : undefined,
+          edge_profile:
+            activeSkills.length || activeTools.length
+              ? {
+                  ...(activeSkills.length
+                    ? { active_skills: activeSkills }
+                    : {}),
+                  ...(activeTools.length ? { active_tools: activeTools } : {}),
+                }
+              : undefined,
         },
       },
       {

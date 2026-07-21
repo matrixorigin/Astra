@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 pub use chat_route::{ChatRouteResponse, classify_chat_route};
 pub use completions::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
-    CompletionResponse, CompletionUsage,
+    CompletionResponse, CompletionUsage, MAX_COMPLETION_OUTPUT_TOKENS,
 };
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,

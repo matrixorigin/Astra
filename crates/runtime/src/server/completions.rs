@@ -28,6 +28,39 @@ fn completion_timeout(timeout_ms: u64) -> Result<Duration, (StatusCode, Json<Err
     Ok(Duration::from_millis(timeout_ms))
 }
 
+fn completion_admission_estimated_tokens(
+    messages: &[serde_json::Value],
+    max_output_tokens: u32,
+) -> u64 {
+    crate::prompts::estimate_tokens(messages, 0, 0)
+        .saturating_add(max_output_tokens as usize)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn provider_admission_http_error(
+    error: astra_core::ClassifiedError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let (status, error_code) = match error.kind {
+        astra_core::ErrorKind::RateLimit => {
+            (StatusCode::TOO_MANY_REQUESTS, "model_provider_limited")
+        }
+        astra_core::ErrorKind::DatabaseError => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_provider_admission_unavailable",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_provider_admission_rejected",
+        ),
+    };
+    crate::error_response_coded(
+        status,
+        "LLM provider admission rejected this request",
+        error_code,
+    )
+}
+
 /// `POST /v1/chat/completions` — lightweight LLM proxy.
 ///
 /// Authenticates via bearer token, admits one effective Offering, and forwards
@@ -39,6 +72,13 @@ pub(super) async fn completions_handler(
 ) -> Result<Json<CompletionResponse>, (StatusCode, Json<ErrorResponse>)> {
     // 1. Authenticate
     let user = state.auth_service.current_user(&headers).await?;
+    request.validate().map_err(|message| {
+        crate::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_completion_request",
+        )
+    })?;
     let provider_timeout = completion_timeout(request.timeout_ms)?;
 
     // 2. Admit one Offering. Explicit selections use the same catalog boundary
@@ -101,16 +141,32 @@ pub(super) async fn completions_handler(
             "inference_ledger_unavailable",
         )
     })?;
+
+    let invocation_scope = request.invocation_scope();
+    let purpose = request.purpose();
+
+    // Use the same provider capacity policy as agent turns. This gate runs
+    // before durable admission and provider I/O, so a rejected request cannot
+    // reserve lifecycle state or consume provider capacity.
+    let mut messages = request.messages;
+    crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
+    let admission_estimated_tokens =
+        completion_admission_estimated_tokens(&messages, request.max_tokens);
+    crate::llm_provider_admission::admit_llm_provider_request(
+        Some(shared_pool),
+        &admitted.provider,
+        &admitted.model_name,
+        admission_estimated_tokens,
+    )
+    .await
+    .map_err(provider_admission_http_error)?;
+
     let durable_ledger = crate::turn::llm::durable::DurableInferenceLedger::new(
         shared_pool.clone(),
         user.user_id,
         admitted.clone(),
     );
     // 4. Execute through the same typed provider boundary as agent turns.
-    let invocation_scope = request.invocation_scope();
-    let purpose = request.purpose();
-    let mut messages = request.messages;
-    crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
     let parsed = durable_ledger
         .execute_nonstream(
@@ -151,6 +207,10 @@ pub(super) async fn completions_handler(
     let content = parsed.full_text;
     let finish_reason = parsed.finish_reason.unwrap_or_else(|| "stop".to_string());
     let usage = completion_usage(&parsed.usage);
+    crate::llm_provider_admission::record_llm_provider_admission_calibration(
+        admission_estimated_tokens,
+        &parsed.usage,
+    );
 
     Ok(Json(CompletionResponse {
         id: response_id,
@@ -471,6 +531,45 @@ mod tests {
     }
 
     #[test]
+    fn completion_admission_estimate_covers_prompt_and_server_bounded_output() {
+        let messages = vec![json!({"role": "user", "content": "classify this request"})];
+        let estimate = completion_admission_estimated_tokens(&messages, 64);
+        assert!(estimate >= 64);
+        assert!(estimate > 14_000, "shared prompt estimate must be included");
+    }
+
+    #[test]
+    fn provider_admission_rate_limit_is_visible_to_completion_clients() {
+        let error = provider_admission_http_error(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "provider capacity exhausted",
+        ));
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.1.error_code.as_deref(),
+            Some("model_provider_limited")
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_excessive_output_before_model_or_provider_work() {
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService));
+        let mut request = explicit_completion_request("offer-completion");
+        request.max_tokens = astra_server_types::MAX_COMPLETION_OUTPUT_TOKENS + 1;
+
+        let error = completions_handler(State(state), completion_headers(), Json(request))
+            .await
+            .expect_err("output budget must be rejected before model admission");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.error_code.as_deref(),
+            Some("invalid_completion_request")
+        );
+    }
+
+    #[test]
     fn completion_response_does_not_claim_zero_usage_when_provider_omits_usage() {
         let raw = serde_json::Map::new();
         assert!(completion_usage(&raw).is_none());
@@ -565,6 +664,7 @@ mod tests {
         use axum::response::IntoResponse;
         use sqlx::Row;
 
+        let _ = dotenvy::dotenv();
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),

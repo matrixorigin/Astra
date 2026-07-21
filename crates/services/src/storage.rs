@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v6";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-20-v7";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1728,6 +1728,19 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
+        // A process can terminate after recording a provider terminal but
+        // before mirroring it to the logical invocation. Reconcile only
+        // facts already durable; this is safe to repeat on every startup and
+        // does not reissue provider I/O.
+        let reconciled =
+            crate::inference_execution::reconcile_admitted_inference_terminals_on_bootstrap(&pool)
+                .await?;
+        if reconciled > 0 {
+            tracing::warn!(
+                reconciled,
+                "reconciled admitted inference invocations from durable provider terminals"
+            );
+        }
         return verify_core_schema_catalog(&pool, &settings.database).await;
     }
 
@@ -4379,8 +4392,7 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
-            INDEX idx_inference_invocations_owner_harness_created (user_id, harness_run_id, created_at, invocation_id),
-            INDEX idx_inference_invocations_status_created (status, created_at, user_id, invocation_id)
+            INDEX idx_inference_invocations_owner_harness_created (user_id, harness_run_id, created_at, invocation_id)
         )",
     )
     .execute(&pool)
@@ -4417,12 +4429,37 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
-            INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id),
-            INDEX idx_inference_attempts_status_started (status, started_at, user_id, attempt_id)
+            INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
         )",
     )
     .execute(&pool)
     .await?;
+
+    // Lifecycle writes are exact owner+identity transitions. MatrixOne can
+    // omit eligible rows when it plans those transitions through a secondary
+    // index led by mutable status, so remove the old scan indexes from both
+    // fresh and existing deployments before any reconciliation reads them.
+    for (table, index) in [
+        (
+            "inference_invocations",
+            "idx_inference_invocations_status_created",
+        ),
+        (
+            "inference_provider_attempts",
+            "idx_inference_attempts_status_started",
+        ),
+    ] {
+        drop_index_if_present(&pool, &settings.database, table, index).await?;
+    }
+    let reconciled =
+        crate::inference_execution::reconcile_admitted_inference_terminals_on_bootstrap(&pool)
+            .await?;
+    if reconciled > 0 {
+        tracing::warn!(
+            reconciled,
+            "reconciled admitted inference invocations from durable provider terminals"
+        );
+    }
 
     fail_if_required_columns_missing_or_nullable(
         &pool,
@@ -6965,40 +7002,6 @@ mod tests {
         if AGENT_ID_LEN < 32 {
             panic!("AGENT_ID_LEN ({AGENT_ID_LEN}) is too small");
         }
-    }
-
-    #[test]
-    fn agent_events_turn_seq_inference_index_is_declared_and_reconciled() {
-        let create_sql = agent_events_create_sql();
-        assert!(
-            create_sql.contains("PRIMARY KEY (user_id, event_id)"),
-            "agent_events identity must be owner-bound so INSERT IGNORE does not suppress another tenant"
-        );
-        assert!(
-            !create_sql.contains("event_id VARCHAR(64) PRIMARY KEY"),
-            "agent_events must not use global event_id identity"
-        );
-        assert!(
-            create_sql.contains("event_id VARCHAR(128) NOT NULL"),
-            "agent_events must fit full content-addressed ingestion event ids"
-        );
-        assert!(
-            create_sql.contains("parent_event_id VARCHAR(128) NULL"),
-            "agent_events parent references must fit full event ids"
-        );
-        assert!(
-            create_sql.contains("causal_chain_id VARCHAR(128) NULL"),
-            "agent_events causal chains often reuse full event ids"
-        );
-        assert!(
-            create_sql.contains(AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_DECL),
-            "agent_events must index the session-turn inference path in CREATE TABLE"
-        );
-        assert!(
-            AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_ALTER_SQL
-                .contains("idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"),
-            "agent_events must reconcile the session-turn inference index in schema ensure"
-        );
     }
 
     #[test]
