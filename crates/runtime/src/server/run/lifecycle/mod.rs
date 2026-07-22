@@ -100,7 +100,7 @@ use astra_turn_core::agent_live_event::{
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnSkillSelectionRecord,
 };
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -2350,8 +2350,6 @@ pub struct AgenticRunLifecycleService {
     hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
-    /// Tool event writer for persisting tool_call events to agent_events.
-    tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Counter of in-flight background agentic loop tasks.
@@ -2413,7 +2411,6 @@ impl AgenticRunLifecycleService {
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             hook_db_writer: None,
             observer_worker: None,
-            tool_event_writer: None,
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
@@ -2551,11 +2548,6 @@ impl AgenticRunLifecycleService {
 
     pub fn with_observer_worker(mut self, worker: Arc<dyn TurnObserverWorker>) -> Self {
         self.observer_worker = Some(worker);
-        self
-    }
-
-    pub fn with_tool_event_writer(mut self, writer: Arc<dyn TurnToolEventWriter>) -> Self {
-        self.tool_event_writer = Some(writer);
         self
     }
 
@@ -7611,7 +7603,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
-            tool_event_writer: self.tool_event_writer.clone(),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
@@ -8877,7 +8868,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
-            tool_event_writer: self.tool_event_writer.clone(),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };

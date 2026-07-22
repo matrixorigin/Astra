@@ -996,7 +996,7 @@ impl ReflectService for DatabaseReflectService {
             "SELECT \
                COUNT(*) AS total_events, \
                COUNT(DISTINCT skill_name) AS unique_skills, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_call_failed', 'stall_detected') \
                     OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
                CAST(MIN(created_at) AS CHAR) AS first_event, \
                CAST(MAX(created_at) AS CHAR) AS last_event \
@@ -1099,7 +1099,7 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                    SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
                  FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  GROUP BY skill_name, event_type \
                  ORDER BY fail_count DESC LIMIT 10",
@@ -1125,7 +1125,7 @@ impl ReflectService for DatabaseReflectService {
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, \
                    SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
                  FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
                  ORDER BY created_at DESC LIMIT 30",
             )
@@ -1656,7 +1656,7 @@ mod tests {
         fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
             self.maybe_fail(column)?;
             Ok(match column {
-                "event_type" => self.text(column, "tool_error"),
+                "event_type" => self.text(column, "tool_call_failed"),
                 "skill_name" => self.text(column, "bash"),
                 "decision_type" => self.text(column, "tool_surface"),
                 "sample_error" => self.text(column, self.sample_error),
@@ -1758,7 +1758,7 @@ mod tests {
             "event_type",
         )
         .expect("count pair decodes");
-        assert_eq!(pair, ("tool_error".to_string(), 4));
+        assert_eq!(pair, ("tool_call_failed".to_string(), 4));
 
         assert_reflect_internal_error_mentions(
             reflect_count_pair_from_row(
@@ -1817,13 +1817,13 @@ mod tests {
         let pattern =
             error_pattern_from_row(&FakeReflectAggRow::complete()).expect("pattern decodes");
         assert_eq!(pattern.skill_name, "bash");
-        assert_eq!(pattern.event_type, "tool_error");
+        assert_eq!(pattern.event_type, "tool_call_failed");
         assert_eq!(pattern.fail_count, 3);
         assert_eq!(pattern.sample_error, "permission denied");
 
         let raw = raw_error_from_row(&FakeReflectAggRow::complete()).expect("raw error decodes");
         assert_eq!(raw.skill_name, "bash");
-        assert_eq!(raw.event_type, "tool_error");
+        assert_eq!(raw.event_type, "tool_call_failed");
         assert_eq!(raw.content, "tool failed with permission denied");
 
         for column in ["skill_name", "event_type", "fail_count", "sample_error"] {
@@ -1971,7 +1971,7 @@ mod tests {
         let ov = make_overview(50, 5, vec![], 5, None);
         let patterns = vec![ErrorPattern {
             skill_name: "bash".into(),
-            event_type: "tool_error".into(),
+            event_type: "tool_call_failed".into(),
             fail_count: 5,
             sample_error: "permission denied".into(),
         }];
@@ -1984,7 +1984,7 @@ mod tests {
         // low count does not trigger
         let patterns = vec![ErrorPattern {
             skill_name: "bash".into(),
-            event_type: "tool_error".into(),
+            event_type: "tool_call_failed".into(),
             fail_count: 2,
             sample_error: "not found".into(),
         }];
@@ -2419,7 +2419,7 @@ mod tests {
                     ref_id: graph_event_ref("evt-1"),
                     layer: ObservationGraphLayer::Runtime,
                     kind: ObservationGraphNodeKind::Event,
-                    label: "tool_call".into(),
+                    label: "tool_call_started".into(),
                     summary: Some("ran bash".into()),
                     metadata: None,
                 },
@@ -2427,7 +2427,7 @@ mod tests {
                     ref_id: graph_event_ref("evt-2"),
                     layer: ObservationGraphLayer::Runtime,
                     kind: ObservationGraphNodeKind::Outcome,
-                    label: "tool_error".into(),
+                    label: "tool_call_failed".into(),
                     summary: Some("timeout".into()),
                     metadata: None,
                 },
@@ -2732,7 +2732,7 @@ mod tests {
             },
             EvidenceEvent {
                 event_id: "evt-tool".into(),
-                event_type: "tool_result".into(),
+                event_type: "tool_call_completed".into(),
                 content: "listed files".into(),
                 skill_name: Some("bash".into()),
                 parent_event_id: Some("evt-user".into()),
@@ -2764,7 +2764,7 @@ mod tests {
         let events = vec![
             EvidenceEvent {
                 event_id: "evt-call".into(),
-                event_type: "tool_call".into(),
+                event_type: "tool_call_started".into(),
                 content: "run bash".into(),
                 skill_name: Some("bash".into()),
                 parent_event_id: None,
@@ -2773,7 +2773,7 @@ mod tests {
             },
             EvidenceEvent {
                 event_id: "evt-error".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "permission denied".into(),
                 skill_name: Some("bash".into()),
                 parent_event_id: Some("evt-call".into()),
@@ -2852,7 +2852,7 @@ mod tests {
             "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_error', 'stall_detected') \
+             WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
                OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
              GROUP BY skill_name, event_type \
              ORDER BY fail_count DESC LIMIT 10",
@@ -2944,54 +2944,66 @@ mod tests {
         let cases: &[(&str, &str, K)] = &[
             (
                 "fork: Resource temporarily unavailable",
-                "tool_error",
+                "tool_call_failed",
                 K::ResourceLimit,
             ),
             (
                 "Cannot allocate memory (ENOMEM)",
-                "tool_error",
+                "tool_call_failed",
                 K::ResourceLimit,
             ),
-            ("HTTP 403: Unauthorized access", "tool_error", K::Auth),
+            ("HTTP 403: Unauthorized access", "tool_call_failed", K::Auth),
             (
                 "token expired, please re-authenticate",
-                "tool_error",
+                "tool_call_failed",
                 K::Auth,
             ),
-            ("connection refused", "tool_error", K::Network),
+            ("connection refused", "tool_call_failed", K::Network),
             (
                 "error sending request for url (x)",
-                "tool_error",
+                "tool_call_failed",
                 K::Network,
             ),
             (
                 "No such file or directory (os error 2)",
-                "tool_error",
+                "tool_call_failed",
                 K::ToolNotFound,
             ),
             (
                 "Path does not exist: /foo/bar",
-                "tool_error",
+                "tool_call_failed",
                 K::ToolNotFound,
             ),
-            ("Missing 'path' parameter", "tool_error", K::ToolInvalidArgs),
+            (
+                "Missing 'path' parameter",
+                "tool_call_failed",
+                K::ToolInvalidArgs,
+            ),
             (
                 "old_str not found in the file",
-                "tool_error",
+                "tool_call_failed",
                 K::ToolInvalidArgs,
             ),
             (
                 "SQL syntax error: column must appear in GROUP BY",
-                "tool_error",
+                "tool_call_failed",
                 K::DatabaseError,
             ),
             (
                 "sqlx: connection pool timed out",
-                "tool_error",
+                "tool_call_failed",
                 K::DatabaseError,
             ),
-            ("operation deadline exceeded", "tool_error", K::ToolTimeout),
-            ("something completely unexpected", "tool_error", K::Unknown),
+            (
+                "operation deadline exceeded",
+                "tool_call_failed",
+                K::ToolTimeout,
+            ),
+            (
+                "something completely unexpected",
+                "tool_call_failed",
+                K::Unknown,
+            ),
         ];
         for &(content, event_type, expected) in cases {
             assert_eq!(
@@ -3009,17 +3021,17 @@ mod tests {
         let errors = vec![
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
                 skill_name: "grep".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "No such file or directory".into(),
             },
         ];
@@ -3046,7 +3058,7 @@ mod tests {
     fn diagnoses_critical_for_resource_limit() {
         let errors = vec![RawError {
             skill_name: "bash".into(),
-            event_type: "tool_error".into(),
+            event_type: "tool_call_failed".into(),
             content: "fork: Resource temporarily unavailable".into(),
         }];
         let diags = build_diagnoses(&errors);
@@ -3066,7 +3078,7 @@ mod tests {
     fn diagnoses_fix_hint_contains_ulimit() {
         let errors = vec![RawError {
             skill_name: "bash".into(),
-            event_type: "tool_error".into(),
+            event_type: "tool_call_failed".into(),
             content: "fork: Resource temporarily unavailable".into(),
         }];
         let diags = build_diagnoses(&errors);
@@ -3081,7 +3093,7 @@ mod tests {
         let errors: Vec<RawError> = (0..10)
             .map(|_| RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             })
             .collect();
@@ -3101,12 +3113,12 @@ mod tests {
         let errors = vec![
             RawError {
                 skill_name: "grep".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "No such file or directory".into(),
             },
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
         ];
@@ -3136,7 +3148,7 @@ mod tests {
         let errors = vec![
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             // memory_store succeeds — no error, not in the error list
@@ -3203,7 +3215,7 @@ mod tests {
             },
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
         ];
@@ -3224,12 +3236,12 @@ mod tests {
         let errors = vec![
             RawError {
                 skill_name: "bash".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
                 skill_name: "matrixone".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 content: "SQL syntax error: column must appear in GROUP BY".into(),
             },
             RawError {
@@ -3255,7 +3267,7 @@ mod tests {
         // must still be critical (not info). Same rule as ResourceLimit.
         let errors = vec![RawError {
             skill_name: "matrixone".into(),
-            event_type: "tool_error".into(),
+            event_type: "tool_call_failed".into(),
             content: "SQL syntax error: column must appear in GROUP BY".into(),
         }];
         let diags = build_diagnoses(&errors);

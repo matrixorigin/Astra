@@ -16,7 +16,9 @@ use crate::storage::{
     bump_agent_session_event_count,
 };
 use crate::sync_outbox::{sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id};
-use astra_core::canonical_names::metadata_tool_name;
+use astra_core::canonical_names::{
+    metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
+};
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
@@ -676,18 +678,16 @@ impl EventService for DatabaseEventService {
         let agent_id = agent_id.unwrap_or_else(|| "system".to_string());
         let agent_version = agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
+        let tool_call_id = metadata_tool_call_id(metadata.as_ref());
         let meta_tool_name = metadata_tool_name(metadata.as_ref());
-        let meta_duration_ms = metadata
-            .as_ref()
-            .and_then(|v| v.get("duration_ms"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
+        let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
 
         let insert_result = match query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-              parent_event_id, causal_chain_id, `metadata`, meta_tool_name, meta_duration_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+              parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
+              meta_duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&event_id)
         .bind(&session_id)
@@ -699,6 +699,7 @@ impl EventService for DatabaseEventService {
         .bind(&primary_parent_event_id)
         .bind(&causal_chain_id)
         .bind(&metadata_str)
+        .bind(&tool_call_id)
         .bind(&meta_tool_name)
         .bind(meta_duration_ms)
         .execute(&mut *tx)
@@ -1416,7 +1417,7 @@ mod tests {
         assert!(!event_list_can_use_session_summary(&without_session));
 
         let mut with_event_type = list_filter_for_summary_fast_path();
-        with_event_type.event_type = Some("tool_call".to_string());
+        with_event_type.event_type = Some("tool_call_completed".to_string());
         assert!(!event_list_can_use_session_summary(&with_event_type));
 
         let mut with_agent = list_filter_for_summary_fast_path();
@@ -1471,7 +1472,7 @@ mod tests {
                 "event_id" => "event-1",
                 "user_id" => "user-1",
                 "session_id" => "session-1",
-                "event_type" => "tool_call",
+                "event_type" => "tool_call_completed",
                 "content" => r#"{"cmd":"pwd"}"#,
                 "metadata_json" => self.metadata_json,
                 "created_at" => "2026-06-26T12:00:00",
@@ -1521,7 +1522,7 @@ mod tests {
         assert_eq!(record.event_id, "event-1");
         assert_eq!(record.user_id, "user-1");
         assert_eq!(record.session_id, "session-1");
-        assert_eq!(record.event_type, "tool_call");
+        assert_eq!(record.event_type, "tool_call_completed");
         assert_eq!(record.content, r#"{"cmd":"pwd"}"#);
         assert_eq!(record.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(record.agent_version.as_deref(), Some("1.2.3"));
@@ -1630,7 +1631,7 @@ mod tests {
             event_id: "e1".to_string(),
             user_id: "u1".to_string(),
             session_id: "s1".to_string(),
-            event_type: "tool_call".to_string(),
+            event_type: "tool_call_completed".to_string(),
             content: "{}".to_string(),
             agent_id: Some("a1".to_string()),
             agent_version: None,
@@ -2014,7 +2015,7 @@ mod tests {
         let request: EventCreateRequest = serde_json::from_str(
             r#"{
                 "session_id":"s1",
-                "event_type":"tool_call",
+                "event_type":"tool_call_completed",
                 "content":"x",
                 "parent_event_id":"p0",
                 "parent_event_ids":["p0","p1"]
@@ -2033,7 +2034,7 @@ mod tests {
         let result = serde_json::from_str::<EventCreateRequest>(
             r#"{
                 "session_id":"s1",
-                "event_type":"tool_call",
+                "event_type":"tool_call_completed",
                 "content":"x",
                 "ignored_by_business_logic":"must not be accepted"
             }"#,

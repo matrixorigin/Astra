@@ -735,6 +735,51 @@ fn bridge_tool_result_ok(
     !transport_error && !output_semantic_error
 }
 
+fn bridge_tool_result_map_ok(
+    tool_result: &Map<String, Value>,
+    output_semantic_error: bool,
+) -> bool {
+    let status = match tool_result.get("status") {
+        None | Some(Value::Null) => "ok",
+        Some(Value::String(status)) => status,
+        Some(_) => return false,
+    };
+    let exit_semantics = tool_result
+        .get("exit_semantics")
+        .and_then(Value::as_str)
+        .and_then(parse_exit_semantics_tag);
+    let result_class = tool_result
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(parse_result_class_tag);
+    let has_explicit_error = match tool_result.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(error)) => !error.trim().is_empty(),
+        Some(_) => true,
+    };
+    !has_explicit_error
+        && bridge_tool_result_ok(status, exit_semantics, result_class, output_semantic_error)
+}
+
+fn canonical_bridge_tool_result_event_type(tool_result: &Map<String, Value>) -> &'static str {
+    let output_semantic_error = tool_result
+        .get("output")
+        .or_else(|| tool_result.get("result"))
+        .is_some_and(|output| {
+            let output = match output {
+                Value::String(output) => output.clone(),
+                Value::Null => String::new(),
+                output => output.to_string(),
+            };
+            astra_turn_core::tool_result_semantics::is_tool_error(&output)
+        });
+    if bridge_tool_result_map_ok(tool_result, output_semantic_error) {
+        "tool_call_completed"
+    } else {
+        "tool_call_failed"
+    }
+}
+
 #[cfg(test)]
 mod exit_semantics_tests {
     use super::normalize_exit_semantics_tag;
@@ -819,18 +864,6 @@ fn build_bridge_tool_call_records(
             .get(&request_id)
             .cloned()
             .unwrap_or((fallback_name, None, None));
-        let status = tool_result
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("ok");
-        let exit_semantics_value = tool_result
-            .get("exit_semantics")
-            .and_then(Value::as_str)
-            .and_then(parse_exit_semantics_tag);
-        let result_class_value = tool_result
-            .get("result_class")
-            .and_then(Value::as_str)
-            .and_then(parse_result_class_tag);
         let output = tool_result.get("output").map(|output| match output {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
@@ -888,17 +921,22 @@ fn build_bridge_tool_call_records(
         let output_semantic_error = output
             .as_deref()
             .is_some_and(astra_turn_core::tool_result_semantics::is_tool_error);
-        let ok = bridge_tool_result_ok(
-            status,
-            exit_semantics_value,
-            result_class_value,
-            output_semantic_error,
-        );
+        let ok = bridge_tool_result_map_ok(tool_result, output_semantic_error);
         let error = tool_result
             .get("error")
             .and_then(Value::as_str)
             .map(ToString::to_string)
-            .or_else(|| (!ok).then(|| output.clone().unwrap_or_else(|| status.to_string())));
+            .or_else(|| {
+                (!ok).then(|| {
+                    output.clone().unwrap_or_else(|| {
+                        tool_result
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("failed")
+                            .to_string()
+                    })
+                })
+            });
         let output_bytes = output
             .as_ref()
             .map(|output| output.len().min(u32::MAX as usize) as u32);
@@ -4314,7 +4352,7 @@ impl InProcessChatTurnBridge {
                             run_id: Some(run_id.clone()),
                             tool_call_id,
                             agent_id: agent_id.clone(),
-                            event_type: "tool_call".to_string(),
+                            event_type: "tool_call_started".to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
                                 v => serde_json::to_string(&v).unwrap_or_default(),
@@ -4350,7 +4388,7 @@ impl InProcessChatTurnBridge {
                             run_id: Some(run_id.clone()),
                             tool_call_id,
                             agent_id: agent_id.clone(),
-                            event_type: "tool_result".to_string(),
+                            event_type: canonical_bridge_tool_result_event_type(tr).to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
                                 v => serde_json::to_string(&v).unwrap_or_default(),
@@ -8572,6 +8610,58 @@ mod tests {
                 .is_some_and(|error| error.contains("unknown field `slot_id`")),
             "{records:?}"
         );
+    }
+
+    #[test]
+    fn bridge_tool_result_events_use_canonical_terminal_lifecycle_types() {
+        let cases = [
+            (
+                json!({"status": "completed", "output": "ok"}),
+                "tool_call_completed",
+            ),
+            (
+                json!({"status": "failed", "output": "boom"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": "completed", "error": "transport failed"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": "completed", "error": {"code": 500}}),
+                "tool_call_failed",
+            ),
+            (
+                json!({"status": 200, "output": "malformed status"}),
+                "tool_call_failed",
+            ),
+            (
+                json!({
+                    "status": "failed",
+                    "output": "No matches",
+                    "result_class": "empty_result"
+                }),
+                "tool_call_completed",
+            ),
+            (
+                json!({
+                    "status": "completed",
+                    "output": "exit 7",
+                    "result_class": "execution_error"
+                }),
+                "tool_call_failed",
+            ),
+        ];
+
+        for (result, expected) in cases {
+            assert_eq!(
+                canonical_bridge_tool_result_event_type(
+                    result.as_object().expect("tool result object")
+                ),
+                expected,
+                "result={result}"
+            );
+        }
     }
 
     #[test]

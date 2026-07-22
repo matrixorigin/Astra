@@ -131,6 +131,29 @@ fn extract_pricing_preserves_explicit_cache_rates() {
 }
 
 #[test]
+fn extract_pricing_rejects_invalid_nested_and_cache_rates() {
+    let nested = vec![serde_json::json!({
+        "name": "broken-nested",
+        "pricing": {"prompt": -0.000_003, "completion": 0.000_015}
+    })];
+    assert!(
+        slash_stats::extract_pricing_for_model(&nested, "broken-nested").is_none(),
+        "invalid server pricing must not enter the CLI cost accumulator"
+    );
+
+    let flat = vec![serde_json::json!({
+        "name": "broken-cache",
+        "pricing_prompt": 0.000_003,
+        "pricing_completion": 0.000_015,
+        "pricing_cache_read": -0.000_001
+    })];
+    assert!(
+        slash_stats::extract_pricing_for_model(&flat, "broken-cache").is_none(),
+        "invalid cache pricing must not be converted into a zero-cost estimate"
+    );
+}
+
+#[test]
 fn missing_cache_rates_use_input_rate_without_family_guesses() {
     let models = vec![serde_json::json!({
         "name": "us.anthropic.claude-sonnet-4-6",

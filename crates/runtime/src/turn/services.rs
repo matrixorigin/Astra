@@ -8,6 +8,25 @@ use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 
+fn validate_tool_lifecycle_event_type(event_type: &str) -> Result<(), String> {
+    if matches!(
+        event_type,
+        "tool_call_started"
+            | "tool_call_completed"
+            | "tool_call_failed"
+            | "tool_call_rejected"
+            | "tool_call_reused"
+            | "tool_call_suppressed"
+            | "tool_call_deferred"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "non-canonical tool lifecycle event type: {event_type:?}"
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnSessionActivityWriter {
     pool: Option<SharedPool>,
@@ -302,6 +321,9 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
     async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
         if plan.events.is_empty() {
             return Ok(());
+        }
+        for event in &plan.events {
+            validate_tool_lifecycle_event_type(&event.event_type)?;
         }
         let pool = self.get_pool()?;
         let skill_versions = resolve_active_skill_versions(
@@ -776,6 +798,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_event_writer_accepts_only_canonical_lifecycle_types() {
+        for event_type in [
+            "tool_call_started",
+            "tool_call_completed",
+            "tool_call_failed",
+            "tool_call_rejected",
+            "tool_call_reused",
+            "tool_call_suppressed",
+            "tool_call_deferred",
+        ] {
+            assert!(validate_tool_lifecycle_event_type(event_type).is_ok());
+        }
+        for event_type in ["tool_call", "tool_result", "tool_error", ""] {
+            assert!(validate_tool_lifecycle_event_type(event_type).is_err());
+        }
+    }
+
+    #[test]
     fn bridge_transcript_projection_excludes_runtime_envelope_but_keeps_reply() {
         let user = core_event(
             "user-event",
@@ -997,7 +1037,7 @@ mod tests {
                         &user_id,
                         &session_id,
                         &causal_chain_id,
-                        "tool_use",
+                        "tool_call_started",
                         "first duplicate",
                         Some(&core_response_event_id),
                     ),
@@ -1006,7 +1046,7 @@ mod tests {
                         &user_id,
                         &session_id,
                         &causal_chain_id,
-                        "tool_use",
+                        "tool_call_started",
                         "second duplicate",
                         Some(&core_response_event_id),
                     ),
@@ -1015,7 +1055,7 @@ mod tests {
                         &user_id,
                         &session_id,
                         &causal_chain_id,
-                        "tool_result",
+                        "tool_call_completed",
                         "unique",
                         Some(&tool_duplicate_event_id),
                     ),
@@ -1198,7 +1238,7 @@ mod tests {
                     run_id: None,
                     tool_call_id: None,
                     agent_id: None,
-                    event_type: "tool_call".into(),
+                    event_type: "tool_call_started".into(),
                     content: "x".into(),
                     parent_event_id: None,
                     parent_event_ids: vec![],

@@ -5,19 +5,14 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::{MySql, query};
 
-use astra_core::canonical_names::metadata_tool_name;
+use astra_core::canonical_names::{
+    metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
+};
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 use astra_turn_core::trace_event::TraceEvent;
-
-fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
-    metadata
-        .and_then(|v| v.get("duration_ms"))
-        .and_then(|v| v.as_i64())
-        .and_then(|v| i32::try_from(v).ok())
-}
 
 fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
     metadata
@@ -318,7 +313,7 @@ pub(crate) async fn insert_tool_turn_event(
         event
             .tool_call_id
             .clone()
-            .or_else(|| metadata_string(event.metadata.as_ref(), "tool_call_id")),
+            .or_else(|| metadata_tool_call_id(event.metadata.as_ref())),
     )
     .bind(event.metadata.as_ref().map(serde_json::Value::to_string))
     .bind(&event.skill_name)

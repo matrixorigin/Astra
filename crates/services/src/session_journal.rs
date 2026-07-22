@@ -1174,6 +1174,22 @@ impl ToolCallRecord {
         self.effective_disposition() == ToolCallDisposition::Executed
     }
 
+    /// Canonical terminal lifecycle event for this record.
+    ///
+    /// Keeping this mapping on the record prevents journal ingestion, live
+    /// trace persistence, transcripts, and audit analytics from inventing
+    /// incompatible interpretations of the same disposition.
+    pub fn canonical_terminal_event_type(&self) -> &'static str {
+        match self.effective_disposition() {
+            ToolCallDisposition::Executed if self.ok => "tool_call_completed",
+            ToolCallDisposition::Executed => "tool_call_failed",
+            ToolCallDisposition::Rejected => "tool_call_rejected",
+            ToolCallDisposition::Reused => "tool_call_reused",
+            ToolCallDisposition::Suppressed => "tool_call_suppressed",
+            ToolCallDisposition::Deferred => "tool_call_deferred",
+        }
+    }
+
     pub fn effective_disposition(&self) -> ToolCallDisposition {
         if let Some(disposition) = self.disposition {
             return disposition;
@@ -7203,8 +7219,23 @@ mod tests {
         assert_eq!(outcomes.suppressed, 1);
         assert_eq!(outcomes.deferred, 1);
         assert!(outcomes.is_consistent());
+        let calls = parsed.tool_calls.unwrap();
         assert_eq!(
-            parsed.tool_calls.unwrap()[1].error_kind,
+            calls
+                .iter()
+                .map(ToolCallRecord::canonical_terminal_event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_call_rejected",
+                "tool_call_reused",
+                "tool_call_suppressed",
+                "tool_call_deferred",
+            ]
+        );
+        assert_eq!(
+            calls[1].error_kind,
             Some(astra_core::ErrorKind::ToolInvalidArgs)
         );
     }

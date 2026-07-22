@@ -2539,6 +2539,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 FROM agent_events \
                 WHERE session_id = ? AND user_id = ? \
                   AND event_type IN ('tool_call_completed', 'tool_call_failed') \
+                  AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
                 GROUP BY tool_name \
               ) agg \
               ORDER BY agg.total_duration_ms DESC",
@@ -2554,6 +2555,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'tool_call_failed' \
+               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
              ORDER BY created_at DESC LIMIT 200",
             agent_events_content_cap::TOOL_LAST_ERROR
         );
@@ -2737,7 +2739,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) as tokens_out, \
                 COUNT(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) as total_tool_calls, \
                 COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) as total_tool_failures, \
-                COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
+                COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) as total_errors, \
                 COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) as total_stalls, \
                 COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) as total_execution_boundaries_opened, \
                 COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) as total_execution_boundaries_committed, \
@@ -2763,6 +2765,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) as ok_cnt \
              FROM agent_events e \
              WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
+               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
              GROUP BY tool_name \
              ORDER BY cnt DESC \
              LIMIT 10"
@@ -2884,6 +2887,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  COUNT(DISTINCT session_id) AS sessions_used \
                 FROM agent_events e \
                 WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
+                  AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
                 GROUP BY tool_name \
               ) agg \
               ORDER BY agg.total_calls DESC \
@@ -2901,6 +2905,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {cap}) AS content \
              FROM agent_events e \
              WHERE {where_clause} AND event_type = 'tool_call_failed' \
+               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
              ORDER BY created_at DESC",
             cap = agent_events_content_cap::TOOL_LAST_ERROR
         );

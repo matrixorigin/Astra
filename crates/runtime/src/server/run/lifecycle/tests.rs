@@ -9,7 +9,7 @@ use astra_services::runs::{
     DurableRunRecord, InMemoryRunStateStore, RunStateStore, RuntimeMcpBindingRequest,
     RuntimeSkillBindingRequest,
 };
-use astra_services::session_journal::{JournalEventType, ToolCallRecord};
+use astra_services::session_journal::{JournalEventType, ToolCallDisposition, ToolCallRecord};
 use astra_services::workspace_records::{
     InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtStore, WorkspaceCleanupDebtStoreError,
     WorkspaceRecordStore,
@@ -1600,6 +1600,76 @@ fn failed_tool_trace_event_persists_searchable_error_content() {
 
     assert_eq!(events[1].event_type, "tool_call_failed");
     assert_eq!(events[1].content.as_deref(), Some("unknown_tool: bash"));
+}
+
+#[test]
+fn unexecuted_tool_trace_events_preserve_canonical_terminal_dispositions() {
+    let trace = TraceContext {
+        session_id: "session-1".to_string(),
+        user_id: "user-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        turn_seq: 7,
+        causal_chain_id: "chain-1".to_string(),
+        root_event_id: "trace:root".to_string(),
+    };
+    let records = vec![
+        ToolCallRecord {
+            tool_call_id: Some("call-rejected".into()),
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Rejected),
+            result_class: Some(astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.into()),
+            ..Default::default()
+        },
+        ToolCallRecord {
+            tool_call_id: Some("call-reused".into()),
+            name: "read_file".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Reused),
+            result_class: Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.into()),
+            ..Default::default()
+        },
+        ToolCallRecord {
+            tool_call_id: Some("call-suppressed".into()),
+            name: "write_file".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Suppressed),
+            surgically_removed: Some(true),
+            ..Default::default()
+        },
+        ToolCallRecord {
+            tool_call_id: Some("call-deferred".into()),
+            name: "agent".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Deferred),
+            ..Default::default()
+        },
+    ];
+
+    let events =
+        build_tool_trace_events(&trace, "root-run", None, Some("root-agent"), None, &records);
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_call_started",
+            "tool_call_rejected",
+            "tool_call_started",
+            "tool_call_reused",
+            "tool_call_started",
+            "tool_call_suppressed",
+            "tool_call_started",
+            "tool_call_deferred",
+        ]
+    );
+    assert!(events.iter().all(|event| event.meta_duration_ms.is_none()));
+    assert_eq!(events[1].metadata["disposition"], "rejected");
+    assert_eq!(events[3].metadata["disposition"], "reused");
+    assert_eq!(events[5].metadata["disposition"], "suppressed");
+    assert_eq!(events[7].metadata["disposition"], "deferred");
 }
 
 #[test]

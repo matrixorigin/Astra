@@ -26,6 +26,7 @@ use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionAr
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
+pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
 const SESSION_STATE_SYNC_METADATA_MARKER: &str = "_session_state_sync";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
     SELECT number, turn, title, summary, total_tokens, contract_state_json \
@@ -811,11 +812,11 @@ impl HybridRestoreService {
             Some(pool) => pool,
             None => return Ok(None),
         };
-        let artifact = crate::session_artifact_store::load_latest_json_artifact_from_pool(
+        let artifact = crate::session_artifact_store::load_json_artifact_from_pool(
             pool,
             user_id,
             session_id,
-            COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
+            COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID,
         )
         .await
         .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
@@ -1363,7 +1364,7 @@ fn composite_snapshot_index_to_remote_artifact_record(
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
     Ok(SessionArtifactJsonRecord {
-        artifact_id: "composite-snapshot-index".to_string(),
+        artifact_id: COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID.to_string(),
         session_id: session_id.to_string(),
         user_id: user_id.to_string(),
         artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
@@ -4537,7 +4538,7 @@ mod tests {
             composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
                 .expect("serialize replayed index");
 
-        assert_eq!(first.artifact_id, "composite-snapshot-index");
+        assert_eq!(first.artifact_id, COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID);
         assert_eq!(second.artifact_id, first.artifact_id);
     }
 

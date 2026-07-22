@@ -1627,7 +1627,11 @@ mod tests {
     fn finalize_workspace_on_end_with_compact_summary() {
         use crate::session_journal;
 
-        let sid = format!("test-finalize-{}", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize";
         // Create workspace
         let ws = WorkspaceMetadata::new(&sid, "test-model");
         write_workspace(&ws).unwrap();
@@ -1651,15 +1655,15 @@ mod tests {
         let ws2 = read_workspace(&sid).unwrap();
         assert_eq!(ws2.status, "completed");
         assert_eq!(ws2.summary.as_deref(), Some("User implemented auth system"));
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]
     fn finalize_workspace_on_end_no_compact_no_summary() {
-        let sid = format!("test-finalize-empty-{}", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize-empty";
         // Create workspace with no journal events
         let ws = WorkspaceMetadata::new(&sid, "test-model");
         write_workspace(&ws).unwrap();
@@ -1672,14 +1676,15 @@ mod tests {
         let ws2 = read_workspace(&sid).unwrap();
         assert_eq!(ws2.status, "completed");
         assert!(ws2.summary.is_none());
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]
     fn finalize_workspace_on_end_ignores_invalid_workspace_without_overwriting() {
-        let sid = format!("test-finalize-invalid-{}", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let sid = "test-finalize-invalid";
         let ws = WorkspaceMetadata::new(&sid, "test-model");
         write_workspace(&ws).unwrap();
 
@@ -1692,8 +1697,6 @@ mod tests {
             std::fs::read_to_string(&workspace_path).unwrap(),
             ":\nnot-valid-yaml"
         );
-
-        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]

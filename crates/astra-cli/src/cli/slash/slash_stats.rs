@@ -494,6 +494,10 @@ pub(crate) fn cost_for_tokens(
     cache_creation_tokens: u64,
     pricing: &astra_services::models::PricingData,
 ) -> f64 {
+    debug_assert!(
+        pricing.is_valid(),
+        "CLI pricing must be validated at ingress"
+    );
     pricing
         .estimated_cost_usd(
             prompt_tokens,
@@ -535,7 +539,9 @@ pub(crate) fn extract_pricing_for_model(
             continue;
         }
         if let Some(pricing) = m.get("pricing") {
-            return serde_json::from_value(pricing.clone()).ok();
+            return serde_json::from_value(pricing.clone())
+                .ok()
+                .filter(astra_services::models::PricingData::is_valid);
         }
         // Top-level pricing_prompt / pricing_completion / pricing_cache_*
         let prompt = m
@@ -547,12 +553,13 @@ pub(crate) fn extract_pricing_for_model(
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         if prompt > 0.0 || completion > 0.0 {
-            return Some(astra_services::models::PricingData {
+            let pricing = astra_services::models::PricingData {
                 prompt,
                 completion,
                 cache_read: m.get("pricing_cache_read").and_then(|v| v.as_f64()),
                 cache_write: m.get("pricing_cache_write").and_then(|v| v.as_f64()),
-            });
+            };
+            return pricing.is_valid().then_some(pricing);
         }
         return None;
     }

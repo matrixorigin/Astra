@@ -37,6 +37,11 @@ pub struct PricingData {
 }
 
 impl PricingData {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        validate_pricing_data(self).is_ok()
+    }
+
     /// Estimate cost from token counts using the canonical USD-per-token unit.
     /// Missing cache rates fall back to the ordinary input rate; callers must
     /// not invent provider-specific discounts that are absent from metadata.

@@ -51,6 +51,27 @@ pub fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String
         .and_then(|s| normalize_optional_name(Some(s)))
 }
 
+/// Extract a normalized tool-call identity from event metadata JSON.
+///
+/// Blank identifiers are not identities and must never reach the indexed
+/// `agent_events.tool_call_id` projection.
+pub fn metadata_tool_call_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|value| value.get("tool_call_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract a database-safe millisecond duration from event metadata JSON.
+pub fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
+    metadata
+        .and_then(|value| value.get("duration_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +121,32 @@ mod tests {
         assert!(metadata_tool_name(Some(&serde_json::json!({"tool_name": "\"\""}))).is_none());
         assert!(metadata_tool_name(Some(&serde_json::json!({"tool_name": 42}))).is_none());
         assert!(metadata_tool_name(None).is_none());
+    }
+
+    #[test]
+    fn metadata_tool_call_id_trims_and_rejects_blank_values() {
+        assert_eq!(
+            metadata_tool_call_id(Some(&serde_json::json!({"tool_call_id": " call-1 "})))
+                .as_deref(),
+            Some("call-1")
+        );
+        assert!(metadata_tool_call_id(Some(&serde_json::json!({"tool_call_id": " "}))).is_none());
+        assert!(metadata_tool_call_id(Some(&serde_json::json!({"tool_call_id": 7}))).is_none());
+        assert!(metadata_tool_call_id(None).is_none());
+    }
+
+    #[test]
+    fn metadata_duration_ms_requires_non_negative_i32_milliseconds() {
+        assert_eq!(
+            metadata_duration_ms(Some(&serde_json::json!({"duration_ms": 42}))),
+            Some(42)
+        );
+        assert!(metadata_duration_ms(Some(&serde_json::json!({"duration_ms": -1}))).is_none());
+        assert!(
+            metadata_duration_ms(Some(&serde_json::json!({
+                "duration_ms": i64::from(i32::MAX) + 1
+            })))
+            .is_none()
+        );
     }
 }

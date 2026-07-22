@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{QueryBuilder, query};
+use sqlx::{QueryBuilder, query, query_scalar};
 use uuid::Uuid;
 
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
@@ -50,6 +50,26 @@ pub enum SessionArtifactStoreError {
 
     #[error("mutable artifact projections cannot carry durable references")]
     MutableProjectionReferencesUnsupported,
+
+    #[error(
+        "mutable artifact projection id must use the reserved {prefix:?} namespace: {artifact_id:?}"
+    )]
+    InvalidMutableProjectionId {
+        prefix: &'static str,
+        artifact_id: String,
+    },
+
+    #[error("immutable artifact id uses the reserved mutable projection namespace: {0:?}")]
+    ReservedMutableProjectionId(String),
+
+    #[error(
+        "mutable artifact projection {artifact_id} cannot replace artifact kind {existing_kind:?} with {requested_kind:?}"
+    )]
+    MutableProjectionIdentityConflict {
+        artifact_id: String,
+        existing_kind: String,
+        requested_kind: String,
+    },
 
     #[error("stored artifact reference kind is invalid: {0}")]
     InvalidStoredReferenceKind(String),
@@ -111,6 +131,17 @@ pub enum SessionArtifactStoreError {
 
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
 pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
+pub const MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX: &str = "projection:";
+
+fn is_mutable_artifact_projection_id(artifact_id: &str) -> bool {
+    artifact_id.starts_with(MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX)
+}
+
+fn is_valid_mutable_artifact_projection_id(artifact_id: &str) -> bool {
+    artifact_id
+        .strip_prefix(MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX)
+        .is_some_and(|name| !name.trim().is_empty())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerScopeKind {
@@ -311,8 +342,8 @@ pub trait SessionArtifactJsonStore: Send + Sync {
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
 
     /// Creates or replaces a mutable, stable-identity projection. Unlike
-    /// immutable artifacts, a projection must provide a non-empty ID and may
-    /// not carry durable references.
+    /// immutable artifacts, a projection must provide an ID in the reserved
+    /// `projection:` namespace and may not carry durable references.
     async fn upsert_json_artifact_projection(
         &self,
         record: SessionArtifactJsonRecord,
@@ -696,6 +727,42 @@ pub(crate) async fn load_latest_json_artifact_from_pool(
     row.as_ref().map(stored_artifact_from_row).transpose()
 }
 
+pub(crate) async fn load_json_artifact_from_pool(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
+    validate_session_id(session_id)?;
+    if artifact_id.trim().is_empty() {
+        return Err(SessionArtifactStoreError::InvalidArtifactId(
+            artifact_id.to_string(),
+        ));
+    }
+    let row = query(
+        "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+                content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                CAST(retention_until AS CHAR) AS retention_until, status, \
+                referenced_by_manifest_count, referenced_by_state_items_count, \
+                referenced_by_citation_count, \
+                (SELECT COUNT(*) FROM session_artifact_references refs \
+                 WHERE refs.user_id = session_artifacts.user_id \
+                   AND refs.session_id = session_artifacts.session_id \
+                   AND refs.artifact_id = session_artifacts.artifact_id) \
+                   AS referenced_by_durable_count, \
+                CAST(created_at AS CHAR) AS created_at \
+         FROM session_artifacts \
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(stored_artifact_from_row).transpose()
+}
+
 #[async_trait]
 impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     async fn persist_json_artifact(
@@ -705,6 +772,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         validate_session_id(&record.session_id)?;
         if record.artifact_id.trim().is_empty() {
             record.artifact_id = Uuid::now_v7().to_string();
+        } else if is_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::ReservedMutableProjectionId(
+                record.artifact_id,
+            ));
         }
         validate_artifact_references(&record.references)?;
 
@@ -793,6 +864,12 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                 record.artifact_id,
             ));
         }
+        if !is_valid_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::InvalidMutableProjectionId {
+                prefix: MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX,
+                artifact_id: record.artifact_id,
+            });
+        }
         if !record.references.is_empty() {
             return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
         }
@@ -802,32 +879,92 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .await?;
         let content_json = serde_json::to_string(&record.content)?;
         let metadata_json = record.metadata.as_ref().map(serde_json::Value::to_string);
+        let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
+        let round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
+        let mut tx = pool.begin().await?;
+        // Claim the composite identity before inspecting it. The duplicate-key
+        // branch is deliberately a no-op: concurrent first writers must not be
+        // able to mutate content until the stored kind and reference state have
+        // been validated under the row lock.
         query(
             "INSERT INTO session_artifacts \
-             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at, updated_at) \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+              content_json, metadata, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
-             ON DUPLICATE KEY UPDATE artifact_kind = VALUES(artifact_kind), \
-               source = VALUES(source), turn = VALUES(turn), round = VALUES(round), \
-               content_json = VALUES(content_json), metadata = VALUES(metadata), \
-               status = 'active', updated_at = CURRENT_TIMESTAMP(6)",
+             ON DUPLICATE KEY UPDATE artifact_id = VALUES(artifact_id)",
         )
         .bind(&record.artifact_id)
         .bind(&record.session_id)
         .bind(&record.user_id)
         .bind(&record.artifact_kind)
         .bind(record.source.as_deref())
-        .bind(encode_counter(
-            record.turn,
-            SessionArtifactStoreError::TurnOverflow,
-        )?)
-        .bind(encode_counter(
-            record.round,
-            SessionArtifactStoreError::RoundOverflow,
-        )?)
+        .bind(turn)
+        .bind(round)
+        .bind(&content_json)
+        .bind(&metadata_json)
+        .execute(&mut *tx)
+        .await?;
+
+        let existing = query(
+            "SELECT artifact_kind, referenced_by_manifest_count, \
+                    referenced_by_state_items_count, referenced_by_citation_count \
+             FROM session_artifacts \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_kind = existing.string_column("artifact_kind")?;
+        if existing_kind != record.artifact_kind {
+            return Err(
+                SessionArtifactStoreError::MutableProjectionIdentityConflict {
+                    artifact_id: record.artifact_id,
+                    existing_kind,
+                    requested_kind: record.artifact_kind,
+                },
+            );
+        }
+        let counter_references = [
+            "referenced_by_manifest_count",
+            "referenced_by_state_items_count",
+            "referenced_by_citation_count",
+        ]
+        .into_iter()
+        .try_fold(0_i64, |total, column| {
+            existing.i64_column(column).map(|value| total + value)
+        })?;
+        let durable_references: i64 = query_scalar(
+            "SELECT COUNT(*) FROM session_artifact_references \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if counter_references != 0 || durable_references != 0 {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+
+        query(
+            "UPDATE session_artifacts \
+             SET source = ?, turn = ?, round = ?, content_json = ?, metadata = ?, \
+                 status = 'active', updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(record.source.as_deref())
+        .bind(turn)
+        .bind(round)
         .bind(content_json)
         .bind(metadata_json)
-        .execute(&pool)
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
             .await?
@@ -850,6 +987,9 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             return Err(SessionArtifactStoreError::InvalidArtifactId(
                 artifact_id.to_string(),
             ));
+        }
+        if is_mutable_artifact_projection_id(artifact_id) {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
         }
         validate_artifact_references(std::slice::from_ref(reference))?;
 
@@ -1039,35 +1179,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         session_id: &str,
         artifact_id: &str,
     ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
-        validate_session_id(session_id)?;
-        if artifact_id.trim().is_empty() {
-            return Err(SessionArtifactStoreError::InvalidArtifactId(
-                artifact_id.to_string(),
-            ));
-        }
         let pool = self.get_pool().await?;
-        let row = query(
-            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
-                    CAST(retention_until AS CHAR) AS retention_until, status, \
-                    referenced_by_manifest_count, referenced_by_state_items_count, \
-                    referenced_by_citation_count, \
-                    (SELECT COUNT(*) FROM session_artifact_references refs \
-                     WHERE refs.user_id = session_artifacts.user_id \
-                       AND refs.session_id = session_artifacts.session_id \
-                       AND refs.artifact_id = session_artifacts.artifact_id) \
-                       AS referenced_by_durable_count, \
-                    CAST(created_at AS CHAR) AS created_at \
-             FROM session_artifacts \
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_id)
-        .fetch_optional(&pool)
-        .await?;
-
-        row.as_ref().map(stored_artifact_from_row).transpose()
+        load_json_artifact_from_pool(&pool, user_id, session_id, artifact_id).await
     }
 
     async fn load_latest_json_artifact(
@@ -1477,6 +1590,91 @@ mod tests {
         assert_eq!(value["artifact_kind"], "llm_capture");
         assert_eq!(value["source"], "server_loop_host");
         assert_eq!(value["metadata"]["model"], "gpt-5.4");
+    }
+
+    fn projection_record(artifact_id: &str) -> SessionArtifactJsonRecord {
+        SessionArtifactJsonRecord {
+            artifact_id: artifact_id.to_string(),
+            session_id: "sess-123".into(),
+            user_id: "user-1".into(),
+            artifact_kind: "projection_test".into(),
+            source: Some("test".into()),
+            turn: None,
+            round: None,
+            content: serde_json::json!({"version": 1}),
+            metadata: None,
+            references: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mutable_projection_namespace_cannot_be_used_as_an_immutable_artifact() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let error = store
+            .persist_json_artifact(projection_record("projection:test"))
+            .await
+            .expect_err("immutable writes must not claim projection identities");
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::ReservedMutableProjectionId(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutable_projection_requires_reserved_identity_and_rejects_references() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let error = store
+            .upsert_json_artifact_projection(projection_record("ordinary-id"))
+            .await
+            .expect_err("projection identity must be explicit before database access");
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::InvalidMutableProjectionId { .. }
+        ));
+
+        let error = store
+            .upsert_json_artifact_projection(projection_record("projection:  "))
+            .await
+            .expect_err("projection identity must name a concrete projection");
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::InvalidMutableProjectionId { .. }
+        ));
+
+        let mut referenced = projection_record("projection:test");
+        referenced.references.push(SessionArtifactReference {
+            kind: SessionArtifactReferenceKind::Manifest,
+            reference_id: "manifest-1".into(),
+        });
+        let error = store
+            .upsert_json_artifact_projection(referenced)
+            .await
+            .expect_err("mutable projections cannot arrive with durable references");
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::MutableProjectionReferencesUnsupported
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutable_projection_cannot_acquire_a_reference_after_creation() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let error = store
+            .retain_json_artifact_reference(
+                "user-1",
+                "sess-123",
+                "projection:test",
+                &SessionArtifactReference {
+                    kind: SessionArtifactReferenceKind::Manifest,
+                    reference_id: "manifest-1".into(),
+                },
+            )
+            .await
+            .expect_err("projection retain must fail before database access");
+        assert!(matches!(
+            error,
+            SessionArtifactStoreError::MutableProjectionReferencesUnsupported
+        ));
     }
 
     #[test]

@@ -261,7 +261,7 @@ mod tests {
             run_id: Some("r1".into()),
             tool_call_id: Some("call-1".into()),
             agent_id: Some("custom-agent".into()),
-            event_type: "tool_call".into(),
+            event_type: "tool_call_started".into(),
             content: "{}".into(),
             parent_event_id: None,
             parent_event_ids: Vec::new(),

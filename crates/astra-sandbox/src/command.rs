@@ -615,6 +615,12 @@ fn is_workspace_out_path(path: &str, workspace_root: Option<&Path>) -> bool {
     if matches!(path, "/dev/null" | "/dev/zero" | "/dev/full") {
         return false;
     }
+    // A static pre-execution check cannot prove where shell expansions point.
+    // Treat unresolved home, parameter, and command substitutions as external
+    // writes instead of resolving them against the workspace as literal text.
+    if path.starts_with('~') || path.contains('$') || path.contains('`') {
+        return true;
+    }
     let candidate = Path::new(path);
     let Some(workspace_root) = workspace_root else {
         return path.starts_with("../") || path.starts_with("..\\") || candidate.is_absolute();
@@ -1021,6 +1027,28 @@ mod tests {
                 .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(path) if path == &escaped_display)),
             "symlinks must not turn an external write into a workspace-local write: {risks:?}"
         );
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_dynamic_write_targets_it_cannot_prove() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        for command in [
+            "touch \"$HOME/outside.txt\"",
+            "mkdir -p ~/outside-dir",
+            "printf no > \"$(pwd)/dynamic.txt\"",
+            "tee `$SHELL -c 'printf /tmp/out'`",
+        ] {
+            let risks = analyze_command_risks_in_workspace(command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "dynamic target must fail closed: {command}: {risks:?}"
+            );
+        }
     }
 
     #[test]

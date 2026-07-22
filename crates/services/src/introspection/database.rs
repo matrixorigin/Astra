@@ -590,7 +590,10 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
                 "ask_user_submitted" | "ask_user_cancelled" | "ask_user_timeout" | "ask_user_error"
             )
         } else {
-            matches!(row.event_type.as_str(), "tool_call" | "tool_error")
+            matches!(
+                row.event_type.as_str(),
+                "tool_call_completed" | "tool_call_failed"
+            )
         };
         if !counts_as_interaction {
             continue;
@@ -1293,8 +1296,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let agg = query(
             "SELECT \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_total_calls, \
-               CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_fail_count, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_total_calls, \
+               CAST(COALESCE(SUM(CASE WHEN event_type = 'tool_call_failed' THEN 1 ELSE 0 END), 0) AS SIGNED) AS tool_fail_count, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS ask_user_total_calls, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS SIGNED) AS ask_user_fail_count \
               FROM agent_events \
@@ -1350,7 +1353,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                  FROM agent_events \
                  WHERE user_id = ? \
                    AND (skill_name = ? OR meta_tool_name = ?) \
-                   AND event_type = 'tool_error' \
+                   AND event_type = 'tool_call_failed' \
                    AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
                  ORDER BY created_at DESC LIMIT 10",
             )
@@ -1398,7 +1401,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                      FROM agent_events \
                      WHERE user_id = ? \
                        AND (skill_name = ? OR meta_tool_name = ?) \
-                       AND event_type IN ('tool_call', 'tool_error') \
+                       AND event_type IN ('tool_call_completed', 'tool_call_failed') \
                        AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
                      ORDER BY created_at DESC LIMIT ?",
                 )
@@ -2853,12 +2856,12 @@ mod tests {
 
     #[test]
     fn summarize_contents_valid_events() {
-        let events = r#"[{"event_type":"user_query"},{"event_type":"tool_call"},{"event_type":"user_query"}]"#;
+        let events = r#"[{"event_type":"user_query"},{"event_type":"tool_call_completed"},{"event_type":"user_query"}]"#;
         let result = summarize_contents(Some(events), None, None, None);
         assert_eq!(result["events"]["total"], 3);
         let by_type = result["events"]["by_type"].as_object().unwrap();
         assert_eq!(by_type["user_query"], 2);
-        assert_eq!(by_type["tool_call"], 1);
+        assert_eq!(by_type["tool_call_completed"], 1);
     }
 
     #[test]
@@ -2980,7 +2983,7 @@ mod tests {
         let rows = vec![
             AskUserHistoryRow {
                 session_id: "s1".into(),
-                event_type: "tool_call".into(),
+                event_type: "tool_call_completed".into(),
                 created_at: "2026-01-01T00:00:00".into(),
                 metadata: serde_json::json!({
                     "ask_user": {
@@ -3001,7 +3004,7 @@ mod tests {
             },
             AskUserHistoryRow {
                 session_id: "s2".into(),
-                event_type: "tool_error".into(),
+                event_type: "tool_call_failed".into(),
                 created_at: "2026-01-02T00:00:00".into(),
                 metadata: serde_json::json!({
                     "ask_user": {
@@ -3073,7 +3076,7 @@ mod tests {
             },
             AskUserHistoryRow {
                 session_id: "s1".into(),
-                event_type: "tool_call".into(),
+                event_type: "tool_call_completed".into(),
                 created_at: "2026-01-01T00:00:02".into(),
                 metadata: serde_json::json!({
                     "ask_user": {

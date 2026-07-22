@@ -10835,8 +10835,8 @@ mod tests {
         )
     }
 
-    fn read_journal_events(session_id: &str) -> Vec<Value> {
-        let path = astra_services::session_journal::JournalWriter::new(session_id)
+    fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
+        let path = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
             .expect("journal writer")
             .path()
             .clone();
@@ -12131,8 +12131,9 @@ mod tests {
             .await
             .expect("mock turn");
 
+        let owner = astra_services::OwnerScope::user("user-capture").expect("capture owner");
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
+            .session_dir_for_owner(&owner, session_id)
             .expect("session dir");
         let files: Vec<_> = std::fs::read_dir(session_dir)
             .expect("capture dir")
@@ -12577,12 +12578,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {
@@ -12719,12 +12723,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {
@@ -12810,12 +12817,15 @@ mod tests {
             .as_mut()
             .expect("turn event buffer")
             .flush(
-                &astra_services::session_journal::JournalWriter::new(session_id)
-                    .expect("journal writer"),
+                &astra_services::session_journal::JournalWriter::for_user(
+                    "user-journal",
+                    session_id,
+                )
+                .expect("journal writer"),
             )
             .expect("flush journal");
 
-        let journal = read_journal_events(session_id);
+        let journal = read_journal_events("user-journal", session_id);
         let llm_events: Vec<_> = journal
             .iter()
             .filter(|event| {

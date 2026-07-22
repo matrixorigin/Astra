@@ -27,29 +27,43 @@ pub fn build_tool_result_event_payload(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let tool_call_id = tool_result
+        .get("tool_call_id")
+        .or_else(|| tool_result.get("request_id"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut metadata = Map::from_iter([
         ("source".to_string(), Value::from(source)),
-        (
-            "tool_call_id".to_string(),
-            tool_result
-                .get("tool_call_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-        ),
+        ("tool_call_id".to_string(), tool_call_id),
         ("name".to_string(), Value::from(skill_name.clone())),
         ("tool_name".to_string(), Value::from(skill_name.clone())),
     ]);
+    for key in [
+        "status",
+        "duration_ms",
+        "error",
+        "exit_semantics",
+        "result_class",
+    ] {
+        if let Some(value) = tool_result.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
     if source == "edge" && skill_name == "get_agent_info" {
         metadata.insert("introspection".to_string(), Value::Bool(true));
     }
-    let result = tool_result
+    let result = match tool_result
         .get("result")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+        .or_else(|| tool_result.get("output"))
+    {
+        Some(Value::String(result)) => result.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(result) => result.to_string(),
+    };
     PersistEventPayload {
         content: json!({
             "name": skill_name,
-            "result": truncate_chars(result, audit_chars),
+            "result": truncate_chars(&result, audit_chars),
         }),
         metadata,
         skill_name,
@@ -254,6 +268,27 @@ mod tests {
         let tr = Map::from_iter([("tool_call_id".to_string(), json!("tc_123"))]);
         let p = build_tool_result_event_payload(&tr, "edge", 100);
         assert_eq!(p.metadata["tool_call_id"].as_str().unwrap(), "tc_123");
+    }
+
+    #[test]
+    fn tool_result_bridge_shape_projects_identity_output_and_lifecycle_metadata() {
+        let tr = Map::from_iter([
+            ("request_id".to_string(), json!("call-bridge-1")),
+            ("name".to_string(), json!("bash")),
+            ("status".to_string(), json!("failed")),
+            ("output".to_string(), json!("exit 7")),
+            ("duration_ms".to_string(), json!(42)),
+            ("result_class".to_string(), json!("execution_error")),
+        ]);
+
+        let payload = build_tool_result_event_payload(&tr, "edge", 100);
+
+        assert_eq!(payload.metadata["tool_call_id"], "call-bridge-1");
+        assert_eq!(payload.metadata["tool_name"], "bash");
+        assert_eq!(payload.metadata["status"], "failed");
+        assert_eq!(payload.metadata["duration_ms"], 42);
+        assert_eq!(payload.metadata["result_class"], "execution_error");
+        assert_eq!(payload.content["result"], "exit 7");
     }
 
     // --- build_tool_call_event_payload ---

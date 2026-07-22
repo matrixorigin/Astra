@@ -881,7 +881,7 @@ mod tests {
     fn lineage_node_serialization_roundtrip() {
         let node = LineageNode {
             event_id: "e1".into(),
-            event_type: "tool_call".into(),
+            event_type: "tool_call_completed".into(),
             content: "hello".into(),
             parent_event_id: Some("e0".into()),
             parent_event_ids: vec!["e0".into(), "e2".into()],
