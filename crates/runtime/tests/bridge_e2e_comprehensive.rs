@@ -28,7 +28,9 @@ use astra_runtime::{
     TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter,
     build_app, turn::bridge::inprocess::InProcessChatTurnBridge,
 };
-use astra_services::session_journal::{JournalEventType, journal_file_path, read_journal};
+use astra_services::session_journal::{
+    JournalEventType, journal_file_path_for_user, read_journal_for_user,
+};
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -613,19 +615,35 @@ fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+fn completed_tool_result(request_id: impl Into<String>, output: impl Into<String>) -> Value {
+    json!({
+        "request_id": request_id.into(),
+        "status": "completed",
+        "output": output.into(),
+    })
+}
+
+fn failed_tool_result(request_id: impl Into<String>, output: impl Into<String>) -> Value {
+    json!({
+        "request_id": request_id.into(),
+        "status": "failed",
+        "output": output.into(),
+    })
+}
+
 async fn wait_for_journal_event_type(
     session_id: &str,
     event_type: JournalEventType,
 ) -> Vec<astra_services::session_journal::JournalEvent> {
     for _ in 0..100 {
-        if let Ok(events) = read_journal(session_id)
+        if let Ok(events) = read_journal_for_user(USER_ID, session_id)
             && events.iter().any(|event| event.event_type == event_type)
         {
             return events;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    read_journal(session_id).unwrap_or_default()
+    read_journal_for_user(USER_ID, session_id).unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -777,7 +795,8 @@ async fn bridge_turn_persists_llm_round_journal_event() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap);
     let session_id = format!("bridge-llm-round-{}", uuid::Uuid::new_v4());
-    let journal_path = journal_file_path(&session_id);
+    let journal_path = journal_file_path_for_user(USER_ID, &session_id)
+        .expect("authenticated journal path must be valid");
     let _ = std::fs::remove_file(&journal_path);
 
     let payload = json!({
@@ -900,7 +919,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
                     { "role": "tool", "tool_call_id": "tc-cont", "content": "file data" }
                 ],
                 "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("glob")],
-                "tool_results": [{ "tool_call_id": "tc-cont", "content": "file data" }],
+                "tool_results": [completed_tool_result("tc-cont", "file data")],
                 "explain": true,
                 "test_llm_rounds": [{ "full_text": "Done." }]
             }),
@@ -1116,7 +1135,7 @@ async fn no_duplicate_event_ids_in_core_persist() {
             { "role": "tool", "tool_call_id": "tc-d1", "content": "file contents" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-d1", "content": "file contents" }],
+        "tool_results": [completed_tool_result("tc-d1", "file contents")],
         "test_llm_rounds": [{
             "full_text": "Here is the answer."
         }]
@@ -1170,7 +1189,7 @@ async fn continuation_call_skips_user_query_persist() {
             { "role": "tool", "tool_call_id": "tc-cont", "content": "file data" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-cont", "content": "file data" }],
+        "tool_results": [completed_tool_result("tc-cont", "file data")],
         "test_llm_rounds": [{
             "full_text": "Done."
         }]
@@ -1234,7 +1253,7 @@ async fn multi_turn_session_accumulates_state() {
             { "role": "tool", "tool_call_id": "tc-mt1", "content": "fn main() {}" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-mt1", "content": "fn main() {}" }],
+        "tool_results": [completed_tool_result("tc-mt1", "fn main() {}")],
         "test_llm_rounds": [{
             "full_text": "The main function is empty.",
             "usage": { "prompt_tokens": 150, "completion_tokens": 20 }
@@ -1550,7 +1569,7 @@ async fn single_tool_round_full_roundtrip() {
             { "role": "tool", "tool_call_id": "tc-rt1", "content": "port = 8080\nhost = localhost" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-rt1", "content": "port = 8080\nhost = localhost" }],
+        "tool_results": [completed_tool_result("tc-rt1", "port = 8080\nhost = localhost")],
         "test_llm_rounds": [{
             "full_text": "The config has port 8080 and host localhost.",
             "usage": { "prompt_tokens": 200, "completion_tokens": 25 }
@@ -1680,7 +1699,7 @@ async fn error_on_continuation_emits_clean_error_event() {
             { "role": "tool", "tool_call_id": "tc-er1", "content": "file data" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-er1", "content": "file data" }],
+        "tool_results": [completed_tool_result("tc-er1", "file data")],
         "test_llm_rounds": []
     });
 
@@ -1796,9 +1815,9 @@ async fn many_sequential_tool_rounds_no_state_corruption() {
             "session_id": &session_id,
             "messages": messages.clone(),
             "edge_tools": [tool_schema("read_file"), tool_schema("write_file")],
-            "tool_results": [{ "tool_call_id": messages.iter().rev()
+            "tool_results": [completed_tool_result(messages.iter().rev()
                 .find_map(|m| m.get("tool_call_id").and_then(Value::as_str))
-                .unwrap_or("tc-mr1"), "content": "ok" }],
+                .unwrap_or("tc-mr1"), "ok")],
             "test_llm_rounds": [{
                 "tool_calls": [tool_call(tc_id, tool_name, args.clone())]
             }]
@@ -1827,7 +1846,7 @@ async fn many_sequential_tool_rounds_no_state_corruption() {
         "session_id": &session_id,
         "messages": messages,
         "edge_tools": [tool_schema("read_file"), tool_schema("write_file")],
-        "tool_results": [{ "tool_call_id": "tc-mr4", "content": "ok" }],
+        "tool_results": [completed_tool_result("tc-mr4", "ok")],
         "test_llm_rounds": [{
             "full_text": "Refactoring complete. Updated main.rs and lib.rs.",
             "usage": { "prompt_tokens": 500, "completion_tokens": 30 }
@@ -2125,7 +2144,7 @@ async fn usage_tracking_across_multi_turn_independent() {
             { "role": "tool", "tool_call_id": "tc-u1", "content": "file contents here" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-u1", "content": "file contents here" }],
+        "tool_results": [completed_tool_result("tc-u1", "file contents here")],
         "test_llm_rounds": [{
             "full_text": "Here is what I found.",
             "usage": { "prompt_tokens": 250, "completion_tokens": 15 }
@@ -2465,7 +2484,7 @@ async fn auxiliary_events_per_turn_in_multi_turn() {
             { "role": "tool", "tool_call_id": "tc-aux1", "content": "data" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-aux1", "content": "data" }],
+        "tool_results": [completed_tool_result("tc-aux1", "data")],
         "test_llm_rounds": [{
             "full_text": "All done."
         }]
@@ -2657,7 +2676,7 @@ async fn session_activity_last_event_id_for_continuation_turn() {
             { "role": "tool", "tool_call_id": "tc-ac1", "content": "result" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-ac1", "content": "result" }],
+        "tool_results": [completed_tool_result("tc-ac1", "result")],
         "test_llm_rounds": [{
             "full_text": "Continuation complete.",
         }]
@@ -2846,7 +2865,7 @@ async fn edge_tool_result_error_content_flows_through() {
             { "role": "tool", "tool_call_id": "tc-terr", "content": "ERROR: file not found: /nonexistent" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-terr", "content": "ERROR: file not found: /nonexistent" }],
+        "tool_results": [failed_tool_result("tc-terr", "ERROR: file not found: /nonexistent")],
         "test_llm_rounds": [{
             "full_text": "The file was not found."
         }]
@@ -2975,7 +2994,7 @@ async fn multi_turn_text_tool_text_alternating_pattern() {
             { "role": "tool", "tool_call_id": "tc-alt1", "content": "file contents here" },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-alt1", "content": "file contents here" }],
+        "tool_results": [completed_tool_result("tc-alt1", "file contents here")],
         "test_llm_rounds": [{ "full_text": "The file contains data." }]
     });
 
@@ -3563,9 +3582,9 @@ async fn continuation_with_three_tool_results_all_persisted() {
         ],
         "edge_tools": [tool_schema("read_file")],
         "tool_results": [
-            { "tool_call_id": "tc-c3a", "content": "aaa" },
-            { "tool_call_id": "tc-c3b", "content": "bbb" },
-            { "tool_call_id": "tc-c3c", "content": "ccc" },
+            completed_tool_result("tc-c3a", "aaa"),
+            completed_tool_result("tc-c3b", "bbb"),
+            completed_tool_result("tc-c3c", "ccc"),
         ],
         "test_llm_rounds": [{ "full_text": "Read all three." }]
     });
@@ -4407,7 +4426,7 @@ async fn session_multi_turn_causal_chain_propagation() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-mt1", "read_file", json!({"path": "a.txt"}))] },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-mt1", "content": "file contents" }],
+        "tool_results": [completed_tool_result("tc-mt1", "file contents")],
         "test_llm_rounds": [{ "full_text": "Final answer." }]
     });
     let (st2, _) = chat_turn(&app, payload2).await;
@@ -4478,7 +4497,7 @@ async fn session_fork_trace_user_query_event_id() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-fork1", "read_file", json!({"path": "a.txt"}))] },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-fork1", "content": "data" }],
+        "tool_results": [completed_tool_result("tc-fork1", "data")],
         "test_llm_rounds": [{ "full_text": "Done." }]
     });
     let (st2, _) = chat_turn(&app, p2).await;
@@ -4792,10 +4811,10 @@ async fn batch_five_tools_all_persisted() {
     assert!(!tools.is_empty());
     let tool_events = &tools[0].events;
 
-    // All 5 tool calls persisted
+    // Every invocation has one canonical start event.
     let call_events: Vec<_> = tool_events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
     assert_eq!(call_events.len(), 5, "all 5 tool calls should be persisted");
 
@@ -4842,9 +4861,9 @@ async fn batch_tool_round_trip_with_results() {
         "messages": [{ "role": "user", "content": "batch round trip" }],
         "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("list_dir")],
         "tool_results": [
-            { "tool_call_id": "tc-rt1", "content": "file: a.txt content" },
-            { "tool_call_id": "tc-rt2", "content": "grep: 3 matches" },
-            { "tool_call_id": "tc-rt3", "content": "list_dir: [a.txt, b.txt]" }
+            { "request_id": "tc-rt1", "status": "completed", "output": "file: a.txt content" },
+            { "request_id": "tc-rt2", "status": "completed", "output": "grep: 3 matches" },
+            { "request_id": "tc-rt3", "status": "completed", "output": "list_dir: [a.txt, b.txt]" }
         ],
         "test_llm_rounds": [{ "full_text": "Based on the 3 results, here's my answer." }]
     });
@@ -4862,12 +4881,16 @@ async fn batch_tool_round_trip_with_results() {
 
     cap.drain_persist_tasks().await;
 
-    // Verify tool results are persisted in turn 2
+    // Successful tool results are persisted as canonical terminal events.
     let tools = cap.tool_plans.lock().await;
-    // Turn 2 tool plan should contain tool_result events
+    // Turn 2 tool plan should contain completed events.
     let turn2_plans: Vec<_> = tools
         .iter()
-        .filter(|p| p.events.iter().any(|e| e.event_type == "tool_result"))
+        .filter(|p| {
+            p.events
+                .iter()
+                .any(|e| e.event_type == "tool_call_completed")
+        })
         .collect();
     assert!(
         !turn2_plans.is_empty(),
@@ -4876,7 +4899,7 @@ async fn batch_tool_round_trip_with_results() {
     let results: Vec<_> = turn2_plans[0]
         .events
         .iter()
-        .filter(|e| e.event_type == "tool_result")
+        .filter(|e| e.event_type == "tool_call_completed")
         .collect();
     assert_eq!(results.len(), 3, "3 tool results persisted");
 }
@@ -4923,7 +4946,7 @@ async fn batch_mixed_tool_argument_types() {
     let calls: Vec<_> = tools[0]
         .events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
     assert_eq!(calls.len(), 2, "2 tool calls with different arg structures");
 }
@@ -4970,7 +4993,7 @@ async fn batch_ten_tools_stress() {
     let calls: Vec<_> = tools[0]
         .events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
     assert_eq!(calls.len(), 10, "all 10 tool calls persisted");
 
@@ -5772,9 +5795,12 @@ async fn gap_tool_call_missing_id_gets_uuid() {
     let tool_events = &plans[0].events;
     let tool_call_events: Vec<_> = tool_events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
-    assert!(!tool_call_events.is_empty(), "at least one tool_call event");
+    assert!(
+        !tool_call_events.is_empty(),
+        "at least one tool_call_started event"
+    );
 
     let content: Value = serde_json::from_str(&tool_call_events[0].content).unwrap_or_default();
     let assigned_id = content
@@ -5825,9 +5851,13 @@ async fn gap_tool_call_mixed_ids_selective_assignment() {
     let tool_call_events: Vec<_> = plans[0]
         .events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
-    assert_eq!(tool_call_events.len(), 2, "two tool_call events persisted");
+    assert_eq!(
+        tool_call_events.len(),
+        2,
+        "two tool_call_started events persisted"
+    );
 
     // Extract tool_call_ids from persisted content
     let content0: Value = serde_json::from_str(&tool_call_events[0].content).unwrap_or_default();
@@ -5878,7 +5908,7 @@ async fn gap_tool_result_large_content_handled() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-big1", "read_file", json!({"path": "huge"}))] }
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-big1", "content": big_result }],
+        "tool_results": [completed_tool_result("tc-big1", big_result)],
         "test_llm_rounds": [{ "full_text": "Processed the big file." }]
     });
     let (st2, _) = chat_turn(&app, p2).await;
@@ -5919,11 +5949,7 @@ async fn gap_tool_result_error_status_persisted() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-err1", "read_file", json!({"path": "missing"}))] }
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{
-            "tool_call_id": "tc-err1",
-            "content": "Error: file not found",
-            "is_error": true
-        }],
+        "tool_results": [failed_tool_result("tc-err1", "Error: file not found")],
         "test_llm_rounds": [{ "full_text": "File not found, let me try another." }]
     });
     let (st2, raw2) = chat_turn(&app, p2).await;
@@ -6058,7 +6084,7 @@ async fn gap_three_continuation_rounds_all_persisted() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-r1", "read_file", json!({"path": "a"}))] }
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-r1", "content": "file a" }],
+        "tool_results": [completed_tool_result("tc-r1", "file a")],
         "test_llm_rounds": [{
             "tool_calls": [tool_call("tc-r2", "read_file", json!({"path": "b"}))]
         }]
@@ -6074,7 +6100,7 @@ async fn gap_three_continuation_rounds_all_persisted() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-r2", "read_file", json!({"path": "b"}))] }
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-r2", "content": "file b" }],
+        "tool_results": [completed_tool_result("tc-r2", "file b")],
         "test_llm_rounds": [{ "full_text": "All done with 3 rounds." }]
     });
     let (st3, _) = chat_turn(&app, p3).await;
@@ -6250,7 +6276,7 @@ async fn deep_causal_chain_refreshes_on_new_user_query() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-dc1", "read_file", json!({"path": "a"}))] },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-dc1", "content": "file data" }],
+        "tool_results": [completed_tool_result("tc-dc1", "file data")],
         "test_llm_rounds": [{ "full_text": "answer to first" }]
     });
     let (st2, _) = chat_turn(&app, p2).await;
@@ -6347,8 +6373,8 @@ async fn deep_parent_linkage_continuation_tool_results() {
         ],
         "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
         "tool_results": [
-            { "tool_call_id": "tc-dp1", "content": "contents of a" },
-            { "tool_call_id": "tc-dp2", "content": "grep results" },
+            completed_tool_result("tc-dp1", "contents of a"),
+            completed_tool_result("tc-dp2", "grep results"),
         ],
         "test_llm_rounds": [{ "full_text": "here is the summary" }]
     });
@@ -6374,7 +6400,7 @@ async fn deep_parent_linkage_continuation_tool_results() {
         .as_str();
     let turn1_tool_events = &tools[0].events;
     for ev in turn1_tool_events {
-        assert_eq!(ev.event_type, "tool_call");
+        assert_eq!(ev.event_type, "tool_call_started");
         assert_eq!(
             ev.parent_event_id.as_deref(),
             Some(turn1_uq_id),
@@ -6462,11 +6488,11 @@ async fn deep_all_event_types_single_turn() {
     );
     assert!(lr.token_usage.is_some(), "usage persisted");
 
-    // 2. Tool writer: 1 tool_call event
+    // 2. Tool writer: 1 canonical start event
     let tools = cap.tool_plans.lock().await;
     assert_eq!(tools.len(), 1, "exactly 1 tool persist plan");
-    assert_eq!(tools[0].events.len(), 1, "1 tool_call event");
-    assert_eq!(tools[0].events[0].event_type, "tool_call");
+    assert_eq!(tools[0].events.len(), 1, "1 tool_call_started event");
+    assert_eq!(tools[0].events[0].event_type, "tool_call_started");
 
     // 3. Auxiliary writer: routing_decision event
     let aux = cap.aux_events.lock().await;
@@ -6547,7 +6573,7 @@ async fn deep_session_activity_cumulative_across_turns() {
             { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-cum1", "read_file", json!({"path": "a"}))] },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-cum1", "content": "file data" }],
+        "tool_results": [completed_tool_result("tc-cum1", "file data")],
         "test_llm_rounds": [{ "full_text": "final answer" }]
     });
     let (st3, _) = chat_turn(&app, p3).await;
@@ -6717,9 +6743,10 @@ async fn deep_tool_result_event_structure() {
         ],
         "edge_tools": [tool_schema("read_file")],
         "tool_results": [{
-            "tool_call_id": "tc-trs1",
+            "request_id": "tc-trs1",
             "name": "read_file",
-            "content": "file contents here"
+            "status": "completed",
+            "output": "file contents here"
         }],
         "test_llm_rounds": [{ "full_text": "done" }]
     });
@@ -6729,13 +6756,13 @@ async fn deep_tool_result_event_structure() {
     cap.drain_persist_tasks().await;
 
     let tools = cap.tool_plans.lock().await;
-    // Find the tool_result events (from turn 2)
+    // Find the canonical terminal events (from turn 2).
     let tool_results: Vec<_> = tools
         .iter()
         .flat_map(|plan| &plan.events)
-        .filter(|e| e.event_type == "tool_result")
+        .filter(|e| e.event_type == "tool_call_completed")
         .collect();
-    assert_eq!(tool_results.len(), 1, "1 tool_result event");
+    assert_eq!(tool_results.len(), 1, "1 tool_call_completed event");
 
     let tr = &tool_results[0];
     // Content is {"name": "...", "result": "..."} — tool_call_id is in metadata only
@@ -6925,7 +6952,11 @@ async fn deep_multi_turn_mixed_pattern_complete() {
             ] },
         ],
         "edge_tools": [tool_schema("read_file")],
-        "tool_results": [{ "tool_call_id": "tc-mx1", "content": "file a data" }],
+        "tool_results": [{
+            "request_id": "tc-mx1",
+            "status": "completed",
+            "output": "file a data"
+        }],
         "test_llm_rounds": [{ "full_text": "file a says..." }]
     });
     let (st3, _) = chat_turn(&app, p3).await;
@@ -7001,18 +7032,18 @@ async fn deep_multi_turn_mixed_pattern_complete() {
     assert_eq!(chain2, chain3, "continuation reuses chain");
     assert_ne!(chain2, chain4, "new query gets fresh chain");
 
-    // Tool events: turn 2 has tool_calls, turn 3 has tool_results
+    // Tool events: turn 2 has starts, turn 3 has successful terminals.
     let all_tool_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
     let tool_calls: Vec<_> = all_tool_events
         .iter()
-        .filter(|e| e.event_type == "tool_call")
+        .filter(|e| e.event_type == "tool_call_started")
         .collect();
     let tool_results: Vec<_> = all_tool_events
         .iter()
-        .filter(|e| e.event_type == "tool_result")
+        .filter(|e| e.event_type == "tool_call_completed")
         .collect();
-    assert_eq!(tool_calls.len(), 1, "1 tool_call");
-    assert_eq!(tool_results.len(), 1, "1 tool_result");
+    assert_eq!(tool_calls.len(), 1, "1 tool_call_started");
+    assert_eq!(tool_results.len(), 1, "1 tool_call_completed");
 }
 
 // ── Failing writer stubs for unhappy path tests ─────────────────────────────
@@ -7525,10 +7556,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             tool_schema("git"),
             tool_schema("read_file"),
         ],
-        "tool_results": [{
-            "tool_call_id": "tc-r1",
-            "content": "abc1234 feat: add new feature (2 hours ago)"
-        }],
+        "tool_results": [completed_tool_result(
+            "tc-r1",
+            "abc1234 feat: add new feature (2 hours ago)"
+        )],
         "test_llm_rounds": [{
             "tool_calls": [
                 tool_call("tc-r2", "git", json!({"action": "show", "revision": "abc1234"}))
@@ -7572,10 +7603,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             tool_schema("git"),
             tool_schema("read_file"),
         ],
-        "tool_results": [{
-            "tool_call_id": "tc-r2",
-            "content": "+fn new_feature() {\n+    println!(\"Hello\");\n+}"
-        }],
+        "tool_results": [completed_tool_result(
+            "tc-r2",
+            "+fn new_feature() {\n+    println!(\"Hello\");\n+}"
+        )],
         "test_llm_rounds": [{
             "full_text": "## Code Review\n\nThe commit adds a `new_feature()` function. LGTM.",
             "usage": { "prompt_tokens": 500, "completion_tokens": 30 }
@@ -7688,8 +7719,8 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
             tool_schema("read_file"),
         ],
         "tool_results": [
-            { "tool_call_id": "tc-opt1", "content": "abc1234 feat: add new feature (2 hours ago)" },
-            { "tool_call_id": "tc-opt2", "content": "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }" },
+            completed_tool_result("tc-opt1", "abc1234 feat: add new feature (2 hours ago)"),
+            completed_tool_result("tc-opt2", "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }"),
         ],
         "test_llm_rounds": [{
             "full_text": "## Code Review\n\nThe commit adds `new_feature()`. Clean implementation. LGTM.",
@@ -7811,10 +7842,10 @@ async fn round_efficiency_deep_analysis_batch_tools() {
             tool_schema("glob"),
         ],
         "tool_results": [
-            { "tool_call_id": "tc-a1", "content": "src/ tests/ Cargo.toml README.md" },
-            { "tool_call_id": "tc-a2", "content": "[package]\nname = \"myproj\"" },
-            { "tool_call_id": "tc-a3", "content": "# My Project\nA Rust project." },
-            { "tool_call_id": "tc-a4", "content": "fn main() {\n    println!(\"Hello\");\n}" },
+            completed_tool_result("tc-a1", "src/ tests/ Cargo.toml README.md"),
+            completed_tool_result("tc-a2", "[package]\nname = \"myproj\""),
+            completed_tool_result("tc-a3", "# My Project\nA Rust project."),
+            completed_tool_result("tc-a4", "fn main() {\n    println!(\"Hello\");\n}"),
         ],
         "test_llm_rounds": [{
             "full_text": "## Project Analysis\n\nThis is a minimal Rust project with a standard layout.",
@@ -7895,10 +7926,10 @@ async fn round_efficiency_bash_compound_two_rounds() {
             tool_schema("bash"),
             tool_schema("read_file"),
         ],
-        "tool_results": [{
-            "tool_call_id": "tc-b1",
-            "content": "abc1234 feat: add new feature\ndiff --git a/src/main.rs\n+fn new_feature() {}"
-        }],
+        "tool_results": [completed_tool_result(
+            "tc-b1",
+            "abc1234 feat: add new feature\ndiff --git a/src/main.rs\n+fn new_feature() {}"
+        )],
         "test_llm_rounds": [{
             "full_text": "## Code Review\n\nCommit abc1234 adds `new_feature()`. Clean and minimal. LGTM.",
             "usage": { "prompt_tokens": 400, "completion_tokens": 20 }

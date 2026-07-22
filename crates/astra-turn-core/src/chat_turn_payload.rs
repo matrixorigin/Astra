@@ -153,13 +153,65 @@ pub fn attach_filtered_edge_tools(
     set_payload_edge_tools(payload, final_schemas);
 }
 
-/// Callback-style `tool_results` array (only set when non-empty, matching historical CLI behavior).
+fn canonical_tool_result_wire_row(row: &Value) -> Value {
+    let Some(row) = row.as_object() else {
+        return json!({
+            "request_id": null,
+            "status": "failed",
+            "output": "invalid non-object tool result",
+        });
+    };
+
+    let mut wire = row.clone();
+    let request_id = wire
+        .remove("request_id")
+        .or_else(|| wire.remove("tool_call_id"))
+        .unwrap_or(Value::Null);
+    let output = wire
+        .remove("output")
+        .or_else(|| wire.remove("result"))
+        .unwrap_or(Value::Null);
+    let explicit_error = wire.get("error").is_some_and(|error| {
+        !error.is_null() && error.as_str().is_none_or(|text| !text.is_empty())
+    }) || wire.remove("is_error").and_then(|value| value.as_bool())
+        == Some(true);
+    let status = if explicit_error {
+        "failed"
+    } else {
+        match wire.remove("status") {
+            Some(Value::String(status)) => match status.trim().to_ascii_lowercase().as_str() {
+                "completed" => "completed",
+                "failed" => "failed",
+                "skipped" => "skipped",
+                _ => "failed",
+            },
+            Some(_) => "failed",
+            None if !output.is_string() => "failed",
+            None => crate::tool_result_semantics::cloud_tool_result_status_label(
+                output.as_str().expect("string checked above"),
+            ),
+        }
+    };
+    wire.insert("request_id".to_string(), request_id);
+    wire.insert("status".to_string(), Value::String(status.to_string()));
+    wire.insert("output".to_string(), output);
+    Value::Object(wire)
+}
+
+/// Attach canonical callback-style `tool_results` to the outbound `/chat/turn` payload.
+///
+/// Agentic-loop state stores model-facing `tool_call_id`/`result` rows. The
+/// transport boundary rewrites those rows to the sole wire contract:
+/// `request_id`/`status`/`output`.
 pub fn set_payload_tool_results_if_non_empty(payload: &mut Value, rows: &[Value]) {
     if rows.is_empty() {
         return;
     }
     if let Some(obj) = payload.as_object_mut() {
-        obj.insert("tool_results".to_string(), Value::Array(rows.to_vec()));
+        obj.insert(
+            "tool_results".to_string(),
+            Value::Array(rows.iter().map(canonical_tool_result_wire_row).collect()),
+        );
     }
 }
 
@@ -361,8 +413,45 @@ mod tests {
         let mut p = json!({});
         set_payload_edge_tools(&mut p, vec![json!({"fn": "t1"})]);
         assert_eq!(p["edge_tools"], json!([{"fn": "t1"}]));
-        set_payload_tool_results_if_non_empty(&mut p, &[json!({"tool_call_id": "1"})]);
-        assert_eq!(p["tool_results"], json!([{"tool_call_id": "1"}]));
+        set_payload_tool_results_if_non_empty(
+            &mut p,
+            &[json!({
+                "tool_call_id": "1",
+                "name": "read_file",
+                "result": "contents",
+            })],
+        );
+        assert_eq!(
+            p["tool_results"],
+            json!([{
+                "request_id": "1",
+                "name": "read_file",
+                "status": "completed",
+                "output": "contents",
+            }])
+        );
+    }
+
+    #[test]
+    fn tool_result_wire_conversion_fails_closed_on_alias_statuses_and_bad_rows() {
+        let mut payload = json!({});
+        set_payload_tool_results_if_non_empty(
+            &mut payload,
+            &[
+                json!({"request_id": "canonical", "status": "skipped", "output": "deduped"}),
+                json!({"tool_call_id": "legacy-status", "status": "success", "result": "ok"}),
+                json!({"tool_call_id": "error", "result": "Error: denied"}),
+                json!({"request_id": "conflict", "status": "completed", "output": "ok", "error": "denied"}),
+                json!({"request_id": "object-output", "output": {"ok": true}}),
+                Value::String("bad".to_string()),
+            ],
+        );
+        assert_eq!(payload["tool_results"][0]["status"], "skipped");
+        assert_eq!(payload["tool_results"][1]["status"], "failed");
+        assert_eq!(payload["tool_results"][2]["status"], "failed");
+        assert_eq!(payload["tool_results"][3]["status"], "failed");
+        assert_eq!(payload["tool_results"][4]["status"], "failed");
+        assert_eq!(payload["tool_results"][5]["status"], "failed");
     }
 
     #[test]
