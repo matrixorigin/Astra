@@ -28,10 +28,10 @@ pub struct PricingData {
     /// Output price in USD per token.
     #[serde(default)]
     pub completion: f64,
-    /// Cached-input price in USD per token. Missing means `prompt` applies.
+    /// Cached-input price in USD per token. Missing means the rate is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read: Option<f64>,
-    /// Cache-creation price in USD per token. Missing means `prompt` applies.
+    /// Cache-creation price in USD per token. Missing means the rate is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<f64>,
 }
@@ -43,8 +43,10 @@ impl PricingData {
     }
 
     /// Estimate cost from token counts using the canonical USD-per-token unit.
-    /// Missing cache rates fall back to the ordinary input rate; callers must
-    /// not invent provider-specific discounts that are absent from metadata.
+    /// Every rate used by the sample must be explicit. A sample containing
+    /// cache tokens is unpriced when its corresponding cache rate is absent;
+    /// callers must not invent provider-specific discounts or charge the
+    /// ordinary input rate for an unknown cache rate.
     pub fn estimated_cost_usd(
         &self,
         input_tokens: u64,
@@ -55,8 +57,16 @@ impl PricingData {
         let valid_rate = |rate: f64| (rate.is_finite() && rate >= 0.0).then_some(rate);
         let prompt = valid_rate(self.prompt)?;
         let completion = valid_rate(self.completion)?;
-        let cache_read = valid_rate(self.cache_read.unwrap_or(prompt))?;
-        let cache_write = valid_rate(self.cache_write.unwrap_or(prompt))?;
+        let cache_read = match (cache_read_tokens, self.cache_read) {
+            (0, _) => 0.0,
+            (_, Some(rate)) => valid_rate(rate)?,
+            (_, None) => return None,
+        };
+        let cache_write = match (cache_write_tokens, self.cache_write) {
+            (0, _) => 0.0,
+            (_, Some(rate)) => valid_rate(rate)?,
+            (_, None) => return None,
+        };
         let cost = input_tokens as f64 * prompt
             + output_tokens as f64 * completion
             + cache_read_tokens as f64 * cache_read
@@ -4216,15 +4226,32 @@ mod tests {
         let pricing = PricingData {
             prompt: 0.000_002,
             completion: 0.000_012,
-            cache_read: None,
-            cache_write: None,
+            cache_read: Some(0.000_000_2),
+            cache_write: Some(0.000_002_5),
         };
 
         let cost = pricing
             .estimated_cost_usd(1_000_000, 500_000, 100_000, 50_000)
             .expect("valid pricing");
 
-        assert!((cost - 8.3).abs() < 1e-12);
+        assert!((cost - 8.145).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pricing_data_requires_rates_for_cache_tokens_that_are_present() {
+        let pricing = PricingData {
+            prompt: 0.000_002,
+            completion: 0.000_012,
+            cache_read: None,
+            cache_write: None,
+        };
+
+        assert_eq!(
+            pricing.estimated_cost_usd(1_000_000, 500_000, 0, 0),
+            Some(8.0)
+        );
+        assert_eq!(pricing.estimated_cost_usd(1_000_000, 500_000, 1, 0), None);
+        assert_eq!(pricing.estimated_cost_usd(1_000_000, 500_000, 0, 1), None);
     }
 
     #[test]

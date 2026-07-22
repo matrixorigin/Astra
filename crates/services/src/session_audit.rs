@@ -4284,7 +4284,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_session_cost_falls_back_to_prompt_rate_for_cache_tokens() {
+    fn summarize_session_cost_marks_missing_cache_rate_as_unpriced() {
         let turns = vec![TurnCostSample {
             model: "claude".into(),
             usage: ParsedTurnTokenUsage {
@@ -4306,10 +4306,10 @@ mod tests {
         )]);
 
         let summary = summarize_session_cost(turns, &pricing_by_model);
-        assert_eq!(summary.priced_turn_count, 1);
-        assert_eq!(summary.unpriced_turn_count, 0);
-        assert!((summary.estimated_cost_usd.unwrap() - 0.000_38).abs() < 1e-12);
-        assert!((summary.per_model_cost_usd["claude"] - 0.000_38).abs() < 1e-12);
+        assert_eq!(summary.priced_turn_count, 0);
+        assert_eq!(summary.unpriced_turn_count, 1);
+        assert_eq!(summary.estimated_cost_usd, None);
+        assert!(summary.per_model_cost_usd.is_empty());
     }
 
     #[test]

@@ -525,7 +525,7 @@ pub(crate) fn format_cost(cost: f64) -> String {
 /// - `pricing: {...}` — full PricingData JSON (all fields optional except prompt/completion)
 /// - `pricing_cache_read` / `pricing_cache_write` at top level — explicit cache rates
 /// - `pricing_prompt` / `pricing_completion` only — base rates with no invented
-///   cache discount; the canonical estimator falls back to the input rate.
+///   cache discount; samples containing cache tokens remain unpriced.
 pub(crate) fn extract_pricing_for_model(
     models: &[serde_json::Value],
     model_name: &str,

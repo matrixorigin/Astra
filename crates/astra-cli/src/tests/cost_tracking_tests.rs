@@ -46,10 +46,12 @@ fn cost_for_tokens() {
         (500.0 * 0.000_003) + (200.0 * 0.000_015) + (1000.0 * 0.000_000_3) + (100.0 * 0.000_003_75);
     assert!((cost - expected).abs() < 1e-10);
 
-    // Missing cache pricing uses the ordinary input rate.
-    let cost = slash_stats::cost_for_tokens(0, 0, 1000, 1000, &pricing);
-    let expected = 2000.0 * 0.000_003;
-    assert!((cost - expected).abs() < 1e-10);
+    // Missing cache pricing must not charge cached tokens at the prompt rate.
+    assert_eq!(
+        pricing.estimated_cost_usd(0, 0, 1000, 1000),
+        None,
+        "unknown cache rates are unpriced instead of guessed"
+    );
 }
 
 // ── format_cost ─────────────────────────────────────────────────────
@@ -154,7 +156,7 @@ fn extract_pricing_rejects_invalid_nested_and_cache_rates() {
 }
 
 #[test]
-fn missing_cache_rates_use_input_rate_without_family_guesses() {
+fn missing_cache_rates_remain_unpriced_without_family_guesses() {
     let models = vec![serde_json::json!({
         "name": "us.anthropic.claude-sonnet-4-6",
         "pricing_prompt": 0.000_003,
@@ -164,7 +166,7 @@ fn missing_cache_rates_use_input_rate_without_family_guesses() {
         slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
     assert_eq!(p.cache_read, None);
     assert_eq!(p.cache_write, None);
-    assert!((slash_stats::cost_for_tokens(0, 0, 1000, 1000, &p) - 0.006).abs() < 1e-12);
+    assert_eq!(p.estimated_cost_usd(0, 0, 1000, 1000), None);
 }
 
 // ── fallback_pricing ────────────────────────────────────────────────

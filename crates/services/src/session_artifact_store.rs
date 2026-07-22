@@ -132,15 +132,27 @@ pub enum SessionArtifactStoreError {
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
 pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
 pub const MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX: &str = "projection:";
+const MAX_ARTIFACT_ID_BYTES: usize = 64;
 
 fn is_mutable_artifact_projection_id(artifact_id: &str) -> bool {
     artifact_id.starts_with(MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX)
 }
 
 fn is_valid_mutable_artifact_projection_id(artifact_id: &str) -> bool {
+    if artifact_id.len() > MAX_ARTIFACT_ID_BYTES {
+        return false;
+    }
     artifact_id
         .strip_prefix(MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX)
-        .is_some_and(|name| !name.trim().is_empty())
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1606,6 +1618,33 @@ mod tests {
             content: serde_json::json!({"version": 1}),
             metadata: None,
             references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mutable_projection_id_validation_matches_storage_and_namespace_contract() {
+        let max_name =
+            "a".repeat(MAX_ARTIFACT_ID_BYTES - MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX.len());
+        assert!(is_valid_mutable_artifact_projection_id(&format!(
+            "{MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX}{max_name}"
+        )));
+        assert!(!is_valid_mutable_artifact_projection_id(&format!(
+            "{MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX}{max_name}a"
+        )));
+
+        for invalid_id in [
+            "projection:",
+            "projection:../escape",
+            "projection:a/b",
+            "projection:UPPER",
+            "projection:-leading",
+            "projection:trailing-",
+            "projection:two--parts",
+        ] {
+            assert!(
+                !is_valid_mutable_artifact_projection_id(invalid_id),
+                "projection identity must be canonical: {invalid_id}"
+            );
         }
     }
 
