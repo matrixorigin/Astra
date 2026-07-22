@@ -51,8 +51,29 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
+API_PORT="${ASTRA_API_PORT:-17001}"
 DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
+
+# Recover from an earlier launcher losing its PID after the server became
+# healthy (notably the macOS screen branch). Starting a second server would
+# only produce a misleading bind failure while the first instance is usable.
+EXISTING_HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 \
+    "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
+if echo "$EXISTING_HEALTH" | grep -q '"status":"healthy"' && \
+   echo "$EXISTING_HEALTH" | grep -q '"database":"connected"'; then
+    EXISTING_PID=""
+    if command -v lsof >/dev/null 2>&1; then
+        EXISTING_PID=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)
+    fi
+    if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        echo "$EXISTING_PID" > "$PID_FILE"
+        echo "⚠️  API server already healthy (PID: $EXISTING_PID, port: $API_PORT)"
+    else
+        echo "⚠️  API server already healthy (port: $API_PORT; PID unavailable)"
+    fi
+    exit 0
+fi
 
 # Wait for database to be ready (retry up to 30 seconds)
 echo "Waiting for database ($DB_HOST:$DB_PORT)..."
@@ -93,16 +114,19 @@ start_detached() {
         # and IDE environments, so use screen when available to create an
         # actually detached process. The command is passed as argv rather than
         # string-concatenated so paths and env values remain shell-safe.
-        screen -dmS astra-api bash -lc \
-            'cd "$1"; log_file="$2"; shift 2; exec "$@" >> "$log_file" 2>&1' \
-            bash "$PWD" "$LOG_FILE" "$@"
-        for _ in {1..20}; do
-            DETACHED_PID=$(pgrep -x "astra-server" 2>/dev/null | tail -n 1)
+        SCREEN_SESSION="astra-api-$$"
+        ABS_PID_FILE="$PWD/$PID_FILE"
+        screen -dmS "$SCREEN_SESSION" bash -lc \
+            'cd "$1"; log_file="$2"; pid_file="$3"; shift 3; printf "%s\n" "$$" > "$pid_file"; exec "$@" >> "$log_file" 2>&1' \
+            bash "$PWD" "$LOG_FILE" "$ABS_PID_FILE" "$@"
+        for _ in {1..100}; do
+            DETACHED_PID=$(sed -n '1p' "$ABS_PID_FILE" 2>/dev/null || true)
             if [ -n "$DETACHED_PID" ] && kill -0 "$DETACHED_PID" 2>/dev/null; then
                 return
             fi
             sleep 0.2
         done
+        screen -S "$SCREEN_SESSION" -X quit 2>/dev/null || true
         DETACHED_PID=""
     else
         nohup "$@" >> "$LOG_FILE" 2>&1 &
@@ -132,7 +156,6 @@ sleep 1
 PID=$SETSID_PID
 echo $PID > "$PID_FILE"
 
-API_PORT="${ASTRA_API_PORT:-17001}"
 API_START_TIMEOUT_SECONDS="${API_START_TIMEOUT_SECONDS:-180}"
 API_HEALTH_INTERVAL_SECONDS="${API_HEALTH_INTERVAL_SECONDS:-2}"
 

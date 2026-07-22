@@ -2383,7 +2383,7 @@ fn read_journal_tail_from_path(path: &Path, limit: usize) -> std::io::Result<Vec
     // Seek backwards from EOF instead of scanning the complete JSONL file.
     // Long-lived CLI sessions can accumulate hundreds of thousands of
     // events; a bounded tail read must bound I/O as well as retained memory.
-    let tail_lines = read_journal_tail_lines_exact(&path, limit)?;
+    let tail_lines = read_journal_tail_lines_exact(path, limit)?;
     let mut events = Vec::with_capacity(tail_lines.len());
     for line in tail_lines {
         if let Ok(event) = serde_json::from_str::<JournalEvent>(&line) {
