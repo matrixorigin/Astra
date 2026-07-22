@@ -1375,6 +1375,10 @@ mod tests {
                 ErrorKind::PolicyDenied,
             ),
             (
+                "Error: bash command blocked (inline interpreter execution (python3 -c))\n⚠ bash failed with an unclassified tool error.",
+                ErrorKind::PolicyDenied,
+            ),
+            (
                 "Error: blocked by safety guard 'shell_obfuscation': command substitution",
                 ErrorKind::PolicyDenied,
             ),
