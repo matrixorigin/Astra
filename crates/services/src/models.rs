@@ -22,14 +22,59 @@ use astra_core::{
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct PricingData {
+    /// Input price in USD per token.
     #[serde(default)]
     pub prompt: f64,
+    /// Output price in USD per token.
     #[serde(default)]
     pub completion: f64,
+    /// Cached-input price in USD per token. Missing means `prompt` applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read: Option<f64>,
+    /// Cache-creation price in USD per token. Missing means `prompt` applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<f64>,
+}
+
+impl PricingData {
+    /// Estimate cost from token counts using the canonical USD-per-token unit.
+    /// Missing cache rates fall back to the ordinary input rate; callers must
+    /// not invent provider-specific discounts that are absent from metadata.
+    pub fn estimated_cost_usd(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> Option<f64> {
+        let valid_rate = |rate: f64| (rate.is_finite() && rate >= 0.0).then_some(rate);
+        let prompt = valid_rate(self.prompt)?;
+        let completion = valid_rate(self.completion)?;
+        let cache_read = valid_rate(self.cache_read.unwrap_or(prompt))?;
+        let cache_write = valid_rate(self.cache_write.unwrap_or(prompt))?;
+        let cost = input_tokens as f64 * prompt
+            + output_tokens as f64 * completion
+            + cache_read_tokens as f64 * cache_read
+            + cache_write_tokens as f64 * cache_write;
+        cost.is_finite().then_some(cost)
+    }
+}
+
+fn validate_pricing_data(pricing: &PricingData) -> Result<(), String> {
+    for (field, value) in [
+        ("prompt", Some(pricing.prompt)),
+        ("completion", Some(pricing.completion)),
+        ("cache_read", pricing.cache_read),
+        ("cache_write", pricing.cache_write),
+    ] {
+        let Some(value) = value else { continue };
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "pricing.{field} must be a finite non-negative USD-per-token rate"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -1891,6 +1936,8 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         request: ModelCreateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        validate_pricing_data(&request.pricing)
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         let context_window = require_create_context_window(request.context_window)?;
 
@@ -2118,6 +2165,10 @@ impl ModelService for DatabaseModelService {
         model_name: String,
         request: ModelUpdateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(pricing) = request.pricing.as_ref() {
+            validate_pricing_data(pricing)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
         validate_update_context_window(request.context_window)?;
@@ -4078,10 +4129,10 @@ mod tests {
     #[test]
     fn pricing_data_serialization_roundtrip() {
         let p = PricingData {
-            prompt: 0.003,
-            completion: 0.015,
-            cache_read: Some(0.0003),
-            cache_write: Some(0.00375),
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_3),
+            cache_write: Some(0.000_003_75),
         };
         let json = serde_json::to_string(&p).unwrap();
         let restored: PricingData = serde_json::from_str(&json).unwrap();
@@ -4100,8 +4151,8 @@ mod tests {
     #[test]
     fn pricing_data_missing_optional_fields() {
         let p: PricingData =
-            serde_json::from_str(r#"{"prompt": 0.003, "completion": 0.015}"#).unwrap();
-        assert_eq!(p.prompt, 0.003);
+            serde_json::from_str(r#"{"prompt": 0.000003, "completion": 0.000015}"#).unwrap();
+        assert_eq!(p.prompt, 0.000_003);
         assert!(p.cache_read.is_none());
         assert!(p.cache_write.is_none());
     }
@@ -4137,11 +4188,38 @@ mod tests {
     }
 
     #[test]
-    fn pricing_data_negative_values_accepted() {
-        // Negative pricing is structurally valid (no validation at serde level)
-        let p: PricingData =
-            serde_json::from_str(r#"{"prompt": -0.001, "completion": -0.002}"#).unwrap();
-        assert!(p.prompt < 0.0);
+    fn pricing_data_rejects_negative_and_non_finite_rates() {
+        let negative = PricingData {
+            prompt: -0.001,
+            completion: 0.002,
+            cache_read: None,
+            cache_write: None,
+        };
+        assert!(validate_pricing_data(&negative).is_err());
+
+        let non_finite = PricingData {
+            prompt: 0.001,
+            completion: f64::INFINITY,
+            cache_read: None,
+            cache_write: None,
+        };
+        assert!(validate_pricing_data(&non_finite).is_err());
+    }
+
+    #[test]
+    fn pricing_data_estimates_cost_in_usd_per_token() {
+        let pricing = PricingData {
+            prompt: 0.000_002,
+            completion: 0.000_012,
+            cache_read: None,
+            cache_write: None,
+        };
+
+        let cost = pricing
+            .estimated_cost_usd(1_000_000, 500_000, 100_000, 50_000)
+            .expect("valid pricing");
+
+        assert!((cost - 8.3).abs() < 1e-12);
     }
 
     #[test]
@@ -5121,7 +5199,7 @@ mod tests {
         let all_entries = [
             (
                 "expensive-main".to_string(),
-                r#"{"prompt":0.003,"completion":0.015}"#.to_string(),
+                r#"{"prompt":0.000003,"completion":0.000015}"#.to_string(),
             ),
             (
                 "qwen-flash".to_string(),

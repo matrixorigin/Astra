@@ -231,6 +231,7 @@ pub(crate) fn replace_json_path(
 }
 
 pub(crate) fn append_config_change_event(
+    user_id: &str,
     session_id: &str,
     turn: u32,
     key: &str,
@@ -238,7 +239,7 @@ pub(crate) fn append_config_change_event(
     old_value: Option<Value>,
     source: &str,
 ) -> Result<(), String> {
-    let writer = astra_services::session_journal::JournalWriter::new(session_id)
+    let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
         .map_err(|e| e.to_string())?;
     let mut event = astra_services::session_journal::JournalEvent::config_change(
         Some(session_id),
@@ -256,6 +257,7 @@ pub(crate) fn append_config_change_event(
 }
 
 pub(crate) fn persist_config_override(
+    user_id: &str,
     session_id: &str,
     path: &str,
     new_value: Value,
@@ -288,7 +290,15 @@ pub(crate) fn persist_config_override(
             "workspace disappeared while persisting config for session {session_id}"
         ));
     }
-    append_config_change_event(session_id, turn, path, &new_value, Some(old_value), source)
+    append_config_change_event(
+        user_id,
+        session_id,
+        turn,
+        path,
+        &new_value,
+        Some(old_value),
+        source,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +324,7 @@ fn adjust_config_output(value: Value) -> AdjustConfigOutcome {
 }
 
 pub(crate) fn execute_adjust_config<PublishWorkspace>(
+    user_id: &str,
     session_id: &str,
     observability_session: Option<&Arc<RwLock<crate::observability::ObservabilitySession>>>,
     config: &Mutex<SessionConfigInner>,
@@ -388,6 +399,7 @@ where
 
     // Phase 2: I/O outside locks.
     if let Err(error) = persist_config_override(
+        user_id,
         session_id,
         path,
         update.new_value.clone(),
@@ -453,12 +465,13 @@ where
 }
 
 pub(crate) fn persist_manual_compression(
+    user_id: &str,
     session_id: &str,
     turn: u32,
     reason: &str,
     source: &str,
 ) -> Result<(), String> {
-    let writer = astra_services::session_journal::JournalWriter::new(session_id)
+    let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
         .map_err(|e| e.to_string())?;
     let mut event = astra_services::session_journal::JournalEvent::compact_with_summary(
         Some(session_id),
@@ -497,6 +510,7 @@ fn compress_context_output(value: Value) -> CompressContextOutcome {
 }
 
 pub(crate) fn execute_compress_context(
+    user_id: &str,
     session_id: &str,
     observability_session: Option<&Arc<RwLock<crate::observability::ObservabilitySession>>>,
     args: &Value,
@@ -529,6 +543,7 @@ pub(crate) fn execute_compress_context(
     let already_compressed_this_turn = session.compressed_turns.contains(&turn);
 
     if let Err(error) = persist_manual_compression(
+        user_id,
         session_id,
         turn,
         reason,
@@ -588,6 +603,7 @@ mod tests {
 
         let journal = Mutex::new(SessionStateRollbackJournal::default());
         let outcome = execute_compress_context(
+            "test-user",
             session_id,
             Some(&session),
             &json!({"reason": "manual_test"}),
@@ -613,7 +629,8 @@ mod tests {
         assert!(rollback.snapshot.compressed_turns.is_empty());
 
         let events =
-            astra_services::session_journal::read_journal(session_id).expect("compression journal");
+            astra_services::session_journal::read_journal_for_user("test-user", session_id)
+                .expect("compression journal");
         assert!(events.iter().any(|event| {
             event.event_type == astra_services::session_journal::JournalEventType::Compact
                 && event.turn == Some(3)
@@ -757,6 +774,7 @@ mod tests {
 
         let journal = Mutex::new(SessionStateRollbackJournal::default());
         let outcome = execute_adjust_config(
+            "test-user",
             session_id,
             Some(&session),
             &config,

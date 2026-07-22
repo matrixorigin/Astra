@@ -2740,7 +2740,13 @@ impl DynamicAgentSpawner {
                 run_config.inherited_prefix.is_some(),
                 run_config.execution_metadata.as_ref(),
             );
-            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&sid) {
+            let writer = match context.trace_context.as_ref() {
+                Some(trace) => {
+                    astra_services::session_journal::JournalWriter::for_user(&trace.user_id, &sid)
+                }
+                None => astra_services::session_journal::JournalWriter::new(&sid),
+            };
+            if let Ok(writer) = writer {
                 let _ = writer.append(&evt);
             }
         }
@@ -3297,7 +3303,13 @@ impl DynamicAgentSpawner {
         let Some(sid) = self.current_session_id() else {
             return;
         };
-        let writer = match astra_services::session_journal::JournalWriter::new(&sid) {
+        let writer = match state.trace_context.as_ref() {
+            Some(trace) => {
+                astra_services::session_journal::JournalWriter::for_user(&trace.user_id, &sid)
+            }
+            None => astra_services::session_journal::JournalWriter::new(&sid),
+        };
+        let writer = match writer {
             Ok(w) => w,
             Err(e) => {
                 astra_core::agent_warn!(

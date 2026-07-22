@@ -1,6 +1,7 @@
 //! Command sandboxing — wraps `std::process::Command` with security restrictions.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use super::policy::SandboxPolicy;
@@ -214,6 +215,25 @@ fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
 ///
 /// This is advisory — the permission manager handles the actual allow/deny decision.
 pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(command, None)
+}
+
+/// Analyze command risks with an explicit workspace boundary.
+///
+/// Callers that enforce [`CommandRisk::WorkspaceOutWrite`] must use this
+/// variant. Whether an absolute path is inside the workspace cannot be
+/// determined from the command string alone.
+pub fn analyze_command_risks_in_workspace(
+    command: &str,
+    workspace_root: &Path,
+) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(command, Some(workspace_root))
+}
+
+fn analyze_command_risks_with_workspace(
+    command: &str,
+    workspace_root: Option<&Path>,
+) -> Vec<CommandRisk> {
     let mut risks = Vec::new();
 
     // 1) AST-level analysis (best-effort). This avoids many string-literal false positives.
@@ -249,7 +269,7 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         push_unique(&mut risks, CommandRisk::DestructiveCommand(cmd.to_string()));
     }
 
-    if let Some(target) = workspace_out_write_target(&lower) {
+    if let Some(target) = workspace_out_write_target(command, workspace_root) {
         push_unique(&mut risks, CommandRisk::WorkspaceOutWrite(target));
     }
 
@@ -474,21 +494,24 @@ fn normalize_shell_token(token: &str) -> &str {
     token.trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
 
-fn workspace_out_write_target(lower: &str) -> Option<String> {
-    if let Some(target) = redirected_write_target(lower) {
+fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+    if let Some(target) = redirected_write_target(command, workspace_root) {
         return Some(target);
     }
 
-    if let Some(target) = download_output_target(lower) {
+    if let Some(target) = download_output_target(command, workspace_root) {
         return Some(target);
     }
 
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
     let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"];
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         let command = token.trim_matches([';', '|', '&']);
-        if !write_commands.contains(&command) {
+        if !write_commands
+            .iter()
+            .any(|candidate| command.eq_ignore_ascii_case(candidate))
+        {
             continue;
         }
         for arg in iter.clone() {
@@ -496,7 +519,7 @@ fn workspace_out_write_target(lower: &str) -> Option<String> {
             if target.starts_with('-') {
                 continue;
             }
-            if is_workspace_out_path(target) {
+            if is_workspace_out_path(target, workspace_root) {
                 return Some(target.to_string());
             }
         }
@@ -505,23 +528,24 @@ fn workspace_out_write_target(lower: &str) -> Option<String> {
     None
 }
 
-fn download_output_target(command: &str) -> Option<String> {
+fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         let command = token.trim_matches([';', '|', '&']);
-        if !matches!(command, "curl" | "wget") {
+        if !command.eq_ignore_ascii_case("curl") && !command.eq_ignore_ascii_case("wget") {
             continue;
         }
         while let Some(arg) = iter.next() {
             let arg = normalize_shell_token(arg);
-            let target = match arg {
-                "-o" | "-O" | "--output" => iter.next().copied(),
-                _ => None,
+            let target = if matches!(arg, "-o" | "-O" | "--output") {
+                iter.next().copied()
+            } else {
+                None
             };
             if let Some(target) = target {
                 let target = normalize_shell_token(target);
-                if is_workspace_out_path(target) {
+                if is_workspace_out_path(target, workspace_root) {
                     return Some(target.to_string());
                 }
             }
@@ -531,7 +555,7 @@ fn download_output_target(command: &str) -> Option<String> {
     None
 }
 
-fn redirected_write_target(command: &str) -> Option<String> {
+fn redirected_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
     let mut scan_from = 0;
     while let Some(op_index) = next_redirect_operator(command, scan_from) {
         let bytes = command.as_bytes();
@@ -550,7 +574,7 @@ fn redirected_write_target(command: &str) -> Option<String> {
             .find(|ch: char| ch.is_whitespace() || [';', '&', '|'].contains(&ch))
             .unwrap_or(rest.len());
         let target = rest[..target_end].trim_matches(['"', '\'']);
-        if is_workspace_out_path(target) {
+        if is_workspace_out_path(target, workspace_root) {
             return Some(target.to_string());
         }
         scan_from = target_index;
@@ -583,7 +607,7 @@ fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
     None
 }
 
-fn is_workspace_out_path(path: &str) -> bool {
+fn is_workspace_out_path(path: &str, workspace_root: Option<&Path>) -> bool {
     // Standard device sinks are part of the sandbox contract, not host-file
     // writes. Classifying `2>/dev/null` as an external mutation made harmless
     // read-only review commands require approval even though the execution
@@ -591,7 +615,59 @@ fn is_workspace_out_path(path: &str) -> bool {
     if matches!(path, "/dev/null" | "/dev/zero" | "/dev/full") {
         return false;
     }
-    path.starts_with("../") || path.starts_with("..\\") || path.starts_with('/')
+    let candidate = Path::new(path);
+    let Some(workspace_root) = workspace_root else {
+        return path.starts_with("../") || path.starts_with("..\\") || candidate.is_absolute();
+    };
+
+    let root = canonicalize_existing_or_lexical(workspace_root);
+    let requested = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace_root.join(candidate)
+    };
+    let requested = canonicalize_existing_ancestor(&requested);
+    !requested.starts_with(&root)
+}
+
+fn canonicalize_existing_or_lexical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let normalized = lexical_normalize(path);
+    let mut ancestor = normalized.as_path();
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            return normalized;
+        };
+        ancestor = parent;
+    }
+    let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) else {
+        return normalized;
+    };
+    let Ok(suffix) = normalized.strip_prefix(ancestor) else {
+        return normalized;
+    };
+    canonical_ancestor.join(suffix)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !path.is_absolute() {
+                    normalized.push(Component::ParentDir.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn push_unique(risks: &mut Vec<CommandRisk>, risk: CommandRisk) {
@@ -894,6 +970,57 @@ mod tests {
                 "{command}: {risks:?}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_boundary_distinguishes_absolute_paths_by_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("Workspace-With-Case");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let inside = workspace.join("tree.py");
+        let inside_command = format!("printf ok > '{}'", inside.display());
+        let inside_risks = analyze_command_risks_in_workspace(&inside_command, &workspace);
+        assert!(
+            !inside_risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "workspace-local absolute writes must be allowed: {inside_risks:?}"
+        );
+
+        let outside = temp.path().join("outside.py");
+        let outside_command = format!("printf no > '{}'", outside.display());
+        let outside_display = outside.display().to_string();
+        let outside_risks = analyze_command_risks_in_workspace(&outside_command, &workspace);
+        assert!(
+            outside_risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(path) if path == &outside_display)),
+            "absolute writes outside the workspace must be rejected: {outside_risks:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_rejects_writes_through_an_outbound_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("external")).unwrap();
+
+        let escaped = workspace.join("external/new-file.txt");
+        let command = format!("touch '{}'", escaped.display());
+        let escaped_display = escaped.display().to_string();
+        let risks = analyze_command_risks_in_workspace(&command, &workspace);
+
+        assert!(
+            risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(path) if path == &escaped_display)),
+            "symlinks must not turn an external write into a workspace-local write: {risks:?}"
+        );
     }
 
     #[test]

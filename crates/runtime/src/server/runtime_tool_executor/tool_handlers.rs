@@ -878,6 +878,7 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackSessionStateToolHandler {
                     journal: context.session_state_journal.as_ref(),
                     current_turn_index: context.journal_turn_index.load(Ordering::Relaxed),
                     restore_context: SessionStateRestoreContext {
+                        user_id: &context.user_id,
                         session_id: &context.session_id,
                         observability_session: context.observability_session.as_ref(),
                         task_manager: &context.task_manager(),

@@ -1104,6 +1104,7 @@ pub(crate) async fn update_session_handler(
             SessionUpdateRequestData {
                 title: request.title,
                 metadata: request.metadata,
+                metadata_patch: request.metadata_patch,
                 status: request.status,
             },
         )
@@ -1361,10 +1362,21 @@ pub(crate) async fn delete_session_handler(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     state
         .session_service
-        .delete_session(session_id.clone(), user.user_id)
+        .delete_session(session_id.clone(), user_id.clone())
         .await?;
+    if let Err(error) =
+        astra_services::session_journal::delete_session_for_user(&user_id, &session_id)
+    {
+        tracing::warn!(
+            user_id,
+            session_id,
+            %error,
+            "database session deleted but owner-scoped local diagnostics cleanup failed"
+        );
+    }
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1383,6 +1395,7 @@ pub(crate) async fn close_session_handler(
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
+                metadata_patch: None,
                 status: Some("closed".to_string()),
             },
         )
@@ -1428,6 +1441,7 @@ pub(crate) async fn resume_session_handler(
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
+                metadata_patch: None,
                 status: Some("active".to_string()),
             },
         )
@@ -1461,6 +1475,7 @@ pub(crate) async fn cancel_session_handler(
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
+                metadata_patch: None,
                 status: Some(STATUS_CANCELLED.to_string()),
             },
         )

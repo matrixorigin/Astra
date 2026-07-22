@@ -2785,7 +2785,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     .await
     .expect("insert session s2");
 
-    // Session s1: two turns (model m1), tool_call + tool_error on "bash", one stall.
+    // Session s1: two turns (model m1), two successful and one failed terminal
+    // tool lifecycle events on "bash", plus one stall.
     for (eid, typ, tin, tout, ttot, model, tool, ts) in [
         (
             &e_turn_a1,
@@ -2809,7 +2810,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_ok,
-            "tool_call",
+            "tool_call_completed",
             0_i64,
             0_i64,
             0_i64,
@@ -2819,7 +2820,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_err,
-            "tool_error",
+            "tool_call_failed",
             0_i64,
             0_i64,
             0_i64,
@@ -2829,7 +2830,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_tool_call2,
-            "tool_call",
+            "tool_call_completed",
             0_i64,
             0_i64,
             0_i64,
@@ -3479,7 +3480,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     sqlx::query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, event_type, parent_event_id, content, metadata, created_at) \
-         VALUES (?, ?, ?, 'tool_call', ?, 'tool child', CAST(? AS JSON), '2026-09-05 09:00:01.000000')",
+         VALUES (?, ?, ?, 'tool_call_completed', ?, 'tool child', CAST(? AS JSON), '2026-09-05 09:00:01.000000')",
     )
     .bind(&child_event_id)
     .bind(&session_id)
@@ -3599,7 +3600,9 @@ async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
     .bind(r#"["text"]"#)
     .bind(r#"["text"]"#)
     .bind("[]")
-    .bind(r#"{"prompt":2.0,"completion":8.0,"cache_read":0.5,"cache_write":1.5}"#)
+    .bind(
+        r#"{"prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
+    )
     .bind("[]")
     .bind("{}")
     .execute(&pool)

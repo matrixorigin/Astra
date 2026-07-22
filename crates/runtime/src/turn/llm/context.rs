@@ -160,12 +160,18 @@ fn session_memory_relevance_score(source: &str) -> f64 {
 
 fn resolve_pipeline_session_current_date(
     pipeline_session: Option<&astra_turn_core::pipeline_session::PipelineSession>,
+    user_id: Option<&str>,
     session_id: &str,
 ) -> String {
     pipeline_session
         .map(|session| session.current_date().to_string())
-        .unwrap_or_else(|| {
-            crate::turn::session_current_date::resolve_session_current_date(session_id)
+        .unwrap_or_else(|| match user_id {
+            Some(user_id) => {
+                crate::turn::session_current_date::resolve_session_current_date_for_user(
+                    user_id, session_id,
+                )
+            }
+            None => crate::turn::session_current_date::resolve_session_current_date(session_id),
         })
 }
 
@@ -1131,8 +1137,11 @@ pub(crate) fn assemble_context_pipeline(
         .model_limit,
     )
     .unwrap_or(u64::MAX);
-    let session_current_date =
-        resolve_pipeline_session_current_date(state.pipeline_session.as_ref(), input.session_id);
+    let session_current_date = resolve_pipeline_session_current_date(
+        state.pipeline_session.as_ref(),
+        state.context_manifest_user_id.as_deref(),
+        input.session_id,
+    );
     let mut session_ctx = build_session_context(
         input.session_id,
         state.current_run_id.as_deref(),
@@ -1170,8 +1179,13 @@ pub(crate) fn assemble_context_pipeline(
             .as_mut()
             .expect("pipeline_session checked before context assembly");
         if let Some(session_id) = state.current_session_id.as_deref()
-            && let Ok(session_dir) =
-                astra_services::local_session_artifact_store().session_dir(session_id)
+            && let Ok(session_dir) = match state.context_manifest_user_id.as_deref() {
+                Some(user_id) => astra_services::OwnerScope::user(user_id).and_then(|owner| {
+                    astra_services::local_session_artifact_store()
+                        .session_dir_for_owner(&owner, session_id)
+                }),
+                None => astra_services::local_session_artifact_store().session_dir(session_id),
+            }
         {
             pipeline_sess.set_prompt_cache_diff_dir(session_dir.join("prompt-cache-diffs"));
         }
@@ -3168,7 +3182,7 @@ mod context_cache_contract_tests {
         writer.append(&later).unwrap();
 
         assert_eq!(
-            resolve_pipeline_session_current_date(None, session_id),
+            resolve_pipeline_session_current_date(None, None, session_id),
             "2026-05-24",
             "context assembly must use the journal-anchored session date when no pipeline session exists yet"
         );
@@ -3182,7 +3196,7 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(
-            resolve_pipeline_session_current_date(Some(&session), "ignored-session-id"),
+            resolve_pipeline_session_current_date(Some(&session), None, "ignored-session-id"),
             "2026-05-21"
         );
     }

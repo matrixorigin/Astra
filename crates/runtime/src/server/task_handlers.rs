@@ -168,7 +168,7 @@ pub(super) async fn task_progress_handler(
     let progress_events = if session_id.is_empty() {
         Vec::new()
     } else {
-        extract_plan_progress_events(&session_id)
+        extract_plan_progress_events(&user.user_id, &session_id)
     };
 
     Ok(Json(TaskProgressResponse {
@@ -654,8 +654,8 @@ fn required_struct_arg<T: serde::de::DeserializeOwned>(
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("decode {field}: {e}")))
 }
 
-fn extract_plan_progress_events(session_id: &str) -> Vec<PlanProgressEventResponse> {
-    let events = match session_journal::read_journal(session_id) {
+fn extract_plan_progress_events(user_id: &str, session_id: &str) -> Vec<PlanProgressEventResponse> {
+    let events = match session_journal::read_journal_for_user(user_id, session_id) {
         Ok(events) => events,
         Err(err) => {
             tracing::warn!(

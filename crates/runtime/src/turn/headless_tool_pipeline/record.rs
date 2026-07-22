@@ -90,6 +90,7 @@ fn emit_tool_display_feedback(
 }
 
 fn maybe_persist_model_tool_result(
+    current_user_id: Option<&str>,
     current_session_id: Option<&String>,
     id: &str,
     name: &str,
@@ -97,8 +98,7 @@ fn maybe_persist_model_tool_result(
     inline_model_result_str: String,
 ) -> String {
     if let Some(sid) = current_session_id {
-        let session_dir = astra_services::local_session_artifact_store()
-            .session_dir(sid)
+        let session_dir = model_tool_result_session_dir(current_user_id, sid)
             .expect("validated session_id must resolve tool-result session dir");
         match astra_turn_core::tool_result_storage::maybe_persist_tool_result(
             &session_dir,
@@ -111,6 +111,20 @@ fn maybe_persist_model_tool_result(
         }
     } else {
         inline_model_result_str
+    }
+}
+
+fn model_tool_result_session_dir(
+    current_user_id: Option<&str>,
+    session_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let store = astra_services::local_session_artifact_store();
+    match current_user_id {
+        Some(user_id) => {
+            let owner = astra_services::OwnerScope::user(user_id)?;
+            store.session_dir_for_owner(&owner, session_id)
+        }
+        None => store.session_dir(session_id),
     }
 }
 
@@ -197,6 +211,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let journal_result_inline =
             truncate_tool_result_for_model(&execution.name, &journal_result_source);
         let journal_result = maybe_persist_model_tool_result(
+            self.ctx.current_user_id,
             self.ctx.current_session_id,
             &execution.id,
             &execution.name,
@@ -271,7 +286,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         &error_msg,
                         rec.clone(),
                     );
-                    match astra_services::session_journal::JournalWriter::new(sid) {
+                    let writer = match self.ctx.current_user_id {
+                        Some(user_id) => {
+                            astra_services::session_journal::JournalWriter::for_user(user_id, sid)
+                        }
+                        None => astra_services::session_journal::JournalWriter::new(sid),
+                    };
+                    match writer {
                         Ok(journal) => {
                             let _ = journal.append(&event);
                         }
@@ -356,6 +377,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let model_result_str =
             truncate_tool_result_for_model(&execution.name, &full_model_result_str);
         let model_result_str = maybe_persist_model_tool_result(
+            self.ctx.current_user_id,
             self.ctx.current_session_id,
             &execution.id,
             &execution.name,
@@ -391,8 +413,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalDirGuard;
     use astra_services::session_journal::ToolCallDisposition;
     use serde_json::json;
+
+    #[test]
+    fn model_tool_result_directory_uses_authenticated_owner_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("owner-tool-result-{}", uuid::Uuid::new_v4());
+
+        let actual = model_tool_result_session_dir(Some("user-a"), &session_id)
+            .expect("owner-scoped session directory");
+        let owner = astra_services::OwnerScope::user("user-a").expect("owner scope");
+        let expected = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(&owner, &session_id)
+            .expect("expected owner path");
+        let local = astra_services::local_session_artifact_store()
+            .session_dir(&session_id)
+            .expect("legacy local path");
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, local);
+    }
 
     #[test]
     fn result_that_never_started_is_rejected_not_executed() {

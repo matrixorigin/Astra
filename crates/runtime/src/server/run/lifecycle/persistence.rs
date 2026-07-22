@@ -2112,6 +2112,9 @@ pub(crate) fn build_tool_trace_events(
         completed.meta_tool_name = Some(tool_name);
         completed.meta_duration_ms = i32::try_from(record.ms).ok();
         completed.parent_event_id = Some(root_event_id.clone());
+        if !record.ok {
+            completed.content = record.error.clone();
+        }
         completed.metadata = json!({
             "ok": record.ok,
             "action": action,

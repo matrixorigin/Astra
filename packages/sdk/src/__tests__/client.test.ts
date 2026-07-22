@@ -675,6 +675,22 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     expect(call[0]).toContain("/sessions/sx");
   });
 
+  test("updateSession serializes metadata patches without a replacement payload", async () => {
+    globalThis.fetch = mockFetch(200, sessWire);
+
+    await createClient().updateSession("sx", {
+      metadataPatch: { current_model: "m2", workspace_selection: null },
+    });
+
+    const body = JSON.parse(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
+    );
+    expect(body).toEqual({
+      metadata_patch: { current_model: "m2", workspace_selection: null },
+    });
+    expect(body).not.toHaveProperty("metadata");
+  });
+
   test("updateRuntimeSession returns raw runtime payload", async () => {
     globalThis.fetch = mockFetch(200, {
       ...sessWire,

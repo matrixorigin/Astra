@@ -254,10 +254,10 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
             eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "  {:<14} ${:.3}/1M prompt, ${:.3}/1M completion",
                 "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
+                pricing.prompt * 1_000_000.0,
+                pricing.completion * 1_000_000.0
             );
             eprintln!();
 
@@ -342,10 +342,10 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 "─── Session Cost History ────────────────────────".bold()
             );
             eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "  {:<14} ${:.3}/1M prompt, ${:.3}/1M completion",
                 "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
+                pricing.prompt * 1_000_000.0,
+                pricing.completion * 1_000_000.0
             );
             eprintln!();
 
@@ -391,8 +391,8 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
         _ => {
             // Current session summary
             let pricing = &state.cached_pricing;
-            let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
-            let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
+            let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt);
+            let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt);
             let cost = cost_for_tokens(
                 state.total_prompt_tokens,
                 state.total_completion_tokens,
@@ -416,30 +416,30 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
             eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "  {:<14} ${:.3}/1M prompt, ${:.3}/1M completion",
                 "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
+                pricing.prompt * 1_000_000.0,
+                pricing.completion * 1_000_000.0
             );
             eprintln!();
             eprintln!(
                 "  {:<14} {} ({})",
                 "prompt:".dim(),
                 state.total_prompt_tokens,
-                format_cost(state.total_prompt_tokens as f64 * pricing.prompt / 1000.0),
+                format_cost(state.total_prompt_tokens as f64 * pricing.prompt),
             );
             eprintln!(
                 "  {:<14} {} ({})",
                 "completion:".dim(),
                 state.total_completion_tokens,
-                format_cost(state.total_completion_tokens as f64 * pricing.completion / 1000.0),
+                format_cost(state.total_completion_tokens as f64 * pricing.completion),
             );
             if state.total_cache_read_tokens > 0 {
                 eprintln!(
                     "  {:<14} {} ({})",
                     "cache read:".dim(),
                     state.total_cache_read_tokens,
-                    format_cost(state.total_cache_read_tokens as f64 * cache_read_rate / 1000.0),
+                    format_cost(state.total_cache_read_tokens as f64 * cache_read_rate),
                 );
             }
             if state.total_cache_creation_tokens > 0 {
@@ -447,9 +447,7 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     "  {:<14} {} ({})",
                     "cache write:".dim(),
                     state.total_cache_creation_tokens,
-                    format_cost(
-                        state.total_cache_creation_tokens as f64 * cache_write_rate / 1000.0
-                    ),
+                    format_cost(state.total_cache_creation_tokens as f64 * cache_write_rate),
                 );
             }
             eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
@@ -470,9 +468,8 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                     .saturating_add(state.total_cache_creation_tokens);
                 let cache_pct =
                     state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
-                let saved = state.total_cache_read_tokens as f64
-                    * (pricing.prompt - cache_read_rate)
-                    / 1000.0;
+                let saved =
+                    state.total_cache_read_tokens as f64 * (pricing.prompt - cache_read_rate);
                 eprintln!(
                     "  {:<14} {:.0}% cache hit, {} saved",
                     "savings:".dim(),
@@ -497,12 +494,14 @@ pub(crate) fn cost_for_tokens(
     cache_creation_tokens: u64,
     pricing: &astra_services::models::PricingData,
 ) -> f64 {
-    let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
-    let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
-    (prompt_tokens as f64 * pricing.prompt / 1000.0)
-        + (completion_tokens as f64 * pricing.completion / 1000.0)
-        + (cache_read_tokens as f64 * cache_read_rate / 1000.0)
-        + (cache_creation_tokens as f64 * cache_write_rate / 1000.0)
+    pricing
+        .estimated_cost_usd(
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        )
+        .unwrap_or(0.0)
 }
 
 /// Format a dollar cost for display.
@@ -521,9 +520,8 @@ pub(crate) fn format_cost(cost: f64) -> String {
 /// Recognizes three shapes:
 /// - `pricing: {...}` — full PricingData JSON (all fields optional except prompt/completion)
 /// - `pricing_cache_read` / `pricing_cache_write` at top level — explicit cache rates
-/// - `pricing_prompt` / `pricing_completion` only — base rates, cache rates inherited
-///   from the model-family defaults (see [`fallback_pricing`]) so non-Anthropic
-///   families don't get mis-estimated with Anthropic's 10%/125% multipliers.
+/// - `pricing_prompt` / `pricing_completion` only — base rates with no invented
+///   cache discount; the canonical estimator falls back to the input rate.
 pub(crate) fn extract_pricing_for_model(
     models: &[serde_json::Value],
     model_name: &str,
@@ -549,19 +547,11 @@ pub(crate) fn extract_pricing_for_model(
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         if prompt > 0.0 || completion > 0.0 {
-            let explicit_cache_read = m.get("pricing_cache_read").and_then(|v| v.as_f64());
-            let explicit_cache_write = m.get("pricing_cache_write").and_then(|v| v.as_f64());
-            // For missing cache rates, inherit from the family-specific fallback
-            // (Claude: 10%/125%, OpenAI: 25%/no-write, DeepSeek: 25%/no-write, ...).
-            // Without this merge every non-Anthropic model would get Claude's
-            // 10%/125% defaults in `cost_for_tokens`, which can mis-estimate
-            // cached costs by 4× on OpenAI-family providers.
-            let family = fallback_pricing(model_name);
             return Some(astra_services::models::PricingData {
                 prompt,
                 completion,
-                cache_read: explicit_cache_read.or(family.cache_read),
-                cache_write: explicit_cache_write.or(family.cache_write),
+                cache_read: m.get("pricing_cache_read").and_then(|v| v.as_f64()),
+                cache_write: m.get("pricing_cache_write").and_then(|v| v.as_f64()),
             });
         }
         return None;
@@ -569,7 +559,7 @@ pub(crate) fn extract_pricing_for_model(
     None
 }
 
-/// Built-in pricing table for known models ($/Ktok).
+/// Built-in pricing table for known models (USD per token).
 /// Used when the API model list doesn't include pricing data.
 /// Pricing from https://platform.claude.com/docs/en/about-claude/pricing
 /// and https://openai.com/api/pricing/
@@ -580,54 +570,54 @@ pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::Pric
     // Claude Opus 4/4.1: $15/$75 per Mtok
     if name.contains("opus-4") && !name.contains("4.5") && !name.contains("4.6") {
         return PricingData {
-            prompt: 0.015,
-            completion: 0.075,
-            cache_read: Some(0.0015),
-            cache_write: Some(0.01875),
+            prompt: 0.000_015,
+            completion: 0.000_075,
+            cache_read: Some(0.000_001_5),
+            cache_write: Some(0.000_018_75),
         };
     }
     // Claude Opus 4.5/4.6: $5/$25 per Mtok
     if name.contains("opus") {
         return PricingData {
-            prompt: 0.005,
-            completion: 0.025,
-            cache_read: Some(0.0005),
-            cache_write: Some(0.00625),
+            prompt: 0.000_005,
+            completion: 0.000_025,
+            cache_read: Some(0.000_000_5),
+            cache_write: Some(0.000_006_25),
         };
     }
     // Claude Sonnet (3.5/3.7/4/4.5/4.6): $3/$15 per Mtok
     if name.contains("sonnet") {
         return PricingData {
-            prompt: 0.003,
-            completion: 0.015,
-            cache_read: Some(0.0003),
-            cache_write: Some(0.00375),
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_3),
+            cache_write: Some(0.000_003_75),
         };
     }
     // Claude Haiku 4.5: $1/$5 per Mtok
     if name.contains("haiku") && (name.contains("4.5") || name.contains("4-5")) {
         return PricingData {
-            prompt: 0.001,
-            completion: 0.005,
-            cache_read: Some(0.0001),
-            cache_write: Some(0.00125),
+            prompt: 0.000_001,
+            completion: 0.000_005,
+            cache_read: Some(0.000_000_1),
+            cache_write: Some(0.000_001_25),
         };
     }
     // Claude Haiku 3.5: $0.80/$4 per Mtok
     if name.contains("haiku") {
         return PricingData {
-            prompt: 0.0008,
-            completion: 0.004,
-            cache_read: Some(0.00008),
-            cache_write: Some(0.001),
+            prompt: 0.000_000_8,
+            completion: 0.000_004,
+            cache_read: Some(0.000_000_08),
+            cache_write: Some(0.000_001),
         };
     }
     // GPT-4o / GPT-4.1: $2.5/$10 per Mtok
     if name.contains("gpt-4o") || name.contains("gpt-4.1") {
         return PricingData {
-            prompt: 0.0025,
-            completion: 0.01,
-            cache_read: Some(0.000625),
+            prompt: 0.000_002_5,
+            completion: 0.000_01,
+            cache_read: Some(0.000_000_625),
             cache_write: None,
         };
     }
@@ -638,18 +628,18 @@ pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::Pric
         || name.contains("5.4-mini")
     {
         return PricingData {
-            prompt: 0.00015,
-            completion: 0.0006,
-            cache_read: Some(0.0000375),
+            prompt: 0.000_000_15,
+            completion: 0.000_000_6,
+            cache_read: Some(0.000_000_037_5),
             cache_write: None,
         };
     }
     // DeepSeek V3/R1: $0.27/$1.10 per Mtok (cache read $0.07)
     if name.contains("deepseek") {
         return PricingData {
-            prompt: 0.00027,
-            completion: 0.0011,
-            cache_read: Some(0.00007),
+            prompt: 0.000_000_27,
+            completion: 0.000_001_1,
+            cache_read: Some(0.000_000_07),
             cache_write: None,
         };
     }
@@ -659,44 +649,44 @@ pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::Pric
     // ratio so `extract_pricing_for_model` can blend it in.
     if name.contains("qwen") {
         return PricingData {
-            prompt: 0.0008,
-            completion: 0.002,
-            cache_read: Some(0.00032),
+            prompt: 0.000_000_8,
+            completion: 0.000_002,
+            cache_read: Some(0.000_000_32),
             cache_write: None,
         };
     }
     // MiniMax: cache reads discounted, no cache_write premium.
     if name.contains("minimax") {
         return PricingData {
-            prompt: 0.0008,
-            completion: 0.008,
-            cache_read: Some(0.0002),
+            prompt: 0.000_000_8,
+            completion: 0.000_008,
+            cache_read: Some(0.000_000_2),
             cache_write: None,
         };
     }
     // GLM / Zhipu: cache reads ~25% of input, no cache_write premium.
     if name.contains("glm") {
         return PricingData {
-            prompt: 0.0005,
-            completion: 0.0015,
-            cache_read: Some(0.000125),
+            prompt: 0.000_000_5,
+            completion: 0.000_001_5,
+            cache_read: Some(0.000_000_125),
             cache_write: None,
         };
     }
     // Kimi (Moonshot): cache reads ~25%, no cache_write premium.
     if name.contains("kimi") || name.contains("moonshot") {
         return PricingData {
-            prompt: 0.003,
-            completion: 0.015,
-            cache_read: Some(0.00075),
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_75),
             cache_write: None,
         };
     }
     // Default: Sonnet pricing as safe fallback
     PricingData {
-        prompt: 0.003,
-        completion: 0.015,
-        cache_read: Some(0.0003),
-        cache_write: Some(0.00375),
+        prompt: 0.000_003,
+        completion: 0.000_015,
+        cache_read: Some(0.000_000_3),
+        cache_write: Some(0.000_003_75),
     }
 }

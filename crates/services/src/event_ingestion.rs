@@ -393,7 +393,7 @@ impl IngestionEvent {
     ///
     /// For Turn events that contain tool_call_records, this produces:
     /// 1. The main turn event (same as `from_journal_event`)
-    /// 2. One `tool_call` event per tool execution record
+    /// 2. One canonical terminal/disposition event per tool record
     ///
     /// This ensures tool-level granularity reaches the DB regardless of
     /// whether the request came through the HTTP bridge or CLI path.
@@ -418,17 +418,30 @@ impl IngestionEvent {
 
         let mut events = vec![main_event];
 
-        // Expand embedded tool_call_records into individual tool_call events
+        // Expand embedded records into the same canonical lifecycle dialect
+        // emitted by the live runtime. A journal record is already terminal,
+        // so synthesizing a second `started` event would be inaccurate.
         if let Some(ref tool_calls) = event.tool_calls {
             for (i, tc) in tool_calls.iter().enumerate() {
                 let Some(tool_name) = normalize_optional_name(Some(tc.name.clone())) else {
                     continue;
                 };
+                let disposition = tc.effective_disposition();
+                let event_type = match disposition {
+                    crate::session_journal::ToolCallDisposition::Executed if tc.ok => {
+                        "tool_call_completed"
+                    }
+                    crate::session_journal::ToolCallDisposition::Executed => "tool_call_failed",
+                    crate::session_journal::ToolCallDisposition::Rejected => "tool_call_rejected",
+                    crate::session_journal::ToolCallDisposition::Reused => "tool_call_reused",
+                    crate::session_journal::ToolCallDisposition::Suppressed => {
+                        "tool_call_suppressed"
+                    }
+                    crate::session_journal::ToolCallDisposition::Deferred => "tool_call_deferred",
+                };
                 let index = i.to_string();
                 let tc_event_id =
-                    stable_event_id(&["tool_call", &main_event_id, &index, &tool_name]);
-
-                let disposition = tc.effective_disposition();
+                    stable_event_id(&[event_type, &main_event_id, &index, &tool_name]);
                 let raw_content = match disposition {
                     crate::session_journal::ToolCallDisposition::Executed if tc.ok => {
                         format!("{} completed in {}ms", tool_name, tc.ms)
@@ -500,14 +513,7 @@ impl IngestionEvent {
                     event_id: tc_event_id,
                     session_id: session_id.clone(),
                     user_id: uid.clone(),
-                    event_type: if disposition
-                        == crate::session_journal::ToolCallDisposition::Executed
-                        && !tc.ok
-                    {
-                        "tool_error".to_string()
-                    } else {
-                        "tool_call".to_string()
-                    },
+                    event_type: event_type.to_string(),
                     content: Some(content),
                     token_usage: None,
                     llm_model_used: None,
@@ -1809,8 +1815,10 @@ mod tests {
             SESSION_END_EVENT_TYPE,
             "turn",
             "turn_error",
-            "tool_call",
-            "tool_error",
+            "tool_call_started",
+            "tool_call_completed",
+            "tool_call_failed",
+            "tool_call_rejected",
             "approval_required",
             "approval_decision",
             "agent_spawned",
@@ -2349,8 +2357,8 @@ mod tests {
         // First is the main turn event
         assert!(events[0].event_type.contains("turn"));
 
-        // Second is successful tool_call
-        assert_eq!(events[1].event_type, "tool_call");
+        // Second is a successful terminal tool event.
+        assert_eq!(events[1].event_type, "tool_call_completed");
         assert_eq!(events[1].skill_name.as_deref(), Some("git"));
         assert_eq!(
             events[1].metadata.as_ref().unwrap()["tool_name"],
@@ -2371,8 +2379,8 @@ mod tests {
         );
         assert_eq!(events[1].created_at, events[0].created_at);
 
-        // Third is failed tool → tool_error
-        assert_eq!(events[2].event_type, "tool_error");
+        // Third is a failed terminal tool event.
+        assert_eq!(events[2].event_type, "tool_call_failed");
         assert_eq!(events[2].skill_name.as_deref(), Some("read_file"));
         assert!(
             events[2].content.as_ref().unwrap().contains("not found"),
@@ -2435,7 +2443,7 @@ mod tests {
         assert_eq!(main_metadata["tool_outcomes"]["rejected"], 1);
 
         let request = &events[1];
-        assert_eq!(request.event_type, "tool_call");
+        assert_eq!(request.event_type, "tool_call_rejected");
         let metadata = request.metadata.as_ref().expect("tool metadata");
         assert_eq!(metadata["disposition"], "rejected");
         assert_eq!(metadata["error_kind"], "tool_invalid_args");

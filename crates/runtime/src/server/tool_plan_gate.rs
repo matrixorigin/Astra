@@ -232,7 +232,9 @@ pub(crate) async fn execute_enter_plan_mode(
     )
     .await;
 
-    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
+    if let Ok(writer) =
+        astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+    {
         let _ = writer.append(
             &astra_services::session_journal::JournalEvent::plan_lifecycle(
                 Some(session_id),
@@ -319,7 +321,9 @@ pub(crate) async fn execute_exit_plan_mode(
     )
     .await;
 
-    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
+    if let Ok(writer) =
+        astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+    {
         let _ = writer.append(
             &astra_services::session_journal::JournalEvent::plan_lifecycle(
                 Some(session_id),

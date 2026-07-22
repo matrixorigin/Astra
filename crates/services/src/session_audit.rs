@@ -1126,8 +1126,8 @@ fn build_audit_session_list_query(
              THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
            CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
              THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
-           COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
-           COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
+           COUNT(CASE WHEN e.event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) AS tool_calls, \
+           COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) AS error_count, \
            MIN(e.created_at) AS first_ts, \
            MAX(e.created_at) AS last_ts, \
            MAX(CASE WHEN e.llm_model_used IS NOT NULL AND e.llm_model_used != '' THEN e.llm_model_used END) AS model, \
@@ -1378,6 +1378,23 @@ pub struct ContextTraceListResponse {
     pub traces: Vec<ContextTraceEntry>,
 }
 
+fn context_trace_entry_from_json(raw: &str, timestamp: String) -> AuditResult<ContextTraceEntry> {
+    let trace: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| audit_decode_error("context_trace", "metadata", error))?;
+    let turn = trace
+        .pointer("/timing/turn")
+        .and_then(serde_json::Value::as_u64)
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|error| audit_decode_error("context_trace", "timing.turn", error))?
+        .unwrap_or(0);
+    Ok(ContextTraceEntry {
+        turn,
+        timestamp,
+        trace,
+    })
+}
+
 /// Full detail for a single turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnDetail {
@@ -1402,7 +1419,7 @@ pub struct TurnDetail {
     pub stall_type: Option<String>,
     pub plan_subtask_id: Option<String>,
     pub created_at: String,
-    /// Child events (tool_call, tool_error) from event expansion.
+    /// Child events, including canonical tool lifecycle terminals.
     pub child_events: Vec<ChildEvent>,
 }
 
@@ -1510,31 +1527,12 @@ struct TurnCostSample {
     usage: ParsedTurnTokenUsage,
 }
 
-const TOKENS_PER_MILLION: f64 = 1_000_000.0;
-
 fn priced_turn_cost(usage: ParsedTurnTokenUsage, pricing: &PricingData) -> Option<f64> {
-    fn valid_rate(rate: f64) -> Option<f64> {
-        (rate.is_finite() && rate >= 0.0).then_some(rate)
-    }
-
-    fn optional_rate(tokens: u64, rate: Option<f64>) -> Option<f64> {
-        if tokens == 0 {
-            Some(0.0)
-        } else {
-            valid_rate(rate?)
-        }
-    }
-
-    let prompt = valid_rate(pricing.prompt)?;
-    let completion = valid_rate(pricing.completion)?;
-    let cache_read = optional_rate(usage.cached_input_tokens, pricing.cache_read)?;
-    let cache_write = optional_rate(usage.cache_creation_tokens, pricing.cache_write)?;
-    Some(
-        (usage.input_tokens as f64 * prompt
-            + usage.output_tokens as f64 * completion
-            + usage.cached_input_tokens as f64 * cache_read
-            + usage.cache_creation_tokens as f64 * cache_write)
-            / TOKENS_PER_MILLION,
+    pricing.estimated_cost_usd(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_tokens,
     )
 }
 
@@ -2250,7 +2248,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let metrics_row = query(&format!(
             "SELECT \
                COALESCE(MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END), 0) AS turn_count, \
-               COUNT(CASE WHEN event_type = 'turn_error' THEN 1 END) AS error_count, \
+               COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) AS error_count, \
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
                COUNT(CASE WHEN event_type = 'compact' THEN 1 END) AS compact_count, \
@@ -2260,9 +2258,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count, \
                COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) AS approval_decision_count, \
                COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count, \
-               COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) \
-                 + COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_total, \
-               COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_failed, \
+               COUNT(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) AS tool_calls_total, \
+               COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS tool_calls_failed, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
@@ -2485,22 +2482,30 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Traces are persisted on `JournalEvent.context_assembly_trace` in the
-        // session journal file; read and filter events that carry a trace.
-        let events = crate::session_journal::read_journal(session_id)
-            .map_err(|e| internal_error(format!("journal read failed: {e}")))?;
-
-        let mut traces: Vec<ContextTraceEntry> = events
-            .into_iter()
-            .filter_map(|evt| {
-                evt.context_assembly_trace.map(|trace| ContextTraceEntry {
-                    turn: evt.turn.unwrap_or(0),
-                    timestamp: evt.ts,
-                    trace,
-                })
+        // `context_trace_signal` is the owner-scoped durable projection used
+        // by restore and evaluation. Audit must read the same source rather
+        // than a process-local journal that may live on another host.
+        let rows = query(
+            "SELECT IFNULL(CAST(metadata AS CHAR), '{}') AS trace_json, \
+                    CAST(created_at AS CHAR) AS created_at \
+             FROM agent_events \
+             WHERE user_id = ? AND session_id = ? AND event_type = 'context_trace_signal' \
+             ORDER BY created_at ASC, event_id ASC",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+        let traces = rows
+            .iter()
+            .map(|row| {
+                context_trace_entry_from_json(
+                    &audit_row_string(row, "context_trace", "trace_json")?,
+                    audit_row_string(row, "context_trace", "created_at")?,
+                )
             })
-            .collect();
-        traces.sort_by_key(|entry| entry.turn);
+            .collect::<AuditResult<Vec<_>>>()?;
 
         Ok(ContextTraceListResponse {
             session_id: session_id.to_string(),
@@ -2526,14 +2531,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 SELECT \
                   meta_tool_name AS tool_name, \
                  COUNT(*) AS total_calls, \
-                 COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
-                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
+                 COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) AS total_success, \
+                 COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS total_failures, \
                  COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
                  COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
                  CAST(COALESCE(SUM(meta_duration_ms), 0) AS SIGNED) AS total_duration_ms \
                 FROM agent_events \
                 WHERE session_id = ? AND user_id = ? \
-                  AND event_type IN ('tool_call', 'tool_error') \
+                  AND event_type IN ('tool_call_completed', 'tool_call_failed') \
                 GROUP BY tool_name \
               ) agg \
               ORDER BY agg.total_duration_ms DESC",
@@ -2548,7 +2553,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT meta_tool_name AS tool_name, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'tool_error' \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'tool_call_failed' \
              ORDER BY created_at DESC LIMIT 200",
             agent_events_content_cap::TOOL_LAST_ERROR
         );
@@ -2588,7 +2593,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
-               AND event_type IN ('turn_error', 'stall_detected', 'error', 'turn_guard_verdict', 'tool_error') \
+               AND event_type IN ('turn_error', 'stall_detected', 'error', 'turn_guard_verdict', 'tool_call_failed') \
              ORDER BY created_at ASC \
              LIMIT 200",
             agent_events_content_cap::ERROR_LIST_ENTRY
@@ -2730,8 +2735,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) as tokens_in, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) as tokens_out, \
-                COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
-                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
+                COUNT(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) as total_tool_calls, \
+                COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) as total_tool_failures, \
                 COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
                 COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) as total_stalls, \
                 COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) as total_execution_boundaries_opened, \
@@ -2755,9 +2760,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                meta_tool_name as tool_name, \
                COUNT(*) as cnt, \
-               COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) as ok_cnt \
+               COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) as ok_cnt \
              FROM agent_events e \
-             WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
+             WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
              GROUP BY tool_name \
              ORDER BY cnt DESC \
              LIMIT 10"
@@ -2872,13 +2877,13 @@ impl SessionAuditService for DatabaseSessionAuditService {
                SELECT \
                   meta_tool_name AS tool_name, \
                   COUNT(*) AS total_calls, \
-                  COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
-                  COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
+                  COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) AS total_success, \
+                  COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS total_failures, \
                  COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
                  COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
                  COUNT(DISTINCT session_id) AS sessions_used \
                 FROM agent_events e \
-                WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
+                WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
                 GROUP BY tool_name \
               ) agg \
               ORDER BY agg.total_calls DESC \
@@ -2895,7 +2900,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT meta_tool_name AS tool_name, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {cap}) AS content \
              FROM agent_events e \
-             WHERE {where_clause} AND event_type = 'tool_error' \
+             WHERE {where_clause} AND event_type = 'tool_call_failed' \
              ORDER BY created_at DESC",
             cap = agent_events_content_cap::TOOL_LAST_ERROR
         );
@@ -3168,6 +3173,18 @@ fn aggregate_runtime_promotion_stats(
 mod tests {
     use super::*;
 
+    #[test]
+    fn context_trace_projection_reads_turn_from_canonical_signal_metadata() {
+        let entry = context_trace_entry_from_json(
+            r#"{"turn_id":"turn-7","timing":{"turn":7,"total_ms":42}}"#,
+            "2026-07-22 10:11:12.123456".to_string(),
+        )
+        .expect("valid context trace signal");
+
+        assert_eq!(entry.turn, 7);
+        assert_eq!(entry.trace["turn_id"], "turn-7");
+    }
+
     const VALID_RUNTIME_PROMOTION_METADATA: &str = r#"{
         "controller": "adaptive_baseline",
         "outcome": "queued",
@@ -3248,7 +3265,9 @@ mod tests {
                 ),
                 turn_seq: Some(42),
                 model: Some("gpt-5"),
-                pricing_json: Some(r#"{"prompt": 2.0, "completion": 8.0, "cache_read": 0.5}"#),
+                pricing_json: Some(
+                    r#"{"prompt": 0.000002, "completion": 0.000008, "cache_read": 0.0000005}"#,
+                ),
             }
         }
 
@@ -3343,7 +3362,7 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "event_id" => "event-1",
-                "event_type" => "tool_call",
+                "event_type" => "tool_call_failed",
                 "session_id" => "session-1",
                 "tool_name" => "bash",
                 "model" => self.model.unwrap_or("gpt-5"),
@@ -3652,11 +3671,11 @@ mod tests {
                 {"name": "bash", "ok": false, "ms": 10, "error": "boom"}
             ]
         }"#;
-        let child = child_event_from_row(&FakeSessionAuditRow::with_metadata(r#"{"ok": true}"#))
+        let child = child_event_from_row(&FakeSessionAuditRow::with_metadata(r#"{"ok": false}"#))
             .expect("child event decodes");
         assert_eq!(child.event_id, "event-1");
-        assert_eq!(child.event_type, "tool_call");
-        assert_eq!(child.metadata["ok"], true);
+        assert_eq!(child.event_type, "tool_call_failed");
+        assert_eq!(child.metadata["ok"], false);
 
         let parent =
             turn_detail_parent_from_row(&FakeSessionAuditRow::with_metadata(parent_metadata))
@@ -3738,7 +3757,7 @@ mod tests {
         .expect("error list row decodes");
 
         assert_eq!(entry.event_id, "event-1");
-        assert_eq!(entry.event_type, "tool_call");
+        assert_eq!(entry.event_type, "tool_call_failed");
         assert_eq!(entry.turn, Some(42));
         assert_eq!(entry.content, "hello from audit turn");
         assert_eq!(entry.metadata["error"], "boom");
@@ -4135,9 +4154,9 @@ mod tests {
             .expect("pricing row decodes")
             .expect("wanted model is retained");
         assert_eq!(decoded.0, "gpt-5");
-        assert_eq!(decoded.1.prompt, 2.0);
-        assert_eq!(decoded.1.completion, 8.0);
-        assert_eq!(decoded.1.cache_read, Some(0.5));
+        assert_eq!(decoded.1.prompt, 0.000_002);
+        assert_eq!(decoded.1.completion, 0.000_008);
+        assert_eq!(decoded.1.cache_read, Some(0.000_000_5));
         assert_eq!(decoded.1.cache_write, None);
 
         let not_wanted = HashSet::from(["glm-5.2"]);
@@ -4245,8 +4264,8 @@ mod tests {
         let pricing_by_model = HashMap::from([(
             "claude".to_string(),
             PricingData {
-                prompt: 2.0,
-                completion: 8.0,
+                prompt: 0.000_002,
+                completion: 0.000_008,
                 cache_read: None,
                 cache_write: None,
             },
@@ -4260,7 +4279,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_session_cost_marks_missing_cache_pricing_as_unpriced() {
+    fn summarize_session_cost_falls_back_to_prompt_rate_for_cache_tokens() {
         let turns = vec![TurnCostSample {
             model: "claude".into(),
             usage: ParsedTurnTokenUsage {
@@ -4274,18 +4293,18 @@ mod tests {
         let pricing_by_model = HashMap::from([(
             "claude".to_string(),
             PricingData {
-                prompt: 2.0,
-                completion: 8.0,
+                prompt: 0.000_002,
+                completion: 0.000_008,
                 cache_read: None,
                 cache_write: None,
             },
         )]);
 
         let summary = summarize_session_cost(turns, &pricing_by_model);
-        assert_eq!(summary.priced_turn_count, 0);
-        assert_eq!(summary.unpriced_turn_count, 1);
-        assert_eq!(summary.estimated_cost_usd, None);
-        assert!(summary.per_model_cost_usd.is_empty());
+        assert_eq!(summary.priced_turn_count, 1);
+        assert_eq!(summary.unpriced_turn_count, 0);
+        assert!((summary.estimated_cost_usd.unwrap() - 0.000_38).abs() < 1e-12);
+        assert!((summary.per_model_cost_usd["claude"] - 0.000_38).abs() < 1e-12);
     }
 
     #[test]

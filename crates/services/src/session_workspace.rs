@@ -1064,6 +1064,13 @@ mod tests {
             })
         }
 
+        async fn upsert_json_artifact_projection(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
+            self.persist_json_artifact(record).await
+        }
+
         async fn load_json_artifact(
             &self,
             _user_id: &str,

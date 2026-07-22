@@ -5,7 +5,7 @@
 //! ```text
 //! restore_session(user_id, session_id)
 //!   ├─ 1. Prove the MatrixOne session belongs to user_id
-//!   ├─ 2. Pull local workspace metadata when present
+//!   ├─ 2. Pull owner-scoped local journal/checkpoints when present
 //!   ├─ 3. Pull owner-bound cloud artifacts/events/checkpoints
 //!   └─ 4. Return RestoredSession for the REPL to continue
 //! ```
@@ -18,14 +18,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{
-    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
-    StoredSessionArtifact,
-};
+use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
 
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
@@ -620,9 +616,9 @@ impl HybridRestoreService {
             return Ok(None);
         }
 
-        let local_journal = summarize_local_journal(session_id)?;
+        let local_journal = summarize_local_journal(user_id, session_id)?;
         let mut local_workspace_error = None;
-        let local_workspace = match self.restore_local_workspace(session_id) {
+        let local_workspace = match self.restore_local_workspace(user_id, session_id) {
             Ok(workspace) => workspace,
             Err(error) => {
                 local_workspace_error = Some(error);
@@ -645,7 +641,7 @@ impl HybridRestoreService {
                 recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
             }
 
-            let ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
+            let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
 
             return Ok(Some(restored_session_from_workspace(
                 ws,
@@ -670,7 +666,8 @@ impl HybridRestoreService {
                 recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
             }
 
-            let local_ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
+            let local_ckpt_count =
+                local_checkpoint_count(Some(user_id), session_id, "restore_session_inner")?;
             let cloud_ckpt_count = self
                 .cloud_checkpoint_count(user_id, session_id)
                 .await
@@ -686,7 +683,7 @@ impl HybridRestoreService {
         }
 
         if let Some(summary) = local_journal {
-            let ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
+            let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
 
             return Ok(Some(RestoredSession {
                 session_id: session_id.to_string(),
@@ -732,12 +729,15 @@ impl HybridRestoreService {
             return Ok(Vec::new());
         }
 
-        let local_entries =
+        let local_entries = if user_id.is_some() {
+            Vec::new()
+        } else {
             super::session_checkpoint::read_checkpoint_index(session_id).map_err(|error| {
                 format!(
                     "list_checkpoints_inner: failed to read local checkpoint index for {session_id}: {error}"
                 )
-            })?;
+            })?
+        };
         let local = parse_local_checkpoint_entries(&local_entries);
         let cloud = if let Some(user_id) = user_id {
             self.cloud_checkpoints(user_id, session_id)
@@ -756,8 +756,15 @@ impl HybridRestoreService {
     /// Try restoring workspace metadata from local YAML file.
     fn restore_local_workspace(
         &self,
+        user_id: Option<&str>,
         session_id: &str,
     ) -> Result<Option<super::session_workspace::WorkspaceMetadata>, String> {
+        // The legacy YAML workspace has no physical owner in its path. It is
+        // valid only for local/CLI restore and must never be consulted by an
+        // authenticated cloud restore.
+        if user_id.is_some() {
+            return Ok(None);
+        }
         match super::session_workspace::read_workspace(session_id) {
             Ok(ws) => Ok(Some(ws)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1324,41 +1331,28 @@ impl HybridRestoreService {
     }
 }
 
-/// Reads `composite_snapshots.json` from the session step-checkpoint directory.
-///
-/// Must stay aligned with `astra_pipeline::step_checkpoint::read_composite_snapshot_index`
-/// (same path and plaintext JSON format).
-fn read_composite_snapshot_index_local(
+fn local_checkpoint_count(
+    user_id: Option<&str>,
     session_id: &str,
-) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-    let path = composite_snapshots_json_path(session_id)?;
-    if !path.exists() {
-        return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
-    }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
-    let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
-        serde_json::from_str(&content)
-            .map_err(|e| format!("parse composite_snapshots.json: {e}"))?;
-    index.normalize_versions();
-    Ok(index)
-}
-
-fn composite_snapshots_json_path(session_id: &str) -> Result<PathBuf, String> {
-    crate::local_session_artifact_store()
-        .session_path(session_id, "step_checkpoints/composite_snapshots.json")
-        .map_err(|error| format!("invalid session_id: {error}"))
-}
-
-fn local_checkpoint_count(session_id: &str, context: &str) -> Result<u32, String> {
-    let entries =
-        super::session_checkpoint::read_checkpoint_index(session_id).map_err(|error| {
-            format!("{context}: failed to read local checkpoint index for {session_id}: {error}")
-        })?;
-    u32::try_from(entries.len()).map_err(|_| {
+    context: &str,
+) -> Result<u32, String> {
+    let count = match user_id {
+        // Authenticated counts come from cloud checkpoint rows. The runtime
+        // local step format is owned by `astra-pipeline`; the services crate
+        // must not duplicate that codec or reverse-depend on runtime layers.
+        Some(_) => 0,
+        None => super::session_checkpoint::read_checkpoint_index(session_id)
+            .map_err(|error| {
+                format!(
+                    "{context}: failed to read local checkpoint index for {session_id}: {error}"
+                )
+            })?
+            .len(),
+    };
+    u32::try_from(count).map_err(|_| {
         format!(
             "{context}: local checkpoint index for {session_id} has too many entries: {}",
-            entries.len()
+            count
         )
     })
 }
@@ -1369,7 +1363,7 @@ fn composite_snapshot_index_to_remote_artifact_record(
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
     Ok(SessionArtifactJsonRecord {
-        artifact_id: String::new(),
+        artifact_id: "composite-snapshot-index".to_string(),
         session_id: session_id.to_string(),
         user_id: user_id.to_string(),
         artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
@@ -1394,7 +1388,7 @@ pub async fn persist_remote_composite_snapshot_index(
     let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
         .map_err(|error| error.to_string())?;
     store
-        .persist_json_artifact(record)
+        .upsert_json_artifact_projection(record)
         .await
         .map_err(|error| error.to_string())
 }
@@ -1522,8 +1516,17 @@ struct CloudWorkspaceArtifact {
     metadata: super::session_workspace::WorkspaceMetadata,
 }
 
-fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummary>, String> {
-    let (events, _, _) = match crate::session_journal::read_journal_for_digest(session_id) {
+fn summarize_local_journal(
+    user_id: Option<&str>,
+    session_id: &str,
+) -> Result<Option<LocalJournalSummary>, String> {
+    let digest = match user_id {
+        Some(user_id) => {
+            crate::session_journal::read_journal_for_digest_for_user(user_id, session_id)
+        }
+        None => crate::session_journal::read_journal_for_digest(session_id),
+    };
+    let (events, _, _) = match digest {
         Ok(digest) => digest,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -1944,7 +1947,10 @@ impl SessionRestoreService for HybridRestoreService {
         {
             return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
         }
-        let local = read_composite_snapshot_index_local(session_id)?;
+        // Runtime pushes this mutable projection after every successful local
+        // index update. The authenticated services view therefore reads the
+        // owner-scoped remote projection only.
+        let local = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
         let remote = self
             .restore_cloud_composite_snapshot_index(user_id, session_id)
             .await;
@@ -3622,46 +3628,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_composite_snapshot_index_reads_plaintext_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = uuid::Uuid::new_v4().to_string();
-        let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&sid, 3)
-            .session_state("000003-heavy.json")
-            .build();
-        snapshot.snapshot_id = "snap-plaintext".into();
-        let index = astra_core::composite_snapshot::CompositeSnapshotIndex {
-            snapshots: vec![snapshot],
-        };
-        let path = composite_snapshots_json_path(&sid).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let json = serde_json::to_string(&index).unwrap();
-        std::fs::write(&path, json).unwrap();
-
-        let restored = read_composite_snapshot_index_local(&sid).unwrap();
-
-        assert_eq!(restored.snapshots.len(), 1);
-        assert_eq!(restored.snapshots[0].snapshot_id, "snap-plaintext");
-    }
-
-    #[test]
-    fn local_composite_snapshot_index_rejects_invalid_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let sid = uuid::Uuid::new_v4().to_string();
-        let path = composite_snapshots_json_path(&sid).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "not-json").unwrap();
-
-        let error = read_composite_snapshot_index_local(&sid).unwrap_err();
-
-        assert!(
-            error.contains("parse composite_snapshots.json"),
-            "corrupt local index must surface as restore error: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn local_only_restore_to_checkpoint_session_not_found() {
         let svc = HybridRestoreService::local_only();
@@ -4558,6 +4524,47 @@ mod tests {
             recent_tools_from_context_trace(Some(&trace)),
             vec!["rg".to_string(), "bash".to_string()],
             "resume recent_tools must contain canonical non-empty tool names only"
+        );
+    }
+
+    #[test]
+    fn composite_snapshot_index_uses_one_stable_remote_projection_id() {
+        let index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
+        let first =
+            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
+                .expect("serialize first index");
+        let second =
+            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
+                .expect("serialize replayed index");
+
+        assert_eq!(first.artifact_id, "composite-snapshot-index");
+        assert_eq!(second.artifact_id, first.artifact_id);
+    }
+
+    #[test]
+    fn authenticated_local_summary_reads_only_the_requested_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let owner_writer = crate::session_journal::JournalWriter::for_user("user-a", &session_id)
+            .expect("owner journal");
+        owner_writer
+            .append(&crate::session_journal::JournalEvent::session_start(
+                Some(&session_id),
+                Some("owner-model"),
+            ))
+            .unwrap();
+
+        assert!(
+            summarize_local_journal(Some("user-b"), &session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            summarize_local_journal(Some("user-a"), &session_id)
+                .unwrap()
+                .and_then(|summary| summary.model),
+            Some("owner-model".to_string())
         );
     }
 

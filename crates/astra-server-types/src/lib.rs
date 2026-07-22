@@ -176,6 +176,7 @@ pub struct SessionCreateRequest {
 pub struct SessionUpdateRequest {
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub metadata_patch: Option<serde_json::Map<String, serde_json::Value>>,
     pub status: Option<String>,
 }
 

@@ -237,6 +237,7 @@ pub(crate) async fn persist_configured_capture(
     if let Err(error) = persist_capture(
         full_capture_enabled,
         session_id,
+        user_id,
         turn,
         round,
         agent_id,
@@ -359,6 +360,7 @@ pub(crate) fn spawn_prompt_request_plan_persist_or_log(
 
 fn capture_file_path(
     session_id: &str,
+    user_id: &str,
     turn: u32,
     round: u32,
     source: &str,
@@ -368,8 +370,10 @@ fn capture_file_path(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    let owner = astra_services::OwnerScope::user(user_id)
+        .map_err(|error| format!("resolve capture owner for session {session_id}: {error}"))?;
     let dir = astra_services::local_session_artifact_store()
-        .session_dir(session_id)
+        .session_dir_for_owner(&owner, session_id)
         .map_err(|error| format!("resolve capture dir for session {session_id}: {error}"))?;
     Ok(dir.join(format!(
         "llm_capture_t{turn}_r{round}_{source}_{outcome}_{millis}.json"
@@ -379,6 +383,7 @@ fn capture_file_path(
 #[allow(clippy::too_many_arguments)]
 fn persist_capture_inner(
     session_id: &str,
+    user_id: &str,
     turn: u32,
     round: u32,
     agent_id: Option<&str>,
@@ -398,7 +403,7 @@ fn persist_capture_inner(
 
     let source = sanitize_component(source);
     let outcome = sanitize_component(outcome);
-    let path = capture_file_path(session_id, turn, round, &source, &outcome)?;
+    let path = capture_file_path(session_id, user_id, turn, round, &source, &outcome)?;
     let parent = path
         .parent()
         .ok_or_else(|| format!("capture path has no parent: {}", path.display()))?;
@@ -437,6 +442,7 @@ fn persist_capture_inner(
 pub(crate) fn persist_capture(
     full_capture_enabled: bool,
     session_id: &str,
+    user_id: &str,
     turn: u32,
     round: u32,
     agent_id: Option<&str>,
@@ -455,6 +461,7 @@ pub(crate) fn persist_capture(
     }
     persist_capture_inner(
         session_id,
+        user_id,
         turn,
         round,
         agent_id,
@@ -517,6 +524,13 @@ mod tests {
                 referenced_by_durable_count: 0,
                 created_at: None,
             })
+        }
+
+        async fn upsert_json_artifact_projection(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, astra_services::SessionArtifactStoreError> {
+            self.persist_json_artifact(record).await
         }
 
         async fn load_json_artifact(
@@ -587,6 +601,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let path = persist_capture_inner(
             "sess-123",
+            "user-1",
             4,
             2,
             Some("agent-1"),
@@ -644,6 +659,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let err = persist_capture_inner(
             "..",
+            "user-1",
             0,
             0,
             None,
@@ -675,6 +691,7 @@ mod tests {
         let path = persist_capture(
             false,
             "sess-123",
+            "user-1",
             1,
             0,
             None,
@@ -758,8 +775,9 @@ mod tests {
         .await
         .expect("configured capture");
 
+        let owner = astra_services::OwnerScope::user("user-1").expect("owner scope");
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
+            .session_dir_for_owner(&owner, session_id)
             .expect("session dir");
         let files: Vec<_> = std::fs::read_dir(session_dir)
             .expect("capture dir")
@@ -773,7 +791,7 @@ mod tests {
         );
         let capture_path = std::fs::read_dir(
             astra_services::local_session_artifact_store()
-                .session_dir(session_id)
+                .session_dir_for_owner(&owner, session_id)
                 .expect("session dir"),
         )
         .expect("capture dir")
@@ -879,8 +897,9 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let store = RecordingArtifactStore::default();
         let session_id = "00000000-0000-0000-0000-000000000125";
+        let owner = astra_services::OwnerScope::user("user-1").expect("owner scope");
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir(session_id)
+            .session_dir_for_owner(&owner, session_id)
             .expect("session dir");
         std::fs::create_dir_all(session_dir.parent().expect("session dir parent"))
             .expect("create owner sessions root");

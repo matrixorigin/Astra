@@ -850,11 +850,9 @@ impl DatabaseReflectService {
                CAST(d.decision_output AS CHAR) AS decision_output_json, \
                DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
-             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
              WHERE d.user_id = ? AND d.session_id = ? \
              ORDER BY d.created_at DESC LIMIT ?",
         )
-        .bind(user_id)
         .bind(user_id)
         .bind(session_id)
         .bind(decision_limit)
@@ -1079,11 +1077,9 @@ impl ReflectService for DatabaseReflectService {
             "SELECT d.decision_type, COUNT(*) AS cnt, \
                COUNT(DISTINCT d.model_used) AS models_used \
              FROM ctx_decision_audits d \
-             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
              WHERE d.user_id = ? AND d.session_id = ? \
              GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
         )
-        .bind(user_id)
         .bind(user_id)
         .bind(session_id)
         .fetch_all(&pool)
@@ -2850,7 +2846,6 @@ mod tests {
             "SELECT d.decision_type, COUNT(*) AS cnt, \
                COUNT(DISTINCT d.model_used) AS models_used \
              FROM ctx_decision_audits d \
-             JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
              WHERE d.user_id = ? AND d.session_id = ? \
              GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
             // error patterns

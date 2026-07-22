@@ -497,6 +497,18 @@ impl Drop for UnattributedRecallRunBoundary {
     }
 }
 
+fn journal_writer_for_owner(
+    user_id: Option<&str>,
+    session_id: &str,
+) -> std::io::Result<astra_services::session_journal::JournalWriter> {
+    match user_id {
+        Some(user_id) => {
+            astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+        }
+        None => astra_services::session_journal::JournalWriter::new(session_id),
+    }
+}
+
 /// Run the multi-turn agentic loop using the provided host.
 ///
 /// This is the runtime-portable entry point. The host handles all
@@ -529,7 +541,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if let Some(sid) = state.current_session_id.as_deref() {
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
-                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                    if let Ok(writer) =
+                        journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
+                    {
                         if let Err(error) = buf.flush_interrupted(&writer) {
                             tracing::warn!(
                                 session_id = sid,
@@ -554,7 +568,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             // Best-effort flush of turn observability events on interruption.
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
-                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                    if let Ok(writer) =
+                        journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
+                    {
                         if let Err(error) = buf.flush_interrupted(&writer) {
                             tracing::warn!(
                                 session_id = sid,
@@ -572,7 +588,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 interruption.to_json(),
             )
             .with_agentic_step(Some(current_agentic_step(state)));
-            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+            if let Ok(writer) =
+                journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
+            {
                 if let Err(error) = writer.append(&evt) {
                     tracing::warn!(
                         session_id = sid,

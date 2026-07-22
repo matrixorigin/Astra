@@ -5,8 +5,8 @@ use crate::cli::slash::slash_stats;
 #[test]
 fn cost_for_tokens() {
     let pricing = astra_services::models::PricingData {
-        prompt: 0.003,
-        completion: 0.015,
+        prompt: 0.000_003,
+        completion: 0.000_015,
         cache_read: None,
         cache_write: None,
     };
@@ -36,21 +36,19 @@ fn cost_for_tokens() {
 
     // with explicit cache rates
     let cache_pricing = astra_services::models::PricingData {
-        prompt: 0.003,
-        completion: 0.015,
-        cache_read: Some(0.0003),
-        cache_write: Some(0.00375),
+        prompt: 0.000_003,
+        completion: 0.000_015,
+        cache_read: Some(0.000_000_3),
+        cache_write: Some(0.000_003_75),
     };
     let cost = slash_stats::cost_for_tokens(500, 200, 1000, 100, &cache_pricing);
-    let expected = (500.0 * 0.003 / 1000.0)
-        + (200.0 * 0.015 / 1000.0)
-        + (1000.0 * 0.0003 / 1000.0)
-        + (100.0 * 0.00375 / 1000.0);
+    let expected =
+        (500.0 * 0.000_003) + (200.0 * 0.000_015) + (1000.0 * 0.000_000_3) + (100.0 * 0.000_003_75);
     assert!((cost - expected).abs() < 1e-10);
 
-    // cache fallback: None → 10%/125% of prompt rate
+    // Missing cache pricing uses the ordinary input rate.
     let cost = slash_stats::cost_for_tokens(0, 0, 1000, 1000, &pricing);
-    let expected = (1000.0 * 0.003 * 0.1 / 1000.0) + (1000.0 * 0.003 * 1.25 / 1000.0);
+    let expected = 2000.0 * 0.000_003;
     assert!((cost - expected).abs() < 1e-10);
 }
 
@@ -78,19 +76,20 @@ fn format_cost() {
 #[test]
 fn extract_pricing_for_model_basic_scenarios() {
     // nested object
-    let models =
-        vec![serde_json::json!({"name":"gpt-4","pricing":{"prompt":0.03,"completion":0.06}})];
+    let models = vec![
+        serde_json::json!({"name":"gpt-4","pricing":{"prompt":0.000_03,"completion":0.000_06}}),
+    ];
     let p = slash_stats::extract_pricing_for_model(&models, "gpt-4").unwrap();
-    assert!((p.prompt - 0.03).abs() < 1e-10);
-    assert!((p.completion - 0.06).abs() < 1e-10);
+    assert!((p.prompt - 0.000_03).abs() < 1e-10);
+    assert!((p.completion - 0.000_06).abs() < 1e-10);
 
     // flat fields
     let models = vec![
-        serde_json::json!({"name":"claude-3","pricing_prompt":0.008,"pricing_completion":0.024}),
+        serde_json::json!({"name":"claude-3","pricing_prompt":0.000_008,"pricing_completion":0.000_024}),
     ];
     let p = slash_stats::extract_pricing_for_model(&models, "claude-3").unwrap();
-    assert!((p.prompt - 0.008).abs() < 1e-10);
-    assert!((p.completion - 0.024).abs() < 1e-10);
+    assert!((p.prompt - 0.000_008).abs() < 1e-10);
+    assert!((p.completion - 0.000_024).abs() < 1e-10);
 
     // model not found
     assert!(slash_stats::extract_pricing_for_model(&models, "nonexistent").is_none());
@@ -106,43 +105,43 @@ fn extract_pricing_for_model_basic_scenarios() {
 }
 
 #[test]
-fn extract_pricing_inherits_cache_read_from_family_when_missing() {
+fn extract_pricing_preserves_missing_cache_rates() {
     let models = vec![serde_json::json!({
         "name": "qwen-plus",
-        "pricing_prompt": 0.0008,
-        "pricing_completion": 0.002,
+        "pricing_prompt": 0.000_000_8,
+        "pricing_completion": 0.000_002,
     })];
     let p = slash_stats::extract_pricing_for_model(&models, "qwen-plus").unwrap();
     assert_eq!(p.cache_write, None);
-    assert!(p.cache_read.is_some());
+    assert_eq!(p.cache_read, None);
 }
 
 #[test]
 fn extract_pricing_preserves_explicit_cache_rates() {
     let models = vec![serde_json::json!({
         "name": "claude-sonnet",
-        "pricing_prompt": 0.003,
-        "pricing_completion": 0.015,
-        "pricing_cache_read": 0.0003,
-        "pricing_cache_write": 0.00375,
+        "pricing_prompt": 0.000_003,
+        "pricing_completion": 0.000_015,
+        "pricing_cache_read": 0.000_000_3,
+        "pricing_cache_write": 0.000_003_75,
     })];
     let p = slash_stats::extract_pricing_for_model(&models, "claude-sonnet").unwrap();
-    assert!((p.cache_read.unwrap() - 0.0003).abs() < 1e-10);
-    assert!((p.cache_write.unwrap() - 0.00375).abs() < 1e-10);
+    assert!((p.cache_read.unwrap() - 0.000_000_3).abs() < 1e-10);
+    assert!((p.cache_write.unwrap() - 0.000_003_75).abs() < 1e-10);
 }
 
 #[test]
-fn bedrock_claude_sonnet_cost_uses_family_cache_rates() {
-    // Bedrock model with only prompt/completion — cache rates come from family fallback
+fn missing_cache_rates_use_input_rate_without_family_guesses() {
     let models = vec![serde_json::json!({
         "name": "us.anthropic.claude-sonnet-4-6",
-        "pricing_prompt": 0.003,
-        "pricing_completion": 0.015,
+        "pricing_prompt": 0.000_003,
+        "pricing_completion": 0.000_015,
     })];
     let p =
         slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
-    assert!((p.cache_read.unwrap() - 0.0003).abs() < 1e-8);
-    assert!((p.cache_write.unwrap() - 0.00375).abs() < 1e-8);
+    assert_eq!(p.cache_read, None);
+    assert_eq!(p.cache_write, None);
+    assert!((slash_stats::cost_for_tokens(0, 0, 1000, 1000, &p) - 0.006).abs() < 1e-12);
 }
 
 // ── fallback_pricing ────────────────────────────────────────────────
@@ -150,20 +149,23 @@ fn bedrock_claude_sonnet_cost_uses_family_cache_rates() {
 #[test]
 fn fallback_pricing_by_model() {
     let cases: &[(&str, f64, Option<f64>)] = &[
-        ("claude-sonnet-4-20250514", 0.003, Some(0.0003)),
-        ("claude-opus-4-20250514", 0.015, None),
-        ("claude-opus-4.5-20250415", 0.005, None),
-        ("claude-haiku-4.5-20250514", 0.001, None),
-        ("gpt-4o-2024-08-06", 0.0025, None),
-        ("deepseek-chat", 0.00027, None),
-        ("some-unknown-model", 0.003, None), // defaults to sonnet
+        ("claude-sonnet-4-20250514", 0.000_003, Some(0.000_000_3)),
+        ("claude-opus-4-20250514", 0.000_015, None),
+        ("claude-opus-4.5-20250415", 0.000_005, None),
+        ("claude-haiku-4.5-20250514", 0.000_001, None),
+        ("gpt-4o-2024-08-06", 0.000_002_5, None),
+        ("deepseek-chat", 0.000_000_27, None),
+        ("some-unknown-model", 0.000_003, None), // defaults to sonnet
     ];
     for (model, expected_prompt, expected_cache_read) in cases {
         let p = slash_stats::fallback_pricing(model);
-        assert!((p.prompt - expected_prompt).abs() < 1e-6, "{model}: prompt");
+        assert!(
+            (p.prompt - expected_prompt).abs() < 1e-12,
+            "{model}: prompt"
+        );
         if let Some(cr) = expected_cache_read {
             assert!(
-                (p.cache_read.unwrap() - cr).abs() < 1e-8,
+                (p.cache_read.unwrap() - cr).abs() < 1e-12,
                 "{model}: cache_read"
             );
         }

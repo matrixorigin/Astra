@@ -555,13 +555,14 @@ fn strategy_change_description(
 }
 
 fn append_session_journal_event(
+    user_id: &str,
     session_id: &str,
     event: astra_services::session_journal::JournalEvent,
 ) {
     // `JournalWriter::append` auto-prepends `SessionStart` under the same
     // file lock; an eager `ensure_session_start_event` here would reacquire
     // flock + restat the journal on every event without changing behavior.
-    match astra_services::session_journal::JournalWriter::new(session_id) {
+    match astra_services::session_journal::JournalWriter::for_user(user_id, session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
                 tracing::error!(
@@ -891,6 +892,7 @@ fn open_server_rollback_boundary(
     };
     if let Some(session_id) = session_id {
         append_session_journal_event(
+            executor.journal_user_id(),
             session_id,
             astra_services::session_journal::JournalEvent::execution_boundary_opened(
                 Some(session_id),
@@ -986,6 +988,7 @@ async fn finalize_server_rollback_boundary(
                         journal: executor.session_state_journal.as_ref(),
                         current_turn_index: executor.journal_turn_index.load(Ordering::Relaxed),
                         restore_context: tool_session_state_rollback::SessionStateRestoreContext {
+                            user_id: executor.journal_user_id(),
                             session_id: &executor.session_id,
                             observability_session: executor.observability_session.as_ref(),
                             task_manager: &executor.task_manager(),
@@ -1017,6 +1020,7 @@ async fn finalize_server_rollback_boundary(
         );
         if let Some(session_id) = session_id {
             append_session_journal_event(
+                executor.journal_user_id(),
                 session_id,
                 astra_services::session_journal::JournalEvent::execution_boundary_aborted(
                     Some(session_id),
@@ -1032,6 +1036,7 @@ async fn finalize_server_rollback_boundary(
         }
     } else if let Some(session_id) = session_id {
         append_session_journal_event(
+            executor.journal_user_id(),
             session_id,
             astra_services::session_journal::JournalEvent::execution_boundary_committed(
                 Some(session_id),
@@ -2735,7 +2740,7 @@ mod tests {
     }
 
     fn read_journal_events(session_id: &str) -> Vec<JournalEvent> {
-        let writer = JournalWriter::new(session_id).unwrap();
+        let writer = JournalWriter::for_user("test-user", session_id).unwrap();
         let content = std::fs::read_to_string(writer.path()).unwrap_or_default();
         content
             .lines()
@@ -2758,7 +2763,7 @@ mod tests {
     }
 
     fn cleanup_journal(session_id: &str) {
-        let writer = JournalWriter::new(session_id).unwrap();
+        let writer = JournalWriter::for_user("test-user", session_id).unwrap();
         std::fs::remove_file(writer.path()).ok();
     }
 
@@ -2952,6 +2957,7 @@ esac
         );
 
         append_session_journal_event(
+            "test-user",
             &session_id,
             astra_services::session_journal::JournalEvent::execution_boundary_committed(
                 Some(&session_id),

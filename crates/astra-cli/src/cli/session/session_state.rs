@@ -1097,10 +1097,10 @@ mod default_tests {
     fn session_cost_accumulation() {
         let mut state = SessionState::default();
         state.cached_pricing = astra_services::models::PricingData {
-            prompt: 3.0,
-            completion: 15.0,
-            cache_read: Some(0.3),
-            cache_write: Some(3.75),
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_3),
+            cache_write: Some(0.000_003_75),
         };
 
         let cost1 = crate::cli::slash::slash_stats::cost_for_tokens(
@@ -1111,7 +1111,7 @@ mod default_tests {
             &state.cached_pricing,
         );
         state.total_session_cost += cost1;
-        assert!(cost1 > 0.0);
+        assert!((cost1 - 0.011_115).abs() < 1e-12);
 
         let cost2 = crate::cli::slash::slash_stats::cost_for_tokens(
             2000,

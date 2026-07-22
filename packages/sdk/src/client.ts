@@ -582,6 +582,7 @@ export class AstraClient {
     const wire: Record<string, unknown> = {};
     if (body.title !== undefined) wire.title = body.title;
     if (body.metadata !== undefined) wire.metadata = body.metadata;
+    if (body.metadataPatch !== undefined) wire.metadata_patch = body.metadataPatch;
     if (body.status !== undefined) wire.status = body.status;
     const raw = await this.put<SessionWire>(sessionPath(sessionId), wire);
     return normalizeSession(raw);

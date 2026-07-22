@@ -878,6 +878,49 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
+  it("does not rewrite an unchanged explicit workspace selection", async () => {
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      messages: [],
+      workspaceSelection: { kind: "server_sandbox" },
+    });
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review the current branch",
+          workspace: { kind: "server_sandbox" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+    await reader?.cancel();
+  });
+
   it("forwards workspace bindings and selected connectors after returning local SSE", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();

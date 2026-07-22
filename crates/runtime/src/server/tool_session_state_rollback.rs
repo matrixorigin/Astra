@@ -32,6 +32,7 @@ pub(crate) struct SessionStateRollbackEntry {
 }
 
 pub(crate) struct SessionStateRestoreContext<'a> {
+    pub(crate) user_id: &'a str,
     pub(crate) session_id: &'a str,
     pub(crate) observability_session:
         Option<&'a Arc<RwLock<crate::observability::ObservabilitySession>>>,
@@ -282,6 +283,7 @@ pub(crate) async fn restore_entry(
         } => {
             restore_observability_snapshot(context.observability_session, snapshot)?;
             persist_config_override(
+                context.user_id,
                 context.session_id,
                 path,
                 old_value.clone(),
@@ -655,6 +657,7 @@ mod tests {
         let task_manager = TaskManager::in_memory();
 
         let context = SessionStateRestoreContext {
+            user_id: "test-user",
             session_id: "session-1",
             observability_session: None,
             task_manager: &task_manager,
@@ -677,6 +680,7 @@ mod tests {
                 journal: &journal,
                 current_turn_index: 1,
                 restore_context: SessionStateRestoreContext {
+                    user_id: "test-user",
                     session_id: "session-1",
                     observability_session: None,
                     task_manager: &task_manager,
@@ -706,6 +710,7 @@ mod tests {
                 journal: &journal,
                 current_turn_index: 9,
                 restore_context: SessionStateRestoreContext {
+                    user_id: "test-user",
                     session_id: "session-1",
                     observability_session: None,
                     task_manager: &task_manager,
@@ -747,6 +752,7 @@ mod tests {
                 journal: &journal,
                 current_turn_index: 4,
                 restore_context: SessionStateRestoreContext {
+                    user_id: "test-user",
                     session_id: "session-1",
                     observability_session: None,
                     task_manager: &task_manager,

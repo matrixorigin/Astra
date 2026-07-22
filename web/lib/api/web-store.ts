@@ -1554,6 +1554,9 @@ export async function updateChatWorkspaceSelection(
   }
 
   const previous = chat.workspaceSelection;
+  if (sameWorkspaceSelection(previous, normalized)) {
+    return getChat(ownerUserId, chatId);
+  }
   if (normalized) {
     chat.workspaceSelection = normalized;
   } else {
@@ -2312,23 +2315,10 @@ async function updateBackendSessionModel(
     auth: "required",
     operation: `update persisted session ${sessionId} model`,
   });
-  let parsed: RuntimeSessionResponse;
   try {
-    parsed = await client.sdk.getRuntimeSession(sessionId);
-  } catch (error) {
-    throw runtimeOperationError(
-      `Cannot read persisted session ${sessionId} before model update`,
-      error,
-    );
-  }
-
-  const metadata = {
-    ...(parsed.metadata ?? {}),
-    current_model: model,
-  };
-
-  try {
-    await client.sdk.updateRuntimeSession(sessionId, { metadata });
+    await client.sdk.updateRuntimeSession(sessionId, {
+      metadata_patch: { current_model: model },
+    });
   } catch (error) {
     throw runtimeOperationError(
       `Cannot update persisted session ${sessionId} model`,
@@ -2346,25 +2336,14 @@ async function updateBackendSessionWorkspaceSelection(
     auth: "required",
     operation: `update persisted session ${sessionId} workspace selection`,
   });
-  let parsed: RuntimeSessionResponse;
   try {
-    parsed = await client.sdk.getRuntimeSession(sessionId);
-  } catch (error) {
-    throw runtimeOperationError(
-      `Cannot read persisted session ${sessionId} before workspace selection update`,
-      error,
-    );
-  }
-
-  const metadata = {
-    ...(parsed.metadata ?? {}),
-    [WORKSPACE_SELECTION_METADATA_KEY]: selection
-      ? workspaceSelectionMetadata(selection)
-      : null,
-  };
-
-  try {
-    await client.sdk.updateRuntimeSession(sessionId, { metadata });
+    await client.sdk.updateRuntimeSession(sessionId, {
+      metadata_patch: {
+        [WORKSPACE_SELECTION_METADATA_KEY]: selection
+          ? workspaceSelectionMetadata(selection)
+          : null,
+      },
+    });
   } catch (error) {
     throw runtimeOperationError(
       `Cannot update persisted session ${sessionId} workspace selection`,

@@ -1069,6 +1069,7 @@ export type RuntimeSessionCreateBody = {
 export type RuntimeSessionUpdateBody = {
   title?: string | null;
   metadata?: Record<string, unknown>;
+  metadata_patch?: Record<string, unknown>;
   status?: string;
 };
 
@@ -1340,6 +1341,7 @@ export type SessionAuditSummary = {
 export type SessionUpdateBody = {
   title?: string;
   metadata?: Record<string, unknown>;
+  metadataPatch?: Record<string, unknown>;
   status?: string;
 };
 

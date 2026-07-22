@@ -80,7 +80,21 @@ pub struct SessionCreateRequestData {
 pub struct SessionUpdateRequestData {
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub metadata_patch: Option<serde_json::Map<String, serde_json::Value>>,
     pub status: Option<String>,
+}
+
+fn apply_metadata_patch(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    patch: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in patch {
+        if value.is_null() {
+            metadata.remove(&key);
+        } else {
+            metadata.insert(key, value);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -569,12 +583,56 @@ impl SessionService for DatabaseSessionService {
         let SessionUpdateRequestData {
             title,
             metadata,
+            metadata_patch,
             status,
         } = request;
 
-        if title.is_none() && metadata.is_none() && status.is_none() {
+        if metadata.is_some() && metadata_patch.is_some() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "metadata and metadata_patch are mutually exclusive",
+            ));
+        }
+
+        if title.is_none() && metadata.is_none() && metadata_patch.is_none() && status.is_none() {
             return Ok(existing);
         }
+
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let locked = query(
+            "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
+             FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        })?;
+
+        let metadata_patch_for_audit = metadata_patch.clone();
+        let metadata = match (metadata, metadata_patch) {
+            (Some(metadata), None) => Some(metadata),
+            (None, Some(patch)) => {
+                let raw = locked
+                    .try_get::<String, _>("metadata_json")
+                    .map_err(internal_error)?;
+                let value: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(internal_error)?;
+                let mut current = value.as_object().cloned().ok_or_else(|| {
+                    internal_error("persisted session metadata must be a JSON object")
+                })?;
+                apply_metadata_patch(&mut current, patch);
+                Some(current)
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("validated above"),
+        };
 
         let mut update_query =
             QueryBuilder::<MySql>::new("UPDATE agent_sessions SET updated_at = NOW()");
@@ -600,7 +658,7 @@ impl SessionService for DatabaseSessionService {
 
         let rows_affected = update_query
             .build()
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(internal_error)?
             .rows_affected();
@@ -610,6 +668,7 @@ impl SessionService for DatabaseSessionService {
                 format!("Session {session_id} 不存在"),
             ));
         }
+        tx.commit().await.map_err(internal_error)?;
 
         let updated = self
             .fetch_session_for_user(&pool, &session_id, &user_id)
@@ -619,6 +678,7 @@ impl SessionService for DatabaseSessionService {
             "title": title,
             "status": status,
             "metadata": metadata,
+            "metadata_patch": metadata_patch_for_audit,
         });
         log_session_audit(&pool, &user_id, "session_update", &session_id, details).await;
         Ok(updated)
@@ -948,5 +1008,28 @@ mod tests {
             "unexpected error: {:?}",
             error.1.0
         );
+    }
+
+    #[test]
+    fn metadata_patch_preserves_unrelated_keys_and_deletes_null_values() {
+        let mut metadata = serde_json::Map::from_iter([
+            ("current_model".to_string(), serde_json::json!("qwen3")),
+            (
+                "workspace_selection".to_string(),
+                serde_json::json!({"kind": "server_sandbox"}),
+            ),
+        ]);
+        let patch = serde_json::Map::from_iter([
+            ("current_model".to_string(), serde_json::json!("gpt-5.6")),
+            ("workspace_selection".to_string(), serde_json::Value::Null),
+        ]);
+
+        apply_metadata_patch(&mut metadata, patch);
+
+        assert_eq!(
+            metadata.get("current_model"),
+            Some(&serde_json::json!("gpt-5.6"))
+        );
+        assert!(!metadata.contains_key("workspace_selection"));
     }
 }

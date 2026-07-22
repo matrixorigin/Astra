@@ -18,7 +18,7 @@ use uuid::Uuid;
 use astra_core::work_unit::{
     WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
 };
-use astra_sandbox::{CommandRisk, analyze_command_risks};
+use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace};
 
 use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{
@@ -728,7 +728,10 @@ fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
     false
 }
 
-pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
+pub fn validate_execute_bash_command_in_workspace(
+    command: &str,
+    workspace_root: &Path,
+) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
@@ -789,7 +792,7 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         return Err("Error: socat/telnet networking in bash is blocked".into());
     }
 
-    for risk in analyze_command_risks(command) {
+    for risk in analyze_command_risks_in_workspace(command, workspace_root) {
         match &risk {
             // Allowed here only — still constrained by local rules + permission layer.
             CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
@@ -872,7 +875,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
-    if let Err(reason) = validate_execute_bash_command(command) {
+    if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
         return ToolResult::error(reason);
     }
 
@@ -3838,6 +3841,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    fn validate_execute_bash_command(command: &str) -> Result<(), String> {
+        validate_execute_bash_command_in_workspace(command, Path::new("/workspace"))
+    }
 
     #[cfg(unix)]
     fn write_fake_rg_script(dir: &Path, body: &str) -> PathBuf {

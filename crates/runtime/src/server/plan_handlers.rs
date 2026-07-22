@@ -450,6 +450,7 @@ fn capabilities_for_phase(phase: PlanPhase) -> PlanCapabilities {
 /// for `session_id` when the plan has no associated session yet (web-author
 /// before any session exists).
 fn emit_plan_journal(
+    user_id: &str,
     session_id: Option<&str>,
     event: astra_services::session_journal::JournalEvent,
 ) {
@@ -459,7 +460,7 @@ fn emit_plan_journal(
     if sid.is_empty() {
         return;
     }
-    match astra_services::session_journal::JournalWriter::new(sid) {
+    match astra_services::session_journal::JournalWriter::for_user(user_id, sid) {
         Ok(writer) => {
             if let Err(e) = writer.append(&event) {
                 tracing::warn!(
@@ -561,6 +562,7 @@ pub(super) async fn create_plan_handler(
     }
 
     emit_plan_journal(
+        &user.user_id,
         req.session_id.as_deref(),
         astra_services::session_journal::JournalEvent::plan_lifecycle(
             req.session_id.as_deref(),
@@ -828,6 +830,7 @@ pub(super) async fn execute_plan_handler(
     }
 
     emit_plan_journal(
+        &user.user_id,
         Some(&req.session_id),
         astra_services::session_journal::JournalEvent::plan_lifecycle(
             Some(&req.session_id),
@@ -841,6 +844,7 @@ pub(super) async fn execute_plan_handler(
         ),
     );
     emit_plan_journal(
+        &user.user_id,
         Some(&req.session_id),
         astra_services::session_journal::JournalEvent::goal_steered(
             Some(&req.session_id),
@@ -924,6 +928,7 @@ pub(super) async fn exit_plan_mode_handler(
     }
 
     emit_plan_journal(
+        &user.user_id,
         session_hint.as_deref(),
         astra_services::session_journal::JournalEvent::plan_lifecycle(
             session_hint.as_deref(),
@@ -1033,6 +1038,7 @@ pub(super) async fn rewind_plan_handler(
     };
 
     emit_plan_journal(
+        &user.user_id,
         session_hint.as_deref(),
         astra_services::session_journal::JournalEvent::plan_edit(
             session_hint.as_deref(),
@@ -1135,6 +1141,7 @@ pub(super) async fn redo_step_handler(
     };
 
     emit_plan_journal(
+        &user.user_id,
         session_hint.as_deref(),
         astra_services::session_journal::JournalEvent::plan_edit(
             session_hint.as_deref(),
@@ -1228,6 +1235,7 @@ pub(super) async fn start_step_run_handler(
 
     let (completed, _) = status_counts(&plan_state.plan);
     emit_plan_journal(
+        &user.user_id,
         Some(&req.session_id),
         astra_services::session_journal::JournalEvent::plan_progress(
             Some(&req.session_id),
@@ -1343,6 +1351,7 @@ pub(super) async fn post_completed_step_run_handler(
         _ => "finished",
     };
     emit_plan_journal(
+        &user.user_id,
         Some(&req.session_id),
         astra_services::session_journal::JournalEvent::plan_progress(
             Some(&req.session_id),
@@ -1455,6 +1464,7 @@ pub(super) async fn finish_step_run_handler(
         _ => "finished",
     };
     emit_plan_journal(
+        &user.user_id,
         Some(&finalized.session_id),
         astra_services::session_journal::JournalEvent::plan_progress(
             Some(&finalized.session_id),
@@ -1555,6 +1565,7 @@ pub(super) async fn delete_plan_handler(
         .map_err(map_plan_load_err)?;
 
     emit_plan_journal(
+        &user.user_id,
         session_hint.as_deref(),
         astra_services::session_journal::JournalEvent::plan_lifecycle(
             session_hint.as_deref(),

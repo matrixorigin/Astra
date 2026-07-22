@@ -585,8 +585,7 @@ export async function POST(
       );
       if (
         liveWorkspaceSelection &&
-        (hasRequestedWorkspace ||
-          !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection))
+        !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection)
       ) {
         const updated = await updateChatWorkspaceSelection(
           ownerUserId,

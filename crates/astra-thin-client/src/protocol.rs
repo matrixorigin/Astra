@@ -104,6 +104,8 @@ pub struct SessionUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_patch: Option<serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
 
@@ -1845,5 +1847,29 @@ mod tests {
         .unwrap();
         assert_eq!(typed.tool_calls[0].name, "read_file");
         assert_eq!(typed.source_event_id.as_deref(), Some("event-call-1"));
+    }
+
+    #[test]
+    fn session_update_serializes_metadata_patch_without_replacement_metadata() {
+        let request = SessionUpdateRequest {
+            title: None,
+            metadata: None,
+            metadata_patch: Some(Map::from_iter([
+                ("current_model".to_string(), serde_json::json!("m2")),
+                ("workspace_selection".to_string(), Value::Null),
+            ])),
+            status: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "metadata_patch": {
+                    "current_model": "m2",
+                    "workspace_selection": null
+                }
+            })
+        );
     }
 }

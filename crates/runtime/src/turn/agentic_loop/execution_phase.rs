@@ -1693,9 +1693,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             // `JournalWriter::append` auto-prepends
                             // `SessionStart` under the same file lock;
                             // see `prepend_session_start_if_needed`.
-                            if let Ok(writer) =
-                                astra_services::session_journal::JournalWriter::new(sid)
-                            {
+                            let writer = match state.context_manifest_user_id.as_deref() {
+                                Some(user_id) => {
+                                    astra_services::session_journal::JournalWriter::for_user(
+                                        user_id, sid,
+                                    )
+                                }
+                                None => astra_services::session_journal::JournalWriter::new(sid),
+                            };
+                            if let Ok(writer) = writer {
                                 if let Err(error) = writer.append(&evt) {
                                     tracing::warn!(
                                         session_id = sid,

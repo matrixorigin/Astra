@@ -48,6 +48,9 @@ pub enum SessionArtifactStoreError {
     #[error("artifact reference query is not supported by this store")]
     ReferenceQueryUnsupported,
 
+    #[error("mutable artifact projections cannot carry durable references")]
+    MutableProjectionReferencesUnsupported,
+
     #[error("stored artifact reference kind is invalid: {0}")]
     InvalidStoredReferenceKind(String),
 
@@ -303,6 +306,14 @@ pub struct SessionArtifactListPage {
 #[async_trait]
 pub trait SessionArtifactJsonStore: Send + Sync {
     async fn persist_json_artifact(
+        &self,
+        record: SessionArtifactJsonRecord,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
+
+    /// Creates or replaces a mutable, stable-identity projection. Unlike
+    /// immutable artifacts, a projection must provide a non-empty ID and may
+    /// not carry durable references.
+    async fn upsert_json_artifact_projection(
         &self,
         record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
@@ -770,6 +781,61 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .await?;
 
         stored_artifact_from_row(&row)
+    }
+
+    async fn upsert_json_artifact_projection(
+        &self,
+        record: SessionArtifactJsonRecord,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
+        if record.artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                record.artifact_id,
+            ));
+        }
+        if !record.references.is_empty() {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, &record.user_id, &record.session_id)
+            .await?;
+        let content_json = serde_json::to_string(&record.content)?;
+        let metadata_json = record.metadata.as_ref().map(serde_json::Value::to_string);
+        query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
+             ON DUPLICATE KEY UPDATE artifact_kind = VALUES(artifact_kind), \
+               source = VALUES(source), turn = VALUES(turn), round = VALUES(round), \
+               content_json = VALUES(content_json), metadata = VALUES(metadata), \
+               status = 'active', updated_at = CURRENT_TIMESTAMP(6)",
+        )
+        .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
+        .bind(&record.artifact_kind)
+        .bind(record.source.as_deref())
+        .bind(encode_counter(
+            record.turn,
+            SessionArtifactStoreError::TurnOverflow,
+        )?)
+        .bind(encode_counter(
+            record.round,
+            SessionArtifactStoreError::RoundOverflow,
+        )?)
+        .bind(content_json)
+        .bind(metadata_json)
+        .execute(&pool)
+        .await?;
+
+        self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
+            .await?
+            .ok_or(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: record.artifact_id,
+                session_id: record.session_id,
+                user_id: record.user_id,
+            })
     }
 
     async fn retain_json_artifact_reference(

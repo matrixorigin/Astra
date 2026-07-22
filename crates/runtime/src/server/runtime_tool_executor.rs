@@ -743,8 +743,13 @@ impl RuntimeToolExecutor {
 
     // ── Session tool wrappers (delegate to extracted module functions) ──────
 
+    pub(crate) fn journal_user_id(&self) -> &str {
+        &self.user_id
+    }
+
     pub(super) fn adjust_config(&self, args: &Value) -> String {
         let outcome = crate::server::tool_session_config::execute_adjust_config(
+            &self.user_id,
             &self.session_id,
             self.observability_session.as_ref(),
             &self.session_config.inner,
@@ -758,6 +763,7 @@ impl RuntimeToolExecutor {
 
     pub(super) fn compress_context(&self, args: &Value) -> String {
         let outcome = crate::server::tool_session_config::execute_compress_context(
+            &self.user_id,
             &self.session_id,
             self.observability_session.as_ref(),
             args,
@@ -3418,6 +3424,14 @@ mod tests {
                 referenced_by_durable_count: 0,
                 created_at: None,
             })
+        }
+
+        async fn upsert_json_artifact_projection(
+            &self,
+            record: astra_services::SessionArtifactJsonRecord,
+        ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
+        {
+            self.persist_json_artifact(record).await
         }
 
         async fn load_json_artifact(

@@ -1970,9 +1970,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         let strategy = state.compact_strategy;
         let session_dir = state.current_session_id.as_deref().and_then(|sid| {
-            astra_services::local_session_artifact_store()
-                .session_dir(sid)
-                .ok()
+            match state.context_manifest_user_id.as_deref() {
+                Some(user_id) => astra_services::OwnerScope::user(user_id).and_then(|owner| {
+                    astra_services::local_session_artifact_store()
+                        .session_dir_for_owner(&owner, sid)
+                }),
+                None => astra_services::local_session_artifact_store().session_dir(sid),
+            }
+            .ok()
         });
         let mc = if !pipeline_allows_clearing {
             // Cascade detected: skip clearing this turn to break the loop.

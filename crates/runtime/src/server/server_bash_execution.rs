@@ -47,7 +47,9 @@ pub(crate) async fn execute_server_bash(
             );
         }
     };
-    if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command(command) {
+    if let Err(reason) =
+        astra_tools::shell_ops::validate_execute_bash_command_in_workspace(command, workspace_root)
+    {
         return astra_tools::ToolResult::error(reason);
     }
     if command.len() > MAX_COMMAND_LENGTH {

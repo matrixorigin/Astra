@@ -1570,8 +1570,9 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 (
                     "rates",
                     format!(
-                        "${:.4}/1k prompt, ${:.4}/1k completion",
-                        pricing.prompt, pricing.completion
+                        "${:.3}/1M prompt, ${:.3}/1M completion",
+                        pricing.prompt * 1_000_000.0,
+                        pricing.completion * 1_000_000.0
                     ),
                 ),
                 (
@@ -1580,7 +1581,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                         "{} ({})",
                         state.total_prompt_tokens,
                         crate::cli::slash::slash_stats::format_cost(
-                            state.total_prompt_tokens as f64 * pricing.prompt / 1000.0
+                            state.total_prompt_tokens as f64 * pricing.prompt
                         )
                     ),
                 ),
@@ -1590,20 +1591,20 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                         "{} ({})",
                         state.total_completion_tokens,
                         crate::cli::slash::slash_stats::format_cost(
-                            state.total_completion_tokens as f64 * pricing.completion / 1000.0
+                            state.total_completion_tokens as f64 * pricing.completion
                         )
                     ),
                 ),
             ];
             if state.total_cache_read_tokens > 0 {
-                let rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
+                let rate = pricing.cache_read.unwrap_or(pricing.prompt);
                 pairs.push((
                     "cache read",
                     format!(
                         "{} ({})",
                         state.total_cache_read_tokens,
                         crate::cli::slash::slash_stats::format_cost(
-                            state.total_cache_read_tokens as f64 * rate / 1000.0
+                            state.total_cache_read_tokens as f64 * rate
                         )
                     ),
                 ));

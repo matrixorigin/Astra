@@ -1571,6 +1571,38 @@ fn tool_trace_events_populate_columns_and_redacted_payloads() {
 }
 
 #[test]
+fn failed_tool_trace_event_persists_searchable_error_content() {
+    let trace = TraceContext {
+        session_id: "session-1".to_string(),
+        user_id: "user-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        turn_seq: 7,
+        causal_chain_id: "chain-1".to_string(),
+        root_event_id: "trace:root".to_string(),
+    };
+    let record = ToolCallRecord {
+        tool_call_id: Some("tool-call-failed".to_string()),
+        name: "bash".to_string(),
+        ok: false,
+        ms: 9,
+        error: Some("unknown_tool: bash".to_string()),
+        ..Default::default()
+    };
+
+    let events = build_tool_trace_events(
+        &trace,
+        "root-run",
+        None,
+        Some("root-agent"),
+        None,
+        &[record],
+    );
+
+    assert_eq!(events[1].event_type, "tool_call_failed");
+    assert_eq!(events[1].content.as_deref(), Some("unknown_tool: bash"));
+}
+
+#[test]
 fn extract_prev_assistant_text_picks_latest_assistant_string() {
     let messages = vec![
         serde_json::json!({"role": "user", "content": "hi"}),

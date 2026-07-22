@@ -1045,6 +1045,8 @@ struct DelegationTrackerState {
 /// source of truth for recovery.
 pub struct DelegationTracker {
     state: RwLock<DelegationTrackerState>,
+    /// Authenticated owner for journal isolation.
+    user_id: Option<String>,
     /// Optional session ID for journal persistence.
     session_id: Option<String>,
     /// Real-time progress per delegation.
@@ -1057,6 +1059,7 @@ impl DelegationTracker {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(DelegationTrackerState::default()),
+            user_id: None,
             session_id: None,
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -1064,9 +1067,10 @@ impl DelegationTracker {
     }
 
     /// Create a tracker with journal persistence enabled.
-    pub fn with_session(session_id: String) -> Self {
+    pub fn with_session(user_id: String, session_id: String) -> Self {
         Self {
             state: RwLock::new(DelegationTrackerState::default()),
+            user_id: Some(user_id),
             session_id: Some(session_id),
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -1109,7 +1113,11 @@ impl DelegationTracker {
         let Some(ref sid) = self.session_id else {
             return;
         };
-        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
+        let Some(ref user_id) = self.user_id else {
+            astra_core::agent_warn!("delegation", "journal owner missing for session {sid}");
+            return;
+        };
+        let writer = match astra_services::session_journal::JournalWriter::for_user(user_id, sid) {
             Ok(w) => w,
             Err(e) => {
                 astra_core::agent_warn!(
@@ -2421,6 +2429,7 @@ impl DelegationEngine {
                     }
 
                     Self::write_journal_event(
+                        user_id,
                         &retry_config.session_id,
                         astra_services::session_journal::JournalEvent::delegation_retry(
                             Some(&retry_config.session_id),
@@ -2631,6 +2640,7 @@ impl DelegationEngine {
 
         // Journal: delegation started
         Self::write_journal_event(
+            &request.user_id,
             &session_id,
             astra_services::session_journal::JournalEvent::delegation_started(
                 Some(&session_id),
@@ -2812,6 +2822,7 @@ impl DelegationEngine {
             let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
             let failed = dr.agent_results.len() - succeeded;
             Self::write_journal_event(
+                &request.user_id,
                 &session_id,
                 astra_services::session_journal::JournalEvent::delegation_completed(
                     Some(&session_id),
@@ -2842,8 +2853,14 @@ impl DelegationEngine {
 
     /// Write a journal event synchronously on the local diagnostic path.
     /// Durable run state is committed separately by `RunEngine`.
-    fn write_journal_event(session_id: &str, event: astra_services::session_journal::JournalEvent) {
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
+    fn write_journal_event(
+        user_id: &str,
+        session_id: &str,
+        event: astra_services::session_journal::JournalEvent,
+    ) {
+        if let Ok(writer) =
+            astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+        {
             if let Err(e) = writer.append(&event) {
                 astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
             }
@@ -7515,7 +7532,11 @@ mod tests {
             .await;
         assert_eq!(chain.len(), 2);
 
-        let journal_path = astra_services::session_journal::journal_file_path("sess-journal-retry");
+        let journal_path = astra_services::session_journal::journal_file_path_for_user(
+            "user-1",
+            "sess-journal-retry",
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let retry_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()
@@ -7549,7 +7570,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&sessions_dir).unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
-        let tracker = DelegationTracker::with_session("sess-subrun-start".into());
+        let tracker = DelegationTracker::with_session("user-1".into(), "sess-subrun-start".into());
 
         tracker
             .record_sub_run(SubRunRecord {
@@ -7567,7 +7588,11 @@ mod tests {
             .await
             .unwrap();
 
-        let journal_path = astra_services::session_journal::journal_file_path("sess-subrun-start");
+        let journal_path = astra_services::session_journal::journal_file_path_for_user(
+            "user-1",
+            "sess-subrun-start",
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let started_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()
@@ -7602,7 +7627,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&sessions_dir).unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
-        let tracker = DelegationTracker::with_session("sess-subrun-complete".into());
+        let tracker =
+            DelegationTracker::with_session("user-1".into(), "sess-subrun-complete".into());
 
         tracker
             .record_sub_run(SubRunRecord {
@@ -7624,8 +7650,11 @@ mod tests {
             )
             .await;
 
-        let journal_path =
-            astra_services::session_journal::journal_file_path("sess-subrun-complete");
+        let journal_path = astra_services::session_journal::journal_file_path_for_user(
+            "user-1",
+            "sess-subrun-complete",
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&journal_path).unwrap();
         let completed_events: Vec<astra_services::session_journal::JournalEvent> = content
             .lines()
