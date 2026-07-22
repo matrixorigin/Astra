@@ -215,6 +215,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::Network => "error_network",
         astra_core::ErrorKind::ToolNotFound => "error_tool_not_found",
         astra_core::ErrorKind::ToolInvalidArgs => "error_tool_invalid_args",
+        astra_core::ErrorKind::PolicyDenied => "error_policy_denied",
         astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
         astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
         astra_core::ErrorKind::ToolBinding => "error_tool_binding",

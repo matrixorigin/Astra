@@ -201,13 +201,6 @@ fn short_flag_contains(flag: &str, c: char) -> bool {
     flag.starts_with('-') && !flag.starts_with("--") && flag.chars().skip(1).any(|ch| ch == c)
 }
 
-/// Returns `true` when `cmd_name` appears as a standalone word in the
-/// lowercased command string (preceded by start-of-string or whitespace,
-/// followed by whitespace or end-of-string).
-fn is_standalone_command(lower: &str, cmd_name: &str) -> bool {
-    find_standalone_word(lower, cmd_name).is_some()
-}
-
 /// Analyze a command string for potentially dangerous patterns.
 ///
 /// Parsing uses tree-sitter-bash only (no legacy substring scanner). Unparseable input
@@ -324,55 +317,6 @@ fn analyze_command_risks_with_workspace(
                 &mut risks,
                 CommandRisk::ZshDangerous(format!("{builtin} builtin")),
             );
-        }
-    }
-
-    // Inline interpreter execution (-c/-e/-r flags) can bypass AST-based bash
-    // analysis by embedding malicious commands inside string literals:
-    //   python3 -c 'import os; os.system("rm -rf /")'
-    //   perl -e 'system("reboot")'
-    //   ruby -e '`rm -rf /`'
-    //   node -e 'require("child_process").exec("reboot")'
-    //   php -r 'system("rm -rf /")'
-    //   lua -e 'os.execute("reboot")'
-    // Block these at the risk level so validate_execute_bash_command rejects them.
-    // Each tuple: (flag_byte, &[interpreter_names]) where flag_byte is the
-    // first byte of the flag (-c, -e, or -r).
-    let inline_interpreters: &[(u8, &[&str])] = &[
-        (1, &["python", "python2", "python3", "python3.12"]),
-        (b'c', &["perl"]),
-        (b'e', &["ruby", "lua"]),
-        (b'e', &["node", "nodejs"]),
-        (b'r', &["php"]),
-    ];
-    // awk is special: it accepts inline code as the first non-flag argument
-    // (e.g., `awk 'BEGIN { system("reboot") }'`). We detect it as a
-    // standalone word (not a flag-based invocation).
-    if is_standalone_command(&lower, "awk") {
-        push_unique(&mut risks, CommandRisk::InlineInterpreter("awk".into()));
-    }
-    for (_flag_byte, names) in inline_interpreters {
-        for name in *names {
-            // Match word-boundary: the interpreter name must be a standalone
-            // word followed by whitespace and -c/-e/-r.
-            if let Some(pos) = lower.find(name) {
-                let after = &lower[pos + name.len()..];
-                if let Some(rest) = after.strip_prefix(' ') {
-                    let flag = if rest.starts_with("-c ") {
-                        "-c"
-                    } else if rest.starts_with("-e ") {
-                        "-e"
-                    } else if rest.starts_with("-r ") {
-                        "-r"
-                    } else {
-                        continue;
-                    };
-                    push_unique(
-                        &mut risks,
-                        CommandRisk::InlineInterpreter(format!("{name} {flag}")),
-                    );
-                }
-            }
         }
     }
 
@@ -715,9 +659,6 @@ pub enum CommandRisk {
     CredentialAccess(String),
     /// Command writes to a path outside the workspace boundary.
     WorkspaceOutWrite(String),
-    /// Command uses inline interpreter execution (-c/-e flags on python/perl/ruby/node)
-    /// which can bypass AST-based bash analysis by embedding commands in string literals.
-    InlineInterpreter(String),
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -738,9 +679,6 @@ impl std::fmt::Display for CommandRisk {
             Self::DestructiveCommand(cmd) => write!(f, "destructive command ({cmd})"),
             Self::CredentialAccess(path) => write!(f, "credential path access ({path})"),
             Self::WorkspaceOutWrite(path) => write!(f, "workspace-out write ({path})"),
-            Self::InlineInterpreter(cmd) => {
-                write!(f, "inline interpreter execution ({cmd})")
-            }
         }
     }
 }
@@ -1312,36 +1250,33 @@ mod tests {
     }
 
     #[test]
-    fn detects_inline_interpreters() {
-        // Existing coverage (python, perl, ruby, node)
+    fn inline_interpreters_are_not_intrinsically_risky() {
+        for command in [
+            "python3 -c 'print(1)'",
+            "perl -e 'print 1'",
+            "ruby -e 'puts 1'",
+            "node -e 'console.log(1)'",
+            "php -r 'echo 1;'",
+            "lua -e 'print(1)'",
+            "awk 'BEGIN { print 1 }'",
+        ] {
+            assert_eq!(
+                analyze_command_risks(command),
+                Vec::<CommandRisk>::new(),
+                "inline source is not a risk without a concrete hazardous operation: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn concrete_hazards_inside_inline_source_remain_visible() {
         assert!(
-            analyze_command_risks("python -c 'import os; os.system(\"rm -rf /\")'")
-                .contains(&CommandRisk::InlineInterpreter("python -c".into()))
+            analyze_command_risks("python3 -c \"open('/etc/shadow').read()\"")
+                .contains(&CommandRisk::SensitivePathAccess("/etc/".into()))
         );
         assert!(
-            analyze_command_risks("perl -e 'system(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("perl -e".into()))
-        );
-        assert!(
-            analyze_command_risks("ruby -e '`rm -rf /`'")
-                .contains(&CommandRisk::InlineInterpreter("ruby -e".into()))
-        );
-        assert!(
-            analyze_command_risks("node -e 'require(\"child_process\").exec(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("node -e".into()))
-        );
-        // New coverage: php, lua, awk
-        assert!(
-            analyze_command_risks("php -r 'system(\"rm -rf /\")'")
-                .contains(&CommandRisk::InlineInterpreter("php -r".into()))
-        );
-        assert!(
-            analyze_command_risks("lua -e 'os.execute(\"reboot\")'")
-                .contains(&CommandRisk::InlineInterpreter("lua -e".into()))
-        );
-        assert!(
-            analyze_command_risks("awk 'BEGIN { system(\"reboot\") }'")
-                .contains(&CommandRisk::InlineInterpreter("awk".into()))
+            analyze_command_risks("node -e 'require(\"child_process\").exec(\"dd\")'")
+                .contains(&CommandRisk::DestructiveCommand("dd".into()))
         );
     }
 }

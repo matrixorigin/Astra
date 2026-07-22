@@ -66,6 +66,8 @@ pub enum ErrorKind {
     ToolNotFound,
     /// Bad arguments, parse error, type mismatch, workspace read-before-write.
     ToolInvalidArgs,
+    /// A sandbox, safety guard, or execution policy intentionally denied the operation.
+    PolicyDenied,
     /// Local command timed out (grep on huge repo, long-running bash).
     ToolTimeout,
     /// Tool not installed, not configured, or explicitly unavailable.
@@ -173,6 +175,7 @@ impl ErrorKind {
             Self::Network => "network",
             Self::ToolNotFound => "tool_not_found",
             Self::ToolInvalidArgs => "tool_invalid_args",
+            Self::PolicyDenied => "policy_denied",
             Self::ToolTimeout => "tool_timeout",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ToolBinding => "tool_binding",
@@ -278,6 +281,11 @@ impl ErrorKind {
                 "Invalid arguments for the tool. \
                  Fix the parameters and retry the same tool before switching tools."
             }
+            Self::PolicyDenied => {
+                "The operation was denied by an execution safety policy. \
+                 Do NOT retry the identical call. Remove the hazardous operation, use a permitted \
+                 structured tool, or request approval only when the policy exposes that path."
+            }
             Self::ToolTimeout => {
                 "Tool command timed out. Do NOT retry with the same arguments. \
                  Run a narrower target, increase timeout only for commands expected to be slow, \
@@ -378,6 +386,10 @@ impl ErrorKind {
                  clarity and steer the model to retry the same tool with corrected args \
                  instead of escalating to bash or unrelated tools."
             }
+            Self::PolicyDenied => {
+                "Inspect the named sandbox or safety rule and the concrete operation it rejected. \
+                 Keep approval policy centralized; do not duplicate blanket bans in executors."
+            }
             Self::ToolTimeout => {
                 "Tool scope is too broad. Break the operation into smaller chunks \
                  or raise the tool timeout if genuinely long-running."
@@ -450,6 +462,7 @@ impl ErrorKind {
             "network" => Some(Self::Network),
             "tool_not_found" => Some(Self::ToolNotFound),
             "tool_invalid_args" => Some(Self::ToolInvalidArgs),
+            "policy_denied" => Some(Self::PolicyDenied),
             "tool_timeout" => Some(Self::ToolTimeout),
             "tool_unavailable" => Some(Self::ToolUnavailable),
             "tool_binding" => Some(Self::ToolBinding),
@@ -676,7 +689,7 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
 /// with the correct [`ErrorKind`] at their source.
 ///
 /// For external categories, more specific patterns come first:
-/// ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
+/// PolicyDenied > ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
 /// ToolInvalidArgs(call contract) > ToolUnavailable >
 /// ToolInvalidArgs(generic) > ToolNotFound > Unknown.
 #[must_use]
@@ -700,6 +713,27 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("no concrete model was selected")
     {
         return ErrorKind::MissingModelSelection;
+    }
+
+    // Explicit execution-policy decisions are neither authentication failures
+    // nor malformed arguments. Preserve that distinction so recovery does not
+    // ask the model to debug the provider/runtime/workspace or retry blindly.
+    if lower.contains("sandbox_denied:")
+        || lower.contains("policy denied:")
+        || lower.contains("blocked by safety guard")
+        || lower.contains("blocked by hook")
+        || lower.contains("blocked by the sandbox")
+        || lower.contains("blocked by local policy")
+        || lower.contains("blocked while plan mode is active")
+        || lower.contains("bash command blocked")
+        || lower.contains("bash command matches a blocked destructive pattern")
+        || lower.contains("piping download output into a shell is blocked")
+        || lower.contains("networking in bash is blocked")
+        || (lower.contains("sandbox:") && lower.contains(" is blocked"))
+        || (lower.contains("recursive force deletion")
+            && lower.contains("requires explicit confirmation"))
+    {
+        return ErrorKind::PolicyDenied;
     }
 
     // Resource limit — never retry, block the tool
@@ -1008,6 +1042,7 @@ mod tests {
         ErrorKind::Network,
         ErrorKind::ToolNotFound,
         ErrorKind::ToolInvalidArgs,
+        ErrorKind::PolicyDenied,
         ErrorKind::ToolTimeout,
         ErrorKind::ToolUnavailable,
         ErrorKind::ToolBinding,
@@ -1078,6 +1113,7 @@ mod tests {
             ErrorKind::ResourceLimit,
             ErrorKind::ToolTimeout,
             ErrorKind::ToolBinding,
+            ErrorKind::PolicyDenied,
             ErrorKind::MissingModelSelection,
         ] {
             assert!(!kind.is_retryable(), "{kind:?} must NOT be retryable");
@@ -1332,6 +1368,23 @@ mod tests {
             (
                 "Error: file is too large (97716 bytes)",
                 ErrorKind::ToolInvalidArgs,
+            ),
+            // PolicyDenied
+            (
+                "Error: bash command blocked (sensitive path access (/etc/))",
+                ErrorKind::PolicyDenied,
+            ),
+            (
+                "Error: blocked by safety guard 'shell_obfuscation': command substitution",
+                ErrorKind::PolicyDenied,
+            ),
+            (
+                "SANDBOX_DENIED: Sandbox: path is outside the workspace",
+                ErrorKind::PolicyDenied,
+            ),
+            (
+                "Error: tool 'bash' is not available for this run binding: policy denied: tool is not allowed",
+                ErrorKind::PolicyDenied,
             ),
             (
                 "Error: unknown field `offset` for read_file. Valid fields: path, start_line, end_line, outline. Required: path. `read_file` uses line numbers, not byte offsets; use `start_line`.",

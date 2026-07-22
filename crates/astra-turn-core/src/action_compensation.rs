@@ -199,6 +199,10 @@ fn classify_error_kind_outcome(
             ExecutionOutcome::Failure,
             Some(FailureCategory::ValidationError),
         ),
+        ErrorKind::PolicyDenied => (
+            ExecutionOutcome::Failure,
+            Some(FailureCategory::PermissionDenied),
+        ),
         ErrorKind::ContractViolation | ErrorKind::DatabaseError => (
             ExecutionOutcome::Failure,
             Some(FailureCategory::RuntimeError),
@@ -1523,6 +1527,13 @@ mod tests {
                 None,
                 ExecutionOutcome::Failure,
                 Some(FailureCategory::ValidationError),
+            ),
+            (
+                Some(astra_core::ErrorKind::PolicyDenied),
+                None,
+                None,
+                ExecutionOutcome::Failure,
+                Some(FailureCategory::PermissionDenied),
             ),
             (
                 Some(astra_core::ErrorKind::ContractViolation),

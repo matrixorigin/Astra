@@ -810,7 +810,6 @@ pub fn validate_execute_bash_command_in_workspace(
             | CommandRisk::DestructiveCommand(_)
             | CommandRisk::CredentialAccess(_)
             | CommandRisk::WorkspaceOutWrite(_)
-            | CommandRisk::InlineInterpreter(_)
             | CommandRisk::Eval
             | CommandRisk::CommandSubstitution
             | CommandRisk::ProcessSubstitution => {
@@ -5056,6 +5055,24 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
+    }
+
+    #[test]
+    fn validate_execute_bash_allows_benign_inline_interpreters() {
+        for command in [
+            "python3 -c 'print(1)'",
+            "node -e 'console.log(1)'",
+            "awk 'BEGIN { print 1 }'",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_ok(),
+                "permission policy, not the command validator, owns approval: {command}"
+            );
+        }
+
+        let error = validate_execute_bash_command("python3 -c \"open('/etc/shadow').read()\"")
+            .expect_err("a concrete sensitive-path access must still be rejected");
+        assert!(error.contains("sensitive path access"), "{error}");
     }
 
     #[tokio::test]

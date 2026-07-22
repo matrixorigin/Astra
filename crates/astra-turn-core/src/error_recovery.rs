@@ -210,6 +210,12 @@ pub fn build_recovery_message_with_evidence(
                 )
             }
         }
+        ErrorCategory::PolicyDenied => format!(
+            "⚠ {} was denied by an execution safety policy. \
+             Do NOT retry the identical call. Remove the hazardous operation, use a permitted structured tool, \
+             or request approval only when the policy explicitly offers it.",
+            tool_name
+        ),
         ErrorCategory::ToolUnavailable => format!(
             "⚠ {} is not available in the current execution environment. \
              Treat the structured failure scope as authoritative: if it names an executor or \
@@ -609,6 +615,7 @@ mod tests {
             ErrorCategory::Auth,
             ErrorCategory::ToolNotFound,
             ErrorCategory::ToolInvalidArgs,
+            ErrorCategory::PolicyDenied,
             ErrorCategory::ToolTimeout,
         ] {
             assert_eq!(should_retry(cat, 0), None, "should not retry {cat:?}");
@@ -691,6 +698,22 @@ mod tests {
         );
         assert!(msg.contains("do NOT switch to bash"));
         assert!(msg.contains("start_line/end_line"));
+    }
+
+    #[test]
+    fn recovery_message_identifies_policy_denial() {
+        let error = "Error: bash command blocked (sensitive path access (/etc/))";
+        let category = classify_error(error);
+        assert_eq!(category, ErrorCategory::PolicyDenied);
+
+        let message = build_recovery_message("bash", error, category, &[]);
+        assert!(message.contains("execution safety policy"), "{message}");
+        assert!(
+            message.contains("Do NOT retry the identical call"),
+            "{message}"
+        );
+        assert!(!message.contains("unclassified"), "{message}");
+        assert!(!message.contains("provider/runtime"), "{message}");
     }
 
     #[test]

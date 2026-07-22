@@ -645,6 +645,9 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::ToolInvalidArgs | K::InvalidRequest => {
             format!("Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences")
         }
+        K::PolicyDenied => format!(
+            "Execution policy denials ({tool}): sandbox or safety rule rejected the operation — {count} occurrences"
+        ),
         K::ContractViolation => format!(
             "Runtime contract violation ({tool}): an internal producer/consumer invariant failed — {count} occurrences"
         ),
@@ -2983,6 +2986,11 @@ mod tests {
                 "old_str not found in the file",
                 "tool_call_failed",
                 K::ToolInvalidArgs,
+            ),
+            (
+                "Error: bash command blocked (sensitive path access (/etc/))",
+                "tool_call_failed",
+                K::PolicyDenied,
             ),
             (
                 "SQL syntax error: column must appear in GROUP BY",

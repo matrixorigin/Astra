@@ -7362,7 +7362,7 @@ mod tests {
     fn bypass_python_read_not_caught_by_path_boundary() {
         // python3 -c "open('/etc/passwd').read()" — interpreter invocation.
         // Path-boundary parsing does not inspect interpreter source code, but
-        // higher-level shell safety guards now deny inline interpreter exec.
+        // the command-risk scanner still detects the concrete sensitive path.
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "python3 -c \"open('/etc/passwd').read()\"");
