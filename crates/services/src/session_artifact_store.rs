@@ -882,16 +882,16 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
         let round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
         let mut tx = pool.begin().await?;
-        // Claim the composite identity before inspecting it. The duplicate-key
-        // branch is deliberately a no-op: concurrent first writers must not be
-        // able to mutate content until the stored kind and reference state have
-        // been validated under the row lock.
+        // Claim the composite identity before inspecting it. INSERT IGNORE is
+        // the portable no-op for an existing primary key: MatrixOne rejects
+        // ON DUPLICATE KEY UPDATE when the assignment names a primary/unique
+        // column, even when the value is unchanged. Concurrent first writers
+        // still serialize on the unique insert before the row lock below.
         query(
-            "INSERT INTO session_artifacts \
+            "INSERT IGNORE INTO session_artifacts \
              (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
               content_json, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
-             ON DUPLICATE KEY UPDATE artifact_id = VALUES(artifact_id)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
         )
         .bind(&record.artifact_id)
         .bind(&record.session_id)

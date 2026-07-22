@@ -2933,7 +2933,10 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_tokens_out, 20);
     assert_eq!(stats.total_tool_calls, 3);
     assert_eq!(stats.total_tool_failures, 1);
-    assert_eq!(stats.total_errors, 1);
+    assert_eq!(
+        stats.total_errors, 2,
+        "the canonical error set contains one failed tool lifecycle and one turn error"
+    );
     assert_eq!(stats.total_stalls, 1);
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
