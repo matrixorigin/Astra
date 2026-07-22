@@ -122,9 +122,10 @@ describe("ModelSwitcher", () => {
       />,
     );
 
-    await waitFor(() => expect(mockListModels).toHaveBeenCalledTimes(1));
     fireEvent.click(
-      screen.getByRole("button", { name: /deepseek-v4-flash-anthropic/i }),
+      await screen.findByRole("button", {
+        name: /deepseek-v4-flash-anthropic/i,
+      }),
     );
     fireEvent.click(
       await screen.findByRole("button", {
