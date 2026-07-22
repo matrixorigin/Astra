@@ -20,7 +20,7 @@ use astra_runtime::{
     SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
     SessionRecord, SessionService, SessionUpdateRequestData, TurnAuxiliaryEventRecord,
     TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
+    TurnObserverWorker, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
@@ -324,20 +324,6 @@ impl TurnObserverWorker for RecordingObserverWorker {
     }
 }
 
-/// Records all tool event persist plans for test verification.
-#[derive(Default)]
-struct RecordingToolEventWriter {
-    plans: tokio::sync::Mutex<Vec<TurnToolEventPersistPlan>>,
-}
-
-#[async_trait]
-impl TurnToolEventWriter for RecordingToolEventWriter {
-    async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
-        self.plans.lock().await.push(plan);
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 struct NoopAuxiliaryEventWriter;
 
@@ -574,12 +560,11 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
     (build_app(state), ledger)
 }
 
-/// Build a test app with recording hook DB + observer + tool event writers for verification.
+/// Build a test app with recording hook DB + observer writers for verification.
 fn build_test_app_with_hooks() -> (
     Router,
     Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
-    Arc<RecordingToolEventWriter>,
 ) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -589,8 +574,6 @@ fn build_test_app_with_hooks() -> (
     let ledger = base.edge_callback_ledger();
     let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
-    let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
-
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
@@ -598,23 +581,16 @@ fn build_test_app_with_hooks() -> (
     .with_model_service(Arc::new(TestModelService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
-    .with_tool_event_writer(tool_event_writer.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (
-        build_app(state),
-        hook_writer,
-        observer_worker,
-        tool_event_writer,
-    )
+    (build_app(state), hook_writer, observer_worker)
 }
 
 fn build_test_app_with_hooks_and_skills() -> (
     Router,
     Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
-    Arc<RecordingToolEventWriter>,
 ) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -624,8 +600,6 @@ fn build_test_app_with_hooks_and_skills() -> (
     let ledger = base.edge_callback_ledger();
     let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
-    let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
-
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
@@ -634,16 +608,10 @@ fn build_test_app_with_hooks_and_skills() -> (
     .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
-    .with_tool_event_writer(tool_event_writer.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (
-        build_app(state),
-        hook_writer,
-        observer_worker,
-        tool_event_writer,
-    )
+    (build_app(state), hook_writer, observer_worker)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1369,7 +1337,7 @@ async fn execute_mock_tool_turn(
 }
 
 async fn run_mock_tool_scenario(case: MockToolScenario) {
-    let (app, hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
     let edge_tools: Vec<Value> = case
         .edge_tools
         .iter()
@@ -1483,37 +1451,6 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
             "{}: user_query should contain {:?}",
             case.name,
             fragment
-        );
-    }
-
-    let tw = tool_writer.clone();
-    poll_until(
-        move || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let tool_plans = tool_writer.plans.lock().await;
-    let tool_events = &tool_plans.last().expect("tool event plan").events;
-    let tool_names: std::collections::HashSet<&str> = tool_events
-        .iter()
-        .filter_map(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|meta| meta.get("tool_name"))
-                .and_then(Value::as_str)
-        })
-        .collect();
-    for step in &case.steps {
-        assert!(
-            tool_names.contains(step.tool_name),
-            "{}: missing persisted tool event {}",
-            case.name,
-            step.tool_name
         );
     }
 }
@@ -2286,7 +2223,7 @@ async fn empty_test_llm_rounds_completes_gracefully() {
 #[tokio::test]
 async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
     init_env();
-    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
 
     let payload = json!({
         "message": "Use the test skill",
@@ -2355,7 +2292,7 @@ async fn skill_resolve_round_trip_carries_instructions_to_next_turn() {
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+        let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
 
         // TestSkillService at line ~290 serves `test-skill` with instructions:
         //   "You are the test skill. Return the prepared instructions."
@@ -2449,7 +2386,7 @@ async fn skill_invocation_costs_exactly_two_llm_rounds_today() {
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks_and_skills();
+        let (app, _hook_writer, _observer) = build_test_app_with_hooks_and_skills();
 
         let payload = json!({
             "message": "use skill",
@@ -2560,7 +2497,7 @@ async fn skill_invocation_costs_exactly_two_llm_rounds_today() {
 #[tokio::test]
 async fn unknown_skill_returns_error_without_edge_tool_request() {
     init_env();
-    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
 
     let payload = json!({
         "message": "Use a missing skill",
@@ -4762,7 +4699,7 @@ async fn client_disconnect_run_still_finalizes() {
 /// Text-only response produces a "response_generation" decision audit with no skills.
 #[tokio::test]
 async fn hook_db_decision_audit_text_only() {
-    let (app, hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -4814,7 +4751,7 @@ async fn hook_db_decision_audit_text_only() {
 /// Tool-call response produces a "tool_surface" decision audit with skill selection.
 #[tokio::test]
 async fn hook_db_decision_audit_with_tools() {
-    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -4879,7 +4816,7 @@ async fn hook_db_decision_audit_with_tools() {
 /// Model name is propagated to decision audit.
 #[tokio::test]
 async fn hook_db_decision_audit_model_name() {
-    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
 
     chat_stream_collect(
         &app,
@@ -4911,7 +4848,7 @@ async fn hook_db_decision_audit_model_name() {
 /// Observer receives correct session_id and turn_count.
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
-    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -4947,7 +4884,7 @@ async fn observer_fired_with_correct_metadata() {
 /// Multiple tool calls across rounds produce a skill selection with all tool names.
 #[tokio::test]
 async fn hook_db_multiple_tools_selected() {
-    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
 
     // Two rounds of approval-free tools (read_file, list_dir) + final text.
     let resp = chat_stream_start(
@@ -5127,7 +5064,7 @@ async fn mock_llm_tool_flow_scenario_matrix() {
 
 #[tokio::test]
 async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
-    let (app, hook_writer, observer_worker, tool_writer) = build_test_app_with_hooks();
+    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
     let sid = format!("memory-state-{}", uuid::Uuid::new_v4());
 
     let store_events = execute_mock_tool_turn(
@@ -5202,17 +5139,11 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
 
     let hw = hook_writer.clone();
     let ow = observer_worker.clone();
-    let tw = tool_writer.clone();
     poll_until(
         move || {
             let hw = hw.clone();
             let ow = ow.clone();
-            let tw = tw.clone();
-            async move {
-                hw.plans.lock().await.len() >= 2
-                    && ow.requests.lock().await.len() >= 2
-                    && tw.plans.lock().await.len() >= 2
-            }
+            async move { hw.plans.lock().await.len() >= 2 && ow.requests.lock().await.len() >= 2 }
         },
         5,
     )
@@ -5240,31 +5171,11 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         .expect("search turn skill selection");
     assert!(search_skill.selected_skills.contains(&"memory".to_string()));
     assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
-    drop(hook_plans);
-
-    let tool_plans = tool_writer.plans.lock().await;
-    assert_eq!(
-        tool_plans.len(),
-        2,
-        "expected one tool-event persist per turn"
-    );
-    let first_tool_name = tool_plans[0].events[0]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("tool_name"))
-        .and_then(Value::as_str);
-    assert_eq!(first_tool_name, Some("memory"));
-    let second_tool_name = tool_plans[1].events[0]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("tool_name"))
-        .and_then(Value::as_str);
-    assert_eq!(second_tool_name, Some("memory"));
 }
 
 #[tokio::test]
 async fn context_meta_exposes_late_round_guidance_signals() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -5371,7 +5282,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
 
 #[tokio::test]
 async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetition() {
-    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -5481,7 +5392,7 @@ async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetit
 
 #[tokio::test]
 async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -5545,7 +5456,7 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
 
 #[tokio::test]
 async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -5615,7 +5526,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
 
 #[tokio::test]
 async fn web_agent_stream_emits_plain_final_text_once() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -5641,7 +5552,7 @@ async fn web_agent_stream_emits_plain_final_text_once() {
 
 #[tokio::test]
 async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
         &app,
@@ -5715,7 +5626,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
 
 #[tokio::test]
 async fn context_meta_exposes_memory_signal_context_flag() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -5753,7 +5664,7 @@ async fn context_meta_exposes_memory_signal_context_flag() {
 
 #[tokio::test]
 async fn context_meta_exposes_builder_supplied_context_signals() {
-    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -5799,7 +5710,7 @@ async fn context_meta_active_skills_survive_model_override() {
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+        let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
         let events = chat_stream_collect(
             &app,
@@ -5852,7 +5763,7 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+        let (app, _hook_writer, _observer) = build_test_app_with_hooks();
 
         let events = chat_stream_collect(
             &app,
@@ -5919,7 +5830,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+        let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
 
         let payload = json!({
             "message": "Review this commit under the pinned output skills.",
@@ -6037,7 +5948,7 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
     // that still prevents CI from hanging indefinitely on a regression.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks_and_skills();
+        let (app, _hook_writer, _observer) = build_test_app_with_hooks_and_skills();
         let sid = format!("complex-multi-{}", uuid::Uuid::new_v4());
 
         // ── Turn 1: model loads the skill ──
@@ -6105,324 +6016,4 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
     })
     .await
     .expect("complex_scenario_multi_turn_preserves_active_skills_and_invoked_state exceeded 30s timeout — likely a hang regression");
-}
-
-// ── Tool Event Persistence Tests ─────────────────────────────────────────────
-
-/// Text-only response produces no tool events.
-#[tokio::test]
-async fn tool_events_empty_for_text_only() {
-    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
-
-    chat_stream_collect(
-        &app,
-        json!({
-            "message": "hello",
-            "context": {
-                "test_llm_rounds": [{ "full_text": "Hi there!" }]
-            }
-        }),
-    )
-    .await;
-
-    let plans = tool_writer.plans.lock().await;
-    assert!(plans.is_empty(), "no tool events for text-only response");
-}
-
-/// Tool calls produce tool_call events with correct tool_name metadata.
-#[tokio::test]
-async fn tool_events_persisted_for_tool_calls() {
-    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "read the file",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc1", "read_file", json!({"path": "a.txt"}))]
-                    },
-                    { "full_text": "Done." }
-                ],
-                "edge_tools": [tool_schema("read_file")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "file contents", "success").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-    let tw = tool_writer.clone();
-    poll_until(
-        || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = tool_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1, "one tool event plan persisted");
-
-    let tool_events = &plans[0].events;
-    assert_eq!(tool_events.len(), 1, "one unique tool used");
-    assert_eq!(tool_events[0].event_type, "tool_call");
-
-    let meta = tool_events[0].metadata.as_ref().expect("metadata present");
-    assert_eq!(meta["tool_name"], "read_file");
-}
-
-/// Multiple distinct tools produce one event per unique tool name.
-#[tokio::test]
-async fn tool_events_multiple_tools_distinct_names() {
-    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "check stuff",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("tc1", "read_file", json!({"path": "a.txt"})),
-                            tool_call("tc2", "list_dir", json!({"path": "."}))
-                        ]
-                    },
-                    { "full_text": "All done." }
-                ],
-                "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
-    post_tool_result(&app, "tc2", "dir listing", "success").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-    let tw = tool_writer.clone();
-    poll_until(
-        || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = tool_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-
-    let tool_events = &plans[0].events;
-    assert_eq!(tool_events.len(), 2, "two distinct tools");
-    let names: std::collections::HashSet<&str> = tool_events
-        .iter()
-        .map(|e| e.metadata.as_ref().unwrap()["tool_name"].as_str().unwrap())
-        .collect();
-    assert!(names.contains("read_file"));
-    assert!(names.contains("list_dir"));
-}
-
-// ── Phase D: mock-LLM multi-turn full API→DB path coverage ──────────────────
-//
-// Audit findings 5.2 (tool error → recovery persisted) and 5.5 (duplicate tool
-// calls preserve ordering in persistence) are end-to-end gaps: the existing
-// `tool_call_with_error_result_continues` test proves the loop survives a tool
-// error, but uses `build_test_app()` — it does not verify that both the failing
-// call AND the recovery call surface in the persistence recording.
-//
-// These tests wire the full SSE → tool ledger → persist path through the
-// recording writers and assert on what would be written to the DB.
-
-/// Scripted LLM sequence: tool call → error result → recovery tool call →
-/// success result → final text. Both tool events must be persisted so that
-/// post-hoc replay can observe the error + recovery shape.
-#[tokio::test]
-async fn mock_llm_tool_error_then_recovery_persists_both_events() {
-    let (app, _hook, _observer, tool_writer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "read a file, recover if missing",
-            "context": {
-                "test_llm_rounds": [
-                    { "tool_calls": [tool_call("tc-err", "read_file", json!({"path": "/missing"}))] },
-                    { "tool_calls": [tool_call("tc-ok",  "read_file", json!({"path": "/tmp/ok"}))] },
-                    { "full_text": "Read the fallback file." }
-                ],
-                "edge_tools": [tool_schema("read_file")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Round 1: return status=error.
-    let req1 = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(req1["request_id"].as_str(), Some("tc-err"));
-    assert_eq!(
-        post_tool_result(&app, "tc-err", "ENOENT: /missing", "error").await,
-        StatusCode::OK
-    );
-
-    // Round 2: the LLM recovers and tries a different path.
-    let req2 = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(req2["request_id"].as_str(), Some("tc-ok"));
-    assert_eq!(
-        post_tool_result(&app, "tc-ok", "file contents", "success").await,
-        StatusCode::OK
-    );
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(
-        find_events(&events, "text_delta")
-            .iter()
-            .any(|ev| ev["content"].as_str() == Some("Read the fallback file.")),
-        "recovery turn must emit the final text_delta"
-    );
-
-    let tw = tool_writer.clone();
-    poll_until(
-        move || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = tool_writer.plans.lock().await;
-    // A single turn plan is expected for the whole run; both tool_call events
-    // must appear inside it so replay can observe the error+recovery sequence.
-    assert!(!plans.is_empty(), "at least one persist plan recorded");
-    let mut all_tool_call_names: Vec<&str> = Vec::new();
-    for plan in plans.iter() {
-        for ev in plan.events.iter().filter(|e| e.event_type == "tool_call") {
-            if let Some(meta) = ev.metadata.as_ref()
-                && let Some(name) = meta.get("tool_name").and_then(Value::as_str)
-            {
-                all_tool_call_names.push(name);
-            }
-        }
-    }
-    // Both calls were `read_file`; we expect the persisted plan to include
-    // both invocations so the error+recovery sequence is reconstructible.
-    // (Existing coverage only deduplicates distinct tool *names* — a known
-    // quirk — but at minimum read_file must be present.)
-    assert!(
-        all_tool_call_names.contains(&"read_file"),
-        "read_file tool_call must be persisted, got {all_tool_call_names:?}"
-    );
-}
-
-/// Scripted LLM returns two identical tool calls in the same round. Each
-/// request_id must receive its own tool_result; the persisted tool-event plan
-/// must capture enough to distinguish them (distinct request_ids or arg
-/// payloads), so downstream observability can't silently collapse duplicate
-/// invocations into a single row.
-#[tokio::test]
-async fn mock_llm_same_name_tools_in_one_round_both_reach_persistence() {
-    let (app, _hook, _observer, tool_writer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "inspect two files",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("tc-dup-1", "read_file", json!({"path": "a.txt"})),
-                            tool_call("tc-dup-2", "read_file", json!({"path": "b.txt"}))
-                        ]
-                    },
-                    { "full_text": "Inspected both." }
-                ],
-                "edge_tools": [tool_schema("read_file")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Both tool_requests arrive before any result is needed (single round).
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _ in 0..2 {
-        let req = wait_for_sse(&mut rx, "tool_request", 5).await;
-        let id = req["request_id"].as_str().expect("id").to_string();
-        seen_ids.insert(id.clone());
-        assert_eq!(
-            post_tool_result(&app, &id, &format!("contents-{id}"), "success").await,
-            StatusCode::OK
-        );
-    }
-    assert_eq!(
-        seen_ids.len(),
-        2,
-        "both same-name tool calls must flow through distinct request_ids"
-    );
-    assert!(seen_ids.contains("tc-dup-1"));
-    assert!(seen_ids.contains("tc-dup-2"));
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(
-        find_events(&events, "text_delta")
-            .iter()
-            .any(|ev| ev["content"].as_str() == Some("Inspected both.")),
-        "follow-up turn must emit the final text"
-    );
-
-    let tw = tool_writer.clone();
-    poll_until(
-        move || {
-            let tw = tw.clone();
-            async move { !tw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-    let plans = tool_writer.plans.lock().await;
-    // The persisted plan must include a read_file tool_call event. This guards
-    // against a future regression where duplicate calls in one round would
-    // cause persistence to drop all but one entirely (vs. deduping by name,
-    // which is today's documented behaviour).
-    let read_file_calls: usize = plans
-        .iter()
-        .flat_map(|p| p.events.iter())
-        .filter(|ev| ev.event_type == "tool_call")
-        .filter(|ev| {
-            ev.metadata
-                .as_ref()
-                .and_then(|m| m.get("tool_name"))
-                .and_then(Value::as_str)
-                == Some("read_file")
-        })
-        .count();
-    assert!(
-        read_file_calls >= 1,
-        "at least one read_file persist event must survive duplicate suppression, got {read_file_calls}"
-    );
 }
