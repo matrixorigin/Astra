@@ -41,6 +41,12 @@ const SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL: &str =
          ORDER BY created_at ASC, invocation_id ASC
          LIMIT ?";
 
+const SESSION_LOCK_INFERENCE_INVOCATIONS_SQL: &str =
+    "SELECT invocation_id FROM inference_invocations
+         WHERE session_id = ? AND user_id = ?
+         ORDER BY created_at ASC, invocation_id ASC
+         FOR UPDATE";
+
 const SESSION_DELETE_TASK_LEASES_SQL: &str = "DELETE FROM task_leases
          WHERE user_id = ?
            AND task_id IN (
@@ -604,6 +610,18 @@ pub(crate) async fn hard_delete_session_rows(
 ) -> Result<SessionDatabaseDeleteOutcome, String> {
     let mut outcome = SessionDatabaseDeleteOutcome::default();
 
+    // Inference settlement takes locks in invocation -> child-row order.
+    // Acquire every invocation lock before deleting settlement debts or
+    // provider attempts so session deletion follows the same global order.
+    // `mark_session_deleting` has already fenced new admissions, therefore
+    // this set cannot grow after the lock query completes.
+    query(SESSION_LOCK_INFERENCE_INVOCATIONS_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.lock_inference_invocations: {source}"))?;
+
     for statement in SESSION_DELETE_DERIVED_FROM_AGENT_RUNS {
         let rows_deleted = delete_session_rows_session_user(
             tx,
@@ -1131,6 +1149,17 @@ mod tests {
                     || statement.label == "prompt_request_records"),
             "prompt high-growth tables must not regress to unbounded direct DELETE statements"
         );
+    }
+
+    #[test]
+    fn inference_session_delete_lock_is_owner_scoped_and_uses_lifecycle_identity_order() {
+        let normalized = SESSION_LOCK_INFERENCE_INVOCATIONS_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("session_id = ? AND user_id = ?"));
+        assert!(normalized.contains("ORDER BY created_at ASC, invocation_id ASC"));
+        assert!(normalized.ends_with("FOR UPDATE"));
     }
 
     #[test]

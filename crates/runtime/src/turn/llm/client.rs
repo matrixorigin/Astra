@@ -75,8 +75,6 @@ pub(crate) fn llm_retry_base_ms() -> u64 {
 /// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
 /// TPM limits typically reset after 60 seconds, so we wait longer.
 const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
-/// Maximum retries for TPM exhaustion (longer recovery period).
-const TPM_MAX_RETRIES: u32 = 5;
 /// TCP connect timeout for LLM API requests (seconds). Override: `ASTRA_LLM_CONNECT_TIMEOUT_S`.
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
 /// Non-stream request hard timeout (seconds). Override: `ASTRA_LLM_NONSTREAM_TIMEOUT_S`.
@@ -684,26 +682,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS: std::cell::RefCell<Option<std::time::Duration>> =
         const { std::cell::RefCell::new(None) };
-    // Retry-backoff override for tests: when `Some(ms)`, the between-attempts
-    // backoff (normally `LLM_RETRY_BASE_MS * 2^(attempt-1)` or TPM_EXHAUST_DELAY_MS)
-    // is replaced by this flat value. Lets retry-logic tests run in <100ms
-    // instead of waiting on real time.
+    // Retry-backoff override for tests: when `Some(ms)`, the generic
+    // `LLM_RETRY_BASE_MS * 2^(attempt-1)` delay is replaced by this flat
+    // value. Provider/cooldown delay hints remain authoritative.
     static TEST_RETRY_BACKOFF_MS: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Compute the between-attempts backoff in ms. `attempt` is 1-indexed (the
 /// first retry after the initial failure has attempt=1).
-fn retry_backoff_ms(attempt: u32, tpm_exhausted: bool) -> u64 {
+fn retry_backoff_ms(attempt: u32) -> u64 {
     #[cfg(test)]
     if let Some(ms) = TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
         return ms;
     }
-    if tpm_exhausted {
-        TPM_EXHAUST_DELAY_MS
-    } else {
-        llm_retry_base_ms() * (1 << (attempt - 1))
-    }
+    llm_retry_base_ms() * (1 << (attempt - 1))
 }
 
 /// Override the between-retry backoff to `ms` for the duration of a test.
@@ -2875,8 +2868,8 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
-    let mut tpm_exhaustion_detected = false;
     let max_retries = LLM_MAX_RETRIES;
+    let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
     // parallel tests (and to ensure consistent timeouts across retries).
     let idle_pre = stream_idle_timeout();
@@ -2892,16 +2885,6 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     };
 
     for attempt in 0..=max_retries {
-        // Extend retries if TPM exhaustion was detected (account-level limit)
-        let effective_max = if tpm_exhaustion_detected {
-            TPM_MAX_RETRIES
-        } else {
-            max_retries
-        };
-        if attempt > effective_max {
-            break;
-        }
-
         if cancel.is_triggered() {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Cancelled,
@@ -2919,17 +2902,12 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             ));
         }
         if attempt > 0 {
-            // Use longer delay for TPM exhaustion (60s) vs standard exponential (1s, 2s, 4s)
-            let delay = retry_backoff_ms(attempt, tpm_exhaustion_detected);
-            if tpm_exhaustion_detected {
-                astra_core::agent_warn!(
-                    "llm",
-                    "TPM exhaustion detected, waiting {}s before retry {}/{}",
-                    delay / 1000,
-                    attempt,
-                    TPM_MAX_RETRIES
-                );
-            }
+            // A provider/cooldown hint owns the next delay when present.
+            // Otherwise use generic exponential backoff. This prevents a
+            // rate-limit response from sleeping in both places.
+            let delay = retry_delay_override_ms
+                .take()
+                .unwrap_or_else(|| retry_backoff_ms(attempt));
             tokio::select! {
                 biased;
                 _ = wait_llm_cancel(cancel) => return Err(astra_core::ClassifiedError::new(
@@ -3050,13 +3028,26 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                 .await?;
                                 last_err = error.message.clone();
                                 last_kind = error.kind;
-                                cooldown.with(model_key, |c| {
-                                    let _ = c.record_429(None, has_fallback);
-                                });
+                                let action =
+                                    cooldown.with(model_key, |c| c.record_429(None, has_fallback));
                                 if has_partial {
                                     return Err(error);
                                 }
-                                continue;
+                                match action {
+                                    RateLimitAction::WaitAndRetry { delay_ms } => {
+                                        retry_delay_override_ms = Some(delay_ms);
+                                        continue;
+                                    }
+                                    RateLimitAction::UseFallback { reason } => {
+                                        return Err(crate::turn::bridge::llm_stream::fallback_required_error(
+                                            error,
+                                            reason,
+                                        ));
+                                    }
+                                    RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
+                                        return Err(error);
+                                    }
+                                }
                             }
                             RetryKind::Transient => {
                                 let error = attach_partial_details(
@@ -3245,12 +3236,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
                 .await?;
 
-            // Detect TPM exhaustion for extended retry behavior
-            if is_tpm_exhaustion(&text) && !tpm_exhaustion_detected {
-                tpm_exhaustion_detected = true;
+            let tpm_exhaustion = is_tpm_exhaustion(&text);
+            if tpm_exhaustion {
                 astra_core::agent_warn!(
                     "llm",
-                    "TPM exhaustion detected on {} — extending retry with {}s cooldown",
+                    "TPM exhaustion detected on {} — applying {}s retry delay",
                     model_key,
                     TPM_EXHAUST_DELAY_MS / 1000
                 );
@@ -3263,16 +3253,25 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 model_key,
                 action,
             );
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                // For TPM exhaustion, use longer delay
-                let actual_delay = if tpm_exhaustion_detected {
-                    delay_ms.max(TPM_EXHAUST_DELAY_MS)
-                } else {
-                    delay_ms
-                };
-                sleep_ms_or_llm_cancel(actual_delay, cancel).await?;
+            match action {
+                RateLimitAction::WaitAndRetry { delay_ms } => {
+                    retry_delay_override_ms = Some(if tpm_exhaustion {
+                        delay_ms.max(TPM_EXHAUST_DELAY_MS)
+                    } else {
+                        delay_ms
+                    });
+                    continue;
+                }
+                RateLimitAction::UseFallback { reason } => {
+                    return Err(crate::turn::bridge::llm_stream::fallback_required_error(
+                        observed_error,
+                        reason,
+                    ));
+                }
+                RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
+                    return Err(observed_error);
+                }
             }
-            continue;
         }
 
         if is_overload_status(status) {
@@ -3287,10 +3286,21 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 model_key,
                 action,
             );
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, cancel).await?;
+            match action {
+                RateLimitAction::WaitAndRetry { delay_ms } => {
+                    retry_delay_override_ms = Some(delay_ms);
+                    continue;
+                }
+                RateLimitAction::UseFallback { reason } => {
+                    return Err(crate::turn::bridge::llm_stream::fallback_required_error(
+                        observed_error,
+                        reason,
+                    ));
+                }
+                RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
+                    return Err(observed_error);
+                }
             }
-            continue;
         }
 
         // Other 5xx errors are retryable
@@ -3325,14 +3335,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         return Err(error);
     }
 
-    let retries_used = if tpm_exhaustion_detected {
-        TPM_MAX_RETRIES
-    } else {
-        LLM_MAX_RETRIES
-    };
     Err(astra_core::ClassifiedError::new(
         last_kind,
-        format!("{last_err} (after {} retries)", retries_used),
+        format!("{last_err} (after {} retries)", LLM_MAX_RETRIES),
     ))
 }
 

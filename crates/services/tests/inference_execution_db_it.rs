@@ -379,6 +379,85 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
     }
 }
 
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn deleting_session_fences_new_run_and_session_inference_admission() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("deleting-admission-user-{suffix}");
+    let session_id = format!("deleting-admission-session-{suffix}");
+    let run_id = format!("deleting-admission-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    sqlx::query(
+        "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("mark inference owner session deleting");
+
+    let scopes = [
+        InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "deleting_run_admission".to_string(),
+            logical_attempt: 0,
+        },
+        InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "deleting_session_admission".to_string(),
+            logical_attempt: 0,
+        },
+    ];
+    for scope in scopes {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope,
+            offering_id: "deleting-admission-offering".to_string(),
+            resolved_model_name: "deleting-admission-model".to_string(),
+            upstream_model_name: "deleting-admission-model".to_string(),
+            provider: "openai".to_string(),
+            purpose: InferencePurpose::PrimaryAgent,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+        })
+        .expect("plan inference against deleting session");
+        assert_eq!(
+            admit_inference_invocation(&shared_pool, &plan)
+                .await
+                .expect_err("deleting session must fence new provider admission")
+                .kind,
+            ServiceErrorKind::NotFound
+        );
+    }
+
+    let durable_rows: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*) FROM inference_routes WHERE user_id = ? AND session_id = ?)
+           + (SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND session_id = ?)",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count inference rows rejected during deletion");
+    assert_eq!(
+        durable_rows, 0,
+        "rejected admission must leave no route or invocation"
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
 async fn seed_harness_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, harness_run_id: &str) {
     sqlx::query(
         "INSERT INTO harness_runs

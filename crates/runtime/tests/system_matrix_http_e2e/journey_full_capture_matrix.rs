@@ -27,8 +27,8 @@ async fn collect_full_sse_stream(
     (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
-fn read_journal_events(session_id: &str) -> Vec<Value> {
-    let path = JournalWriter::new(session_id)
+fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
+    let path = JournalWriter::for_user(user_id, session_id)
         .expect("journal writer")
         .path()
         .clone();
@@ -61,10 +61,10 @@ fn is_response_event(event: &Value) -> bool {
     event["metadata"]["response"]["response"].is_object()
 }
 
-async fn wait_for_full_capture_events(session_id: &str) -> Vec<Value> {
+async fn wait_for_full_capture_events(user_id: &str, session_id: &str) -> Vec<Value> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let events = read_journal_events(session_id);
+        let events = read_journal_events(user_id, session_id);
         let llm_full: Vec<_> = events
             .iter()
             .filter(|event| is_full_capture_event(event))
@@ -145,7 +145,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         "expected streamed assistant text in body: {body}"
     );
 
-    let llm_events = wait_for_full_capture_events(&session_id).await;
+    let llm_events = wait_for_full_capture_events(&ctx.user_id, &session_id).await;
     let request_event = llm_events
         .iter()
         .find(|event| is_request_event(event))

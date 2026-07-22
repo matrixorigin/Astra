@@ -248,40 +248,81 @@ async fn ensure_invocation_scope(
     connection: &mut sqlx::MySqlConnection,
     input: &InferenceInvocationInput,
 ) -> ServiceResult<()> {
-    let query = match &input.scope {
+    let exists = match &input.scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
-        } => sqlx::query(
-            "SELECT 1 FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
+        } => {
+            let session_exists = sqlx::query(
+                "SELECT 1 FROM agent_sessions
+                 WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
+                 LIMIT 1 FOR UPDATE",
+            )
+            .bind(&input.user_id)
+            .bind(session_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "verify inference session scope",
+                    error,
+                )
+            })?
+            .is_some();
+            session_exists
+                && sqlx::query(
+                    "SELECT 1 FROM agent_runs
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                     LIMIT 1 FOR UPDATE",
+                )
+                .bind(&input.user_id)
+                .bind(session_id)
+                .bind(run_id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "verify inference run scope",
+                        error,
+                    )
+                })?
+                .is_some()
+        }
+        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
+            "SELECT 1 FROM agent_sessions
+             WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
+             LIMIT 1 FOR UPDATE",
         )
         .bind(&input.user_id)
         .bind(session_id)
-        .bind(run_id),
-        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
-            "SELECT 1 FROM agent_sessions
-             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(&input.user_id)
-        .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "SELECT 1 FROM harness_runs
-             WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(&input.user_id)
-        .bind(harness_run_id),
-    };
-    let exists = query
         .fetch_optional(&mut *connection)
         .await
         .map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "verify inference owner scope",
+                "verify inference session scope",
                 error,
             )
         })?
-        .is_some();
+        .is_some(),
+        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
+            "SELECT 1 FROM harness_runs
+             WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&input.user_id)
+        .bind(harness_run_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "verify inference harness scope",
+                error,
+            )
+        })?
+        .is_some(),
+    };
     if !exists {
         return Err(ServiceError::not_found(format!(
             "inference {} scope does not exist for user_id={} owner_id={}",

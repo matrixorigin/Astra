@@ -2108,8 +2108,8 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
 
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
-        4,
-        "expected one initial stream attempt plus three retries before failure"
+        3,
+        "the third consecutive rate limit must enter cooldown without a fourth provider call"
     );
     assert_no_primary_nonstream_fallback(
         &hits,
@@ -2950,8 +2950,8 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
 
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
-        4,
-        "expected one initial stream attempt plus three retries before failure"
+        3,
+        "the third consecutive rate limit must enter cooldown without a fourth provider call"
     );
     assert_no_primary_nonstream_fallback(
         &hits,

@@ -496,7 +496,8 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events \
              WHERE user_id = ? AND session_id = ? \
-               AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')",
+               AND event_type IN ('user_query', 'llm_response', \
+                                  'tool_call_started', 'tool_call_completed')",
         )
         .bind(user_id)
         .bind(&session_id)
@@ -516,7 +517,8 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
     let rows = sqlx::query(
         "SELECT event_type, content, tool_call_id FROM agent_events \
          WHERE user_id = ? AND session_id = ? \
-           AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result') \
+           AND event_type IN ('user_query', 'llm_response', \
+                              'tool_call_started', 'tool_call_completed') \
          ORDER BY created_at ASC, event_id ASC",
     )
     .bind(user_id)
@@ -533,8 +535,8 @@ pub async fn run_cli_bridge_tool_round_preserves_causal_event_order() {
         vec![
             "user_query",
             "llm_response",
-            "tool_call",
-            "tool_result",
+            "tool_call_started",
+            "tool_call_completed",
             "llm_response"
         ],
         "bridge event order must follow user -> model call -> tool result -> model reply"

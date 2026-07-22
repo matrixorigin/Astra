@@ -240,7 +240,7 @@ fn classify_non_success_and_record_cooldown(
 
 const FALLBACK_REQUIRED_SOURCE: &str = "llm_fallback_required";
 
-fn fallback_required_error(
+pub(crate) fn fallback_required_error(
     cause: astra_core::ClassifiedError,
     reason: CooldownReason,
 ) -> astra_core::ClassifiedError {
