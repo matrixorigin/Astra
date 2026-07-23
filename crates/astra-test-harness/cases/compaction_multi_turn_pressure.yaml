@@ -12,12 +12,14 @@ description: |
   **Pass means**: Agent recalls turn-2 content in turn 3 after compaction fired.
   **Fail means**: Compaction was too aggressive (cleared recent results) or never fired.
 prompt: |
-  Read these 5 files using read_file, one at a time:
-  1. crates/runtime/Cargo.toml
-  2. crates/astra-cli/Cargo.toml
-  3. crates/services/Cargo.toml
-  4. crates/astra-tools/Cargo.toml
-  5. Makefile
+  Read these 5 bounded source ranges using read_file, one at a time. Use the
+  exact start_line/end_line ranges so this turn contains realistic large tool
+  results without depending on accidental duplicate reads:
+  1. crates/runtime/src/turn/bridge/inprocess.rs, lines 1-300
+  2. crates/runtime/src/server/server_loop_host.rs, lines 1-300
+  3. crates/services/src/storage.rs, lines 1-300
+  4. crates/runtime/src/turn/agentic_loop/execution_phase.rs, lines 1-300
+  5. Makefile, lines 1-300
   After reading, say "batch-1-done" and nothing else.
 capability: tool_use
 difficulty: 3
@@ -49,15 +51,10 @@ steps:
     criteria:
       - type: text_contains
         needle: "BUILD_TOOL:"
-      - type: judger
-        question: |
-          The agent was asked about start-api.sh (which uses cargo to build)
-          and the package name in crates/core/Cargo.toml (which is "astra-core").
-          Did the agent correctly answer:
-          1. BUILD_TOOL: cargo (the script runs cargo build)
-          2. PACKAGE: astra-core
-          Score 1.0 if both correct, 0.5 if one correct, 0.0 if neither.
-        threshold: 0.5
+      - type: text_contains
+        needle: "BUILD_TOOL: cargo"
+      - type: text_contains
+        needle: "PACKAGE: astra-core"
 criteria:
   - type: exit_code
     code: 0

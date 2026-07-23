@@ -23,6 +23,9 @@ pub(crate) struct BasicCliTurnOptions {
     pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
     pub(crate) disable_session_not_found_retry: bool,
+    /// Authoritative 1-based outer-session turn restored before any auxiliary
+    /// inference or main bridge request is admitted.
+    pub(crate) turn_index: Option<u32>,
 }
 
 fn build_basic_cli_turn_params<'a>(
@@ -40,6 +43,9 @@ fn build_basic_cli_turn_params<'a>(
     params.append_system_prompt = options.append_system_prompt.clone();
     params.cancel_token = options.cancel_token.clone();
     params.approval_request_tx = options.approval_request_tx.clone();
+    if let Some(turn_index) = options.turn_index {
+        params.turn_index = turn_index.max(1);
+    }
     params
 }
 

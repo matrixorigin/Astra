@@ -376,6 +376,14 @@ pub(crate) fn context_meta_event(
     breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     context_manifest_trace: Option<&Value>,
 ) -> Value {
+    context_meta_event_with_compactions(breakdown, context_manifest_trace, &[])
+}
+
+pub(crate) fn context_meta_event_with_compactions(
+    breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
+    context_manifest_trace: Option<&Value>,
+    compactions: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
+) -> Value {
     let mut event = json!({
         "type": "context_meta",
         "system_prompt_tokens": breakdown.total_tokens,
@@ -383,6 +391,9 @@ pub(crate) fn context_meta_event(
     });
     if let Some(trace) = context_manifest_trace {
         event["context_manifest_trace"] = trace.clone();
+    }
+    if !compactions.is_empty() {
+        event["compactions"] = json!(compactions);
     }
     event
 }
@@ -2556,6 +2567,35 @@ mod context_cache_contract_tests {
         assert_eq!(event["type"], "context_meta");
         assert_eq!(event["system_prompt_tokens"], 123);
         assert_eq!(event["context_manifest_trace"], trace);
+    }
+
+    #[test]
+    fn context_meta_event_carries_compaction_observations_as_runtime_facts() {
+        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+            total_tokens: 42,
+            ..Default::default()
+        };
+        let compactions = vec![
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+                id: "initial".to_string(),
+                phase: "initial".to_string(),
+                tier: "compact_history".to_string(),
+                messages_before: 18,
+                messages_after: 10,
+                tokens_before: 12_000,
+                tokens_after: 7_000,
+                tokens_saved: 5_000,
+            },
+        ];
+
+        let event = context_meta_event_with_compactions(&breakdown, None, &compactions);
+
+        assert_eq!(event["compactions"][0]["id"], "initial");
+        assert_eq!(event["compactions"][0]["tokens_saved"], 5_000);
+        assert!(
+            event.get("context_manifest_trace").is_none(),
+            "runtime facts must not fabricate a context-manifest trace"
+        );
     }
 
     #[test]

@@ -43,11 +43,10 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
-            let messages =
-                match astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
-                    cp.messages,
-                    &prompt_state,
-                ) {
+            let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
+                cp.messages,
+                &prompt_state,
+            ) {
                     Ok(messages) => messages,
                     Err(error) => {
                         tracing::warn!(
@@ -112,7 +111,9 @@ fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec
     Ok((!messages.is_empty()).then_some(messages))
 }
 
-fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Value>>, String> {
+pub(crate) fn load_csl_messages_for_continuation(
+    session_id: &str,
+) -> Result<Option<Vec<Value>>, String> {
     let store = astra_turn_core::conversation_log::file_store::FileCslStore::new(
         crate::cli::session::session_recovery::io::csl_store_base_dir(),
     );
@@ -122,11 +123,12 @@ fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Val
     let Some(materialized) = materialized else {
         return Ok(None);
     };
-    let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
-        materialized.messages,
-        &materialized.session_state,
-    )
-    .map_err(|error| error.to_string())?;
+    let messages =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
+            materialized.messages,
+            &materialized.session_state,
+        )
+        .map_err(|error| error.to_string())?;
     Ok((!messages.is_empty()).then_some(messages))
 }
 
@@ -152,8 +154,15 @@ fn heavy_checkpoint_prompt_state(
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
-    msgs =
-        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(msgs);
+    msgs = astra_turn_core::prompt_facing::
+        sanitize_canonical_continuation_messages_with_turn_semantics(msgs)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "dropping continuation with invalid typed turn metadata"
+            );
+            Vec::new()
+        });
     msgs
 }
 
@@ -422,6 +431,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn load_session_messages_restores_completed_tool_evidence_from_csl() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("test-session-csl-tools-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                json!({"role": "user", "content": "inspect Cargo.toml"}),
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "[package]\nname = \"astra\""
+                }),
+                json!({"role": "assistant", "content": "done"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        let messages = super::load_session_messages_for_continuation(&session_id)
+            .expect("canonical continuation");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["content"], "[package]\nname = \"astra\"");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn csl_continuation_reports_corrupt_typed_metadata() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
@@ -541,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_compacts_trailing_completed_tool_round() {
+    fn sanitize_preserves_trailing_completed_tool_round_for_pressure_aware_optimizer() {
         let msgs = vec![
             json!({"role": "user", "content": "check status"}),
             json!({"role": "assistant", "content": "Here is the status."}),
@@ -552,8 +602,12 @@ mod tests {
             json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 7);
         assert_eq!(result[2]["content"], "hi");
+        assert_eq!(result[3]["tool_calls"][0]["id"], "1");
+        assert_eq!(result[4]["tool_call_id"], "1");
+        assert_eq!(result[5]["tool_calls"][0]["id"], "2");
+        assert_eq!(result[6]["tool_call_id"], "2");
     }
 
     #[test]

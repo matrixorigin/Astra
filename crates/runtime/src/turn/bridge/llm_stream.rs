@@ -1039,26 +1039,18 @@ fn apply_anthropic_event(
             if let Some(u) = chunk.get("usage").and_then(Value::as_object)
                 && let Some(out_toks) = u.get("output_tokens").and_then(Value::as_u64)
             {
-                usage.insert("output_tokens".into(), Value::from(out_toks));
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let cached = usage
-                    .get("cached_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let cache_creation = usage
-                    .get("cache_creation_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let final_usage = crate::turn::token_usage::TokenUsage {
+                    output_tokens: out_toks,
+                    ..crate::turn::token_usage::TokenUsage::from_partial_json_map(usage)
+                };
+                *usage = final_usage.to_json_map();
                 out.push(render_sse(&json!({
                     "type": "usage",
-                    "input_tokens": input,
-                    "cached_input_tokens": cached,
-                    "cache_creation_tokens": cache_creation,
-                    "output_tokens": out_toks,
-                    "total_tokens": input + cached + cache_creation + out_toks,
+                    "input_tokens": final_usage.input_tokens,
+                    "cached_input_tokens": final_usage.cached_input_tokens,
+                    "cache_creation_tokens": final_usage.cache_creation_tokens,
+                    "output_tokens": final_usage.output_tokens,
+                    "total_tokens": final_usage.total_tokens(),
                 })));
             }
         }
@@ -2192,6 +2184,7 @@ mod tests {
 
         let mut text_deltas = Vec::<String>::new();
         let mut usage_events = Vec::<Value>::new();
+        let mut summary_events = Vec::<Value>::new();
         for chunk in raw.split("\n\n") {
             let chunk = chunk.trim();
             let Some(rest) = chunk.strip_prefix("data: ") else {
@@ -2208,6 +2201,7 @@ mod tests {
                         .to_string(),
                 ),
                 Some("usage") => usage_events.push(v),
+                Some("_inprocess_summary") => summary_events.push(v),
                 _ => {}
             }
         }
@@ -2250,6 +2244,17 @@ mod tests {
                 .unwrap_or(0)
                 >= 7,
             "output_tokens must reflect message_delta update — got {last_usage}",
+        );
+        let summary_usage = summary_events
+            .last()
+            .and_then(|summary| summary.get("usage"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            summary_usage.get("total_tokens").and_then(Value::as_u64),
+            Some(61),
+            "the persisted summary must retain the canonical invariant \
+             total = fresh + cached + cache_creation + output — got {summary_usage}",
         );
         assert!(raw.contains("\"provider_response_id\":\"msg_1\""), "{raw}");
         let events = observer.events();

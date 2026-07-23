@@ -81,6 +81,52 @@ pub struct CoreSchemaTableSpec {
     pub ddl_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistedCoreSchemaTableClaim {
+    name: String,
+    component: String,
+    owner: String,
+    contract_version: String,
+    ddl_sha256: String,
+}
+
+/// Validate ownership and identify declarations retired by the new contract.
+///
+/// A contract-version upgrade is an ownership-aware reconciliation, not an
+/// unqualified delete/reinsert cycle. The old path mapped every duplicate-key
+/// error to "another owner" without reading the persisted owner first. An
+/// explicit read plus per-key upsert distinguishes legitimate same-component
+/// upgrades from real cross-component conflicts and remains safe under retry.
+fn stale_core_schema_table_claims(
+    existing: &[PersistedCoreSchemaTableClaim],
+    declarations: &[CoreSchemaTableSpec],
+) -> Result<Vec<String>, sqlx::Error> {
+    let desired_names = declarations
+        .iter()
+        .map(|declaration| declaration.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for claim in existing {
+        if desired_names.contains(claim.name.as_str())
+            && claim.component != CORE_SCHEMA_CONTRACT_COMPONENT
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "schema table {} is already claimed by lifecycle component {} (owner={})",
+                claim.name, claim.component, claim.owner
+            )));
+        }
+    }
+
+    Ok(existing
+        .iter()
+        .filter(|claim| {
+            claim.component == CORE_SCHEMA_CONTRACT_COMPONENT
+                && !desired_names.contains(claim.name.as_str())
+        })
+        .map(|claim| claim.name.clone())
+        .collect())
+}
+
 #[derive(Clone, Debug)]
 struct CoreSchemaDeclaration {
     owner: String,
@@ -557,15 +603,36 @@ async fn publish_core_schema_table_contracts(
         ));
     }
     let mut transaction = pool.begin().await?;
-    query("DELETE FROM astra_schema_table_contracts WHERE component = ?")
-        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-        .execute(&mut *transaction)
-        .await?;
+    let existing = query(
+        "SELECT table_name, component, owner, contract_version, ddl_sha256
+         FROM astra_schema_table_contracts",
+    )
+    .fetch_all(&mut *transaction)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(PersistedCoreSchemaTableClaim {
+            name: row.try_get("table_name")?,
+            component: row.try_get("component")?,
+            owner: row.try_get("owner")?,
+            contract_version: row.try_get("contract_version")?,
+            ddl_sha256: row.try_get("ddl_sha256")?,
+        })
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let stale_claims = stale_core_schema_table_claims(&existing, declarations)?;
+
     for declaration in declarations {
         query(
             "INSERT INTO astra_schema_table_contracts
              (table_name, component, owner, contract_version, ddl_sha256)
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               component = VALUES(component),
+               owner = VALUES(owner),
+               contract_version = VALUES(contract_version),
+               ddl_sha256 = VALUES(ddl_sha256),
+               updated_at = NOW(6)",
         )
         .bind(&declaration.name)
         .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
@@ -576,10 +643,20 @@ async fn publish_core_schema_table_contracts(
         .await
         .map_err(|error| {
             sqlx::Error::Protocol(format!(
-                "schema table {} is already claimed by another lifecycle owner: {error}",
+                "failed to reconcile schema table {} lifecycle contract: {error}",
                 declaration.name
             ))
         })?;
+    }
+    for table_name in stale_claims {
+        query(
+            "DELETE FROM astra_schema_table_contracts
+             WHERE table_name = ? AND component = ?",
+        )
+        .bind(table_name)
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .execute(&mut *transaction)
+        .await?;
     }
     transaction.commit().await
 }
@@ -7273,6 +7350,85 @@ mod tests {
 
         let error = authority.declarations().unwrap_err().to_string();
         assert!(error.contains("duplicate_owner (claims=2)"), "{error}");
+    }
+
+    fn persisted_claim(
+        name: &str,
+        component: &str,
+        owner: &str,
+        version: &str,
+    ) -> PersistedCoreSchemaTableClaim {
+        PersistedCoreSchemaTableClaim {
+            name: name.to_string(),
+            component: component.to_string(),
+            owner: owner.to_string(),
+            contract_version: version.to_string(),
+            ddl_sha256: "a".repeat(64),
+        }
+    }
+
+    fn desired_table(name: &str, owner: &str) -> CoreSchemaTableSpec {
+        CoreSchemaTableSpec {
+            name: name.to_string(),
+            owner: owner.to_string(),
+            ddl_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn core_schema_contract_upgrade_reconciles_same_component_in_place() {
+        let existing = vec![persisted_claim(
+            "admin_config",
+            CORE_SCHEMA_CONTRACT_COMPONENT,
+            "storage",
+            "2026-07-20-v6",
+        )];
+        let declarations = vec![desired_table("admin_config", "storage")];
+
+        let stale = stale_core_schema_table_claims(&existing, &declarations).unwrap();
+
+        assert!(
+            stale.is_empty(),
+            "an older contract for the same component must be updated in place"
+        );
+    }
+
+    #[test]
+    fn core_schema_contract_upgrade_removes_only_retired_same_component_claims() {
+        let existing = vec![
+            persisted_claim(
+                "kept_table",
+                CORE_SCHEMA_CONTRACT_COMPONENT,
+                "storage",
+                "old",
+            ),
+            persisted_claim(
+                "retired_table",
+                CORE_SCHEMA_CONTRACT_COMPONENT,
+                "storage",
+                "old",
+            ),
+            persisted_claim("foreign_table", "extension", "plugin", "v1"),
+        ];
+        let declarations = vec![desired_table("kept_table", "storage")];
+
+        let stale = stale_core_schema_table_claims(&existing, &declarations).unwrap();
+
+        assert_eq!(stale, vec!["retired_table"]);
+    }
+
+    #[test]
+    fn core_schema_contract_upgrade_rejects_foreign_component_claim() {
+        let existing = vec![persisted_claim("shared_table", "extension", "plugin", "v1")];
+        let declarations = vec![desired_table("shared_table", "storage")];
+
+        let error = stale_core_schema_table_claims(&existing, &declarations)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("shared_table"), "{error}");
+        assert!(error.contains("extension"), "{error}");
+        assert!(error.contains("plugin"), "{error}");
     }
 
     #[test]

@@ -2,14 +2,17 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::{
-    load_session_messages_for_continuation, sanitize_continuation_messages,
+    load_csl_messages_for_continuation, load_session_messages_for_continuation,
+    sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
-    list_cloud_resumable_sessions, restore_session_snapshot_with_client,
+    fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
+    restore_session_snapshot_with_client,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct OneShotSessionResumeMetadata {
+    pub(crate) completed_turn_count: u32,
     pub(crate) model: Option<String>,
     pub(crate) permission_mode: Option<String>,
     pub(crate) continuation_messages: Vec<serde_json::Value>,
@@ -24,6 +27,19 @@ pub(crate) struct OneShotSessionRouting {
 
 impl OneShotSessionRouting {
     pub(crate) fn continuation_messages(&self) -> Option<Vec<serde_json::Value>> {
+        if let Some(session_id) = self.history_source_session_id.as_deref() {
+            match load_csl_messages_for_continuation(session_id) {
+                Ok(Some(messages)) => return Some(messages),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "failed to read canonical local continuation; trying restore projection"
+                    );
+                }
+            }
+        }
         if !self.resume_metadata.continuation_messages.is_empty() {
             return Some(self.resume_metadata.continuation_messages.clone());
         }
@@ -42,6 +58,21 @@ impl OneShotSessionRouting {
 
     pub(crate) fn restored_permission_mode(&self) -> Option<&str> {
         self.resume_metadata.permission_mode.as_deref()
+    }
+
+    /// Return the 1-based turn index for the next Server-owned turn.
+    ///
+    /// Auxiliary inference runs before the main `/chat/turn` request, so it
+    /// cannot rely on that request's stale-turn recovery to repair its causal
+    /// scope. A resumed Server session must start from the authoritative
+    /// completed-turn count obtained during restore. Local-only continuation
+    /// creates a new Server session and therefore always starts at turn 1.
+    pub(crate) fn next_server_turn_index(&self) -> u32 {
+        if self.server_session_id.is_some() {
+            self.resume_metadata.completed_turn_count.saturating_add(1)
+        } else {
+            1
+        }
     }
 }
 
@@ -83,16 +114,56 @@ async fn load_one_shot_resume_metadata(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     session_id: Option<&str>,
+    server_session: bool,
 ) -> OneShotSessionResumeMetadata {
     let Some(session_id) = session_id else {
         return OneShotSessionResumeMetadata::default();
     };
 
-    match restore_session_snapshot_with_client(profile, api, session_id).await {
+    let mut restored = restore_session_snapshot_with_client(profile, api, session_id).await;
+    if server_session
+        && restored
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|snapshot| !snapshot.restored_from_cloud)
+    {
+        // Local CSL/checkpoints remain the highest-fidelity conversation
+        // source, but the Server owns the causal turn sequence. Reconcile a
+        // local snapshot with the remote turn count so another process or
+        // device cannot make auxiliary inference reuse an old ledger key.
+        match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
+            Ok(Some(remote)) => {
+                if let Ok(Some(local)) = restored.as_mut() {
+                    local.turn_count = remote.turn_count;
+                    if remote.model.is_some() {
+                        local.model = remote.model;
+                    }
+                    if remote.permission_mode.is_some() {
+                        local.permission_mode = remote.permission_mode;
+                    }
+                    if local.conversation_messages.is_empty() {
+                        local.conversation_messages = remote.conversation_messages;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "failed to reconcile local resume metadata with authoritative server turn"
+                );
+            }
+        }
+    }
+
+    match restored {
         Ok(Some(restored)) => {
             let continuation_messages =
                 sanitize_continuation_messages(restored.conversation_messages);
             OneShotSessionResumeMetadata {
+                completed_turn_count: restored.turn_count,
                 model: restored.model,
                 permission_mode: restored.permission_mode,
                 continuation_messages,
@@ -119,8 +190,13 @@ async fn attach_one_shot_resume_metadata(
         .history_source_session_id
         .as_deref()
         .or(routing.server_session_id.as_deref());
-    routing.resume_metadata =
-        load_one_shot_resume_metadata(api, profile, metadata_session_id).await;
+    routing.resume_metadata = load_one_shot_resume_metadata(
+        api,
+        profile,
+        metadata_session_id,
+        routing.server_session_id.is_some(),
+    )
+    .await;
     routing
 }
 
@@ -177,8 +253,8 @@ pub(crate) async fn resolve_one_shot_session_routing(
 #[cfg(test)]
 mod tests {
     use super::{
-        explicit_resume_preflight_error, resolve_one_shot_session_routing,
-        select_one_shot_session_routing,
+        OneShotSessionResumeMetadata, OneShotSessionRouting, explicit_resume_preflight_error,
+        resolve_one_shot_session_routing, select_one_shot_session_routing,
     };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_pipeline::step_checkpoint::write_step_checkpoint;
@@ -320,6 +396,57 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn continuation_prefers_local_canonical_evidence_over_lossy_restore_projection() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("routing-canonical-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                serde_json::json!({"role": "user", "content": "inspect"}),
+                serde_json::json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}
+                    }]
+                }),
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "canonical evidence"
+                }),
+                serde_json::json!({"role": "assistant", "content": "done"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+        let routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.clone()),
+            history_source_session_id: Some(session_id),
+            resume_metadata: OneShotSessionResumeMetadata {
+                continuation_messages: vec![
+                    serde_json::json!({"role": "user", "content": "inspect"}),
+                    serde_json::json!({"role": "assistant", "content": "done"}),
+                ],
+                ..Default::default()
+            },
+        };
+
+        let continuation = routing.continuation_messages().expect("continuation");
+
+        assert!(
+            continuation
+                .iter()
+                .any(|message| message["role"] == "tool"
+                    && message["content"] == "canonical evidence"),
+            "a lower-fidelity restore projection must not replace canonical local history"
+        );
+    }
+
+    #[test]
     fn explicit_resume_preflight_error_describes_missing_and_noauth() {
         let missing = explicit_resume_preflight_error(
             "sess-1",
@@ -433,6 +560,17 @@ mod tests {
 
         let server = MockServer::start().await;
         mock_existing_session(&server, &session_id).await;
+        mock_cloud_resume(
+            &server,
+            &session_id,
+            astra_services::session_restore::RestoredSession {
+                session_id: session_id.clone(),
+                turn_count: 4,
+                restored_from_cloud: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let routing =
@@ -446,6 +584,11 @@ mod tests {
         );
         assert_eq!(routing.restored_model(), Some("gpt-5"));
         assert_eq!(routing.restored_permission_mode(), Some("plan"));
+        assert_eq!(
+            routing.next_server_turn_index(),
+            5,
+            "remote causal sequence must override a stale local checkpoint without replacing its richer metadata"
+        );
     }
 
     #[serial_test::serial]
@@ -474,6 +617,7 @@ mod tests {
             &session_id,
             astra_services::session_restore::RestoredSession {
                 session_id: session_id.clone(),
+                turn_count: 6,
                 model: Some("gpt-5-cloud".to_string()),
                 permission_mode: Some("accept_edits".to_string()),
                 conversation_messages: vec![
@@ -494,6 +638,11 @@ mod tests {
 
         assert_eq!(routing.restored_model(), Some("gpt-5-cloud"));
         assert_eq!(routing.restored_permission_mode(), Some("accept_edits"));
+        assert_eq!(
+            routing.next_server_turn_index(),
+            7,
+            "causal scopes for auxiliary inference must use the restored server turn before the main turn starts"
+        );
         let continuation = routing
             .continuation_messages()
             .expect("cloud resume messages should feed one-shot continuation");

@@ -21,6 +21,7 @@ pub(crate) fn build_context_trace_signal(
     visible_tools: Vec<String>,
     measured_prompt_tokens: Option<u64>,
     model_limit: usize,
+    compression_triggered: bool,
     tool_execution_ms: u64,
     total_ms: u64,
 ) -> ContextTraceSignal {
@@ -32,7 +33,7 @@ pub(crate) fn build_context_trace_signal(
         } else {
             0.0
         },
-        compression_triggered: false,
+        compression_triggered,
     });
     let llm_total_ms = total_ms.saturating_sub(tool_execution_ms);
 

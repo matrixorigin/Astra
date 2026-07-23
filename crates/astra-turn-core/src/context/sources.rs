@@ -40,7 +40,9 @@ pub trait ContextChannelProvider: Send + Sync {
     fn channel_id(&self) -> &'static str;
 
     /// Cache scope for this channel's output.
-    /// - `Session` → routed to `extra_stable_sections` (cached prefix)
+    /// - `Session` → routed to `extra_stable_sections` (cached prefix). The
+    ///   provider still rebuilds the section every turn; if its versioned
+    ///   source changes, different bytes naturally invalidate that prefix.
     /// - `None`   → routed to `extra_dynamic_sections` (per-turn volatile)
     fn cache_scope(&self) -> CacheScope;
 

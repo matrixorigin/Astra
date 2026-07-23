@@ -2199,6 +2199,10 @@ pub struct AgenticLoopState {
     /// Set to `true` once the budget-exceeded wrap-up message has been injected.
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
+    /// Whether any provider-visible context compaction occurred during this
+    /// user turn. This is observability state only; unlike the budget wrap-up
+    /// flag it must never change execution policy.
+    pub context_compression_triggered: bool,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3576,6 +3580,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
+        context_compression_triggered: false,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
@@ -4317,6 +4322,7 @@ pub(crate) mod tests {
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            context_compression_triggered: false,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

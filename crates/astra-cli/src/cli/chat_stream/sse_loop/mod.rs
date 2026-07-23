@@ -967,6 +967,7 @@ pub(crate) async fn stream_chat_sse(
         sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: effective_max_turn_input_tokens,
         budget_wrapup_injected: false,
+        context_compression_triggered: false,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
@@ -1359,9 +1360,15 @@ fn load_turn_messages(
     current_message: &str,
 ) -> Vec<serde_json::Value> {
     if let Some(mut msgs) = pre_loaded_messages {
-        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
-            msgs,
-        );
+        msgs = astra_turn_core::prompt_facing::
+            sanitize_canonical_continuation_messages_with_turn_semantics(msgs)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "dropping preloaded continuation with invalid typed turn metadata"
+                );
+                Vec::new()
+            });
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }
@@ -1430,6 +1437,35 @@ mod tests {
                 .iter()
                 .all(|msg| !msg["content"].as_str().unwrap_or("").contains("3 agents"))
         );
+    }
+
+    #[test]
+    fn preloaded_turn_messages_keep_complete_tool_evidence_for_context_optimizer() {
+        let preloaded = vec![
+            json!({"role": "user", "content": "inspect Cargo.toml"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "canonical evidence"
+            }),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+
+        let messages = load_turn_messages(Some(preloaded), &[], "what did you find?");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["tool_call_id"], "call-1");
+        assert_eq!(messages[2]["content"], "canonical evidence");
+        assert_eq!(messages[4]["content"], "what did you find?");
     }
 
     #[test]

@@ -40,6 +40,23 @@ pub struct BridgeInjectionFingerprints {
     pub channels: Vec<BridgeChannelFingerprint>,
 }
 
+/// One context compaction that changed the provider-visible prompt.
+///
+/// The bridge may emit `context_meta` more than once for one HTTP turn, so
+/// `id` is stable within that turn and lets consumers de-duplicate repeated
+/// snapshots without conflating distinct retry compactions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextCompactionObservation {
+    pub id: String,
+    pub phase: String,
+    pub tier: String,
+    pub messages_before: u64,
+    pub messages_after: u64,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub tokens_saved: u64,
+}
+
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
@@ -70,6 +87,8 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_breakdown: Option<Value>,
     /// Lightweight manifest trace from the shared LLM context assembler.
     pub context_manifest_trace: Option<Value>,
+    /// Distinct compactions observed while assembling or retrying this request.
+    pub context_compactions: Vec<ContextCompactionObservation>,
     /// Per-turn injection-channel fingerprints captured from the
     /// bridge's `injection_freshness` SSE event. `None` until the
     /// event fires. wip-7 contract: the CLI MUST NOT default this to
@@ -470,6 +489,30 @@ fn apply_one_event(
             }
             if let Some(trace) = event.get("context_manifest_trace") {
                 accum.context_manifest_trace = Some(trace.clone());
+            }
+            if let Some(compactions) = event.get("compactions").and_then(Value::as_array) {
+                for value in compactions {
+                    let Ok(observation) =
+                        serde_json::from_value::<ContextCompactionObservation>(value.clone())
+                    else {
+                        continue;
+                    };
+                    if observation.id.trim().is_empty()
+                        || observation.phase.trim().is_empty()
+                        || observation.tier.trim().is_empty()
+                    {
+                        continue;
+                    }
+                    if let Some(existing) = accum
+                        .context_compactions
+                        .iter_mut()
+                        .find(|existing| existing.id == observation.id)
+                    {
+                        *existing = observation;
+                    } else {
+                        accum.context_compactions.push(observation);
+                    }
+                }
             }
         }
         "injection_freshness" => {
@@ -1983,5 +2026,51 @@ mod context_manifest_trace_sse_tests {
 
         assert_eq!(accum.system_prompt_tokens, Some(42));
         assert_eq!(accum.context_manifest_trace, Some(trace));
+    }
+
+    #[test]
+    fn context_meta_sse_deduplicates_compaction_snapshots_but_keeps_distinct_retries() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut effects = Vec::new();
+        let initial = json!({
+            "id": "initial",
+            "phase": "initial",
+            "tier": "compact_history",
+            "messages_before": 18,
+            "messages_after": 10,
+            "tokens_before": 12_000,
+            "tokens_after": 7_000,
+            "tokens_saved": 5_000
+        });
+        let retry = json!({
+            "id": "context_window_retry:2:1",
+            "phase": "context_window_retry",
+            "tier": "aggressive_prune",
+            "messages_before": 22,
+            "messages_after": 8,
+            "tokens_before": 16_000,
+            "tokens_after": 6_000,
+            "tokens_saved": 10_000
+        });
+
+        for compactions in [
+            json!([initial.clone()]),
+            json!([initial.clone()]),
+            json!([initial, retry.clone()]),
+        ] {
+            let block = format!(
+                "data: {}\n\n",
+                json!({"type": "context_meta", "compactions": compactions})
+            );
+            dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut effects);
+        }
+
+        assert_eq!(accum.context_compactions.len(), 2);
+        assert_eq!(accum.context_compactions[0].id, "initial");
+        assert_eq!(accum.context_compactions[0].tokens_saved, 5_000);
+        assert_eq!(
+            accum.context_compactions[1],
+            serde_json::from_value(retry).unwrap()
+        );
     }
 }

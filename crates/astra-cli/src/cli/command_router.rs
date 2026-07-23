@@ -320,14 +320,41 @@ fn persist_one_shot_session_state(
     sr: &mut StreamResult,
     turn_start: std::time::Instant,
 ) {
-    if let Err(error) = session_side_effects::append_one_shot_journal_events(
+    let persisted_turn = match session_side_effects::append_one_shot_journal_events(
         sr.session_id.as_deref(),
         model,
         line,
         sr,
         turn_start,
     ) {
-        record_stream_persistence_error(sr, error);
+        Ok(turn) => turn,
+        Err(error) => {
+            record_stream_persistence_error(sr, error);
+            None
+        }
+    };
+
+    if sr.session_persistence_error.is_none()
+        && let (Some(session_id), Some(turn)) = (sr.session_id.clone(), persisted_turn)
+        && !sr.final_messages.is_empty()
+    {
+        let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
+            recent_tools: sr.tools_used.clone(),
+            ..Default::default()
+        };
+        if let Err(error) =
+            crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+                &session_id,
+                turn,
+                &sr.final_messages,
+                &csl_state,
+            )
+        {
+            record_stream_persistence_error(
+                sr,
+                format!("failed to persist one-shot canonical continuation: {error}"),
+            );
+        }
     }
 
     if sr.session_persistence_error.is_none()
@@ -664,6 +691,7 @@ async fn execute_headless_task_body(
     let turn_start = std::time::Instant::now();
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
+        turn_index: Some(session_routing.next_server_turn_index()),
         ..Default::default()
     };
     let turn_result = crate::cli::turn::execute_basic_cli_turn(
@@ -1468,6 +1496,7 @@ async fn execute_cli_command_impl(
             };
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
+                turn_index: Some(session_routing.next_server_turn_index()),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
@@ -2023,6 +2052,7 @@ async fn execute_cli_command_impl(
                 pre_loaded_messages: continuation_messages.take(),
                 append_system_prompt: args.append_system_prompt.clone(),
                 disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
+                turn_index: Some(session_routing.next_server_turn_index()),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
@@ -2750,6 +2780,7 @@ pub(crate) async fn run_print_mode(
 
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
+        turn_index: Some(session_routing.next_server_turn_index()),
         ..Default::default()
     };
     let turn_start = std::time::Instant::now();
@@ -3543,6 +3574,61 @@ mod one_shot_persistence_tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[serial_test::serial]
+    fn one_shot_settlement_persists_canonical_tool_evidence_for_next_process() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("one-shot-csl-tools-{}", uuid::Uuid::new_v4());
+        let mut result = crate::tests::stub_stream_result("manifest inspected");
+        result.session_id = Some(sid.clone());
+        result.tools_used = vec!["read_file".to_string()];
+        result.tool_calls_count = 1;
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect Cargo.toml"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"Cargo.toml\"}"
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "[package]\nname = \"astra\""
+            }),
+            serde_json::json!({"role": "assistant", "content": "manifest inspected"}),
+        ];
+
+        persist_one_shot_session_state(
+            None,
+            Some("test-model"),
+            "inspect Cargo.toml",
+            &mut result,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(result.session_persistence_error, None);
+        let restored =
+            crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
+                .expect("one-shot canonical continuation");
+        let tool_call = restored
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant tool call");
+        let tool_result = restored
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("paired tool result");
+        assert_eq!(tool_call["tool_calls"][0]["id"], "call-1");
+        assert_eq!(tool_result["tool_call_id"], "call-1");
+        assert_eq!(tool_result["content"], "[package]\nname = \"astra\"");
+    }
 
     #[cfg(unix)]
     #[test]

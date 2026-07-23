@@ -262,9 +262,9 @@ pub(crate) fn append_one_shot_journal_events(
     line: &str,
     result: &StreamResult,
     turn_start: Instant,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
-        return Ok(());
+        return Ok(None);
     };
     let existing_events = match session_journal::read_journal(session_id) {
         Ok(events) => events,
@@ -296,7 +296,7 @@ pub(crate) fn append_one_shot_journal_events(
     if existing_events.iter().any(|event| {
         event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
     }) {
-        return Ok(());
+        return Ok(Some(turn));
     }
     let writer = session_journal::JournalWriter::new(session_id)
         .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
@@ -347,7 +347,7 @@ pub(crate) fn append_one_shot_journal_events(
             "failed to append one-shot journal events for {session_id}: {error}"
         ));
     }
-    Ok(())
+    Ok(Some(turn))
 }
 
 fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<JournalPromptTurn> {

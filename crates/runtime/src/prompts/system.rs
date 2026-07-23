@@ -1121,8 +1121,11 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Tool-dependent sections derived from the active tool list. They MUST
-    //    go after the cache marker to keep the Global prefix stable. ──
+    // ── Tool-dependent sections derived from the exact active tool list. ──
+    //
+    // These are rebuilt every turn but cacheable for as long as the surface
+    // bytes stay equal. A tool activation/removal produces different bytes and
+    // therefore a new provider prefix; no stale capability guidance is reused.
     sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
         PromptTokenBucket::BasePersona,
@@ -1130,15 +1133,15 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc);
     if !tool_cond.is_empty() {
-        // Tool-conditional guidance is composed from live tool list and runtime
-        // profile — both per-turn dynamic. Even though the structure is similar,
-        // the actual content (tool names in conditionals) varies. Using
-        // CacheScope::None prevents cache invalidation on content changes while
-        // still billing to BasePersona for accurate token accounting.
-        sections.push(PromptSection::dynamic(
-            tool_cond,
-            PromptTokenBucket::BasePersona,
-        ));
+        // The visible surface may change at an activation boundary, but is
+        // commonly stable for many turns. Cache the exact derived bytes for
+        // that surface epoch; a changed list naturally misses and rewrites.
+        sections.push(PromptSection {
+            text: tool_cond,
+            scope: CacheScope::Session,
+            token_bucket: PromptTokenBucket::BasePersona,
+            trace_signals: Default::default(),
+        });
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -1854,14 +1857,14 @@ mod tests {
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(bd.base_persona_tokens <= 3600);
 
-        // Tool-conditional guidance is billed to BasePersona but remains
-        // volatile because the live tool list can vary per turn.
+        // Tool-conditional guidance is billed to BasePersona and remains
+        // cacheable until the visible tool surface changes.
         let timer = sections
             .iter()
             .find(|s| s.text.contains("Tool Availability Protocol"))
             .unwrap();
         assert_eq!(timer.token_bucket, PromptTokenBucket::BasePersona);
-        assert_eq!(timer.scope, CacheScope::None);
+        assert_eq!(timer.scope, CacheScope::Session);
 
         // Search strategy billed to environment bucket
         let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "");

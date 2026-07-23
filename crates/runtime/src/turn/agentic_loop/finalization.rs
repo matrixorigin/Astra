@@ -42,7 +42,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
             .map(|_| astra_turn_types::ContextWindowUsageSource::ProviderReported)
             .unwrap_or(astra_turn_types::ContextWindowUsageSource::Estimated),
         budget_pressure,
-        compression_triggered: state.budget_wrapup_injected,
+        compression_triggered: state.context_compression_triggered,
         ..Default::default()
     });
     let trace = collector.finalize();
@@ -943,6 +943,7 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     // `budget_wrapup_injected` is still true from the previous turn),
     // which was exactly the stale-state bug the code-review called out.
     state.budget_wrapup_injected = false;
+    state.context_compression_triggered = false;
     state.budget_wrapup_ignored_rounds = 0;
     // Defensive reset: last_finish_reason is rewritten before every LLM call
     // in execution_phase.rs, but resetting here prevents stale leakage if a
@@ -2010,6 +2011,35 @@ mod tests {
             .expect("pending_context_assembly_trace should be set");
         assert_eq!(*turn_num, 3);
         assert_eq!(trace_json["turn_id"], "turn-3");
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_trace_reports_bridge_compaction_without_budget_wrapup() {
+        let mut state = make_state();
+        state.max_turns = 40;
+        state.remaining_turns = 39;
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(70_000);
+        state.context_compression_triggered = true;
+        state.budget_wrapup_injected = false;
+        let hub = crate::observability::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 1;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session.clone());
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-1".to_string(),
+                "s1".to_string(),
+            ));
+
+        finalize_turn_trace(&mut state).await;
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.context_traces[0].token_budget.compression_triggered,
+            "trace must report actual context compaction independently of budget wrap-up policy"
+        );
     }
 
     #[tokio::test]

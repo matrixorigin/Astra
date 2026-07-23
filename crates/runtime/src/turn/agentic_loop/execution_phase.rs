@@ -733,6 +733,33 @@ fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
         .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32)
 }
 
+fn record_bridge_context_compactions(
+    state: &mut AgenticLoopState,
+    observations: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
+) {
+    if observations.is_empty() {
+        return;
+    }
+
+    state.context_compression_triggered = true;
+    for observation in observations {
+        let compacted_messages = observation
+            .messages_before
+            .saturating_sub(observation.messages_after)
+            .min(u64::from(u32::MAX)) as u32;
+        let pressure = if state.max_turn_input_tokens > 0 {
+            observation.tokens_before as f64 / state.max_turn_input_tokens as f64
+        } else {
+            0.0
+        };
+        state.step_recorder.record_compaction(
+            compacted_messages,
+            observation.tokens_saved,
+            pressure,
+        );
+    }
+}
+
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -1284,6 +1311,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         .as_ref()
         .ok()
         .and_then(|r| r.accum.finish_reason.clone());
+    if let Ok(result) = &turn_result {
+        record_bridge_context_compactions(state, &result.accum.context_compactions);
+    }
     // Persist the per-call manifest only after the host returns: the durable
     // record includes observed token usage and the emitted context-manifest
     // trace, both of which are only available on the completed turn result.
@@ -1643,19 +1673,24 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         }
                         let tokens_freed = result.pipeline_outcome.total_tokens_freed;
                         let messages_after = state.messages.len();
+                        // In a retry context we know we overflowed the context
+                        // window, so use max_turn_input_tokens as the floor for
+                        // tokens_before when measured usage is unavailable.
+                        let tokens_before = state
+                            .last_measured_prompt_tokens
+                            .unwrap_or(state.max_turn_input_tokens);
+                        let pressure = if state.max_turn_input_tokens == 0 {
+                            0.0
+                        } else {
+                            (tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
+                        };
+                        state.context_compression_triggered = true;
+                        state.step_recorder.record_compaction(
+                            result.messages_removed.min(u32::MAX as usize) as u32,
+                            tokens_freed,
+                            pressure,
+                        );
                         if !prep.quiet {
-                            // In a retry context we know we overflowed the
-                            // context window, so use max_turn_input_tokens as
-                            // the floor for tokens_before when measured value
-                            // is unavailable (rather than 0, which is misleading).
-                            let tokens_before = state
-                                .last_measured_prompt_tokens
-                                .unwrap_or(state.max_turn_input_tokens);
-                            let pressure = if state.max_turn_input_tokens == 0 {
-                                0.0
-                            } else {
-                                (tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
-                            };
                             let event = CompactionEvent::new(
                                 result.tier,
                                 pressure,
@@ -2601,8 +2636,14 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         }
 
         if total_freed > 0 {
+            let pressure = measured as f64 / state.max_turn_input_tokens as f64;
+            state.context_compression_triggered = true;
+            state.step_recorder.record_compaction(
+                total_messages_removed.min(u32::MAX as usize) as u32,
+                total_freed,
+                pressure,
+            );
             if !prep.quiet {
-                let pressure = measured as f64 / state.max_turn_input_tokens as f64;
                 let event = CompactionEvent::new(
                     CompactionKind::ReactiveBudget,
                     pressure,
@@ -3152,6 +3193,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bridge_compaction_observations_update_turn_trace_and_step_audit() {
+        let mut state = make_state();
+        state.max_turn_input_tokens = 20_000;
+        let observations = vec![
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+                id: "initial".to_string(),
+                phase: "initial".to_string(),
+                tier: "compact_history".to_string(),
+                messages_before: 18,
+                messages_after: 10,
+                tokens_before: 15_000,
+                tokens_after: 9_000,
+                tokens_saved: 6_000,
+            },
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+                id: "context_window_retry:1:1".to_string(),
+                phase: "context_window_retry".to_string(),
+                tier: "aggressive_prune".to_string(),
+                messages_before: 12,
+                messages_after: 6,
+                tokens_before: 10_000,
+                tokens_after: 5_000,
+                tokens_saved: 5_000,
+            },
+        ];
+
+        record_bridge_context_compactions(&mut state, &observations);
+
+        assert!(state.context_compression_triggered);
+        let compactions: Vec<_> = state
+            .step_recorder
+            .events()
+            .iter()
+            .filter(|event| {
+                event.event_type == astra_pipeline::step_protocol::StepEventType::CompactionFired
+            })
+            .collect();
+        assert_eq!(compactions.len(), 2);
+        assert_eq!(
+            compactions[0].payload.as_ref().unwrap()["results_compacted"],
+            8
+        );
+        assert_eq!(
+            compactions[0].payload.as_ref().unwrap()["tokens_saved"],
+            6_000
+        );
+        assert_eq!(compactions[0].payload.as_ref().unwrap()["pressure"], 0.75);
+        assert_eq!(
+            compactions[1].payload.as_ref().unwrap()["results_compacted"],
+            6
+        );
+    }
+
     // PR 5a: the turn loop must invoke host.on_turn_completed
     // exactly once per successful ingested turn, AFTER run_id is
     // populated by ingest but BEFORE tool execution / side effects.
@@ -3572,6 +3667,16 @@ mod tests {
         assert!(
             !state.budget_wrapup_injected,
             "successful reactive compaction should continue the turn without arming wrapup"
+        );
+        assert!(
+            state.context_compression_triggered,
+            "quiet reactive compaction must remain visible to the final context trace"
+        );
+        assert!(
+            state.step_recorder.events().iter().any(|event| {
+                event.event_type == astra_pipeline::step_protocol::StepEventType::CompactionFired
+            }),
+            "quiet reactive compaction must still emit durable step audit"
         );
         assert!(
             state

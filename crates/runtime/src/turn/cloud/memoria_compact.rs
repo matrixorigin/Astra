@@ -249,6 +249,11 @@ impl HttpMemoriaPort {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn bound_owner_user_id(&self) -> Option<&str> {
+        self.owner_user_id.as_deref()
+    }
+
     /// Create from environment variables.
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();

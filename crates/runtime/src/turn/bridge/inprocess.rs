@@ -439,6 +439,54 @@ fn has_inprocess_persisted_events(
     core_event_count > 0 || (tool_events_persisted && tool_event_count > 0)
 }
 
+fn observe_context_compaction(
+    id: impl Into<String>,
+    phase: impl Into<String>,
+    history_before: &[Value],
+    result: &crate::turn::cloud::compaction::CompactResult,
+    fixed_context: &[Value],
+    visible_tools: &[Value],
+) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
+    result.boundary.as_ref()?;
+
+    let estimate = |history: &[Value]| -> u64 {
+        fixed_context
+            .iter()
+            .chain(history)
+            .chain(visible_tools)
+            .map(crate::prompts::estimate_json_value_tokens)
+            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add)
+    };
+    let tokens_before = estimate(history_before);
+    let tokens_after = estimate(&result.messages);
+    let tier = serde_json::to_value(result.tier)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(
+        astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+            id: id.into(),
+            phase: phase.into(),
+            tier,
+            messages_before: history_before.len().min(u64::MAX as usize) as u64,
+            messages_after: result.messages.len().min(u64::MAX as usize) as u64,
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before.saturating_sub(tokens_after),
+        },
+    )
+}
+
+fn bind_bridge_memoria_owner(
+    client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
+    user_id: &str,
+) -> Result<Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>, String> {
+    let scope = astra_memoria::MemoryScope::new(user_id, "bridge-owner-binding")?;
+    Ok(client.map(|client| client.with_owner_user_id(scope.user_id)))
+}
+
 #[derive(Debug, Default)]
 struct BridgePipelineBaseline {
     #[cfg(test)]
@@ -1756,7 +1804,13 @@ impl InProcessChatTurnBridge {
             .clone()
             .unwrap_or_else(|| Arc::new(CancellationToken::new()));
         let client_cancel_capture = response_cancel.clone();
-        let memoria_client_owned = self.memoria_client.clone();
+        let memoria_client_owned = bind_bridge_memoria_owner(self.memoria_client.clone(), &user_id)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to bind Memoria request owner: {error}"),
+                )
+            })?;
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
         let persist_tails_shared = self.persist_tails.clone();
@@ -2446,6 +2500,7 @@ impl InProcessChatTurnBridge {
             {
                 compaction_fixed_context.push(required);
             }
+            let mut context_compactions = Vec::new();
             let (merged_messages, _initial_tier) = {
                 let raw = pipeline_messages;
 
@@ -2468,6 +2523,16 @@ impl InProcessChatTurnBridge {
                 let compact_result = ctx
                     .compact(&raw, &compaction_fixed_context, &edge_tools)
                     .await;
+                if let Some(observation) = observe_context_compaction(
+                    "initial",
+                    "initial",
+                    &raw,
+                    &compact_result,
+                    &compaction_fixed_context,
+                    &edge_tools,
+                ) {
+                    context_compactions.push(observation);
+                }
 
                 if let Some(rerun) =
                     crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
@@ -2814,9 +2879,10 @@ impl InProcessChatTurnBridge {
                             prompt_request_plan,
                         );
                     }
-                    yield render_sse(&crate::turn::llm::context::context_meta_event(
+                    yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
+                        &context_compactions,
                     ));
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
@@ -2998,9 +3064,10 @@ impl InProcessChatTurnBridge {
                         "type": "injection_freshness",
                         "channels": channels_payload,
                     }));
-                    yield render_sse(&crate::turn::llm::context::context_meta_event(
+                    yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
+                        &context_compactions,
                     ));
                     tracing::debug!(
                         target: "astra_timing",
@@ -3220,6 +3287,18 @@ impl InProcessChatTurnBridge {
                                     overrides,
                                 )
                                 .await;
+                            if let Some(observation) = observe_context_compaction(
+                                format!(
+                                    "context_window_retry:{round_ix}:{attempt_in_round}"
+                                ),
+                                "context_window_retry",
+                                &retry_compaction_history,
+                                &compact_result,
+                                system_prefix,
+                                &round_edge_tools,
+                            ) {
+                                context_compactions.push(observation);
+                            }
 
                             let rebuilt_retry_messages =
                                 crate::turn::llm::context::rebuild_bridge_retry_wire_messages(
@@ -3261,9 +3340,10 @@ impl InProcessChatTurnBridge {
                                 model_context_window,
                                 max_output_tokens / 2,
                             );
-                            yield render_sse(&crate::turn::llm::context::context_meta_event(
+                            yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                                 &breakdown,
                                 Some(&bridge_manifest_trace_json),
+                                &context_compactions,
                             ));
                             attempt_in_round = attempt_in_round.saturating_add(1);
                             record_full_llm_request_event(
@@ -4670,6 +4750,7 @@ impl InProcessChatTurnBridge {
                 recent_tools_for_quality.clone(),
                 last_measured_prompt,
                 budget.model_limit,
+                !context_compactions.is_empty(),
                 tool_execution_ms,
                 turn_started.elapsed().as_millis() as u64,
             );
@@ -5723,6 +5804,7 @@ mod tests {
             vec!["read_file".to_string(), "grep".to_string()],
             Some(1200),
             8000,
+            true,
             450,
             1500,
         );
@@ -5734,12 +5816,108 @@ mod tests {
         );
         assert_eq!(tool_surface.tools_available, 5);
 
+        let budget = signal.budget.as_ref().expect("budget");
+        assert!(
+            budget.compression_triggered,
+            "bridge trace must preserve the compaction fact supplied by prompt assembly"
+        );
+
         let timing = signal.timing.as_ref().expect("timing");
         assert_eq!(timing.turn, 3);
         assert_eq!(timing.context_assembly_ms, 0);
         assert_eq!(timing.llm_total_ms, 1050);
         assert_eq!(timing.tool_execution_ms, 450);
         assert_eq!(timing.total_ms, 1500);
+    }
+
+    #[test]
+    fn compaction_observation_measures_the_actual_prompt_delta() {
+        use crate::turn::cloud::compaction::{CompactBoundary, CompactResult, CompactTrigger};
+
+        let before = vec![
+            json!({"role": "user", "content": "keep the database invariant"}),
+            json!({"role": "assistant", "content": "x".repeat(4_000)}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let after = vec![
+            json!({"role": "user", "content": "keep the database invariant"}),
+            json!({"role": "assistant", "content": "summary"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let result = CompactResult {
+            messages: after,
+            boundary: Some(
+                CompactBoundary::new(
+                    CompactTrigger::Auto,
+                    crate::prompts::CompactionTier::CompactHistory,
+                )
+                .with_pre_metrics(0, before.len())
+                .with_post_count(3),
+            ),
+            tier: crate::prompts::CompactionTier::CompactHistory,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+
+        let observation = observe_context_compaction(
+            "initial",
+            "initial",
+            &before,
+            &result,
+            &[json!({"role": "system", "content": "stable"})],
+            &[json!({"type": "function", "function": {"name": "read_file"}})],
+        )
+        .expect("boundary must produce one observation");
+
+        assert_eq!(observation.id, "initial");
+        assert_eq!(observation.phase, "initial");
+        assert_eq!(observation.tier, "compact_history");
+        assert_eq!(observation.messages_before, 3);
+        assert_eq!(observation.messages_after, 3);
+        assert!(observation.tokens_before > observation.tokens_after);
+        assert_eq!(
+            observation.tokens_saved,
+            observation.tokens_before - observation.tokens_after
+        );
+    }
+
+    #[test]
+    fn compaction_observation_ignores_a_noop_result() {
+        use crate::turn::cloud::compaction::CompactResult;
+
+        let messages = vec![json!({"role": "user", "content": "small"})];
+        let result = CompactResult {
+            messages: messages.clone(),
+            boundary: None,
+            tier: crate::prompts::CompactionTier::Normal,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+
+        assert!(
+            observe_context_compaction("initial", "initial", &messages, &result, &[], &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bridge_memoria_client_is_bound_to_the_authenticated_request_owner() {
+        let client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
+            "http://127.0.0.1:9".to_string(),
+            "test-key".to_string(),
+        );
+
+        let bound = bind_bridge_memoria_owner(Some(client), "authenticated-user")
+            .expect("valid owner")
+            .expect("configured client");
+
+        assert_eq!(
+            bound.bound_owner_user_id(),
+            Some("authenticated-user"),
+            "the shared startup transport must become request-owner-scoped before any strict recall"
+        );
     }
 
     // ── Static/dynamic prompt boundary tests ──

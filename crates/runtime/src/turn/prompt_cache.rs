@@ -430,8 +430,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     use astra_turn_core::pipeline_config::PipelineConfig;
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
-    // Build ExternalSources from bridge-side signals. Tool-dependent prompt
-    // fragments are volatile because bridge tool surface can vary per turn.
+    // Build ExternalSources from bridge-side signals. Guidance derived from
+    // the exact visible surface is rebuilt every turn but remains cacheable
+    // until that surface changes.
     let self_model_text = if tool_names.is_empty() {
         None
     } else {
@@ -489,10 +490,12 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         ));
     }
     if let Some(ref text) = tool_conditional {
-        volatile.push(prompts::PromptSection::dynamic(
-            text.clone(),
-            prompts::PromptTokenBucket::Environment,
-        ));
+        stable.push(prompts::PromptSection {
+            text: text.clone(),
+            scope: prompts::CacheScope::Session,
+            token_bucket: prompts::PromptTokenBucket::Environment,
+            trace_signals: Default::default(),
+        });
     }
     let trace_extra_sections = {
         let mut v = stable.clone();
@@ -1713,6 +1716,10 @@ mod tests {
             .filter_map(|block| block.get("text").and_then(Value::as_str))
             .collect::<String>();
         assert!(
+            primary_text.contains("Tool Availability Protocol"),
+            "surface-derived guidance should be in the reusable prefix: {primary_text}"
+        );
+        assert!(
             !primary_text.contains("Model: claude-sonnet-4-6"),
             "anthropic cacheable prefix must not churn on model id changes: {primary_text}"
         );
@@ -1724,6 +1731,10 @@ mod tests {
         assert!(
             dtext.contains("Model: claude-sonnet-4-6 (via bedrock)"),
             "anthropic model identity should remain visible outside the cacheable prefix: {dtext}"
+        );
+        assert!(
+            !dtext.contains("Tool Availability Protocol"),
+            "surface-derived guidance must not be paid again in the volatile tail: {dtext}"
         );
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),

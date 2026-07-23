@@ -149,6 +149,191 @@ pub fn sanitize_prompt_facing_messages_with_state(
     Ok(trim_to_recent_messages(out))
 }
 
+/// Project canonical runtime history into a continuation-safe conversation.
+///
+/// Unlike the compact prompt-facing transcript above, a continuation is fed
+/// back through the context optimizer. It therefore retains completed tool
+/// call/result groups as model evidence instead of deleting them before the
+/// optimizer can make a pressure-aware decision. Runtime-owned controls and
+/// orphaned tool frames are still removed at this trust boundary.
+pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    for message in &messages {
+        if message
+            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+            .is_some()
+        {
+            astra_turn_types::user_turn_semantics(message)?;
+        }
+    }
+
+    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
+    let messages = messages
+        .into_iter()
+        .skip(start)
+        .filter(|message| {
+            message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
+                && !is_runtime_owned_message(message)
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::new();
+    let mut index = 0;
+    let mut has_user_context = false;
+    while index < messages.len() {
+        let message = &messages[index];
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "user" | "system" => {
+                if let Some(projected) = canonical_text_message(message, role, role == "user") {
+                    out.push(projected);
+                    has_user_context |= role == "user";
+                }
+                index += 1;
+            }
+            "assistant" if contains_tool_call_frame(message) => {
+                let block_end = consecutive_tool_block_end(&messages, index + 1);
+                if has_user_context {
+                    append_complete_tool_group(&mut out, message, &messages[index + 1..block_end]);
+                }
+                index = block_end;
+            }
+            "assistant" => {
+                if has_user_context
+                    && let Some(projected) = canonical_text_message(message, role, false)
+                {
+                    out.push(projected);
+                }
+                index += 1;
+            }
+            // Tool messages are admitted only by `append_complete_tool_group`,
+            // which guarantees that every retained result has a matching call.
+            _ => index += 1,
+        }
+    }
+    Ok(out)
+}
+
+pub fn sanitize_canonical_continuation_messages_with_state(
+    messages: Vec<Value>,
+    state: &SessionStateCompact,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    let mut out = sanitize_canonical_continuation_messages_with_turn_semantics(messages)?;
+    if let Some(recap) = runtime_recap_message(state) {
+        out.push(recap);
+    }
+    Ok(out)
+}
+
+fn canonical_text_message(
+    message: &Value,
+    role: &str,
+    preserve_turn_semantics: bool,
+) -> Option<Value> {
+    let raw_content = extract_text_content(message)?;
+    let content = prompt_facing_content_for_role(role, &raw_content)?;
+    let mut projected = json!({
+        "role": role,
+        "content": content,
+    });
+    if preserve_turn_semantics
+        && let Ok(Some(semantics)) = astra_turn_types::user_turn_semantics(message)
+    {
+        astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+    }
+    Some(projected)
+}
+
+fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
+    while messages
+        .get(index)
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("tool")
+    {
+        index += 1;
+    }
+    index
+}
+
+fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[Value]) {
+    let Some(calls) = assistant.get("tool_calls").and_then(Value::as_array) else {
+        if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
+            out.push(projected);
+        }
+        return;
+    };
+
+    let mut results_by_id = std::collections::HashMap::<&str, &Value>::new();
+    for tool in tools {
+        if let Some(id) = tool.get("tool_call_id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            results_by_id.entry(id).or_insert(tool);
+        }
+    }
+
+    let mut matched_calls = Vec::new();
+    let mut matched_results = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for call in calls {
+        let Some(id) = call.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() || !seen_ids.insert(id) {
+            continue;
+        }
+        let Some(result) = results_by_id.get(id) else {
+            continue;
+        };
+        matched_calls.push(call.clone());
+        matched_results.push(project_tool_result(result, id));
+    }
+
+    if matched_calls.is_empty() {
+        if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
+            out.push(projected);
+        }
+        return;
+    }
+
+    let mut projected = serde_json::Map::from_iter([
+        ("role".to_string(), Value::String("assistant".to_string())),
+        ("tool_calls".to_string(), Value::Array(matched_calls)),
+    ]);
+    if let Some(content) = assistant.get("content") {
+        projected.insert("content".to_string(), content.clone());
+    }
+    if let Some(reasoning) = assistant.get("reasoning_content") {
+        projected.insert("reasoning_content".to_string(), reasoning.clone());
+    }
+    out.push(Value::Object(projected));
+    out.extend(matched_results);
+}
+
+fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
+    let content = match tool.get("content") {
+        Some(Value::String(content)) => Value::String(content.clone()),
+        Some(content) => Value::String(serde_json::to_string(content).unwrap_or_default()),
+        None => Value::String(String::new()),
+    };
+    let mut projected = serde_json::Map::from_iter([
+        ("role".to_string(), Value::String("tool".to_string())),
+        (
+            "tool_call_id".to_string(),
+            Value::String(tool_call_id.to_string()),
+        ),
+        ("content".to_string(), content),
+    ]);
+    if let Some(name) = tool.get("name").and_then(Value::as_str)
+        && !name.is_empty()
+    {
+        projected.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    Value::Object(projected)
+}
+
 pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
     messages
         .into_iter()
@@ -304,12 +489,13 @@ fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_recap_message, sanitize_prompt_facing_messages,
-        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
+        runtime_recap_message, sanitize_canonical_continuation_messages_with_state,
+        sanitize_prompt_facing_messages, sanitize_prompt_facing_messages_with_state,
+        sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use astra_turn_types::{RuntimeMessageDelivery, runtime_owned_message};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn compresses_completed_tool_pair_and_drops_reasoning_only_messages() {
@@ -329,6 +515,96 @@ mod tests {
                 json!({"role": "user", "content": "fix it"}),
                 json!({"role": "assistant", "content": "done"}),
             ]
+        );
+    }
+
+    #[test]
+    fn canonical_continuation_keeps_complete_tool_evidence_as_an_atomic_group() {
+        let runtime_scaffold = runtime_owned_message(
+            "user",
+            "retry this tool round",
+            RuntimeMessageDelivery::EphemeralControl,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "inspect the manifest"}),
+            runtime_scaffold,
+            json!({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I should inspect it",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "[package]\nname = \"astra\""
+            }),
+            json!({"role": "assistant", "content": "manifest inspected"}),
+        ];
+
+        let got = sanitize_canonical_continuation_messages_with_state(
+            messages,
+            &SessionStateCompact::default(),
+        )
+        .expect("valid canonical history");
+
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0]["role"], "user");
+        assert_eq!(got[1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(got[2]["role"], "tool");
+        assert_eq!(got[2]["content"], "[package]\nname = \"astra\"");
+        assert_eq!(got[3]["content"], "manifest inspected");
+        assert!(
+            got.iter()
+                .all(|message| message["content"] != "retry this tool round"),
+            "runtime-owned control messages must not cross a continuation boundary"
+        );
+    }
+
+    #[test]
+    fn canonical_continuation_drops_orphaned_tool_frames_without_splitting_valid_pairs() {
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "orphan-result", "content": "ignore me"}),
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "paired", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "missing", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "paired", "content": "durable evidence"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+
+        let got = sanitize_canonical_continuation_messages_with_state(
+            messages,
+            &SessionStateCompact::default(),
+        )
+        .expect("valid canonical history");
+
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(got[1]["tool_calls"][0]["id"], "paired");
+        assert_eq!(got[2]["tool_call_id"], "paired");
+        assert!(
+            got.iter().all(|message| {
+                message["tool_call_id"] != "orphan-result"
+                    && message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_none_or(|calls| calls.iter().all(|call| call["id"] != "missing"))
+            }),
+            "projection must retain only provider-valid complete tool groups"
         );
     }
 

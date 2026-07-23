@@ -40,7 +40,9 @@ steps:
       Then tell me how many total echo commands you ran across all phases.
     criteria:
       - type: text_contains
-        needle: "8"
+        # There are six echo commands: two in each of the three phases.
+        # The numbered work list has eight total items because two are reads.
+        needle: "6"
       - type: tool_called
         name: bash
 criteria:
