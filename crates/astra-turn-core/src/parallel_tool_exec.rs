@@ -467,6 +467,11 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    async fn metrics_registry_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
     fn make_tool_call(name: &str, id: &str) -> Value {
         json!({
             "id": id,
@@ -521,6 +526,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tool_admission_metrics_record_wait_time() {
+        let _guard = metrics_registry_test_guard().await;
         let registry = Arc::new(crate::pipeline_metrics::MetricsRegistry::new());
         set_tool_execution_metrics_registry(registry.clone());
         let semaphore = Arc::new(Semaphore::new(1));
@@ -551,6 +557,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tool_admission_closed_semaphore_is_counted() {
+        let _guard = metrics_registry_test_guard().await;
         let registry = Arc::new(crate::pipeline_metrics::MetricsRegistry::new());
         set_tool_execution_metrics_registry(registry.clone());
         let semaphore = Semaphore::new(1);

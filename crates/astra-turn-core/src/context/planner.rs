@@ -82,7 +82,11 @@ pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
 
     // 4. Allocate token budgets per section
     let section_history = input.stats.section_token_history();
-    let budget = TokenBudget::allocate(input.model_limit, tier, &section_history);
+    // Section budgets describe usable input capacity, not the full
+    // input+output window. Reserve predicted output/thinking/schema growth
+    // exactly once before allocating prompt sections.
+    let effective_input_limit = input.model_limit.saturating_sub(reserves.total()).max(1);
+    let budget = TokenBudget::allocate(effective_input_limit, tier, &section_history);
 
     // 5. Choose cache strategy based on provider policy + latches
     let cache_strategy = plan_cache_strategy(input.provider_policy, input.latches);
@@ -399,6 +403,25 @@ mod tests {
             "allocated={} > limit={}",
             plan.budget.total_allocated(),
             input.model_limit,
+        );
+    }
+
+    #[test]
+    fn plan_section_capacity_excludes_response_reserve_exactly_once() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        assert_eq!(plan.reserves.total(), 500);
+        assert_eq!(
+            plan.budget.effective_limit,
+            input.model_limit - plan.reserves.total(),
+            "prompt sections may consume only the input side of the shared model window"
+        );
+        assert_eq!(
+            plan.budget.total_allocated(),
+            plan.budget.effective_limit,
+            "the reserve must not be deducted a second time inside section allocation"
         );
     }
 

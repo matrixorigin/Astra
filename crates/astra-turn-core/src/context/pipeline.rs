@@ -4,12 +4,12 @@
 //! requests: Plan -> Bind -> Optimize -> Serialize -> Explain/Metrics.
 
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
-use crate::context_binder::bind_all;
+use crate::context_binder::{ContextBound, bind_sections};
 use crate::context_optimizer::{ContextOptimized, optimize_with_spill};
 use crate::context_planner::{ContextPlan, PlanInput, plan_turn};
 use crate::context_pressure::ContextPressure;
@@ -18,9 +18,29 @@ use crate::context_sources::ContextSources;
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::recovery_state::RecoveryState;
+use crate::section_types::estimate_text_tokens;
 use crate::session_latches::SessionLatches;
 use crate::spill_backend::SpillBackend;
 use crate::token_accounting::TokenAccounting;
+
+enum LimitPolicy<'a> {
+    Explicit(&'a OptimizeLimits),
+    Adaptive {
+        suppress_tool_result_clearing: bool,
+        history_owner: HistoryOptimizationOwner,
+    },
+}
+
+/// Selects the component that owns lossy conversation-history reduction.
+///
+/// A pipeline can run standalone, or as the planning/front-end stage of a
+/// semantic compactor. Exactly one layer should clear results or drop units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryOptimizationOwner {
+    #[default]
+    Pipeline,
+    DownstreamSemanticCompactor,
+}
 
 /// Pipeline refused to execute due to unrecoverable error state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +90,42 @@ impl ContextPipeline {
     /// Run the full pipeline. Returns `Err(PipelineAbort)` if recovery state
     /// indicates an unrecoverable error streak (e.g., 3+ consecutive PTL errors).
     pub fn run(&self, input: PipelineRunInput<'_>) -> Result<PipelineRunOutput, PipelineAbort> {
+        self.run_with_limit_policy(&input, LimitPolicy::Explicit(input.optimize_limits))
+    }
+
+    /// Run with transformation gates derived from the final, measured plan.
+    ///
+    /// This prevents the caller from having to predict the compaction tier
+    /// before Plan has measured the bound request.
+    pub fn run_adaptive(
+        &self,
+        input: AdaptivePipelineRunInput<'_>,
+    ) -> Result<PipelineRunOutput, PipelineAbort> {
+        let compatibility_limits = OptimizeLimits::all_closed();
+        let full_input = PipelineRunInput {
+            sources: input.sources,
+            tokens: input.tokens,
+            model_limit: input.model_limit,
+            recovery: input.recovery,
+            latches: input.latches,
+            optimize_limits: &compatibility_limits,
+            model_id: input.model_id,
+            query_source: input.query_source,
+        };
+        self.run_with_limit_policy(
+            &full_input,
+            LimitPolicy::Adaptive {
+                suppress_tool_result_clearing: input.suppress_tool_result_clearing,
+                history_owner: input.history_owner,
+            },
+        )
+    }
+
+    fn run_with_limit_policy(
+        &self,
+        input: &PipelineRunInput<'_>,
+        limit_policy: LimitPolicy<'_>,
+    ) -> Result<PipelineRunOutput, PipelineAbort> {
         if input.model_limit == 0 {
             return Err(PipelineAbort::InvalidModelLimit {
                 model_limit: input.model_limit,
@@ -86,9 +142,11 @@ impl ContextPipeline {
         }
 
         let mut timings = Vec::with_capacity(4);
+        let mut plan_elapsed = Duration::ZERO;
+        let mut bind_elapsed = Duration::ZERO;
 
         let started = Instant::now();
-        let plan_input = PlanInput {
+        let preliminary_plan_input = PlanInput {
             tokens: input.tokens,
             model_limit: input.model_limit,
             recovery: input.recovery,
@@ -99,12 +157,77 @@ impl ContextPipeline {
             model_id: input.model_id,
             query_source: input.query_source,
         };
-        let plan = plan_turn(&plan_input);
-        timings.push(PipelinePhaseTiming::elapsed("plan", started));
+        let preliminary_plan = plan_turn(&preliminary_plan_input);
+        plan_elapsed = plan_elapsed.saturating_add(started.elapsed());
 
         let started = Instant::now();
-        let bound = bind_all(&plan, input.sources);
-        timings.push(PipelinePhaseTiming::elapsed("bind", started));
+        let preliminary_sections = bind_sections(&preliminary_plan, input.sources);
+        bind_elapsed = bind_elapsed.saturating_add(started.elapsed());
+
+        // Provider usage is a billing ledger, not necessarily this request's
+        // context occupancy. Measure the concrete candidate after Bind. A
+        // non-zero caller value remains a conservative lower-bound hint for
+        // direct callers with a more accurate tokenizer.
+        let measured_input_tokens = estimate_bound_input_tokens(
+            &preliminary_sections,
+            &input.sources.turn.messages,
+            &input.sources.agent.tool_schemas,
+        )
+        .max(input.tokens.total_input_u32_saturating());
+        let measured = TokenAccounting::from_fields(u64::from(measured_input_tokens), 0, 0, 0);
+
+        let started = Instant::now();
+        let final_plan_input = PlanInput {
+            tokens: &measured,
+            model_limit: input.model_limit,
+            recovery: input.recovery,
+            latches: input.latches,
+            stats: input.sources.stats,
+            provider_policy,
+            has_memory: !input.sources.external.memory_entries.is_empty(),
+            model_id: input.model_id,
+            query_source: input.query_source,
+        };
+        let plan = plan_turn(&final_plan_input);
+        plan_elapsed = plan_elapsed.saturating_add(started.elapsed());
+
+        let started = Instant::now();
+        let sections = if plan.sections == preliminary_plan.sections {
+            preliminary_sections
+        } else {
+            bind_sections(&plan, input.sources)
+        };
+        let bound = ContextBound {
+            sections,
+            messages: input.sources.turn.messages.clone(),
+            tool_schemas: input.sources.agent.tool_schemas.clone(),
+        };
+        bind_elapsed = bind_elapsed.saturating_add(started.elapsed());
+        timings.push(PipelinePhaseTiming::from_duration("plan", plan_elapsed));
+        timings.push(PipelinePhaseTiming::from_duration("bind", bind_elapsed));
+
+        let owned_limits;
+        let optimize_limits = match limit_policy {
+            LimitPolicy::Explicit(limits) => limits,
+            LimitPolicy::Adaptive {
+                suppress_tool_result_clearing,
+                history_owner,
+            } => {
+                owned_limits = {
+                    let mut limits = OptimizeLimits::for_tier(plan.compact_tier, input.model_limit);
+                    if suppress_tool_result_clearing
+                        || history_owner == HistoryOptimizationOwner::DownstreamSemanticCompactor
+                    {
+                        limits.allow_tool_result_clearing = false;
+                    }
+                    if history_owner == HistoryOptimizationOwner::DownstreamSemanticCompactor {
+                        limits.allow_round_dropping = false;
+                    }
+                    limits
+                };
+                &owned_limits
+            }
+        };
 
         let started = Instant::now();
         let spill_backend: Option<&dyn SpillBackend> =
@@ -114,7 +237,7 @@ impl ContextPipeline {
             bound,
             input.latches,
             provider_policy,
-            input.optimize_limits,
+            optimize_limits,
             input.sources.turn.turn_index,
             spill_backend,
         );
@@ -124,7 +247,8 @@ impl ContextPipeline {
         let serialized = serialize_provider_request(&optimized, provider_policy);
         timings.push(PipelinePhaseTiming::elapsed("serialize", started));
 
-        let metrics = PipelineRunMetrics::from_output(&input, &plan, &optimized);
+        let metrics =
+            PipelineRunMetrics::from_output(input, measured_input_tokens, &plan, &optimized);
         let explain = PipelineExplain {
             phase_timings: timings,
             pressure: plan.pressure,
@@ -142,6 +266,31 @@ impl ContextPipeline {
     }
 }
 
+fn estimate_bound_input_tokens(
+    sections: &[crate::section_types::BoundSection],
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+) -> u32 {
+    let section_tokens = sections
+        .iter()
+        .map(|section| section.actual_tokens)
+        .fold(0_u32, u32::saturating_add);
+    section_tokens
+        .saturating_add(estimate_json_values_tokens(messages))
+        .saturating_add(estimate_json_values_tokens(tool_schemas))
+}
+
+fn estimate_json_values_tokens(values: &[serde_json::Value]) -> u32 {
+    values
+        .iter()
+        .map(|value| {
+            serde_json::to_string(value)
+                .map(|encoded| estimate_text_tokens(&encoded).max(1))
+                .unwrap_or(1)
+        })
+        .fold(0_u32, u32::saturating_add)
+}
+
 pub struct PipelineRunInput<'a> {
     pub sources: &'a ContextSources<'a>,
     pub tokens: &'a TokenAccounting,
@@ -151,6 +300,21 @@ pub struct PipelineRunInput<'a> {
     pub optimize_limits: &'a OptimizeLimits,
     pub model_id: &'a str,
     pub query_source: &'a str,
+}
+
+pub struct AdaptivePipelineRunInput<'a> {
+    pub sources: &'a ContextSources<'a>,
+    pub tokens: &'a TokenAccounting,
+    pub model_limit: u32,
+    pub recovery: &'a RecoveryState,
+    pub latches: &'a SessionLatches,
+    pub model_id: &'a str,
+    pub query_source: &'a str,
+    /// Cascade protection is a session-level execution constraint, orthogonal
+    /// to pressure tier selection.
+    pub suppress_tool_result_clearing: bool,
+    /// Prevents two lossy history optimizers from acting on the same request.
+    pub history_owner: HistoryOptimizationOwner,
 }
 
 #[derive(Debug)]
@@ -178,9 +342,13 @@ pub struct PipelinePhaseTiming {
 
 impl PipelinePhaseTiming {
     fn elapsed(phase: &str, started: Instant) -> Self {
+        Self::from_duration(phase, started.elapsed())
+    }
+
+    fn from_duration(phase: &str, elapsed: Duration) -> Self {
         Self {
             phase: phase.to_string(),
-            elapsed_micros: started.elapsed().as_micros() as u64,
+            elapsed_micros: elapsed.as_micros() as u64,
         }
     }
 }
@@ -204,12 +372,13 @@ pub struct PipelineRunMetrics {
 impl PipelineRunMetrics {
     fn from_output(
         input: &PipelineRunInput<'_>,
+        measured_input_tokens: u32,
         plan: &ContextPlan,
         optimized: &ContextOptimized,
     ) -> Self {
         Self {
             turn_index: input.sources.turn.turn_index,
-            input_tokens: input.tokens.total_input_u32_saturating(),
+            input_tokens: measured_input_tokens,
             output_reserve_tokens: plan.reserves.output_tokens,
             raw_pressure: plan.pressure.raw,
             predictive_pressure: plan.pressure.value,

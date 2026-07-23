@@ -271,32 +271,47 @@ fn prune_tool_schemas(schemas: &mut Vec<Value>, tier: CompactionTier) -> u32 {
     u32::try_from(touched).unwrap_or(u32::MAX)
 }
 
-/// Drop the oldest assistant/user round pairs under extreme pressure.
+/// Drop the oldest complete user-driven conversation units under extreme
+/// pressure.
+///
+/// A unit starts at a user message and contains every following assistant and
+/// tool message up to the next user message. Treating those messages as an
+/// atomic unit prevents compaction from retaining a tool result after its
+/// assistant `tool_calls` declaration was removed.
 /// Returns estimated tokens dropped.
 fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
-    let droppable_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.get("role").and_then(Value::as_str) != Some("system"))
-        .map(|(idx, _)| idx)
-        .collect();
-
-    if droppable_indices.len() < 4 {
-        return 0; // Need at least 2 rounds to drop one
+    let mut units = Vec::<Vec<usize>>::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let role = message.get("role").and_then(Value::as_str);
+        if role == Some("system") {
+            continue;
+        }
+        if role == Some("user") || units.is_empty() {
+            units.push(Vec::new());
+        }
+        if let Some(unit) = units.last_mut() {
+            unit.push(idx);
+        }
     }
-    // Drop fraction scales with pressure: at 0.9 drop 1/6, at 1.0 drop 1/3
-    let fraction = ((pressure - 0.85) * 2.0).clamp(0.0, 0.5);
-    let total_rounds = droppable_indices.len() / 2;
-    let rounds_to_drop = ((total_rounds as f64 * fraction) as usize).max(1);
-    let messages_to_drop = (rounds_to_drop * 2).min(droppable_indices.len().saturating_sub(2));
 
-    if messages_to_drop == 0 {
+    if units.len() < 2 {
         return 0;
     }
 
-    let tokens_dropped: u32 = droppable_indices
+    // Drop fraction scales with pressure: at 0.9 drop 1/6, at 1.0 drop 1/3
+    let fraction = ((pressure - 0.85) * 2.0).clamp(0.0, 0.5);
+    let units_to_drop = ((units.len() as f64 * fraction) as usize)
+        .max(1)
+        .min(units.len().saturating_sub(1));
+    let indices_to_drop: Vec<usize> = units
         .iter()
-        .take(messages_to_drop)
+        .take(units_to_drop)
+        .flatten()
+        .copied()
+        .collect();
+
+    let tokens_dropped: u32 = indices_to_drop
+        .iter()
         .map(|&idx| &messages[idx])
         .map(|m| {
             let content = m.get("content").and_then(Value::as_str).unwrap_or("");
@@ -304,7 +319,7 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         })
         .sum();
 
-    for &idx in droppable_indices.iter().take(messages_to_drop).rev() {
+    for &idx in indices_to_drop.iter().rev() {
         messages.remove(idx);
     }
     tokens_dropped
@@ -1034,6 +1049,42 @@ mod tests {
     }
 
     #[test]
+    fn round_dropping_never_orphans_tool_results_from_their_calls() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect the project"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-old",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-old",
+                "content": "old tool result"
+            }),
+            serde_json::json!({"role": "assistant", "content": "old conclusion"}),
+            serde_json::json!({"role": "user", "content": "now make the change"}),
+            serde_json::json!({"role": "assistant", "content": "recent answer"}),
+        ];
+
+        let dropped = drop_oldest_rounds(&mut messages, 1.0);
+
+        assert!(dropped > 0);
+        assert_eq!(
+            messages,
+            vec![
+                serde_json::json!({"role": "user", "content": "now make the change"}),
+                serde_json::json!({"role": "assistant", "content": "recent answer"}),
+            ],
+            "a user request and every assistant/tool continuation it caused form one atomic unit"
+        );
+    }
+
+    #[test]
     fn round_dropping_gate_closed_preserves_all() {
         let (mut plan, bound, latches) = build_test_plan_and_bound();
         plan.compact_tier = CompactionTier::AggressivePrune;
@@ -1087,9 +1138,9 @@ mod tests {
         let mut messages: Vec<Value> = (0..12)
             .map(|i| {
                 if i % 2 == 0 {
-                    serde_json::json!({"role": "assistant", "content": content})
-                } else {
                     serde_json::json!({"role": "user", "content": content})
+                } else {
+                    serde_json::json!({"role": "assistant", "content": content})
                 }
             })
             .collect();

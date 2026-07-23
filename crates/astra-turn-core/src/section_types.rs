@@ -331,7 +331,7 @@ pub enum SectionSource {
 }
 
 /// A section as planned (before binding). Describes what to include and how.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedSection {
     pub kind: SectionKind,
     pub scope: CacheScope,

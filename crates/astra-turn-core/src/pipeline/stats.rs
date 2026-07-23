@@ -454,6 +454,24 @@ impl PipelineStats {
         }
     }
 
+    /// Record already-computed fingerprints captured with the exact provider
+    /// request. This closes the feedback loop when the runtime intentionally
+    /// drops the full `TurnOutput` before the asynchronous response arrives.
+    pub(crate) fn record_section_fingerprint_hashes(
+        &mut self,
+        fingerprints: &[(crate::section_types::SectionKind, u64)],
+    ) {
+        for &(kind, hash) in fingerprints {
+            match self.section_fingerprints.insert(kind, hash) {
+                Some(previous) if previous != hash => {
+                    let entry = self.section_churns.entry(kind).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Observed content churn count for a section kind.
     #[must_use]
     pub fn section_churn(&self, kind: crate::section_types::SectionKind) -> u32 {
@@ -490,7 +508,7 @@ fn f64_to_u32_saturating(value: f64) -> u32 {
     value as u32
 }
 
-fn section_content_hash(kind: crate::section_types::SectionKind, text: &str) -> u64 {
+pub(crate) fn section_content_hash(kind: crate::section_types::SectionKind, text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     kind.hash(&mut hasher);
     text.hash(&mut hasher);

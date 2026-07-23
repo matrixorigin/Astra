@@ -299,28 +299,10 @@ pub(crate) fn compact_tiered_impl(
 
     let total_chars: usize = messages
         .iter()
-        .map(|m| {
-            let content_chars = m
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.chars().count())
-                .unwrap_or(0);
-            let tool_calls_chars = m
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|c| {
-                            c.get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(Value::as_str)
-                                .map(|s| s.chars().count())
-                        })
-                        .sum::<usize>()
-                })
-                .unwrap_or(0);
-            content_chars + tool_calls_chars
+        .map(|message| {
+            serde_json::to_string(message)
+                .map(|encoded| encoded.chars().count())
+                .unwrap_or(1)
         })
         .sum();
 
@@ -444,15 +426,19 @@ pub(crate) fn compact_tiered_impl(
             .collect();
         let keep_count = keep_recent_turns * 2;
         if conv_indices.len() > keep_count {
-            let drop_set: HashSet<usize> = conv_indices[..conv_indices.len() - keep_count]
-                .iter()
-                .copied()
-                .filter(|i| Some(*i) != first_user_idx)
-                .collect();
+            // Drop one contiguous historical span rather than user/assistant
+            // messages in isolation. Tool results live between those control
+            // messages; retaining them while deleting their assistant
+            // `tool_calls` frame produces provider-invalid history.
+            let tail_start = conv_indices[conv_indices.len() - keep_count.max(1)];
             compacted = compacted
                 .into_iter()
                 .enumerate()
-                .filter(|(i, _)| !drop_set.contains(i))
+                .filter(|(index, message)| {
+                    message.get("role").and_then(Value::as_str) == Some("system")
+                        || Some(*index) == first_user_idx
+                        || *index >= tail_start
+                })
                 .map(|(_, m)| m)
                 .collect();
         }
@@ -538,6 +524,51 @@ mod tests {
             compact_tiered_with_result(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4)
                 .messages;
         assert_eq!(result, msgs);
+    }
+
+    #[test]
+    fn aggressive_prune_never_orphans_tool_results() {
+        let mut messages = vec![user("complete a long tool-driven task")];
+        for index in 0..8 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }));
+            messages.push(tool_with_id(
+                &format!("call-{index}"),
+                &format!("result {index}: {}", "evidence ".repeat(200)),
+            ));
+        }
+
+        let result =
+            compact_tiered_with_result(&messages, 1, 100, CompactionTier::AggressivePrune, 2);
+        let retained_call_ids: HashSet<&str> = result
+            .messages
+            .iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .collect();
+
+        for result_message in result
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        {
+            let result_id = result_message["tool_call_id"]
+                .as_str()
+                .expect("tool result id");
+            assert!(
+                retained_call_ids.contains(result_id),
+                "compaction retained orphan tool result {result_id}: {:#?}",
+                result.messages
+            );
+        }
     }
 
     // --- CompactResult / CompactBoundary tests ---

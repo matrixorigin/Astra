@@ -3009,6 +3009,7 @@ impl ServerAgenticLoopHost {
         state.last_llm_context_manifest_trace = Some(mock_pipeline.manifest_trace.to_json());
         let system_msgs = mock_pipeline.system_messages;
         let volatile_preamble = mock_pipeline.volatile_preamble;
+        let pipeline_messages = mock_pipeline.messages;
 
         // Replicate the real-path tool + message annotations so captured
         // payloads reflect what a real provider would see. Start from the
@@ -3045,7 +3046,7 @@ impl ServerAgenticLoopHost {
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
             volatile_preamble.clone(),
-            state.messages.clone(),
+            pipeline_messages,
             state,
             &mock_llm_cfg,
             &cache_cfg,
@@ -4768,6 +4769,7 @@ impl ServerAgenticLoopHost {
     async fn compact_messages_via_memoria(
         &self,
         state: &AgenticLoopState,
+        messages: &[Value],
         system_messages: &[Value],
         visible_tools: &[Value],
         tier: CompactionTier,
@@ -4791,8 +4793,7 @@ impl ServerAgenticLoopHost {
             tier,
             session_facts: None,
         };
-        ctx.compact(&state.messages, system_messages, visible_tools)
-            .await
+        ctx.compact(messages, system_messages, visible_tools).await
     }
 
     /// Thin wrapper around [`wire_assembly::assemble_llm_messages_with_cache_capability`] that
@@ -5300,6 +5301,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let PipelineTurnOutcome {
             system_messages,
             volatile_preamble,
+            messages: pipeline_messages,
             system_plain: system_prompt_plain,
             breakdown: system_prompt_breakdown,
             tier,
@@ -5326,10 +5328,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // from the pure assembly step. `execute_turn` orchestrates both so
         // the wire-building flow is readable and each phase is individually
         // testable / replaceable.
+        let mut compaction_fixed_context = final_system_messages.clone();
+        compaction_fixed_context.extend(final_volatile_preamble.iter().cloned());
         let compact_result = self
             .compact_messages_via_memoria(
                 state,
-                &final_system_messages,
+                &pipeline_messages,
+                &compaction_fixed_context,
                 &visible_tools,
                 tier,
                 &llm_cfg,
@@ -5425,11 +5430,36 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // not actually see this turn.
         self.sync_valid_tools_to_wire_surface_for_state(&final_tools, state);
         self.last_turn_tool_schemas = final_tools.clone();
-        if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire(
-                trace,
-                &llm_messages,
-                &final_tools,
+        let final_wire_budget_status =
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::llm::context::augment_manifest_trace_with_wire(
+                    trace,
+                    &llm_messages,
+                    &final_tools,
+                );
+                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                    trace,
+                    &llm_messages,
+                    &final_tools,
+                    &llm_cfg.model_name,
+                    llm_cfg.context_window,
+                    max_output_tokens,
+                )
+            } else {
+                crate::turn::wire_assembly::wire_budget_status(
+                    &llm_messages,
+                    &final_tools,
+                    &llm_cfg.model_name,
+                    llm_cfg.context_window,
+                    max_output_tokens,
+                )
+            };
+        if final_wire_budget_status.hard_limit_exceeded() {
+            tracing::warn!(
+                estimated_input_tokens = final_wire_budget_status.estimated_input_tokens,
+                requested_output_tokens = final_wire_budget_status.requested_output_tokens,
+                model_limit = final_wire_budget_status.model_limit,
+                "final wire estimate exceeds the model limit; provider tokenizer remains authoritative"
             );
         }
         self.emit_context_meta(

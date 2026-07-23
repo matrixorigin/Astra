@@ -2336,6 +2336,7 @@ impl InProcessChatTurnBridge {
             };
             let pipeline_outcome = crate::turn::llm::context::assemble_bridge_context(
                 crate::turn::llm::context::BridgeContextAssemblyInput {
+                    conversation_messages: &messages,
                     tool_surface:
                         crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                             &edge_tools,
@@ -2369,6 +2370,7 @@ impl InProcessChatTurnBridge {
             );
             let mut system_msg = pipeline_outcome.primary_system;
             let mut dynamic_msg = pipeline_outcome.dynamic_system;
+            let pipeline_messages = pipeline_outcome.messages;
             let mut prompt_sections = pipeline_outcome.prompt_sections;
             // Pipeline decision is the only source of truth for tier + pruning.
             // Cache the outputs so the round-level block below uses them
@@ -2406,7 +2408,7 @@ impl InProcessChatTurnBridge {
             }
             llm_messages.push(system_msg);
             let mut bridge_volatile_text: Option<String> = None;
-            if let Some(dyn_msg) = dynamic_msg {
+            if let Some(ref dyn_msg) = dynamic_msg {
                 // Volatile per-turn content (Self-Awareness counter, session
                 // anchor, etc.) — ALL protocols now route it to the
                 // last user message prefix so the system + tools prefix stays
@@ -2434,8 +2436,18 @@ impl InProcessChatTurnBridge {
             // now route through the shared `wire_assembly::MemoriaContext`.
             // The summary adapter uses the same admitted route as the main
             // request, including forwarded headers and endpoint overrides.
+            let mut compaction_fixed_context = llm_messages.clone();
+            if let Some(dynamic) = dynamic_msg.as_ref() {
+                compaction_fixed_context.push(dynamic.clone());
+            }
+            if let Some(required) = required_runtime_text.as_deref().and_then(
+                crate::turn::wire_assembly::required_runtime_preamble_message,
+            )
+            {
+                compaction_fixed_context.push(required);
+            }
             let (merged_messages, _initial_tier) = {
-                let raw = messages.clone();
+                let raw = pipeline_messages;
 
                 let memoria_client = memoria_client_shared.clone();
 
@@ -2453,7 +2465,9 @@ impl InProcessChatTurnBridge {
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
 
-                let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
+                let compact_result = ctx
+                    .compact(&raw, &compaction_fixed_context, &edge_tools)
+                    .await;
 
                 if let Some(rerun) =
                     crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
@@ -2465,6 +2479,7 @@ impl InProcessChatTurnBridge {
                         |session_memory_entry, memory_entries| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {
+                                    conversation_messages: &messages,
                                     tool_surface:
                                         crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                                             &edge_tools,
@@ -2754,6 +2769,14 @@ impl InProcessChatTurnBridge {
                         &llm_messages,
                         &pruned_tools,
                     );
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                        &model_name,
+                        model_context_window,
+                        max_output_tokens,
+                    );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
@@ -2835,6 +2858,14 @@ impl InProcessChatTurnBridge {
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
+                    );
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                        &model_name,
+                        model_context_window,
+                        max_output_tokens,
                     );
 
                     // Capture the final post-mutation request state (see the
@@ -3221,6 +3252,14 @@ impl InProcessChatTurnBridge {
                                 &mut bridge_manifest_trace_json,
                                 &llm_messages,
                                 &pruned_tools,
+                            );
+                            crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                                &mut bridge_manifest_trace_json,
+                                &llm_messages,
+                                &pruned_tools,
+                                &model_name,
+                                model_context_window,
+                                max_output_tokens / 2,
                             );
                             yield render_sse(&crate::turn::llm::context::context_meta_event(
                                 &breakdown,

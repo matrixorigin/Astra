@@ -31,6 +31,96 @@ pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runt
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
 const TOOL_RUNTIME_CONTEXT_SUFFIX: &str = "</runtime-context-after-tool>";
 
+/// Preflight estimate for the final provider payload.
+///
+/// This is deliberately observational: provider tokenizers remain the hard
+/// authority. The soft target can drive diagnostics without turning an
+/// approximation into another destructive compaction trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireBudgetStatus {
+    pub estimated_input_tokens: usize,
+    pub requested_output_tokens: usize,
+    pub effective_input_limit: usize,
+    pub model_limit: usize,
+}
+
+impl WireBudgetStatus {
+    #[must_use]
+    pub fn soft_target_exceeded(self) -> bool {
+        self.estimated_input_tokens > self.effective_input_limit
+    }
+
+    #[must_use]
+    pub fn hard_limit_exceeded(self) -> bool {
+        self.estimated_input_tokens
+            .saturating_add(self.requested_output_tokens)
+            > self.model_limit
+    }
+
+    #[must_use]
+    pub fn to_json(self) -> Value {
+        serde_json::json!({
+            "estimated_input_tokens": self.estimated_input_tokens,
+            "requested_output_tokens": self.requested_output_tokens,
+            "effective_input_limit": self.effective_input_limit,
+            "model_limit": self.model_limit,
+            "soft_target_exceeded": self.soft_target_exceeded(),
+            "hard_limit_exceeded": self.hard_limit_exceeded(),
+            "enforcement": "observational_estimate_provider_authoritative",
+        })
+    }
+}
+
+pub(crate) fn wire_budget_status(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    context_window: Option<u32>,
+    requested_output_tokens: usize,
+) -> WireBudgetStatus {
+    const PROVIDER_FRAMING_TOKENS: usize = 300;
+    let tool_tokens = tools
+        .iter()
+        .map(crate::prompts::estimate_json_value_tokens)
+        .sum();
+    let estimated_input_tokens =
+        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens)
+            .total_tokens
+            .saturating_add(PROVIDER_FRAMING_TOKENS);
+    let budget = crate::prompts::budget_for_model_with_override(Some(model_name), context_window);
+    WireBudgetStatus {
+        estimated_input_tokens,
+        requested_output_tokens,
+        effective_input_limit: budget.effective_input_limit(),
+        model_limit: budget.model_limit,
+    }
+}
+
+pub(crate) fn augment_manifest_trace_with_wire_budget(
+    trace: &mut Value,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    context_window: Option<u32>,
+    requested_output_tokens: usize,
+) -> WireBudgetStatus {
+    let status = wire_budget_status(
+        messages,
+        tools,
+        model_name,
+        context_window,
+        requested_output_tokens,
+    );
+    if !trace.is_object() {
+        *trace = serde_json::json!({});
+    }
+    if !trace["wire"].is_object() {
+        trace["wire"] = serde_json::json!({});
+    }
+    trace["wire"]["budget"] = status.to_json();
+    status
+}
+
 pub(crate) fn required_runtime_preamble_message(text: &str) -> Option<Value> {
     let text = text.trim();
     if text.is_empty() {
@@ -189,6 +279,16 @@ struct ResolvedBudget {
     tier: CompactionTier,
 }
 
+fn history_budget_chars(
+    budget: &crate::prompts::ContextBudget,
+    fixed_context_tokens: usize,
+) -> usize {
+    budget
+        .effective_input_limit()
+        .saturating_sub(fixed_context_tokens)
+        .saturating_mul(4)
+}
+
 impl BudgetOverrides {
     fn apply(self, base: ResolvedBudget) -> ResolvedBudget {
         ResolvedBudget {
@@ -241,11 +341,7 @@ impl<'a> MemoriaContext<'a> {
         // count tool schemas alongside messages for a single total.
         let tool_schema_tokens: usize = visible_tools
             .iter()
-            .map(|t| {
-                serde_json::to_string(t)
-                    .map(|s| crate::prompts::estimate_str_tokens(&s))
-                    .unwrap_or(50)
-            })
+            .map(crate::prompts::estimate_json_value_tokens)
             .sum();
         let cache_est = crate::prompts::estimate_tokens_cache_aware_split(
             system_messages,
@@ -254,7 +350,11 @@ impl<'a> MemoriaContext<'a> {
         );
 
         let resolved = overrides.apply(ResolvedBudget {
-            budget_chars: budget.effective_input_limit() * 4,
+            // Memoria controls only the conversation working set. Stable
+            // system messages and tool schemas consume the same provider
+            // window, so reserve their concrete cost before deriving the
+            // history budget.
+            budget_chars: history_budget_chars(&budget, cache_est.cache_eligible_tokens),
             keep_chars: 2_000,
             keep_recent_turns: budget.keep_recent_turns,
             current_tokens: cache_est.total_tokens,
@@ -754,6 +854,151 @@ mod tests {
         };
 
         assert_eq!(ctx.context_budget().model_limit, 1_000_000);
+    }
+
+    #[test]
+    fn history_budget_reserves_system_and_tool_tokens_once() {
+        let budget = crate::prompts::budget_for_model_with_override(Some("model"), Some(10_000));
+        assert_eq!(budget.effective_input_limit(), 8_500);
+        assert_eq!(history_budget_chars(&budget, 1_500), 28_000);
+        assert_eq!(
+            history_budget_chars(&budget, 20_000),
+            0,
+            "fixed context larger than the input window must not underflow"
+        );
+    }
+
+    #[test]
+    fn final_wire_budget_status_is_observational_and_counts_block_content() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "你好世界".repeat(400)}]
+        })];
+        let mut trace = json!({"wire": {"message_count": 1}});
+        let status = augment_manifest_trace_with_wire_budget(
+            &mut trace,
+            &messages,
+            &[],
+            "model",
+            Some(1_000),
+            100,
+        );
+
+        assert!(status.soft_target_exceeded());
+        assert!(status.hard_limit_exceeded());
+        assert_eq!(trace["wire"]["message_count"], 1);
+        assert_eq!(
+            trace["wire"]["budget"]["enforcement"],
+            "observational_estimate_provider_authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_running_compaction_converges_without_protocol_decay() {
+        let mut history = vec![json!({
+            "role": "user",
+            "content": "Inspect, repair, and verify the project without losing the active goal."
+        })];
+        for round in 0..200 {
+            history.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call-{round}"),
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": format!("{{\"path\":\"src/file-{round}.rs\"}}")
+                    }
+                }]
+            }));
+            history.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call-{round}"),
+                "content": format!("round {round}: {}", "realistic tool evidence ".repeat(120))
+            }));
+        }
+        let system = vec![json!({
+            "role": "system",
+            "content": "Stable execution policy. Preserve the active goal and tool causality."
+        })];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        })];
+        let ctx = MemoriaContext {
+            session_id: "sid-long-running",
+            model_name: "model-with-explicit-window",
+            context_window: Some(8_000),
+            memoria_client: None,
+            summary_client: None,
+            tier: CompactionTier::AggressivePrune,
+            session_facts: None,
+        };
+
+        let first = ctx.compact(&history, &system, &tools).await;
+        let second = ctx.compact(&first.messages, &system, &tools).await;
+
+        assert_eq!(
+            second.messages, first.messages,
+            "reapplying compaction to an already-bounded working set must converge"
+        );
+        assert!(
+            first.messages.len() < history.len() / 4,
+            "a long execution must keep a bounded live working set"
+        );
+        assert!(first.messages.iter().any(|message| {
+            message.get("content").and_then(Value::as_str)
+                == Some("Inspect, repair, and verify the project without losing the active goal.")
+        }));
+        assert!(first.messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("call-199")
+        }));
+
+        let retained_calls: std::collections::HashSet<&str> = first
+            .messages
+            .iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .collect();
+        for result in first
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        {
+            let call_id = result
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .expect("tool result id");
+            assert!(
+                retained_calls.contains(call_id),
+                "long-running compaction must never retain orphan result {call_id}"
+            );
+        }
+
+        let tool_tokens = tools
+            .iter()
+            .map(crate::prompts::estimate_json_value_tokens)
+            .sum();
+        let estimate = crate::prompts::estimate_tokens_cache_aware_split(
+            &system,
+            &first.messages,
+            tool_tokens,
+        );
+        assert!(
+            estimate.total_tokens <= ctx.context_budget().effective_input_limit(),
+            "bounded wire estimate {} exceeds effective input limit {}",
+            estimate.total_tokens,
+            ctx.context_budget().effective_input_limit()
+        );
     }
 
     #[test]

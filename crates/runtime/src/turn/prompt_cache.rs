@@ -210,6 +210,8 @@ pub(crate) struct BridgePipelineOutcome {
     pub primary_system: Value,
     /// Optional dynamic system message (OpenAI stable+dynamic split only).
     pub dynamic_system: Option<Value>,
+    /// Conversation history after tier-aware pipeline optimization.
+    pub messages: Vec<Value>,
     /// Trace-facing sections (original input form, for observability).
     pub prompt_sections: Vec<prompts::PromptSection>,
     /// Compaction tier the planner selected this turn. Bridge must honour
@@ -349,6 +351,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
 ///   the Memory section (None scope), where the core binder applies rank,
 ///   deduplication, and token-budget trimming.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn assemble_bridge_pipeline_outcome(
     tool_names: &[&str],
     tool_schemas: &[Value],
@@ -369,6 +372,57 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     deferred_tools_block: &str,
     skill_listing_block: &str,
     current_date: &str,
+) -> BridgePipelineOutcome {
+    assemble_bridge_pipeline_outcome_with_messages(
+        tool_names,
+        tool_schemas,
+        extra_stable_sections,
+        extra_volatile_sections,
+        memory_entries,
+        session_memory_entry,
+        system_override,
+        cache_cfg,
+        cache_capability,
+        session_id,
+        model_id,
+        context_window,
+        provider,
+        edge_profile_cwd,
+        edge_profile_git_branch,
+        project_context,
+        deferred_tools_block,
+        skill_listing_block,
+        current_date,
+        &[],
+    )
+}
+
+/// Message-aware bridge entry point used by the production wire path.
+///
+/// The compatibility wrapper above deliberately supplies an empty history for
+/// older system-prompt-only callers and tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
+    tool_names: &[&str],
+    tool_schemas: &[Value],
+    extra_stable_sections: &[prompts::PromptSection],
+    extra_volatile_sections: &[prompts::PromptSection],
+    memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
+    session_memory_entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
+    system_override: Option<&str>,
+    cache_cfg: &PromptCacheConfig,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    session_id: &str,
+    model_id: &str,
+    context_window: Option<u32>,
+    provider: &str,
+    edge_profile_cwd: Option<&str>,
+    edge_profile_git_branch: Option<&str>,
+    project_context: Option<&str>,
+    deferred_tools_block: &str,
+    skill_listing_block: &str,
+    current_date: &str,
+    conversation_messages: &[Value],
 ) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
@@ -498,7 +552,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         ..Default::default()
     };
     let turn_state = TurnState {
-        messages: Vec::new(),
+        messages: conversation_messages.to_vec(),
         tool_results: Vec::new(),
         tokens: Default::default(),
         active_skills: Vec::new(),
@@ -526,7 +580,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         query_source: "bridge",
     };
 
-    let output = match session.run_turn_adaptive(input) {
+    let output = match session.run_turn_adaptive_with_history_owner(
+        input,
+        astra_turn_core::context_pipeline::HistoryOptimizationOwner::DownstreamSemanticCompactor,
+    ) {
         Ok(out) => out,
         Err(abort) => {
             tracing::warn!(
@@ -536,6 +593,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             return BridgePipelineOutcome {
                 primary_system: json!({"role": "system", "content": ""}),
                 dynamic_system: None,
+                messages: conversation_messages.to_vec(),
                 prompt_sections: Vec::new(),
                 tier: astra_turn_core::compaction_types::CompactionTier::Normal,
                 tool_schemas: tool_schemas.to_vec(),
@@ -641,6 +699,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     BridgePipelineOutcome {
         primary_system,
         dynamic_system,
+        messages: output.optimized.messages,
         prompt_sections: sections,
         tier,
         tool_schemas: pruned_tool_schemas,
@@ -1099,6 +1158,57 @@ mod tests {
                 .unwrap_or(""),
             tool_schemas[0]["function"]["description"].as_str().unwrap(),
             "Normal tier must not strip description text"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_measures_working_set_but_defers_lossy_history_reduction() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let messages: Vec<Value> = (0..16)
+            .map(|index| {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                json!({
+                    "role": role,
+                    "content": format!("round {index}: {}", "working context ".repeat(700)),
+                })
+            })
+            .collect();
+        let outcome = assemble_bridge_pipeline_outcome_with_messages(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-long-running-bridge",
+            "model-with-explicit-window",
+            Some(8_000),
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-07-23",
+            &messages,
+        );
+
+        assert_eq!(
+            outcome.tier,
+            astra_turn_core::compaction_types::CompactionTier::AggressivePrune,
+            "tier must follow the concrete request working set"
+        );
+        assert_eq!(
+            outcome.messages, messages,
+            "the bridge's downstream semantic compactor is the sole lossy history owner"
         );
     }
 

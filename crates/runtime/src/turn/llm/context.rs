@@ -307,6 +307,11 @@ impl<'a> RuntimeSignals<'a> {
 pub(crate) struct LlmContextAssemblyOutput {
     pub system_messages: Vec<Value>,
     pub volatile_preamble: Vec<Value>,
+    /// Conversation history after the pipeline's tier-aware optimization.
+    ///
+    /// Callers must feed this view into any later semantic compactor instead
+    /// of restarting from the unoptimized session history.
+    pub messages: Vec<Value>,
     pub system_plain: String,
     pub breakdown: astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     pub tier: astra_turn_core::compaction_types::CompactionTier,
@@ -439,6 +444,9 @@ fn role_counts_json(roles: &[String]) -> Value {
 /// the existing bridge pipeline helper until the bridge source collection is
 /// fully normalized into [`LlmContextAssemblyInput`].
 pub(crate) struct BridgeContextAssemblyInput<'a> {
+    /// Current conversation working set. It is optimized by the same pipeline
+    /// that selects the system sections and tool surface.
+    pub conversation_messages: &'a [Value],
     pub tool_surface: ToolSurfacePlan<'a>,
     pub runtime_signals: BridgeRuntimeSignals<'a>,
     pub session: BridgeSessionContextInput<'a>,
@@ -590,6 +598,7 @@ impl<'a> BridgeSessionContextInput<'a> {
 pub(crate) struct BridgeContextAssemblyOutput {
     pub primary_system: Value,
     pub dynamic_system: Option<Value>,
+    pub messages: Vec<Value>,
     pub prompt_sections: Vec<crate::prompts::PromptSection>,
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     pub tool_schemas: Vec<Value>,
@@ -954,7 +963,7 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
     );
-    let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
+    let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome_with_messages(
         &effective_tool_names,
         &effective_tool_schemas,
         input.runtime_signals.extra_stable_sections,
@@ -974,6 +983,7 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.deferred_tools_block,
         input.session.skill_listing_block,
         input.session.current_date,
+        input.conversation_messages,
     );
     let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system).saturating_add(
         outcome
@@ -997,6 +1007,7 @@ pub(crate) fn assemble_bridge_context(
     BridgeContextAssemblyOutput {
         primary_system: outcome.primary_system,
         dynamic_system: outcome.dynamic_system,
+        messages: outcome.messages,
         prompt_sections: outcome.prompt_sections,
         tier: outcome.tier,
         tool_schemas: outcome.tool_schemas,
@@ -1189,7 +1200,11 @@ pub(crate) fn assemble_context_pipeline(
         {
             pipeline_sess.set_prompt_cache_diff_dir(session_dir.join("prompt-cache-diffs"));
         }
-        pipeline_sess.run_turn_adaptive(adaptive)
+        pipeline_sess.run_turn_adaptive_with_history_owner(
+            adaptive,
+            astra_turn_core::context_pipeline::HistoryOptimizationOwner::
+                DownstreamSemanticCompactor,
+        )
     };
 
     let pipeline_output = match pipeline_result {
@@ -1209,8 +1224,8 @@ pub(crate) fn assemble_context_pipeline(
         .get("system_prompt_override")
         .and_then(Value::as_str)
         .is_some_and(|text| !text.trim().is_empty());
-    let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
-        total_tokens: pipeline_output.metrics.sections,
+    let mut breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+        total_tokens: 0,
         repository_memories: prompt_memory_injections(&external.memory_entries),
         session_memory_injected: session_memory_injection(
             input.runtime_signals.session_memory_entry.as_ref(),
@@ -1295,6 +1310,11 @@ pub(crate) fn assemble_context_pipeline(
     }
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
+    let system_prompt_tokens = system_messages
+        .iter()
+        .map(estimate_json_tokens)
+        .fold(0_u32, u32::saturating_add);
+    breakdown.total_tokens = system_prompt_tokens;
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
     let tier = pipeline_output.plan.compact_tier;
     let compaction_tier = format!("{:?}", tier);
@@ -1303,6 +1323,7 @@ pub(crate) fn assemble_context_pipeline(
     Ok(LlmContextAssemblyOutput {
         system_messages,
         volatile_preamble,
+        messages: pipeline_output.optimized.messages,
         system_plain: plain,
         breakdown,
         tier,
@@ -1313,7 +1334,7 @@ pub(crate) fn assemble_context_pipeline(
             model_name: input.model_name.to_string(),
             model_context_window_tokens,
             compaction_tier,
-            system_prompt_tokens: pipeline_output.metrics.sections,
+            system_prompt_tokens,
             stable_system_message_count,
             volatile_preamble_count,
             tool_schema_count,
@@ -2167,6 +2188,19 @@ mod context_cache_contract_tests {
             state.messages, history_before,
             "required runtime policy must not enter persistent conversation history"
         );
+        assert_eq!(
+            output.messages, history_before,
+            "normal-pressure pipeline output must preserve the conversation history"
+        );
+        assert_eq!(
+            output.breakdown.total_tokens,
+            output
+                .system_messages
+                .iter()
+                .map(estimate_json_tokens)
+                .fold(0_u32, u32::saturating_add),
+            "system prompt telemetry must report estimated tokens, not section count"
+        );
         assert!(state.messages.iter().all(|message| {
             !message
                 .get("content")
@@ -2180,7 +2214,7 @@ mod context_cache_contract_tests {
             output.system_messages,
             output.volatile_preamble,
             Vec::new(),
-            state.messages.clone(),
+            output.messages,
             &crate::turn::wire_assembly::PostCompactAttachments::default(),
             "sid-deepseek",
             "openai",
@@ -2337,6 +2371,7 @@ mod context_cache_contract_tests {
         ];
 
         let output = assemble_bridge_context(BridgeContextAssemblyInput {
+            conversation_messages: &[],
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
             runtime_signals: BridgeRuntimeSignals::new(&[], &[], &memory_entries, None, None)
                 .with_memory_provider_source(Some("request_binding")),
@@ -2393,6 +2428,7 @@ mod context_cache_contract_tests {
         let unrestricted = HashSet::new();
         let assemble = |restricted_tools: &HashSet<String>| {
             assemble_bridge_context(BridgeContextAssemblyInput {
+                conversation_messages: &[],
                 tool_surface: ToolSurfacePlan::from_visible_tools(&memory_tool, restricted_tools),
                 runtime_signals: BridgeRuntimeSignals::new(&[], &[], &[], None, None),
                 session: BridgeSessionContextInput::new(

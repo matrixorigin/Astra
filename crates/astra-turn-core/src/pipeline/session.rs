@@ -15,8 +15,8 @@ use crate::compaction_types::CompactionTier;
 use crate::context_feedback::ContextFeedback;
 use crate::context_optimizer::ContextOptimized;
 use crate::context_pipeline::{
-    ContextPipeline, PipelineAbort, PipelineExplain, PipelineRunInput, PipelineRunMetrics,
-    PipelineRunOutput,
+    AdaptivePipelineRunInput, ContextPipeline, HistoryOptimizationOwner, PipelineAbort,
+    PipelineExplain, PipelineRunInput, PipelineRunMetrics, PipelineRunOutput,
 };
 use crate::context_planner::ContextPlan;
 use crate::context_serializer::SerializedProviderRequest;
@@ -97,6 +97,10 @@ fn default_session_current_date() -> String {
 pub(crate) struct PendingPromptSnapshot {
     query_source: String,
     snapshot: PromptStateSnapshot,
+    #[serde(default)]
+    section_usage: std::collections::HashMap<crate::section_types::SectionKind, u32>,
+    #[serde(default)]
+    section_fingerprints: Vec<(crate::section_types::SectionKind, u64)>,
 }
 
 impl PipelineSession {
@@ -211,28 +215,8 @@ impl PipelineSession {
             query_source: input.query_source,
         };
 
-        let PipelineRunOutput {
-            plan,
-            optimized,
-            serialized,
-            explain,
-            metrics,
-        } = self.pipeline.run(run_input)?;
-
-        let output = TurnOutput {
-            plan,
-            optimized,
-            serialized,
-            explain,
-            metrics,
-        };
-        self.pending_prompt_snapshot = Some(PendingPromptSnapshot::capture(
-            input.query_source,
-            input.session,
-            input.model_id,
-            &output,
-        ));
-        Ok(output)
+        let output = self.pipeline.run(run_input)?;
+        self.finish_turn_output(input.query_source, input.session, input.model_id, output)
     }
 
     /// Run the pipeline with tier-adaptive limits. The Plan phase determines
@@ -243,18 +227,71 @@ impl PipelineSession {
         &mut self,
         input: AdaptiveTurnInput<'_>,
     ) -> Result<TurnOutput, PipelineAbort> {
-        let limits = self.cascade_aware_limits(input.session.model_limit);
-        let full_input = TurnInput {
+        self.run_turn_adaptive_with_history_owner(input, HistoryOptimizationOwner::Pipeline)
+    }
+
+    /// Adaptive pipeline entry point for runtimes with a downstream semantic
+    /// history compactor. Planning and schema optimization still happen here,
+    /// while lossy history reduction is delegated to exactly one owner.
+    pub fn run_turn_adaptive_with_history_owner(
+        &mut self,
+        input: AdaptiveTurnInput<'_>,
+        history_owner: HistoryOptimizationOwner,
+    ) -> Result<TurnOutput, PipelineAbort> {
+        let sources = ContextSources {
             statics: input.statics,
             agent: input.agent,
+            latches: &self.latches,
             session: input.session,
             turn: input.turn,
             external: input.external,
-            optimize_limits: &limits,
+            emergent: &self.emergent,
+            working_memory: Some(&self.working_memory),
+            stats: &self.stats,
+        };
+        let run_input = AdaptivePipelineRunInput {
+            sources: &sources,
+            tokens: &input.turn.tokens,
+            model_limit: input.session.model_limit,
+            recovery: &self.recovery,
+            latches: &self.latches,
             model_id: input.model_id,
             query_source: input.query_source,
+            suppress_tool_result_clearing: self.stats.has_compaction_cascade(),
+            history_owner,
         };
-        self.run_turn(full_input)
+        let output = self.pipeline.run_adaptive(run_input)?;
+        self.finish_turn_output(input.query_source, input.session, input.model_id, output)
+    }
+
+    fn finish_turn_output(
+        &mut self,
+        query_source: &str,
+        session: &SessionContext,
+        model_id: &str,
+        output: PipelineRunOutput,
+    ) -> Result<TurnOutput, PipelineAbort> {
+        let PipelineRunOutput {
+            plan,
+            optimized,
+            serialized,
+            explain,
+            metrics,
+        } = output;
+        let output = TurnOutput {
+            plan,
+            optimized,
+            serialized,
+            explain,
+            metrics,
+        };
+        self.pending_prompt_snapshot = Some(PendingPromptSnapshot::capture(
+            query_source,
+            session,
+            model_id,
+            &output,
+        ));
+        Ok(output)
     }
 
     /// Run the pipeline in shadow mode: produce pipeline output AND compare
@@ -287,6 +324,14 @@ impl PipelineSession {
         turn_output: Option<&TurnOutput>,
     ) {
         let pending_snapshot = self.pending_prompt_snapshot.take();
+        let recorded_pending_sections = pending_snapshot.as_ref().is_some_and(|pending| {
+            !pending.section_usage.is_empty() || !pending.section_fingerprints.is_empty()
+        });
+        if let Some(pending) = pending_snapshot.as_ref() {
+            self.stats.record_section_usage(&pending.section_usage);
+            self.stats
+                .record_section_fingerprint_hashes(&pending.section_fingerprints);
+        }
         let had_cache_baseline = pending_snapshot.as_ref().is_some_and(|pending| {
             self.cache_detector
                 .snapshot_for_source(&pending.query_source)
@@ -328,7 +373,7 @@ impl PipelineSession {
             }
         }
 
-        if let Some(output) = turn_output {
+        if !recorded_pending_sections && let Some(output) = turn_output {
             let mut usage = std::collections::HashMap::new();
             for section in &output.optimized.sections {
                 *usage.entry(section.plan.kind).or_insert(0u32) += section.actual_tokens;
@@ -652,6 +697,17 @@ impl PendingPromptSnapshot {
             .filter(|section| section.plan.scope != crate::section_types::CacheScope::None)
             .map(|section| section.actual_tokens as usize)
             .sum();
+        let mut section_usage = std::collections::HashMap::new();
+        let mut section_fingerprints = Vec::new();
+        for section in &output.optimized.sections {
+            *section_usage.entry(section.plan.kind).or_insert(0_u32) += section.actual_tokens;
+            if let Some(text) = section.text() {
+                section_fingerprints.push((
+                    section.plan.kind,
+                    crate::pipeline_stats::section_content_hash(section.plan.kind, text),
+                ));
+            }
+        }
         Self {
             query_source: query_source.to_string(),
             snapshot: PromptStateSnapshot::capture_serialized(
@@ -661,6 +717,8 @@ impl PendingPromptSnapshot {
                 model_id,
                 cache_eligible_tokens,
             ),
+            section_usage,
+            section_fingerprints,
         }
     }
 }
@@ -976,9 +1034,39 @@ mod tests {
     fn run_turn_adaptive_uses_tier_based_limits() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
-        let agent = AgentContext::default();
+        let agent = AgentContext {
+            tool_schemas: vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "A deliberately verbose description that must be pruned under aggressive pressure.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "A verbose property description that is not needed under pressure."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            })],
+            ..Default::default()
+        };
         let session = test_session_context();
-        let turn = test_turn_state(1);
+        let mut turn = test_turn_state(1);
+        turn.tokens = TokenAccounting::from_fields(195_000, 0, 0, 0);
+        turn.messages = (0..12)
+            .map(|index| {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                serde_json::json!({
+                    "role": role,
+                    "content": format!("round {index}: {}", "context ".repeat(64))
+                })
+            })
+            .collect();
+        let original_message_count = turn.messages.len();
         let external = test_external();
 
         let input = AdaptiveTurnInput {
@@ -992,8 +1080,61 @@ mod tests {
         };
 
         let output = sess.run_turn_adaptive(input).expect("should succeed");
-        assert_eq!(output.metrics.turn_index, 1);
-        assert!(output.explain.phase_timings.len() == 4);
+        assert_eq!(
+            output.plan.compact_tier,
+            CompactionTier::AggressivePrune,
+            "the plan must see the high-pressure request"
+        );
+        assert!(
+            output.optimized.stats.schemas_pruned > 0,
+            "adaptive limits must be derived from the selected plan tier"
+        );
+        assert!(
+            output.optimized.messages.len() < original_message_count,
+            "AggressivePrune must open the round-dropping gate"
+        );
+    }
+
+    #[test]
+    fn downstream_semantic_compactor_is_the_only_lossy_history_owner() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let mut turn = test_turn_state(1);
+        turn.tokens = TokenAccounting::from_fields(195_000, 0, 0, 0);
+        turn.messages = (0..12)
+            .map(|index| {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                serde_json::json!({
+                    "role": role,
+                    "content": format!("round {index}: {}", "context ".repeat(64))
+                })
+            })
+            .collect();
+        let original_messages = turn.messages.clone();
+        let external = test_external();
+
+        let output = sess
+            .run_turn_adaptive_with_history_owner(
+                AdaptiveTurnInput {
+                    statics: &statics,
+                    agent: &agent,
+                    session: &session,
+                    turn: &turn,
+                    external: &external,
+                    model_id: "model",
+                    query_source: "runtime",
+                },
+                HistoryOptimizationOwner::DownstreamSemanticCompactor,
+            )
+            .expect("should succeed");
+
+        assert_eq!(output.plan.compact_tier, CompactionTier::AggressivePrune);
+        assert_eq!(
+            output.optimized.messages, original_messages,
+            "planning must not pre-drop context that the semantic compactor needs to summarize"
+        );
     }
 
     #[test]
@@ -1025,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn record_feedback_with_output_tracks_section_usage() {
+    fn record_feedback_without_retained_output_tracks_pending_section_usage() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
         let agent = AgentContext::default();
@@ -1044,15 +1185,16 @@ mod tests {
             model_id: "model",
             query_source: "repl",
         };
-        let output = sess.run_turn(input).unwrap();
+        let _output = sess.run_turn(input).unwrap();
 
         let mut feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", &mut feedback, Some(&output));
+        sess.record_feedback("model", "repl", &mut feedback, None);
 
         let history = sess.stats.section_token_history();
         assert!(
             !history.is_empty(),
-            "section usage should be recorded from turn output"
+            "the pending plan/output observation must close the production \
+             feedback loop even when the runtime no longer owns TurnOutput"
         );
     }
 

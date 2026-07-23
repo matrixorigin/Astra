@@ -30,12 +30,7 @@ pub struct ContextBound {
 
 /// Execute the full Bind phase: resolve all planned sections into concrete content.
 pub fn bind_all(plan: &ContextPlan, sources: &ContextSources<'_>) -> ContextBound {
-    let mut sections = Vec::with_capacity(plan.sections.len());
-
-    for planned in &plan.sections {
-        let bound = bind_section(planned, sources);
-        sections.push(bound);
-    }
+    let sections = bind_sections(plan, sources);
 
     // Messages come from TurnState
     let messages = sources.turn.messages.clone();
@@ -48,6 +43,16 @@ pub fn bind_all(plan: &ContextPlan, sources: &ContextSources<'_>) -> ContextBoun
         messages,
         tool_schemas,
     }
+}
+
+/// Bind only planned sections without cloning the conversation or tool
+/// working sets. Used by bind-aware planning to measure a candidate before
+/// the final wire view is materialized.
+pub(crate) fn bind_sections(plan: &ContextPlan, sources: &ContextSources<'_>) -> Vec<BoundSection> {
+    plan.sections
+        .iter()
+        .map(|planned| bind_section(planned, sources))
+        .collect()
 }
 
 /// Bind a single section based on its kind.

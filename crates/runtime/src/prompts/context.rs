@@ -91,33 +91,32 @@ pub fn estimate_tokens(
 
 pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
 
-/// Estimate tokens for a single message (content + tool_calls arguments).
+/// Estimate an arbitrary JSON value without assuming a provider-specific
+/// message shape. This covers string content, block arrays, multimodal
+/// envelopes, tool calls, and future fields with one conservative rule.
+pub fn estimate_json_value_tokens(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(number) => estimate_str_tokens(&number.to_string()).max(1),
+        serde_json::Value::String(text) => estimate_str_tokens(text).saturating_add(1),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(estimate_json_value_tokens)
+            .fold(1_usize, usize::saturating_add),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                estimate_str_tokens(key)
+                    .saturating_add(1)
+                    .saturating_add(estimate_json_value_tokens(value))
+            })
+            .fold(1_usize, usize::saturating_add),
+    }
+}
+
+/// Estimate tokens for a single provider message in any JSON wire shape.
 pub(crate) fn estimate_single_message_tokens(m: &serde_json::Value) -> usize {
-    let content_tokens = m
-        .get("content")
-        .and_then(|v| v.as_str())
-        .map(estimate_str_tokens)
-        .unwrap_or(0);
-    // Each tool_call carries structural overhead: id, type, function.name.
-    const TOOL_CALL_STRUCTURAL_OVERHEAD: usize = 15;
-    let tool_call_tokens = m
-        .get("tool_calls")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|tc| {
-                    let args_tokens = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                        .map(estimate_str_tokens)
-                        .unwrap_or(0);
-                    args_tokens + TOOL_CALL_STRUCTURAL_OVERHEAD
-                })
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    content_tokens + tool_call_tokens
+    estimate_json_value_tokens(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,34 +666,38 @@ mod tests {
         assert_eq!(est.volatile_tokens, 0);
 
         // system only
-        let messages = vec![msg(&"a".repeat(80))]; // 80 chars → 20 tokens + 4 overhead = 24
+        let messages = vec![msg(&"a".repeat(80))];
+        let system_tokens = estimate_single_message_tokens(&messages[0]) + PER_MESSAGE_OVERHEAD;
         let est = estimate_tokens_cache_aware(&messages, 100);
-        assert_eq!(est.cache_eligible_tokens, 24 + 100);
+        assert_eq!(est.cache_eligible_tokens, system_tokens + 100);
         assert_eq!(est.volatile_tokens, 0);
-        assert_eq!(est.total_tokens, 24 + 100);
+        assert_eq!(est.total_tokens, system_tokens + 100);
 
         // separates system from conversation
         let messages = vec![
-            msg(&"s".repeat(400)), // system: 100 tok + 4 = 104
-            msg(&"u".repeat(200)), // user:    50 tok + 4 =  54
-            msg(&"a".repeat(100)), // asst:    25 tok + 4 =  29
+            msg(&"s".repeat(400)),
+            msg(&"u".repeat(200)),
+            msg(&"a".repeat(100)),
         ];
+        let system_tokens = estimate_single_message_tokens(&messages[0]) + PER_MESSAGE_OVERHEAD;
+        let volatile_tokens = messages[1..]
+            .iter()
+            .map(|message| estimate_single_message_tokens(message) + PER_MESSAGE_OVERHEAD)
+            .sum::<usize>();
         let schema_tokens = 200;
         let est = estimate_tokens_cache_aware(&messages, schema_tokens);
-        assert_eq!(est.cache_eligible_tokens, 104 + 200);
-        assert_eq!(est.volatile_tokens, 54 + 29);
+        assert_eq!(est.cache_eligible_tokens, system_tokens + schema_tokens);
+        assert_eq!(est.volatile_tokens, volatile_tokens);
         assert_eq!(
             est.total_tokens,
             est.cache_eligible_tokens + est.volatile_tokens
         );
 
         // with tool calls
-        let messages = vec![
-            msg("system prompt"),
-            tool_msg(&"x".repeat(120)), // 30 args + 15 structural + 4 msg = 49
-        ];
+        let messages = vec![msg("system prompt"), tool_msg(&"x".repeat(120))];
+        let tool_tokens = estimate_single_message_tokens(&messages[1]) + PER_MESSAGE_OVERHEAD;
         let est = estimate_tokens_cache_aware(&messages, 0);
-        assert_eq!(est.volatile_tokens, 49);
+        assert_eq!(est.volatile_tokens, tool_tokens);
 
         // split matches joined
         let stable = vec![msg(&"s".repeat(320))];
@@ -832,6 +835,14 @@ mod tests {
         // tool call tokens included
         let tokens = estimate_tokens(&[tool_msg(&"x".repeat(120))], 0, 0);
         assert!(tokens > 30);
+
+        // Provider block arrays must count their text instead of looking like
+        // empty content merely because `content` is not a string.
+        let block_message = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "你好世界".repeat(100)}]
+        });
+        assert!(estimate_single_message_tokens(&block_message) > 400);
 
         // with schema dwarfs estimate without for CJK
         let cjk_session: Vec<_> = (0..5)
