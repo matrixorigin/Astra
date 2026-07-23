@@ -6554,6 +6554,95 @@ mod tests {
     }
 
     #[test]
+    fn canonical_continuation_tool_result_is_valid_across_provider_protocols() {
+        let canonical =
+            astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                vec![
+                    json!({"role": "user", "content": "inspect"}),
+                    json!({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"}
+                        }]
+                    }),
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "durable evidence"}],
+                            "cache_control": {"type": "ephemeral"}
+                        }]
+                    }),
+                ],
+            )
+            .expect("canonical continuation");
+        assert_eq!(canonical[2]["content"].as_str(), Some("durable evidence"));
+
+        let openai = build_provider_request_body(
+            &canonical,
+            &[],
+            "gpt-test",
+            "openai",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(
+            openai["messages"][2]["content"].as_str(),
+            Some("durable evidence")
+        );
+
+        let anthropic = build_provider_request_body(
+            &canonical,
+            &[],
+            "claude-test",
+            "anthropic",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let anthropic_result = anthropic["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find(|block| block["type"] == "tool_result")
+            .expect("Anthropic tool_result");
+        assert_eq!(
+            anthropic_result["content"].as_str(),
+            Some("durable evidence")
+        );
+
+        let bedrock = build_provider_request_body(
+            &canonical,
+            &[],
+            "anthropic.claude-test",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let bedrock_result = bedrock["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find_map(|block| block.get("toolResult"))
+            .expect("Bedrock toolResult");
+        assert_eq!(
+            bedrock_result["content"][0]["text"].as_str(),
+            Some("durable evidence")
+        );
+    }
+
+    #[test]
     fn openai_request_body_tool_message_empty_object_content_becomes_empty_string() {
         let messages = vec![
             json!({

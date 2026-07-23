@@ -297,6 +297,12 @@ pub(crate) fn compact_tiered_impl(
         };
     }
 
+    // total_chars measures full JSON serialization, not just content + tool_call
+    // args. This is intentionally consistent with the pipeline estimator
+    // (estimate_json_values_tokens in context/pipeline.rs), which also uses
+    // serde_json::to_string. The guard and truncation limits in this legacy
+    // helper remain character-based; the context pipeline's token budget is
+    // the authoritative outer limit.
     let total_chars: usize = messages
         .iter()
         .map(|message| {

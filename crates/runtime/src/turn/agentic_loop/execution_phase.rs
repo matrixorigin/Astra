@@ -1312,7 +1312,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         .as_ref()
         .ok()
         .and_then(|r| r.accum.finish_reason.clone());
-    if let Ok(result) = &turn_result {
+    // Bridge-reported context compactions live in TurnOutput::accum and are
+    // available only when the host returned a successful output. Failed calls
+    // have no accumulator evidence to record here.
+    if let Ok(result) = &turn_result
+        && !result.accum.context_compactions.is_empty()
+    {
         record_bridge_context_compactions(state, &result.accum.context_compactions);
     }
     // Persist the per-call manifest only after the host returns: the durable

@@ -94,6 +94,13 @@ pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
 /// Estimate an arbitrary JSON value without assuming a provider-specific
 /// message shape. This covers string content, block arrays, multimodal
 /// envelopes, tool calls, and future fields with one conservative rule.
+///
+/// This recursively walks the JSON tree with per-variant rules matched to
+/// provider tokenization behavior. The pipeline estimator in
+/// astra-turn-core/src/context/pipeline.rs uses a different method
+/// (serde_json::to_string → char count → token estimate), which is coarser
+/// but available at a lower layer without depending on this crate.
+/// Both are approximations; the provider tokenizer is authoritative.
 pub fn estimate_json_value_tokens(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Null | serde_json::Value::Bool(_) => 1,

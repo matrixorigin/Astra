@@ -153,17 +153,18 @@ fn heavy_checkpoint_prompt_state(
 /// turn boundaries. Without this, harness nudges (injected as "user" role)
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
-pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
-    msgs = astra_turn_core::prompt_facing::
-        sanitize_canonical_continuation_messages_with_turn_semantics(msgs)
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                error = %error,
-                "dropping continuation with invalid typed turn metadata"
-            );
-            Vec::new()
-        });
-    msgs
+pub(crate) fn sanitize_continuation_messages(msgs: Vec<Value>) -> Vec<Value> {
+    let (sanitized, invalid_turn_semantics_dropped) =
+        astra_turn_core::prompt_facing::recover_canonical_continuation_messages_with_turn_semantics(
+            msgs,
+        );
+    if invalid_turn_semantics_dropped > 0 {
+        tracing::warn!(
+            invalid_turn_semantics_dropped,
+            "dropped invalid typed turn metadata while sanitizing continuation messages"
+        );
+    }
+    sanitized
 }
 
 /// Extract text content from a message regardless of format.
@@ -538,6 +539,37 @@ mod tests {
             astra_turn_types::user_turn_semantics(&result[0]).expect("valid semantics"),
             Some(semantics)
         );
+    }
+
+    #[test]
+    fn sanitize_corrupt_turn_semantics_still_enforces_the_continuation_boundary() {
+        let corrupt_field = astra_turn_types::USER_TURN_SEMANTICS_FIELD;
+        let messages = vec![
+            json!({"role": "user", "content": "stale objective"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "runtime-only retry instruction",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            json!({
+                "role": "user",
+                "content": "current objective",
+                (corrupt_field): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "orphan result"}),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
+
+        let sanitized = super::sanitize_continuation_messages(messages);
+
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0]["content"], "current objective");
+        assert!(sanitized[0].get(corrupt_field).is_none());
+        assert_eq!(sanitized[1]["content"], "current answer");
     }
 
     #[test]

@@ -1359,16 +1359,15 @@ fn load_turn_messages(
     history: &[(String, String)],
     current_message: &str,
 ) -> Vec<serde_json::Value> {
-    if let Some(mut msgs) = pre_loaded_messages {
-        msgs = astra_turn_core::prompt_facing::
-            sanitize_canonical_continuation_messages_with_turn_semantics(msgs)
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "dropping preloaded continuation with invalid typed turn metadata"
-                );
-                Vec::new()
-            });
+    if let Some(msgs) = pre_loaded_messages {
+        let (mut msgs, invalid_turn_semantics_dropped) = astra_turn_core::prompt_facing::
+            recover_canonical_continuation_messages_with_turn_semantics(msgs);
+        if invalid_turn_semantics_dropped > 0 {
+            tracing::warn!(
+                invalid_turn_semantics_dropped,
+                "dropped invalid typed turn metadata while sanitizing preloaded continuation"
+            );
+        }
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }
@@ -1437,6 +1436,38 @@ mod tests {
                 .iter()
                 .all(|msg| !msg["content"].as_str().unwrap_or("").contains("3 agents"))
         );
+    }
+
+    #[test]
+    fn preloaded_turn_messages_with_corrupt_semantics_still_drop_runtime_scaffolding() {
+        let corrupt_field = astra_turn_types::USER_TURN_SEMANTICS_FIELD;
+        let preloaded = vec![
+            json!({"role": "user", "content": "stale objective"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "runtime-only retry instruction",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            json!({
+                "role": "user",
+                "content": "current objective",
+                (corrupt_field): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "orphan result"}),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
+
+        let messages = load_turn_messages(Some(preloaded), &[], "continue safely");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], "current objective");
+        assert!(messages[0].get(corrupt_field).is_none());
+        assert_eq!(messages[1]["content"], "current answer");
+        assert_eq!(messages[2]["content"], "continue safely");
     }
 
     #[test]

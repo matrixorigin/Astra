@@ -271,6 +271,12 @@ fn estimate_bound_input_tokens(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
 ) -> u32 {
+    // Section tokens come from the pipeline's bound-section measurement.
+    // Message and tool-schema tokens use full JSON serialization
+    // (serde_json::to_string) for a consistent encoded-text estimate. This is a
+    // different method from the wire-budget estimator in runtime/src/prompts,
+    // which recursively walks the JSON tree without serializing intermediate
+    // strings. Both are approximations; the provider tokenizer is authoritative.
     let section_tokens = sections
         .iter()
         .map(|section| section.actual_tokens)

@@ -334,8 +334,12 @@ fn persist_one_shot_session_state(
         }
     };
 
-    if sr.session_persistence_error.is_none()
-        && let (Some(session_id), Some(turn)) = (sr.session_id.clone(), persisted_turn)
+    // Local journal and CSL persistence are independent of any degradation
+    // already reported by the remote session. The local journal turn supplies
+    // the sequence number and remains a lower-fidelity recovery fallback when
+    // the richer CSL snapshot cannot be written.
+    let local_recovery_persisted = persisted_turn.is_some();
+    if let (Some(session_id), Some(turn)) = (sr.session_id.clone(), persisted_turn)
         && !sr.final_messages.is_empty()
     {
         let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
@@ -357,7 +361,7 @@ fn persist_one_shot_session_state(
         }
     }
 
-    if sr.session_persistence_error.is_none()
+    if local_recovery_persisted
         && let Some(sid) = sr.session_id.as_deref()
         && let Err(error) = persist_profile_last_session(profile, sid)
     {
@@ -3628,6 +3632,54 @@ mod one_shot_persistence_tests {
         assert_eq!(tool_call["tool_calls"][0]["id"], "call-1");
         assert_eq!(tool_result["tool_call_id"], "call-1");
         assert_eq!(tool_result["content"], "[package]\nname = \"astra\"");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_persistence_degradation_keeps_successful_local_recovery_discoverable() {
+        let _home = crate::tests::HomeGuard::temp();
+        let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+
+        let sid = format!("one-shot-local-recovery-{}", uuid::Uuid::new_v4());
+        let mut result = crate::tests::stub_stream_result("locally recoverable answer");
+        result.session_id = Some(sid.clone());
+        result.session_persistence_error = Some("remote journal returned 503".into());
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "keep this turn"}),
+            serde_json::json!({"role": "assistant", "content": "locally recoverable answer"}),
+        ];
+
+        persist_one_shot_session_state(
+            Some("default"),
+            Some("test-model"),
+            "keep this turn",
+            &mut result,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(
+            result.session_persistence_error.as_deref(),
+            Some("remote journal returned 503"),
+            "local recovery must not hide the remote durability degradation"
+        );
+        let credentials = crate::cli::cli_config::cli_utils::load_credentials();
+        assert_eq!(
+            credentials
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(sid.as_str()),
+            "a successfully persisted local recovery must remain discoverable"
+        );
+        let restored =
+            crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
+                .expect("local continuation");
+        assert_eq!(
+            restored.last().unwrap()["content"],
+            "locally recoverable answer"
+        );
     }
 
     #[cfg(unix)]

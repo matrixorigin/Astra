@@ -215,6 +215,34 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     Ok(out)
 }
 
+/// Recovery projection for continuation sources that may contain one corrupt
+/// producer-owned turn-semantics field.
+///
+/// Invalid metadata is removed per message before the normal strict
+/// continuation sanitizer runs. The raw message vector is never returned:
+/// compaction boundaries, runtime-owned controls, and tool-call pairing remain
+/// enforced even when one metadata field is damaged.
+pub fn recover_canonical_continuation_messages_with_turn_semantics(
+    mut messages: Vec<Value>,
+) -> (Vec<Value>, usize) {
+    let mut invalid_turn_semantics_dropped = 0;
+    for message in &mut messages {
+        let has_semantics = message
+            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+            .is_some();
+        if has_semantics && astra_turn_types::user_turn_semantics(message).is_err() {
+            if let Some(object) = message.as_object_mut() {
+                object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
+                invalid_turn_semantics_dropped += 1;
+            }
+        }
+    }
+
+    let sanitized = sanitize_canonical_continuation_messages_with_turn_semantics(messages)
+        .expect("invalid turn semantics were removed before strict continuation sanitization");
+    (sanitized, invalid_turn_semantics_dropped)
+}
+
 pub fn sanitize_canonical_continuation_messages_with_state(
     messages: Vec<Value>,
     state: &SessionStateCompact,
@@ -313,11 +341,7 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
 }
 
 fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
-    let content = match tool.get("content") {
-        Some(Value::String(content)) => Value::String(content.clone()),
-        Some(content) => Value::String(serde_json::to_string(content).unwrap_or_default()),
-        None => Value::String(String::new()),
-    };
+    let content = Value::String(canonical_tool_result_content(tool.get("content")));
     let mut projected = serde_json::Map::from_iter([
         ("role".to_string(), Value::String("tool".to_string())),
         (
@@ -332,6 +356,61 @@ fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
         projected.insert("name".to_string(), Value::String(name.to_string()));
     }
     Value::Object(projected)
+}
+
+fn canonical_tool_result_content(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) if !blocks.is_empty() && blocks.iter().all(is_tool_result_block) => {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("content"))
+                .map(canonical_tool_result_payload)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        other => canonical_tool_result_payload(other),
+    }
+}
+
+fn canonical_tool_result_payload(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) if !blocks.is_empty() && blocks.iter().all(is_text_block) => blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .or_else(|| block.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn is_tool_result_block(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("tool_result")
+        && value
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && value.get("content").is_some()
+}
+
+fn is_text_block(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("text" | "output_text")
+    ) && value
+        .get("text")
+        .or_else(|| value.get("content"))
+        .and_then(Value::as_str)
+        .is_some()
 }
 
 pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
@@ -489,9 +568,9 @@ fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_recap_message, sanitize_canonical_continuation_messages_with_state,
-        sanitize_prompt_facing_messages, sanitize_prompt_facing_messages_with_state,
-        sanitize_user_visible_messages,
+        recover_canonical_continuation_messages_with_turn_semantics, runtime_recap_message,
+        sanitize_canonical_continuation_messages_with_state, sanitize_prompt_facing_messages,
+        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use astra_turn_types::{RuntimeMessageDelivery, runtime_owned_message};
@@ -567,6 +646,125 @@ mod tests {
             got.iter()
                 .all(|message| message["content"] != "retry this tool round"),
             "runtime-owned control messages must not cross a continuation boundary"
+        );
+    }
+
+    #[test]
+    fn canonical_continuation_normalizes_structured_tool_results_to_provider_neutral_text() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "object-result",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}
+                    },
+                    {
+                        "id": "annotated-result",
+                        "type": "function",
+                        "function": {"name": "grep", "arguments": "{}"}
+                    },
+                    {
+                        "id": "empty-array-result",
+                        "type": "function",
+                        "function": {"name": "query", "arguments": "{}"}
+                    },
+                    {
+                        "id": "lookalike-result",
+                        "type": "function",
+                        "function": {"name": "query", "arguments": "{}"}
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "object-result",
+                "content": {"error": "boom", "code": 42}
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "annotated-result",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "annotated-result",
+                    "content": [{"type": "text", "text": "durable evidence"}],
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "empty-array-result",
+                "content": []
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "lookalike-result",
+                "content": [{"type": "tool_result", "value": {"row": 1}}]
+            }),
+        ];
+
+        let got = sanitize_canonical_continuation_messages_with_state(
+            messages,
+            &SessionStateCompact::default(),
+        )
+        .expect("valid canonical history");
+
+        assert_eq!(
+            got[2]["content"].as_str(),
+            Some("{\"code\":42,\"error\":\"boom\"}"),
+            "provider-neutral history must keep structured JSON as readable text"
+        );
+        assert_eq!(
+            got[3]["content"].as_str(),
+            Some("durable evidence"),
+            "provider cache annotations must not leak across continuation/provider boundaries"
+        );
+        assert_eq!(
+            got[4]["content"].as_str(),
+            Some("[]"),
+            "unknown structured results, including empty arrays, must round-trip as stable JSON text"
+        );
+        assert_eq!(
+            got[5]["content"].as_str(),
+            Some("[{\"type\":\"tool_result\",\"value\":{\"row\":1}}]"),
+            "a discriminant lookalike without the provider envelope must remain ordinary JSON data"
+        );
+    }
+
+    #[test]
+    fn recovery_drops_only_corrupt_semantics_then_runs_the_full_sanitizer() {
+        let messages = vec![
+            json!({"role": "user", "content": "stale objective"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            runtime_owned_message(
+                "system",
+                "runtime-only control",
+                RuntimeMessageDelivery::EphemeralControl,
+            ),
+            json!({
+                "role": "user",
+                "content": "current objective",
+                (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "orphan result"}),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
+
+        let (got, invalid_turn_semantics_dropped) =
+            recover_canonical_continuation_messages_with_turn_semantics(messages);
+
+        assert_eq!(invalid_turn_semantics_dropped, 1);
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "current objective"}),
+                json!({"role": "assistant", "content": "current answer"}),
+            ]
         );
     }
 

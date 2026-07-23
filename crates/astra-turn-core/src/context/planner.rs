@@ -85,7 +85,18 @@ pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
     // Section budgets describe usable input capacity, not the full
     // input+output window. Reserve predicted output/thinking/schema growth
     // exactly once before allocating prompt sections.
-    let effective_input_limit = input.model_limit.saturating_sub(reserves.total()).max(1);
+    let effective_input_limit = input.model_limit.saturating_sub(reserves.total());
+    if effective_input_limit == 0 {
+        tracing::warn!(
+            model_limit = input.model_limit,
+            total_reserves = reserves.total(),
+            "context budget fully consumed by reserves; clamping prompt allocation to one token"
+        );
+    }
+    // Clamp to 1 token as a minimum viable allocation — a zero budget would
+    // cause downstream allocators to produce empty prompts that are hard to
+    // diagnose. The warn! above surfaces the root cause.
+    let effective_input_limit = effective_input_limit.max(1);
     let budget = TokenBudget::allocate(effective_input_limit, tier, &section_history);
 
     // 5. Choose cache strategy based on provider policy + latches
