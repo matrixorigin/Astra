@@ -752,7 +752,8 @@ fn record_bridge_context_compactions(
         } else {
             0.0
         };
-        state.step_recorder.record_compaction(
+        state.step_recorder.record_compaction_with_kind(
+            "bridge_context",
             compacted_messages,
             observation.tokens_saved,
             pressure,
@@ -1685,7 +1686,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             (tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
                         };
                         state.context_compression_triggered = true;
-                        state.step_recorder.record_compaction(
+                        state.step_recorder.record_compaction_with_kind(
+                            &result.tier.to_string(),
                             result.messages_removed.min(u32::MAX as usize) as u32,
                             tokens_freed,
                             pressure,
@@ -2638,7 +2640,8 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         if total_freed > 0 {
             let pressure = measured as f64 / state.max_turn_input_tokens as f64;
             state.context_compression_triggered = true;
-            state.step_recorder.record_compaction(
+            state.step_recorder.record_compaction_with_kind(
+                "reactive_budget",
                 total_messages_removed.min(u32::MAX as usize) as u32,
                 total_freed,
                 pressure,

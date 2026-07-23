@@ -65,7 +65,7 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("check history"),
+            p.contains("Reuse history"),
             "should include history awareness"
         );
         assert!(

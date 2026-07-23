@@ -212,6 +212,21 @@ pub enum Criterion {
         max_creation: Option<u64>,
     },
 
+    /// Passes when the token-weighted provider prompt-cache read ratio,
+    /// after discarding a configurable number of cold-start observations,
+    /// is at least `min`.
+    ///
+    /// The denominator is all provider input:
+    /// `fresh + cache_read + cache_creation`. This prevents small requests
+    /// from dominating an average and prevents cache-write churn from being
+    /// mistaken for a healthy read hit rate. The criterion reads canonical
+    /// `turn` journal usage and falls back to legacy `llm_round` records.
+    ProviderPromptCacheReadRatio {
+        min: f64,
+        #[serde(default = "default_prompt_cache_warmup_turns")]
+        warmup_turns: u32,
+    },
+
     /// Passes when the session's pipeline alerts matching `rule`
     /// occur at most `max` times.
     PipelineAlertCount {
@@ -251,6 +266,10 @@ fn default_judger_threshold() -> f64 {
 }
 
 fn default_event_min() -> u32 {
+    1
+}
+
+fn default_prompt_cache_warmup_turns() -> u32 {
     1
 }
 
@@ -332,6 +351,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::TurnRoundsBetween { .. }
         | Criterion::CacheRateAbove { .. }
         | Criterion::PromptCacheTokens { .. }
+        | Criterion::ProviderPromptCacheReadRatio { .. }
         | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
 
         Criterion::Judger { .. }
@@ -386,7 +406,8 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::JournalToolCallCount { .. }
         | Criterion::JournalToolJson { .. }
         | Criterion::PipelineAlertCount { .. }
-        | Criterion::PipelineAvgCacheHitRatio { .. } => true,
+        | Criterion::PipelineAvgCacheHitRatio { .. }
+        | Criterion::ProviderPromptCacheReadRatio { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_session_capture(criteria)
         }
@@ -946,6 +967,54 @@ fn evaluate_one(
                 score: None,
             }
         }
+        Criterion::ProviderPromptCacheReadRatio { min, warmup_turns } => match session {
+            None => missing_required_session(c, "provider prompt-cache read ratio"),
+            Some(capture) => {
+                let usages = provider_prompt_cache_usages(capture);
+                let measured = usages.iter().skip(*warmup_turns as usize);
+                let mut fresh = 0_u128;
+                let mut read = 0_u128;
+                let mut creation = 0_u128;
+                let mut turns = 0_usize;
+                for usage in measured {
+                    fresh += u128::from(usage.fresh);
+                    read += u128::from(usage.read);
+                    creation += u128::from(usage.creation);
+                    turns += 1;
+                }
+                let input = fresh + read + creation;
+                if turns == 0 || input == 0 {
+                    CriterionResult {
+                        criterion: c.clone(),
+                        severity: criterion_severity(c),
+                        passed: false,
+                        detail: format!(
+                            "no provider usage after {} warmup turn(s) (usage observations={})",
+                            warmup_turns,
+                            usages.len()
+                        ),
+                        full_detail: None,
+                        score: None,
+                    }
+                } else {
+                    let ratio = read as f64 / input as f64;
+                    CriterionResult {
+                        criterion: c.clone(),
+                        severity: criterion_severity(c),
+                        passed: ratio >= *min,
+                        detail: format!(
+                            "provider_prompt_cache_read_ratio={:.2}% \
+                             (read={read}, fresh={fresh}, creation={creation}, turns={turns}, \
+                             warmup={warmup_turns}), expected >= {:.2}%",
+                            ratio * 100.0,
+                            min * 100.0
+                        ),
+                        full_detail: None,
+                        score: None,
+                    }
+                }
+            }
+        },
         Criterion::PipelineAlertCount {
             rule,
             max,
@@ -1043,6 +1112,54 @@ fn evaluate_one(
                 }
             }
         },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderPromptCacheUsage {
+    fresh: u64,
+    read: u64,
+    creation: u64,
+}
+
+/// Extract provider usage observations in journal order. Canonical `turn`
+/// records are authoritative; legacy `llm_round` records are considered only
+/// when the session has no canonical usage records, avoiding double-counting
+/// sessions that contain both schemas.
+fn provider_prompt_cache_usages(capture: &SessionCapture) -> Vec<ProviderPromptCacheUsage> {
+    fn extract(capture: &SessionCapture, event_type: &str) -> Vec<ProviderPromptCacheUsage> {
+        capture
+            .events
+            .iter()
+            .filter(|event| event.event_type == event_type)
+            .filter_map(|event| {
+                let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
+                let read = event
+                    .raw
+                    .get("cache_read_tokens")
+                    .and_then(|value| value.as_u64());
+                let creation = event
+                    .raw
+                    .get("cache_creation_tokens")
+                    .and_then(|value| value.as_u64());
+                if fresh.is_none() && read.is_none() && creation.is_none() {
+                    return None;
+                }
+                let usage = ProviderPromptCacheUsage {
+                    fresh: fresh.unwrap_or_default(),
+                    read: read.unwrap_or_default(),
+                    creation: creation.unwrap_or_default(),
+                };
+                (usage.fresh > 0 || usage.read > 0 || usage.creation > 0).then_some(usage)
+            })
+            .collect()
+    }
+
+    let canonical = extract(capture, "turn");
+    if canonical.is_empty() {
+        extract(capture, "llm_round")
+    } else {
+        canonical
     }
 }
 
@@ -1144,6 +1261,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             if !min.is_finite() || *min < 0.0 || *min > 1.0 {
                 return Err(format!(
                     "PipelineAvgCacheHitRatio.min must be finite in [0.0, 1.0]; got {min}"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::ProviderPromptCacheReadRatio { min, .. } => {
+            if !min.is_finite() || *min < 0.0 || *min > 1.0 {
+                return Err(format!(
+                    "ProviderPromptCacheReadRatio.min must be finite in [0.0, 1.0]; got {min}"
                 ));
             }
             Ok(())
@@ -1835,6 +1960,133 @@ mod tests {
         assert!(r[0].detail.contains("no pipeline feedback turns"));
     }
 
+    #[test]
+    fn provider_prompt_cache_read_ratio_excludes_configured_warmup() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "tokens_in": 10_000,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 2_000
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 200,
+                    "cache_read_tokens": 9_800,
+                    "cache_creation_tokens": 0
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 3,
+                    "tokens_in": 200,
+                    "cache_read_tokens": 9_800,
+                    "cache_creation_tokens": 0
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.98,
+                warmup_turns: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(result[0].passed, "{:?}", result[0]);
+        assert!(result[0].detail.contains("98.00%"), "{}", result[0].detail);
+        assert!(result[0].detail.contains("turns=2"), "{}", result[0].detail);
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_is_token_weighted_and_counts_creation() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "tokens_in": 20,
+                    "cache_read_tokens": 980,
+                    "cache_creation_tokens": 0
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "tokens_in": 0,
+                    "cache_read_tokens": 9_800,
+                    "cache_creation_tokens": 220
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.98,
+                warmup_turns: 0,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(!result[0].passed, "creation tokens are non-read input");
+        assert!(result[0].detail.contains("97.82%"), "{}", result[0].detail);
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_fails_without_post_warmup_usage() {
+        let sess = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tokens_in": 100,
+                "cache_read_tokens": 0
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.98,
+                warmup_turns: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(!result[0].passed);
+        assert!(
+            result[0]
+                .detail
+                .contains("no provider usage after 1 warmup"),
+            "{}",
+            result[0].detail
+        );
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_falls_back_to_legacy_llm_round_events() {
+        let sess = mk_session(&[(
+            "llm_round",
+            serde_json::json!({
+                "tokens_in": 10,
+                "cache_read_tokens": 990
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.99,
+                warmup_turns: 0,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(result[0].passed, "{:?}", result[0]);
+    }
+
     // ── validate_criterion / validate_criteria (R3 #2) ──
 
     #[test]
@@ -2347,5 +2599,17 @@ mod tests {
             err.contains("max_creation"),
             "validate must mention the offending field: {err}"
         );
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_rejects_invalid_min() {
+        for min in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            let criterion = Criterion::ProviderPromptCacheReadRatio {
+                min,
+                warmup_turns: 1,
+            };
+            let error = validate_criterion(&criterion).expect_err("invalid ratio must fail");
+            assert!(error.contains("finite in [0.0, 1.0]"), "{error}");
+        }
     }
 }

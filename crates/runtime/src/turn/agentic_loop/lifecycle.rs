@@ -1244,7 +1244,8 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
             .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
             .collect();
         state.context_compression_triggered = true;
-        state.step_recorder.record_compaction(
+        state.step_recorder.record_compaction_with_kind(
+            &kind.to_string(),
             messages_removed.min(u32::MAX as usize) as u32,
             outcome.total_tokens_freed,
             pressure,
@@ -2024,7 +2025,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 );
                 host.on_compaction(event);
             }
-            state.step_recorder.record_compaction(
+            state.step_recorder.record_compaction_with_kind(
+                "microcompact",
                 mc.results_compacted as u32,
                 mc.tokens_saved as u64,
                 pressure,
@@ -4291,11 +4293,28 @@ mod tests {
             state.context_compression_triggered,
             "quiet/headless rendering must not erase the turn-level compression fact"
         );
-        assert!(
-            state.step_recorder.events().iter().any(|event| {
+        let compaction_event = state
+            .step_recorder
+            .events()
+            .iter()
+            .find(|event| {
                 event.event_type == astra_pipeline::step_protocol::StepEventType::CompactionFired
-            }),
-            "quiet mode may suppress UI output, but durable compaction audit must still be emitted"
+            })
+            .expect(
+                "quiet mode may suppress UI output, but durable compaction audit must be emitted",
+            );
+        let compaction_kind = compaction_event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .expect("production compaction paths must identify their strategy");
+        assert!(
+            matches!(
+                compaction_kind,
+                "proactive_default" | "proactive_aggressive"
+            ),
+            "unexpected compaction strategy: {compaction_kind}"
         );
     }
 

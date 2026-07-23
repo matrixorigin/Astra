@@ -844,6 +844,9 @@ mod tests {
         )
         .expect("write shim");
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Some overlay filesystems can briefly report ETXTBSY when a freshly
+        // written executable is spawned under parallel test load.
+        std::process::Command::new("sync").status().ok();
 
         let mut cfg = JudgerConfig::new(shim, "judge-model");
         cfg.profile = Some("isolated-harness".into());

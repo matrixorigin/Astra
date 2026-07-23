@@ -475,6 +475,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_compaction_tool_result_case_makes_efficiency_bounds_hard() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/compaction_tool_result_clearing.yaml");
+        let case = Case::from_path(&path).expect("bundled compaction case must parse");
+
+        let hard_group = case
+            .criteria
+            .iter()
+            .find_map(|criterion| match criterion {
+                crate::criteria::Criterion::AllOf { criteria } => Some(criteria),
+                _ => None,
+            })
+            .expect("tool and round bounds must be nested in all_of");
+
+        assert!(
+            hard_group.iter().any(|criterion| matches!(
+                criterion,
+                crate::criteria::Criterion::ToolsCountBetween { min: 8, max: 8 }
+            )),
+            "the scenario must fail when the model skips or invents tool work"
+        );
+        assert!(
+            hard_group.iter().any(|criterion| matches!(
+                criterion,
+                crate::criteria::Criterion::TurnRoundsBetween { min: 5, max: 15 }
+            )),
+            "the scenario must fail on an inefficient multi-round loop"
+        );
+    }
+
+    #[test]
     fn case_rejects_unknown_fields_instead_of_ignoring_a_misspelled_contract() {
         let error = serde_yaml_ng::from_str::<Case>(
             "name: strict\nprompt: hello\ncleanup_memory_record: true\n",

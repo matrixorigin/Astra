@@ -1063,9 +1063,25 @@ impl StepRecorder {
 
     /// Record that microcompact or compression fired this turn.
     pub fn record_compaction(&mut self, results_compacted: u32, tokens_saved: u64, pressure: f64) {
+        self.record_compaction_with_kind("unspecified", results_compacted, tokens_saved, pressure);
+    }
+
+    /// Record compaction with the concrete execution path that produced it.
+    ///
+    /// `kind` is deliberately an open string rather than a closed enum: the
+    /// pipeline crate is below runtime-specific compaction policy, and durable
+    /// telemetry must remain forward-compatible as new strategies are added.
+    pub fn record_compaction_with_kind(
+        &mut self,
+        kind: &str,
+        results_compacted: u32,
+        tokens_saved: u64,
+        pressure: f64,
+    ) {
         self.emit_with_payload(
             StepEventType::CompactionFired,
             serde_json::json!({
+                "kind": kind,
                 "results_compacted": results_compacted,
                 "tokens_saved": tokens_saved,
                 "pressure": (pressure * 1000.0).round() / 1000.0,
@@ -1625,6 +1641,36 @@ mod tests {
             .expect("typed inference purpose");
             assert_eq!(purpose, InferencePurpose::SubAgent);
         }
+    }
+
+    #[test]
+    fn compaction_event_preserves_the_execution_path_kind() {
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-compaction-kind", "task-1");
+        rec.begin_turn_with_context(4, 2);
+        rec.record_compaction_with_kind("microcompact", 3, 1_500, 0.812);
+
+        let event = rec
+            .events()
+            .iter()
+            .find(|event| event.event_type == StepEventType::CompactionFired)
+            .expect("compaction event");
+        let payload = event.payload.as_ref().expect("compaction payload");
+        assert_eq!(
+            payload.get("kind").and_then(serde_json::Value::as_str),
+            Some("microcompact")
+        );
+        assert_eq!(
+            payload
+                .pointer("/trace_context/visible_turn")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            payload
+                .pointer("/trace_context/round_index")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]

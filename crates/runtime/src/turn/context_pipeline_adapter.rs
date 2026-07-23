@@ -2140,16 +2140,16 @@ mod tests {
         let with_tools = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(
             with_tools
-                .extra_dynamic_sections
+                .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Tool Availability Protocol")),
-            "tool_conditional emits when tools present"
+            "tool_conditional emits in the cacheable surface epoch when tools are present"
         );
 
         let without_tools = build_external_sources(&ep, &state, &[], None, None);
         assert!(
             !without_tools
-                .extra_dynamic_sections
+                .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Tool Availability Protocol")),
             "tool_conditional absent when no tools"

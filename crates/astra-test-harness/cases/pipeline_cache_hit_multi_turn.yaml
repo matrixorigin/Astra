@@ -12,6 +12,8 @@ description: |
     - cumulative cached_input_tokens ≥ 10000 (Bedrock: 32k-52k; DeepSeek: 13k-25k — provider variance)
     - cache_creation_tokens ≤ 25000 (observed: 20k worst-case warm-up, 0 when
       cross-session cache is warm; 25k caps persistent ~5-6k/turn rebuilds)
+    - token-weighted provider cache-read ratio after the first warm-up turn ≥ 98%
+    - no tool calls; a tool-surface or ambient-context detour invalidates this measurement
   **Fail means**: cache prefix broken every turn (non-deterministic skill enum,
   `ttl: 1h` marker Bedrock silently drops, Session-scoped tool-dependent sections,
   or any byte drift in the pinned prefix).
@@ -39,3 +41,9 @@ criteria:
         min_read: 10000
         min_creation: 0
         max_creation: 25000
+      - type: provider_prompt_cache_read_ratio
+        min: 0.98
+        warmup_turns: 1
+      - type: tools_count_between
+        min: 0
+        max: 0

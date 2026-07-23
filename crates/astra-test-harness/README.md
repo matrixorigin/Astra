@@ -120,6 +120,7 @@ criteria:
 | `turn_rounds_between { min, max }`                  | LLM round-trips (StepStarted events) in range                | step_events |
 | `cache_rate_above { threshold }`                    | tool cache hit rate ≥ threshold (0.0–1.0)                    | step_events |
 | `prompt_cache_tokens { min_read, min_creation }`    | provider prompt-cache read/write token buckets meet minimums | envelope    |
+| `provider_prompt_cache_read_ratio { min, warmup_turns }` | token-weighted cache-read ratio after warm-up ≥ `min`    | journal     |
 | `stderr_matches { pattern }`                        | multi-line regex on stderr                                   | stderr      |
 | `text_contains { needle }`                          | substring in final text                                      | envelope    |
 | `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
@@ -137,7 +138,7 @@ Each criterion has a severity that controls how failures are treated:
 | Severity    | Meaning                                                                                                                            | Criteria types                                                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Hard**    | Fundamental correctness — failure means the case did not work. The judger still runs for diagnostics.                              | envelope correctness, `hard_judger`, strict journal checks, durable tool JSON/count checks                                                     |
-| **Soft**    | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger.          | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `prompt_cache_tokens`, `stderr_matches` |
+| **Soft**    | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger.          | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, provider prompt-cache checks, `stderr_matches` |
 | **Quality** | Advisory quality signal; failure is a warning rather than a product failure.                                                       | `judger`, optional journal checks                                                                                                               |
 
 Severity is assigned automatically based on criterion type (see
