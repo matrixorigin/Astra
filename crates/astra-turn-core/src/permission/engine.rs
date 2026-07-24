@@ -2164,6 +2164,13 @@ mod tests {
                     "slot_index": 0
                 }),
             ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "stop_group",
+                    "group_id": "review"
+                }),
+            ),
         ] {
             let envelope = evaluate_permission(tool, &args, &ctx);
             assert!(

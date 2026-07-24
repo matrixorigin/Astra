@@ -5140,7 +5140,7 @@ impl ToolExecutor {
     ) -> EdgeToolRun {
         if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
             let evidence = error.failure_evidence();
-            return EdgeToolRun::failure_evidence(format!("Error: {error}"), evidence);
+            return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;

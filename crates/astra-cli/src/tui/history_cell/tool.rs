@@ -579,6 +579,8 @@ impl ToolCell {
                 format!("Did not run {label}")
             } else if self.status == ToolStatus::Failed {
                 format!("Failed {label}")
+            } else if self.status == ToolStatus::Uncertain {
+                format!("Could not confirm {label}")
             } else if let Some(task_header) = background_task_tool_header(&self.name) {
                 task_header.to_string()
             } else {
@@ -1323,6 +1325,24 @@ mod tests {
         let out = render(&t, 100, 4);
         assert!(out.contains("Did not run Agent Fanout · 10ms"), "{out}");
         assert!(!out.contains("Ran Agent Fanout"), "{out}");
+    }
+
+    #[test]
+    fn uncertain_execution_is_not_rendered_as_ran() {
+        let mut cell = ToolCell::new_running("agent_fanout", "agent_fanout");
+        cell.complete(
+            "uncertain",
+            1,
+            String::new(),
+            Some("Launch confirmation is delayed".to_string()),
+            None,
+        );
+        let output = render(&cell, 100, 4);
+        assert!(
+            output.contains("Could not confirm Agent Fanout · 1ms"),
+            "{output}"
+        );
+        assert!(!output.contains("Ran Agent Fanout"), "{output}");
     }
 
     #[test]

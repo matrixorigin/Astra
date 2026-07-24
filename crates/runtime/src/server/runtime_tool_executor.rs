@@ -1725,6 +1725,47 @@ impl RuntimeToolExecutor {
         self.agent_tool_context = Some(ctx);
     }
 
+    /// Cancel dynamic children through the same producer that owns their
+    /// lifecycle. `None` means this executor has no dynamic-agent binding and
+    /// lets the caller fall back to its host-specific hook.
+    pub async fn cancel_child_agents(
+        &self,
+        agent_ids: &[String],
+        _reason: &str,
+    ) -> Option<Vec<String>> {
+        let ctx = self.agent_tool_context.as_ref()?;
+        // Fanout children are represented by one parent tool record rather
+        // than one `agent.spawn` record per slot. Cancel from the producer's
+        // run tree as well: this catches fanout and nested descendants and
+        // seals the parent against a concurrent late spawn.
+        ctx.spawner
+            .cancel_descendants_of_parent_run(
+                &ctx.run_id,
+                crate::orchestration::spawner::DescendantCancellationReason::AncestorCancelled,
+            )
+            .await;
+        let mut cancelled = Vec::new();
+        for agent_id in agent_ids {
+            if ctx
+                .spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .is_some_and(|state| {
+                    matches!(
+                        state.status,
+                        astra_turn_core::orchestration_types::AgentStatus::Cancelled {
+                            by_user: false,
+                            ..
+                        }
+                    )
+                })
+            {
+                cancelled.push(agent_id.clone());
+            }
+        }
+        Some(cancelled)
+    }
+
     /// Attach the live web-agent work-surface event channel.
     pub fn set_work_surface_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         self.work_surface_events.set_tx(tx);

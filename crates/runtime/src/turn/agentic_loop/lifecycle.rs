@@ -607,7 +607,7 @@ fn collect_parallel_agent_budget_rollup(
         })
         .collect();
 
-    if completed.is_empty() || unfinished.is_empty() {
+    if completed.is_empty() && unfinished.is_empty() {
         return None;
     }
 
@@ -622,6 +622,9 @@ fn parallel_agent_budget_exhaustion_summary(
     cancelled_agents: &HashSet<String>,
 ) -> Option<String> {
     let rollup = collect_parallel_agent_budget_rollup(state)?;
+    if rollup.completed.is_empty() || rollup.unfinished.is_empty() {
+        return None;
+    }
 
     let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
         " The latest checkpoint was saved, so you can continue in the next message."
@@ -682,18 +685,24 @@ fn budget_exhaustion_completion_text(
 
 async fn cancel_child_agents_with_timeout<H: AgenticLoopHost>(
     host: &mut H,
+    runtime_tool_executor: Option<
+        std::sync::Arc<crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+    >,
     agent_ids: Vec<String>,
     reason: &str,
 ) -> HashSet<String> {
-    if agent_ids.is_empty() {
+    if agent_ids.is_empty() && runtime_tool_executor.is_none() {
         return HashSet::new();
     }
-    match tokio::time::timeout(
-        CHILD_AGENT_CANCEL_TIMEOUT,
-        host.cancel_child_agents(&agent_ids, reason),
-    )
-    .await
-    {
+    let cancellation = async {
+        if let Some(executor) = runtime_tool_executor
+            && let Some(cancelled) = executor.cancel_child_agents(&agent_ids, reason).await
+        {
+            return cancelled;
+        }
+        host.cancel_child_agents(&agent_ids, reason).await
+    };
+    match tokio::time::timeout(CHILD_AGENT_CANCEL_TIMEOUT, cancellation).await {
         Ok(cancelled) => cancelled.into_iter().collect(),
         Err(_) => {
             tracing::warn!(
@@ -705,6 +714,35 @@ async fn cancel_child_agents_with_timeout<H: AgenticLoopHost>(
             HashSet::new()
         }
     }
+}
+
+pub(super) async fn cancel_unfinished_child_agents<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &AgenticLoopState,
+    reason: &str,
+) -> HashSet<String> {
+    cancel_child_agents_with_timeout(
+        host,
+        state.runtime_tool_executor.clone(),
+        unfinished_parallel_agent_ids(state),
+        reason,
+    )
+    .await
+}
+
+async fn finish_user_cancellation<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> PreparedTurnIteration {
+    let _cancelled =
+        cancel_unfinished_child_agents(host, state, "parent turn cancelled by user").await;
+    try_write_heavy_checkpoint(state);
+    state.interruption = Some(InterruptionRecord::new(
+        InterruptionKind::UserCancelled,
+        ResumeAction::ContinueImmediately,
+        interruption_state_summary(state, None),
+    ));
+    PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
 }
 
 fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
@@ -1307,15 +1345,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     .as_ref()
                     .is_some_and(|t| t.is_cancelled())
             {
-                try_write_heavy_checkpoint(state);
-                state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::UserCancelled,
-                    ResumeAction::ContinueImmediately,
-                    interruption_state_summary(state, None),
-                ));
-                return Ok(PreparedTurnIteration::Finished(
-                    AgenticLoopOutcome::Cancelled,
-                ));
+                return Ok(finish_user_cancellation(host, state).await);
             }
 
             // Periodic DB poll for cross-pod cancel/pause
@@ -1333,15 +1363,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                                 if let Some(ref token) = state.cancellation.token {
                                     token.cancel();
                                 }
-                                try_write_heavy_checkpoint(state);
-                                state.interruption = Some(InterruptionRecord::new(
-                                    InterruptionKind::UserCancelled,
-                                    ResumeAction::ContinueImmediately,
-                                    interruption_state_summary(state, None),
-                                ));
-                                return Ok(PreparedTurnIteration::Finished(
-                                    AgenticLoopOutcome::Cancelled,
-                                ));
+                                return Ok(finish_user_cancellation(host, state).await);
                             }
                             Ok(Some(RunControlStatus::Paused)) => {
                                 // DB says paused, keep waiting — sync in-memory flag
@@ -1424,15 +1446,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     token.cancel();
                 }
             }
-            try_write_heavy_checkpoint(state);
-            state.interruption = Some(InterruptionRecord::new(
-                InterruptionKind::UserCancelled,
-                ResumeAction::ContinueImmediately,
-                interruption_state_summary(state, None),
-            ));
-            return Ok(PreparedTurnIteration::Finished(
-                AgenticLoopOutcome::Cancelled,
-            ));
+            return Ok(finish_user_cancellation(host, state).await);
         }
 
         if matches!(durable_control_status, Some(RunControlStatus::Paused)) {
@@ -1470,6 +1484,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             ));
             let cancelled_agents = cancel_child_agents_with_timeout(
                 host,
+                state.runtime_tool_executor.clone(),
                 unfinished_parallel_agent_ids(state),
                 "parent turn budget exhausted",
             )
@@ -2857,6 +2872,7 @@ mod tests {
 
         let cancelled = cancel_child_agents_with_timeout(
             &mut host,
+            None,
             vec!["agent-c".to_string()],
             "parent turn budget exhausted",
         )
@@ -3512,6 +3528,16 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.cancellation.flag = Some(Arc::new(AtomicBool::new(true)));
+        state.stall.tool_call_records = vec![agent_record(
+            "spawn",
+            json!({"description":"Review runtime"}),
+            Some(json!({
+                "status":"launched",
+                "agent_id":"agent-running",
+                "description":"Review runtime"
+            })),
+            None,
+        )];
 
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
@@ -3536,6 +3562,11 @@ mod tests {
         assert_eq!(
             ir.resume_action,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        );
+        assert_eq!(
+            host.cancelled_agent_ids,
+            vec!["agent-running".to_string()],
+            "parent cancellation must propagate to every unfinished dynamic child"
         );
     }
 

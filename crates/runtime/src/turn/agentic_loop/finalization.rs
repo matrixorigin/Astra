@@ -5,7 +5,10 @@ use astra_services::SessionArtifactStore;
 
 use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
 use super::host::{AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_impl};
-use super::lifecycle::{current_agentic_step, interruption_state_summary, session_turn_number};
+use super::lifecycle::{
+    cancel_unfinished_child_agents, current_agentic_step, interruption_state_summary,
+    session_turn_number,
+};
 
 /// Finalize the turn trace collector: record measured token budget, feed to
 /// observability session, and persist to journal. Called from every exit path
@@ -556,6 +559,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // settle the same producer queue as normal and error returns.
     let _recall_run_boundary = UnattributedRecallRunBoundary::new(host.memory_recall_scope(state));
     let result = run_agentic_loop_impl(host, state).await;
+    let user_cancelled = matches!(&result, Ok(AgenticLoopOutcome::Cancelled))
+        || matches!(
+            &result,
+            Err(error) if error.kind == astra_core::ErrorKind::Cancelled
+        )
+        || state.interruption.as_ref().is_some_and(|interruption| {
+            interruption.kind == astra_turn_core::interruption::InterruptionKind::UserCancelled
+        });
+    if user_cancelled {
+        let _cancelled =
+            cancel_unfinished_child_agents(host, state, "parent turn cancelled by user").await;
+    }
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
     #[cfg(feature = "harness")]
@@ -2509,6 +2524,94 @@ mod tests {
             "run boundary must use the executor session and canonical fallback producer without touching concurrent work"
         );
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
+    }
+
+    #[tokio::test]
+    async fn cancelled_error_exit_cancels_unfinished_children_at_loop_boundary() {
+        struct CancelledHost {
+            valid_tool_names: std::collections::HashSet<String>,
+            cancelled_agent_ids: Vec<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgenticLoopHost for CancelledHost {
+            fn emit_headless_line(
+                &mut self,
+                _style: astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle,
+                _line: String,
+            ) {
+            }
+
+            fn is_quiet(&self) -> bool {
+                true
+            }
+
+            fn valid_tool_names(&self) -> &std::collections::HashSet<String> {
+                &self.valid_tool_names
+            }
+
+            async fn execute_turn(
+                &mut self,
+                _state: &mut AgenticLoopState,
+            ) -> Result<crate::turn::agentic_loop::host::HostTurnResult, astra_core::ClassifiedError>
+            {
+                Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "user interrupted the active turn",
+                ))
+            }
+
+            async fn cancel_child_agents(
+                &mut self,
+                agent_ids: &[String],
+                _reason: &str,
+            ) -> Vec<String> {
+                self.cancelled_agent_ids.extend_from_slice(agent_ids);
+                agent_ids.to_vec()
+            }
+        }
+
+        let mut host = CancelledHost {
+            valid_tool_names: std::collections::HashSet::new(),
+            cancelled_agent_ids: Vec::new(),
+        };
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "agent".to_string(),
+            ok: true,
+            ms: 0,
+            args_full: Some(
+                serde_json::json!({
+                    "action": "spawn",
+                    "description": "Review runtime"
+                })
+                .to_string(),
+            ),
+            result_full: Some(
+                serde_json::json!({
+                    "status": "launched",
+                    "agent_id": "agent-running",
+                    "description": "Review runtime"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        }];
+
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(matches!(
+            result,
+            Err(astra_core::ClassifiedError {
+                kind: astra_core::ErrorKind::Cancelled,
+                ..
+            })
+        ));
+        assert_eq!(
+            host.cancelled_agent_ids,
+            vec!["agent-running".to_string()],
+            "the shared loop exit must cancel children even when cancellation surfaces as an error"
+        );
     }
 
     #[tokio::test]

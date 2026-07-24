@@ -639,6 +639,7 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
         AgentFanoutAction::Start => handle_agent_fanout_start_action(args, ctx).await,
         AgentFanoutAction::GetResults => handle_agent_fanout_get_results_action(args, ctx).await,
         AgentFanoutAction::StopSlot => handle_agent_fanout_stop_slot_action(args, ctx).await,
+        AgentFanoutAction::StopGroup => handle_agent_fanout_stop_group_action(args, ctx).await,
     }
 }
 
@@ -671,10 +672,16 @@ pub async fn recover_agent_fanout_tool_result(
         }
         return handle_agent_fanout_get_results_action(&get_args, Some(ctx)).await;
     }
-    if action == AgentFanoutAction::StopSlot {
+    if matches!(
+        action,
+        AgentFanoutAction::StopSlot | AgentFanoutAction::StopGroup
+    ) {
         return render_agent_tool_error(
             None,
-            "Cannot recover missing agent_fanout.stop_slot result because stop_slot has side effects. Recovery never replays control actions that can mutate child-agent state; call agent_fanout(action='get_results', group_id=...) to inspect the current group.",
+            &format!(
+                "Cannot recover missing agent_fanout.{} result because the action has side effects. Recovery never replays control actions that can mutate child-agent state; call agent_fanout(action='get_results', group_id=...) to inspect the current group.",
+                action.as_str()
+            ),
         );
     }
 
@@ -849,6 +856,16 @@ struct AgentFanoutStopSlotInput {
     slot_index: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFanoutStopGroupInput {
+    #[serde(default, rename = "action")]
+    _action: Option<String>,
+    #[serde(default, rename = "_tool_call_id")]
+    _tool_call_id: Option<String>,
+    group_id: String,
+}
+
 const FANOUT_START_FIELDS: &[&str] = &[
     "action",
     "_tool_call_id",
@@ -886,9 +903,12 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
     "max_bytes",
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief; inspect the shared workspace directly\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief; inspect the shared workspace directly\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt; never paste file contents, diffs, or prior tool output because children share the bound workspace and inspect it directly. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
+const FANOUT_STOP_GROUP_SHAPE: &str =
+    "Use one JSON object: {\"action\":\"stop_group\",\"group_id\":\"returned-group-id\"}.";
 
 fn reject_unknown_fields_for_shape(
     object: &serde_json::Map<String, Value>,
@@ -1121,6 +1141,30 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                 input.slots.len()
             ),
         );
+    }
+    for (slot_index, slot) in input.slots.iter().enumerate() {
+        let description_chars = slot.description.chars().count() as u64;
+        if description_chars
+            > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
+        {
+            return render_agent_tool_error(
+                None,
+                &format!(
+                    "Invalid input: slots[{slot_index}].description has {description_chars} characters; maximum is {}",
+                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
+                ),
+            );
+        }
+        let prompt_chars = slot.prompt.chars().count() as u64;
+        if prompt_chars > astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS {
+            return render_agent_tool_error(
+                None,
+                &format!(
+                    "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and have the child inspect files/diffs in the shared workspace instead of embedding them.",
+                    astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
+                ),
+            );
+        }
     }
 
     let group_id = match input.group_id.as_deref().map(str::trim) {
@@ -1729,7 +1773,8 @@ async fn handle_agent_fanout_stop_slot_action(
     let terminal_reason = slot.terminal_reason.clone();
     let Some(agent_id) = slot.agent_id.clone() else {
         return json!({
-            "status": "not_stoppable",
+            "status": "completed",
+            "stop_outcome": "not_stoppable",
             "reason": "no_accepted_agent",
             "group_id": group_id,
             "slot_index": input.slot_index,
@@ -1742,7 +1787,8 @@ async fn handle_agent_fanout_stop_slot_action(
     };
     if slot.status.is_terminal() {
         return json!({
-            "status": "not_stoppable",
+            "status": "completed",
+            "stop_outcome": "not_stoppable",
             "reason": "already_terminal",
             "group_id": group_id,
             "slot_index": input.slot_index,
@@ -1765,7 +1811,8 @@ async fn handle_agent_fanout_stop_slot_action(
         .iter()
         .find(|slot| slot.slot_index == input.slot_index);
     json!({
-        "status": if stopped { "stopped" } else { "not_stopped" },
+        "status": if stopped { "completed" } else { "completed_with_issues" },
+        "stop_outcome": if stopped { "stopped" } else { "not_stopped" },
         "group_id": group_id,
         "slot_index": input.slot_index,
         "id": updated_slot
@@ -1778,6 +1825,100 @@ async fn handle_agent_fanout_stop_slot_action(
         "terminal_reason": updated_slot
             .and_then(|slot| slot.terminal_reason.as_deref())
             .or(terminal_reason.as_deref()),
+        "fanout": fanout_group_to_json(&updated),
+    })
+    .to_string()
+}
+
+async fn handle_agent_fanout_stop_group_action(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> String {
+    if let Err(error) = validate_agent_fanout_group_shape(
+        args,
+        "stop_group",
+        FANOUT_STOP_GROUP_FIELDS,
+        FANOUT_STOP_GROUP_SHAPE,
+    ) {
+        return render_agent_tool_error(None, &format!("Invalid input: {error}"));
+    }
+    let Some(ctx) = ctx else {
+        return render_agent_runtime_binding_error("agent_fanout", "stop_group");
+    };
+    let input: AgentFanoutStopGroupInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(error) => {
+            return render_agent_tool_error(
+                None,
+                &format!(
+                    "Invalid input for agent_fanout.stop_group: {error}. {FANOUT_STOP_GROUP_SHAPE}"
+                ),
+            );
+        }
+    };
+    let group_id = input.group_id.trim();
+    if group_id.is_empty() {
+        return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+    }
+    let Some(group) = find_fanout_group(ctx, group_id).await else {
+        return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
+    };
+
+    let active_agent_ids = group
+        .slots
+        .iter()
+        .filter(|slot| !slot.status.is_terminal())
+        .filter_map(|slot| slot.agent_id.clone())
+        .collect::<Vec<_>>();
+    let already_terminal_count = group
+        .slots
+        .iter()
+        .filter(|slot| slot.status.is_terminal())
+        .count();
+    let non_stoppable_count = group
+        .slots
+        .iter()
+        .filter(|slot| !slot.status.is_terminal() && slot.agent_id.is_none())
+        .count();
+    let mut stopped_agent_ids = Vec::new();
+    let mut cancellation_not_owned_agent_ids = Vec::new();
+    for agent_id in active_agent_ids {
+        if ctx
+            .spawner
+            .cancel_agent(&agent_id, "user-requested via agent_fanout.stop_group")
+            .await
+        {
+            stopped_agent_ids.push(agent_id);
+        } else {
+            cancellation_not_owned_agent_ids.push(agent_id);
+        }
+    }
+    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
+    let not_stopped_agent_ids = cancellation_not_owned_agent_ids
+        .into_iter()
+        .filter(|agent_id| {
+            updated.slots.iter().any(|slot| {
+                slot.agent_id.as_deref() == Some(agent_id.as_str()) && !slot.status.is_terminal()
+            })
+        })
+        .collect::<Vec<_>>();
+    let has_issues = !not_stopped_agent_ids.is_empty() || non_stoppable_count > 0;
+    let stop_outcome = if has_issues {
+        "partially_stopped"
+    } else if stopped_agent_ids.is_empty() {
+        "already_terminal"
+    } else {
+        "stopped"
+    };
+    json!({
+        "status": if has_issues { "completed_with_issues" } else { "completed" },
+        "stop_outcome": stop_outcome,
+        "group_id": group_id,
+        "stopped_count": stopped_agent_ids.len(),
+        "stopped_agent_ids": stopped_agent_ids,
+        "already_terminal_count": already_terminal_count,
+        "non_stoppable_count": non_stoppable_count,
+        "not_stopped_agent_ids": not_stopped_agent_ids,
         "fanout": fanout_group_to_json(&updated),
     })
     .to_string()
@@ -3070,6 +3211,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_fanout_rejects_embedded_large_prompt_before_spawning() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let oversized_prompt = "diff line\n".repeat(
+            astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS as usize / 5,
+        );
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "oversized-review",
+                "target_count": 1,
+                "slots": [{
+                    "description": "Review embedded diff",
+                    "prompt": oversized_prompt
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("inspect files/diffs"), "{result}");
+        assert!(
+            spawner.list_all_agents().await.is_empty(),
+            "oversized fanout arguments must be rejected before any child is admitted"
+        );
+        assert_eq!(executor.spawn_count(), 0);
+    }
+
+    #[tokio::test]
     async fn agent_fanout_start_creates_fixed_group_slots() {
         let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
@@ -4108,9 +4281,9 @@ mod tests {
 
         assert_eq!(value["status"], "failed");
         assert!(
-            value["error"]
-                .as_str()
-                .is_some_and(|text| text.contains("stop_slot has side effects")),
+            value["error"].as_str().is_some_and(
+                |text| text.contains("stop_slot result") && text.contains("side effects")
+            ),
             "{recovered}"
         );
     }
@@ -4253,7 +4426,8 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "not_stoppable");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["stop_outcome"], "not_stoppable");
         assert_eq!(value["reason"], "no_accepted_agent");
         assert_eq!(value["slot_index"], 0);
         assert_eq!(value["slot_status"], "spawn_rejected");
@@ -4297,7 +4471,8 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "not_stoppable");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["stop_outcome"], "not_stoppable");
         assert_eq!(value["reason"], "already_terminal");
         assert_eq!(value["slot_status"], "completed");
         assert_eq!(value["fanout"]["completed"], 1);
@@ -4351,7 +4526,8 @@ mod tests {
         )
         .await;
         let stop_value: Value = serde_json::from_str(&stop).unwrap();
-        assert_eq!(stop_value["status"], "stopped");
+        assert_eq!(stop_value["status"], "completed");
+        assert_eq!(stop_value["stop_outcome"], "stopped");
         assert_eq!(stop_value["slot_status"], "cancelled_by_user");
         assert_eq!(stop_value["fanout"]["cancelled_by_user"], 1);
 
@@ -4372,6 +4548,55 @@ mod tests {
 
         assert_eq!(value["status"], "completed_with_issues");
         assert_eq!(value["cancelled_by_user"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_stop_group_cancels_all_running_slots_in_one_action() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let start_ctx = ctx.clone();
+        let start_task = tokio::spawn(async move {
+            handle_agent_fanout_tool(
+                &json!({
+                    "action": "start",
+                    "group_id": "review-stop-all",
+                    "target_count": 2,
+                    "slots": [
+                        {"description": "Review runtime", "prompt": "Review runtime changes"},
+                        {"description": "Review UI", "prompt": "Review UI changes"}
+                    ]
+                }),
+                Some(&start_ctx),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if spawner.list_all_agents().await.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let stop = handle_agent_fanout_tool(
+            &json!({
+                "action": "stop_group",
+                "group_id": "review-stop-all"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let stop_value: Value = serde_json::from_str(&stop).unwrap();
+        assert_eq!(stop_value["status"], "completed");
+        assert_eq!(stop_value["stop_outcome"], "stopped");
+        assert_eq!(stop_value["stopped_count"], 2);
+        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 2);
+
+        let start = tokio::time::timeout(Duration::from_secs(1), start_task)
+            .await
+            .expect("group cancellation must unblock foreground fan-in")
+            .expect("fanout start task must not panic");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["cancelled_by_user"], 2);
     }
 
     #[test]

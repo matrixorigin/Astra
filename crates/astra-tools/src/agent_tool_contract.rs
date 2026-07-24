@@ -4,8 +4,10 @@ pub const AGENT_RUNTIME_TOOL_NAMES: &[&str] = &["agent", "agent_fanout"];
 pub const AGENT_ACTIONS: &[&str] = &["spawn", "get_result", "run_chain", "send_message"];
 pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, get_result, run_chain, send_message";
 
-pub const AGENT_FANOUT_ACTIONS: &[&str] = &["start", "get_results", "stop_slot"];
-pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot";
+pub const AGENT_FANOUT_ACTIONS: &[&str] = &["start", "get_results", "stop_slot", "stop_group"];
+pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot, stop_group";
+pub const AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS: u64 = 256;
+pub const AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS: u64 = 4096;
 
 pub fn is_agent_runtime_tool(name: &str) -> bool {
     AGENT_RUNTIME_TOOL_NAMES.contains(&name)
@@ -43,6 +45,7 @@ pub enum AgentFanoutAction {
     Start,
     GetResults,
     StopSlot,
+    StopGroup,
 }
 
 impl AgentFanoutAction {
@@ -51,6 +54,7 @@ impl AgentFanoutAction {
             Self::Start => "start",
             Self::GetResults => "get_results",
             Self::StopSlot => "stop_slot",
+            Self::StopGroup => "stop_group",
         }
     }
 }
@@ -119,6 +123,7 @@ pub fn agent_fanout_action_from_args(args: &Value) -> Result<AgentFanoutAction, 
             "start" => Ok(AgentFanoutAction::Start),
             "get_results" => Ok(AgentFanoutAction::GetResults),
             "stop_slot" => Ok(AgentFanoutAction::StopSlot),
+            "stop_group" => Ok(AgentFanoutAction::StopGroup),
             other => Err(agent_fanout_unknown_action_message(other)),
         },
         Some(Value::String(_)) | None => Err(agent_fanout_missing_action_message()),

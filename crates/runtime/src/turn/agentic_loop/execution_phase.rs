@@ -71,6 +71,23 @@ fn unsettled_work_status_marker(
 }
 
 fn append_unsettled_work_status<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
+    // The turn-local tracker is only a projection. Reconcile every identity
+    // against the producer registry immediately before freezing user-visible
+    // output so a terminal transition that arrived after the last model
+    // boundary cannot be rendered as still running.
+    if let Some(registry) = state.stall.active_work_registry.clone() {
+        let tracked = state.stall.work_unit_observations.active_work_units();
+        for observation in tracked {
+            if let Some(canonical) =
+                registry.canonical_observation(&observation.id, &observation.kind)
+            {
+                state.stall.work_unit_observations.observe(&canonical);
+            }
+        }
+        for observation in registry.active_work_observations() {
+            state.stall.work_unit_observations.observe(&observation);
+        }
+    }
     let active_work = state.stall.work_unit_observations.active_work_units();
     let Some(marker) = unsettled_work_status_marker(&active_work) else {
         return;
@@ -4468,6 +4485,45 @@ mod tests {
         assert_eq!(
             delayed["projection_state"],
             "superseded_by_newer_producer_observation"
+        );
+    }
+
+    #[test]
+    fn final_settlement_reconciles_terminal_registry_truth_before_rendering() {
+        let mut state = make_state();
+        let registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        let running = astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            1,
+            astra_core::work_unit::WorkUnitObservationMode::Current,
+        )
+        .unwrap();
+        registry.observe(&running);
+        state.attach_active_work_registry(registry.clone());
+        let completed = astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Completed,
+            2,
+            astra_core::work_unit::WorkUnitObservationMode::Transition,
+        )
+        .unwrap();
+        registry.observe(&completed);
+        state.final_text = "All reviewers stopped.".to_string();
+        let mut host = MockHost::new(vec![]);
+
+        append_unsettled_work_status(&mut host, &mut state);
+
+        assert_eq!(state.final_text, "All reviewers stopped.");
+        assert!(
+            state
+                .stall
+                .work_unit_observations
+                .active_work_units()
+                .is_empty(),
+            "terminal producer truth must absorb the stale turn-local running projection"
         );
     }
 

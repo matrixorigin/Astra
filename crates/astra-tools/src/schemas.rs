@@ -20,6 +20,7 @@ pub struct ToolArgumentValidationError {
     pub tool_name: String,
     pub action: Option<String>,
     pub issues: Vec<String>,
+    malformed_parse_error: Option<Value>,
 }
 
 impl fmt::Display for ToolArgumentValidationError {
@@ -36,6 +37,46 @@ impl std::error::Error for ToolArgumentValidationError {}
 
 impl ToolArgumentValidationError {
     #[must_use]
+    pub fn output(&self) -> String {
+        if let Some(parse_error) = self.malformed_parse_error.as_ref() {
+            let mut body = json!({
+                "status": "failed",
+                "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                "error": "Tool arguments were not valid JSON; the tool was not executed.",
+                "advisory": {
+                    "kind": "malformed_tool_arguments",
+                    "tool": self.tool_name,
+                    "executed": false,
+                    "next_step": "Retry the same native tool once with one complete JSON argument object matching the advertised schema.",
+                },
+            });
+            let mut metadata = Map::new();
+            if let Some(kind @ ("invalid_json" | "truncated")) =
+                parse_error.get("kind").and_then(Value::as_str)
+            {
+                metadata.insert("kind".into(), json!(kind));
+            }
+            if let Some(category @ ("io" | "syntax" | "data" | "eof")) =
+                parse_error.get("category").and_then(Value::as_str)
+            {
+                metadata.insert("category".into(), json!(category));
+            }
+            for field in ["argument_bytes", "line", "column"] {
+                if let Some(value) = parse_error.get(field).and_then(Value::as_u64) {
+                    metadata.insert(field.into(), json!(value));
+                }
+            }
+            if !metadata.is_empty() {
+                body["advisory"]["parse_error"] = Value::Object(metadata);
+            }
+            return body.to_string();
+        }
+        format!(
+            "Error: {self}. Correct the arguments and issue one new call matching the advertised schema."
+        )
+    }
+
+    #[must_use]
     pub fn failure_evidence(&self) -> astra_core::ToolFailureEvidence {
         astra_core::ToolFailureEvidence::new(
             astra_core::ErrorKind::ToolInvalidArgs,
@@ -48,10 +89,7 @@ impl ToolArgumentValidationError {
     #[must_use]
     pub fn into_tool_result(self) -> crate::ToolResult {
         let evidence = self.failure_evidence();
-        crate::ToolResult::error(format!(
-            "Error: {self}. Correct the arguments and issue one new call matching the advertised schema."
-        ))
-        .with_failure_evidence(evidence)
+        crate::ToolResult::error(self.output()).with_failure_evidence(evidence)
     }
 }
 
@@ -355,8 +393,21 @@ pub fn validate_tool_arguments(
             tool_name: tool_name.to_string(),
             action: action.map(str::to_string),
             issues,
+            malformed_parse_error: None,
         });
     };
+
+    // A provider preserves undecodable arguments as this sentinel. Handle it
+    // before ordinary schema checks so the original parse fact remains a
+    // typed, machine-readable "not executed" receipt.
+    if let Some(parse_error) = arguments.get("_parse_error") {
+        return Err(ToolArgumentValidationError {
+            tool_name: tool_name.to_string(),
+            action: None,
+            issues: vec!["arguments were not valid JSON".to_string()],
+            malformed_parse_error: Some(parse_error.clone()),
+        });
+    }
 
     for field in collect_required_fields(parameters, action) {
         if !value_is_present(arguments.get(&field)) {
@@ -417,6 +468,7 @@ pub fn validate_tool_arguments(
             tool_name: tool_name.to_string(),
             action: action.map(str::to_string),
             issues,
+            malformed_parse_error: None,
         })
     }
 }
@@ -999,6 +1051,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "boolean",
                             "description": "Show staged (index vs HEAD) changes. Used by: diff. Default false."
                         },
+                        "stat_only": {
+                            "type": "boolean",
+                            "description": "Return only file/change statistics instead of patch content. Used by: diff and show. Default false."
+                        },
                         "n": {
                             "type": "integer",
                             "description": "Max entries to return. Used by: log (default 10, max 500 auto-throttled), file_history (default 10), log_search (default 200)."
@@ -1378,13 +1434,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id` for an explicitly backgrounded group. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
-         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
+         - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
+         Use this for independent parallel work. Put each concise child instruction only in `slots[i].prompt`. Children share the bound workspace and must inspect files/diffs with their own tools: never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "start: action+target_count+exactly target_count slots; each slot needs description+prompt. Shared config goes in defaults; no brief/agents/background. Results use group_id.",
+                    "x-astra-discovery-summary": "start: action+target_count+exactly target_count slots; each slot needs a short description and concise prompt. Children inspect the shared workspace themselves: never embed diffs, file contents, or tool output. Shared config goes in defaults; no brief/agents/background. Results use group_id.",
                     "properties": {
-                        "action": {"type": "string", "enum": ["start","get_results","stop_slot"]},
-                        "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results and stop_slot."},
+                        "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
+                        "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
                         "title": {"type": "string", "description": "Optional short label for the group."},
                         "target_count": {"type": "integer", "minimum": 1, "description": "REQUIRED for start. Fixed number of slots to launch; must equal slots.length."},
                         "slots": {
@@ -1395,8 +1452,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "additionalProperties": false,
                                 "properties": {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
-                                    "description": {"type": "string", "description": "Short UI summary for this slot."},
-                                    "prompt": {"type": "string", "description": "Full child task brief for this slot."},
+                                    "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
+                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child shares the workspace and should inspect files/diffs itself; never paste file contents, diffs, or prior tool output here."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
                                     "model": {"type": "string"},
                                     "max_turns": {"type": "integer", "minimum": 1},
@@ -1431,7 +1488,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "x-astra-per-action-required": {
                         "start": ["target_count", "slots"],
                         "get_results": ["group_id"],
-                        "stop_slot": ["group_id", "slot_index"]
+                        "stop_slot": ["group_id", "slot_index"],
+                        "stop_group": ["group_id"]
                     }
                 }
             }
@@ -1870,6 +1928,10 @@ mod tests {
             params["x-astra-per-action-required"]["get_results"],
             json!(["group_id"])
         );
+        assert_eq!(
+            params["x-astra-per-action-required"]["stop_group"],
+            json!(["group_id"])
+        );
         assert!(params["properties"].get("offset").is_some());
         assert_eq!(params["properties"]["max_bytes"]["maximum"], 65536);
         assert_eq!(
@@ -1883,6 +1945,20 @@ mod tests {
             "fanout slots must expose the canonical caller-facing identity field"
         );
         assert!(slot_props.get("slot_id").is_none());
+        assert_eq!(
+            slot_props["description"]["maxLength"],
+            crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
+        );
+        assert_eq!(
+            slot_props["prompt"]["maxLength"],
+            crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
+        );
+        assert!(
+            fanout["function"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("never paste file contents")),
+            "the advertised contract must prevent large diff/tool-output embedding at generation time"
+        );
         assert!(
             slot_props.get("name").is_none(),
             "fanout slots should not expose spawn mailbox names as slot identity"
@@ -2160,6 +2236,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actions, crate::git_tool_contract::GIT_ACTIONS);
+    }
+
+    #[test]
+    fn git_schema_exposes_executor_stat_only_capability() {
+        let schemas = all_tool_schemas();
+        let git = find_schema(&schemas, "git").expect("git schema");
+        assert_eq!(
+            git.pointer("/function/parameters/properties/stat_only/type")
+                .and_then(Value::as_str),
+            Some("boolean")
+        );
+        validate_tool_arguments("git", &json!({"action": "diff", "stat_only": true}))
+            .expect("advertised stat_only diff must validate");
     }
 
     #[test]
@@ -2671,6 +2760,29 @@ mod tests {
             error.failure_evidence().kind,
             astra_core::ErrorKind::ToolInvalidArgs
         );
+    }
+
+    #[test]
+    fn malformed_argument_sentinel_preserves_not_executed_receipt() {
+        let error = validate_tool_arguments(
+            "agent_fanout",
+            &json!({
+                "_parse_error": {
+                    "kind": "invalid_json",
+                    "category": "syntax",
+                    "argument_bytes": 8699,
+                    "column": 106,
+                    "raw": "must not leak"
+                }
+            }),
+        )
+        .unwrap_err();
+        let output: Value = serde_json::from_str(&error.output()).expect("typed failure JSON");
+        assert_eq!(output["status"], "failed");
+        assert_eq!(output["error_kind"], "tool_invalid_args");
+        assert_eq!(output["advisory"]["executed"], false);
+        assert_eq!(output["advisory"]["parse_error"]["column"], 106);
+        assert!(output["advisory"]["parse_error"].get("raw").is_none());
     }
 
     #[test]

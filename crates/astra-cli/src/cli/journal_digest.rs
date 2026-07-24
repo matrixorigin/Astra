@@ -92,6 +92,9 @@ pub struct JournalDigest {
 
 #[derive(Serialize)]
 pub struct Aggregates {
+    /// All root attempts that reached either Turn or TurnError.
+    pub attempt_count: usize,
+    /// Successfully committed root turns.
     pub turn_count: usize,
     pub turn_error_count: usize,
     pub compact_count: usize,
@@ -259,11 +262,28 @@ pub struct SideEvent {
 
 #[derive(Serialize)]
 pub struct TurnErrRow {
+    pub seq: u32,
     pub ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub tool_calls_ok: u32,
+    pub tool_calls_fail: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub llm_round_details: Vec<LlmRoundRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_groups: Vec<ToolGroupRow>,
     pub error: String,
 }
 
@@ -352,12 +372,54 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
 /// 19ad8393 agent-spawn case).
 pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
     if !c.ok {
-        return true;
+        // Older runtimes classified the producer-owned `stopped` control
+        // outcome as an unknown status and wrote ok=false even though the
+        // cancellation succeeded. Preserve the historical transport bit, but
+        // let the explicit control receipt correct forensic failure counts.
+        return !legacy_control_result_proves_success(c);
     }
     let Some(preview) = c.result_preview.as_deref() else {
         return false;
     };
     result_body_signals_failure(preview)
+}
+
+fn legacy_control_result_proves_success(c: &session_journal::ToolCallRecord) -> bool {
+    if c.name != "agent_fanout" {
+        return false;
+    }
+    let is_stop_slot = c
+        .args_full
+        .as_deref()
+        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("stop_slot")
+        || c.args_preview.as_deref() == Some("stop_slot");
+    if !is_stop_slot {
+        return false;
+    }
+    [c.result_full.as_deref(), c.result_preview.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|result| {
+            serde_json::Deserializer::from_str(result)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .and_then(Result::ok)
+                .is_some_and(|body| {
+                    body.get("status").and_then(serde_json::Value::as_str) == Some("stopped")
+                        && body.get("slot_status").and_then(serde_json::Value::as_str)
+                            == Some("cancelled_by_user")
+                        && body
+                            .get("error")
+                            .is_none_or(|error| error.is_null() || error.as_str() == Some(""))
+                })
+        })
 }
 
 /// Detect the "tool returned ok but body is an error" pattern in a
@@ -604,6 +666,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut total_noop_or_cached_tool_calls: u64 = 0;
     let mut tool_calls_failed: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
+    let mut total_root_llm_rounds: u64 = 0;
+    let mut root_attempts_with_llm_rounds: u64 = 0;
     let mut turn_error_count = 0usize;
     let mut compact_count = 0usize;
     let mut stall_count = 0usize;
@@ -633,6 +697,13 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     Vec::new()
                 };
                 let pending_attempt_run_id = attempt_run_id(&pending_rounds);
+                let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
+                    (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
+                });
+                if let Some(rounds) = attempt_llm_rounds {
+                    total_root_llm_rounds += u64::from(rounds);
+                    root_attempts_with_llm_rounds += 1;
+                }
                 let stats = tool_call_stats(ev.tool_calls.as_ref());
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
@@ -760,7 +831,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     budget_pressure: ev.budget_pressure,
                     git_head: ev.git_head.clone(),
                     git_branch: ev.git_branch.clone(),
-                    llm_rounds: ev.llm_rounds,
+                    llm_rounds: attempt_llm_rounds,
                     total_llm_ms: ev.total_llm_ms,
                     total_tool_ms: ev.total_tool_ms,
                     llm_round_details: if matches!(focus, DigestFocus::All) {
@@ -780,19 +851,83 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 turns_out.push(row);
             }
             JournalEventType::TurnError => {
+                seq += 1;
                 turn_error_count += 1;
-                let pending_attempt_run_id = if matches!(focus, DigestFocus::All) {
+                let pending_rounds = if matches!(focus, DigestFocus::All) {
                     ev.turn
                         .and_then(|turn| llm_rounds_by_turn.remove(&turn))
-                        .as_deref()
-                        .and_then(attempt_run_id)
+                        .unwrap_or_default()
                 } else {
-                    None
+                    Vec::new()
                 };
+                let pending_attempt_run_id = attempt_run_id(&pending_rounds);
+                let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
+                    (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
+                });
+                if let Some(rounds) = attempt_llm_rounds {
+                    total_root_llm_rounds += u64::from(rounds);
+                    root_attempts_with_llm_rounds += 1;
+                }
+                let stats = tool_call_stats(ev.tool_calls.as_ref());
+                let effective_total = if stats.total() > 0 {
+                    u64::from(stats.total())
+                } else {
+                    u64::from(ev.tool_count.unwrap_or(0))
+                };
+                total_tool_calls += effective_total;
+                total_fresh_tool_calls += if stats.total() > 0 {
+                    u64::from(stats.fresh)
+                } else {
+                    u64::from(ev.tool_count.unwrap_or(0))
+                };
+                total_noop_or_cached_tool_calls += u64::from(stats.noop_or_cached);
+                tool_calls_failed += u64::from(stats.fail);
+                if let Some(calls) = ev.tool_calls.as_ref() {
+                    for call in calls.iter().filter(|call| is_effective_failure(call)) {
+                        let error = effective_error_text(call);
+                        if classify_tool_error(&error) == ErrorCategory::SafetyGuard {
+                            safety_guard_blocks += 1;
+                        }
+                        if matches!(focus, DigestFocus::All) {
+                            failed_tool_calls.push(FailedToolCall {
+                                seq,
+                                turn_id: ev.turn,
+                                tool: call.name.clone(),
+                                error_category: classify_tool_error(&error),
+                                error_preview: preview(Some(&error), 200),
+                                args_preview: call.args_preview.clone(),
+                            });
+                        }
+                    }
+                }
+                total_tokens_in += ev.tokens_in.unwrap_or(0);
+                total_tokens_out += ev.tokens_out.unwrap_or(0);
+                total_duration_ms += ev.duration_ms.unwrap_or(0);
                 turn_errors.push(TurnErrRow {
+                    seq,
                     ts: ev.ts.clone(),
                     turn: ev.turn,
                     attempt_run_id: pending_attempt_run_id,
+                    model: ev.model.clone(),
+                    tokens_in: ev.tokens_in,
+                    tokens_out: ev.tokens_out,
+                    duration_ms: ev.duration_ms,
+                    tool_calls_ok: if stats.total() > 0 {
+                        stats.ok
+                    } else {
+                        ev.tool_count.unwrap_or(0)
+                    },
+                    tool_calls_fail: stats.fail,
+                    llm_rounds: attempt_llm_rounds,
+                    llm_round_details: pending_rounds,
+                    tool_groups: if matches!(focus, DigestFocus::All) {
+                        ev.tool_calls
+                            .as_ref()
+                            .map(|calls| build_tool_group_rows(calls))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     error: ev.error.clone().unwrap_or_default(),
                 });
             }
@@ -891,10 +1026,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     }
 
     let turn_count = turns_out.len();
-    let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if turn_count == 0 {
+    let attempt_count = turn_count + turn_error_count;
+    let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if attempt_count == 0 {
         (0.0, 0.0, 0.0)
     } else {
-        let n = turn_count as f64;
+        let n = attempt_count as f64;
         (
             total_tokens_in as f64 / n,
             total_tokens_out as f64 / n,
@@ -909,6 +1045,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         journal_lines_non_empty,
         journal_lines_malformed,
         aggregates: Aggregates {
+            attempt_count,
             turn_count,
             turn_error_count,
             compact_count,
@@ -927,20 +1064,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             avg_tokens_in,
             avg_tokens_out,
             avg_duration_ms,
-            avg_llm_rounds: if turn_count > 0 {
-                turns_out.iter().filter_map(|t| t.llm_rounds).sum::<u32>() as f64
-                    / turns_out
-                        .iter()
-                        .filter(|t| t.llm_rounds.is_some())
-                        .count()
-                        .max(1) as f64
+            avg_llm_rounds: if root_attempts_with_llm_rounds > 0 {
+                total_root_llm_rounds as f64 / root_attempts_with_llm_rounds as f64
             } else {
                 0.0
             },
             avg_tool_calls_per_round: {
-                let total_rounds: u32 = turns_out.iter().filter_map(|t| t.llm_rounds).sum();
-                if total_rounds > 0 {
-                    total_tool_calls as f64 / total_rounds as f64
+                if total_root_llm_rounds > 0 {
+                    total_tool_calls as f64 / total_root_llm_rounds as f64
                 } else {
                     0.0
                 }
@@ -979,7 +1110,8 @@ pub fn print_text(d: &JournalDigest) {
     let a = &d.aggregates;
     println!("\n  {}", "Aggregates".bold().magenta());
     println!(
-        "  turns={} turn_errors={} compacts={} stalls={} errors={}",
+        "  attempts={} turns={} turn_errors={} compacts={} stalls={} errors={}",
+        a.attempt_count.to_string().magenta(),
         a.turn_count.to_string().magenta(),
         a.turn_error_count,
         a.compact_count,
@@ -996,7 +1128,7 @@ pub fn print_text(d: &JournalDigest) {
         a.total_noop_or_cached_tool_calls,
         a.tool_calls_failed
     );
-    println!("\n  {}", "Averages (per turn)".bold().magenta());
+    println!("\n  {}", "Averages (per root attempt)".bold().magenta());
     println!(
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
@@ -1420,6 +1552,7 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.aggregates.attempt_count, 3);
         assert_eq!(d.turns.len(), 1);
         assert_eq!(d.turn_errors.len(), 2);
 
@@ -1442,6 +1575,11 @@ mod tests {
             d.turn_errors[1].attempt_run_id.as_deref(),
             Some("run-cancel-2")
         );
+        assert_eq!(d.turn_errors[0].llm_round_details.len(), 1);
+        assert_eq!(d.turn_errors[1].llm_round_details.len(), 1);
+        assert_eq!(d.turn_errors[0].seq, 1);
+        assert_eq!(d.turn_errors[1].seq, 2);
+        assert_eq!(turn.seq, 3);
     }
 
     #[test]
@@ -1876,6 +2014,24 @@ mod tests {
             "error_preview should be derived from result_preview when error field is empty: {}",
             f.error_preview
         );
+    }
+
+    #[test]
+    fn digest_repairs_legacy_stopped_control_receipt_misclassification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "test-stopped-receipt-00000000-0000-0000-0000-000000000099";
+        fs::write(
+            journal_path_for_test(sid),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":false,"ms":1,"error_kind":"unknown","error":"Tool returned an unrecognized status.","args_full":"{\"action\":\"stop_slot\",\"group_id\":\"review\",\"slot_index\":0}","result_preview":"{\"status\":\"stopped\",\"slot_status\":\"cancelled_by_user\",\"group_id\":\"review\",\"slot_index\":0}\n⚠ agent_fanout failed with an unclassified tool error."}]}"#,
+        )
+        .expect("write journal");
+
+        let digest = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(digest.aggregates.total_tool_calls, 1);
+        assert_eq!(digest.aggregates.tool_calls_failed, 0);
+        assert_eq!(digest.aggregates.total_fresh_tool_calls, 1);
+        assert!(digest.failed_tool_calls.is_empty());
     }
 
     #[test]
