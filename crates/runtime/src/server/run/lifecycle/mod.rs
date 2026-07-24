@@ -444,6 +444,8 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
+    executor
+        .restore_activated_deferred_tool_names_for_session(&state.activated_deferred_tool_names);
     let executor = std::sync::Arc::new(executor);
     state.hooks.task_board_monitor = Some(executor.task_manager());
     state.runtime_tool_executor = Some(executor);
@@ -3183,8 +3185,14 @@ impl AgenticRunLifecycleService {
         let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
+                let mut session_state = mat.session_state;
+                session_state.activated_deferred_tool_names =
+                    astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+                        &mat.messages,
+                        session_state.activated_deferred_tool_names,
+                    );
                 restored_messages = mat.messages;
-                restore_session_state_compact(mat.session_state, loop_state);
+                restore_session_state_compact(session_state, loop_state);
             }
             Ok(None) => {
                 restored_messages = self
@@ -5873,6 +5881,7 @@ impl AgenticRunLifecycleService {
             message: prompt_user_message.clone(),
             user_intent: prompt_user_intent,
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,
@@ -11696,6 +11705,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task.clone(),
             user_intent: full_task,
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,

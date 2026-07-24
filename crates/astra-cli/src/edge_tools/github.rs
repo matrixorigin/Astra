@@ -1,9 +1,8 @@
 use super::ToolExecutor;
+use astra_tools::github::resolve_github_repo_argument;
 use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
-
-const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' — infer repo from current user text or recent conversation; bare names like 'memoria' are allowed";
 
 impl ToolExecutor {
     async fn github_request(
@@ -100,16 +99,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn list_prs(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "list_prs",
                     "pull_requests",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -199,16 +198,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn get_pr(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "get_pr",
                     "pull_request",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -408,16 +407,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn ci_status(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "ci_status",
                     "workflow_runs",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -570,16 +569,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn list_issues(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "list_issues",
                     "issues",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -677,16 +676,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn get_issue(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "get_issue",
                     "issue",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -832,16 +831,16 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn repo_stats(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "repo_stats",
                     "repository",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -957,17 +956,10 @@ impl ToolExecutor {
     }
 
     pub(crate) async fn github_create_issue(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
-                return github_error_response(
-                    "github",
-                    "issue",
-                    None,
-                    None,
-                    None,
-                    GITHUB_MISSING_REPO_ERROR,
-                );
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
+                return github_error_response("github", "issue", None, None, None, error);
             }
         };
         let title = match args.get("title").and_then(Value::as_str) {
@@ -1739,10 +1731,10 @@ mod tests {
     use crate::edge_tools::extract_github_owner_repo;
 
     use super::{
-        GITHUB_MISSING_REPO_ERROR, GithubDetail, GithubRepoResolution, github_duration_seconds,
-        github_error_response, github_excerpt, github_issue_list_item, github_normalize_conclusion,
-        github_normalize_name, github_pick_resolved_repo, github_pr_list_item, github_pr_state,
-        github_requested_limit, github_timestamp,
+        GithubDetail, GithubRepoResolution, github_duration_seconds, github_error_response,
+        github_excerpt, github_issue_list_item, github_normalize_conclusion, github_normalize_name,
+        github_pick_resolved_repo, github_pr_list_item, github_pr_state, github_requested_limit,
+        github_timestamp, resolve_github_repo_argument,
     };
     use serde_json::{Value, json};
 
@@ -1912,17 +1904,18 @@ mod tests {
 
     #[test]
     pub(crate) fn github_missing_repo_error_guides_recovery() {
+        let error = resolve_github_repo_argument(&json!({}), &[]).unwrap_err();
         let response = github_error_response(
             "ci_status",
             "workflow_runs",
             Some(GithubDetail::Brief),
             None,
             None,
-            GITHUB_MISSING_REPO_ERROR,
+            error,
         );
         assert!(response.contains("missing 'repo'"));
-        assert!(response.contains("recent conversation"));
-        assert!(response.contains("memoria"));
+        assert!(response.contains("workspace repository"));
+        assert!(response.contains("owner/name"));
     }
 
     // ── Helper function correctness ──

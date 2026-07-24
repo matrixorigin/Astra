@@ -59,6 +59,10 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
 fn write_atomic_text(
     path: &Path,
     content: &str,
@@ -370,9 +374,22 @@ pub fn write_step_checkpoint(
 
     write_atomic_text(&path, &json, checkpoint_write_durability(checkpoint))?;
 
-    // Prune old light checkpoints if too many
-    if tier == "light" {
-        prune_light_checkpoints(&dir)?;
+    match checkpoint {
+        StepCheckpoint::Light(_) => prune_light_checkpoints(&dir)?,
+        StepCheckpoint::Heavy(_) => {
+            // A heavy checkpoint embeds the complete light cursor and is
+            // durably on disk at this point. Older light artifacts no longer
+            // improve recovery and only amplify writes/listing work. Cleanup
+            // is best-effort: failure must not invalidate the durable anchor.
+            if let Err(error) = prune_light_checkpoints_superseded_by(&dir, number) {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to prune light checkpoints superseded by heavy checkpoint {}: {}",
+                    number,
+                    error
+                );
+            }
+        }
     }
 
     Ok(path)
@@ -591,6 +608,54 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Remove light cursor artifacts already represented by a durable heavy anchor.
+///
+/// Checkpoint numbers are session-global and monotonically allocated. A light
+/// artifact with a larger number may belong to later work and must be retained.
+fn prune_light_checkpoints_superseded_by(dir: &Path, heavy_number: u32) -> std::io::Result<()> {
+    let mut removed_any = false;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to read dir entry during heavy checkpoint prune: {}",
+                    error
+                );
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(number) = file_name
+            .strip_suffix("-light.json")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if number > heavy_number {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed_any = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to prune light checkpoint {:?}: {}",
+                    entry.file_name(),
+                    error
+                );
+            }
+        }
+    }
+    if removed_any {
+        sync_dir(dir)?;
+    }
     Ok(())
 }
 pub fn read_breakpoint_index(
@@ -1085,6 +1150,7 @@ mod tests {
             budget_remaining_rounds: 8,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["grep".to_string(), "read_file".to_string()],
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -1151,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn write_step_checkpoint_prunes_old_light_artifacts_keeps_heavy_and_lists_tiers() {
+    fn durable_heavy_checkpoint_supersedes_all_older_light_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let session_id = unique_session_id("prune-list");
@@ -1180,16 +1246,93 @@ mod tests {
             .filter_map(|(number, tier)| matches!(tier, &CheckpointTier::Heavy).then_some(*number))
             .collect();
 
-        assert_eq!(light_numbers.len(), MAX_LIGHT_CHECKPOINTS);
-        assert_eq!(light_numbers.first().copied(), Some(10));
-        assert_eq!(
-            light_numbers.last().copied(),
-            Some((light_total - 1) as u32)
+        assert!(
+            light_numbers.is_empty(),
+            "the first durable heavy checkpoint embeds and supersedes every older light cursor"
         );
         assert_eq!(
             heavy_numbers,
             ((light_total as u32)..(light_total as u32 + 5)).collect::<Vec<_>>(),
             "heavy checkpoints must not be pruned when light checkpoints exceed the limit"
+        );
+    }
+
+    #[test]
+    fn durable_heavy_checkpoint_supersedes_older_light_cursor_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = unique_session_id("heavy-supersedes-light");
+        let light = make_light("same-step", 1.0);
+        let heavy = make_heavy(
+            "same-step",
+            vec![json!({"role": "assistant", "content": "recoverable"})],
+        );
+
+        write_step_checkpoint(TEST_USER_ID, &session_id, 1, &StepCheckpoint::Light(light)).unwrap();
+        write_step_checkpoint(
+            TEST_USER_ID,
+            &session_id,
+            2,
+            &StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_checkpoints(TEST_USER_ID, &session_id).unwrap(),
+            vec![(2, CheckpointTier::Heavy)],
+            "the durable heavy checkpoint already contains the latest cursor and full recovery state"
+        );
+        assert_eq!(
+            read_latest_light_checkpoint(TEST_USER_ID, &session_id)
+                .unwrap()
+                .expect("heavy checkpoint exposes its embedded light cursor")
+                .step_id,
+            "same-step"
+        );
+        assert_eq!(
+            read_latest_heavy_checkpoint(TEST_USER_ID, &session_id)
+                .unwrap()
+                .expect("durable recovery anchor")
+                .messages,
+            vec![json!({"role": "assistant", "content": "recoverable"})]
+        );
+    }
+
+    #[test]
+    fn heavy_checkpoint_never_prunes_a_later_light_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = unique_session_id("heavy-preserves-later-light");
+
+        write_step_checkpoint(
+            TEST_USER_ID,
+            &session_id,
+            3,
+            &StepCheckpoint::Light(make_light("later-step", 0.75)),
+        )
+        .unwrap();
+        write_step_checkpoint(
+            TEST_USER_ID,
+            &session_id,
+            2,
+            &StepCheckpoint::Heavy(Box::new(make_heavy(
+                "earlier-step",
+                vec![json!({"role": "assistant", "content": "earlier"})],
+            ))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_checkpoints(TEST_USER_ID, &session_id).unwrap(),
+            vec![(2, CheckpointTier::Heavy), (3, CheckpointTier::Light)],
+            "cleanup must be ordered by the durable recovery frontier, not by file type alone"
+        );
+        assert_eq!(
+            read_latest_light_checkpoint(TEST_USER_ID, &session_id)
+                .unwrap()
+                .expect("later cursor remains recoverable")
+                .step_id,
+            "later-step"
         );
     }
 

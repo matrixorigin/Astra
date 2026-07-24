@@ -99,7 +99,34 @@ impl GitHubClient {
     }
 }
 
-const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' — infer repo from current user text or recent conversation; bare names like 'memoria' are allowed";
+const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' and no preferred workspace repository is available; pass owner/name or configure repository context";
+
+/// Resolve the repository argument according to the public GitHub tool contract.
+///
+/// An explicit non-empty argument always wins. When it is omitted, use the
+/// executor-provided repository context (normally learned from the workspace's
+/// git remote). Keeping this policy outside either executor prevents schema and
+/// runtime behavior from drifting apart.
+pub fn resolve_github_repo_argument(
+    args: &Value,
+    preferred_repos: &[String],
+) -> Result<String, String> {
+    if let Some(repo) = args
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+    {
+        return Ok(repo.to_string());
+    }
+
+    preferred_repos
+        .iter()
+        .map(|repo| repo.trim())
+        .find(|repo| !repo.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| GITHUB_MISSING_REPO_ERROR.to_string())
+}
 
 /// Collect GitHub token candidates: `GITHUB_TOKEN` env var, then `gh auth token` CLI.
 /// Returns all valid tokens found (may be 0, 1, or 2).
@@ -247,16 +274,16 @@ impl GitHubClient {
     }
 
     pub async fn list_prs(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "list_prs",
                     "pull_requests",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -346,16 +373,16 @@ impl GitHubClient {
     }
 
     pub async fn get_pr(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "get_pr",
                     "pull_request",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -555,16 +582,16 @@ impl GitHubClient {
     }
 
     pub async fn ci_status(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "ci_status",
                     "workflow_runs",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -717,16 +744,16 @@ impl GitHubClient {
     }
 
     pub async fn list_issues(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "list_issues",
                     "issues",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -824,16 +851,16 @@ impl GitHubClient {
     }
 
     pub async fn get_issue(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "get_issue",
                     "issue",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -979,16 +1006,16 @@ impl GitHubClient {
     }
 
     pub async fn repo_stats(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
                 return github_error_response(
                     "repo_stats",
                     "repository",
                     Some(GithubDetail::Brief),
                     None,
                     None,
-                    GITHUB_MISSING_REPO_ERROR,
+                    error,
                 );
             }
         };
@@ -1104,17 +1131,10 @@ impl GitHubClient {
     }
 
     pub async fn create_issue(&self, args: &Value) -> String {
-        let repo = match args.get("repo").and_then(Value::as_str) {
-            Some(r) => r.to_string(),
-            None => {
-                return github_error_response(
-                    "github",
-                    "issue",
-                    None,
-                    None,
-                    None,
-                    GITHUB_MISSING_REPO_ERROR,
-                );
+        let repo = match resolve_github_repo_argument(args, &self.get_preferred_repos()) {
+            Ok(repo) => repo,
+            Err(error) => {
+                return github_error_response("github", "issue", None, None, None, error);
             }
         };
         let title = match args.get("title").and_then(Value::as_str) {
@@ -1900,10 +1920,79 @@ pub fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
     }
 }
 
+/// Detect GitHub repositories from the remotes of one explicit workspace.
+///
+/// This is shared by CLI, edge, and server executors so the GitHub schema's
+/// omitted-`repo` contract does not depend on execution placement.
+pub fn detect_github_remote_repos(project_root: &std::path::Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(project_root)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut repos = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(repo) = extract_github_owner_repo(line) else {
+            continue;
+        };
+        let normalized = repo.to_lowercase();
+        if !repos.contains(&normalized) {
+            repos.push(normalized);
+        }
+    }
+    repos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn omitted_repo_uses_first_non_empty_preferred_repo() {
+        let preferred = vec![
+            "matrixorigin/astra".to_string(),
+            "matrixorigin/memoria".to_string(),
+        ];
+
+        assert_eq!(
+            resolve_github_repo_argument(&json!({"action": "list_prs"}), &preferred).unwrap(),
+            "matrixorigin/astra"
+        );
+    }
+
+    #[test]
+    fn explicit_repo_wins_over_preferred_repo_and_blank_values_are_absent() {
+        let preferred = vec!["matrixorigin/astra".to_string()];
+
+        assert_eq!(
+            resolve_github_repo_argument(
+                &json!({"action": "list_prs", "repo": "owner/other"}),
+                &preferred
+            )
+            .unwrap(),
+            "owner/other"
+        );
+        assert_eq!(
+            resolve_github_repo_argument(&json!({"action": "list_prs", "repo": "  "}), &preferred)
+                .unwrap(),
+            "matrixorigin/astra"
+        );
+    }
+
+    #[test]
+    fn omitted_repo_without_context_fails_with_actionable_contract_error() {
+        let error = resolve_github_repo_argument(&json!({"action": "list_prs"}), &[]).unwrap_err();
+
+        assert!(error.contains("missing 'repo'"));
+        assert!(error.contains("preferred"));
+    }
 
     #[test]
     fn enforce_github_api_url_accepts_official_host_https() {
@@ -2021,6 +2110,41 @@ mod tests {
         assert_eq!(super::extract_github_owner_repo(line), None);
     }
 
+    #[test]
+    fn detect_github_remote_repos_is_workspace_scoped_and_deduplicated() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "git@github.com:MatrixOrigin/Astra.git"
+                ])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            detect_github_remote_repos(workspace.path()),
+            vec!["matrixorigin/astra"]
+        );
+        assert!(
+            detect_github_remote_repos(workspace.path().join("missing").as_path()).is_empty(),
+            "a server/edge executor must never borrow repository context from the process cwd"
+        );
+    }
+
     // ── github_pick_resolved_repo edge cases ──
 
     #[test]
@@ -2098,8 +2222,8 @@ mod tests {
             GITHUB_MISSING_REPO_ERROR,
         );
         assert!(response.contains("missing 'repo'"));
-        assert!(response.contains("recent conversation"));
-        assert!(response.contains("memoria"));
+        assert!(response.contains("workspace repository"));
+        assert!(response.contains("owner/name"));
     }
 
     // ── Helper function correctness ──

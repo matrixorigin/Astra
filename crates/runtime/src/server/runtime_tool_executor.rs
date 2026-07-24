@@ -951,11 +951,15 @@ impl RuntimeToolExecutor {
     }
 
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
+        self.current_activatable_tool_names_state()
+            .unwrap_or_default()
+    }
+
+    fn current_activatable_tool_names_state(&self) -> Option<HashSet<String>> {
         rwlock_read_clone_or_default(
             &self.current_activatable_tool_names,
             "current_activatable_tool_names_snapshot",
         )
-        .unwrap_or_default()
     }
 
     pub(crate) fn current_searchable_tool_names(&self) -> Option<HashSet<String>> {
@@ -998,14 +1002,17 @@ impl RuntimeToolExecutor {
     }
 
     pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let allowed = self.current_activatable_tool_names_snapshot();
+        let allowed = self.current_activatable_tool_names_state();
 
         // Use zero-clone filter path to avoid cloning the entire HashSet
         let mut result = Vec::new();
         match self.activated_deferred_tools.read() {
             Ok(guard) => {
                 for name in guard.iter() {
-                    if allowed.is_empty() || allowed.contains(name) {
+                    if allowed
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(name))
+                    {
                         result.push(name.clone());
                     }
                 }
@@ -1026,7 +1033,23 @@ impl RuntimeToolExecutor {
                 *guard = HashSet::new();
             }
         }
+        result.sort();
         result
+    }
+
+    pub fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_restore",
+        );
+        guard.clear();
+        guard.extend(
+            names
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned),
+        );
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
@@ -1106,8 +1129,11 @@ impl RuntimeToolExecutor {
         if name.is_empty() {
             return;
         }
-        let allowed = self.current_activatable_tool_names_snapshot();
-        if !allowed.is_empty() && !allowed.contains(name) {
+        let allowed = self.current_activatable_tool_names_state();
+        if allowed
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
             return;
         }
         let mut guard = rwlock_write_reset_on_poison(
@@ -8316,6 +8342,30 @@ esac
             activated.contains(&"agent_fanout".to_string()),
             "activated_deferred_tool_names must include agent_fanout after select: activation; got: {:?}",
             activated
+        );
+    }
+
+    #[test]
+    fn restored_activation_is_deterministic_and_filtered_by_current_surface() {
+        let (exec, _dir) = test_executor_with_agent_context();
+        exec.restore_activated_deferred_tool_names_for_session(&[
+            "web_fetch".to_string(),
+            " agent_fanout ".to_string(),
+            "agent_fanout".to_string(),
+            String::new(),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
+
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            vec!["agent_fanout"],
+            "restored prompt facts must be deduplicated and intersected with the live surface"
+        );
+
+        exec.set_current_activatable_tool_names(HashSet::new());
+        assert!(
+            exec.activated_deferred_tool_names().is_empty(),
+            "an explicitly empty installed surface must fail closed rather than act like an uninstalled surface"
         );
     }
 

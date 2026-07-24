@@ -332,6 +332,7 @@ mod tests {
             message: message.to_string(),
             user_intent: message.to_string(),
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),

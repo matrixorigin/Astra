@@ -220,8 +220,8 @@ pub(crate) struct SessionState {
     /// Most recent non-empty tool usage context — fed into tool-surface
     /// continuity for short follow-up turns.
     pub recent_tools: Vec<String>,
-    /// Deferred tools selected with `tool_search(select:...)` but not yet
-    /// consumed by a visible tool call.
+    /// Deferred schemas materialized in the retained session context.
+    /// Entries remain until reset or invalidation by the live tool surface.
     pub activated_deferred_tool_names: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,

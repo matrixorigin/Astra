@@ -314,6 +314,22 @@ pub fn mark_execution_incomplete_from_turn_evaluation(state: &mut AgenticLoopSta
 /// responses and explicit stop-hook boundaries) skip the main post-tool-policy checkpoint.
 /// This helper ensures those paths still persist the accumulated messages so that
 /// `/debug` turn inspection and session recovery have accurate per-iteration state.
+fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
+    let (StepCheckpoint::Heavy(left), StepCheckpoint::Heavy(right)) = (left, right) else {
+        return false;
+    };
+    let mut left = (**left).clone();
+    let mut right = (**right).clone();
+    // Wall-clock write time is artifact metadata, not recoverable execution
+    // state. It must not manufacture a new immutable timeline version.
+    left.light.created_at = 0;
+    right.light.created_at = 0;
+    match (serde_json::to_value(&left), serde_json::to_value(&right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let Some(sid) = state.current_session_id.as_ref() else {
         return;
@@ -363,6 +379,16 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     else {
         return;
     };
+    let persisted_activation = state
+        .runtime_tool_executor
+        .as_deref()
+        .map(|executor| executor.activated_deferred_tool_names())
+        .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
+    heavy.activated_deferred_tool_names =
+        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+            &checkpoint_messages,
+            persisted_activation,
+        );
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
     // Persist context pipeline state for warm-start on resume (includes emergent context).
@@ -380,6 +406,14 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         };
     }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
+    if state
+        .stall
+        .last_heavy_checkpoint
+        .as_ref()
+        .is_some_and(|previous| same_recovery_state(previous, &cp))
+    {
+        return;
+    }
 
     // A delegated run does not own the parent session timeline. Its recorder
     // counter is run-local, so writing it into the parent checkpoint directory
@@ -1547,6 +1581,38 @@ mod tests {
 
     #[test]
     #[serial_test::serial(session_journal_dir)]
+    fn heavy_checkpoint_carries_activation_after_tool_evidence_is_compacted() {
+        let user_id = "test-user";
+        let session_id = format!("activation-checkpoint-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.step_recorder.begin_turn(0);
+        state.activated_deferred_tool_names = vec!["github".to_string()];
+        state.messages = vec![
+            serde_json::json!({"role": "system", "content": "compacted", "_compact_boundary": true}),
+            serde_json::json!({"role": "user", "content": "continue"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let heavy =
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
+                .expect("read checkpoint")
+                .expect("heavy checkpoint");
+        assert_eq!(
+            heavy.activated_deferred_tool_names,
+            vec!["github"],
+            "compaction may remove tool-search messages but must not erase schema materialization state"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
     fn root_heavy_checkpoints_are_immutable_session_timeline_versions() {
         let user_id = "test-user";
         let session_id = format!("root-composite-{}", uuid::Uuid::new_v4());
@@ -1601,6 +1667,54 @@ mod tests {
         assert!(
             state.last_composite_snapshot.is_some(),
             "root loop must expose the current session composite snapshot"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn unchanged_recovery_state_does_not_create_duplicate_heavy_versions() {
+        let user_id = "test-user";
+        let session_id = format!("root-composite-dedup-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.session_turn = 7;
+        state.step_recorder.begin_turn(0);
+
+        try_write_heavy_checkpoint(&mut state);
+        let first_snapshot = state
+            .last_composite_snapshot
+            .clone()
+            .expect("first composite snapshot");
+        try_write_heavy_checkpoint(&mut state);
+
+        let index =
+            astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
+                .expect("read composite index");
+        assert_eq!(
+            index.snapshots.len(),
+            1,
+            "created_at alone is not recovery state and must not create a second durable version"
+        );
+        assert_eq!(
+            state
+                .last_composite_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.snapshot_id.as_str()),
+            Some(first_snapshot.snapshot_id.as_str())
+        );
+        assert_eq!(
+            astra_pipeline::step_checkpoint::list_checkpoints(user_id, &session_id)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, tier)| {
+                    matches!(tier, astra_pipeline::step_protocol::CheckpointTier::Heavy)
+                })
+                .count(),
+            1
         );
     }
 

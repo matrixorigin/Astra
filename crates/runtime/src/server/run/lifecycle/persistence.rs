@@ -793,15 +793,21 @@ fn truncate_for_projection(text: &str, max_chars: usize) -> String {
 pub(crate) fn extract_session_state_compact(
     state: &AgenticLoopState,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
+    let activated_deferred_tool_names = state
+        .runtime_tool_executor
+        .as_deref()
+        .map(crate::server::runtime_tool_executor::RuntimeToolExecutor::activated_deferred_tool_names)
+        .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
     astra_turn_core::conversation_log::SessionStateCompact {
         // CSL is conversation materialization, not execution policy. Persisting
         // transient restrictions, approvals, interruptions, budgets, or
         // compaction pressure here makes old materialized state hard-steer later
-        // turns. Runtime controls are restored only from explicit runtime
-        // checkpoints/interruption contracts.
+        // turns. Deferred activation is different: it records which full
+        // schemas the retained prompt has already materialized and remains
+        // subject to the current surface and runtime bindings on restore.
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
-        activated_deferred_tool_names: Vec::new(),
+        activated_deferred_tool_names,
         approval_overrides: None,
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
@@ -819,10 +825,11 @@ pub(crate) fn restore_session_state_compact(
     if !ss.recent_tools.is_empty() {
         loop_state.recent_tools = ss.recent_tools;
     }
-    // Intentionally ignore all runtime-control fields in SessionStateCompact.
-    // Older CSL records may contain them, but restoring them here would leak
-    // stale pauses, approvals, budget pressure, and compaction failures into a
-    // new user turn.
+    loop_state.activated_deferred_tool_names = ss.activated_deferred_tool_names;
+    // Intentionally ignore all actual runtime-control fields in
+    // SessionStateCompact. Older CSL records may contain them, but restoring
+    // them here would leak stale pauses, approvals, budget pressure, and
+    // compaction failures into a new user turn.
 }
 
 pub(crate) fn restore_step_checkpoint_runtime_state(
@@ -830,6 +837,13 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     current_date: &str,
     loop_state: &mut AgenticLoopState,
 ) {
+    let mut persisted_activation = std::mem::take(&mut loop_state.activated_deferred_tool_names);
+    persisted_activation.extend(restored.activated_deferred_tool_names.clone());
+    loop_state.activated_deferred_tool_names =
+        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+            &restored.messages,
+            persisted_activation,
+        );
     if !restored.cache_restore_report.journal_complete {
         tracing::warn!(
             target: "astra_runtime::recovery",

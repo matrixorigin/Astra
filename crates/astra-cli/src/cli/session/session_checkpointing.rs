@@ -414,6 +414,7 @@ mod tests {
             budget_remaining_rounds: 6,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
+            activated_deferred_tool_names: vec!["github".to_string()],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,

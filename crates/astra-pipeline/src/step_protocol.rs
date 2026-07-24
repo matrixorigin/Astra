@@ -708,6 +708,12 @@ pub struct HeavyCheckpoint {
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
+    /// Deferred schemas already materialized in the retained prompt context.
+    ///
+    /// This is not execution authority; resume paths must intersect it with
+    /// the current advertised surface and live runtime bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_deferred_tool_names: Vec<String>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -854,6 +860,7 @@ impl StepCheckpoint {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -2898,6 +2905,7 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec![],
             recent_tools: vec![],
+            activated_deferred_tool_names: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -2933,6 +2941,7 @@ mod tests {
             budget_remaining_rounds: 10,
             blocked_tools: vec![],
             recent_tools: vec![],
+            activated_deferred_tool_names: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3018,6 +3027,7 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
+            h.activated_deferred_tool_names = vec!["github".into()];
         }
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
@@ -3026,7 +3036,22 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
+            assert_eq!(h.activated_deferred_tool_names, vec!["github"]);
         }
+
+        let mut legacy_json = serde_json::to_value(&cp).unwrap();
+        legacy_json["Heavy"]
+            .as_object_mut()
+            .expect("externally tagged heavy checkpoint")
+            .remove("activated_deferred_tool_names");
+        let legacy: StepCheckpoint = serde_json::from_value(legacy_json).unwrap();
+        let StepCheckpoint::Heavy(legacy) = legacy else {
+            panic!("expected heavy checkpoint");
+        };
+        assert!(
+            legacy.activated_deferred_tool_names.is_empty(),
+            "checkpoints written before activation persistence must remain readable"
+        );
     }
 
     // ── Eviction Safety ──

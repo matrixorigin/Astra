@@ -2126,6 +2126,12 @@ pub struct AgenticLoopState {
     /// prompt-facing `message`.
     pub user_intent: String,
     pub recent_tools: Vec<String>,
+    /// Deferred schemas proven materialized in the retained session context.
+    ///
+    /// This is prompt continuity, not an authorization grant. The runtime
+    /// executor still intersects these names with the current advertised
+    /// surface and live bindings before schema injection or execution.
+    pub activated_deferred_tool_names: Vec<String>,
     /// True when the prior (immediately preceding) turn produced assistant
     /// output (text or tool calls). Set by the agentic loop on every turn
     /// boundary (`has_any_usage` from the just-completed ingest).
@@ -3556,6 +3562,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         user_intent: "test query".to_string(),
         has_prior_assistant_turn: false,
         recent_tools: Vec::new(),
+        activated_deferred_tool_names: Vec::new(),
         turn_intent: None,
         task_profile: TaskExecutionProfile::default(),
         last_turn_policy: TurnInteractionPolicy::default(),
@@ -4297,6 +4304,7 @@ pub(crate) mod tests {
             user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_finish_reason: None,

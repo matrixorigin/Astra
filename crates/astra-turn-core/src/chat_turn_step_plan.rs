@@ -6,18 +6,18 @@ use astra_pipeline::step_recorder::StepRecorder;
 /// Mirrors the `prepare_chat_turn_payload` tail that calls [`StepRecorder::record_plan`].
 pub fn record_agentic_step_plan_after_payload_prep(
     step_recorder: &mut StepRecorder,
-    first_surface_report: Option<&ToolSelectionReport>,
-    first_budget_pressure: f64,
+    current_surface_report: Option<&ToolSelectionReport>,
+    current_budget_pressure: f64,
 ) {
-    let selected_tool_names: Vec<String> = first_surface_report
+    let selected_tool_names: Vec<String> = current_surface_report
         .map(|r| r.visible_tools.clone())
         .unwrap_or_default();
-    let schema_budget_tokens = first_surface_report
+    let schema_budget_tokens = current_surface_report
         .map(|r| r.schema_budget_used as u64)
         .unwrap_or(0);
     step_recorder.record_plan(
         &selected_tool_names,
-        first_budget_pressure,
+        current_budget_pressure,
         schema_budget_tokens,
     );
 }
@@ -36,7 +36,14 @@ mod tests {
             schema_budget_total: 100,
         };
         record_agentic_step_plan_after_payload_prep(&mut rec, Some(&rep), 0.3);
-        // Smoke: recorder accepted without panic; phase advanced internally.
-        assert!(!rec.events().is_empty());
+        let event = rec.events().last().expect("plan event");
+        assert_eq!(
+            event.payload.as_ref().unwrap()["visible_tools"],
+            serde_json::json!(["bash"])
+        );
+        assert_eq!(
+            event.payload.as_ref().unwrap()["budget_pressure"],
+            serde_json::json!(0.3)
+        );
     }
 }

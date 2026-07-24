@@ -324,6 +324,12 @@ pub struct RestoredSession {
     /// Conversation messages from Step Protocol heavy checkpoint (for LLM resume).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_messages: Vec<serde_json::Value>,
+    /// Deferred schemas materialized in the retained conversation.
+    ///
+    /// This is prompt continuity, not execution authority; consumers must
+    /// intersect it with the current live tool surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_deferred_tool_names: Vec<String>,
     /// Blocked/health-avoidance tools from checkpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
@@ -386,6 +392,7 @@ pub struct CloudHeavyCheckpointState {
     pub messages: Vec<serde_json::Value>,
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
+    pub activated_deferred_tool_names: Vec<String>,
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
@@ -1035,6 +1042,10 @@ impl HybridRestoreService {
                         .map(|heavy| heavy.messages.clone())
                         .filter(|messages| !messages.is_empty())
                         .unwrap_or(transcript_messages),
+                    activated_deferred_tool_names: heavy_state
+                        .as_ref()
+                        .map(|heavy| heavy.activated_deferred_tool_names.clone())
+                        .unwrap_or_default(),
                     blocked_tools: heavy_state
                         .as_ref()
                         .map(|heavy| heavy.blocked_tools.clone())
@@ -1369,6 +1380,16 @@ fn reconcile_restored_session_candidates(
         .total_cache_creation_tokens
         .max(other.total_cache_creation_tokens);
     current.checkpoint_count = current.checkpoint_count.max(other.checkpoint_count);
+    // Schema materialization is monotonic within a session. Unlike messages
+    // and runtime controls, retaining an older activation cannot splice two
+    // causal histories and is still constrained by the current live surface.
+    append_unique_names(
+        &mut current.activated_deferred_tool_names,
+        other
+            .activated_deferred_tool_names
+            .iter()
+            .map(String::as_str),
+    );
 
     if current.git_branch.is_none() {
         current.git_branch = other.git_branch.clone();
@@ -1827,10 +1848,22 @@ pub fn parse_cloud_heavy_checkpoint_state(
         return Ok(None);
     };
     let recent_tools: Vec<String> = required_cloud_heavy_field(heavy, "recent_tools")?;
+    let activated_deferred_tool_names = heavy
+        .get("activated_deferred_tool_names")
+        .cloned()
+        .map(serde_json::from_value::<Vec<String>>)
+        .transpose()
+        .map_err(|source| {
+            format!(
+                "invalid cloud heavy checkpoint JSON field: field=activated_deferred_tool_names, source={source}"
+            )
+        })?
+        .unwrap_or_default();
     Ok(Some(CloudHeavyCheckpointState {
         messages: required_cloud_heavy_field(heavy, "messages")?,
         blocked_tools: required_cloud_heavy_field(heavy, "blocked_tools")?,
         recent_tools: normalize_name_list(recent_tools),
+        activated_deferred_tool_names: normalize_name_list(activated_deferred_tool_names),
         approval_overrides: heavy
             .get("approval_overrides")
             .cloned()
@@ -3604,6 +3637,7 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "stale local question"}),
                 serde_json::json!({"role": "assistant", "content": "stale local answer"}),
             ],
+            activated_deferred_tool_names: vec!["github".into()],
             restored_from_cloud: false,
             ..Default::default()
         };
@@ -3617,6 +3651,7 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "current cloud question"}),
                 serde_json::json!({"role": "assistant", "content": "current cloud answer"}),
             ],
+            activated_deferred_tool_names: vec!["web_fetch".into()],
             restored_from_cloud: true,
             ..Default::default()
         };
@@ -3638,6 +3673,11 @@ mod tests {
                 .iter()
                 .all(|message| message["content"] != "stale local answer"),
             "history from an older turn must not be combined with a newer turn count"
+        );
+        assert_eq!(
+            restored.activated_deferred_tool_names,
+            vec!["web_fetch", "github"],
+            "monotonic schema materialization may be unioned without mixing causal message projections"
         );
     }
 
@@ -4805,6 +4845,7 @@ mod tests {
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["rg".into()],
+            activated_deferred_tool_names: vec!["github".into()],
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
@@ -4816,6 +4857,7 @@ mod tests {
                 "messages": messages,
                 "blocked_tools": ["bash"],
                 "recent_tools": ["rg"],
+                "activated_deferred_tool_names": ["github"],
                 "approval_overrides": approval_overrides,
                 "interruption": interruption,
                 "compaction_state": compaction_state
@@ -4826,6 +4868,7 @@ mod tests {
             "messages": expected.messages.clone(),
             "blocked_tools": expected.blocked_tools.clone(),
             "recent_tools": expected.recent_tools.clone(),
+            "activated_deferred_tool_names": expected.activated_deferred_tool_names.clone(),
             "approval_overrides": expected.approval_overrides.clone(),
             "interruption": expected.interruption.clone(),
             "compaction_state": expected.compaction_state.clone()
@@ -4861,6 +4904,10 @@ mod tests {
         assert_eq!(
             state.recent_tools,
             vec!["rg".to_string(), "bash".to_string()]
+        );
+        assert!(
+            state.activated_deferred_tool_names.is_empty(),
+            "cloud checkpoints written before activation sidecars must remain readable"
         );
     }
 

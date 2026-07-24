@@ -82,6 +82,7 @@ pub(crate) fn session_state_compact_from_heavy_checkpoint(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: heavy.recent_tools.clone(),
+        activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
         ..Default::default()
     }
 }
@@ -124,7 +125,7 @@ pub(crate) fn next_step_checkpoint_number(user_id: &str, sid: &str) -> Result<u3
 pub(crate) fn build_manual_heavy_step_checkpoint(
     state: &SessionState,
     sid: &str,
-    _session_state: &astra_turn_core::conversation_log::SessionStateCompact,
+    session_state: &astra_turn_core::conversation_log::SessionStateCompact,
     previous_heavy: Option<&astra_pipeline::step_protocol::HeavyCheckpoint>,
 ) -> astra_pipeline::step_protocol::StepCheckpoint {
     use astra_pipeline::step_protocol::{
@@ -133,6 +134,15 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     };
 
     let messages = history_as_messages(&state.history);
+    let activated_deferred_tool_names =
+        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+            &messages,
+            state
+                .activated_deferred_tool_names
+                .iter()
+                .chain(session_state.activated_deferred_tool_names.iter())
+                .cloned(),
+        );
 
     let now_ms = epoch_ms();
     let total_tok = state.total_prompt_tokens + state.total_completion_tokens;
@@ -191,6 +201,7 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         budget_remaining_rounds: previous_budget_rounds.unwrap_or(0),
         blocked_tools: interrupted_blocked_tools,
         recent_tools: state.recent_tools.clone(),
+        activated_deferred_tool_names,
         memory_context: previous_heavy.and_then(|heavy| heavy.memory_context.clone()),
         delegation_id: interrupted_delegation
             .as_ref()

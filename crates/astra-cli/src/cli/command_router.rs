@@ -313,7 +313,7 @@ fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<Stri
     }
 }
 
-fn persist_one_shot_session_state(
+pub(crate) fn persist_headless_session_state(
     profile: Option<&str>,
     model: Option<&str>,
     line: &str,
@@ -344,6 +344,7 @@ fn persist_one_shot_session_state(
     {
         let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
             recent_tools: sr.tools_used.clone(),
+            activated_deferred_tool_names: sr.activated_deferred_tool_names.clone(),
             ..Default::default()
         };
         if let Err(error) =
@@ -379,7 +380,7 @@ fn finalize_one_shot_stream_result(
     sr: &mut StreamResult,
     turn_start: std::time::Instant,
 ) -> ExitCode {
-    persist_one_shot_session_state(profile, model, line, sr, turn_start);
+    persist_headless_session_state(profile, model, line, sr, turn_start);
     compute_exit_code(sr)
 }
 
@@ -596,7 +597,8 @@ async fn execute_headless_task_body(
         session_routing.restored_permission_mode(),
         true,
     )?;
-    let mut continuation_messages = session_routing.continuation_messages();
+    let (mut continuation_messages, activated_deferred_tool_names) =
+        session_routing.continuation_turn_inputs();
 
     emit_task_event(
         options.stream_events,
@@ -695,6 +697,7 @@ async fn execute_headless_task_body(
     let turn_start = std::time::Instant::now();
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
+        activated_deferred_tool_names,
         turn_index: Some(session_routing.next_server_turn_index()),
         ..Default::default()
     };
@@ -752,7 +755,7 @@ async fn execute_headless_task_body(
     sr.background_agent_results = background_agent_results;
     sr.integrate_background_agent_results();
 
-    persist_one_shot_session_state(
+    persist_headless_session_state(
         Some(&profile_name),
         effective_model.as_deref(),
         &prompt,
@@ -1460,7 +1463,8 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let mut continuation_messages = session_routing.continuation_messages();
+            let (mut continuation_messages, activated_deferred_tool_names) =
+                session_routing.continuation_turn_inputs();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
@@ -1500,6 +1504,7 @@ async fn execute_cli_command_impl(
             };
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
+                activated_deferred_tool_names,
                 turn_index: Some(session_routing.next_server_turn_index()),
                 ..Default::default()
             };
@@ -1956,7 +1961,8 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let mut continuation_messages = session_routing.continuation_messages();
+            let (mut continuation_messages, activated_deferred_tool_names) =
+                session_routing.continuation_turn_inputs();
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
@@ -2054,6 +2060,7 @@ async fn execute_cli_command_impl(
             };
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
+                activated_deferred_tool_names,
                 append_system_prompt: args.append_system_prompt.clone(),
                 disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 turn_index: Some(session_routing.next_server_turn_index()),
@@ -2714,7 +2721,8 @@ pub(crate) async fn run_print_mode(
         session_routing.restored_permission_mode(),
         true,
     )?;
-    let mut continuation_messages = session_routing.continuation_messages();
+    let (mut continuation_messages, activated_deferred_tool_names) =
+        session_routing.continuation_turn_inputs();
     let _pipeline = create_pipeline_modules(api, profile);
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.
@@ -2784,6 +2792,7 @@ pub(crate) async fn run_print_mode(
 
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
+        activated_deferred_tool_names,
         turn_index: Some(session_routing.next_server_turn_index()),
         ..Default::default()
     };
@@ -3573,7 +3582,7 @@ mod one_shot_effective_settings_tests {
 #[cfg(test)]
 mod one_shot_persistence_tests {
     use super::{
-        ExitCode, StreamResult, finalize_one_shot_stream_result, persist_one_shot_session_state,
+        ExitCode, StreamResult, finalize_one_shot_stream_result, persist_headless_session_state,
     };
 
     #[cfg(unix)]
@@ -3587,6 +3596,7 @@ mod one_shot_persistence_tests {
         let mut result = crate::tests::stub_stream_result("manifest inspected");
         result.session_id = Some(sid.clone());
         result.tools_used = vec!["read_file".to_string()];
+        result.activated_deferred_tool_names = vec!["github".to_string()];
         result.tool_calls_count = 1;
         result.final_messages = vec![
             serde_json::json!({"role": "user", "content": "inspect Cargo.toml"}),
@@ -3609,7 +3619,7 @@ mod one_shot_persistence_tests {
             serde_json::json!({"role": "assistant", "content": "manifest inspected"}),
         ];
 
-        persist_one_shot_session_state(
+        persist_headless_session_state(
             None,
             Some("test-model"),
             "inspect Cargo.toml",
@@ -3632,6 +3642,14 @@ mod one_shot_persistence_tests {
         assert_eq!(tool_call["tool_calls"][0]["id"], "call-1");
         assert_eq!(tool_result["tool_call_id"], "call-1");
         assert_eq!(tool_result["content"], "[package]\nname = \"astra\"");
+        assert_eq!(
+            crate::cli::session::session_continuation::load_csl_continuation(&sid)
+                .unwrap()
+                .unwrap()
+                .activated_deferred_tool_names,
+            vec!["github"],
+            "one-shot settlement must make deferred activation durable for the next process"
+        );
     }
 
     #[test]
@@ -3651,7 +3669,7 @@ mod one_shot_persistence_tests {
             serde_json::json!({"role": "assistant", "content": "locally recoverable answer"}),
         ];
 
-        persist_one_shot_session_state(
+        persist_headless_session_state(
             Some("default"),
             Some("test-model"),
             "keep this turn",
@@ -3685,7 +3703,7 @@ mod one_shot_persistence_tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn persist_one_shot_session_state_marks_stream_result_and_skips_pointer_update_on_append_failure()
+    fn persist_headless_session_state_marks_stream_result_and_skips_pointer_update_on_append_failure()
      {
         let _home = crate::tests::HomeGuard::temp();
         let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
@@ -3748,6 +3766,7 @@ mod one_shot_persistence_tests {
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             tool_call_records: Vec::new(),
             budget_used: 0,
             budget_pressure: 0.0,
@@ -3773,7 +3792,7 @@ mod one_shot_persistence_tests {
             background_agent_results: Vec::new(),
         };
 
-        persist_one_shot_session_state(
+        persist_headless_session_state(
             Some("default"),
             Some("test-model"),
             "continue",
@@ -3863,6 +3882,7 @@ mod one_shot_persistence_tests {
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             tool_call_records: Vec::new(),
             budget_used: 0,
             budget_pressure: 0.0,

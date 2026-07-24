@@ -199,6 +199,7 @@ fn build_restored_from_scan(
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
+        activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
         resume_turn: extract_turn_from_step_id(&heavy.light.step_id),
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,

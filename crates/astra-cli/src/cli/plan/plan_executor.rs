@@ -3909,6 +3909,7 @@ All acceptance checks pass:
             visible_tools: vec!["read_file".into(), "write_file".into()],
             selected_skills: vec!["debug".into()],
             tools_used: vec!["read_file".into(), "write_file".into()],
+            activated_deferred_tool_names: Vec::new(),
             tool_call_records: vec![
                 astra_services::session_journal::ToolCallRecord {
                     name: "read_file".into(),

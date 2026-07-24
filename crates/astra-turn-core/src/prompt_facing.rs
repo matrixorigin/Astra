@@ -450,12 +450,10 @@ pub fn runtime_recap_message(state: &SessionStateCompact) -> Option<Value> {
     if !state.recent_tools.is_empty() {
         lines.push(format!("Recent tools: {}", state.recent_tools.join(", ")));
     }
-    if !state.activated_deferred_tool_names.is_empty() {
-        lines.push(format!(
-            "Activated deferred tools awaiting schema injection: {}",
-            state.activated_deferred_tool_names.join(", ")
-        ));
-    }
+    // Deferred activation is represented structurally by the injected tool
+    // schema and retained as recovery sidecar state. Repeating it as prose
+    // creates a second, stale-able source of truth and needlessly changes the
+    // provider cache prefix.
     // Checkpoint headroom is recovery diagnostics, not model policy. In
     // particular, `budget_remaining_tokens` historically measured assembled
     // context headroom while `budget_remaining_rounds` measured agent-loop
@@ -1042,7 +1040,10 @@ mod tests {
 
         assert!(content.starts_with("[Session runtime recap]"));
         assert!(content.contains("Recent tools: read_file, grep"));
-        assert!(content.contains("Activated deferred tools awaiting schema injection: write_file"));
+        assert!(
+            !content.contains("write_file"),
+            "schema materialization belongs in the tool surface, not recap prose"
+        );
         assert!(!content.contains("checkpoint budget"));
         assert!(!content.contains("tokens=1234"));
         assert!(content.contains("Context-window recovery attempts: 2"));

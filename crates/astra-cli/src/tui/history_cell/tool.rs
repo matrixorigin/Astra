@@ -8,7 +8,7 @@
 //!   until the final `complete()` call.
 //! - **Success** — green bullet, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `Ran <name> · Xms`, otherwise identical to success.
+//! - **Failed** — red bullet, `Failed <name> · Xms`, otherwise identical to success.
 //! - **Rejected** — warning bullet, `Did not run <name> · Xms`; the
 //!   runtime rejected the request before execution began
 //!
@@ -577,6 +577,8 @@ impl ToolCell {
         } else {
             let title = if self.execution_was_rejected() {
                 format!("Did not run {label}")
+            } else if self.status == ToolStatus::Failed {
+                format!("Failed {label}")
             } else if let Some(task_header) = background_task_tool_header(&self.name) {
                 task_header.to_string()
             } else {
@@ -1300,11 +1302,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_header_uses_red_bullet_without_status_word() {
+    fn failed_header_names_the_failure_instead_of_reporting_successful_execution() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("● Ran Bash · 10ms"));
-        assert!(!out.contains("· failed"), "{out}");
+        assert!(out.contains("● Failed Bash · 10ms"), "{out}");
+        assert!(!out.contains("● Ran Bash"), "{out}");
     }
 
     #[test]

@@ -622,6 +622,7 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
 
     restore_session_state_compact(
         astra_turn_core::conversation_log::SessionStateCompact {
+            activated_deferred_tool_names: vec!["github".into()],
             approval_overrides: Some(json!({"approval": "stale"})),
             budget_remaining_tokens: 42_000,
             budget_remaining_rounds: 3,
@@ -648,6 +649,11 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
     assert_eq!(state.remaining_turns, 9);
     assert_eq!(state.consecutive_context_window_errors, 0);
     assert_eq!(state.compaction_effectiveness.attempt_count, 0);
+    assert_eq!(
+        state.activated_deferred_tool_names,
+        vec!["github"],
+        "schema materialization is prompt continuity, not a stale runtime control"
+    );
 }
 
 #[test]
@@ -681,6 +687,7 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
         },
     ));
     state.compaction_effectiveness.attempt_count = 7;
+    state.activated_deferred_tool_names = vec!["github".into()];
 
     let compact = extract_session_state_compact(&state);
 
@@ -694,6 +701,46 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
     assert_eq!(compact.budget_remaining_rounds, 0);
     assert_eq!(compact.consecutive_ctx_errors, 0);
     assert!(compact.compaction_tracker.is_none());
+    assert_eq!(
+        compact.activated_deferred_tool_names,
+        vec!["github"],
+        "CSL must carry prompt-visible deferred schema materialization across turns"
+    );
+}
+
+#[test]
+fn csl_session_state_snapshots_live_executor_activation() {
+    let svc = test_service();
+    let request = test_request("resume");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.activated_deferred_tool_names = vec!["stale-state-copy".into()];
+    let workspace = tempfile::tempdir().expect("workspace");
+    let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workspace.path().to_path_buf(),
+        "test-user".to_string(),
+        "session-1".to_string(),
+        None,
+        None,
+    );
+    executor
+        .restore_activated_deferred_tool_names_for_session(&["web_fetch".into(), "github".into()]);
+    state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
+
+    let compact = extract_session_state_compact(&state);
+
+    assert_eq!(
+        compact.activated_deferred_tool_names,
+        vec!["github", "web_fetch"],
+        "settlement must snapshot the live executor rather than an older loop-state copy"
+    );
 }
 
 #[test]
@@ -855,6 +902,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         budget_remaining_rounds: 0,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
+        activated_deferred_tool_names: vec!["github".into()],
         resume_turn: 0,
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         completed_tool_results: HashMap::new(),
@@ -880,6 +928,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
 
     assert!(state.restricted_tools.contains("flaky_tool"));
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
+    assert_eq!(state.activated_deferred_tool_names, vec!["github"]);
     assert!(
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"

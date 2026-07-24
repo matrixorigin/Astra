@@ -953,6 +953,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             message: config.task.clone(),
             user_intent: config.task.clone(),
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,

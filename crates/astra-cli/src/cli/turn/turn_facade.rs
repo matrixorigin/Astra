@@ -19,6 +19,7 @@ use crate::cli::stream::streaming_types::{StreamResult, TurnFailure};
 #[derive(Clone, Default)]
 pub(crate) struct BasicCliTurnOptions {
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    pub(crate) activated_deferred_tool_names: Vec<String>,
     pub(crate) append_system_prompt: Option<String>,
     pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
@@ -36,10 +37,12 @@ fn build_basic_cli_turn_params<'a>(
     skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     options: &BasicCliTurnOptions,
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    activated_deferred_tool_names: Option<&'a mut Vec<String>>,
 ) -> ChatTurnParams<'a> {
     let mut params =
         ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager, skill_quality_tracker);
     params.pre_loaded_messages = pre_loaded_messages;
+    params.activated_deferred_tool_names = activated_deferred_tool_names;
     params.append_system_prompt = options.append_system_prompt.clone();
     params.cancel_token = options.cancel_token.clone();
     params.approval_request_tx = options.approval_request_tx.clone();
@@ -74,6 +77,8 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
 ) -> Result<StreamResult, TurnFailure> {
     let pre_loaded_messages = options.pre_loaded_messages.take();
     let retry_messages = retry_pre_loaded_messages(&pre_loaded_messages);
+    let mut activated_deferred_tool_names =
+        std::mem::take(&mut options.activated_deferred_tool_names);
     let params = build_basic_cli_turn_params(
         ctx,
         token,
@@ -82,6 +87,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
         skill_quality_tracker,
         &options,
         pre_loaded_messages,
+        Some(&mut activated_deferred_tool_names),
     );
     match stream_chat_sse(params).await {
         Err(err)
@@ -109,6 +115,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
                 skill_quality_tracker,
                 &options,
                 retry_messages,
+                Some(&mut activated_deferred_tool_names),
             ))
             .await
         }

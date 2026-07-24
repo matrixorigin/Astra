@@ -5106,10 +5106,13 @@ fn materialize_prepared_fork_restore(
         if !materialized.session_state.recent_tools.is_empty() {
             recent_tools = materialized.session_state.recent_tools.clone();
         }
-        activated_deferred_tool_names = materialized
-            .session_state
-            .activated_deferred_tool_names
-            .clone();
+        activated_deferred_tool_names = session_continuation::continuation_activation_names(
+            &materialized.messages,
+            materialized
+                .session_state
+                .activated_deferred_tool_names
+                .clone(),
+        );
     }
     PreparedForkRestore {
         history,
@@ -5433,6 +5436,7 @@ async fn apply_restored_session(
         .max(local_state.total_cache_creation_tokens);
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
+    let mut restored_activation = restored.activated_deferred_tool_names.clone();
     let last_turn_event = local_journal.last_turn_event;
     let user_id = state
         .ingestion_user_id
@@ -5579,6 +5583,15 @@ async fn apply_restored_session(
         || restored.approval_overrides.is_some()
         || restored.interruption.is_some()
         || restored.compaction_state.is_some();
+    if let Some(step_restored) = step_restored.as_ref() {
+        restored_activation.extend(step_restored.activated_deferred_tool_names.iter().cloned());
+    }
+    restored_activation.extend(
+        prepared_history
+            .activated_deferred_tool_names
+            .iter()
+            .cloned(),
+    );
     if step_restore_error.is_some()
         && !has_cloud_heavy_fallback
         && let Some(error) = step_restore_error.as_ref()
@@ -5687,7 +5700,6 @@ async fn apply_restored_session(
     if !prepared_history.recent_tools.is_empty() {
         state.recent_tools = prepared_history.recent_tools;
     }
-    state.activated_deferred_tool_names = prepared_history.activated_deferred_tool_names;
     state.csl_manager = prepared_history.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
@@ -5700,6 +5712,10 @@ async fn apply_restored_session(
                 .unwrap_or_else(|| session_projection::history_as_messages(&state.history));
         fallback_resume_messages.as_slice()
     };
+    state.activated_deferred_tool_names = session_continuation::continuation_activation_names(
+        canonical_resume_messages,
+        restored_activation,
+    );
     session_projection::seed_continuation_objective_from_messages(state, canonical_resume_messages);
     session_projection::rebuild_continuation_anchor_from_live_state(state).await;
     state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(

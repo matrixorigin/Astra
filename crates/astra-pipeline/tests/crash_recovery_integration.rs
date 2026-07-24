@@ -38,6 +38,7 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         budget_remaining_rounds: 0,
         blocked_tools: vec![],
         recent_tools: vec![],
+        activated_deferred_tool_names: vec![],
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,

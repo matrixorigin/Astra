@@ -921,6 +921,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         visible_tool_tokens_total,
         surface_report.schema_budget_total,
     );
+    // `first_selection_report` is turn-level telemetry and intentionally
+    // remains immutable after round zero. Step telemetry is round-level and
+    // must use this round's actual final surface.
+    let current_surface_report = final_surface_report.clone();
     let final_visible_tool_names_for_trace = final_visible_tool_names.clone();
     *ctx.valid_tool_names = final_visible_tool_names;
 
@@ -963,8 +967,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     record_agentic_step_plan_after_payload_prep(
         ctx.step_recorder,
-        ctx.telem.first_selection_report.as_ref(),
-        *ctx.telem.first_budget_pressure,
+        Some(&current_surface_report),
+        budget_pressure,
     );
 
     record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
@@ -3398,8 +3402,14 @@ mod tests {
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
+        let mut first_selection_report =
+            Some(astra_turn_core::tool_registry_report::ToolSelectionReport {
+                visible_tools: vec!["stale_first_round_tool".to_string()],
+                visible_count: 1,
+                schema_budget_used: 1,
+                schema_budget_total: 2,
+            });
+        let mut first_budget_pressure = 0.99;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
         let trace_collector = TurnTraceCollector::new("turn-1", "session-1");
@@ -3496,6 +3506,29 @@ mod tests {
             trace.tools.tools_available as usize,
             payload["edge_tools"].as_array().unwrap().len(),
             "context assembly trace tools_available must be the final visible count"
+        );
+        let plan_event = step_recorder
+            .events()
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.event_type,
+                    astra_pipeline::step_protocol::StepEventType::StepStarted
+                )
+            })
+            .expect("round plan event");
+        assert_eq!(
+            plan_event.payload.as_ref().unwrap()["visible_tools"],
+            json!(edge_tool_names),
+            "round-level step telemetry must describe the current final tool surface, not the immutable first-round report"
+        );
+        assert_eq!(
+            first_selection_report
+                .as_ref()
+                .map(|report| report.visible_tools.as_slice()),
+            Some(["stale_first_round_tool".to_string()].as_slice()),
+            "turn-level first-surface telemetry must remain immutable"
         );
     }
 

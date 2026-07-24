@@ -4,7 +4,7 @@
 //! change counting, and safe cleanup.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -112,47 +112,12 @@ impl GitWorktreeRollbackJournal {
 /// Extract owner/repo from git remote URLs in the given directory.
 /// Returns lowercased "owner/repo" strings for all GitHub remotes.
 pub(super) fn detect_git_remote_repos(project_root: &Path) -> Vec<String> {
-    let output = Command::new("git")
-        .args(["remote", "-v"])
-        .current_dir(project_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut repos = Vec::new();
-    for line in stdout.lines() {
-        if let Some(repo) = extract_github_owner_repo(line) {
-            let lower = repo.to_lowercase();
-            if !repos.contains(&lower) {
-                repos.push(lower);
-            }
-        }
-    }
-    repos
+    astra_tools::github::detect_github_remote_repos(project_root)
 }
 
 /// Parse owner/repo from a GitHub remote URL (SSH or HTTPS).
 pub(super) fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
-    // SSH:   git@github.com:MatrixOrigin/Memoria.git (fetch)
-    // HTTPS: https://github.com/MatrixOrigin/Memoria.git (fetch)
-    let parts: Vec<&str> = remote_line.split_whitespace().collect();
-    let url = parts.get(1)?;
-    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest
-    } else if url.contains("://github.com/") {
-        url.rsplit_once("github.com/")?.1
-    } else {
-        return None;
-    };
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    if path.contains('/') && !path.contains(' ') {
-        Some(path.to_string())
-    } else {
-        None
-    }
+    astra_tools::github::extract_github_owner_repo(remote_line)
 }
 
 /// Count uncommitted changes and new commits in a worktree since a baseline commit.

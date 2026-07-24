@@ -282,7 +282,8 @@ impl DefaultToolExecutor {
         executor.http_client_available = http_client_available;
         let tokens = crate::github::resolve_github_tokens();
         if !tokens.is_empty() {
-            let github = GitHubClient::from_tokens(http_client, tokens, Vec::new());
+            let preferred_repos = crate::github::detect_github_remote_repos(workspace);
+            let github = GitHubClient::from_tokens(http_client, tokens, preferred_repos);
             executor = executor.with_github_client(github);
         }
         executor

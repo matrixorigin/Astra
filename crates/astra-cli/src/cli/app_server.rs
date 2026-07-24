@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
 use crate::cli::cli_config::cli_utils::get_profile_and_token;
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
-use crate::cli::session::session_continuation::load_session_messages_for_continuation;
+use crate::cli::session::session_continuation::{
+    SessionContinuation, load_session_continuation_for_recovery,
+};
 use crate::cli::session::session_runtime;
 use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
@@ -453,14 +455,21 @@ async fn run_turn(
         .map(str::to_string)
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
-    let continuation_messages = app_server_continuation_messages(&thread_id);
+    let continuation = app_server_continuation(&thread_id);
+    let activated_deferred_tool_names = continuation
+        .as_ref()
+        .map(|continuation| continuation.activated_deferred_tool_names.clone())
+        .unwrap_or_default();
+    let continuation_messages = continuation.map(|continuation| continuation.messages);
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages,
+        activated_deferred_tool_names,
         append_system_prompt,
         cancel_token: Some(cancel),
         approval_request_tx: Some(approval_tx.clone()),
         ..Default::default()
     };
+    let turn_start = std::time::Instant::now();
     let result = crate::cli::turn::execute_basic_cli_turn(
         &chat_ctx,
         &token,
@@ -499,6 +508,13 @@ async fn run_turn(
     };
     sr.background_agent_results = background_agent_results;
     sr.integrate_background_agent_results();
+    persist_app_server_turn(
+        ctx.auth_profile.as_deref(),
+        model.as_deref(),
+        &message,
+        &mut sr,
+        turn_start,
+    );
     let next_thread_id = next_thread_id_after_turn(&thread_id, sr.session_id.as_deref());
     state.lock().await.thread_id = Some(next_thread_id.clone());
     write_turn_result(&writer, &thread_id, &next_thread_id, &turn_id, &sr).await?;
@@ -552,8 +568,20 @@ fn next_thread_id_after_turn(thread_id: &str, session_id: Option<&str>) -> Strin
     }
 }
 
-fn app_server_continuation_messages(thread_id: &str) -> Option<Vec<serde_json::Value>> {
-    load_session_messages_for_continuation(thread_id)
+fn app_server_continuation(thread_id: &str) -> Option<SessionContinuation> {
+    load_session_continuation_for_recovery(thread_id)
+}
+
+fn persist_app_server_turn(
+    profile: Option<&str>,
+    model: Option<&str>,
+    message: &str,
+    result: &mut StreamResult,
+    turn_start: std::time::Instant,
+) {
+    crate::cli::command_router::persist_headless_session_state(
+        profile, model, message, result, turn_start,
+    );
 }
 
 fn developer_instructions(params: &Value) -> Option<String> {
@@ -911,15 +939,55 @@ async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_response_from_params, explain_mode_from_params, extract_turn_message,
-        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
-        requested_thread_id, stream_event_notification, thread_started_params,
-        turn_completed_params,
+        app_server_continuation, approval_response_from_params, explain_mode_from_params,
+        extract_turn_message, join_or_abort_app_server_task, next_thread_id_after_turn,
+        permission_mode_from_params, persist_app_server_turn, requested_thread_id,
+        stream_event_notification, thread_started_params, turn_completed_params,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
     use crate::cli::permission_manager::PermissionMode;
     use std::time::Duration;
+
+    #[test]
+    #[serial_test::serial]
+    fn app_server_settlement_restores_deferred_activation_for_the_next_turn() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let session_id = format!("app-server-activation-{}", uuid::Uuid::new_v4());
+        let mut result = crate::tests::stub_stream_result("done");
+        result.session_id = Some(session_id.clone());
+        result.tools_used = vec!["github".to_string()];
+        result.activated_deferred_tool_names = vec!["github".to_string()];
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "list pull requests"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+
+        persist_app_server_turn(
+            None,
+            Some("test-model"),
+            "list pull requests",
+            &mut result,
+            std::time::Instant::now(),
+        );
+
+        let continuation =
+            app_server_continuation(&session_id).expect("next app-server turn continuation");
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "a long-lived app-server must not require tool_search again on every visible turn"
+        );
+        assert_eq!(
+            continuation
+                .messages
+                .get(..result.final_messages.len())
+                .expect("persisted user-visible messages"),
+            result.final_messages.as_slice(),
+            "runtime-owned projections may follow, but must not replace or reorder the turn"
+        );
+    }
 
     #[test]
     fn extract_turn_message_collects_text_items() {

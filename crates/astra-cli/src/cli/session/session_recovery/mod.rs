@@ -443,6 +443,7 @@ mod tests {
             budget_remaining_rounds: 7,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
+            activated_deferred_tool_names: vec!["github".to_string()],
             memory_context: Some(astra_pipeline::step_protocol::MemoryContext {
                 retrieved_memory_ids: vec!["m-1".to_string()],
                 domain_hints: vec!["rust".to_string()],
@@ -473,6 +474,11 @@ mod tests {
         let StepCheckpoint::Heavy(heavy) = checkpoint else {
             panic!("expected Heavy checkpoint");
         };
+        assert_eq!(
+            heavy.activated_deferred_tool_names,
+            vec!["github"],
+            "manual recovery must retain prompt-visible deferred schemas independently of interruption state"
+        );
         assert_eq!(heavy.budget_remaining_tokens, 0);
         assert_eq!(heavy.budget_remaining_rounds, 0);
         assert!(heavy.blocked_tools.is_empty());
@@ -520,6 +526,7 @@ mod tests {
             budget_remaining_rounds: 7,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -803,6 +810,7 @@ mod tests {
             budget_remaining_rounds: 7,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["read_file".to_string()],
+            activated_deferred_tool_names: vec!["github".to_string()],
             memory_context: None,
             delegation_id: Some("deleg-1".to_string()),
             delegation_pattern: Some("fan_out".to_string()),
@@ -828,6 +836,10 @@ mod tests {
         let compact = session_state_compact_from_heavy_checkpoint(&heavy);
 
         assert_eq!(compact.recent_tools, vec!["read_file".to_string()]);
+        assert_eq!(
+            compact.activated_deferred_tool_names,
+            vec!["github".to_string()]
+        );
         assert!(compact.blocked_tools.is_empty());
         assert!(compact.approval_overrides.is_none());
         assert!(compact.compaction_tracker.is_none());
@@ -856,6 +868,7 @@ mod tests {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: Some("deleg-1".to_string()),
             delegation_pattern: None,
@@ -943,6 +956,7 @@ mod tests {
             budget_remaining_rounds: 9,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,

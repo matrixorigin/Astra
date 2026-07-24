@@ -944,6 +944,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message.to_string(),
         user_intent: p.user_intent.to_string(),
         recent_tools: p.recent_tools.to_vec(),
+        activated_deferred_tool_names: host.executor.activated_deferred_tool_names(),
         has_prior_assistant_turn: false,
         turn_intent: None,
         task_profile,
@@ -1119,6 +1120,7 @@ pub(crate) async fn stream_chat_sse(
         &mut p.activated_deferred_tool_names,
         host.executor.as_ref(),
     );
+    let activated_deferred_tool_names = host.executor.activated_deferred_tool_names();
     // Merge skill quality data back to session-scoped tracker
     *p.skill_quality_tracker = state.skills.quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
@@ -1238,6 +1240,7 @@ pub(crate) async fn stream_chat_sse(
         first_surface_report: state.telemetry.first_selection_report,
         selected_skills: state.telemetry.all_selected_skills,
         tools_used: state.telemetry.all_tools_used,
+        activated_deferred_tool_names,
         tool_call_records: state.stall.tool_call_records,
         budget_pressure: state.telemetry.first_budget_pressure,
         stall_events: state.stall.events,

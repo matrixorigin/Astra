@@ -6,9 +6,20 @@
 use serde_json::{Value, json};
 
 #[derive(Debug)]
-pub(crate) struct CslContinuation {
-    pub(crate) completed_turn_count: u32,
+pub(crate) struct SessionContinuation {
+    pub(crate) completed_turn_count: Option<u32>,
     pub(crate) messages: Vec<Value>,
+    pub(crate) activated_deferred_tool_names: Vec<String>,
+}
+
+pub(crate) fn continuation_activation_names(
+    messages: &[Value],
+    persisted_names: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+        messages,
+        persisted_names,
+    )
 }
 
 /// Load prompt-facing continuation from canonical local session state.
@@ -21,8 +32,14 @@ pub(crate) struct CslContinuation {
 /// A heavy checkpoint is the final recovery fallback. The TUI transcript is a
 /// display projection and is deliberately never used as model history.
 pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
-    match load_csl_messages_for_continuation(session_id) {
-        Ok(Some(messages)) => return Some(messages),
+    load_session_continuation_for_recovery(session_id).map(|continuation| continuation.messages)
+}
+
+pub(crate) fn load_session_continuation_for_recovery(
+    session_id: &str,
+) -> Option<SessionContinuation> {
+    match load_csl_continuation(session_id) {
+        Ok(Some(continuation)) => return Some(continuation),
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
@@ -33,21 +50,48 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
         }
     }
 
-    match load_journal_messages_for_continuation(session_id) {
-        Ok(Some(messages)) => return Some(messages),
-        Ok(None) => {}
+    let journal_messages = match load_journal_messages_for_continuation(session_id) {
+        Ok(messages) => messages,
         Err(error) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %error,
                 "failed to read journal continuation fallback; falling back to heavy checkpoint"
             );
+            None
         }
-    }
+    };
 
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
-        Ok(Some(cp)) if !cp.messages.is_empty() => {
+    let heavy =
+        match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to read continuation checkpoint"
+                );
+                None
+            }
+        };
+
+    if let Some(messages) = journal_messages {
+        return Some(SessionContinuation {
+            completed_turn_count: None,
+            activated_deferred_tool_names: continuation_activation_names(
+                &messages,
+                heavy.as_ref().into_iter().flat_map(|checkpoint| {
+                    checkpoint.activated_deferred_tool_names.iter().cloned()
+                }),
+            ),
+            messages,
+        });
+    }
+
+    match heavy {
+        Some(cp) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
             let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
                 cp.messages,
@@ -72,17 +116,15 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
                 );
                 None
             } else {
-                Some(messages)
+                Some(SessionContinuation {
+                    completed_turn_count: None,
+                    activated_deferred_tool_names: continuation_activation_names(
+                        &messages,
+                        cp.activated_deferred_tool_names,
+                    ),
+                    messages,
+                })
             }
-        }
-        Err(error) => {
-            tracing::warn!(
-                user_id = %user_id,
-                session_id = %session_id,
-                error = %error,
-                "failed to read continuation checkpoint"
-            );
-            None
         }
         _ => None,
     }
@@ -117,14 +159,9 @@ fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec
     Ok((!messages.is_empty()).then_some(messages))
 }
 
-pub(crate) fn load_csl_messages_for_continuation(
+pub(crate) fn load_csl_continuation(
     session_id: &str,
-) -> Result<Option<Vec<Value>>, String> {
-    load_csl_continuation(session_id)
-        .map(|continuation| continuation.map(|continuation| continuation.messages))
-}
-
-pub(crate) fn load_csl_continuation(session_id: &str) -> Result<Option<CslContinuation>, String> {
+) -> Result<Option<SessionContinuation>, String> {
     let store = astra_turn_core::conversation_log::file_store::FileCslStore::new(
         crate::cli::session::session_recovery::io::csl_store_base_dir(),
     );
@@ -140,9 +177,14 @@ pub(crate) fn load_csl_continuation(session_id: &str) -> Result<Option<CslContin
             &materialized.session_state,
         )
         .map_err(|error| error.to_string())?;
-    Ok((!messages.is_empty()).then_some(CslContinuation {
-        completed_turn_count: materialized.last_turn,
+    let activated_deferred_tool_names = continuation_activation_names(
+        &messages,
+        materialized.session_state.activated_deferred_tool_names,
+    );
+    Ok((!messages.is_empty()).then_some(SessionContinuation {
+        completed_turn_count: Some(materialized.last_turn),
         messages,
+        activated_deferred_tool_names,
     }))
 }
 
@@ -247,7 +289,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn load_session_messages_uses_durable_journal_when_csl_is_unavailable() {
+    fn journal_messages_and_heavy_activation_form_one_recovery_continuation() {
         let temp = tempfile::tempdir().unwrap();
         let _journal_dir = session_journal::JournalDirGuard::new(temp.path());
         let session_id = format!("journal-continuation-{}", uuid::Uuid::new_v4());
@@ -265,10 +307,34 @@ mod tests {
                 10,
             ))
             .unwrap();
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let mut checkpoint = StepCheckpoint::heavy(
+            "s1".to_string(),
+            "t1".to_string(),
+            "astra-cli".to_string(),
+            ExecutionCursor::default(),
+        );
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
+        };
+        heavy.activated_deferred_tool_names = vec!["github".to_string()];
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
+            &session_id,
+            2,
+            &checkpoint,
+        )
+        .unwrap();
 
-        let messages = super::load_session_messages_for_continuation(&session_id)
+        let continuation = super::load_session_continuation_for_recovery(&session_id)
             .expect("journal turn should provide continuation while CSL is absent");
 
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "a lower-fidelity journal must not hide monotonic sidecar state from the durable checkpoint"
+        );
+        let messages = continuation.messages;
         assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[0],
@@ -296,6 +362,7 @@ mod tests {
             json!({"role": "user", "content": "Remember: code is ZEBRA-99"}),
             json!({"role": "assistant", "content": "OK, noted."}),
         ];
+        heavy.activated_deferred_tool_names = vec!["github".to_string()];
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -305,13 +372,19 @@ mod tests {
         )
         .unwrap();
 
-        let messages = super::load_session_messages_for_continuation(&session_id);
+        let continuation = super::load_session_continuation_for_recovery(&session_id);
 
         let _ = std::fs::remove_dir_all(
             astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, &session_id).unwrap(),
         );
 
-        let messages = messages.expect("should load messages from checkpoint");
+        let continuation = continuation.expect("should load messages from checkpoint");
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "heavy fallback must carry activation even when compaction removed its original tool result"
+        );
+        let messages = continuation.messages;
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
@@ -487,6 +560,53 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn csl_continuation_upgrades_legacy_activation_from_paired_history() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("test-session-csl-activation-{}", uuid::Uuid::new_v4());
+        let selected = json!({
+            "mode": "select",
+            "query": "select:github",
+            "requested": ["github"],
+            "matches": [{"name": "github", "parameters": {"type": "object"}}],
+            "missing": []
+        })
+        .to_string();
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                json!({"role": "user", "content": "list pull requests"}),
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "search-1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": "{\"query\":\"select:github\"}"
+                        }
+                    }]
+                }),
+                json!({"role": "tool", "tool_call_id": "search-1", "content": selected}),
+                json!({"role": "assistant", "content": "done"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        let continuation = super::load_csl_continuation(&session_id)
+            .unwrap()
+            .expect("canonical continuation");
+
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "older CSL snapshots must recover activation only from paired canonical evidence"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn csl_continuation_reports_corrupt_typed_metadata() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
@@ -509,7 +629,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            super::load_csl_messages_for_continuation(&session_id).is_err(),
+            super::load_csl_continuation(&session_id).is_err(),
             "corrupt canonical metadata must not become an untyped continuation"
         );
     }

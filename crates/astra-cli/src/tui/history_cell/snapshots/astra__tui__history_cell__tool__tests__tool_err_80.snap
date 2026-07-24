@@ -2,6 +2,6 @@
 source: crates/astra-cli/src/tui/history_cell/tool.rs
 expression: "render(&err_tool(\"bash\", \"false\", 10), 80, 3)"
 ---
-● Ran Bash · 10ms
+● Failed Bash · 10ms
   ├ false
   ├ Bash ended without a result payload: false.

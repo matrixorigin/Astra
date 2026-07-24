@@ -2,7 +2,8 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::{
-    load_csl_continuation, load_session_messages_for_continuation, sanitize_continuation_messages,
+    SessionContinuation, continuation_activation_names, load_csl_continuation,
+    load_session_continuation_for_recovery, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
     fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
@@ -15,6 +16,7 @@ pub(crate) struct OneShotSessionResumeMetadata {
     pub(crate) model: Option<String>,
     pub(crate) permission_mode: Option<String>,
     pub(crate) continuation_messages: Vec<serde_json::Value>,
+    pub(crate) activated_deferred_tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -25,40 +27,73 @@ pub(crate) struct OneShotSessionRouting {
 }
 
 impl OneShotSessionRouting {
-    pub(crate) fn continuation_messages(&self) -> Option<Vec<serde_json::Value>> {
-        if let Some(session_id) = self.history_source_session_id.as_deref() {
-            match load_csl_continuation(session_id) {
-                Ok(Some(local)) => {
-                    let restored_is_causally_newer =
-                        !self.resume_metadata.continuation_messages.is_empty()
-                            && self.resume_metadata.completed_turn_count
-                                > local.completed_turn_count;
-                    if !restored_is_causally_newer {
-                        return Some(local.messages);
-                    }
+    fn local_csl_continuation(&self) -> Option<SessionContinuation> {
+        let session_id = self.history_source_session_id.as_deref()?;
+        match load_csl_continuation(session_id) {
+            Ok(Some(local)) => {
+                let restored_is_causally_newer =
+                    !self.resume_metadata.continuation_messages.is_empty()
+                        && self.resume_metadata.completed_turn_count
+                            > local.completed_turn_count.unwrap_or_default();
+                if restored_is_causally_newer {
                     tracing::info!(
                         %session_id,
-                        local_completed_turns = local.completed_turn_count,
+                        local_completed_turns = local.completed_turn_count.unwrap_or_default(),
                         restored_completed_turns = self.resume_metadata.completed_turn_count,
                         "using restored continuation because the local CSL projection is behind"
                     );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        %session_id,
-                        %error,
-                        "failed to read canonical local continuation; trying restore projection"
-                    );
+                    None
+                } else {
+                    Some(local)
                 }
             }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "failed to read canonical local continuation; trying restore projection"
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) fn continuation(&self) -> Option<SessionContinuation> {
+        if let Some(local) = self.local_csl_continuation() {
+            return Some(local);
         }
         if !self.resume_metadata.continuation_messages.is_empty() {
-            return Some(self.resume_metadata.continuation_messages.clone());
+            let messages = self.resume_metadata.continuation_messages.clone();
+            return Some(SessionContinuation {
+                completed_turn_count: Some(self.resume_metadata.completed_turn_count),
+                activated_deferred_tool_names: continuation_activation_names(
+                    &messages,
+                    self.resume_metadata
+                        .activated_deferred_tool_names
+                        .iter()
+                        .cloned(),
+                ),
+                messages,
+            });
         }
-        self.history_source_session_id
+        let continuation = self
+            .history_source_session_id
             .as_deref()
-            .and_then(load_session_messages_for_continuation)
+            .and_then(load_session_continuation_for_recovery)?;
+        Some(continuation)
+    }
+
+    /// Resolve continuation once, then keep its prompt messages and durable
+    /// tool-surface state on the same causal path.
+    pub(crate) fn continuation_turn_inputs(&self) -> (Option<Vec<serde_json::Value>>, Vec<String>) {
+        match self.continuation() {
+            Some(continuation) => (
+                Some(continuation.messages),
+                continuation.activated_deferred_tool_names,
+            ),
+            None => (None, Vec::new()),
+        }
     }
 
     pub(crate) fn task_scope_session_id(&self) -> Option<&str> {
@@ -165,6 +200,14 @@ async fn load_one_shot_resume_metadata(
                     {
                         local.conversation_messages = remote.conversation_messages;
                     }
+                    local.activated_deferred_tool_names = continuation_activation_names(
+                        &[],
+                        local
+                            .activated_deferred_tool_names
+                            .iter()
+                            .chain(remote.activated_deferred_tool_names.iter())
+                            .cloned(),
+                    );
                 }
             }
             Ok(None) => {}
@@ -187,6 +230,7 @@ async fn load_one_shot_resume_metadata(
                 model: restored.model,
                 permission_mode: restored.permission_mode,
                 continuation_messages,
+                activated_deferred_tool_names: restored.activated_deferred_tool_names,
             }
         }
         Ok(None) => OneShotSessionResumeMetadata::default(),
@@ -309,6 +353,7 @@ mod tests {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -440,7 +485,10 @@ mod tests {
                 }),
                 serde_json::json!({"role": "assistant", "content": "done"}),
             ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                activated_deferred_tool_names: vec!["github".to_string()],
+                ..Default::default()
+            },
         )
         .unwrap();
         let routing = OneShotSessionRouting {
@@ -455,10 +503,16 @@ mod tests {
             },
         };
 
-        let continuation = routing.continuation_messages().expect("continuation");
+        let continuation = routing.continuation().expect("continuation");
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "one-shot routing must restore prompt-visible activation from the same canonical projection as its messages"
+        );
 
         assert!(
             continuation
+                .messages
                 .iter()
                 .any(|message| message["role"] == "tool"
                     && message["content"] == "canonical evidence"),
@@ -488,25 +542,50 @@ mod tests {
                 completed_turn_count: 3,
                 continuation_messages: vec![
                     serde_json::json!({"role": "user", "content": "current restored question"}),
+                    serde_json::json!({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "search-1",
+                            "function": {"name": "tool_search", "arguments": "{\"query\":\"select:github\"}"}
+                        }]
+                    }),
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": "search-1",
+                        "content": serde_json::json!({
+                            "mode": "select",
+                            "query": "select:github",
+                            "requested": ["github"],
+                            "matches": [{"name": "github"}],
+                            "missing": []
+                        }).to_string()
+                    }),
                     serde_json::json!({"role": "assistant", "content": "current restored answer"}),
                 ],
                 ..Default::default()
             },
         };
 
-        let continuation = routing.continuation_messages().expect("continuation");
+        let continuation = routing.continuation().expect("continuation");
 
         assert!(
             continuation
+                .messages
                 .iter()
                 .any(|message| message["content"] == "current restored answer"),
             "history and its completed-turn clock must be selected as one causal projection"
         );
         assert!(
             continuation
+                .messages
                 .iter()
                 .all(|message| message["content"] != "stale local answer"),
             "an older CSL history must not be paired with a newer restored turn clock"
+        );
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "a newer restored projection must reconstruct activation from its own durable tool-search evidence"
         );
     }
 
@@ -566,8 +645,9 @@ mod tests {
         assert_eq!(routing.restored_permission_mode(), Some("plan"));
 
         let continuation = routing
-            .continuation_messages()
-            .expect("local checkpoint should provide continuation messages");
+            .continuation()
+            .expect("local checkpoint should provide continuation messages")
+            .messages;
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
@@ -600,7 +680,7 @@ mod tests {
         assert_eq!(routing.server_session_id, None);
         assert_eq!(routing.history_source_session_id, None);
         assert_eq!(routing.task_scope_session_id(), None);
-        assert!(routing.continuation_messages().is_none());
+        assert!(routing.continuation().is_none());
     }
 
     #[serial_test::serial]
@@ -644,6 +724,7 @@ mod tests {
                     serde_json::json!({"role": "user", "content": "question from another device"}),
                     serde_json::json!({"role": "assistant", "content": "latest cloud answer"}),
                 ],
+                activated_deferred_tool_names: vec!["github".to_string()],
                 restored_from_cloud: true,
                 ..Default::default()
             },
@@ -668,8 +749,9 @@ mod tests {
             "remote causal sequence must override a stale local checkpoint without replacing its richer metadata"
         );
         let continuation = routing
-            .continuation_messages()
-            .expect("the fresher remote conversation should be resumable");
+            .continuation()
+            .expect("the fresher remote conversation should be resumable")
+            .messages;
         assert!(
             continuation
                 .iter()
@@ -768,6 +850,7 @@ mod tests {
                     serde_json::json!({"role": "user", "content": "cloud question"}),
                     serde_json::json!({"role": "assistant", "content": "cloud answer"}),
                 ],
+                activated_deferred_tool_names: vec!["github".to_string()],
                 restored_from_cloud: true,
                 ..Default::default()
             },
@@ -788,11 +871,16 @@ mod tests {
             "causal scopes for auxiliary inference must use the restored server turn before the main turn starts"
         );
         let continuation = routing
-            .continuation_messages()
+            .continuation()
             .expect("cloud resume messages should feed one-shot continuation");
-        assert_eq!(continuation.len(), 2);
-        assert_eq!(continuation[0]["content"], "cloud question");
-        assert_eq!(continuation[1]["content"], "cloud answer");
+        assert_eq!(
+            continuation.activated_deferred_tool_names,
+            vec!["github"],
+            "cloud checkpoint sidecars must survive even when compaction removed tool-search evidence"
+        );
+        assert_eq!(continuation.messages.len(), 2);
+        assert_eq!(continuation.messages[0]["content"], "cloud question");
+        assert_eq!(continuation.messages[1]["content"], "cloud answer");
     }
 
     #[serial_test::serial]

@@ -136,6 +136,8 @@ pub(crate) struct StreamResult {
     pub(crate) selected_skills: Vec<String>,
     /// Tool names with material execution across all turns.
     pub(crate) tools_used: Vec<String>,
+    /// Deferred schemas materialized in the retained session context.
+    pub(crate) activated_deferred_tool_names: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.
     pub(crate) tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     /// Token budget used by selected dynamic tools.
@@ -413,6 +415,7 @@ impl Default for StreamResult {
             visible_tools: vec![],
             selected_skills: vec![],
             tools_used: vec![],
+            activated_deferred_tool_names: vec![],
             tool_call_records: vec![],
             budget_used: 0,
             budget_pressure: 0.0,

@@ -4,7 +4,7 @@
 //! only when it is already visible in `tools[]`, including a later request
 //! after `tool_search(query="select:NAME")` activates its full schema.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::Value;
 
@@ -272,6 +272,86 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
         }
     }
     names
+}
+
+/// Reconstruct deferred-tool activation from canonical conversation history.
+///
+/// Activation is accepted only from a tool result paired by `tool_call_id`
+/// with an assistant `tool_search` call. This deliberately ignores user or
+/// assistant prose and unpaired lookalike JSON. It lets process restarts and
+/// legacy session projections recover the same prompt fact without treating
+/// transient executor memory as the source of truth.
+#[must_use]
+pub fn activated_tool_names_from_messages(messages: &[Value]) -> Vec<String> {
+    let mut pending_tool_search_call_ids = HashSet::new();
+    let mut activated = BTreeSet::new();
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                pending_tool_search_call_ids.extend(
+                    message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|call| {
+                            call.get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| name.eq_ignore_ascii_case("tool_search"))
+                        })
+                        .filter_map(|call| call.get("id").and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+                continue;
+            }
+            Some("tool") => {}
+            _ => continue,
+        }
+        let paired_tool_search = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|id| pending_tool_search_call_ids.remove(id));
+        if !paired_tool_search {
+            continue;
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let serialized;
+        let output = if let Some(content) = content.as_str() {
+            content
+        } else {
+            serialized = match serde_json::to_string(content) {
+                Ok(serialized) => serialized,
+                Err(_) => continue,
+            };
+            serialized.as_str()
+        };
+        activated.extend(activated_tool_names_from_tool_search_output(output));
+    }
+    activated.into_iter().collect()
+}
+
+/// Merge an explicit session snapshot with activation reconstructed from the
+/// same retained message projection. The explicit snapshot survives
+/// compaction; history reconstruction upgrades older snapshots and remote
+/// projections that did not yet persist this field.
+#[must_use]
+pub fn merged_activated_tool_names(
+    messages: &[Value],
+    persisted_names: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut names: BTreeSet<String> = persisted_names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.extend(activated_tool_names_from_messages(messages));
+    names.into_iter().collect()
 }
 
 fn requested_tool_names_from_select_query(query: &str) -> Vec<String> {
@@ -665,6 +745,97 @@ mod tests {
             activated_tool_names_from_tool_search_output(&out),
             vec!["agent_fanout".to_string()]
         );
+    }
+
+    #[test]
+    fn canonical_history_reconstructs_only_paired_tool_search_activation() {
+        let selected = json!({
+            "mode": "select",
+            "query": "select:github,web_fetch",
+            "requested": ["github", "web_fetch"],
+            "matches": [
+                {"name": "web_fetch", "parameters": {"type": "object"}},
+                {"name": "github", "parameters": {"type": "object"}}
+            ],
+            "missing": []
+        })
+        .to_string();
+        let messages = vec![
+            json!({"role": "user", "content": selected}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "function": {"name": "tool_search", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "search-1", "content": selected}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "other-1",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "other-1",
+                "content": {
+                    "mode": "select",
+                    "query": "select:lookalike",
+                    "requested": ["lookalike"],
+                    "matches": [{"name": "lookalike"}],
+                    "missing": []
+                }
+            }),
+        ];
+
+        assert_eq!(
+            activated_tool_names_from_messages(&messages),
+            vec!["github".to_string(), "web_fetch".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_history_ignores_unpaired_or_keyword_search_results() {
+        let selected = json!({
+            "mode": "select",
+            "query": "select:github",
+            "requested": ["github"],
+            "matches": [{"name": "github"}],
+            "missing": []
+        })
+        .to_string();
+        let keyword = json!({
+            "mode": "keyword",
+            "query": "github",
+            "matches": [{"name": "github"}]
+        })
+        .to_string();
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "search-1", "content": selected}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "function": {"name": "tool_search", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "search-1", "content": keyword}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "missing-call",
+                "content": {
+                    "mode": "select",
+                    "query": "select:github",
+                    "requested": ["github"],
+                    "matches": [{"name": "github"}],
+                    "missing": []
+                }
+            }),
+        ];
+
+        assert!(activated_tool_names_from_messages(&messages).is_empty());
     }
 
     #[test]
