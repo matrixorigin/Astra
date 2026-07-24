@@ -578,30 +578,56 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
 fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
     let aggr = json.get("aggregates");
     if let Some(a) = aggr {
-        let get_u = |k: &str| a.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        // Digest v2 uses explicit aggregate names (`turn_count`,
+        // `total_tool_calls`, ...). Keep the legacy aliases so reports from
+        // older Astra binaries remain readable instead of silently rendering
+        // a convincing block of zeroes.
+        let get_u = |primary: &str, legacy: &str| {
+            a.get(primary)
+                .or_else(|| a.get(legacy))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
         out.push_str(&format!(
-            "      turns={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
-            get_u("turns"),
-            get_u("tool_calls"),
-            get_u("tool_failures"),
-            get_u("errors"),
-            get_u("compacts"),
-            get_u("stalls"),
+            "      attempts={} turns={} turn_errors={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
+            get_u("attempt_count", "turns"),
+            get_u("turn_count", "turns"),
+            get_u("turn_error_count", "turn_errors"),
+            get_u("total_tool_calls", "tool_calls"),
+            get_u("tool_calls_failed", "tool_failures"),
+            get_u("error_event_count", "errors"),
+            get_u("compact_count", "compacts"),
+            get_u("stall_count", "stalls"),
         ));
         out.push_str(&format!(
             "      tokens_in={} tokens_out={} duration_ms={}\n",
-            get_u("tokens_in"),
-            get_u("tokens_out"),
-            get_u("duration_ms"),
+            get_u("total_tokens_in", "tokens_in"),
+            get_u("total_tokens_out", "tokens_out"),
+            get_u("total_duration_ms", "duration_ms"),
         ));
-    }
-    if let Some(avg) = json.get("averages_per_turn") {
-        let get_f = |k: &str| avg.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         out.push_str(&format!(
             "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
-            get_f("tokens_in"),
-            get_f("tokens_out"),
-            get_f("duration_ms"),
+            a.get("avg_tokens_in")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    json.pointer("/averages_per_turn/tokens_in")
+                        .and_then(|v| v.as_f64())
+                })
+                .unwrap_or(0.0),
+            a.get("avg_tokens_out")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    json.pointer("/averages_per_turn/tokens_out")
+                        .and_then(|v| v.as_f64())
+                })
+                .unwrap_or(0.0),
+            a.get("avg_duration_ms")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    json.pointer("/averages_per_turn/duration_ms")
+                        .and_then(|v| v.as_f64())
+                })
+                .unwrap_or(0.0),
         ));
     }
     // Point the reviewer at the full digest — if and only if the
@@ -873,6 +899,43 @@ mod tests {
         assert!(out.contains("tokens_in=12000"));
         assert!(out.contains("avg_tokens_in=4000.0"));
         assert!(out.contains("astra journal digest sess"));
+    }
+
+    #[test]
+    fn text_report_renders_v2_digest_aggregate_names_without_false_zeroes() {
+        use crate::digest::DigestArtifact;
+        let mut r = mk_report_passed();
+        r.runs[0].passed = false;
+        r.runs[0].digest = Some(DigestArtifact {
+            session_id: "sess-v2".into(),
+            json: serde_json::json!({
+                "session_id": "sess-v2",
+                "aggregates": {
+                    "attempt_count": 2,
+                    "turn_count": 1,
+                    "turn_error_count": 1,
+                    "total_tool_calls": 14,
+                    "tool_calls_failed": 2,
+                    "error_event_count": 0,
+                    "compact_count": 0,
+                    "stall_count": 0,
+                    "total_tokens_in": 60147,
+                    "total_tokens_out": 7112,
+                    "total_duration_ms": 116320,
+                    "avg_tokens_in": 30073.5,
+                    "avg_tokens_out": 3556.0,
+                    "avg_duration_ms": 58160.0
+                }
+            }),
+        });
+
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("attempts=2 turns=1 turn_errors=1"));
+        assert!(out.contains("tool_calls=14 tool_failures=2"));
+        assert!(out.contains("tokens_in=60147 tokens_out=7112 duration_ms=116320"));
+        assert!(
+            out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
+        );
     }
 
     #[test]
