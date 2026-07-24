@@ -3648,7 +3648,7 @@ mod tests {
         assert!(result.contains("\"status\":\"failed\""), "{result}");
         assert!(result.contains("unknown field `brief`"), "{result}");
         assert!(result.contains("slots[i].prompt"), "{result}");
-        assert!(result.contains("there is no top-level brief"), "{result}");
+        assert!(result.contains("There is no top-level brief"), "{result}");
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
     }
