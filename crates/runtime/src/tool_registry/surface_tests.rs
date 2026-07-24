@@ -672,8 +672,8 @@ fn deferred_agent_summaries_keep_load_bearing_constraints() {
         .get("agent_fanout")
         .expect("agent_fanout should be deferred by default");
     assert!(
-        fanout.contains("exactly target_count slots")
-            && fanout.contains("short description and concise prompt")
+        fanout.contains("exactly that many slots")
+            && fanout.contains("description+prompt")
             && fanout.contains("never embed diffs")
             && fanout.contains("no brief/agents/background"),
         "agent_fanout deferred summary must keep current count, slot-shape, and shared-workspace constraints: {fanout}"

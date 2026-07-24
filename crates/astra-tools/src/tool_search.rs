@@ -971,8 +971,8 @@ mod tests {
             .expect("agent_fanout should be discoverable by keyword");
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("exactly target_count slots")
-                && desc.contains("short description and concise prompt")
+            desc.contains("exactly that many slots")
+                && desc.contains("description+prompt")
                 && desc.contains("never embed diffs")
                 && desc.contains("no brief/agents/background"),
             "keyword summary must keep the current fanout shape and shared-workspace constraints: {desc}"
