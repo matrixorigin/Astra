@@ -578,56 +578,30 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
 fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
     let aggr = json.get("aggregates");
     if let Some(a) = aggr {
-        // Digest v2 uses explicit aggregate names (`turn_count`,
-        // `total_tool_calls`, ...). Keep the legacy aliases so reports from
-        // older Astra binaries remain readable instead of silently rendering
-        // a convincing block of zeroes.
-        let get_u = |primary: &str, legacy: &str| {
-            a.get(primary)
-                .or_else(|| a.get(legacy))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-        };
+        let get_u = |key: &str| a.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        let get_f = |key: &str| a.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
         out.push_str(&format!(
             "      attempts={} turns={} turn_errors={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
-            get_u("attempt_count", "turns"),
-            get_u("turn_count", "turns"),
-            get_u("turn_error_count", "turn_errors"),
-            get_u("total_tool_calls", "tool_calls"),
-            get_u("tool_calls_failed", "tool_failures"),
-            get_u("error_event_count", "errors"),
-            get_u("compact_count", "compacts"),
-            get_u("stall_count", "stalls"),
+            get_u("attempt_count"),
+            get_u("turn_count"),
+            get_u("turn_error_count"),
+            get_u("total_tool_calls"),
+            get_u("tool_calls_failed"),
+            get_u("error_event_count"),
+            get_u("compact_count"),
+            get_u("stall_count"),
         ));
         out.push_str(&format!(
             "      tokens_in={} tokens_out={} duration_ms={}\n",
-            get_u("total_tokens_in", "tokens_in"),
-            get_u("total_tokens_out", "tokens_out"),
-            get_u("total_duration_ms", "duration_ms"),
+            get_u("total_tokens_in"),
+            get_u("total_tokens_out"),
+            get_u("total_duration_ms"),
         ));
         out.push_str(&format!(
             "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
-            a.get("avg_tokens_in")
-                .and_then(|v| v.as_f64())
-                .or_else(|| {
-                    json.pointer("/averages_per_turn/tokens_in")
-                        .and_then(|v| v.as_f64())
-                })
-                .unwrap_or(0.0),
-            a.get("avg_tokens_out")
-                .and_then(|v| v.as_f64())
-                .or_else(|| {
-                    json.pointer("/averages_per_turn/tokens_out")
-                        .and_then(|v| v.as_f64())
-                })
-                .unwrap_or(0.0),
-            a.get("avg_duration_ms")
-                .and_then(|v| v.as_f64())
-                .or_else(|| {
-                    json.pointer("/averages_per_turn/duration_ms")
-                        .and_then(|v| v.as_f64())
-                })
-                .unwrap_or(0.0),
+            get_f("avg_tokens_in"),
+            get_f("avg_tokens_out"),
+            get_f("avg_duration_ms"),
         ));
     }
     // Point the reviewer at the full digest — if and only if the
@@ -875,20 +849,20 @@ mod tests {
             json: serde_json::json!({
                 "session_id": "sess",
                 "aggregates": {
-                    "turns": 3,
-                    "tool_calls": 5,
-                    "tool_failures": 1,
-                    "errors": 0,
-                    "compacts": 0,
-                    "stalls": 0,
-                    "tokens_in": 12000,
-                    "tokens_out": 450,
-                    "duration_ms": 8200,
-                },
-                "averages_per_turn": {
-                    "tokens_in": 4000.0,
-                    "tokens_out": 150.0,
-                    "duration_ms": 2733.33,
+                    "attempt_count": 3,
+                    "turn_count": 3,
+                    "turn_error_count": 0,
+                    "total_tool_calls": 5,
+                    "tool_calls_failed": 1,
+                    "error_event_count": 0,
+                    "compact_count": 0,
+                    "stall_count": 0,
+                    "total_tokens_in": 12000,
+                    "total_tokens_out": 450,
+                    "total_duration_ms": 8200,
+                    "avg_tokens_in": 4000.0,
+                    "avg_tokens_out": 150.0,
+                    "avg_duration_ms": 2733.33,
                 }
             }),
         });
