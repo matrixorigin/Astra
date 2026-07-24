@@ -25,7 +25,6 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
                 | "succeeded"
                 | "passed"
                 | "done"
-                | "stopped"
                 | "skipped"
                 | "launched"
                 | "pending"
@@ -715,14 +714,7 @@ mod tests {
 
     #[test]
     fn explicit_success_signal_rejects_noncanonical_status_aliases() {
-        for status in [
-            "ok",
-            "success",
-            "succeeded",
-            "complete",
-            "passed",
-            "stopped",
-        ] {
+        for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}"}}"#);
             assert!(
                 !tool_output_has_explicit_success_signal(&body),

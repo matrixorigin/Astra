@@ -372,54 +372,12 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
 /// 19ad8393 agent-spawn case).
 pub(crate) fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
     if !c.ok {
-        // Older runtimes classified the producer-owned `stopped` control
-        // outcome as an unknown status and wrote ok=false even though the
-        // cancellation succeeded. Preserve the historical transport bit, but
-        // let the explicit control receipt correct forensic failure counts.
-        return !legacy_control_result_proves_success(c);
+        return true;
     }
     let Some(preview) = c.result_preview.as_deref() else {
         return false;
     };
     result_body_signals_failure(preview)
-}
-
-fn legacy_control_result_proves_success(c: &session_journal::ToolCallRecord) -> bool {
-    if c.name != "agent_fanout" {
-        return false;
-    }
-    let is_stop_slot = c
-        .args_full
-        .as_deref()
-        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-        .and_then(|args| {
-            args.get("action")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some("stop_slot")
-        || c.args_preview.as_deref() == Some("stop_slot");
-    if !is_stop_slot {
-        return false;
-    }
-    [c.result_full.as_deref(), c.result_preview.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|result| {
-            serde_json::Deserializer::from_str(result)
-                .into_iter::<serde_json::Value>()
-                .next()
-                .and_then(Result::ok)
-                .is_some_and(|body| {
-                    body.get("status").and_then(serde_json::Value::as_str) == Some("stopped")
-                        && body.get("slot_status").and_then(serde_json::Value::as_str)
-                            == Some("cancelled_by_user")
-                        && body
-                            .get("error")
-                            .is_none_or(|error| error.is_null() || error.as_str() == Some(""))
-                })
-        })
 }
 
 /// Detect the "tool returned ok but body is an error" pattern in a
@@ -2014,24 +1972,6 @@ mod tests {
             "error_preview should be derived from result_preview when error field is empty: {}",
             f.error_preview
         );
-    }
-
-    #[test]
-    fn digest_repairs_legacy_stopped_control_receipt_misclassification() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _g = JournalDirGuard::new(tmp.path());
-        let sid = "test-stopped-receipt-00000000-0000-0000-0000-000000000099";
-        fs::write(
-            journal_path_for_test(sid),
-            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":false,"ms":1,"error_kind":"unknown","error":"Tool returned an unrecognized status.","args_full":"{\"action\":\"stop_slot\",\"group_id\":\"review\",\"slot_index\":0}","result_preview":"{\"status\":\"stopped\",\"slot_status\":\"cancelled_by_user\",\"group_id\":\"review\",\"slot_index\":0}\n⚠ agent_fanout failed with an unclassified tool error."}]}"#,
-        )
-        .expect("write journal");
-
-        let digest = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(digest.aggregates.total_tool_calls, 1);
-        assert_eq!(digest.aggregates.tool_calls_failed, 0);
-        assert_eq!(digest.aggregates.total_fresh_tool_calls, 1);
-        assert!(digest.failed_tool_calls.is_empty());
     }
 
     #[test]
