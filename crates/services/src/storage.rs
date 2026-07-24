@@ -90,6 +90,16 @@ struct PersistedCoreSchemaTableClaim {
     ddl_sha256: String,
 }
 
+const INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL: &str =
+    "INSERT INTO astra_schema_table_contracts
+     (table_name, component, owner, contract_version, ddl_sha256)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)";
+
+const UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL: &str = "UPDATE astra_schema_table_contracts
+     SET owner = ?, contract_version = ?, ddl_sha256 = ?, updated_at = NOW(6)
+     WHERE table_name = ? AND component = ?";
+
 /// Validate ownership and identify declarations retired by the new contract.
 ///
 /// A contract-version upgrade is an ownership-aware reconciliation, not an
@@ -125,6 +135,28 @@ fn stale_core_schema_table_claims(
         })
         .map(|claim| claim.name.clone())
         .collect())
+}
+
+fn validate_reconciled_core_schema_table_claim(
+    claim: &PersistedCoreSchemaTableClaim,
+    declaration: &CoreSchemaTableSpec,
+) -> Result<(), sqlx::Error> {
+    if claim.component != CORE_SCHEMA_CONTRACT_COMPONENT {
+        return Err(sqlx::Error::Protocol(format!(
+            "schema table {} is already claimed by lifecycle component {} (owner={})",
+            claim.name, claim.component, claim.owner
+        )));
+    }
+    if claim.owner != declaration.owner
+        || claim.contract_version != CORE_SCHEMA_CONTRACT_VERSION
+        || claim.ddl_sha256 != declaration.ddl_sha256
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "schema table {} lifecycle contract did not converge after owner-scoped reconciliation",
+            declaration.name
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -623,30 +655,56 @@ async fn publish_core_schema_table_contracts(
     let stale_claims = stale_core_schema_table_claims(&existing, declarations)?;
 
     for declaration in declarations {
-        query(
-            "INSERT INTO astra_schema_table_contracts
-             (table_name, component, owner, contract_version, ddl_sha256)
-             VALUES (?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-               component = VALUES(component),
-               owner = VALUES(owner),
-               contract_version = VALUES(contract_version),
-               ddl_sha256 = VALUES(ddl_sha256),
-               updated_at = NOW(6)",
+        // Insert without taking over an existing primary key. A concurrent
+        // foreign component may claim the table after the pre-read above; the
+        // duplicate branch must therefore be a no-op, not an owner rewrite.
+        query(INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL)
+            .bind(&declaration.name)
+            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+            .bind(&declaration.owner)
+            .bind(CORE_SCHEMA_CONTRACT_VERSION)
+            .bind(&declaration.ddl_sha256)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "failed to insert schema table {} lifecycle contract: {error}",
+                    declaration.name
+                ))
+            })?;
+
+        // Only the owning lifecycle component may mutate an existing claim.
+        query(UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL)
+            .bind(&declaration.owner)
+            .bind(CORE_SCHEMA_CONTRACT_VERSION)
+            .bind(&declaration.ddl_sha256)
+            .bind(&declaration.name)
+            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "failed to update schema table {} lifecycle contract: {error}",
+                    declaration.name
+                ))
+            })?;
+
+        let row = query(
+            "SELECT table_name, component, owner, contract_version, ddl_sha256
+             FROM astra_schema_table_contracts
+             WHERE table_name = ?",
         )
         .bind(&declaration.name)
-        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-        .bind(&declaration.owner)
-        .bind(CORE_SCHEMA_CONTRACT_VERSION)
-        .bind(&declaration.ddl_sha256)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| {
-            sqlx::Error::Protocol(format!(
-                "failed to reconcile schema table {} lifecycle contract: {error}",
-                declaration.name
-            ))
-        })?;
+        .fetch_one(&mut *transaction)
+        .await?;
+        let reconciled = PersistedCoreSchemaTableClaim {
+            name: row.try_get("table_name")?,
+            component: row.try_get("component")?,
+            owner: row.try_get("owner")?,
+            contract_version: row.try_get("contract_version")?,
+            ddl_sha256: row.try_get("ddl_sha256")?,
+        };
+        validate_reconciled_core_schema_table_claim(&reconciled, declaration)?;
     }
     for table_name in stale_claims {
         query(
@@ -7429,6 +7487,64 @@ mod tests {
         assert!(error.contains("shared_table"), "{error}");
         assert!(error.contains("extension"), "{error}");
         assert!(error.contains("plugin"), "{error}");
+    }
+
+    #[test]
+    fn core_schema_contract_write_never_takes_over_a_concurrent_foreign_claim() {
+        let declaration = desired_table("shared_table", "storage");
+        let raced_claim = persisted_claim("shared_table", "extension", "plugin", "v1");
+
+        let error = validate_reconciled_core_schema_table_claim(&raced_claim, &declaration)
+            .expect_err("a foreign claim that appears after the pre-read must still fail")
+            .to_string();
+
+        assert!(error.contains("shared_table"), "{error}");
+        assert!(error.contains("extension"), "{error}");
+        assert!(error.contains("plugin"), "{error}");
+        assert!(
+            !INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL
+                .contains("component = VALUES(component)"),
+            "the duplicate branch must not rewrite lifecycle ownership"
+        );
+        assert!(
+            UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL.contains("AND component = ?"),
+            "contract updates must be scoped to the existing owning component"
+        );
+    }
+
+    #[test]
+    fn core_schema_contract_write_validates_the_exact_converged_claim() {
+        let declaration = desired_table("shared_table", "storage");
+        let converged = PersistedCoreSchemaTableClaim {
+            name: declaration.name.clone(),
+            component: CORE_SCHEMA_CONTRACT_COMPONENT.to_string(),
+            owner: declaration.owner.clone(),
+            contract_version: CORE_SCHEMA_CONTRACT_VERSION.to_string(),
+            ddl_sha256: declaration.ddl_sha256.clone(),
+        };
+
+        validate_reconciled_core_schema_table_claim(&converged, &declaration)
+            .expect("the exact owner-scoped contract should validate");
+
+        for divergent in [
+            PersistedCoreSchemaTableClaim {
+                owner: "other-owner".to_string(),
+                ..converged.clone()
+            },
+            PersistedCoreSchemaTableClaim {
+                contract_version: "stale-version".to_string(),
+                ..converged.clone()
+            },
+            PersistedCoreSchemaTableClaim {
+                ddl_sha256: "c".repeat(64),
+                ..converged
+            },
+        ] {
+            assert!(
+                validate_reconciled_core_schema_table_claim(&divergent, &declaration).is_err(),
+                "reconciliation must fail loudly unless every claimed contract field converged"
+            );
+        }
     }
 
     #[test]

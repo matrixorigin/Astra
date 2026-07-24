@@ -672,9 +672,6 @@ mod tests {
         let mut perms = std::fs::metadata(&shim).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
-        // Ensure the freshly written executable is visible before the timeout
-        // branch races to spawn it under parallel test load.
-        std::process::Command::new("sync").status().ok();
 
         let cfg = RunnerConfig::new(shim.clone());
         let exec = AstraCliExecutor::new(cfg);

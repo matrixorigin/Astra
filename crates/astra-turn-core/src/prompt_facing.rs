@@ -341,7 +341,10 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
 }
 
 fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
-    let content = Value::String(canonical_tool_result_content(tool.get("content")));
+    let content = Value::String(canonical_tool_result_content(
+        tool.get("content"),
+        tool_call_id,
+    ));
     let mut projected = serde_json::Map::from_iter([
         ("role".to_string(), Value::String("tool".to_string())),
         (
@@ -358,13 +361,18 @@ fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
     Value::Object(projected)
 }
 
-fn canonical_tool_result_content(content: Option<&Value>) -> String {
+fn canonical_tool_result_content(content: Option<&Value>, tool_call_id: &str) -> String {
     let Some(content) = content else {
         return String::new();
     };
     match content {
         Value::String(text) => text.clone(),
-        Value::Array(blocks) if !blocks.is_empty() && blocks.iter().all(is_tool_result_block) => {
+        Value::Array(blocks)
+            if !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| is_tool_result_block_for(block, tool_call_id)) =>
+        {
             blocks
                 .iter()
                 .filter_map(|block| block.get("content"))
@@ -393,12 +401,9 @@ fn canonical_tool_result_payload(content: &Value) -> String {
     }
 }
 
-fn is_tool_result_block(value: &Value) -> bool {
+fn is_tool_result_block_for(value: &Value, tool_call_id: &str) -> bool {
     value.get("type").and_then(Value::as_str) == Some("tool_result")
-        && value
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
+        && value.get("tool_use_id").and_then(Value::as_str) == Some(tool_call_id)
         && value.get("content").is_some()
 }
 
@@ -730,6 +735,44 @@ mod tests {
             got[5]["content"].as_str(),
             Some("[{\"type\":\"tool_result\",\"value\":{\"row\":1}}]"),
             "a discriminant lookalike without the provider envelope must remain ordinary JSON data"
+        );
+    }
+
+    #[test]
+    fn canonical_continuation_does_not_relabel_a_mismatched_provider_tool_envelope() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "outer-call",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "outer-call",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "different-call",
+                    "content": "evidence owned by a different call"
+                }]
+            }),
+        ];
+
+        let got = sanitize_canonical_continuation_messages_with_state(
+            messages,
+            &SessionStateCompact::default(),
+        )
+        .expect("valid canonical history");
+
+        assert_eq!(
+            got[2]["content"].as_str(),
+            Some(
+                "[{\"content\":\"evidence owned by a different call\",\"tool_use_id\":\"different-call\",\"type\":\"tool_result\"}]"
+            ),
+            "a provider envelope may be unwrapped only when its tool identity matches the canonical result"
         );
     }
 

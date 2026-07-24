@@ -319,9 +319,19 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         })
         .sum();
 
-    for &idx in indices_to_drop.iter().rev() {
-        messages.remove(idx);
+    // Removing each index individually repeatedly shifts the remaining tail
+    // and becomes quadratic for long-running sessions. Mark the selected
+    // units, then compact the vector in one linear retain pass.
+    let mut drop_mask = vec![false; messages.len()];
+    for index in indices_to_drop {
+        drop_mask[index] = true;
     }
+    let mut index = 0;
+    messages.retain(|_| {
+        let keep = !drop_mask[index];
+        index += 1;
+        keep
+    });
     tokens_dropped
 }
 
@@ -1082,6 +1092,52 @@ mod tests {
             ],
             "a user request and every assistant/tool continuation it caused form one atomic unit"
         );
+    }
+
+    #[test]
+    fn round_dropping_scales_across_long_tool_driven_history() {
+        let mut messages = Vec::new();
+        for turn in 0..1_000 {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("request {turn}")
+            }));
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call-{turn}"),
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }));
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": format!("call-{turn}"),
+                "content": "evidence"
+            }));
+        }
+
+        assert!(drop_oldest_rounds(&mut messages, 1.0) > 0);
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message["role"].as_str()),
+            Some("user"),
+            "the retained suffix must still start at a complete user-driven unit"
+        );
+        let retained_call_ids = messages
+            .iter()
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flatten()
+            .filter_map(|call| call["id"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(messages.iter().all(|message| {
+            message["role"] != "tool"
+                || message["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|id| retained_call_ids.contains(id))
+        }));
     }
 
     #[test]

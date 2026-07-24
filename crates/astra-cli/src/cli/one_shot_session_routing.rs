@@ -2,8 +2,7 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::{
-    load_csl_messages_for_continuation, load_session_messages_for_continuation,
-    sanitize_continuation_messages,
+    load_csl_continuation, load_session_messages_for_continuation, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
     fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
@@ -28,8 +27,22 @@ pub(crate) struct OneShotSessionRouting {
 impl OneShotSessionRouting {
     pub(crate) fn continuation_messages(&self) -> Option<Vec<serde_json::Value>> {
         if let Some(session_id) = self.history_source_session_id.as_deref() {
-            match load_csl_messages_for_continuation(session_id) {
-                Ok(Some(messages)) => return Some(messages),
+            match load_csl_continuation(session_id) {
+                Ok(Some(local)) => {
+                    let restored_is_causally_newer =
+                        !self.resume_metadata.continuation_messages.is_empty()
+                            && self.resume_metadata.completed_turn_count
+                                > local.completed_turn_count;
+                    if !restored_is_causally_newer {
+                        return Some(local.messages);
+                    }
+                    tracing::info!(
+                        %session_id,
+                        local_completed_turns = local.completed_turn_count,
+                        restored_completed_turns = self.resume_metadata.completed_turn_count,
+                        "using restored continuation because the local CSL projection is behind"
+                    );
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -135,14 +148,21 @@ async fn load_one_shot_resume_metadata(
         match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
             Ok(Some(remote)) => {
                 if let Ok(Some(local)) = restored.as_mut() {
-                    local.turn_count = remote.turn_count;
+                    let remote_is_newer = remote.turn_count > local.turn_count;
+                    // Restore sources are independently persisted and can be
+                    // briefly out of sync. A completed-turn clock is
+                    // monotonic: observing an older remote projection must
+                    // never roll a valid local clock backwards.
+                    local.turn_count = local.turn_count.max(remote.turn_count);
                     if remote.model.is_some() {
                         local.model = remote.model;
                     }
                     if remote.permission_mode.is_some() {
                         local.permission_mode = remote.permission_mode;
                     }
-                    if local.conversation_messages.is_empty() {
+                    if !remote.conversation_messages.is_empty()
+                        && (remote_is_newer || local.conversation_messages.is_empty())
+                    {
                         local.conversation_messages = remote.conversation_messages;
                     }
                 }
@@ -447,6 +467,50 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn continuation_prefers_the_projection_with_the_newer_completed_turn() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("routing-causal-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                serde_json::json!({"role": "user", "content": "stale local question"}),
+                serde_json::json!({"role": "assistant", "content": "stale local answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+        let routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.clone()),
+            history_source_session_id: Some(session_id),
+            resume_metadata: OneShotSessionResumeMetadata {
+                completed_turn_count: 3,
+                continuation_messages: vec![
+                    serde_json::json!({"role": "user", "content": "current restored question"}),
+                    serde_json::json!({"role": "assistant", "content": "current restored answer"}),
+                ],
+                ..Default::default()
+            },
+        };
+
+        let continuation = routing.continuation_messages().expect("continuation");
+
+        assert!(
+            continuation
+                .iter()
+                .any(|message| message["content"] == "current restored answer"),
+            "history and its completed-turn clock must be selected as one causal projection"
+        );
+        assert!(
+            continuation
+                .iter()
+                .all(|message| message["content"] != "stale local answer"),
+            "an older CSL history must not be paired with a newer restored turn clock"
+        );
+    }
+
+    #[test]
     fn explicit_resume_preflight_error_describes_missing_and_noauth() {
         let missing = explicit_resume_preflight_error(
             "sess-1",
@@ -547,6 +611,16 @@ mod tests {
         let _home_guard = crate::tests::HomeGuard::temp();
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                serde_json::json!({"role": "user", "content": "previous question"}),
+                serde_json::json!({"role": "assistant", "content": "previous answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -566,6 +640,10 @@ mod tests {
             astra_services::session_restore::RestoredSession {
                 session_id: session_id.clone(),
                 turn_count: 4,
+                conversation_messages: vec![
+                    serde_json::json!({"role": "user", "content": "question from another device"}),
+                    serde_json::json!({"role": "assistant", "content": "latest cloud answer"}),
+                ],
                 restored_from_cloud: true,
                 ..Default::default()
             },
@@ -588,6 +666,72 @@ mod tests {
             routing.next_server_turn_index(),
             5,
             "remote causal sequence must override a stale local checkpoint without replacing its richer metadata"
+        );
+        let continuation = routing
+            .continuation_messages()
+            .expect("the fresher remote conversation should be resumable");
+        assert!(
+            continuation
+                .iter()
+                .any(|message| message["content"] == "latest cloud answer"),
+            "a remotely advanced turn count and a stale local conversation must never be combined"
+        );
+        assert!(
+            continuation
+                .iter()
+                .all(|message| message["content"] != "previous answer"),
+            "remote history is authoritative when it is strictly newer"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_never_regresses_the_completed_turn_clock() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _home_guard = crate::tests::HomeGuard::temp();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        write_local_resumable_session_with_checkpoint(&session_id);
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&session_id, "gpt-5");
+        workspace.turn_count = 3;
+        workspace.permission_mode = Some("plan".to_string());
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_existing_session(&server, &session_id).await;
+        mock_cloud_resume(
+            &server,
+            &session_id,
+            astra_services::session_restore::RestoredSession {
+                session_id: session_id.clone(),
+                turn_count: 0,
+                restored_from_cloud: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let routing =
+            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id), true)
+                .await
+                .expect("resume should tolerate a lagging remote projection");
+
+        assert_eq!(
+            routing.next_server_turn_index(),
+            4,
+            "an eventually consistent restore projection must never roll the local causal clock backwards"
         );
     }
 

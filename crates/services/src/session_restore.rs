@@ -627,7 +627,7 @@ impl HybridRestoreService {
             }
         };
 
-        if let Some(ws) = local_workspace {
+        let mut projection = if let Some(ws) = local_workspace {
             let mut recent_tools = if let Some(user_id) = user_id {
                 self.restore_recent_tools(user_id, session_id).await?
             } else {
@@ -644,16 +644,14 @@ impl HybridRestoreService {
 
             let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
 
-            return Ok(Some(restored_session_from_workspace(
+            Some(restored_session_from_workspace(
                 ws,
                 local_journal.as_ref(),
                 recent_tools,
                 ckpt_count,
                 false,
-            )));
-        }
-
-        if let Some(user_id) = user_id
+            ))
+        } else if let Some(user_id) = user_id
             && let Some(ws) = self.restore_cloud_workspace(user_id, session_id).await?
         {
             let mut recent_tools = self.restore_recent_tools(user_id, session_id).await?;
@@ -674,19 +672,17 @@ impl HybridRestoreService {
                 .await
                 .map_err(|e| format!("restore_session_inner cloud checkpoint count: {e}"))?;
 
-            return Ok(Some(restored_session_from_workspace(
+            Some(restored_session_from_workspace(
                 ws.metadata,
                 local_journal.as_ref(),
                 recent_tools,
                 cloud_ckpt_count.max(local_ckpt_count),
                 true,
-            )));
-        }
-
-        if let Some(summary) = local_journal {
+            ))
+        } else if let Some(summary) = local_journal {
             let ckpt_count = local_checkpoint_count(user_id, session_id, "restore_session_inner")?;
 
-            return Ok(Some(RestoredSession {
+            Some(RestoredSession {
                 session_id: session_id.to_string(),
                 turn_count: summary.turn_count,
                 total_tokens_in: summary.total_tokens_in,
@@ -700,14 +696,27 @@ impl HybridRestoreService {
                 permission_mode: summary.permission_mode,
                 restored_from_cloud: false,
                 ..Default::default()
-            }));
-        }
+            })
+        } else {
+            None
+        };
 
         if let Some(user_id) = user_id {
-            let cloud_result = self.restore_cloud_session(user_id, session_id).await?;
-            if cloud_result.is_some() {
-                return Ok(cloud_result);
+            // Authenticated restore can observe two independently persisted
+            // projections: local journal/workspace state and MatrixOne event
+            // state. Neither projection is allowed to shadow a later causal
+            // turn from the other. Reconcile them before returning so callers
+            // never pair an old turn clock with a newer Server session.
+            if let Some(cloud) = self.restore_cloud_session(user_id, session_id).await? {
+                projection = Some(match projection {
+                    Some(local) => reconcile_restored_session_candidates(local, cloud),
+                    None => cloud,
+                });
             }
+        }
+
+        if projection.is_some() {
+            return Ok(projection);
         }
 
         if let Some(error) = local_workspace_error {
@@ -1330,6 +1339,102 @@ impl HybridRestoreService {
         let count = mysql_i64(&row, "cloud_checkpoint_count", "checkpoint_count")?;
         non_negative_i64_to_u32(count, "cloud_checkpoint_count", "checkpoint_count")
     }
+}
+
+/// Reconcile two restore projections without combining history from different
+/// causal turns.
+///
+/// The projection with the greatest completed-turn clock owns all
+/// turn-sensitive state. Projections at the same turn may safely complement
+/// one another because they describe the same causal boundary.
+fn reconcile_restored_session_candidates(
+    first: RestoredSession,
+    second: RestoredSession,
+) -> RestoredSession {
+    debug_assert_eq!(first.session_id, second.session_id);
+
+    let same_turn = first.turn_count == second.turn_count;
+    let (mut current, other) = if second.turn_count > first.turn_count {
+        (second, first)
+    } else {
+        (first, second)
+    };
+
+    current.total_tokens_in = current.total_tokens_in.max(other.total_tokens_in);
+    current.total_tokens_out = current.total_tokens_out.max(other.total_tokens_out);
+    current.total_cache_read_tokens = current
+        .total_cache_read_tokens
+        .max(other.total_cache_read_tokens);
+    current.total_cache_creation_tokens = current
+        .total_cache_creation_tokens
+        .max(other.total_cache_creation_tokens);
+    current.checkpoint_count = current.checkpoint_count.max(other.checkpoint_count);
+
+    if current.git_branch.is_none() {
+        current.git_branch = other.git_branch.clone();
+    }
+    if current.model.is_none() {
+        current.model = other.model.clone();
+    }
+    if current.permission_mode.is_none() {
+        current.permission_mode = other.permission_mode.clone();
+    }
+    if current.title.is_none() {
+        current.title = other.title.clone();
+    }
+
+    if same_turn {
+        if current.recent_tools.is_empty() {
+            current.recent_tools = other.recent_tools;
+        }
+        if current.conversation_messages.is_empty() {
+            current.conversation_messages = other.conversation_messages;
+        }
+        if current.blocked_tools.is_empty() {
+            current.blocked_tools = other.blocked_tools;
+        }
+        if current.approval_overrides.is_none() {
+            current.approval_overrides = other.approval_overrides;
+        }
+        if current.interruption.is_none() {
+            current.interruption = other.interruption;
+        }
+        if current.compaction_state.is_none() {
+            current.compaction_state = other.compaction_state;
+        }
+        if current.pipeline_state.is_none() {
+            current.pipeline_state = other.pipeline_state;
+        }
+        if current.executing_plan_json.is_none() {
+            current.executing_plan_json = other.executing_plan_json;
+        }
+        if current.plan_goal.is_none() {
+            current.plan_goal = other.plan_goal;
+        }
+        if current.plan_config_json.is_none() {
+            current.plan_config_json = other.plan_config_json;
+        }
+        current.plan_execution_rounds = current
+            .plan_execution_rounds
+            .max(other.plan_execution_rounds);
+        if current.contract_json.is_none() {
+            current.contract_json = other.contract_json;
+        }
+        if current.plan_corrections.is_empty() {
+            current.plan_corrections = other.plan_corrections;
+        }
+        if current.last_context_trace.is_none() {
+            current.last_context_trace = other.last_context_trace;
+        }
+        if current.workspace.is_none() {
+            current.workspace = other.workspace;
+        }
+        if current.last_status.is_empty() {
+            current.last_status = other.last_status;
+        }
+    }
+
+    current
 }
 
 fn local_checkpoint_count(
@@ -3489,6 +3594,54 @@ mod tests {
     }
 
     #[test]
+    fn restore_reconciliation_uses_the_furthest_completed_turn_without_mixing_history() {
+        let local_projection = RestoredSession {
+            session_id: "session-1".into(),
+            turn_count: 1,
+            total_tokens_in: 100,
+            model: Some("local-model".into()),
+            conversation_messages: vec![
+                serde_json::json!({"role": "user", "content": "stale local question"}),
+                serde_json::json!({"role": "assistant", "content": "stale local answer"}),
+            ],
+            restored_from_cloud: false,
+            ..Default::default()
+        };
+        let cloud_projection = RestoredSession {
+            session_id: "session-1".into(),
+            turn_count: 4,
+            total_tokens_in: 500,
+            total_cache_read_tokens: 400,
+            model: Some("cloud-model".into()),
+            conversation_messages: vec![
+                serde_json::json!({"role": "user", "content": "current cloud question"}),
+                serde_json::json!({"role": "assistant", "content": "current cloud answer"}),
+            ],
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+
+        let restored = reconcile_restored_session_candidates(local_projection, cloud_projection);
+
+        assert_eq!(restored.turn_count, 4);
+        assert_eq!(restored.model.as_deref(), Some("cloud-model"));
+        assert_eq!(restored.total_tokens_in, 500);
+        assert_eq!(restored.total_cache_read_tokens, 400);
+        assert!(restored.restored_from_cloud);
+        assert_eq!(
+            restored.conversation_messages[1]["content"], "current cloud answer",
+            "a newer causal clock must carry its matching conversation projection"
+        );
+        assert!(
+            restored
+                .conversation_messages
+                .iter()
+                .all(|message| message["content"] != "stale local answer"),
+            "history from an older turn must not be combined with a newer turn count"
+        );
+    }
+
+    #[test]
     fn restored_checkpoint_ordering() {
         let ckpts = [
             RestoredCheckpoint {
@@ -3986,6 +4139,79 @@ mod tests {
                 message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
             }),
             "child run transcript rows are work-unit output, not main prompt history"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn authenticated_restore_does_not_let_an_incomplete_local_mirror_shadow_matrixone() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _journal_guard = JournalDirGuard::new(journal_dir.path());
+        let pool = setup_session_restore_db_it().await;
+        let user_id = format!("user-{}", uuid::Uuid::new_v4());
+        let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+        let event_id = format!("event-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .expect("insert restore session");
+        sqlx::query(
+            "INSERT INTO agent_events
+             (event_id, session_id, user_id, event_type, content, turn_seq, created_at)
+             VALUES (?, ?, ?, 'user_query', 'turn four', 4, NOW(6))",
+        )
+        .bind(&event_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .expect("insert authoritative turn event");
+
+        // The API process writes an owner-scoped observability mirror before
+        // the CLI writes its completed-turn journal. It is evidence that the
+        // session exists, but it contains no completed Turn event and must not
+        // hide the authoritative MatrixOne clock.
+        let local_writer =
+            crate::session_journal::JournalWriter::for_user(&user_id, &session_id).unwrap();
+        local_writer
+            .append(&crate::session_journal::JournalEvent::session_start(
+                Some(&session_id),
+                Some("mirror-model"),
+            ))
+            .unwrap();
+
+        let service = HybridRestoreService::new(pool.get().clone());
+        let restored = service
+            .restore_session(&user_id, &session_id)
+            .await
+            .expect("restore should reconcile available projections")
+            .expect("session should be resumable");
+
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("delete restore events");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("delete restore session");
+
+        assert_eq!(restored.turn_count, 4);
+        assert!(
+            restored.restored_from_cloud,
+            "the projection that owns the furthest completed turn must own the restored state"
         );
     }
 

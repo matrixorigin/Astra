@@ -296,24 +296,18 @@ where
     Some(snapshot)
 }
 
-/// Build a prompt section for the CLI-injected skill listing.
+/// Normalize the CLI-injected skill listing for the typed session channel.
 ///
 /// Returns `None` when the CLI didn't include a listing (no skills loaded
-/// this session). Returns a `CacheScope::Session` section otherwise, so
-/// the Anthropic prompt cache hits the full block. This was previously a
-/// `CacheScope::None` volatile section, which meant CLI users paid the
-/// ~2.5KB skill listing cost every turn.
-pub fn skill_listing_section_for_edge_profile(
-    raw: Option<&str>,
-) -> Option<crate::prompts::PromptSection> {
+/// this session). The context binder owns its `CacheScope::Session`
+/// placement through `SessionContext.skill_listing_block`; callers must not
+/// also copy it into the generic stable-section lane.
+pub fn skill_listing_block_for_edge_profile(raw: Option<&str>) -> Option<String> {
     let text = raw?.trim();
     if text.is_empty() {
         return None;
     }
-    Some(crate::prompts::PromptSection::stable(
-        text.to_string(),
-        crate::prompts::CacheScope::Session,
-    ))
+    Some(text.to_string())
 }
 
 fn deferred_tools_section_for_edge_profile(
@@ -448,6 +442,9 @@ fn observe_context_compaction(
     visible_tools: &[Value],
 ) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
     result.boundary.as_ref()?;
+    if result.messages == history_before {
+        return None;
+    }
 
     let estimate = |history: &[Value]| -> u64 {
         fixed_context
@@ -460,6 +457,9 @@ fn observe_context_compaction(
     };
     let tokens_before = estimate(history_before);
     let tokens_after = estimate(&result.messages);
+    if tokens_after >= tokens_before {
+        return None;
+    }
     let tier = serde_json::to_value(result.tier)
         .ok()
         .and_then(|value| value.as_str().map(ToString::to_string))
@@ -2210,19 +2210,16 @@ impl InProcessChatTurnBridge {
                 .unwrap_or_default();
 
             // ── Skill listing (injected by CLI via edge_profile) ──
-            // Phase-9 fix: route to the session-stable lane so the
-            // Anthropic prompt cache hits the listing block. Previously
-            // this string went into `dynamic_sections` (volatile) which
-            // made CLI users' turn-to-turn cache miss the entire listing
-            // every round — the very regression the skill rewrite was
-            // meant to eliminate.
-            let skill_listing_hint_text = edge_profile
-                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let skill_listing_section =
-                skill_listing_section_for_edge_profile(skill_listing_hint_text.as_deref());
+            // The typed AvailableSkills channel owns session-stable placement.
+            // Keeping the catalog out of generic stable sections prevents the
+            // same routing metadata from appearing twice in one wire request.
+            let skill_listing_hint_text = skill_listing_block_for_edge_profile(
+                edge_profile
+                    .get(
+                        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT,
+                    )
+                    .and_then(Value::as_str),
+            );
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_for_turn.clone();
@@ -2286,11 +2283,6 @@ impl InProcessChatTurnBridge {
                         prompts::PromptTokenBucket::Environment,
                     ),
                 );
-            }
-            if let Some(section) = skill_listing_section.clone() {
-                // Session-scope: joins the cached prefix. Cache flips
-                // once when skill catalog changes, then stabilizes.
-                stable_sections.push(section);
             }
             let runtime_volatile_parts =
                 astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
@@ -2468,11 +2460,9 @@ impl InProcessChatTurnBridge {
                 // last user message prefix so the system + tools prefix stays
                 // byte-stable across rounds. Earlier the Anthropic/Bedrock
                 // paths embedded volatile in the system content array past
-                // the cache_control marker; controlled probes (session
-                // 5c5cbf78, see deepseek_anthropic_cache_probe.py) showed
-                // DeepSeek treats the byte change as a fresh payload and
-                // never reaches the 2nd-warm state where tools enter cache.
-                // Bedrock is unaffected either way.
+                // the cache_control marker. Providers that cache an exact
+                // request prefix treat that byte change as a fresh payload,
+                // while marker-isolated providers are unaffected.
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
@@ -5884,13 +5874,16 @@ mod tests {
 
     #[test]
     fn compaction_observation_ignores_a_noop_result() {
-        use crate::turn::cloud::compaction::CompactResult;
+        use crate::turn::cloud::compaction::{CompactBoundary, CompactResult, CompactTrigger};
 
         let messages = vec![json!({"role": "user", "content": "small"})];
         let result = CompactResult {
             messages: messages.clone(),
-            boundary: None,
-            tier: crate::prompts::CompactionTier::Normal,
+            boundary: Some(CompactBoundary::new(
+                CompactTrigger::Auto,
+                crate::prompts::CompactionTier::CompactHistory,
+            )),
+            tier: crate::prompts::CompactionTier::CompactHistory,
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             runtime_contexts: Vec::new(),

@@ -967,6 +967,20 @@ pub(crate) fn assemble_bridge_context(
             crate::prompts::PromptTokenBucket::Environment,
         ));
     }
+    // The typed AvailableSkills channel is the catalog's canonical owner.
+    // Older bridge callers also placed the exact same section in the generic
+    // stable lane. Filter that structurally identical copy at the ownership
+    // boundary so one logical context source cannot be serialized twice.
+    let typed_skill_catalog = input.session.skill_listing_block.trim();
+    let extra_stable_sections = input
+        .runtime_signals
+        .extra_stable_sections
+        .iter()
+        .filter(|section| {
+            typed_skill_catalog.is_empty() || section.text.trim() != typed_skill_catalog
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let _tool_surface_metadata = (
         input.tool_surface.visible_tools.len(),
         input.tool_surface.always_load_tools.len(),
@@ -977,7 +991,7 @@ pub(crate) fn assemble_bridge_context(
     let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome_with_messages(
         &effective_tool_names,
         &effective_tool_schemas,
-        input.runtime_signals.extra_stable_sections,
+        &extra_stable_sections,
         &extra_volatile_sections,
         input.runtime_signals.memory_entries,
         input.runtime_signals.session_memory_entry.as_ref(),
@@ -2418,6 +2432,46 @@ mod context_cache_contract_tests {
                 "session_snapshot_injected": false,
                 "delivery": "typed_runtime_dynamic",
             })
+        );
+    }
+
+    #[test]
+    fn assemble_bridge_context_emits_typed_skill_catalog_once() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let catalog = "<available_skills><skill><name>review</name></skill></available_skills>";
+        let legacy_generic_copy = [crate::prompts::PromptSection::stable(
+            catalog,
+            crate::prompts::CacheScope::Session,
+        )];
+        let visible_tools: Vec<Value> = Vec::new();
+        let restricted_tools = HashSet::new();
+
+        let output = assemble_bridge_context(BridgeContextAssemblyInput {
+            conversation_messages: &[],
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: BridgeRuntimeSignals::new(&legacy_generic_copy, &[], &[], None, None),
+            session: BridgeSessionContextInput::new(
+                &cache_cfg,
+                None,
+                "sid-single-skill-catalog",
+                "deepseek-v4-flash-anthropic",
+                "anthropic",
+                Some("/tmp/project"),
+                Some("main"),
+                None,
+                "2026-07-24",
+            )
+            .with_skill_listing_block(catalog),
+        });
+
+        let system_text = message_text(&output.primary_system);
+        assert_eq!(
+            system_text.matches("<available_skills>").count(),
+            1,
+            "the typed AvailableSkills channel must be the catalog's single owner: {system_text}"
         );
     }
 

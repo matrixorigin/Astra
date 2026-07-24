@@ -1122,42 +1122,86 @@ struct ProviderPromptCacheUsage {
     creation: u64,
 }
 
+fn provider_cache_ratio_cmp(
+    left: ProviderPromptCacheUsage,
+    right: ProviderPromptCacheUsage,
+) -> std::cmp::Ordering {
+    let left_total = u128::from(left.fresh) + u128::from(left.read) + u128::from(left.creation);
+    let right_total = u128::from(right.fresh) + u128::from(right.read) + u128::from(right.creation);
+    (u128::from(left.read) * right_total).cmp(&(u128::from(right.read) * left_total))
+}
+
 /// Extract provider usage observations in journal order. Canonical `turn`
 /// records are authoritative; legacy `llm_round` records are considered only
 /// when the session has no canonical usage records, avoiding double-counting
 /// sessions that contain both schemas.
 fn provider_prompt_cache_usages(capture: &SessionCapture) -> Vec<ProviderPromptCacheUsage> {
-    fn extract(capture: &SessionCapture, event_type: &str) -> Vec<ProviderPromptCacheUsage> {
-        capture
+    fn extract(
+        capture: &SessionCapture,
+        event_type: &str,
+        aggregate_rounds: bool,
+    ) -> Vec<ProviderPromptCacheUsage> {
+        let mut usages = Vec::<ProviderPromptCacheUsage>::new();
+        let mut turn_positions = std::collections::HashMap::<u64, usize>::new();
+        for event in capture
             .events
             .iter()
             .filter(|event| event.event_type == event_type)
-            .filter_map(|event| {
-                let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
-                let read = event
-                    .raw
-                    .get("cache_read_tokens")
-                    .and_then(|value| value.as_u64());
-                let creation = event
-                    .raw
-                    .get("cache_creation_tokens")
-                    .and_then(|value| value.as_u64());
-                if fresh.is_none() && read.is_none() && creation.is_none() {
-                    return None;
+        {
+            let fresh = event.raw.get("tokens_in").and_then(|value| value.as_u64());
+            let read = event
+                .raw
+                .get("cache_read_tokens")
+                .and_then(|value| value.as_u64());
+            let creation = event
+                .raw
+                .get("cache_creation_tokens")
+                .and_then(|value| value.as_u64());
+            if fresh.is_none() && read.is_none() && creation.is_none() {
+                continue;
+            }
+            let usage = ProviderPromptCacheUsage {
+                fresh: fresh.unwrap_or_default(),
+                read: read.unwrap_or_default(),
+                creation: creation.unwrap_or_default(),
+            };
+            if usage.fresh == 0 && usage.read == 0 && usage.creation == 0 {
+                continue;
+            }
+
+            let Some(turn) = event.raw.get("turn").and_then(|value| value.as_u64()) else {
+                usages.push(usage);
+                continue;
+            };
+            if let Some(index) = turn_positions.get(&turn).copied() {
+                if aggregate_rounds {
+                    let current = &mut usages[index];
+                    current.fresh = current.fresh.saturating_add(usage.fresh);
+                    current.read = current.read.saturating_add(usage.read);
+                    current.creation = current.creation.saturating_add(usage.creation);
+                } else if provider_cache_ratio_cmp(usage, usages[index]).is_lt() {
+                    // Mirrored canonical journals should agree. If they do
+                    // not, retain the lower cache-read ratio so a path-order
+                    // change cannot turn conflicting evidence into a false
+                    // pass.
+                    usages[index] = usage;
                 }
-                let usage = ProviderPromptCacheUsage {
-                    fresh: fresh.unwrap_or_default(),
-                    read: read.unwrap_or_default(),
-                    creation: creation.unwrap_or_default(),
-                };
-                (usage.fresh > 0 || usage.read > 0 || usage.creation > 0).then_some(usage)
-            })
-            .collect()
+                continue;
+            }
+            turn_positions.insert(turn, usages.len());
+            usages.push(usage);
+        }
+        usages
     }
 
-    let canonical = extract(capture, "turn");
+    // Canonical turn records already aggregate every LLM round. Mirrored
+    // records for one turn are de-duplicated; disagreement is resolved
+    // conservatively and independently of artifact path ordering.
+    let canonical = extract(capture, "turn", false);
     if canonical.is_empty() {
-        extract(capture, "llm_round")
+        // Legacy journals expose one usage record per LLM round. Aggregate
+        // those by user turn so `warmup_turns` never removes only half a turn.
+        extract(capture, "llm_round", true)
     } else {
         canonical
     }
@@ -2085,6 +2129,149 @@ mod tests {
         );
 
         assert!(result[0].passed, "{:?}", result[0]);
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_conflicting_mirrors_fail_closed_in_either_order() {
+        let evaluate = |second_turn_first_is_cached: bool| {
+            let cached = (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 20,
+                    "cache_read_tokens": 980
+                }),
+            );
+            let uncached = (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 1_000,
+                    "cache_read_tokens": 0
+                }),
+            );
+            let (first, second) = if second_turn_first_is_cached {
+                (cached, uncached)
+            } else {
+                (uncached, cached)
+            };
+            let sess = mk_session(&[
+                (
+                    "turn",
+                    serde_json::json!({
+                        "turn": 1,
+                        "tokens_in": 1_000,
+                        "cache_read_tokens": 0
+                    }),
+                ),
+                first,
+                second,
+            ]);
+            evaluate_deterministic_with_session(
+                &[Criterion::ProviderPromptCacheReadRatio {
+                    min: 0.98,
+                    warmup_turns: 1,
+                }],
+                &outcome_with_tools(&[]),
+                Some(&sess),
+            )
+        };
+
+        for cached_first in [true, false] {
+            let result = evaluate(cached_first);
+            assert!(
+                !result[0].passed,
+                "conflicting mirrors must not produce an order-dependent false pass: {:?}",
+                result[0]
+            );
+            assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
+        }
+    }
+
+    #[test]
+    fn provider_prompt_cache_read_ratio_deduplicates_identical_canonical_mirrors() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "tokens_in": 1_000,
+                    "cache_read_tokens": 0
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 20,
+                    "cache_read_tokens": 980
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 20,
+                    "cache_read_tokens": 980
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.98,
+                warmup_turns: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(
+            result[0].passed,
+            "identical mirrors of one canonical turn must be counted once: {:?}",
+            result[0]
+        );
+        assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
+    }
+
+    #[test]
+    fn provider_prompt_cache_warmup_skips_whole_legacy_turn_not_one_round() {
+        let sess = mk_session(&[
+            (
+                "llm_round",
+                serde_json::json!({
+                    "turn": 1,
+                    "tokens_in": 500,
+                    "cache_read_tokens": 0
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "turn": 1,
+                    "tokens_in": 500,
+                    "cache_read_tokens": 0
+                }),
+            ),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "turn": 2,
+                    "tokens_in": 20,
+                    "cache_read_tokens": 980
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[Criterion::ProviderPromptCacheReadRatio {
+                min: 0.98,
+                warmup_turns: 1,
+            }],
+            &outcome_with_tools(&[]),
+            Some(&sess),
+        );
+
+        assert!(result[0].passed, "{:?}", result[0]);
+        assert!(result[0].detail.contains("turns=1"), "{}", result[0].detail);
     }
 
     // ── validate_criterion / validate_criteria (R3 #2) ──

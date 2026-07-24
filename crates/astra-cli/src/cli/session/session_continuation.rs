@@ -5,6 +5,12 @@
 
 use serde_json::{Value, json};
 
+#[derive(Debug)]
+pub(crate) struct CslContinuation {
+    pub(crate) completed_turn_count: u32,
+    pub(crate) messages: Vec<Value>,
+}
+
 /// Load prompt-facing continuation from canonical local session state.
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
@@ -114,6 +120,11 @@ fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec
 pub(crate) fn load_csl_messages_for_continuation(
     session_id: &str,
 ) -> Result<Option<Vec<Value>>, String> {
+    load_csl_continuation(session_id)
+        .map(|continuation| continuation.map(|continuation| continuation.messages))
+}
+
+pub(crate) fn load_csl_continuation(session_id: &str) -> Result<Option<CslContinuation>, String> {
     let store = astra_turn_core::conversation_log::file_store::FileCslStore::new(
         crate::cli::session::session_recovery::io::csl_store_base_dir(),
     );
@@ -129,7 +140,10 @@ pub(crate) fn load_csl_messages_for_continuation(
             &materialized.session_state,
         )
         .map_err(|error| error.to_string())?;
-    Ok((!messages.is_empty()).then_some(messages))
+    Ok((!messages.is_empty()).then_some(CslContinuation {
+        completed_turn_count: materialized.last_turn,
+        messages,
+    }))
 }
 
 fn heavy_checkpoint_prompt_state(

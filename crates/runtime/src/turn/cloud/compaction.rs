@@ -102,6 +102,200 @@ fn duplicate_read_stub(path: &str) -> String {
     )
 }
 
+fn serialized_value_chars(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|encoded| encoded.chars().count())
+        .unwrap_or(1)
+}
+
+fn serialized_message_chars(messages: &[Value]) -> usize {
+    messages.iter().map(serialized_value_chars).sum()
+}
+
+fn tool_text_chars(message: &Value) -> usize {
+    match message.get("content") {
+        Some(Value::String(content)) => content.chars().count(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(|text| text.chars().count())
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn truncate_tool_text_content(message: &mut Value, keep_chars: usize, suffix: &str) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    match content {
+        Value::String(text) => {
+            if text.chars().count() <= keep_chars {
+                return false;
+            }
+            let truncated: String = text.chars().take(keep_chars).collect();
+            *text = truncated + suffix;
+            true
+        }
+        Value::Array(blocks) => {
+            let total_text_chars: usize = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(|text| text.chars().count())
+                .sum();
+            if total_text_chars <= keep_chars {
+                return false;
+            }
+
+            let mut remaining = keep_chars;
+            let mut retained = Vec::with_capacity(blocks.len());
+            let mut last_text_index = None;
+            for mut block in blocks.drain(..) {
+                let Some(text) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                else {
+                    retained.push(block);
+                    continue;
+                };
+                if remaining == 0 {
+                    continue;
+                }
+
+                let text_chars = text.chars().count();
+                if text_chars > remaining {
+                    block["text"] = Value::String(text.chars().take(remaining).collect());
+                    remaining = 0;
+                } else {
+                    remaining -= text_chars;
+                }
+                last_text_index = Some(retained.len());
+                retained.push(block);
+            }
+            if let Some(index) = last_text_index
+                && let Some(Value::String(text)) = retained[index].get_mut("text")
+            {
+                text.push_str(suffix);
+            }
+            *blocks = retained;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn truncate_tool_results_to_serialized_budget(
+    messages: &mut [Value],
+    budget_chars: usize,
+    preserve_latest: bool,
+) -> bool {
+    const MIN_TOOL_EVIDENCE_CHARS: usize = 80;
+    const SUFFIX: &str = "\n...[compacted for context budget; re-run tool if needed]";
+
+    let latest_tool_index = preserve_latest
+        .then(|| {
+            messages
+                .iter()
+                .rposition(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        })
+        .flatten();
+    let suffix_chars = serde_json::to_string(SUFFIX)
+        .map(|encoded| encoded.chars().count().saturating_sub(2))
+        .unwrap_or_else(|_| SUFFIX.chars().count());
+    // Re-serializing the complete transcript once per tool result makes
+    // compaction quadratic in session length. Maintain the exact serialized
+    // total from per-message deltas so long-running executions remain linear
+    // in the number of messages processed here.
+    let mut total_chars = serialized_message_chars(messages);
+    let mut changed = false;
+    for index in 0..messages.len() {
+        if total_chars <= budget_chars {
+            break;
+        }
+        if messages[index].get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if Some(index) == latest_tool_index {
+            continue;
+        }
+        let content_chars = tool_text_chars(&messages[index]);
+        if content_chars <= MIN_TOOL_EVIDENCE_CHARS {
+            continue;
+        }
+
+        let overage = total_chars.saturating_sub(budget_chars);
+        let keep_chars = content_chars
+            .saturating_sub(overage.saturating_add(suffix_chars))
+            .max(MIN_TOOL_EVIDENCE_CHARS);
+        if keep_chars.saturating_add(suffix_chars) >= content_chars {
+            continue;
+        }
+
+        let before_chars = serialized_value_chars(&messages[index]);
+        if truncate_tool_text_content(&mut messages[index], keep_chars, SUFFIX) {
+            let after_chars = serialized_value_chars(&messages[index]);
+            total_chars = total_chars
+                .saturating_sub(before_chars)
+                .saturating_add(after_chars);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
+    let first_user_idx = messages
+        .iter()
+        .position(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    let conversation_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            )
+            .then_some(index)
+        })
+        .collect();
+
+    let Some(first_user_idx) = first_user_idx else {
+        return false;
+    };
+    let Some(tail_start) = conversation_indices
+        .iter()
+        .copied()
+        .find(|index| *index > first_user_idx)
+    else {
+        return false;
+    };
+    let tail_role = messages[tail_start]
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(next_tail_start) = conversation_indices.iter().copied().find(|index| {
+        *index > tail_start
+            && (tail_role != "user"
+                || messages[*index].get("role").and_then(Value::as_str) == Some("user"))
+    }) else {
+        return false;
+    };
+
+    let before = messages.len();
+    *messages = messages
+        .drain(..)
+        .enumerate()
+        .filter(|(index, message)| {
+            message.get("role").and_then(Value::as_str) == Some("system")
+                || *index == first_user_idx
+                || *index >= next_tail_start
+        })
+        .map(|(_, message)| message)
+        .collect();
+    messages.len() < before
+}
+
 /// Resolve `function.name` + `function.arguments` for a `role: tool` message by matching
 /// `tool_call_id` to the nearest preceding assistant `tool_calls` entry.
 /// Apply context release stubs to messages
@@ -303,14 +497,7 @@ pub(crate) fn compact_tiered_impl(
     // serde_json::to_string. The guard and truncation limits in this legacy
     // helper remain character-based; the context pipeline's token budget is
     // the authoritative outer limit.
-    let total_chars: usize = messages
-        .iter()
-        .map(|message| {
-            serde_json::to_string(message)
-                .map(|encoded| encoded.chars().count())
-                .unwrap_or(1)
-        })
-        .sum();
+    let total_chars = serialized_message_chars(messages);
 
     if total_chars <= budget_chars {
         return CompactResult {
@@ -450,15 +637,34 @@ pub(crate) fn compact_tiered_impl(
         }
     }
 
-    let messages_after = compacted.len();
-    let boundary = CompactBoundary::new(CompactTrigger::Auto, tier)
-        .with_pre_metrics(0, messages_before)
-        .with_post_count(messages_after)
-        .with_discovered_tools(extract_discovered_tools(messages));
+    // `keep_recent_turns` is a preservation preference, not permission to
+    // overflow the provider window. Reduce old oversized tool evidence first.
+    // At the aggressive tier, release complete old conversation spans before
+    // touching the latest tool result that the active execution may need.
+    truncate_tool_results_to_serialized_budget(
+        &mut compacted,
+        budget_chars,
+        tier == CompactionTier::AggressivePrune,
+    );
+    if tier == CompactionTier::AggressivePrune {
+        while serialized_message_chars(&compacted) > budget_chars
+            && prune_oldest_conversation_span(&mut compacted)
+        {
+            truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, true);
+        }
+        truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, false);
+    }
+
+    let boundary = (compacted != messages).then(|| {
+        CompactBoundary::new(CompactTrigger::Auto, tier)
+            .with_pre_metrics(0, messages_before)
+            .with_post_count(compacted.len())
+            .with_discovered_tools(extract_discovered_tools(messages))
+    });
 
     CompactResult {
         messages: compacted,
-        boundary: Some(boundary),
+        boundary,
         tier,
         session_memory_context: None,
         retrieved_memory_entries: Vec::new(),
@@ -599,6 +805,120 @@ mod tests {
         assert!(
             result.boundary.is_none(),
             "Under-budget should produce no boundary"
+        );
+    }
+
+    #[test]
+    fn over_budget_but_ineligible_history_does_not_emit_compaction_boundary() {
+        let msgs = vec![
+            user(&"current user input ".repeat(500)),
+            assistant("short reply"),
+        ];
+
+        let result = compact_tiered_with_result(&msgs, 1, 100, CompactionTier::CompactHistory, 4);
+
+        assert_eq!(
+            result.messages, msgs,
+            "the compactor must not mutate the current user input just to satisfy a budget"
+        );
+        assert!(
+            result.boundary.is_none(),
+            "a boundary is evidence that the provider-visible history changed"
+        );
+    }
+
+    #[test]
+    fn aggressive_budget_pruning_removes_complete_user_turns() {
+        let msgs = vec![
+            user("session anchor"),
+            user(&"obsolete request ".repeat(500)),
+            assistant("answer that only belongs to the obsolete request"),
+            user("latest request"),
+            assistant("latest answer"),
+        ];
+
+        let result =
+            compact_tiered_with_result(&msgs, 400, 100, CompactionTier::AggressivePrune, 4);
+
+        assert!(
+            result.messages.iter().all(|message| {
+                message.get("content").and_then(Value::as_str)
+                    != Some("answer that only belongs to the obsolete request")
+            }),
+            "removing an old user turn must remove its dependent assistant answer too"
+        );
+        assert!(result.messages.iter().any(|message| {
+            message.get("content").and_then(Value::as_str) == Some("latest request")
+        }));
+        assert!(result.messages.iter().any(|message| {
+            message.get("content").and_then(Value::as_str) == Some("latest answer")
+        }));
+    }
+
+    #[test]
+    fn structured_tool_content_compacts_text_without_losing_opaque_blocks() {
+        let msgs = vec![
+            user("inspect the document"),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-structured",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-structured",
+                "content": [
+                    {"type": "document", "source": {"type": "base64", "data": "opaque"}},
+                    {"type": "text", "text": "结构化工具证据".repeat(1_000)}
+                ]
+            }),
+        ];
+
+        let result =
+            compact_tiered_with_result(&msgs, 1_000, 100, CompactionTier::AggressivePrune, 2);
+
+        assert!(
+            serialized_message_chars(&result.messages) <= 1_000,
+            "text blocks must participate in the same concrete budget as string tool results"
+        );
+        let blocks = result.messages[2]["content"]
+            .as_array()
+            .expect("structured tool content");
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("document")),
+            "budget enforcement must preserve opaque provider content blocks"
+        );
+        assert!(result.boundary.is_some());
+    }
+
+    #[test]
+    fn serialized_budget_truncation_scales_across_long_tool_histories() {
+        let mut messages = (0..1_000)
+            .map(|index| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": format!("call-{index}"),
+                    "content": "x".repeat(1_024),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert!(truncate_tool_results_to_serialized_budget(
+            &mut messages,
+            0,
+            false
+        ));
+        assert!(
+            messages
+                .iter()
+                .all(|message| tool_text_chars(message) < 200),
+            "one linear pass must compact every eligible result even when the irreducible envelope exceeds the budget"
         );
     }
 
