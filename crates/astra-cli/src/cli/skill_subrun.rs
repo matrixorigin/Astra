@@ -1574,13 +1574,13 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()],
-            "subrun surface assembly must not consume activation before the selected tool is called"
+            "subrun surface assembly must preserve selected schema materialization"
         );
         let _ = executor.execute("memory", &json!({})).await;
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "the accepted visible tool call consumes the matching activation"
+            vec!["memory".to_string()],
+            "a selected schema must remain materialized for the subrun after a call"
         );
     }
 

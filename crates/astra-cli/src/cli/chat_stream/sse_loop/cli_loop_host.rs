@@ -761,6 +761,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     tool_results: state.tool_results.as_slice(),
                     all_schemas: &self.all_schemas,
                     valid_tool_names: &mut self.valid_tool_names,
+                    pinned_tool_schema_tokens: &mut state.pinned_tool_schema_tokens,
                     turn_guard: &state.turn_guard,
                     restricted_tools: &mut state.restricted_tools,
                     widen_selection_pending: &mut state.widen_selection_pending,

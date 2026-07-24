@@ -127,10 +127,11 @@ where
 /// Record names selected by `tool_search(select:...)` or by the direct
 /// deferred-call recovery path.
 ///
-/// Activation is not a time-to-live counter. It remains pending until the
-/// corresponding full schema reaches `tools[]` and the model actually calls
-/// that tool once, or until the installed non-empty surface/runtime binding
-/// proves the activation is stale.
+/// Activation is a materialization record in the session's retained context.
+/// It remains active after the corresponding full schema reaches `tools[]` and
+/// after the model calls the tool, so schema visibility and admission cannot
+/// drift across later turns. Session reset, context restoration, an installed
+/// non-empty surface, or a missing runtime binding can prove an entry stale.
 pub fn refresh_activated_tool_names<I>(activated: &mut HashSet<String>, names: I)
 where
     I: IntoIterator<Item = String>,
@@ -172,9 +173,10 @@ where
 /// Return activated tool names for schema injection and prune stale entries.
 ///
 /// This does not consume activation. A selected deferred tool remains visible
-/// until the model calls it once, which matches the user-facing contract:
-/// `tool_search(select:a,b,c)` makes all three tools available, not just for a
-/// guessed number of follow-up schema-selection rounds.
+/// while its selection evidence remains in retained conversation context,
+/// including after repeated calls. This matches the user-facing contract: a
+/// schema returned by `tool_search(select:a,b,c)` is callable like a regular
+/// visible schema until context/session reset or the surface becomes invalid.
 pub fn activated_tool_names_for_schema_injection<F>(
     activated: &mut HashSet<String>,
     surface: &ToolSurfaceNames,
@@ -191,12 +193,6 @@ where
     let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
     activated.retain(|name| retained_set.contains(name.as_str()));
     retained
-}
-
-/// Consume activation once the tool has actually been called from a visible
-/// schema surface.
-pub fn consume_activated_tool_name(activated: &mut HashSet<String>, name: &str) -> bool {
-    activated.remove(name)
 }
 
 /// Extract activation names from a `tool_search(select:...)` result and keep
@@ -555,12 +551,11 @@ mod tests {
             vec!["memory".to_string()]
         );
         assert!(activated.contains("memory"));
-        assert!(consume_activated_tool_name(&mut activated, "memory"));
-        assert!(activated.is_empty());
+        assert!(activated.contains("memory"));
     }
 
     #[test]
-    fn activation_long_selected_chain_remains_until_each_tool_is_called() {
+    fn activation_remains_stable_after_repeated_calls() {
         let mut activated = HashSet::new();
         refresh_activated_tool_names(
             &mut activated,
@@ -590,18 +585,15 @@ mod tests {
                 "read_file".to_string()
             ]
         );
-        assert!(consume_activated_tool_name(&mut activated, "bash"));
-        assert!(consume_activated_tool_name(&mut activated, "grep"));
         assert_eq!(
             activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["glob".to_string(), "read_file".to_string()],
-            "unused activated tools must not disappear just because earlier tools were called"
-        );
-        assert!(consume_activated_tool_name(&mut activated, "glob"));
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["read_file".to_string()],
-            "last activated tool must remain available until it is called"
+            vec![
+                "bash".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "read_file".to_string()
+            ],
+            "calls must not revoke schemas that remain valid for this agentic run"
         );
     }
 

@@ -347,8 +347,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "tool_search",
-        description: "Search and activate deferred tools. `select:NAME` queues the tool schema \
-             for the next request and returns compact callable shape.",
+        description: "Search and materialize deferred tools. `select:NAME` makes the selected \
+             schema callable in retained session context and returns its full callable shape.",
         triggers: &[
             "tool_search",
             "find tool",

@@ -448,6 +448,7 @@ fn canonical_result_status(status: &str) -> String {
         "completed" => "completed".to_string(),
         "failed" => "failed".to_string(),
         "skipped" => "skipped".to_string(),
+        "rejected" => "rejected".to_string(),
         _ => "failed".to_string(),
     }
 }
@@ -615,6 +616,19 @@ mod tests {
         );
         assert_eq!(skipped.get("success").and_then(Value::as_bool), Some(false));
         assert_eq!(skipped.get("skipped").and_then(Value::as_bool), Some(true));
+
+        let rejected = build_tool_call_end_event(
+            "call_rejected",
+            Value::String(r#"{"status":"rejected","message":"not admitted"}"#.to_string()),
+        );
+        assert_eq!(
+            rejected.get("status").and_then(Value::as_str),
+            Some("rejected")
+        );
+        assert_eq!(
+            rejected.get("success").and_then(Value::as_bool),
+            Some(false)
+        );
 
         let denied = build_tool_call_end_event(
             "call_deny",

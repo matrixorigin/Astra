@@ -1473,9 +1473,10 @@ pub struct ToolExecutor {
     /// mixed snapshots such as "new activatable names with old visible names".
     current_tool_surface: std::sync::RwLock<ToolSurfaceNames>,
     /// Deferred tool names whose full schema has been fetched via
-    /// `tool_search(query="select:NAME")`. Names remain pending until that
-    /// tool is actually called once from a visible schema surface, or until a
-    /// non-empty runtime surface proves the activation is stale.
+    /// `tool_search(query="select:NAME")`. Names remain materialized in the
+    /// session's retained context until a non-empty runtime surface proves the
+    /// activation stale. Session reset and context restoration own this state;
+    /// a successful call never revokes it.
     activated_deferred_tools: std::sync::RwLock<HashSet<String>>,
     /// Cached plan-mode authoring flag keyed by the session it was
     /// computed for. Mirrors the server-side write guard so a CLI run
@@ -1686,7 +1687,7 @@ impl ToolExecutor {
             .and_then(|mut g| g.take())
     }
 
-    /// Names of deferred tools currently queued for short-lived schema injection.
+    /// Names of deferred tools currently materialized for schema injection.
     /// Stale entries are pruned against the current visible/activatable
     /// surface so this side set cannot become a long-lived allowlist.
     pub fn activated_deferred_tool_names(&self) -> Vec<String> {
@@ -1716,11 +1717,10 @@ impl ToolExecutor {
         retained
     }
 
-    /// Return activated deferred tools for the next schema-selection round.
-    ///
-    /// Activation is consumed only when the tool is actually called from a
-    /// visible schema surface. Merely including the schema in `tools[]` must
-    /// not drop other selected tools from a long `select:a,b,c` chain.
+    /// Return deferred tools materialized by retained conversation context for
+    /// the next schema-selection round. Calls do not consume this state: a
+    /// schema admitted to the model remains admitted until context/session
+    /// reset or a real surface change.
     pub fn activated_deferred_tool_names_for_schema_injection(&self) -> Vec<String> {
         let surface = self.current_tool_surface_snapshot("current_tool_surface_activation_take");
         if matches!(surface, ToolSurfaceNames::Uninstalled) {
@@ -2251,24 +2251,6 @@ impl ToolExecutor {
             "activated_deferred_tools",
         );
         astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(&mut guard, names);
-    }
-
-    fn consume_activated_deferred_tool_if_called(&self, name: &str) {
-        let surface = self.current_tool_surface_snapshot("current_tool_surface_consume_call");
-        if !surface.visible_contains(name) {
-            return;
-        }
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_consume_call",
-        );
-        if astra_turn_core::tool::deferred_activation::consume_activated_tool_name(&mut guard, name)
-        {
-            tracing::debug!(
-                tool = name,
-                "consumed CLI deferred activation after visible tool call"
-            );
-        }
     }
 
     pub(crate) fn runtime_bound_provider_owned_schemas_excluding(
@@ -5039,11 +5021,6 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
         if name == "bash" {
-            // Deferred activation must be consumed exactly once, and only
-            // after this sync dispatcher has claimed the call. Non-shell
-            // names fall through to the async dispatcher, which owns their
-            // activation lifecycle.
-            self.consume_activated_deferred_tool_if_called(name);
             let mut outcome = self.bash_outcome_with_cancel(args, cancel_token);
             outcome.output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(outcome.output.len());
@@ -5051,7 +5028,6 @@ impl ToolExecutor {
         }
         #[cfg(windows)]
         if name == "powershell" {
-            self.consume_activated_deferred_tool_if_called(name);
             let output =
                 self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
             self.record_output_size(output.len());
@@ -5083,7 +5059,6 @@ impl ToolExecutor {
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
         }
-        self.consume_activated_deferred_tool_if_called(name);
         if name == "bash" {
             let mut outcome = self.bash_outcome_with_cancel(args, None);
             outcome.output = self.finalize_tool_output(outcome.output, name);
@@ -5148,7 +5123,6 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
-        self.consume_activated_deferred_tool_if_called(name);
         self.execute_run(
             name,
             args,
@@ -8494,7 +8468,7 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["session".to_string()],
-            "schema assembly must not consume activation before the tool is called"
+            "schema assembly must preserve retained deferred materialization"
         );
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
@@ -8504,7 +8478,7 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["session".to_string()],
-            "activation must remain pending until the tool is actually called"
+            "activation must remain available while conversation context retains it"
         );
 
         executor.set_current_visible_tool_schemas(&[
@@ -8530,8 +8504,8 @@ mod tests {
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "accepted visible tool calls consume the matching deferred activation"
+            vec!["session".to_string()],
+            "a successful call must not revoke retained schema materialization"
         );
     }
 
@@ -9116,7 +9090,7 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()],
-            "schema injection does not consume deferred activation"
+            "schema injection preserves retained deferred materialization"
         );
     }
 

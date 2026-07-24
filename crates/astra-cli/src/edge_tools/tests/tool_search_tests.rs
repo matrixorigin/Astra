@@ -200,7 +200,7 @@ async fn selecting_visible_tool_does_not_record_deferred_activation() {
 }
 
 #[tokio::test]
-async fn activated_deferred_tool_remains_until_called_after_schema_injection() {
+async fn activated_deferred_tool_remains_callable_across_retained_context() {
     let executor = executor();
     set_visible(&executor, &["bash", "tool_search"]);
     executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
@@ -223,7 +223,7 @@ async fn activated_deferred_tool_remains_until_called_after_schema_injection() {
     assert_eq!(
         executor.activated_deferred_tool_names(),
         strings(&["web_fetch"]),
-        "schema assembly must not consume activation before the tool is called"
+        "schema assembly must preserve retained deferred materialization"
     );
 
     set_visible(&executor, &["bash", "tool_search", "web_fetch"]);
@@ -237,19 +237,31 @@ async fn activated_deferred_tool_remains_until_called_after_schema_injection() {
     assert_eq!(
         executor.activated_deferred_tool_names(),
         strings(&["web_fetch"]),
-        "activation must remain pending until the tool is actually called"
+        "activation must remain available while conversation context retains it"
     );
 
     let _ = executor.execute("web_fetch", &json!({})).await;
     assert_eq!(
         executor.activated_deferred_tool_names(),
-        Vec::<String>::new(),
-        "accepted visible tool calls consume the matching deferred activation"
+        strings(&["web_fetch"]),
+        "a successful call must not revoke retained schema materialization"
+    );
+
+    let restored = executor.activated_deferred_tool_names();
+    let resume_root = tempfile::tempdir().expect("resume root");
+    let resumed = ToolExecutor::new(resume_root.path());
+    set_visible(&resumed, &["bash", "tool_search", "web_fetch"]);
+    resumed.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
+    resumed.restore_activated_deferred_tool_names_for_session(&restored);
+    assert_eq!(
+        resumed.activated_deferred_tool_names_for_schema_injection(),
+        strings(&["web_fetch"]),
+        "restored conversation context must keep a selected schema callable on a later turn"
     );
 }
 
 #[tokio::test]
-async fn multi_selected_deferred_tools_remain_available_until_each_is_called() {
+async fn multi_selected_deferred_tools_remain_available_after_each_is_called() {
     let executor = executor();
     set_visible(&executor, &["tool_search"]);
     executor.set_current_activatable_tool_names(HashSet::from([
@@ -275,20 +287,20 @@ async fn multi_selected_deferred_tools_remain_available_until_each_is_called() {
     let _ = executor.execute("web_fetch", &json!({})).await;
     assert_eq!(
         executor.activated_deferred_tool_names(),
-        strings(&["memory"]),
-        "calling one selected tool must not consume unrelated selected tools"
+        strings(&["memory", "web_fetch"]),
+        "calling one selected tool must not revoke retained selected schemas"
     );
     assert_eq!(
         executor.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["memory"]),
-        "unused selected tools must remain injectable after earlier tools run"
+        strings(&["memory", "web_fetch"]),
+        "all selected tools must remain injectable across later turns"
     );
 
     let _ = executor.execute("memory", &json!({})).await;
     assert_eq!(
         executor.activated_deferred_tool_names(),
-        Vec::<String>::new(),
-        "each selected tool is consumed only by its own accepted visible call"
+        strings(&["memory", "web_fetch"]),
+        "repeated calls must preserve retained schema materialization"
     );
 }
 

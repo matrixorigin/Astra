@@ -720,6 +720,10 @@ impl SessionState {
         self.task_manager.rebind("");
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
+        // Deferred materialization is evidence from this session's retained
+        // conversation. Never carry a selected schema into a newly bound
+        // session after the identity is cleared.
+        self.activated_deferred_tool_names.clear();
         self.clear_resume_recovery_state();
         self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
@@ -1055,6 +1059,7 @@ mod default_tests {
             runtime_pipeline_state: Some(serde_json::json!({"old_session": true})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 3})),
             runtime_consecutive_context_window_errors: 2,
+            activated_deferred_tool_names: vec!["web_fetch".into()],
             ..Default::default()
         };
 
@@ -1068,6 +1073,7 @@ mod default_tests {
         assert!(state.runtime_pipeline_state.is_none());
         assert!(state.runtime_compaction_state.is_none());
         assert_eq!(state.runtime_consecutive_context_window_errors, 0);
+        assert!(state.activated_deferred_tool_names.is_empty());
     }
 
     #[test]

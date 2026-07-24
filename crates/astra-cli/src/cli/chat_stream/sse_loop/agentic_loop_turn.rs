@@ -439,6 +439,10 @@ fn chat_turn_budget_pressure(
 struct PreparedChatTurnPayload {
     payload: Value,
     context_window_estimate: astra_turn_types::ContextWindowUsage,
+    /// Exact token cost of the schemas actually sent in this request. The
+    /// loop carries it into the next compaction decision, including deferred
+    /// schemas materialized from retained conversation context.
+    pinned_tool_schema_tokens: u64,
 }
 
 impl std::fmt::Display for PreparedChatTurnPayload {
@@ -729,9 +733,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 ctx.all_schemas,
             );
         }
-        // Make newly activated deferred tools visible. This is not a TTL:
-        // activation remains pending until the model actually calls that
-        // tool, so `select:a,b,c` does not lose `c` after `a` and `b` run.
+        // Materialize deferred tools selected in retained conversation
+        // context. A successful call cannot revoke a schema that later turns
+        // may still need; only reset or a real surface change may remove it.
         let activated = ctx
             .executor
             .activated_deferred_tool_names_for_schema_injection();
@@ -1171,6 +1175,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             u64::from(estimated_total),
             u64::from(max_tokens),
         ),
+        pinned_tool_schema_tokens: visible_tool_tokens_total_u64,
     }
 }
 
@@ -1267,6 +1272,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// round. This is overwritten during payload preparation from the final
     /// `edge_tools` actually sent to the model.
     pub valid_tool_names: &'a mut HashSet<String>,
+    /// Exact schema footprint from the last outbound payload. Updated after
+    /// preparing this request so the next loop iteration compacts against the
+    /// same tool surface that the model actually saw.
+    pub pinned_tool_schema_tokens: &'a mut u64,
     pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
     pub widen_selection_pending: &'a mut bool,
@@ -1376,14 +1385,14 @@ async fn chat_turn_post_payload_after_prepare(
     ui: &ChatTurnSseFetchUi,
     stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
     prepare: PrepareChatTurnRequest<'_>,
-) -> Result<(astra_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
+) -> Result<(astra_thin_client::HttpResponse, ChatTurnPrepLineGuard, u64), String> {
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
-    let payload = prepare_chat_turn_payload(prepare).await;
+    let prepared = prepare_chat_turn_payload(prepare).await;
 
     if let Some(tx) = stream_event_tx {
         let _ = tx.try_send(
             crate::cli::chat_stream::StreamEvent::ContextWindowEstimated(
-                payload.context_window_estimate,
+                prepared.context_window_estimate,
             ),
         );
     }
@@ -1391,7 +1400,7 @@ async fn chat_turn_post_payload_after_prepare(
     touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");
     let http_mark = Instant::now();
     let resp = api
-        .post_chat_turn_retry_429(token, &payload.payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
+        .post_chat_turn_retry_429(token, &prepared.payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
         .await
         .map_err(|e| e.to_string())?;
     if ui.timing {
@@ -1404,7 +1413,7 @@ async fn chat_turn_post_payload_after_prepare(
             .dim()
         );
     }
-    Ok((resp, prep_line))
+    Ok((resp, prep_line, prepared.pinned_tool_schema_tokens))
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -1439,6 +1448,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_results,
         all_schemas,
         valid_tool_names,
+        pinned_tool_schema_tokens,
         turn_guard,
         restricted_tools,
         widen_selection_pending,
@@ -1497,7 +1507,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     };
     let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
-    let (resp, prep_line) = chat_turn_post_payload_after_prepare(
+    let (resp, prep_line, prepared_schema_tokens) = chat_turn_post_payload_after_prepare(
         api,
         token,
         render_policy.is_silent(),
@@ -1563,6 +1573,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         },
     )
     .await?;
+
+    *pinned_tool_schema_tokens = prepared_schema_tokens;
 
     let status = resp.status();
     if !status.is_success() {
@@ -3131,13 +3143,13 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()],
-            "payload assembly must not consume activation before the tool is called"
+            "payload assembly must preserve retained deferred materialization"
         );
         let _ = executor.execute("memory", &json!({})).await;
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "the accepted visible tool call consumes the matching activation"
+            vec!["memory".to_string()],
+            "a successful call must not revoke retained schema materialization"
         );
         executor.clear_current_tool_surface_for_tests();
 
@@ -3731,6 +3743,14 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert!(edge_tool_names.contains("memory"), "{edge_tool_names:?}");
+        let expected_pinned_tokens: u64 = edge_tool_names
+            .iter()
+            .map(|name| u64::from(registry.token_cost(name)))
+            .sum();
+        assert_eq!(
+            payload.pinned_tool_schema_tokens, expected_pinned_tokens,
+            "next-round compaction must account for the exact deferred schema materialized in this payload"
+        );
         assert!(
             valid_tool_names.contains("memory"),
             "activated deferred tool must be admitted only after it is injected"
@@ -3739,7 +3759,7 @@ mod tests {
         assert_eq!(
             executor.activated_deferred_tool_names(),
             vec!["memory".to_string()],
-            "payload assembly must not consume activation before the activated tool is called"
+            "payload assembly must preserve retained deferred materialization"
         );
     }
 

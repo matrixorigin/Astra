@@ -7,7 +7,8 @@ use super::host::AgenticLoopState;
 pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
     match status.trim().to_ascii_lowercase().as_str() {
         "completed" | "skipped" => Some(0),
-        "failed" | "partial_failure" | "denied" | "cancelled" | "timeout" | "timed_out" => Some(1),
+        "failed" | "partial_failure" | "denied" | "rejected" | "cancelled" | "timeout"
+        | "timed_out" => Some(1),
         _ => None,
     }
 }
@@ -177,6 +178,7 @@ mod tests {
         assert_eq!(edge_tool_status_exit_code("skipped"), Some(0));
         assert_eq!(edge_tool_status_exit_code("failed"), Some(1));
         assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("rejected"), Some(1));
         assert_eq!(edge_tool_status_exit_code("ok"), None);
         assert_eq!(edge_tool_status_exit_code("success"), None);
         assert_eq!(edge_tool_status_exit_code("error"), None);

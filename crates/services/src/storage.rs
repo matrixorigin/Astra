@@ -91,10 +91,9 @@ struct PersistedCoreSchemaTableClaim {
 }
 
 const INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL: &str =
-    "INSERT INTO astra_schema_table_contracts
+    "INSERT IGNORE INTO astra_schema_table_contracts
      (table_name, component, owner, contract_version, ddl_sha256)
-     VALUES (?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)";
+     VALUES (?, ?, ?, ?, ?)";
 
 const UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL: &str = "UPDATE astra_schema_table_contracts
      SET owner = ?, contract_version = ?, ddl_sha256 = ?, updated_at = NOW(6)
@@ -655,9 +654,13 @@ async fn publish_core_schema_table_contracts(
     let stale_claims = stale_core_schema_table_claims(&existing, declarations)?;
 
     for declaration in declarations {
-        // Insert without taking over an existing primary key. A concurrent
-        // foreign component may claim the table after the pre-read above; the
-        // duplicate branch must therefore be a no-op, not an owner rewrite.
+        // Insert without taking over an existing identity. A concurrent foreign
+        // component may claim the table after the pre-read above, so a duplicate
+        // must be a true no-op. Do not express that no-op as an update of the
+        // primary key: some MySQL-protocol engines reject every primary-key
+        // update, even assignment to its current value. The exact post-write
+        // read below validates convergence and surfaces any suppressed insert
+        // error as a contract mismatch rather than granting ownership.
         query(INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL)
             .bind(&declaration.name)
             .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
@@ -7502,9 +7505,13 @@ mod tests {
         assert!(error.contains("extension"), "{error}");
         assert!(error.contains("plugin"), "{error}");
         assert!(
+            INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL.starts_with("INSERT IGNORE INTO"),
+            "claims must use an identity-preserving insert-if-absent operation"
+        );
+        assert!(
             !INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL
-                .contains("component = VALUES(component)"),
-            "the duplicate branch must not rewrite lifecycle ownership"
+                .contains("ON DUPLICATE KEY UPDATE"),
+            "a duplicate claim must never be implemented by updating its identity"
         );
         assert!(
             UPDATE_OWNED_CORE_SCHEMA_TABLE_CLAIM_SQL.contains("AND component = ?"),

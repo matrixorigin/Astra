@@ -3699,7 +3699,9 @@ impl ServerAgenticLoopHost {
             self.emit_progress_event(Value::Object(build_tool_call_end_event(
                 &request_id,
                 json!({
-                    "status": "error",
+                    "status": "rejected",
+                    "error_kind": "tool_not_admitted",
+                    "advisory": {"executed": false},
                     "output": output,
                 }),
             )));
@@ -3716,7 +3718,7 @@ impl ServerAgenticLoopHost {
                         &args,
                         None,
                     )),
-                    status: "error".to_string(),
+                    status: "rejected".to_string(),
                     duration_ms: 0,
                 },
             );

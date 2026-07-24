@@ -209,17 +209,17 @@ fn truncate_tool_results_to_serialized_budget(
     // in the number of messages processed here.
     let mut total_chars = serialized_message_chars(messages);
     let mut changed = false;
-    for index in 0..messages.len() {
+    for (index, message) in messages.iter_mut().enumerate() {
         if total_chars <= budget_chars {
             break;
         }
-        if messages[index].get("role").and_then(Value::as_str) != Some("tool") {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
         }
         if Some(index) == latest_tool_index {
             continue;
         }
-        let content_chars = tool_text_chars(&messages[index]);
+        let content_chars = tool_text_chars(message);
         if content_chars <= MIN_TOOL_EVIDENCE_CHARS {
             continue;
         }
@@ -232,9 +232,9 @@ fn truncate_tool_results_to_serialized_budget(
             continue;
         }
 
-        let before_chars = serialized_value_chars(&messages[index]);
-        if truncate_tool_text_content(&mut messages[index], keep_chars, SUFFIX) {
-            let after_chars = serialized_value_chars(&messages[index]);
+        let before_chars = serialized_value_chars(message);
+        if truncate_tool_text_content(message, keep_chars, SUFFIX) {
+            let after_chars = serialized_value_chars(message);
             total_chars = total_chars
                 .saturating_sub(before_chars)
                 .saturating_add(after_chars);

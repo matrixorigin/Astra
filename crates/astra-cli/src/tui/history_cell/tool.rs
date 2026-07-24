@@ -8,8 +8,9 @@
 //!   until the final `complete()` call.
 //! - **Success** — green bullet, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
-//! - **Failed** — red bullet, `Ran <name> · Xms`, otherwise identical
-//!   to Success.
+//! - **Failed** — red bullet, `Ran <name> · Xms`, otherwise identical to success.
+//! - **Rejected** — warning bullet, `Did not run <name> · Xms`; the
+//!   runtime rejected the request before execution began
 //!
 //! Diff-looking output summaries (lines starting with `+` or `-`)
 //! get routed through `diff_render` so +/- lines light up green/red
@@ -49,6 +50,10 @@ pub(crate) enum ToolStatus {
     /// from both a successful tool call and a failed one after persistence.
     Uncertain,
     Failed,
+    /// The runtime rejected the request before the executor began work.
+    /// This is terminal but differs from a tool failure, which happened after
+    /// the tool was admitted and attempted.
+    Rejected,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +127,7 @@ impl ToolCell {
     ) {
         self.status = match status_str {
             "uncertain" => ToolStatus::Uncertain,
+            "rejected" => ToolStatus::Rejected,
             _ if tool_result_status_is_success(status_str) => ToolStatus::Success,
             _ => ToolStatus::Failed,
         };
@@ -210,6 +216,7 @@ impl ToolCell {
             ToolStatus::Success => Span::styled("● ", Style::default().fg(theme.success).bold()),
             ToolStatus::Uncertain => Span::styled("● ", Style::default().fg(theme.warn).bold()),
             ToolStatus::Failed => Span::styled("● ", Style::default().fg(theme.error).bold()),
+            ToolStatus::Rejected => Span::styled("● ", Style::default().fg(theme.warn).bold()),
         }
     }
 
@@ -468,15 +475,19 @@ impl ToolCell {
     /// malformed provider arguments fail before that boundary and must not be
     /// described as `Ran ...`.
     fn execution_was_rejected(&self) -> bool {
+        if self.status == ToolStatus::Rejected {
+            return true;
+        }
         [self.output_summary.as_deref(), self.output.as_deref()]
             .into_iter()
             .flatten()
-            .filter_map(structured_tool_result)
-            .any(|value| {
-                value
-                    .pointer("/advisory/executed")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(false)
+            .any(|text| {
+                structured_tool_result(text).is_some_and(|value| {
+                    value
+                        .pointer("/advisory/executed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                }) || is_deferred_admission_rejection(text)
             })
     }
 
@@ -787,7 +798,7 @@ impl HistoryCell for ToolCell {
         let status = match self.status {
             ToolStatus::Success => PersistStatus::Success,
             ToolStatus::Uncertain => PersistStatus::Uncertain,
-            ToolStatus::Failed => PersistStatus::Failed,
+            ToolStatus::Failed | ToolStatus::Rejected => PersistStatus::Failed,
             ToolStatus::Running => return None,
         };
         Some(TurnEvent::Tool {
@@ -800,6 +811,15 @@ impl HistoryCell for ToolCell {
             output: self.output.clone(),
         })
     }
+}
+
+/// Backwards-compatible recognition for journals written before the stream
+/// carried the typed `rejected` status. This is a protocol message, not a
+/// tool-name exception: it applies to every deferred capability.
+fn is_deferred_admission_rejection(text: &str) -> bool {
+    text.starts_with("Error: Tool '")
+        && text.contains("' is not available in this turn yet.")
+        && text.contains("<deferred-tools>")
 }
 
 fn prefix_tool_output_line(prefix: &str, line: Line<'static>, fallback: Style) -> Line<'static> {
@@ -1301,6 +1321,40 @@ mod tests {
         let out = render(&t, 100, 4);
         assert!(out.contains("Did not run Agent Fanout · 10ms"), "{out}");
         assert!(!out.contains("Ran Agent Fanout"), "{out}");
+    }
+
+    #[test]
+    fn typed_rejection_is_rendered_and_legacy_replay_preserves_its_meaning() {
+        let legacy_output = "Error: Tool 'remote_catalog' is not available in this turn yet. It appears in <deferred-tools>.";
+        let mut live = ToolCell::new_running("remote_catalog", "list entries");
+        live.complete(
+            "rejected",
+            1,
+            String::new(),
+            Some(legacy_output.to_string()),
+            None,
+        );
+        assert_eq!(live.status, ToolStatus::Rejected);
+        let live_output = render(&live, 100, 4);
+        assert!(
+            live_output.contains("Did not run Remote Catalog · 1ms"),
+            "{live_output}"
+        );
+
+        let replay = ToolCell::from_persist(
+            live.to_persist()
+                .expect("terminal rejected cell must remain journaled"),
+        )
+        .expect("persisted tool cell");
+        let replay_output = render(&replay, 100, 4);
+        assert!(
+            replay_output.contains("Did not run Remote Catalog · 1ms"),
+            "{replay_output}"
+        );
+        assert!(
+            !replay_output.contains("Ran Remote Catalog"),
+            "{replay_output}"
+        );
     }
 
     #[test]
