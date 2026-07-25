@@ -91,7 +91,7 @@ fn cascade_responder_emits_alert() {
 
     let feedback = ContextFeedback::from_usage(0, 800, 200, 300, false);
     let recovery = RecoveryState::default();
-    let alerts = evaluate_alerts(7, "model-a", &feedback, &stats, &recovery);
+    let alerts = evaluate_alerts(7, "model-a", "test", &feedback, &stats, &recovery);
 
     assert!(
         alerts.iter().any(|a| a.rule == "compaction_cascade"),

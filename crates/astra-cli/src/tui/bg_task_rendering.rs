@@ -942,7 +942,12 @@ pub(crate) fn render_background_task_rows_xml(
         } else {
             "completed"
         };
-        let live_control = if members
+        // Control availability is a property of the group lifecycle first.
+        // A child row can retain an old handle after it is terminal, but that
+        // never makes a settled fanout stoppable again.
+        let live_control = if active == 0 {
+            LiveControlState::StaleHandle
+        } else if members
             .iter()
             .any(|row| row.live_control == LiveControlState::Available)
         {
@@ -995,4 +1000,53 @@ pub(crate) fn render_background_task_rows_xml(
     }
     out.push_str("\n</background_tasks>");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::bottom_pane::background_task_view::{
+        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
+        BackgroundTaskRowInit, LiveControlState,
+    };
+
+    #[test]
+    fn terminal_fanout_never_advertises_live_control_from_stale_child_handles() {
+        let fanout = BackgroundTaskFanoutMembership {
+            group_id: "review".into(),
+            group_title: "Review".into(),
+            target_count: 2,
+            slot_index: 0,
+            slot_label: "one".into(),
+        };
+        let rows = vec![
+            BackgroundTaskRow::new(BackgroundTaskRowInit::new(
+                "agent-one",
+                BackgroundTaskKind::LocalAgent,
+                "cancelled",
+                10,
+                "one",
+            ))
+            .with_fanout(fanout.clone())
+            .with_live_control(LiveControlState::Available),
+            BackgroundTaskRow::new(BackgroundTaskRowInit::new(
+                "agent-two",
+                BackgroundTaskKind::LocalAgent,
+                "completed",
+                10,
+                "two",
+            ))
+            .with_fanout(BackgroundTaskFanoutMembership {
+                slot_index: 1,
+                slot_label: "two".into(),
+                ..fanout
+            })
+            .with_live_control(LiveControlState::Available),
+        ];
+
+        let xml = render_background_task_rows_xml(&rows);
+        assert!(xml.contains("status=\"completed_with_issues\""), "{xml}");
+        assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(!xml.contains("live_control=\"available\""), "{xml}");
+    }
 }

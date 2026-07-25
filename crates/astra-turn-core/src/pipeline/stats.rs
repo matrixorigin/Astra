@@ -203,14 +203,22 @@ impl ModelCacheReadShareStats {
     }
 }
 
+/// Stable in-memory key for a cache baseline. The unit separator avoids
+/// accidental ambiguity between model and execution-source names while keeping
+/// the persisted shape backward compatible as a string-keyed map.
+fn cache_read_share_scope_key(model: &str, source: &str) -> String {
+    format!("{}\u{1f}{}", model.trim(), source.trim())
+}
+
 /// Cross-turn accumulated statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PipelineStats {
     pub turns_executed: u32,
     pub avg_cache_hit_ratio: f64,
-    /// Model-scoped prompt-cache read share. Provider/model cache namespaces
-    /// are not interchangeable; cross-model averages create false regressions.
+    /// Prompt-cache read share scoped by the provider model and execution
+    /// source. Cache namespaces and prompt shapes are not interchangeable
+    /// across either boundary; cross-source averages create false regressions.
     pub cache_read_share_by_model: HashMap<String, ModelCacheReadShareStats>,
     pub compact_events: Vec<CompactEvent>,
     pub cache_breaks: Vec<CacheBreakEvent>,
@@ -342,7 +350,7 @@ impl PipelineStats {
         let alpha = if self.turns_executed <= 1 { 1.0 } else { 0.1 };
         self.avg_cache_hit_ratio =
             (1.0 - alpha) * self.avg_cache_hit_ratio + alpha * feedback.cache_hit_ratio;
-        self.record_cache_read_share_observation(model, feedback.cache_hit_ratio);
+        self.record_cache_read_share_observation(model, source, feedback.cache_hit_ratio);
         let model = model.trim();
 
         // Feed response token estimator
@@ -362,19 +370,20 @@ impl PipelineStats {
         }
     }
 
-    pub fn model_cache_regression_baseline(&self, model: &str) -> Option<f64> {
+    pub fn model_cache_regression_baseline(&self, model: &str, source: &str) -> Option<f64> {
         self.cache_read_share_by_model
-            .get(model)
+            .get(&cache_read_share_scope_key(model, source))
             .and_then(ModelCacheReadShareStats::regression_baseline)
     }
 
-    pub fn record_cache_read_share_observation(&mut self, model: &str, value: f64) {
+    pub fn record_cache_read_share_observation(&mut self, model: &str, source: &str, value: f64) {
         let model = model.trim();
-        if model.is_empty() || !value.is_finite() {
+        let source = source.trim();
+        if model.is_empty() || source.is_empty() || !value.is_finite() {
             return;
         }
         self.cache_read_share_by_model
-            .entry(model.to_string())
+            .entry(cache_read_share_scope_key(model, source))
             .or_default()
             .record(value.clamp(0.0, 1.0));
     }

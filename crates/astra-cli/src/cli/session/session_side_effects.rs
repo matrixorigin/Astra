@@ -221,9 +221,13 @@ pub(crate) fn build_bridge_pipeline_journal_events(
         ..Default::default()
     };
     for ratio in &prior_ratios {
-        stats.record_cache_read_share_observation(model_id, *ratio);
+        stats.record_cache_read_share_observation(model_id, "bridge_inprocess", *ratio);
     }
-    stats.record_cache_read_share_observation(model_id, feedback.cache_hit_ratio);
+    stats.record_cache_read_share_observation(
+        model_id,
+        "bridge_inprocess",
+        feedback.cache_hit_ratio,
+    );
 
     let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
         turn, model_id, &feedback,
@@ -240,6 +244,7 @@ pub(crate) fn build_bridge_pipeline_journal_events(
     for alert in astra_turn_core::trace_alert::evaluate_alerts(
         turn,
         model_id,
+        "bridge_inprocess",
         &feedback,
         &stats,
         &astra_turn_core::recovery_state::RecoveryState::default(),

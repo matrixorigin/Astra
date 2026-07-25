@@ -5138,6 +5138,43 @@ impl JournalEvent {
         evt
     }
 
+    /// Spawn event with the immutable fanout slot identity needed to recover a
+    /// group after the parent turn's in-memory runtime binding has gone away.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_spawned_with_fanout(
+        session_id: Option<&str>,
+        agent_id: &str,
+        run_id: &str,
+        parent_run_id: &str,
+        agent_type: &str,
+        description: &str,
+        model: Option<&str>,
+        inherit_prefix: bool,
+        fanout_slot: Option<&serde_json::Value>,
+        execution_metadata: Option<&serde_json::Value>,
+    ) -> Self {
+        let mut event = Self::agent_spawned(
+            session_id,
+            agent_id,
+            run_id,
+            parent_run_id,
+            agent_type,
+            description,
+            model,
+            inherit_prefix,
+            execution_metadata,
+        );
+        if let Some(fanout_slot) = fanout_slot
+            && let Some(metadata) = event
+                .metadata
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.insert("fanout_slot".to_string(), fanout_slot.clone());
+        }
+        event
+    }
+
     /// Agent terminated event — persists final state of a spawned agent.
     #[allow(clippy::too_many_arguments)]
     pub fn agent_terminated(
@@ -5152,6 +5189,41 @@ impl JournalEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         duration_ms: u64,
+        execution_metadata: Option<&serde_json::Value>,
+    ) -> Self {
+        Self::agent_terminated_with_metric_completeness(
+            session_id,
+            agent_id,
+            run_id,
+            agent_type,
+            status,
+            finish_reason,
+            turns_completed,
+            tool_calls,
+            prompt_tokens,
+            completion_tokens,
+            duration_ms,
+            None,
+            execution_metadata,
+        )
+    }
+
+    /// Persist a terminal spawned-agent fact without treating unavailable
+    /// cancellation-time counters as measured zeroes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_terminated_with_metric_completeness(
+        session_id: Option<&str>,
+        agent_id: &str,
+        run_id: &str,
+        agent_type: &str,
+        status: &str,
+        finish_reason: Option<&str>,
+        turns_completed: Option<u32>,
+        tool_calls: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        duration_ms: u64,
+        metrics_completeness: Option<&str>,
         execution_metadata: Option<&serde_json::Value>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::AgentTerminated, session_id);
@@ -5170,6 +5242,13 @@ impl JournalEvent {
         }
         if let Some(finish_reason) = finish_reason.filter(|reason| !reason.is_empty()) {
             metadata["finish_reason"] = serde_json::Value::String(finish_reason.to_string());
+        }
+        if let Some(metrics_completeness) = metrics_completeness
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            metadata["metrics_completeness"] =
+                serde_json::Value::String(metrics_completeness.to_string());
         }
         merge_execution_boundary_metadata(&mut metadata, execution_metadata);
         evt.metadata = Some(metadata);

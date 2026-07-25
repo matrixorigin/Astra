@@ -4301,6 +4301,7 @@ impl InProcessChatTurnBridge {
                     for alert in astra_turn_core::trace_alert::evaluate_alerts(
                         current_turn,
                         capture_model,
+                        BRIDGE_CACHE_SOURCE,
                         &feedback,
                         &bridge_pipeline_baseline.stats,
                         &astra_turn_core::recovery_state::RecoveryState::default(),

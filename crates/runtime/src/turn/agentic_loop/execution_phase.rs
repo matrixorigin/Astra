@@ -1539,6 +1539,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 let alerts = astra_turn_core::trace_alert::evaluate_alerts(
                     turn,
                     model_id,
+                    "agentic_loop",
                     &feedback,
                     &pipeline_sess.stats,
                     &pipeline_sess.recovery,

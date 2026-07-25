@@ -362,7 +362,7 @@ fn pipeline_trace_alerts_on_recovery() {
     let feedback = ContextFeedback::from_usage(0, 0, 5000, 100, false);
     let stats = PipelineStats::default();
 
-    let alerts = evaluate_alerts(5, "model-a", &feedback, &stats, &recovery);
+    let alerts = evaluate_alerts(5, "model-a", "test", &feedback, &stats, &recovery);
     assert!(
         alerts.iter().any(|a| a.rule == "recovery_loop"),
         "2 PTL errors should trigger recovery_loop alert"

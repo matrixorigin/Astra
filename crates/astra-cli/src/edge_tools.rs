@@ -2141,6 +2141,18 @@ impl ToolExecutor {
         if self.tool_has_runtime_binding_for_call(name, args) {
             return None;
         }
+        // Terminal fanout evidence is durable session data, not a live
+        // spawner mutation. Admit this one read action only when the requested
+        // group is actually recoverable from the current session journal.
+        if name == "agent_fanout"
+            && args.get("action").and_then(Value::as_str) == Some("get_results")
+            && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
+            && self
+                .journal_fanout_task_output_snapshot(group_id, 0, 1)
+                .is_some()
+        {
+            return None;
+        }
         if self.tool_can_validate_without_runtime_binding(name, args) {
             return None;
         }
@@ -2155,6 +2167,15 @@ impl ToolExecutor {
     }
 
     fn tool_admission_denial(&self, name: &str, args: &Value) -> Option<EdgeToolRun> {
+        if name == "agent_fanout"
+            && args.get("action").and_then(Value::as_str) == Some("get_results")
+            && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
+            && self
+                .journal_fanout_task_output_snapshot(group_id, 0, 1)
+                .is_some()
+        {
+            return None;
+        }
         // ── Phase 1: Structural binding (no locks) ───────────────────────
         //
         // First principles: "does this tool have an executor attached?" is
@@ -4031,6 +4052,7 @@ impl ToolExecutor {
         match self
             .fanout_group_task_output_snapshot(task_id, offset, max_bytes)
             .await
+            .or_else(|| self.journal_fanout_task_output_snapshot(task_id, offset, max_bytes))
         {
             Some(projection) => {
                 let observation_mode = match read_mode {
@@ -4174,6 +4196,127 @@ impl ToolExecutor {
                 total_lines: output.lines().count() as u64,
                 status,
                 output_ref: format!("agent_fanout:{}", group.group_id),
+            },
+        })
+    }
+
+    /// Recover a settled fanout after a new root turn no longer has the old
+    /// in-memory spawner binding. The journal is the durable producer record:
+    /// it contains immutable slot identity, terminal state, and any child
+    /// transcript evidence. This path is read-only and deliberately never
+    /// recreates a group or claims a live control handle.
+    fn journal_fanout_task_output_snapshot(
+        &self,
+        task_id: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Option<FanoutTaskOutputProjection> {
+        let session_id = self.active_session_id()?.trim().to_string();
+        let events = astra_services::session_journal::read_journal(&session_id).ok()?;
+        let mut recovered = Vec::new();
+        let mut group_id = None;
+        let mut target_count = 0usize;
+        for event in &events {
+            if event.event_type != astra_services::session_journal::JournalEventType::AgentSpawned {
+                continue;
+            }
+            let Some(metadata) = event.metadata.as_ref() else {
+                continue;
+            };
+            let Some(fanout_slot) = metadata.get("fanout_slot") else {
+                continue;
+            };
+            let Ok(slot) = serde_json::from_value::<
+                astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity,
+            >(fanout_slot.clone()) else {
+                continue;
+            };
+            let Some(agent_id) = metadata.get("agent_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(run_id) = metadata.get("run_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if slot.group_id != task_id && agent_id != task_id && run_id != task_id {
+                continue;
+            }
+            group_id = Some(slot.group_id.clone());
+            target_count = target_count.max(slot.target_count);
+            let terminal = events.iter().rev().find_map(|candidate| {
+                (candidate.event_type
+                    == astra_services::session_journal::JournalEventType::AgentTerminated)
+                    .then_some(candidate.metadata.as_ref())
+                    .flatten()
+                    .filter(|meta| meta.get("run_id").and_then(Value::as_str) == Some(run_id))
+            });
+            let result = events.iter().rev().find_map(|candidate| {
+                let item = candidate.transcript_item.as_ref()?;
+                (item.run_id == run_id
+                    && item.message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .then(|| item.message.get("content").and_then(Value::as_str))
+                .flatten()
+                .filter(|content| !content.trim().is_empty())
+            });
+            recovered.push(json!({
+                "slot_index": slot.slot_index,
+                "id": slot.slot_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "status": terminal.and_then(|meta| meta.get("status")).and_then(Value::as_str).unwrap_or("unknown_after_resume"),
+                "terminal_reason": terminal.and_then(|meta| meta.get("finish_reason")).and_then(Value::as_str),
+                "metrics_completeness": terminal.and_then(|meta| meta.get("metrics_completeness")).and_then(Value::as_str).unwrap_or("recorded"),
+                "result": result,
+            }));
+        }
+        let group_id = group_id?;
+        recovered.sort_by_key(|slot| {
+            slot.get("slot_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+        let all_terminal = recovered.iter().all(|slot| {
+            matches!(
+                slot.get("status").and_then(Value::as_str),
+                Some("completed" | "failed" | "cancelled" | "interrupted")
+            )
+        });
+        let all_completed = recovered
+            .iter()
+            .all(|slot| slot.get("status").and_then(Value::as_str) == Some("completed"));
+        let status = if all_terminal && all_completed {
+            WorkUnitStatus::Completed
+        } else {
+            WorkUnitStatus::CompletedWithIssues
+        };
+        let output = json!({
+            "type": "agent_fanout_group",
+            "group_id": group_id,
+            "title": group_id,
+            "status": status.as_str(),
+            "target_count": target_count,
+            "recovered_slots": recovered,
+            "recovery": {
+                "source": "session_journal",
+                "runtime_binding_required": false,
+                "task_output_call": format!("task_output(task_id='{group_id}')"),
+                "do_not_rerun_when_user_asks_for_results": true,
+            },
+            "hint": "Recovered from the durable session journal; this is a settled historical observation, not a live fanout control handle.",
+        }).to_string();
+        let start = output.floor_char_boundary((offset as usize).min(output.len()));
+        let end = output.floor_char_boundary((start + max_bytes).min(output.len()));
+        Some(FanoutTaskOutputProjection {
+            group_id: group_id.clone(),
+            revision: 1,
+            snapshot: BgTaskOutputSnapshot {
+                kind: "agent fanout".into(),
+                title: Some(group_id.clone()),
+                output: output[start..end].to_string(),
+                end_offset: end as u64,
+                total_bytes: output.len() as u64,
+                total_lines: output.lines().count() as u64,
+                status,
+                output_ref: format!("agent_fanout:{group_id}"),
             },
         })
     }
@@ -5566,8 +5709,17 @@ impl ToolExecutor {
                     }
                 }
                 "agent_fanout" => {
-                    agent_spawning::handle_agent_fanout_tool(args, self.spawn_context.as_ref())
-                        .await
+                    if self.spawn_context.is_none()
+                        && args.get("action").and_then(Value::as_str) == Some("get_results")
+                        && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
+                        && let Some(projection) =
+                            self.journal_fanout_task_output_snapshot(group_id, 0, 65_536)
+                    {
+                        projection.snapshot.output
+                    } else {
+                        agent_spawning::handle_agent_fanout_tool(args, self.spawn_context.as_ref())
+                            .await
+                    }
                 }
                 // ── Consolidated session tool ──────────────────────────────
                 "session" => {
@@ -7209,6 +7361,78 @@ mod tests {
         assert_eq!(
             alias_fields.as_ref().unwrap()["requested_task_output_id"],
             child_id
+        );
+    }
+
+    #[tokio::test]
+    async fn task_output_recovers_terminal_fanout_from_journal_without_runtime_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "journal-fanout-recovery";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let fanout_slot = serde_json::json!({
+            "group_id": "review-fanout",
+            "target_count": 1,
+            "slot_index": 0,
+            "slot_id": "review"
+        });
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
+                    Some(session_id),
+                    "reviewer",
+                    "child-run",
+                    "parent-run",
+                    "general-purpose",
+                    "Review the change",
+                    None,
+                    false,
+                    Some(&fanout_slot),
+                    None,
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::agent_terminated(
+                    Some(session_id),
+                    "reviewer",
+                    "child-run",
+                    "general-purpose",
+                    "cancelled",
+                    Some("user requested stop"),
+                    None,
+                    0,
+                    0,
+                    0,
+                    10,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let output = executor
+            .task_output(&serde_json::json!({"task_id": "review-fanout"}))
+            .await;
+        assert!(output.contains("session_journal"), "{output}");
+        assert!(output.contains("review-fanout"), "{output}");
+        assert!(output.contains("cancelled"), "{output}");
+        assert!(
+            !output.contains("Background task unavailable"),
+            "a durable group must not pretend it needs the vanished runtime binding: {output}"
+        );
+
+        let recovered = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({"action": "get_results", "group_id": "review-fanout"}),
+            )
+            .await;
+        assert!(recovered.contains("session_journal"), "{recovered}");
+        assert!(
+            !recovered.contains("multi-agent runtime is not connected"),
+            "durable get_results must not be rejected after the parent turn: {recovered}"
         );
     }
 

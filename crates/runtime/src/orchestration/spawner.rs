@@ -2742,7 +2742,10 @@ impl DynamicAgentSpawner {
 
         // Emit agent_spawned journal event for unified timeline.
         if let Some(sid) = self.current_session_id() {
-            let evt = astra_services::session_journal::JournalEvent::agent_spawned(
+            let fanout_slot = fanout_slot
+                .as_ref()
+                .and_then(|slot| serde_json::to_value(slot).ok());
+            let evt = astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
                 Some(&sid),
                 &agent_id,
                 &run_id,
@@ -2751,6 +2754,7 @@ impl DynamicAgentSpawner {
                 &input.description,
                 run_config.model.as_deref(),
                 run_config.inherited_prefix.is_some(),
+                fanout_slot.as_ref(),
                 run_config.execution_metadata.as_ref(),
             );
             let writer = match context.trace_context.as_ref() {
@@ -3399,7 +3403,14 @@ impl DynamicAgentSpawner {
             .elapsed()
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let event = astra_services::session_journal::JournalEvent::agent_terminated(
+        // Forced cancellation aborts the executor future before it can return
+        // its terminal counter snapshot. Preserve the numeric fields for wire
+        // shape stability, but explicitly mark them unknown rather than
+        // allowing consumers to mistake their default zeroes for observed
+        // work. Normal finalization receives a complete SpawnRunResult.
+        let metrics_completeness =
+            (status == "cancelled").then_some("unknown_after_forced_cancellation");
+        let event = astra_services::session_journal::JournalEvent::agent_terminated_with_metric_completeness(
             Some(sid.as_str()),
             &state.agent_id,
             &state.run_id,
@@ -3411,6 +3422,7 @@ impl DynamicAgentSpawner {
             state.metrics.prompt_tokens,
             state.metrics.completion_tokens,
             duration_ms,
+            metrics_completeness,
             state.execution_metadata.as_ref(),
         );
         if let Err(e) = writer.append(&event) {
@@ -7146,6 +7158,44 @@ mod tests {
                 "Agent cancelled: turn budget exhausted".to_string()
             )],
             "shutdown aggregation must surface cancellation instead of silently dropping it"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_cancellation_marks_default_metrics_as_unknown_in_journal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_session("cancel-metrics".to_string())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        let launched = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match launched {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        assert!(spawner.cancel_agent(&agent_id, "user cancelled").await);
+
+        let events = astra_services::session_journal::read_journal("cancel-metrics").unwrap();
+        let terminated = events
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::AgentTerminated
+            })
+            .expect("cancellation must persist a terminal event");
+        assert_eq!(
+            terminated
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("metrics_completeness"))
+                .and_then(serde_json::Value::as_str),
+            Some("unknown_after_forced_cancellation"),
+            "default counters must never be interpreted as measured cancellation work"
         );
     }
 
