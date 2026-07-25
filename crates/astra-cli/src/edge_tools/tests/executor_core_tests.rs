@@ -238,6 +238,31 @@ async fn execute_with_metadata_bash_non_zero_exit_is_structured_failure() {
 }
 
 #[tokio::test]
+async fn legacy_bash_string_path_preserves_execution_failure_truth() {
+    let executor = test_executor();
+    let output = executor
+        .execute("bash", &json!({"command": "echo diagnostic >&2; exit 127"}))
+        .await;
+
+    assert!(
+        crate::edge_tools::cli_tool_output_is_error(&output),
+        "string-only callers must not record a failed shell execution as success: {output}"
+    );
+    assert!(
+        output.starts_with("Error: bash execution failed"),
+        "{output}"
+    );
+    assert!(
+        output.contains("diagnostic"),
+        "diagnostic evidence was lost: {output}"
+    );
+    assert!(
+        output.contains("exit code 127"),
+        "exit truth was lost: {output}"
+    );
+}
+
+#[tokio::test]
 async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure() {
     let executor = test_executor();
     let outcome = executor

@@ -4213,17 +4213,34 @@ impl ToolExecutor {
             result.push('\n');
         }
 
+        let exit_code = out.status.code().unwrap_or(-1);
+        let exit_semantics = exit_semantics::classify_exit(command, exit_code);
+        let result_class =
+            exit_semantics::classify_command_result(command, &stdout, &stderr, Some(exit_code));
+        let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
+
+        // `execute()` is a legacy string-only boundary. It cannot carry the
+        // structured `is_error` bit returned by `render_bash_outcome`, so an
+        // execution failure must have a stable textual failure envelope as
+        // well. Otherwise a useful stderr line such as "command not found"
+        // was recorded as a successful tool call by string consumers.
+        if execution_failed {
+            result.push_str(&format!(
+                "Error: bash execution failed (exit code {exit_code})"
+            ));
+        }
         if !stdout.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nstdout:\n");
+            }
             result.push_str(&stdout);
         }
         if !stderr.is_empty() {
             if !result.is_empty() {
-                result.push('\n');
+                result.push_str("\nstderr:\n");
             }
             result.push_str(&stderr);
         }
-
-        let exit_code = out.status.code().unwrap_or(-1);
 
         if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
             return if out.status.success() {

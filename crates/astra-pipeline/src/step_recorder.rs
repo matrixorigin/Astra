@@ -32,7 +32,9 @@ use crate::event::clip_output_preview;
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
 use astra_turn_types::InferencePurpose;
+use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Redact common credential patterns from tool output before persisting to disk.
 /// Returns (redacted_text, redaction_count).
@@ -51,6 +53,7 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
         .collect();
     let mut result = lines.join("\n");
     count += redact_pem_blocks(&mut result);
+    count += redact_shell_credentials(&mut result);
 
     // Inline redaction for common standalone token shapes.
     let inline_patterns = [
@@ -88,6 +91,58 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
     (result, count)
 }
 
+/// Redact credentials embedded in shell syntax before persisting a tool
+/// preview or result. Assignment-only redaction is insufficient here: command
+/// lines commonly pass a password as the argument to a credential-bearing
+/// flag, which otherwise ends up in a durable step event.
+///
+/// This deliberately recognizes only flags with unambiguous secret semantics
+/// (`sshpass -p` and `--password`). Broad flags such as `-p` remain untouched
+/// because they are frequently ordinary process IDs, paths, or ports.
+fn redact_shell_credentials(text: &mut String) -> usize {
+    static SECRET_ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    static SSHPASS_PASSWORD: OnceLock<Regex> = OnceLock::new();
+    static LONG_PASSWORD_FLAG: OnceLock<Regex> = OnceLock::new();
+
+    let assignment = SECRET_ASSIGNMENT.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)\b([a-z_][a-z0-9_]*(?:password|passwd|token|secret|api_key)\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^\s;|&]+)"#,
+        )
+        .expect("shell credential assignment regex must compile")
+    });
+    let sshpass = SSHPASS_PASSWORD.get_or_init(|| {
+        Regex::new(r#"(?ix)\b(sshpass\s+-[a-z]*p[a-z]*\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"#)
+            .expect("sshpass password regex must compile")
+    });
+    let long_password = LONG_PASSWORD_FLAG.get_or_init(|| {
+        Regex::new(r#"(?ix)(--(?:password|passwd|token|secret|api-key)(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|\S+)"#)
+            .expect("long password flag regex must compile")
+    });
+
+    let mut count = 0;
+    for matcher in [assignment, sshpass, long_password] {
+        let redacted = matcher.replace_all(text, |captures: &regex::Captures<'_>| {
+            let whole = captures
+                .get(0)
+                .expect("credential regex always captures the full match")
+                .as_str();
+            let prefix = captures
+                .get(1)
+                .expect("credential regex always captures its prefix")
+                .as_str();
+            if &whole[prefix.len()..] == "[REDACTED]" {
+                return whole.to_string();
+            }
+            count += 1;
+            format!("{prefix}[REDACTED]")
+        });
+        if redacted.as_ref() != text {
+            *text = redacted.into_owned();
+        }
+    }
+    count
+}
+
 fn sanitize_args_preview_for_storage(args_preview: Option<&str>) -> (Option<String>, usize) {
     let Some(args_preview) = args_preview else {
         return (None, 0);
@@ -106,6 +161,18 @@ enum SensitiveKeyKind {
 fn redact_sensitive_assignment_line(line: &str) -> Option<String> {
     let separator = find_sensitive_separator(line)?;
     let key = line[..separator].trim();
+    // This path owns configuration-style lines such as `DB_PASSWORD=value`.
+    // A shell command can contain the same assignment after another command
+    // (`env DB_PASSWORD=value mysql ...`); redacting the entire remainder of
+    // that line would discard useful diagnostics and hide later credentials
+    // from the token-aware sanitizer below.
+    if line.as_bytes().get(separator) == Some(&b'=')
+        && !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return None;
+    }
     let suffix = &line[separator + 1..];
     let leading_ws_len = suffix.len() - suffix.trim_start().len();
     let value = suffix.trim();
@@ -1606,6 +1673,22 @@ mod tests {
         let sanitized = sanitized.expect("sanitized preview");
         assert!(sanitized.contains("Authorization: [REDACTED]"));
         assert!(!sanitized.contains("sk-test-secret-value"));
+    }
+
+    #[test]
+    fn sanitize_args_preview_redacts_shell_credentials_before_persistence() {
+        let (sanitized, count) = sanitize_args_preview_for_storage(Some(
+            "sshpass -p 'opaque-password' ssh host; DB_PASSWORD=another-secret mysql --password=third-secret",
+        ));
+        let sanitized = sanitized.expect("sanitized preview");
+
+        assert_eq!(count, 3, "every durable shell secret must be accounted for");
+        assert!(sanitized.contains("sshpass -p [REDACTED]"));
+        assert!(sanitized.contains("DB_PASSWORD=[REDACTED]"));
+        assert!(sanitized.contains("--password=[REDACTED]"));
+        for secret in ["opaque-password", "another-secret", "third-secret"] {
+            assert!(!sanitized.contains(secret), "leaked shell secret: {secret}");
+        }
     }
 
     #[test]

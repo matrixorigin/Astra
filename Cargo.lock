@@ -381,6 +381,7 @@ dependencies = [
  "astra-turn-types",
  "async-trait",
  "chrono",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
