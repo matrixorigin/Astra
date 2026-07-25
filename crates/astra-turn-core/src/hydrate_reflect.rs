@@ -3,17 +3,9 @@
 use astra_thin_client::{ThinClient, ThinClientError};
 use serde_json::Value;
 
-/// Minimal query-value encoding for reflect URL.
+/// RFC 3986 query-value encoding for the reflect URL.
 fn reflect_query_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '#' => "%23".to_string(),
-            _ => c.to_string(),
-        })
-        .collect()
+    astra_text_utils::url_component::encode_url_component(s)
 }
 
 /// Relative path + query for `GET /chat/session/{id}/reflect?...` (no leading slash).
@@ -86,6 +78,14 @@ mod tests {
     fn reflect_query_encode_specials() {
         assert_eq!(reflect_query_encode("a b"), "a%20b");
         assert_eq!(reflect_query_encode("a&b=c#d"), "a%26b%3Dc%23d");
+    }
+
+    #[test]
+    fn reflect_query_encode_preserves_one_query_value_for_all_reserved_and_unicode_bytes() {
+        assert_eq!(
+            reflect_query_encode("why?source_policy=cloud_only% +/雪"),
+            "why%3Fsource_policy%3Dcloud_only%25%20%2B%2F%E9%9B%AA"
+        );
     }
 
     #[test]

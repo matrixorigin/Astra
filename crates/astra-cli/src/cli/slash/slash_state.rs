@@ -1411,9 +1411,10 @@ fn is_reflect_facet(token: &str) -> bool {
 /// vs the last cloud-synced baseline. Auto-populated — reads directly
 /// from `SessionState` without any new plumbing.
 ///
-/// Output enumerates tool-health entries whose failure rate, call count,
-/// or presence changed since last sync. When nothing changed (e.g. fresh
-/// session) the output is an explicit "no delta" line.
+/// Output enumerates tool-health entries whose execution failure rate, call
+/// count, input-validation rejects, or presence changed since last sync.
+/// When nothing changed (e.g. fresh session) the output is an explicit
+/// "no delta" line.
 pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
@@ -1433,24 +1434,28 @@ pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
         match synced.get(cur.name.as_str()) {
             None => {
                 rows.push(format!(
-                    "  + {name:20}  new · {calls} calls · {rate:.0}% fail",
+                    "  + {name:20}  new · {calls} calls · {rate:.0}% fail · {invalid} input rejects",
                     name = cur.name,
                     calls = cur.total_calls,
-                    rate = cur.failure_rate * 100.0
+                    rate = cur.failure_rate * 100.0,
+                    invalid = cur.input_validation_failures,
                 ));
             }
             Some(prev) => {
                 let rate_delta = cur.failure_rate - prev.failure_rate;
                 let call_delta = cur.total_calls as i64 - prev.total_calls as i64;
-                if call_delta == 0 && rate_delta.abs() < 0.005 {
+                let invalid_delta =
+                    cur.input_validation_failures as i64 - prev.input_validation_failures as i64;
+                if call_delta == 0 && rate_delta.abs() < 0.005 && invalid_delta == 0 {
                     continue;
                 }
                 let sign = if rate_delta >= 0.0 { "+" } else { "" };
                 rows.push(format!(
-                    "  ~ {name:20}  Δcalls {call_delta:+} · Δfail {sign}{rate:.0}% (now {now:.0}%)",
+                    "  ~ {name:20}  Δcalls {call_delta:+} · Δfail {sign}{rate:.0}% (now {now:.0}%) · Δinput {invalid_delta:+}",
                     name = cur.name,
                     rate = rate_delta * 100.0,
-                    now = cur.failure_rate * 100.0
+                    now = cur.failure_rate * 100.0,
+                    invalid_delta = invalid_delta,
                 ));
             }
         }
@@ -2299,6 +2304,7 @@ mod tests {
             name: "grep".into(),
             total_calls: 10,
             total_failures: 1,
+            input_validation_failures: 0,
             failure_rate: 0.10,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -2309,6 +2315,7 @@ mod tests {
                 name: "grep".into(),
                 total_calls: 14,
                 total_failures: 5,
+                input_validation_failures: 2,
                 failure_rate: 0.36,
                 last_updated_epoch: 0,
                 recent_outcomes: vec![],
@@ -2317,6 +2324,7 @@ mod tests {
                 name: "glob".into(),
                 total_calls: 3,
                 total_failures: 0,
+                input_validation_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
                 recent_outcomes: vec![],
@@ -2327,6 +2335,10 @@ mod tests {
         assert!(out.contains("glob"), "new tool shown: {out}");
         assert!(out.contains("new"), "new marker: {out}");
         assert!(out.contains("Δcalls +4"), "grep call delta surfaced: {out}");
+        assert!(
+            out.contains("Δinput +2"),
+            "caller misuse delta surfaced: {out}"
+        );
     }
 
     #[test]

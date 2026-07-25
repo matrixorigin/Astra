@@ -204,15 +204,12 @@ mod tests {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
         let tmp = tempfile::tempdir().expect("tempdir");
         let shim = tmp.path().join("fake-astra");
         // `astra journal digest …` args are swallowed; the shim just
         // sleeps indefinitely.
-        std::fs::write(&shim, "#!/bin/sh\nsleep 30\n").expect("write shim");
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+        write_executable_shim(&shim, "#!/bin/sh\nsleep 30\n").expect("write shim");
 
         let collector = AstraCliDigestCollector::new(shim).with_timeout(2);
         let start = std::time::Instant::now();

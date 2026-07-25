@@ -1412,20 +1412,17 @@ mod tests {
 
     #[tokio::test]
     async fn memory_cleanup_uses_only_the_current_sessions_store_record() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
         let marker = dir.path().join("cleanup-args.txt");
         let shim = dir.path().join("astra-cleanup-shim");
-        std::fs::write(
+        write_executable_shim(
             &shim,
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", marker.display()),
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&shim, permissions).unwrap();
 
         let exec = FakeExecutor::new();
         exec.seed("cleanup", "m", outcome_ok("m", "text", &[]));

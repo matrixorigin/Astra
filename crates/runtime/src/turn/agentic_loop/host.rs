@@ -692,13 +692,14 @@ fn build_introspect_snapshot_with_tool_admission(
         .health
         .all()
         .iter()
-        .filter(|(_, h)| h.total_calls > 0)
+        .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
         .map(|(name, h)| {
             let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
             astra_turn_core::introspect::ToolHealthEntry {
                 name: name.clone(),
                 calls: h.total_calls as u32,
                 errors: h.total_failures as u32,
+                input_validation_failures: h.input_validation_failures as u32,
                 avg_ms: 0,
                 avoidance_advised: h.avoidance_advised,
                 consecutive_failures: h.consecutive_failures as u32,

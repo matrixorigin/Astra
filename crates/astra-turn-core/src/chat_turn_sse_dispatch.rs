@@ -101,6 +101,11 @@ pub struct ChatTurnSseAccum {
     /// natural completion, `"length"` when output was truncated by the API's
     /// max_tokens limit, `"tool_calls"` when the model requested tools.
     pub finish_reason: Option<String>,
+    /// Whether the transport emitted its terminal `[DONE]` marker. This is
+    /// intentionally distinct from a model finish reason: once set, later
+    /// bytes belong to no valid part of this response and must not mutate the
+    /// accumulated answer or queue edge work.
+    pub stream_complete: bool,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -594,13 +599,17 @@ pub fn dispatch_chat_turn_sse_event_block(
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
 ) -> Vec<SseRenderEffect> {
+    if accum.stream_complete {
+        return Vec::new();
+    }
     let mut effects = Vec::new();
     for line in block.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
         if data == "[DONE]" {
-            continue;
+            accum.stream_complete = true;
+            break;
         }
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             // Synthetic error: protocol parse error should be visible, not silently ignored.
@@ -1947,21 +1956,23 @@ mod tests {
 
     // ── SSE dispatch contract pins ─────────────────────────────────────
 
-    /// Current contract: `[DONE]` is NOT terminal — subsequent `data:`
-    /// lines in the same block are still processed. This is arguably a
-    /// bug (a real `[DONE]` should stop parsing) but is preserved here
-    /// deliberately for now; changing it is out of scope for this PR.
-    /// TODO(astra-stream-protocol): decide whether `[DONE]` should stop
-    /// dispatch of subsequent lines in the same block.
+    /// `[DONE]` is a terminal transport marker, not an ordinary ignored
+    /// event. A malformed or malicious transport must not be able to append
+    /// text or queue edge work after it has declared the stream complete.
     #[test]
-    fn done_marker_is_non_terminal_subsequent_lines_still_processed() {
+    fn done_marker_stops_current_and_later_event_blocks() {
         let mut a = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
         let block = "data: [DONE]\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
-        dispatch_chat_turn_sse_event_block(block, &mut a, &mut vec![]);
-        assert_eq!(
-            a.full_text, "after-done",
-            "data lines after [DONE] in the same block are currently still processed"
+        dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_request\",\"request_id\":\"after-done\",\"tool\":\"bash\",\"args\":{}}\n\n",
+            &mut a,
+            &mut pending,
         );
+        assert!(a.stream_complete);
+        assert!(a.full_text.is_empty());
+        assert!(pending.is_empty());
     }
 
     /// Contract pin: only the FIRST malformed JSON line sets

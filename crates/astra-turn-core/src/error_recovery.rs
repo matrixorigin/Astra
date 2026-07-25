@@ -324,7 +324,8 @@ pub enum EscalationLevel {
 /// Determine escalation level from session error signals.
 ///
 /// - `nudge_count`: how many stall nudges have been sent
-/// - `total_errors`: total tool errors this session (excluding auth + timeouts)
+/// - `total_errors`: executor failures this session (excluding auth, timeouts,
+///   and requests rejected before execution for invalid arguments)
 /// - `health_avoidance_count`: number of health-avoidance tools
 ///
 /// Thresholds are deliberately generous: normal agent behavior (search→read→search)

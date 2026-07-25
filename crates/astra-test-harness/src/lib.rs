@@ -55,6 +55,8 @@ pub mod runner;
 pub mod session_capture;
 pub mod suite;
 pub mod summarizer;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Well-known prefix for every stderr line this harness emits.
 /// Grepping `stderr_matches { pattern: '^\[astra-test\]' }` finds

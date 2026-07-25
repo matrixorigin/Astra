@@ -36,10 +36,19 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
         };
         eprintln!("  Status: {status}");
         eprintln!(
-            "  Tools: {}  Errors: {}  Timeouts: {}  Cache hits: {}",
+            "  Tools: {}  Errors: {}  Input rejects: {}  Timeouts: {}  Cache hits: {}",
             summary.total_tools.to_string().magenta(),
             if summary.total_errors > 0 {
                 summary.total_errors.to_string().red().to_string()
+            } else {
+                "0".to_string()
+            },
+            if summary.total_input_validation_failures > 0 {
+                summary
+                    .total_input_validation_failures
+                    .to_string()
+                    .yellow()
+                    .to_string()
             } else {
                 "0".to_string()
             },
@@ -62,10 +71,11 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
         if detail {
             // Per-tool breakdown
             eprintln!(
-                "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
+                "  {:<20} {:>5} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
                 "tool".bold(),
                 "calls".bold(),
                 "fail".bold(),
+                "args".bold(),
                 "TO".bold(),
                 "cache".bold(),
                 "rehab".bold(),
@@ -85,10 +95,11 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
                     "✓ healthy".green().to_string()
                 };
                 eprintln!(
-                    "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
+                    "  {:<20} {:>5} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
                     name.as_str().magenta(),
                     health.total_calls,
                     health.total_failures,
+                    health.input_validation_failures,
                     health.timeout_count,
                     health.cache_hit_count,
                     health.rehabilitation_count,
@@ -133,6 +144,18 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
                 .collect();
             if !recovering.is_empty() {
                 eprintln!("  {} {}", "With errors:".yellow(), recovering.join(", "));
+            }
+            let input_rejected: Vec<&str> = all
+                .iter()
+                .filter(|(_, h)| h.input_validation_failures > 0)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if !input_rejected.is_empty() {
+                eprintln!(
+                    "  {} {} (executor did not run)",
+                    "Invalid args:".yellow(),
+                    input_rejected.join(", ")
+                );
             }
             if !detail {
                 eprintln!("  {}", "Use /health detail for per-tool breakdown.".dim());

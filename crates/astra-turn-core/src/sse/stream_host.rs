@@ -1157,6 +1157,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn done_marker_prevents_later_chunks_from_executing_edge_tools() {
+        let chunks: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(b"data: [DONE]\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"tool_request\",\"request_id\":\"after-done\",\"tool\":\"bash\",\"args\":{}}\n\n".to_vec()),
+        ];
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(result.accum.stream_complete);
+        assert!(result.tool_results.is_empty());
+        assert!(result.approval_results.is_empty());
+    }
+
+    #[tokio::test]
     async fn recording_host_receives_typed_agent_communication() {
         let events = sse_event(
             "agent_communication",

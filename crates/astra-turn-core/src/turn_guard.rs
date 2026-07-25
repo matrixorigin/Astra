@@ -758,17 +758,24 @@ impl TurnGuard {
         // 5. Escalation
         // Discount timeout-only errors: they're infrastructure issues, not agent failures.
         // Also discount auth errors: they're credential issues, not agent misbehavior.
+        // Input validation rejects did not reach an executor; they are kept as
+        // caller-quality evidence but must not turn into a false system/tool
+        // failure escalation.
         let recent_timeouts = self
             .errors
             .recent_error_count(error_recovery::ErrorCategory::ToolTimeout);
         let auth_errors = self
             .errors
             .recent_error_count(error_recovery::ErrorCategory::Auth);
+        let input_validation_errors = self
+            .errors
+            .recent_error_count(error_recovery::ErrorCategory::ToolInvalidArgs);
         let actionable_errors = self
             .errors
             .recent_error_pressure()
             .saturating_sub(recent_timeouts)
-            .saturating_sub(auth_errors);
+            .saturating_sub(auth_errors)
+            .saturating_sub(input_validation_errors);
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
             actionable_errors,
@@ -1226,8 +1233,13 @@ mod tests {
             .health
             .get("task_board")
             .expect("task health should be tracked");
-        assert_eq!(health.total_calls, errors.len());
-        assert_eq!(health.total_failures, errors.len());
+        assert_eq!(health.total_calls, 0, "the executor was never called");
+        assert_eq!(health.total_failures, 0, "the executor never failed");
+        assert_eq!(
+            health.input_validation_failures,
+            errors.len(),
+            "caller-fixable contract errors remain attributable"
+        );
         assert_eq!(
             health.consecutive_failures, 0,
             "caller-fixable contract errors must not count toward tool quarantine"
@@ -1236,6 +1248,28 @@ mod tests {
             !guard.health.is_avoidance_advised("task_board"),
             "bad tool-call shape must not hide a healthy task tool"
         );
+    }
+
+    #[test]
+    fn repeated_input_validation_failures_do_not_escalate_as_executor_failures() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..16 {
+            guard.record_tool_result("agent_fanout", "Error: Invalid argument");
+        }
+
+        assert_eq!(guard.errors.total_errors, 16, "rejections remain traceable");
+        assert_eq!(
+            guard
+                .health
+                .get("agent_fanout")
+                .expect("tracked validation rejects")
+                .input_validation_failures,
+            16
+        );
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+        assert!(verdict.avoid_tools.is_empty());
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     #[test]
@@ -1319,6 +1353,7 @@ mod tests {
             name: "bash".to_string(),
             total_calls: 3,
             total_failures: 2,
+            input_validation_failures: 0,
             failure_rate: 0.67,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -1336,6 +1371,7 @@ mod tests {
             name: "mo_query".to_string(),
             total_calls: 10,
             total_failures: 7,
+            input_validation_failures: 0,
             failure_rate: 0.7,
             last_updated_epoch: 0,
             recent_outcomes: vec![],

@@ -223,8 +223,13 @@ const CROSS_SESSION_MIN_CALLS: usize = 8;
 /// Per-tool health record within a session.
 #[derive(Debug, Clone, Default)]
 pub struct ToolHealth {
+    /// Calls that reached the executor.
     pub total_calls: usize,
+    /// Failures from calls that reached the executor.
     pub total_failures: usize,
+    /// Requests rejected at schema/input validation before the executor ran.
+    /// This is a caller-quality signal and must never affect tool reliability.
+    pub input_validation_failures: usize,
     pub consecutive_failures: usize,
     /// Whether repeated failures should produce retry-caution guidance.
     pub avoidance_advised: bool,
@@ -242,12 +247,19 @@ pub struct ToolHealth {
 }
 
 impl ToolHealth {
-    pub fn success_rate(&self) -> f64 {
+    /// Fraction of executor calls that failed. Validation rejects are excluded
+    /// because no tool execution occurred.
+    #[must_use]
+    pub fn failure_rate(&self) -> f64 {
         if self.total_calls == 0 {
-            1.0
+            0.0
         } else {
-            (self.total_calls - self.total_failures) as f64 / self.total_calls as f64
+            self.total_failures.min(self.total_calls) as f64 / self.total_calls as f64
         }
+    }
+
+    pub fn success_rate(&self) -> f64 {
+        1.0 - self.failure_rate()
     }
 }
 
@@ -340,32 +352,13 @@ impl ToolHealthTracker {
 
     /// Record an input-validation failure (LLM passed wrong arg types,
     /// missing required fields, etc.). The TOOL is fine — the caller's
-    /// arguments are wrong. Does NOT increment `consecutive_failures`
-    /// or trigger health avoidance, because the tool itself isn't
-    /// broken and will succeed if the LLM fixes its args next round.
+    /// arguments are wrong. The request never reaches the executor, so it
+    /// does not count as a tool call, execution failure, or avoidance signal.
+    /// It is preserved separately for caller-quality diagnosis.
     ///
-    /// Session 7e3fecb5: 3× `"background": "true"` (string instead of
-    /// bool) caused avoid advice for the agent tool. The tool was
-    /// perfectly healthy — serde just rejected the input shape.
-    ///
-    /// ## Reporting note
-    /// Both `total_calls` and `total_failures` are incremented, so
-    /// `failure_rate = total_failures / total_calls` WILL reflect
-    /// input-validation failures. Operator dashboards that use
-    /// `failure_rate` to flag "unhealthy" tools should either
-    /// (a) separately surface `input_validation_failures` (TODO:
-    /// add as dedicated counter), or (b) cross-check with
-    /// `consecutive_failures` / `avoidance_advised` before alerting —
-    /// a tool with high `failure_rate` but `consecutive_failures == 0`
-    /// and `!avoidance_advised` is almost certainly being misused by the
-    /// LLM, not broken.
     pub fn record_input_validation_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
-        health.total_calls += 1;
-        health.total_failures += 1;
-        // Deliberately NOT incrementing consecutive_failures or
-        // clearing consecutive_successes — the tool isn't broken,
-        // the caller just needs to fix their args.
+        health.input_validation_failures += 1;
         self.dirty_tools.insert(tool_name.to_string());
     }
 
@@ -536,16 +529,13 @@ impl ToolHealthTracker {
             .unwrap_or(0);
         self.tools
             .iter()
-            .filter(|(_, h)| h.total_calls > 0)
+            .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
             .map(|(name, h)| astra_pipeline::ToolHealthEntry {
                 name: name.clone(),
                 total_calls: h.total_calls,
                 total_failures: h.total_failures,
-                failure_rate: if h.total_calls > 0 {
-                    h.total_failures as f64 / h.total_calls as f64
-                } else {
-                    0.0
-                },
+                input_validation_failures: h.input_validation_failures,
+                failure_rate: h.failure_rate(),
                 last_updated_epoch: now_epoch,
                 recent_outcomes: self.export_outcomes_for_tool(name),
             })
@@ -572,12 +562,14 @@ impl ToolHealthTracker {
         let mut result: Vec<_> = self
             .tools
             .iter()
-            .filter(|(_, h)| h.total_calls > 0)
+            .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
             .map(|(name, h)| {
                 // Check if this tool had activity this session by comparing with historical data
                 let had_session_activity = match historical_map.get(name.as_str()) {
                     Some(hist) => {
-                        h.total_calls != hist.total_calls || h.total_failures != hist.total_failures
+                        h.total_calls != hist.total_calls
+                            || h.total_failures != hist.total_failures
+                            || h.input_validation_failures != hist.input_validation_failures
                     }
                     None => true, // New tool, definitely had activity
                 };
@@ -586,11 +578,8 @@ impl ToolHealthTracker {
                     name: name.clone(),
                     total_calls: h.total_calls,
                     total_failures: h.total_failures,
-                    failure_rate: if h.total_calls > 0 {
-                        h.total_failures as f64 / h.total_calls as f64
-                    } else {
-                        0.0
-                    },
+                    input_validation_failures: h.input_validation_failures,
+                    failure_rate: h.failure_rate(),
                     // Update timestamp only if tool had session activity
                     last_updated_epoch: if had_session_activity {
                         now_epoch
@@ -629,16 +618,13 @@ impl ToolHealthTracker {
         self.dirty_tools
             .iter()
             .filter_map(|name| self.tools.get(name).map(|h| (name, h)))
-            .filter(|(_, h)| h.total_calls > 0)
+            .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
             .map(|(name, h)| astra_pipeline::ToolHealthEntry {
                 name: name.clone(),
                 total_calls: h.total_calls,
                 total_failures: h.total_failures,
-                failure_rate: if h.total_calls > 0 {
-                    h.total_failures as f64 / h.total_calls as f64
-                } else {
-                    0.0
-                },
+                input_validation_failures: h.input_validation_failures,
+                failure_rate: h.failure_rate(),
                 last_updated_epoch: now_epoch,
                 recent_outcomes: self.export_outcomes_for_tool(name),
             })
@@ -670,13 +656,19 @@ impl ToolHealthTracker {
     pub fn from_entries(entries: &[astra_pipeline::ToolHealthEntry]) -> Self {
         let mut tracker = Self::new();
         for entry in entries {
+            let execution_failure_rate = if entry.total_calls == 0 {
+                0.0
+            } else {
+                entry.total_failures.min(entry.total_calls) as f64 / entry.total_calls as f64
+            };
             let avoidance_advised = entry.total_calls >= CROSS_SESSION_MIN_CALLS
-                && entry.failure_rate >= CROSS_SESSION_AVOIDANCE_RATE;
+                && execution_failure_rate >= CROSS_SESSION_AVOIDANCE_RATE;
             tracker.tools.insert(
                 entry.name.clone(),
                 ToolHealth {
                     total_calls: entry.total_calls,
                     total_failures: entry.total_failures,
+                    input_validation_failures: entry.input_validation_failures,
                     consecutive_failures: 0, // Reset per-session
                     avoidance_advised,
                     rehabilitation_count: 0,
@@ -780,6 +772,11 @@ impl ToolHealthTracker {
             .filter(|h| h.rehabilitation_count >= 2)
             .count();
         let total_errors: usize = self.tools.values().map(|h| h.total_failures).sum();
+        let total_input_validation_failures: usize = self
+            .tools
+            .values()
+            .map(|h| h.input_validation_failures)
+            .sum();
         let total_timeouts: usize = self.tools.values().map(|h| h.timeout_count).sum();
         let total_cache_hits: usize = self.tools.values().map(|h| h.cache_hit_count).sum();
         ToolHealthSummary {
@@ -787,6 +784,7 @@ impl ToolHealthTracker {
             health_avoidance_count,
             flaky_count,
             total_errors,
+            total_input_validation_failures,
             total_timeouts,
             total_cache_hits,
         }
@@ -1206,6 +1204,9 @@ pub struct ToolHealthSummary {
     pub total_tools: usize,
     pub health_avoidance_count: usize,
     pub flaky_count: usize,
+    /// Requests rejected before an executor call because their input did not
+    /// satisfy the tool schema. This is intentionally excluded from errors.
+    pub total_input_validation_failures: usize,
     pub total_errors: usize,
     pub total_timeouts: usize,
     pub total_cache_hits: usize,
@@ -1364,6 +1365,42 @@ mod tests {
     }
 
     #[test]
+    fn input_validation_failures_are_persisted_but_do_not_poison_execution_health() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_input_validation_failure("agent_fanout");
+        }
+
+        let health = tracker.get("agent_fanout").expect("tracked tool");
+        assert_eq!(health.total_calls, 0, "the executor never ran");
+        assert_eq!(health.total_failures, 0, "the executor never failed");
+        assert_eq!(health.input_validation_failures, 3);
+        assert!(!health.avoidance_advised);
+
+        let exported = tracker.export();
+        assert_eq!(exported.len(), 1, "caller misuse remains observable");
+        assert_eq!(exported[0].input_validation_failures, 3);
+        assert_eq!(exported[0].failure_rate, 0.0);
+    }
+
+    #[test]
+    fn imported_health_uses_raw_execution_counts_not_a_stale_rate_cache() {
+        let tracker = ToolHealthTracker::from_entries(&[astra_pipeline::ToolHealthEntry {
+            name: "read_file".to_string(),
+            total_calls: 10,
+            total_failures: 0,
+            input_validation_failures: 7,
+            failure_rate: 1.0,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![],
+        }]);
+
+        let health = tracker.get("read_file").expect("imported tool");
+        assert_eq!(health.input_validation_failures, 7);
+        assert!(!health.avoidance_advised);
+    }
+
+    #[test]
     fn cache_wasteful_requires_repeated_same_signature() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
@@ -1407,6 +1444,7 @@ mod tests {
             name: "bash".to_string(),
             total_calls: 10,
             total_failures: 8,
+            input_validation_failures: 0,
             failure_rate: 0.8,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -1427,6 +1465,7 @@ mod tests {
             name: "str_replace".to_string(),
             total_calls: 5,
             total_failures: 3,
+            input_validation_failures: 0,
             failure_rate: 0.6,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -1446,6 +1485,7 @@ mod tests {
             name: "str_replace".to_string(),
             total_calls: 10,
             total_failures: 6,
+            input_validation_failures: 0,
             failure_rate: 0.6,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -1464,6 +1504,7 @@ mod tests {
             name: "read_file".to_string(),
             total_calls: 20,
             total_failures: 2,
+            input_validation_failures: 0,
             failure_rate: 0.1,
             last_updated_epoch: 0,
             recent_outcomes: vec![],
@@ -1708,6 +1749,7 @@ mod tests {
                 name: "bash".to_string(),
                 total_calls: 10,
                 total_failures: 2,
+                input_validation_failures: 0,
                 failure_rate: 0.2,
                 last_updated_epoch: 1000, // Old timestamp
                 recent_outcomes: vec![],
@@ -1716,6 +1758,7 @@ mod tests {
                 name: "grep".to_string(),
                 total_calls: 5,
                 total_failures: 1,
+                input_validation_failures: 0,
                 failure_rate: 0.2,
                 last_updated_epoch: 1000, // Old timestamp
                 recent_outcomes: vec![],
@@ -1757,6 +1800,7 @@ mod tests {
             name: "bash".to_string(),
             total_calls: 5,
             total_failures: 0,
+            input_validation_failures: 0,
             failure_rate: 0.0,
             last_updated_epoch: 1000,
             recent_outcomes: vec![],
@@ -1786,6 +1830,7 @@ mod tests {
             name: "bash".to_string(),
             total_calls: 3,
             total_failures: 1,
+            input_validation_failures: 0,
             failure_rate: 1.0 / 3.0,
             last_updated_epoch: 1000,
             recent_outcomes: vec![ToolOutcomeCacheEntry {

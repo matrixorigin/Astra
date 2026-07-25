@@ -31,8 +31,13 @@ pub struct ToolOutcomeCacheEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolHealthEntry {
     pub name: String,
+    /// Calls that reached the tool executor.
     pub total_calls: usize,
+    /// Executor failures, excluding rejected input before execution began.
     pub total_failures: usize,
+    /// Requests rejected by the argument/schema boundary before the executor
+    /// ran. This measures caller/model misuse, not tool reliability.
+    pub input_validation_failures: usize,
     /// Stored failure rate (0.0-1.0) rather than raw consecutive count.
     /// This avoids carrying session-local "consecutive" state across sessions.
     pub failure_rate: f64,

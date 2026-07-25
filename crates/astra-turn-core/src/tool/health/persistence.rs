@@ -275,6 +275,7 @@ mod tests {
             name: name.into(),
             total_calls: calls,
             total_failures: failures,
+            input_validation_failures: 0,
             failure_rate: if calls == 0 {
                 0.0
             } else {
@@ -314,6 +315,7 @@ mod tests {
                 "name": "bash",
                 "total_calls": 3,
                 "total_failures": 1,
+                "input_validation_failures": 0,
                 "failure_rate": 0.33,
                 "last_updated_epoch": 99
             }]

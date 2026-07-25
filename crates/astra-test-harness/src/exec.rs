@@ -544,18 +544,15 @@ mod tests {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
         let tmp = tempfile::tempdir().expect("tempdir");
         let args_path = tmp.path().join("args");
         let shim = tmp.path().join("fake-astra");
-        std::fs::write(
+        write_executable_shim(
             &shim,
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HARNESS_ARGS_PATH\"\nprintf '%s\\n' '{\"session_id\":\"server-issued\"}'\n",
         )
         .expect("write shim");
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
 
         let mut case = simple_case();
         case.env.insert(
@@ -665,13 +662,10 @@ mod tests {
         // vector and just sleeps. This lets `AstraCliExecutor`
         // spawn it via its real `chat -m ... --model ... --json -y`
         // arg assembly without the child exiting early.
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
         let tmp = tempfile::tempdir().expect("tempdir");
         let shim = tmp.path().join("fake-astra");
-        std::fs::write(&shim, "#!/bin/sh\nsleep 10\n").expect("write shim");
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+        write_executable_shim(&shim, "#!/bin/sh\nsleep 10\n").expect("write shim");
 
         let cfg = RunnerConfig::new(shim.clone());
         let exec = AstraCliExecutor::new(cfg);

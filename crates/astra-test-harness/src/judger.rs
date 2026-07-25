@@ -789,21 +789,16 @@ mod tests {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
         let tmp = tempfile::tempdir().expect("tempdir");
         let shim = tmp.path().join("fake-astra");
-        std::fs::write(
+        write_executable_shim(
             &shim,
             "#!/bin/sh\n\
              echo 'rate limit exceeded: please retry in 30s' 1>&2\n\
              exit 42\n",
         )
         .expect("write shim");
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
-        // Ensure the file is fully flushed before exec (prevents ETXTBSY under load).
-        std::process::Command::new("sync").status().ok();
 
         let cfg = JudgerConfig::new(shim, "sonnet");
         let j = AstraCliJudger::new(cfg);
@@ -830,12 +825,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn judger_uses_shared_profile_without_resuming_tested_session() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_executable_shim;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let log = tmp.path().join("args.log");
         let shim = tmp.path().join("fake-astra");
-        std::fs::write(
+        write_executable_shim(
             &shim,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"text\":\"receipt verified\\nSCORE: 1.0\"}}'\n",
@@ -843,10 +838,6 @@ mod tests {
             ),
         )
         .expect("write shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Some overlay filesystems can briefly report ETXTBSY when a freshly
-        // written executable is spawned under parallel test load.
-        std::process::Command::new("sync").status().ok();
 
         let mut cfg = JudgerConfig::new(shim, "judge-model");
         cfg.profile = Some("isolated-harness".into());

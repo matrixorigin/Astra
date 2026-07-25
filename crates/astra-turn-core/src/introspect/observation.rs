@@ -476,7 +476,10 @@ fn build_introspect_observations(
                 .tool_health
                 .iter()
                 .filter(|tool| {
-                    tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0
+                    tool.avoidance_advised
+                        || tool.errors > 0
+                        || tool.input_validation_failures > 0
+                        || tool.consecutive_failures > 0
                 })
                 .take(8)
             {
@@ -496,8 +499,12 @@ fn build_introspect_observations(
                     }
                     .to_string(),
                     summary: format!(
-                        "{} calls={} errors={} consecutive_failures={}",
-                        tool.name, tool.calls, tool.errors, tool.consecutive_failures
+                        "{} calls={} errors={} input_validation_failures={} consecutive_failures={}",
+                        tool.name,
+                        tool.calls,
+                        tool.errors,
+                        tool.input_validation_failures,
+                        tool.consecutive_failures
                     ),
                     confidence: ObservationConfidence::complete(0.70, 0.75, 0.35),
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
@@ -1029,7 +1036,10 @@ fn build_introspect_graph_slice(
         ObservationFacet::Session | ObservationFacet::Overview
     ) {
         for tool in snapshot.tool_health.iter().filter(|tool| {
-            tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0
+            tool.avoidance_advised
+                || tool.errors > 0
+                || tool.input_validation_failures > 0
+                || tool.consecutive_failures > 0
         }) {
             let health_ref = Urn::new("observation", "local", "introspect")
                 .seg("execution")
@@ -1050,16 +1060,18 @@ fn build_introspect_graph_slice(
                     kind: ObservationGraphNodeKind::Outcome,
                     label: "tool_health".to_string(),
                     summary: Some(format!(
-                        "{name} calls={calls} errors={errors} consecutive_failures={cf}",
+                        "{name} calls={calls} errors={errors} input_validation_failures={ivf} consecutive_failures={cf}",
                         name = tool.name,
                         calls = tool.calls,
                         errors = tool.errors,
+                        ivf = tool.input_validation_failures,
                         cf = tool.consecutive_failures
                     )),
                     metadata: Some(serde_json::json!({
                         "tool_name": tool.name,
                         "calls": tool.calls,
                         "errors": tool.errors,
+                        "input_validation_failures": tool.input_validation_failures,
                         "consecutive_failures": tool.consecutive_failures,
                         "avoidance_advised": tool.avoidance_advised,
                         "severity": severity,
@@ -1152,6 +1164,7 @@ mod tests {
             name: name.to_string(),
             calls: 10,
             errors: 3,
+            input_validation_failures: 0,
             avg_ms: 500,
             avoidance_advised: true,
             consecutive_failures: 2,
@@ -1202,6 +1215,38 @@ mod tests {
                 .any(|node| node.label == "step_latency"),
             "step latency observation should also be reachable from graph_slice"
         );
+    }
+
+    #[test]
+    fn validation_only_tool_misuse_is_observable_without_unhealthy_severity() {
+        let snapshot = IntrospectSnapshot {
+            tool_health: vec![ToolHealthEntry {
+                name: "agent_fanout".to_string(),
+                calls: 0,
+                errors: 0,
+                input_validation_failures: 3,
+                avg_ms: 0,
+                avoidance_advised: false,
+                consecutive_failures: 0,
+                last_failure_category: None,
+            }],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Session,
+            ..Default::default()
+        };
+
+        let report = build_introspect_report(&snapshot, &request);
+        let observation = report
+            .observations
+            .iter()
+            .find(|observation| observation.kind == "tool_health")
+            .expect("validation rejects must remain observable");
+        assert_eq!(observation.severity, "info");
+        assert!(observation.summary.contains("calls=0 errors=0"));
+        assert!(observation.summary.contains("input_validation_failures=3"));
     }
 
     #[test]

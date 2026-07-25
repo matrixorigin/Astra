@@ -900,6 +900,7 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                                 name: tool_name,
                                 total_calls: 0,
                                 total_failures: 0,
+                                input_validation_failures: 0,
                                 failure_rate: 0.0,
                                 last_updated_epoch: 0,
                                 recent_outcomes: vec![],

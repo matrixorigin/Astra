@@ -213,8 +213,14 @@ pub struct StallSnapshotSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolHealthEntry {
     pub name: String,
+    /// Calls that reached the executor.
     pub calls: u32,
+    /// Executor failures. Input rejects are reported separately.
     pub errors: u32,
+    /// Requests rejected before execution because their arguments failed
+    /// schema/input validation. This is a caller-quality signal, not a tool
+    /// reliability signal.
+    pub input_validation_failures: u32,
     pub avg_ms: u64,
     #[serde(default)]
     pub avoidance_advised: bool,
@@ -631,14 +637,25 @@ fn render_full(s: &IntrospectSnapshot) -> String {
 
     if !s.tool_health.is_empty() {
         out.push_str("\n## Tool Health\n");
-        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Avoid | LastFail |\n");
-        out.push_str("|------|-------|--------|--------|------------|-------|----------|\n");
+        out.push_str(
+            "| Tool | Calls | Errors | Input rejects | Avg ms | ConsecFail | Avoid | LastFail |\n",
+        );
+        out.push_str(
+            "|------|-------|--------|---------------|--------|------------|-------|----------|\n",
+        );
         for t in &s.tool_health {
             let avoidance = if t.avoidance_advised { "YES" } else { "-" };
             let last_fail = t.last_failure_category.as_deref().unwrap_or("-");
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
-                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, avoidance, last_fail
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                t.name,
+                t.calls,
+                t.errors,
+                t.input_validation_failures,
+                t.avg_ms,
+                t.consecutive_failures,
+                avoidance,
+                last_fail
             ));
         }
     }
@@ -1094,6 +1111,7 @@ mod tests {
                     name: "bash".into(),
                     calls: 15,
                     errors: 5,
+                    input_validation_failures: 2,
                     avg_ms: 2300,
                     avoidance_advised: false,
                     consecutive_failures: 0,
@@ -1103,6 +1121,7 @@ mod tests {
                     name: "read_file".into(),
                     calls: 22,
                     errors: 0,
+                    input_validation_failures: 0,
                     avg_ms: 12,
                     avoidance_advised: false,
                     consecutive_failures: 0,
@@ -1112,6 +1131,7 @@ mod tests {
                     name: "grep".into(),
                     calls: 8,
                     errors: 1,
+                    input_validation_failures: 0,
                     avg_ms: 45,
                     avoidance_advised: true,
                     consecutive_failures: 3,
@@ -1259,6 +1279,8 @@ mod tests {
         assert!(output.contains("## Tool Health"));
         assert!(output.contains("| bash |"));
         assert!(output.contains("| read_file |"));
+        assert!(output.contains("Input rejects"));
+        assert!(output.contains("| bash | 15 | 5 | 2 |"));
     }
 
     #[test]
@@ -1448,6 +1470,7 @@ mod tests {
                 name: format!("tool_{idx}"),
                 calls: 10 + idx,
                 errors: 3,
+                input_validation_failures: 0,
                 avg_ms: 100,
                 avoidance_advised: true,
                 consecutive_failures: 3,
@@ -2108,6 +2131,7 @@ mod tests {
                 name: format!("tool_{idx}"),
                 calls: 10,
                 errors: 3,
+                input_validation_failures: 0,
                 avg_ms: 100,
                 avoidance_advised: true,
                 consecutive_failures: 3,
@@ -2118,6 +2142,7 @@ mod tests {
             name: "clean_tool".into(),
             calls: 5,
             errors: 0,
+            input_validation_failures: 0,
             avg_ms: 5,
             avoidance_advised: false,
             consecutive_failures: 0,
@@ -2164,6 +2189,7 @@ mod tests {
                 name: format!("info_tool_{idx}"),
                 calls: 10,
                 errors: 1,
+                input_validation_failures: 0,
                 avg_ms: 100,
                 avoidance_advised: false,
                 consecutive_failures: 1,
@@ -2175,6 +2201,7 @@ mod tests {
                 name: format!("bad_tool_{idx}"),
                 calls: 10,
                 errors: 4,
+                input_validation_failures: 0,
                 avg_ms: 100,
                 avoidance_advised: true,
                 consecutive_failures: 3,

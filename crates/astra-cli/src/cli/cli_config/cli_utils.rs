@@ -801,15 +801,7 @@ pub(crate) fn terminal_width_usize() -> usize {
 pub(crate) use astra_text_utils::str_preview::{prefix_chars, truncate_str};
 
 pub(crate) fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '#' => "%23".to_string(),
-            _ => c.to_string(),
-        })
-        .collect()
+    astra_text_utils::url_component::encode_url_component(s)
 }
 
 /// Read current git HEAD (short SHA) and branch name for journal git snapshots.
@@ -961,6 +953,14 @@ mod tests {
     #[test]
     fn urlencoding_special_chars() {
         assert_eq!(urlencoding("a&b=c#d"), "a%26b%3Dc%23d");
+    }
+
+    #[test]
+    fn urlencoding_escapes_all_query_delimiters_and_unicode() {
+        assert_eq!(
+            urlencoding("why?source_policy=cloud_only% +/雪"),
+            "why%3Fsource_policy%3Dcloud_only%25%20%2B%2F%E9%9B%AA"
+        );
     }
 
     #[test]

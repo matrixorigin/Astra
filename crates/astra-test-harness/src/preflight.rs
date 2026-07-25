@@ -334,18 +334,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn model_probe_uses_requested_profile_without_resuming_user_session() {
+        use crate::test_support::write_executable_shim;
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
         let bin = dir.path().join("astra-shim");
-        fs::write(
+        write_executable_shim(
             &bin,
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
         )
         .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
         let profile = check_model(&bin, "deepseek", Some("isolated-harness"))
             .await
@@ -399,18 +398,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn auto_register_delegates_profile_persistence_to_cli() {
+        use crate::test_support::write_executable_shim;
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
         let bin = dir.path().join("astra-shim");
-        fs::write(
+        write_executable_shim(
             &bin,
             format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
         )
         .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
         try_auto_register(&bin, "isolated-harness").await.unwrap();
 

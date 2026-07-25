@@ -498,6 +498,7 @@ mod tests {
             name: name.into(),
             total_calls: total,
             total_failures: failures,
+            input_validation_failures: 0,
             failure_rate: if total > 0 {
                 failures as f64 / total as f64
             } else {
