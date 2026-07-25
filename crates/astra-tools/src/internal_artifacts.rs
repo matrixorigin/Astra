@@ -30,10 +30,11 @@ pub fn internal_tool_result_artifact_access_error(surface: &str, value: &str) ->
     }
     Some(format!(
         "Error: {surface} cannot read runtime-owned tool-result artifacts directly. \
-         Use the owning tool's recovery action instead: \
+         Use the owning recovery action instead: \
          agent_fanout(action='get_results', group_id=...) for fanout groups, \
          agent(action='get_result', agent_id=...) for child agents, or \
-         task_output(task_id=...) for background tasks. \
+         task_output(task_id=...) for background tasks. Session tool-result handles \
+         use introspect(artifact='artifact://session/tool-result/<opaque_token>', offset=0, max_bytes=8192). \
          Do not inspect ~/.astra session artifact files with shell/file tools; \
          if no first-class recovery action exists, report that the result was truncated."
     ))
@@ -52,7 +53,7 @@ mod tests {
             "find ~/.astra/sessions/session-1/tool-results -type f"
         ));
         assert!(references_internal_tool_result_artifact(
-            "artifact://session/tool-result/call_abc"
+            "artifact://session/tool-result/Y2FsbF9hYmM"
         ));
         assert!(references_internal_tool_result_artifact(
             "/home/me/.astra/tool-results/call_abc.txt"

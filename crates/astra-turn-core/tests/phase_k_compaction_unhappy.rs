@@ -195,7 +195,8 @@ fn phase_k_state_aware_pins_active_files() {
 #[test]
 fn phase_k_persisted_markers_never_compact_even_under_pressure() {
     let persisted = "<persisted-output>\nTool `read_file` produced 50000 chars.\n\
-         File: /tmp/sessions/tool_results/c1.txt\n\
+         Artifact handle: artifact://session/tool-result/YzE\n\
+         Read with introspect(artifact=\"artifact://session/tool-result/YzE\", offset=0, max_bytes=8192).\n\
          Preview: ...\n</persisted-output>"
         .to_string();
     let live = "x".repeat(3000);

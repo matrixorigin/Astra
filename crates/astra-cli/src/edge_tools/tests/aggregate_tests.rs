@@ -1,8 +1,7 @@
-use super::super::tool_results_dir;
 use super::test_executor;
 use crate::edge_tools::{
-    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, PERSIST_THRESHOLD, ToolExecutor,
-    per_tool_output_limit, tool_output_limit,
+    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ToolExecutor, per_tool_output_limit,
+    tool_output_limit,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -11,7 +10,7 @@ use std::path::PathBuf;
 //
 // These tests simulate realistic multi-tool-call turns to verify that:
 // 1. Progressive scaling reduces limits smoothly (not step-function)
-// 2. Internal artifact persistence triggers when aggregate is high + output is large
+// 2. Large output remains intact until the session-aware runtime persistence boundary
 // 3. read_file auto-downgrades to outline under aggregate pressure
 // 4. Ranged reads always work regardless of aggregate pressure
 // 5. git(action=show/diff) respects aggregate-aware limits
@@ -90,139 +89,6 @@ fn progressive_scaling_combines_token_and_aggregate_pressure() {
         both < token_only,
         "combined pressure should be tighter: {both} vs token-only {token_only}"
     );
-}
-
-#[test]
-fn persist_to_disk_triggers_when_aggregate_high_and_output_large() {
-    let executor = test_executor();
-
-    // Simulate high aggregate output (above soft limit)
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 10_000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    // Small output → not persisted
-    let small = "x".repeat(1000);
-    let result = executor.maybe_persist_large_output(small.clone(), "bash");
-    assert_eq!(result, small, "small output should pass through");
-
-    // Large output → persisted internally while keeping the model-facing text
-    // inside the workspace/provider contract.
-    let marker = format!(
-        "persist-contract-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let large = format!("{marker}\n{}", "x\n".repeat(30_000)); // ~60KB
-    let result = executor.maybe_persist_large_output(large.clone(), "bash");
-    assert!(
-        result.contains("<persisted-output>"),
-        "large output should be persisted, got first 200 chars: {}",
-        &result[..result.len().min(200)]
-    );
-    assert!(
-        result.contains("internal tool-result artifact"),
-        "should describe the internal artifact contract"
-    );
-    assert!(
-        !result.contains("tool-results/"),
-        "model-facing result must not expose internal file path"
-    );
-    assert!(
-        result.contains("</persisted-output>"),
-        "should have closing tag"
-    );
-    assert!(
-        !result.contains("read_file"),
-        "must not suggest workspace read_file for internal artifacts"
-    );
-    assert!(
-        result.len() < large.len() / 5,
-        "persisted reference ({}) should be much smaller than original ({})",
-        result.len(),
-        large.len()
-    );
-
-    // Verify file was actually written without parsing a model-visible path.
-    let persisted_file = std::fs::read_dir(tool_results_dir())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            std::fs::read_to_string(path)
-                .map(|content| content.contains(&marker))
-                .unwrap_or(false)
-        })
-        .expect("persisted file containing unique marker should exist");
-    assert!(
-        persisted_file.exists(),
-        "persisted file should exist: {}",
-        persisted_file.display()
-    );
-
-    // Cleanup
-    let _ = std::fs::remove_file(persisted_file);
-}
-
-#[test]
-fn persist_to_disk_skipped_when_aggregate_low() {
-    let executor = test_executor();
-
-    // Aggregate below soft limit → no persist even for large output
-    executor
-        .aggregate_output_bytes
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-
-    let large = "x\n".repeat(30_000);
-    let result = executor.maybe_persist_large_output(large.clone(), "bash");
-    assert!(
-        !result.contains("<persisted-output>"),
-        "should not persist when aggregate is low"
-    );
-}
-
-#[test]
-fn persist_to_disk_skipped_for_errors() {
-    let executor = test_executor();
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 10_000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    let error_output = format!("Error: {}", "x".repeat(60_000));
-    let result = executor.maybe_persist_large_output(error_output.clone(), "bash");
-    assert_eq!(
-        result, error_output,
-        "error outputs should never be persisted"
-    );
-}
-
-#[test]
-fn persist_to_disk_idempotent_same_content() {
-    let executor = test_executor();
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 10_000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    let large = "deterministic content\n".repeat(3000);
-    let result1 = executor.maybe_persist_large_output(large.clone(), "bash");
-    let result2 = executor.maybe_persist_large_output(large, "bash");
-    assert_eq!(
-        result1, result2,
-        "same content should produce identical reference"
-    );
-
-    // Cleanup
-    if let Some(path) = result1
-        .split_whitespace()
-        .find(|s| s.contains("tool-results/"))
-    {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[test]
@@ -374,45 +240,6 @@ async fn multi_turn_full_execute_accumulates_aggregate() {
         after2,
         after + output2.len(),
         "aggregate should accumulate across calls"
-    );
-}
-
-#[tokio::test]
-async fn multi_turn_persist_triggers_via_execute() {
-    // End-to-end: execute() should persist large bash output when aggregate is high
-    let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    // Pre-load aggregate to above soft limit
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 10_000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    // Execute bash that produces large output (>50KB)
-    let output = executor
-            .execute(
-                "bash",
-                &json!({"command": format!("python3 -c \"print('x' * 70 + '\\n', end='')\" | head -c 60000; echo; seq 1 500")}),
-            )
-            .await;
-
-    // If the output was large enough, it should have been persisted
-    // (depends on actual bash output size — if python3 isn't available,
-    // the error message will be small and won't trigger persist)
-    if output.len() > PERSIST_THRESHOLD {
-        assert!(
-            output.contains("<persisted-output>"),
-            "large execute output should be persisted when aggregate is high"
-        );
-    }
-    // Either way, aggregate should have been updated
-    let agg = executor
-        .aggregate_output_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        agg > AGGREGATE_SOFT_LIMIT + 10_000,
-        "aggregate should have increased"
     );
 }
 

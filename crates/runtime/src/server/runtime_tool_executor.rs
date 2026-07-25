@@ -5306,6 +5306,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_introspect_recovers_only_owner_scoped_tool_result_artifacts() {
+        let sessions = TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        let (exec, _workspace) = test_executor();
+        let owner = astra_services::OwnerScope::user(&exec.user_id).unwrap();
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir_for_owner(
+            &store,
+            &owner,
+            &exec.session_id,
+        )
+        .expect("runtime owner and session resolve to a private artifact directory");
+        let content = "server-owned evidence 😀\n".repeat(3_000);
+        assert!(
+            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
+                &session_dir,
+                "call-server-artifact",
+                "git",
+                &content,
+            )
+            .is_some(),
+            "setup must persist a recoverable result in the runtime owner's session"
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "introspect",
+                &json!({
+                    "artifact": astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
+                        "call-server-artifact"
+                    ),
+                    "max_bytes": 31,
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("<tool-result-window>"), "{result:?}");
+        assert!(
+            result.output.contains("server-owned evidence"),
+            "{result:?}"
+        );
+        assert!(
+            result.output.contains("Continue with introspect("),
+            "{result:?}"
+        );
+        assert!(
+            !result
+                .output
+                .contains(sessions.path().to_string_lossy().as_ref()),
+            "model output must never disclose the physical owner/session path: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn server_only_introspect_json_preserves_provider_coverage_graph() {
         let dir = TempDir::new().unwrap();
         let exec = RuntimeToolExecutor::new(

@@ -251,7 +251,7 @@ mod tests {
             "path": "/home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"
         });
         let logical = json!({
-            "path": "artifact://session/tool-result/call_abc"
+            "path": "artifact://session/tool-result/Y2FsbF9hYmM"
         });
         let command = json!({
             "command": "cat /home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"

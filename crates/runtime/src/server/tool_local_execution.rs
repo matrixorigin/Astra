@@ -150,15 +150,11 @@ pub(crate) fn normalize_local_tool_result_output(
     aggregate_output_bytes: &AtomicUsize,
 ) {
     result.output = astra_tools::normalize_empty_output(std::mem::take(&mut result.output), name);
-    let aggregate_before = aggregate_output_bytes.fetch_add(result.output.len(), Ordering::Relaxed);
-    let aggregate_after = aggregate_before.saturating_add(result.output.len());
-    result.output = astra_tools::maybe_persist_large_output(
-        std::mem::take(&mut result.output),
-        aggregate_after,
-        name,
-    );
-    let limit = astra_tools::per_tool_output_limit(name);
-    result.output = astra_tools::truncate_output(std::mem::take(&mut result.output), limit);
+    // The headless recording pipeline owns model-facing truncation and,
+    // crucially, has the session + tool-call id required to make an oversized
+    // result recoverable. Truncating or globally persisting here would discard
+    // evidence before that owner can create a session-scoped artifact handle.
+    aggregate_output_bytes.fetch_add(result.output.len(), Ordering::Relaxed);
 }
 
 pub(crate) fn spawn_memory_recall_feedback_after_success(
@@ -341,6 +337,18 @@ mod tests {
 
         assert_eq!(result.output, "(bash completed with no output)");
         assert_eq!(aggregate.load(Ordering::Relaxed), result.output.len());
+    }
+
+    #[test]
+    fn normalize_large_output_keeps_full_evidence_for_session_recording() {
+        let aggregate = AtomicUsize::new(0);
+        let output = "review evidence\n".repeat(6_000);
+        let mut result = astra_tools::ToolResult::text(output.clone());
+
+        normalize_local_tool_result_output("git", &mut result, &aggregate);
+
+        assert_eq!(result.output, output);
+        assert_eq!(aggregate.load(Ordering::Relaxed), output.len());
     }
 
     #[test]

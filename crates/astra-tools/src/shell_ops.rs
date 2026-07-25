@@ -4887,7 +4887,7 @@ printf 'probe.txt:1:needle\n'
             "cat /home/me/.astra/sessions/session-1/tool-results/call_abc.txt",
             "find ~/.astra/sessions/session-1/tool-results -type f",
             "grep -R result /home/me/.astra/tool-results/call_abc.txt",
-            "cat artifact://session/tool-result/call_abc",
+            "cat artifact://session/tool-result/Y2FsbF9hYmM",
         ] {
             let error = validate_execute_bash_command(command).expect_err(command);
             assert!(

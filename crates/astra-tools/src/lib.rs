@@ -600,12 +600,6 @@ pub const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 /// suggest narrowing further before hitting the hard soft-limit.
 pub const AGGREGATE_HINT_THRESHOLD: usize = AGGREGATE_SOFT_LIMIT / 2;
 
-/// Per-tool persistence threshold (chars).
-pub const PERSIST_THRESHOLD: usize = 50_000;
-
-/// Preview size for persisted output references.
-pub const PERSIST_PREVIEW_BYTES: usize = 2000;
-
 /// Truncate tool output to `max_bytes`, cutting at a newline boundary when
 /// possible to avoid mid-line cuts that confuse the LLM.
 pub fn truncate_output(mut output: String, max_bytes: usize) -> String {
@@ -629,71 +623,6 @@ pub fn normalize_empty_output(output: String, tool_name: &str) -> String {
     } else {
         output
     }
-}
-
-/// Directory for persisted tool results within the astra home.
-pub fn tool_results_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("tool-results")
-}
-
-/// Persist large tool output to disk when aggregate budget is under pressure.
-pub fn maybe_persist_large_output(
-    output: String,
-    aggregate_bytes: usize,
-    _tool_name: &str,
-) -> String {
-    if output.len() < PERSIST_THRESHOLD {
-        return output;
-    }
-    if aggregate_bytes <= AGGREGATE_SOFT_LIMIT {
-        return output;
-    }
-    if output.starts_with("Error:") {
-        return output;
-    }
-
-    let dir = tool_results_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return output;
-    }
-
-    let hash = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        output.hash(&mut h);
-        format!("{:016x}", h.finish())
-    };
-    let filepath = dir.join(format!("{hash}.txt"));
-
-    if !filepath.exists() && std::fs::write(&filepath, &output).is_err() {
-        return output;
-    }
-
-    let preview_end = output.len().min(PERSIST_PREVIEW_BYTES);
-    let preview_end = output.floor_char_boundary(preview_end);
-    let preview_end = output[..preview_end]
-        .rfind('\n')
-        .filter(|&pos| pos > preview_end / 2)
-        .map(|pos| pos + 1)
-        .unwrap_or(preview_end);
-    let preview = &output[..preview_end];
-    let total_lines = output.lines().count();
-
-    format!(
-        "<persisted-output>\n\
-         Output too large ({} bytes, ~{} lines) for context window. \
-         Full output was persisted as an internal tool-result artifact outside the workspace.\n\n\
-         Preview (first ~{} bytes):\n\
-         {}\n...\n\
-         </persisted-output>",
-        output.len(),
-        total_lines,
-        PERSIST_PREVIEW_BYTES,
-        preview,
-    )
 }
 
 // ─── Shared utility functions ───────────────────────────────────────────────
@@ -1195,62 +1124,6 @@ mod tests {
             assert!(func.get("name").and_then(|n| n.as_str()).is_some());
             assert!(func.get("description").and_then(|d| d.as_str()).is_some());
         }
-    }
-
-    // ── Persist large output ───────────────────────────────────────────
-
-    #[test]
-    fn maybe_persist_small_output_passes_through() {
-        let out = "small output".to_string();
-        let result = maybe_persist_large_output(out.clone(), 0, "bash");
-        assert_eq!(result, out);
-    }
-
-    #[test]
-    fn maybe_persist_under_soft_limit_passes_through() {
-        let out = "x".repeat(PERSIST_THRESHOLD + 1);
-        let result = maybe_persist_large_output(out.clone(), 0, "bash");
-        // Under AGGREGATE_SOFT_LIMIT, even large output passes through
-        assert_eq!(result, out);
-    }
-
-    #[test]
-    fn maybe_persist_error_output_passes_through() {
-        let out = format!("Error: {}", "x".repeat(PERSIST_THRESHOLD + 1));
-        let result = maybe_persist_large_output(out.clone(), AGGREGATE_SOFT_LIMIT + 1, "bash");
-        // Error output is never persisted
-        assert_eq!(result, out);
-    }
-
-    // ── UTF-8 char boundary regression for persist preview ───────────────
-
-    #[test]
-    fn persist_preview_multibyte_at_boundary() {
-        // The preview clips at PERSIST_PREVIEW_BYTES (2000). Ensure it doesn't
-        // panic when a multi-byte char straddles that boundary.
-        let prefix = "x".repeat(1997); // 1997 ASCII bytes
-        let mb = "─".repeat(10); // '─' = 3 bytes each
-        let suffix = "y".repeat(PERSIST_THRESHOLD + 1000); // push past threshold
-        let s = format!("{prefix}{mb}{suffix}");
-        assert!(s.len() > PERSIST_THRESHOLD);
-        let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
-        // Must not panic; if it succeeded, the preview was built safely
-        assert!(result.contains("<persisted-output>"));
-        assert!(!result.contains("Full output saved to:"));
-        assert!(!result.contains("Use read_file"));
-    }
-
-    #[test]
-    fn persist_preview_4byte_emoji_at_boundary() {
-        let prefix = "a".repeat(1998); // 1998 bytes
-        let emoji = "🔥🔥🔥"; // 4 bytes each
-        let suffix = "z".repeat(PERSIST_THRESHOLD + 1000);
-        let s = format!("{prefix}{emoji}{suffix}");
-        assert!(s.len() > PERSIST_THRESHOLD);
-        let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
-        assert!(result.contains("<persisted-output>"));
-        assert!(!result.contains("Full output saved to:"));
-        assert!(!result.contains("Use read_file"));
     }
 
     // ── porcelain_status_codes ─────────────────────────────────────────

@@ -1504,7 +1504,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
+                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. Use artifact plus offset to read a bounded window from a persisted tool-result handle. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1514,7 +1514,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range label. Choose trace-like content with facet=trace, not by changing horizon."},
                         "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source. Missing or unsatisfied providers are reported instead of fabricated."},
                         "include_context": {"type": "boolean", "description": "Request visible prompt/context facts when a provider is available; these are observed context, not durable truth."},
-                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. text is default; json returns a structured read-only observation envelope."}
+                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. text is default; json returns a structured read-only observation envelope."},
+                        "artifact": {"type": "string", "description": "An opaque session-scoped artifact://session/tool-result/<token> handle returned for an oversized tool result. When set, reads that result instead of a runtime snapshot."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Byte offset for artifact recovery. Start at 0 and continue with the returned next_offset."},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Maximum bytes in one artifact window. Defaults to 8192; use returned next_offset to continue."}
                     },
                     "additionalProperties": false
                 }
@@ -2338,6 +2341,9 @@ mod tests {
             "source_policy",
             "include_context",
             "format",
+            "artifact",
+            "offset",
+            "max_bytes",
         ] {
             assert!(
                 properties.contains_key(key),
@@ -2367,6 +2373,7 @@ mod tests {
             ],
             "introspect source_policy schema must not regress to old edge/server/cloud aliases"
         );
+        assert_eq!(properties["max_bytes"]["maximum"], 65_536);
     }
 
     #[test]

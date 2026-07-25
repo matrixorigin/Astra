@@ -18,6 +18,7 @@ use astra_core::work_unit::{
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
+use astra_services::SessionArtifactStore;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
@@ -367,26 +368,8 @@ const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
 /// before doing I/O and suggest lighter alternatives when exceeded.
 const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
-/// Per-tool persistence threshold (chars). When a single tool result exceeds
-/// this AND aggregate output is above the soft limit, the result is persisted
-/// as an internal artifact and replaced with a preview. The artifact path is
-/// not part of the workspace filesystem contract.
-/// Global default for large-output persistence threshold (50K).
-const PERSIST_THRESHOLD: usize = 50_000;
-
-/// Preview size (bytes) included in the persisted-output reference message.
-const PERSIST_PREVIEW_BYTES: usize = 2000;
-
 /// Maximum file size (10MB) for LSP operations to prevent OOM.
 const MAX_LSP_FILE_SIZE: usize = 10 * 1024 * 1024;
-
-/// Directory for persisted tool results within the astra home.
-fn tool_results_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("tool-results")
-}
 
 /// Convert UTF-16 column position to char index.
 /// LSP protocol uses UTF-16 code units, Rust uses UTF-8 chars.
@@ -4498,6 +4481,29 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        if args.get("artifact").is_some() {
+            let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) else {
+                return "Error: introspect artifact recovery requires an active session"
+                    .to_string();
+            };
+            let store = astra_services::local_session_artifact_store();
+            let session_dir = match store.session_dir(&session_id) {
+                Ok(session_dir) => session_dir,
+                Err(error) => {
+                    return format!(
+                        "Error: could not resolve the active session for artifact recovery: {error}"
+                    );
+                }
+            };
+            return astra_turn_core::tool_result_storage::resolve_session_tool_result_artifact_request(
+                &session_dir,
+                args,
+            )
+            .unwrap_or_else(|| {
+                Err("introspect artifact recovery request was not recognized".to_string())
+            })
+            .unwrap_or_else(|error| format!("Error: {error}"));
+        }
         let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
 
         if !request.format.is_json() && request.source_policy.allows_edge_local_artifacts() {
@@ -5108,9 +5114,11 @@ impl ToolExecutor {
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
     fn finalize_tool_output(&self, output: String, name: &str) -> String {
-        let output = normalize_empty_output(output, name);
-        let persisted = self.maybe_persist_large_output(output, name);
-        truncate_output(persisted, global_output_limit())
+        // This executor has neither a session owner nor a tool-call id. It
+        // must therefore preserve the evidence exactly; the session-aware
+        // recording pipeline is the sole boundary allowed to turn oversized
+        // output into a recoverable artifact handle.
+        normalize_empty_output(output, name)
     }
 
     pub async fn execute_with_metadata_cancelable(
@@ -5856,78 +5864,6 @@ impl ToolExecutor {
         output
     }
 
-    /// Persist large tool output to disk when aggregate budget is under pressure.
-    ///
-    /// When a single tool result exceeds `PERSIST_THRESHOLD` AND cumulative
-    /// output this turn is above `AGGREGATE_SOFT_LIMIT`, the full output is
-    /// written to an internal artifact and replaced with a ~2KB preview. The
-    /// artifact path is intentionally not exposed to the model because it is
-    /// outside the workspace filesystem contract.
-    fn maybe_persist_large_output(&self, output: String, _tool_name: &str) -> String {
-        // Skip small outputs
-        if output.len() < PERSIST_THRESHOLD {
-            return output;
-        }
-        // Only persist when aggregate pressure is meaningful
-        let agg = self
-            .aggregate_output_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let agg = agg.saturating_add(output.len());
-        if agg <= AGGREGATE_SOFT_LIMIT {
-            return output;
-        }
-        // Never persist error outputs (they're small and actionable)
-        if cli_tool_output_is_error(&output) {
-            return output;
-        }
-
-        // Write to disk
-        let dir = tool_results_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return output;
-        }
-
-        // Use a content hash for the filename (dedup identical outputs)
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            output.hash(&mut h);
-            format!("{:016x}", h.finish())
-        };
-        let filepath = dir.join(format!("{hash}.txt"));
-
-        // Write only if not already persisted (idempotent)
-        if !filepath.exists() {
-            if std::fs::write(&filepath, &output).is_err() {
-                return output;
-            }
-        }
-
-        // Build preview: first ~2KB, cut at newline boundary
-        let preview_end = output.len().min(PERSIST_PREVIEW_BYTES);
-        let preview_end = output.floor_char_boundary(preview_end);
-        let preview_end = output[..preview_end]
-            .rfind('\n')
-            .filter(|&pos| pos > preview_end / 2)
-            .map(|pos| pos + 1)
-            .unwrap_or(preview_end);
-        let preview = &output[..preview_end];
-        let total_lines = output.lines().count();
-
-        format!(
-            "<persisted-output>\n\
-             Output too large ({} bytes, ~{} lines) for context window. \
-             Full output was persisted as an internal tool-result artifact outside the workspace.\n\n\
-             Preview (first ~{} bytes):\n\
-             {}\n...\n\
-             </persisted-output>",
-            output.len(),
-            total_lines,
-            PERSIST_PREVIEW_BYTES,
-            preview,
-        )
-    }
-
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
     ///
     /// Returns a JSON summary with per-step outputs and the final result.
@@ -6576,9 +6512,8 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot,
-        BgTaskOutputSnapshot, BgTaskOutputStatus, PERSIST_THRESHOLD, ToolExecutor,
-        WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
+        BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot, BgTaskOutputSnapshot,
+        BgTaskOutputStatus, ToolExecutor, WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
         background_task_output_result_fields, cli_tool_output_is_error, detect_git_remote_repos,
         embedded_work_unit_observation, extract_github_owner_repo, file_checkpoint_dir_for,
         format_background_task_error, format_background_task_output,
@@ -6924,21 +6859,20 @@ mod tests {
     }
 
     #[test]
-    fn edge_large_output_reference_does_not_expose_unreadable_filesystem_path() {
+    fn edge_preserves_large_output_until_call_id_aware_persistence() {
         let executor = test_executor();
-        executor.aggregate_output_bytes.store(
-            AGGREGATE_SOFT_LIMIT + 1,
-            std::sync::atomic::Ordering::Relaxed,
+        let output = "evidence\n".repeat(100_000);
+
+        let rendered = executor.finalize_tool_output(output.clone(), "bash");
+
+        assert_eq!(
+            rendered, output,
+            "the edge must not replace output before the runtime can bind it to a session and tool call id"
         );
-        let output = "x".repeat(PERSIST_THRESHOLD + 100);
-
-        let rendered = executor.maybe_persist_large_output(output, "bash");
-
-        assert!(rendered.contains("<persisted-output>"));
-        assert!(rendered.contains("internal tool-result artifact"));
-        assert!(!rendered.contains("Full output saved to:"));
-        assert!(!rendered.contains("Use read_file"));
-        assert!(!rendered.contains(".astra/tool-results"));
+        assert!(
+            !rendered.contains("<persisted-output>"),
+            "only the call-id-aware runtime persistence layer may emit an artifact handle"
+        );
     }
 
     #[test]
@@ -9445,6 +9379,48 @@ mod tests {
         assert!(
             !out.contains("first turn"),
             "must not return opaque first-turn placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_recovers_only_the_active_sessions_large_tool_artifact() {
+        let sessions = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        let session_id = "artifact-recovery-cli";
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, session_id)
+            .expect("safe session id resolves to its artifact directory");
+        let content = "checked evidence 😀\n".repeat(4_000);
+        assert!(
+            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
+                &session_dir,
+                "call-artifact-cli",
+                "git",
+                &content,
+            )
+            .is_some(),
+            "setup must create an oversized session artifact"
+        );
+
+        let artifact = astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
+            "call-artifact-cli",
+        );
+        let active = test_executor().with_active_session_id(session_id);
+        let first = active.handle_introspect(&serde_json::json!({
+            "artifact": artifact,
+            "offset": 0,
+            "max_bytes": 29,
+        }));
+        assert!(first.contains("<tool-result-window>"), "{first}");
+        assert!(first.contains("checked evidence"), "{first}");
+        assert!(first.contains("Continue with introspect("), "{first}");
+        assert!(!first.contains(sessions.path().to_string_lossy().as_ref()));
+
+        let other_session = test_executor().with_active_session_id("artifact-recovery-other");
+        let denied = other_session.handle_introspect(&serde_json::json!({"artifact": artifact}));
+        assert!(
+            denied.contains("was not found in the active session"),
+            "artifact handles must not cross session ownership: {denied}"
         );
     }
 

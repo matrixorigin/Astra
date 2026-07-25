@@ -11,8 +11,12 @@
 //! the model to copy incorrectly; callers that need the full body must resolve
 //! the handle through runtime-owned artifact APIs.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 /// Maximum length of the human-readable portion of a sanitized filename.
@@ -66,6 +70,31 @@ const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 /// Logical URI prefix for a persisted tool result scoped to the current
 /// session.
 pub const SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX: &str = "artifact://session/tool-result/";
+
+/// Default payload size for one model-requested artifact window.
+pub const DEFAULT_TOOL_RESULT_WINDOW_BYTES: usize = 8 * 1024;
+
+/// Largest payload size accepted for one model-requested artifact window.
+///
+/// This is a transport-window bound, not a cap on the result itself: callers
+/// can continue from `next_offset` until the complete durable result is read.
+pub const MAX_TOOL_RESULT_WINDOW_BYTES: usize = 64 * 1024;
+
+/// A UTF-8-safe byte window over one persisted tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedToolResultWindow {
+    pub content: String,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub total_bytes: usize,
+}
+
+impl PersistedToolResultWindow {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.next_offset >= self.total_bytes
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistedFormat {
@@ -189,6 +218,190 @@ pub fn read_persisted_result(session_dir: &Path, tool_call_id: &str) -> Option<S
     std::fs::read_to_string(file_path).ok()
 }
 
+/// Parse a session-local logical tool-result handle without exposing a
+/// filesystem path.
+///
+/// Handles use URL-safe Base64 rather than embedding provider-supplied call
+/// ids directly. Provider identifiers are opaque strings, not a protocol we
+/// control; encoding them preserves every valid id while keeping a handle to
+/// one non-traversable URI segment.
+#[must_use]
+pub fn parse_session_tool_result_artifact_uri(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)?;
+    if encoded.is_empty()
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let tool_call_id = String::from_utf8(decoded).ok()?;
+    (!tool_call_id.is_empty()).then_some(tool_call_id)
+}
+
+/// Read one UTF-8-safe byte window from a persisted result.
+///
+/// The caller owns the session directory, so a logical handle can never cross
+/// session ownership boundaries. `next_offset` is always a valid UTF-8
+/// boundary and is the only continuation cursor a model needs to retain.
+pub fn read_persisted_result_window(
+    session_dir: &Path,
+    tool_call_id: &str,
+    offset: usize,
+    max_bytes: usize,
+) -> Result<Option<PersistedToolResultWindow>, String> {
+    if max_bytes == 0 || max_bytes > MAX_TOOL_RESULT_WINDOW_BYTES {
+        return Err(format!(
+            "max_bytes must be between 1 and {MAX_TOOL_RESULT_WINDOW_BYTES}"
+        ));
+    }
+
+    let safe_id = safe_filename_stem(tool_call_id);
+    let file_path = session_dir
+        .join(TOOL_RESULTS_SUBDIR)
+        .join(format!("{safe_id}.txt"));
+    let total_bytes = match std::fs::metadata(&file_path) {
+        Ok(metadata) => usize::try_from(metadata.len())
+            .map_err(|_| "persisted result is too large for this runtime".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect persisted result: {error}")),
+    };
+    if offset > total_bytes {
+        return Err(format!(
+            "offset {offset} is past the end of this {total_bytes}-byte tool result"
+        ));
+    }
+    if offset == total_bytes {
+        return Ok(Some(PersistedToolResultWindow {
+            content: String::new(),
+            offset,
+            next_offset: offset,
+            total_bytes,
+        }));
+    }
+
+    let mut file = std::fs::File::open(&file_path)
+        .map_err(|error| format!("failed to open persisted result: {error}"))?;
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|error| format!("failed to seek persisted result: {error}"))?;
+
+    // Read a few extra bytes so a UTF-8 scalar straddling `max_bytes` can
+    // still make forward progress without returning malformed text.
+    let available = total_bytes.saturating_sub(offset);
+    let read_len = available.min(max_bytes.saturating_add(3));
+    let mut bytes = vec![0_u8; read_len];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("failed to read persisted result: {error}"))?;
+
+    if offset > 0 && bytes[0] & 0b1100_0000 == 0b1000_0000 {
+        return Err(format!(
+            "offset {offset} is not a UTF-8 boundary; continue with the next_offset returned by the prior window"
+        ));
+    }
+
+    let budget = available.min(max_bytes);
+    let mut consumed = match std::str::from_utf8(&bytes[..budget]) {
+        Ok(_) => budget,
+        Err(error) if error.error_len().is_some() => {
+            return Err(format!("persisted result is not valid UTF-8: {error}"));
+        }
+        Err(error) => error.valid_up_to(),
+    };
+    if consumed == 0 {
+        // `bytes` includes up to three extra bytes, enough to complete one
+        // valid UTF-8 scalar. Returning that scalar is preferable to an empty
+        // non-terminal window, which would make recovery unable to progress.
+        let scalar_len = utf8_scalar_len(bytes[0])
+            .ok_or_else(|| "persisted result is not valid UTF-8".to_string())?;
+        let scalar = bytes
+            .get(..scalar_len)
+            .ok_or_else(|| "persisted result ended inside a UTF-8 scalar".to_string())?;
+        std::str::from_utf8(scalar)
+            .map_err(|error| format!("persisted result is not valid UTF-8: {error}"))?;
+        consumed = scalar_len;
+    }
+    let content = std::str::from_utf8(&bytes[..consumed])
+        .map_err(|error| format!("persisted result is not valid UTF-8: {error}"))?
+        .to_string();
+
+    Ok(Some(PersistedToolResultWindow {
+        content,
+        offset,
+        next_offset: offset.saturating_add(consumed),
+        total_bytes,
+    }))
+}
+
+/// Resolve the model-facing artifact fields accepted by `introspect`.
+///
+/// Returning `None` means this is an ordinary introspection request. A present
+/// `artifact` field is always handled here, including malformed requests, so
+/// callers never silently fall back to an unrelated runtime snapshot.
+pub fn resolve_session_tool_result_artifact_request(
+    session_dir: &Path,
+    args: &Value,
+) -> Option<Result<String, String>> {
+    let artifact = args.get("artifact")?;
+    let artifact = match artifact.as_str() {
+        Some(value) => value,
+        None => {
+            return Some(Err(
+                "artifact must be a session tool-result handle string".to_string()
+            ));
+        }
+    };
+    let tool_call_id = match parse_session_tool_result_artifact_uri(artifact) {
+        Some(tool_call_id) => tool_call_id,
+        None => {
+            return Some(Err(
+                "artifact must be a valid artifact://session/tool-result/<opaque_token> handle"
+                    .to_string(),
+            ));
+        }
+    };
+    let offset = match args.get("offset") {
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(offset) => offset,
+            None => return Some(Err("offset must be a non-negative integer".to_string())),
+        },
+        None => 0,
+    };
+    let max_bytes = match args.get("max_bytes") {
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(max_bytes) => max_bytes,
+            None => return Some(Err("max_bytes must be a positive integer".to_string())),
+        },
+        None => DEFAULT_TOOL_RESULT_WINDOW_BYTES,
+    };
+
+    Some(read_persisted_result_window(session_dir, &tool_call_id, offset, max_bytes).and_then(
+        |window| {
+            let Some(window) = window else {
+                return Err("tool-result artifact was not found in the active session".to_string());
+            };
+            let handle = session_tool_result_artifact_uri(&tool_call_id);
+            let continuation = if window.is_complete() {
+                "Complete.".to_string()
+            } else {
+                format!(
+                    "Continue with introspect(artifact=\"{handle}\", offset={}, max_bytes={max_bytes}).",
+                    window.next_offset
+                )
+            };
+            Ok(format!(
+                "<tool-result-window>\n\
+                 Artifact handle: {handle}\n\
+                 Bytes: [{}..{}) of {}\n\n\
+                 {}\n\n\
+                 {continuation}\n\
+                 </tool-result-window>",
+                window.offset, window.next_offset, window.total_bytes, window.content,
+            ))
+        },
+    ))
+}
+
 /// Return the storage directory for tool results under a session.
 pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
     session_dir.join(TOOL_RESULTS_SUBDIR)
@@ -197,7 +410,10 @@ pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
 /// Return the model-facing logical artifact URI for a persisted tool result.
 #[must_use]
 pub fn session_tool_result_artifact_uri(tool_call_id: &str) -> String {
-    format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{tool_call_id}")
+    format!(
+        "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(tool_call_id)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +433,18 @@ fn persistable_content(content: &str) -> PersistedContent {
     PersistedContent {
         text: content.to_string(),
         format: PersistedFormat::PlainText,
+    }
+}
+
+/// Return the encoded length of a valid UTF-8 scalar from its first byte.
+/// Continuation bytes and invalid leading bytes deliberately return `None`.
+fn utf8_scalar_len(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
     }
 }
 
@@ -253,8 +481,8 @@ fn build_replacement(
          Tool result id: {tool_call_id}\n\
          Artifact handle: {artifact_uri}\n\
          Storage: session tool-result artifact.\n\
-         Resolve this handle through runtime artifact recovery; do not search, \
-         copy, or read physical local session paths with workspace filesystem tools.\n\
+         Read bounded windows with introspect(artifact=\"{artifact_uri}\", offset=0, max_bytes={DEFAULT_TOOL_RESULT_WINDOW_BYTES}); \
+         continue with the returned next_offset. Do not search, copy, or read physical local session paths.\n\
          {format_note}\
          \n\
          Preview (first ~{prev_len} chars):\n\
@@ -297,8 +525,12 @@ mod tests {
         assert!(replacement.contains(PERSISTED_TAG_CLOSE));
         assert!(replacement.contains("bash"));
         assert!(replacement.contains("Tool result id: call-42"));
-        assert!(replacement.contains("Artifact handle: artifact://session/tool-result/call-42"));
+        assert!(replacement.contains(&format!(
+            "Artifact handle: {}",
+            session_tool_result_artifact_uri("call-42")
+        )));
         assert!(replacement.contains("session tool-result artifact"));
+        assert!(replacement.contains("introspect(artifact="));
         assert!(!replacement.contains("read_file"));
         assert!(!replacement.contains("File:"));
         assert!(!replacement.contains("tool-results"));
@@ -396,9 +628,106 @@ mod tests {
     fn session_artifact_uri_is_stable_and_path_free() {
         let uri = session_tool_result_artifact_uri("call_abc123");
 
-        assert_eq!(uri, "artifact://session/tool-result/call_abc123");
+        assert_eq!(uri, "artifact://session/tool-result/Y2FsbF9hYmMxMjM");
         assert!(!uri.contains(".astra"));
         assert!(!uri.contains("tool-results/"));
+    }
+
+    #[test]
+    fn artifact_handles_are_opaque_and_round_trip_every_provider_call_id() {
+        let provider_id = "call/with spaces: provider-owned 😀";
+        let uri = session_tool_result_artifact_uri(provider_id);
+        assert_eq!(
+            parse_session_tool_result_artifact_uri(&uri),
+            Some(provider_id.to_string())
+        );
+        assert!(!uri.contains(provider_id));
+        for invalid in [
+            "artifact://session/tool-result/",
+            "artifact://session/tool-result/../other-session",
+            "artifact://session/tool-result/call/child",
+            "artifact://session/tool-result/call+child",
+            "artifact://session/tool-result/call_abc-123",
+            "file:///tmp/result.txt",
+        ] {
+            assert_eq!(
+                parse_session_tool_result_artifact_uri(invalid),
+                None,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_windows_round_trip_unicode_without_exposing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "前缀😀\n".repeat(10_000);
+        assert!(
+            maybe_persist_tool_result(dir.path(), "call-unicode", "bash", &content).is_some(),
+            "setup must create a session artifact"
+        );
+
+        let mut offset = 0;
+        let mut recovered = String::new();
+        while offset < content.len() {
+            let window = read_persisted_result_window(dir.path(), "call-unicode", offset, 7)
+                .unwrap()
+                .expect("persisted result exists");
+            assert!(window.next_offset > offset, "window must make progress");
+            assert!(content.is_char_boundary(window.offset));
+            assert!(content.is_char_boundary(window.next_offset));
+            recovered.push_str(&window.content);
+            offset = window.next_offset;
+        }
+        assert_eq!(recovered, content);
+
+        let rendered = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({
+                "artifact": session_tool_result_artifact_uri("call-unicode"),
+                "max_bytes": 7,
+            }),
+        )
+        .expect("artifact request is recognized")
+        .expect("artifact request succeeds");
+        assert!(rendered.contains(&format!(
+            "Artifact handle: {}",
+            session_tool_result_artifact_uri("call-unicode")
+        )));
+        assert!(rendered.contains("Continue with introspect("));
+        assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn artifact_windows_reject_non_boundary_and_cross_session_lookup() {
+        let owner = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let content = "évidence\n".repeat(6_000);
+        assert!(
+            maybe_persist_tool_result(owner.path(), "call-boundary", "grep", &content).is_some()
+        );
+
+        let boundary_error = read_persisted_result_window(owner.path(), "call-boundary", 1, 32)
+            .expect_err("middle of a UTF-8 scalar must not be accepted");
+        assert!(boundary_error.contains("not a UTF-8 boundary"));
+        assert!(
+            read_persisted_result_window(other.path(), "call-boundary", 0, 32)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_windows_fail_closed_for_corrupt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let results = tool_results_dir(dir.path());
+        std::fs::create_dir_all(&results).unwrap();
+        let path = results.join(format!("{}.txt", safe_filename_stem("call-corrupt")));
+        std::fs::write(path, b"valid prefix\xff").unwrap();
+
+        let error = read_persisted_result_window(dir.path(), "call-corrupt", 0, 64)
+            .expect_err("a corrupt artifact must not yield a partial evidence window");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     #[test]

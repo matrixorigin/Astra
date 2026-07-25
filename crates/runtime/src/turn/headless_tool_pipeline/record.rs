@@ -438,6 +438,37 @@ mod tests {
     }
 
     #[test]
+    fn model_result_persistence_binds_large_evidence_to_its_owner_and_call_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("persisted-tool-result-{}", uuid::Uuid::new_v4());
+        let content = "review evidence 😀\n".repeat(4_000);
+        let inline = "inline preview should be replaced".to_string();
+
+        let model_result = maybe_persist_model_tool_result(
+            Some("reviewer-a"),
+            Some(&session_id),
+            "call-evidence-1",
+            "git",
+            &content,
+            inline,
+        );
+
+        assert!(model_result.contains(
+            &astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
+                "call-evidence-1"
+            )
+        ));
+        assert!(model_result.contains("introspect(artifact="));
+        let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
+        assert_eq!(
+            astra_turn_core::tool_result_storage::read_persisted_result(&dir, "call-evidence-1"),
+            Some(content),
+            "the model handle and durable evidence must share the same owner/session/call identity"
+        );
+    }
+
+    #[test]
     fn result_that_never_started_is_rejected_not_executed() {
         let fields = json!({
             "execution_started": false,

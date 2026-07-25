@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use astra_services::{OwnerScope, SessionArtifactStore};
 use astra_turn_core::tool::schema::tool_schema_name;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -491,6 +492,35 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        if args.get("artifact").is_some() {
+            let owner = match OwnerScope::user(&context.user_id) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(format!(
+                        "Error: could not resolve artifact owner: {error}"
+                    ));
+                }
+            };
+            let store = astra_services::local_session_artifact_store();
+            let session_dir = match store.session_dir_for_owner(&owner, &context.session_id) {
+                Ok(session_dir) => session_dir,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(format!(
+                        "Error: could not resolve the active session for artifact recovery: {error}"
+                    ));
+                }
+            };
+            return tool_result_from_output(
+                astra_turn_core::tool_result_storage::resolve_session_tool_result_artifact_request(
+                    &session_dir,
+                    args,
+                )
+                .unwrap_or_else(|| {
+                    Err("introspect artifact recovery request was not recognized".to_string())
+                })
+                .unwrap_or_else(|error| format!("Error: {error}")),
+            );
+        }
         let mut snapshot = current_introspect_snapshot(
             &context.session_id,
             &context.introspect_snapshot,

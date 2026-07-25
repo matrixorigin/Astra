@@ -292,8 +292,9 @@ impl ToolCallMaps {
     }
 }
 
-/// Marker for tool results persisted to disk by `tool_result_storage`.
-/// These contain a file reference the LLM needs to re-read the output.
+/// Marker for tool results persisted to session-owned `tool_result_storage`.
+/// These retain a logical artifact handle the LLM can re-read through
+/// `introspect`; compaction must not destroy that recovery instruction.
 const PERSISTED_TAG: &str = "<persisted-output>";
 
 fn is_compactable_tool_name(name: &str) -> bool {
@@ -1122,7 +1123,8 @@ mod tests {
     #[test]
     fn skips_persisted_to_disk_results() {
         let persisted = "<persisted-output>\nTool `read_file` produced 50000 chars.\n\
-             File: /tmp/sessions/tool_results/c1.txt\n\
+             Artifact handle: artifact://session/tool-result/YzE\n\
+             Read bounded windows with introspect(artifact=\"artifact://session/tool-result/YzE\", offset=0, max_bytes=8192).\n\
              Preview: first 500 chars...\n</persisted-output>"
             .to_string();
         let mut messages = vec![
@@ -1829,8 +1831,9 @@ mod tests {
     fn persisted_output_mixed_with_compactable_in_same_turn() {
         // One assistant turn produces both a persisted-output result and
         // a normal compactable result. Only the normal one should compact.
-        let persisted =
-            "<persisted-output>Preview of large file... (saved to /tmp/abc)</persisted-output>";
+        let persisted = "<persisted-output>Artifact handle: artifact://session/tool-result/YzE\n\
+            Read with introspect(artifact=\"artifact://session/tool-result/YzE\", offset=0, max_bytes=8192).\n\
+            Preview of large file...</persisted-output>";
         let big = "x".repeat(800);
 
         // Need >6 compactable (non-persisted) to trigger count-based.

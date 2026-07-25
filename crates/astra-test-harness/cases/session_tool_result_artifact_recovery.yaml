@@ -1,0 +1,36 @@
+name: session_tool_result_artifact_recovery
+description: |
+  **What**: Produce a tool result larger than the inline persistence threshold,
+  then recover its first durable window through the advertised `introspect`
+  artifact handle.
+  **Tests**: The full edge → recording → session-owned artifact → model recovery
+  path. The edge may not replace output before it has a call id, and recovery
+  may not require a physical local path.
+  **Pass means**: The agent calls `bash`, follows the returned logical handle
+  with `introspect`, and reports the durable evidence marker.
+  **Fail means**: Large evidence was lost, only an unreadable preview remained,
+  or the artifact recovery surface was not visible to the model.
+prompt: |
+  Perform exactly this evidence-recovery workflow:
+
+  1. Call `bash` with this exact command to produce a large result:
+     `yes RECOVERED_EVIDENCE_OK | head -c 36000`
+  2. The result will give you a session artifact handle. Call `introspect` with
+     that exact handle, `offset: 0`, and `max_bytes: 256`. Do not guess a path
+     and do not use `read_file` or `bash` again.
+  3. In your final response, write exactly `RECOVERED_EVIDENCE_OK`.
+
+  Do not call any other tools.
+capability: tool_use
+difficulty: 2
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_sequence
+    tools: [bash, introspect]
+  - type: tools_count_between
+    min: 2
+    max: 2
+  - type: text_contains
+    needle: RECOVERED_EVIDENCE_OK
