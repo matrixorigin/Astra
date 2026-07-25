@@ -1243,6 +1243,18 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return Vec::new();
         };
 
+        // A tool receipt is not the lifecycle owner. Fanout may be admitted
+        // before its result commits, so the known-id list can be empty when
+        // the parent is interrupted. Cancel and fence the producer run tree
+        // first; this also closes the race with a late descendant spawn.
+        spawn_context
+            .spawner
+            .cancel_descendants_of_parent_run(
+                &spawn_context.run_id,
+                astra_runtime::orchestration::DescendantCancellationReason::UserCancelledAncestor,
+            )
+            .await;
+
         let mut cancelled = Vec::new();
         for agent_id in agent_ids {
             if spawn_context.spawner.cancel_agent(agent_id, reason).await {

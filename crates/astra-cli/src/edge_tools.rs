@@ -1230,7 +1230,7 @@ fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration
         "task_id": task_id,
         "status": "stop_status_unknown",
         "error": format!(
-            "Background task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
+            "Background task registry did not respond within {}ms. The task may still be running; query task_list before issuing another stop request.",
             duration_ms_u64(timeout)
         ),
     })

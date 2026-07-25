@@ -7108,15 +7108,16 @@ pub(crate) async fn run_tui_session(
                                                                     update.receipt,
                                                                 ),
                                                             );
-                                                            if submit_active_runtime_notification(
-                                                                &active_turn_local_run_control,
-                                                                &update.notification,
-                                                            )
-                                                            .await
-                                                            .is_err()
+                                                            if let Some(notification) = update.notification
+                                                                && submit_active_runtime_notification(
+                                                                    &active_turn_local_run_control,
+                                                                    &notification,
+                                                                )
+                                                                .await
+                                                                .is_err()
                                                             {
                                                                 deferred_active_bg_notifications
-                                                                    .push(update.notification);
+                                                                    .push(notification);
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
@@ -8432,7 +8433,9 @@ pub(crate) async fn run_tui_session(
                         chat_widget.commit_concurrent_system(
                             history_cell::system::SystemCell::runtime_work(update.receipt),
                         );
-                        agent_notifications.push(update.notification);
+                        if let Some(notification) = update.notification {
+                            agent_notifications.push(notification);
+                        }
                         frame_requester.schedule_frame();
                     }
                     if !agent_notifications.is_empty() {

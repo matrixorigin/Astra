@@ -106,6 +106,18 @@ pub struct Aggregates {
     pub total_tokens_out: u64,
     pub total_duration_ms: u64,
     pub total_tool_calls: u64,
+    /// Number of distinct child runs observed from producer-scoped LLM rounds.
+    pub subrun_count: usize,
+    /// Sum of child-run LLM token input. Duration is cumulative work, not wall time.
+    pub subrun_total_tokens_in: u64,
+    pub subrun_total_tokens_out: u64,
+    pub subrun_total_duration_ms: u64,
+    pub subrun_total_tool_calls: u64,
+    /// Root plus child-run work. Use these for the total session cost; root
+    /// totals above remain intentionally scoped to the parent conversation.
+    pub inclusive_total_tokens_in: u64,
+    pub inclusive_total_tokens_out: u64,
+    pub inclusive_total_tool_calls: u64,
     /// Tool records that produced fresh observations, excluding cache hits,
     /// duplicate suppressions, synthetic placeholders, and failures.
     pub total_fresh_tool_calls: u64,
@@ -541,14 +553,6 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     }
 }
 
-fn legacy_metadata_string(ev: &session_journal::JournalEvent, key: &str) -> Option<String> {
-    ev.metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get(key))
-        .and_then(|value| value.as_str())
-        .map(String::from)
-}
-
 fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
     if let Some(scope) = ev.producer_scope.as_ref()
         && scope.agent_id.is_some()
@@ -561,17 +565,7 @@ fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity>
         });
     }
 
-    // Read compatibility for journals written before producer_scope existed.
-    // Legacy child rounds used metadata.agent_id and incorrectly placed their
-    // producer-local counter in event.turn. Keep that number local here.
-    let agent_id = legacy_metadata_string(ev, "agent_id")?;
-    let run_id = legacy_metadata_string(ev, "run_id")?;
-    Some(SubrunIdentity {
-        run_id,
-        parent_run_id: None,
-        agent_id: Some(agent_id),
-        local_turn: ev.turn,
-    })
+    None
 }
 
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
@@ -635,6 +629,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut failed_tool_calls: Vec<FailedToolCall> = Vec::new();
     let mut subruns_by_run: std::collections::BTreeMap<String, SubrunRow> =
         std::collections::BTreeMap::new();
+    let mut subrun_ids = std::collections::BTreeSet::new();
+    let mut subrun_total_tokens_in = 0u64;
+    let mut subrun_total_tokens_out = 0u64;
+    let mut subrun_total_duration_ms = 0u64;
+    let mut subrun_total_tool_calls = 0u64;
 
     // Buffer llm_rounds until the current turn attempt terminates. A TurnError
     // closes the current attempt, so later successful Turn rows for the same
@@ -957,8 +956,13 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             JournalEventType::SessionEnd => session_end_count += 1,
             JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
-                if matches!(focus, DigestFocus::All) {
-                    if let Some(identity) = subrun_identity(ev) {
+                if let Some(identity) = subrun_identity(ev) {
+                    subrun_ids.insert(identity.run_id.clone());
+                    subrun_total_tokens_in += ev.tokens_in.unwrap_or(0);
+                    subrun_total_tokens_out += ev.tokens_out.unwrap_or(0);
+                    subrun_total_duration_ms += ev.duration_ms.unwrap_or(0);
+                    subrun_total_tool_calls += u64::from(ev.tool_calls_returned.unwrap_or(0));
+                    if matches!(focus, DigestFocus::All) {
                         let mut round = llm_round_row(ev);
                         round.local_turn = identity.local_turn;
                         subruns_by_run
@@ -971,12 +975,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                             })
                             .llm_round_details
                             .push(round);
-                    } else if let Some(turn) = ev.turn {
-                        llm_rounds_by_turn
-                            .entry(turn)
-                            .or_default()
-                            .push(llm_round_row(ev));
                     }
+                } else if matches!(focus, DigestFocus::All)
+                    && let Some(turn) = ev.turn
+                {
+                    llm_rounds_by_turn
+                        .entry(turn)
+                        .or_default()
+                        .push(llm_round_row(ev));
                 }
             }
             _ => {}
@@ -1015,6 +1021,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             total_tokens_out,
             total_duration_ms,
             total_tool_calls,
+            subrun_count: subrun_ids.len(),
+            subrun_total_tokens_in,
+            subrun_total_tokens_out,
+            subrun_total_duration_ms,
+            subrun_total_tool_calls,
+            inclusive_total_tokens_in: total_tokens_in + subrun_total_tokens_in,
+            inclusive_total_tokens_out: total_tokens_out + subrun_total_tokens_out,
+            inclusive_total_tool_calls: total_tool_calls + subrun_total_tool_calls,
             total_fresh_tool_calls,
             total_noop_or_cached_tool_calls,
             tool_calls_failed,
@@ -1437,22 +1451,21 @@ mod tests {
     }
 
     #[test]
-    fn digest_never_joins_child_local_turns_to_root_session_turns() {
+    fn digest_keeps_producer_scoped_child_work_out_of_root_turns() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-producer-scope-00000000-0000-0000-0000-000000000012";
         fs::write(
             journal_path_for_test(sid),
             concat!(
-                // Legacy child event: local turn was incorrectly serialized as `turn`.
-                r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":2,"round":0,"metadata":{"source":"child_agent","run_id":"child-legacy","agent_id":"agent-legacy"}}"#,
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","producer_scope":{"run_id":"child-one","parent_run_id":"root-run","agent_id":"agent-one","local_turn":2},"round":0,"tokens_in":10,"tokens_out":2,"duration_ms":30,"tool_calls_returned":1,"metadata":{"source":"child_agent"}}"#,
                 "\n",
                 // Canonical child event: root turn absent and local turn typed in producer_scope.
-                r#"{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"S","producer_scope":{"run_id":"child-new","parent_run_id":"root-run","agent_id":"agent-new","local_turn":3},"round":1,"metadata":{"source":"child_agent"}}"#,
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"S","producer_scope":{"run_id":"child-new","parent_run_id":"root-run","agent_id":"agent-new","local_turn":3},"round":1,"tokens_in":20,"tokens_out":3,"duration_ms":40,"tool_calls_returned":2,"metadata":{"source":"child_agent"}}"#,
                 "\n",
                 r#"{"type":"llm_round","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":2,"round":0,"producer_scope":{"run_id":"root-run"},"metadata":{"source":"agentic_loop"}}"#,
                 "\n",
-                r#"{"type":"turn","ts":"2026-01-01T00:00:03Z","session_id":"S","turn":2,"user_input":"continue","tool_calls":[],"llm_rounds":1}"#,
+                r#"{"type":"turn","ts":"2026-01-01T00:00:03Z","session_id":"S","turn":2,"tokens_in":100,"tokens_out":10,"tool_calls":[],"llm_rounds":1}"#,
                 "\n",
             ),
         )
@@ -1466,11 +1479,18 @@ mod tests {
             Some("root-run")
         );
         assert_eq!(digest.subruns.len(), 2);
+        assert_eq!(digest.aggregates.subrun_count, 2);
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 30);
+        assert_eq!(digest.aggregates.subrun_total_tokens_out, 5);
+        assert_eq!(digest.aggregates.subrun_total_duration_ms, 70);
+        assert_eq!(digest.aggregates.subrun_total_tool_calls, 3);
+        assert_eq!(digest.aggregates.inclusive_total_tokens_in, 130);
+        assert_eq!(digest.aggregates.inclusive_total_tokens_out, 15);
         assert_eq!(
             digest
                 .subruns
                 .iter()
-                .find(|subrun| subrun.run_id == "child-legacy")
+                .find(|subrun| subrun.run_id == "child-one")
                 .and_then(|subrun| subrun.llm_round_details[0].local_turn),
             Some(2)
         );

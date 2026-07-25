@@ -1864,44 +1864,24 @@ async fn handle_agent_fanout_stop_group_action(
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
 
-    let active_agent_ids = group
-        .slots
-        .iter()
-        .filter(|slot| !slot.status.is_terminal())
-        .filter_map(|slot| slot.agent_id.clone())
-        .collect::<Vec<_>>();
-    let already_terminal_count = group
-        .slots
-        .iter()
-        .filter(|slot| slot.status.is_terminal())
-        .count();
-    let non_stoppable_count = group
-        .slots
-        .iter()
-        .filter(|slot| !slot.status.is_terminal() && slot.agent_id.is_none())
-        .count();
-    let mut stopped_agent_ids = Vec::new();
-    let mut cancellation_not_owned_agent_ids = Vec::new();
-    for agent_id in active_agent_ids {
-        if ctx
-            .spawner
-            .cancel_agent(&agent_id, "user-requested via agent_fanout.stop_group")
-            .await
-        {
-            stopped_agent_ids.push(agent_id);
-        } else {
-            cancellation_not_owned_agent_ids.push(agent_id);
-        }
-    }
-    let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
-    let not_stopped_agent_ids = cancellation_not_owned_agent_ids
-        .into_iter()
-        .filter(|agent_id| {
-            updated.slots.iter().any(|slot| {
-                slot.agent_id.as_deref() == Some(agent_id.as_str()) && !slot.status.is_terminal()
-            })
-        })
-        .collect::<Vec<_>>();
+    let cancelled = ctx
+        .spawner
+        .cancel_fanout_group(group_id, "user-requested via agent_fanout.stop_group")
+        .await
+        // The group was confirmed immediately above; a concurrent cleanup can
+        // only make it terminal, never turn it into an unknown target.
+        .unwrap_or_else(|| crate::orchestration::FanoutGroupCancellation {
+            group,
+            stopped_agent_ids: Vec::new(),
+            not_stopped_agent_ids: Vec::new(),
+            already_terminal_count: 0,
+            non_stoppable_count: 0,
+        });
+    let updated = cancelled.group;
+    let stopped_agent_ids = cancelled.stopped_agent_ids;
+    let not_stopped_agent_ids = cancelled.not_stopped_agent_ids;
+    let already_terminal_count = cancelled.already_terminal_count;
+    let non_stoppable_count = cancelled.non_stoppable_count;
     let has_issues = !not_stopped_agent_ids.is_empty() || non_stoppable_count > 0;
     let stop_outcome = if has_issues {
         "partially_stopped"

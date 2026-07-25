@@ -1741,7 +1741,7 @@ impl RuntimeToolExecutor {
         ctx.spawner
             .cancel_descendants_of_parent_run(
                 &ctx.run_id,
-                crate::orchestration::spawner::DescendantCancellationReason::AncestorCancelled,
+                crate::orchestration::DescendantCancellationReason::UserCancelledAncestor,
             )
             .await;
         let mut cancelled = Vec::new();
@@ -1754,7 +1754,7 @@ impl RuntimeToolExecutor {
                     matches!(
                         state.status,
                         astra_turn_core::orchestration_types::AgentStatus::Cancelled {
-                            by_user: false,
+                            by_user: true,
                             ..
                         }
                     )

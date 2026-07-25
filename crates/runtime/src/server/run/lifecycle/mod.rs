@@ -2903,7 +2903,7 @@ impl AgenticRunLifecycleService {
             let cancelled_children = spawner
                 .cancel_descendants_of_parent_run(
                     run_id,
-                    DescendantCancellationReason::AncestorCancelled,
+                    DescendantCancellationReason::UserCancelledAncestor,
                 )
                 .await;
             if cancelled_children > 0 {
@@ -2920,7 +2920,7 @@ impl AgenticRunLifecycleService {
             user_id,
             session_id,
             run_id,
-            DescendantCancellationReason::AncestorCancelled.as_str(),
+            DescendantCancellationReason::UserCancelledAncestor.as_str(),
         )
         .await
         {
@@ -9035,7 +9035,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let cancelled_children = missing_lifecycle_spawner
                         .cancel_descendants_of_parent_run(
                             &bg_run_id,
-                            DescendantCancellationReason::AncestorCancelled,
+                            DescendantCancellationReason::UserCancelledAncestor,
                         )
                         .await;
                     if cancelled_children > 0 {
@@ -9051,7 +9051,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_user_id,
                         &bg_session_id,
                         &bg_run_id,
-                        DescendantCancellationReason::AncestorCancelled.as_str(),
+                        DescendantCancellationReason::UserCancelledAncestor.as_str(),
                     )
                     .await
                     {

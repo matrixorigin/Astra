@@ -696,6 +696,19 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     let lower = error_str.to_lowercase();
 
+    // Control tools carry a machine-owned lifecycle status. Preserve its
+    // meaning before applying text heuristics: a registry timeout means the
+    // operation's terminal state is unknown, not that the caller supplied bad
+    // arguments. This applies to every producer using the shared status wire.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(error_str)
+        && let Some(status) = value.get("status").and_then(serde_json::Value::as_str)
+    {
+        match status {
+            "registry_timeout" | "stop_status_unknown" => return ErrorKind::ToolTimeout,
+            _ => {}
+        }
+    }
+
     // A structured memory conflict is an intentional write guard, not a
     // transport failure. Its repair is semantic (select/update the existing
     // memory, or explicitly opt out when distinct), so retrying the same call
@@ -1620,5 +1633,15 @@ mod tests {
         let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
         let err = format!("LLM error 400: {api_body}");
         assert!(is_llm_context_window_error(&err));
+    }
+
+    #[test]
+    fn control_timeout_status_is_not_misclassified_as_invalid_arguments() {
+        for status in ["registry_timeout", "stop_status_unknown"] {
+            let output = format!(
+                r#"{{"ok":false,"kind":"background_task","status":"{status}","error":"registry did not respond"}}"#
+            );
+            assert_eq!(classify_tool_output(&output), ErrorKind::ToolTimeout);
+        }
     }
 }

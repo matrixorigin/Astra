@@ -635,6 +635,11 @@ pub(crate) async fn dispatch_background_task_stop(
                 "Stopping local agent {task_id}."
             )));
         }
+        Ok(BackgroundTaskStopTarget::FanoutGroup) => {
+            chat_widget.commit_system(super::history_cell::system::SystemCell::info(format!(
+                "Stopping local agent group {task_id}."
+            )));
+        }
         Err(error) => {
             let message = format_background_task_stop_error_system_message(&error);
             if matches!(error, BackgroundTaskError::AlreadyTerminated { .. }) {
@@ -660,6 +665,7 @@ pub(crate) async fn dispatch_background_task_stop(
 pub(crate) enum BackgroundTaskStopTarget {
     Shell,
     LocalAgent,
+    FanoutGroup,
 }
 
 pub(crate) async fn stop_background_task_with_agents(
@@ -672,6 +678,13 @@ pub(crate) async fn stop_background_task_with_agents(
         Ok(()) => Ok(BackgroundTaskStopTarget::Shell),
         Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
+                if spawner
+                    .cancel_fanout_group(task_id, "user-requested via background task control")
+                    .await
+                    .is_some()
+                {
+                    return Ok(BackgroundTaskStopTarget::FanoutGroup);
+                }
                 if spawner
                     .cancel_agent(task_id, "user-requested via background task control")
                     .await

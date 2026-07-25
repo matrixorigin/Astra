@@ -592,10 +592,17 @@ fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
             get_u("stall_count"),
         ));
         out.push_str(&format!(
-            "      tokens_in={} tokens_out={} duration_ms={}\n",
+            "      root_tokens_in={} root_tokens_out={} root_duration_ms={}\n",
             get_u("total_tokens_in"),
             get_u("total_tokens_out"),
             get_u("total_duration_ms"),
+        ));
+        out.push_str(&format!(
+            "      subruns={} inclusive_tokens_in={} inclusive_tokens_out={} inclusive_tool_calls={}\n",
+            get_u("subrun_count"),
+            get_u("inclusive_total_tokens_in"),
+            get_u("inclusive_total_tokens_out"),
+            get_u("inclusive_total_tool_calls"),
         ));
         out.push_str(&format!(
             "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
@@ -860,6 +867,10 @@ mod tests {
                     "total_tokens_in": 12000,
                     "total_tokens_out": 450,
                     "total_duration_ms": 8200,
+                    "subrun_count": 0,
+                    "inclusive_total_tokens_in": 12000,
+                    "inclusive_total_tokens_out": 450,
+                    "inclusive_total_tool_calls": 5,
                     "avg_tokens_in": 4000.0,
                     "avg_tokens_out": 150.0,
                     "avg_duration_ms": 2733.33,
@@ -870,7 +881,8 @@ mod tests {
         assert!(out.contains("digest:"));
         assert!(out.contains("turns=3"));
         assert!(out.contains("tool_calls=5"));
-        assert!(out.contains("tokens_in=12000"));
+        assert!(out.contains("root_tokens_in=12000"));
+        assert!(out.contains("inclusive_tokens_in=12000"));
         assert!(out.contains("avg_tokens_in=4000.0"));
         assert!(out.contains("astra journal digest sess"));
     }
@@ -896,6 +908,10 @@ mod tests {
                     "total_tokens_in": 60147,
                     "total_tokens_out": 7112,
                     "total_duration_ms": 116320,
+                    "subrun_count": 3,
+                    "inclusive_total_tokens_in": 189908,
+                    "inclusive_total_tokens_out": 29610,
+                    "inclusive_total_tool_calls": 96,
                     "avg_tokens_in": 30073.5,
                     "avg_tokens_out": 3556.0,
                     "avg_duration_ms": 58160.0
@@ -906,7 +922,8 @@ mod tests {
         let out = render(&r, Format::Text, false);
         assert!(out.contains("attempts=2 turns=1 turn_errors=1"));
         assert!(out.contains("tool_calls=14 tool_failures=2"));
-        assert!(out.contains("tokens_in=60147 tokens_out=7112 duration_ms=116320"));
+        assert!(out.contains("root_tokens_in=60147 root_tokens_out=7112 root_duration_ms=116320"));
+        assert!(out.contains("subruns=3 inclusive_tokens_in=189908"));
         assert!(
             out.contains("avg_tokens_in=30073.5 avg_tokens_out=3556.0 avg_duration_ms=58160.0")
         );

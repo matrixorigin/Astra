@@ -48,16 +48,29 @@ pub const SPAWN_STATUS_WAITING: &str = "waiting";
 
 /// Stable causes shared by descendant cancellation and durable run cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DescendantCancellationReason {
-    AncestorCancelled,
+pub enum DescendantCancellationReason {
+    UserCancelledAncestor,
 }
 
 impl DescendantCancellationReason {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AncestorCancelled => "ancestor run cancelled before child completion",
+            Self::UserCancelledAncestor => "user cancelled ancestor run before child completion",
         }
     }
+}
+
+/// The producer-owned result of stopping one fixed-size fanout group.
+///
+/// Tool and UI control paths use this rather than independently reimplementing
+/// slot selection and cancellation-race handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanoutGroupCancellation {
+    pub group: AgentFanoutGroupProjection,
+    pub stopped_agent_ids: Vec<String>,
+    pub not_stopped_agent_ids: Vec<String>,
+    pub already_terminal_count: usize,
+    pub non_stoppable_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2982,13 +2995,74 @@ impl DynamicAgentSpawner {
             .await
     }
 
+    /// Stop every currently stoppable slot in a fanout group as one
+    /// producer-owned operation. The group id is a task-list identity, not an
+    /// individual agent id.
+    pub async fn cancel_fanout_group(
+        &self,
+        group_id: &str,
+        reason: &str,
+    ) -> Option<FanoutGroupCancellation> {
+        let group = self.fanout_groups.read().await.get(group_id).cloned()?;
+        let active_agent_ids = group
+            .slots
+            .iter()
+            .filter(|slot| !slot.status.is_terminal())
+            .filter_map(|slot| slot.agent_id.clone())
+            .collect::<Vec<_>>();
+        let already_terminal_count = group
+            .slots
+            .iter()
+            .filter(|slot| slot.status.is_terminal())
+            .count();
+        let non_stoppable_count = group
+            .slots
+            .iter()
+            .filter(|slot| !slot.status.is_terminal() && slot.agent_id.is_none())
+            .count();
+
+        let mut stopped_agent_ids = Vec::new();
+        let mut cancellation_not_owned_agent_ids = Vec::new();
+        for agent_id in active_agent_ids {
+            if self.cancel_agent(&agent_id, reason).await {
+                stopped_agent_ids.push(agent_id);
+            } else {
+                cancellation_not_owned_agent_ids.push(agent_id);
+            }
+        }
+
+        let updated = self
+            .fanout_groups
+            .read()
+            .await
+            .get(group_id)
+            .cloned()
+            .unwrap_or(group);
+        let not_stopped_agent_ids = cancellation_not_owned_agent_ids
+            .into_iter()
+            .filter(|agent_id| {
+                updated.slots.iter().any(|slot| {
+                    slot.agent_id.as_deref() == Some(agent_id.as_str())
+                        && !slot.status.is_terminal()
+                })
+            })
+            .collect();
+        Some(FanoutGroupCancellation {
+            group: updated,
+            stopped_agent_ids,
+            not_stopped_agent_ids,
+            already_terminal_count,
+            non_stoppable_count,
+        })
+    }
+
     /// Cancel every live dynamic-agent descendant of `parent_run_id`.
     ///
     /// Dynamic fanout tasks are owned by the session spawner rather than the
     /// parent loop's `JoinHandle`, so dropping/cancelling the parent future is
     /// not sufficient. Snapshot the run tree first, then cancel deepest-first
     /// without holding an agent-map lock across persistence or mailbox I/O.
-    pub(crate) async fn cancel_descendants_of_parent_run(
+    pub async fn cancel_descendants_of_parent_run(
         &self,
         parent_run_id: &str,
         reason: DescendantCancellationReason,
@@ -3031,7 +3105,7 @@ impl DynamicAgentSpawner {
         let mut cancelled = 0;
         for agent_id in descendants.into_iter().rev() {
             if self
-                .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::System)
+                .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::User)
                 .await
             {
                 cancelled += 1;
@@ -7117,7 +7191,7 @@ mod tests {
             spawner
                 .cancel_descendants_of_parent_run(
                     "root",
-                    DescendantCancellationReason::AncestorCancelled,
+                    DescendantCancellationReason::UserCancelledAncestor,
                 )
                 .await,
             2
@@ -7131,9 +7205,9 @@ mod tests {
             assert!(matches!(
                 archived.status,
                 AgentStatus::Cancelled {
-                    by_user: false,
+                    by_user: true,
                     ref reason,
-                } if reason == DescendantCancellationReason::AncestorCancelled.as_str()
+                } if reason == DescendantCancellationReason::UserCancelledAncestor.as_str()
             ));
         }
 
