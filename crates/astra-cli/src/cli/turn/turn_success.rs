@@ -426,6 +426,8 @@ fn apply_turn_success_primary_sync(
         return primary_commit;
     }
 
+    persist_tool_health_after_durable_turn(state, profile);
+
     if let Some(session_id) = result_session_id.as_deref() {
         persist_profile_last_session_or_warn(
             profile,
@@ -455,6 +457,26 @@ fn apply_turn_success_primary_sync(
     primary_commit
 }
 
+/// Cross-session learning is a derived snapshot: it must never survive a
+/// failed primary turn, and a snapshot write failure must never roll back a
+/// turn that is already durable in its journal.
+fn persist_tool_health_after_durable_turn(state: &mut SessionState, profile: Option<&str>) {
+    let profile_name = profile.unwrap_or("default");
+    if let Err(error) = astra_turn_core::tool_health_persistence::save_learning_state(
+        profile_name,
+        &state.tool_health_entries,
+    ) {
+        let message = format!("persist tool-health snapshot for profile `{profile_name}`: {error}");
+        tracing::warn!(
+            target: "astra_cli::turn_settlement",
+            profile = profile_name,
+            error = %error,
+            "turn is durable but cross-session tool-health persistence failed"
+        );
+        state.session_persistence_error = Some(message);
+    }
+}
+
 #[cfg(test)]
 fn apply_turn_success_sync(
     state: &mut SessionState,
@@ -481,9 +503,10 @@ mod tests {
     use crate::cli::turn::turn_post_commit::{
         apply_turn_post_commit_completion, execute_turn_post_commit_job,
     };
-    use crate::tests::heavy_checkpoint_with_runtime_state;
+    use crate::tests::{HomeGuard, heavy_checkpoint_with_runtime_state};
     use astra_runtime::tool_registry::ToolRegistry;
     use astra_services::session_journal;
+    use astra_turn_core::tool_health_persistence::{ToolHealthEntry, load_tool_health};
     use std::time::Instant;
 
     #[test]
@@ -548,6 +571,44 @@ mod tests {
         apply_turn_success(&mut state, None, "apply the fix", result, Instant::now());
 
         assert_eq!(state.recent_tools, vec!["str_replace".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_persists_tool_health_after_the_primary_turn_is_durable() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _home = HomeGuard::temp();
+        let profile = format!("turn-success-health-{}", uuid::Uuid::new_v4());
+        let sid = format!("turn-success-health-durable-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result("Done.");
+        result.session_id = Some(sid.clone());
+        result.tool_health_export = vec![ToolHealthEntry {
+            name: "git".to_string(),
+            total_calls: 7,
+            total_failures: 2,
+            input_validation_failures: 3,
+            failure_rate: 2.0 / 7.0,
+            last_updated_epoch: 42,
+            recent_outcomes: Vec::new(),
+        }];
+
+        apply_turn_success(
+            &mut state,
+            Some(&profile),
+            "review the change",
+            result,
+            Instant::now(),
+        );
+
+        assert_eq!(state.tool_health_entries.len(), 1);
+        assert!(state.session_persistence_error.is_none());
+        assert!(
+            session_journal::journal_file_path(&sid).is_file(),
+            "the primary turn must be durable before its health snapshot is saved"
+        );
+        let restored = load_tool_health(&profile);
+        assert_eq!(restored, state.tool_health_entries);
     }
 
     #[test]
@@ -783,6 +844,41 @@ mod tests {
                 .unwrap_or_default()
                 .contains("append turn event")
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_primary_turn_does_not_persist_tool_health_snapshot() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _home = HomeGuard::temp();
+        let profile = format!("turn-success-health-failed-{}", uuid::Uuid::new_v4());
+        let sid = format!("turn-success-health-journal-fail-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result("new response");
+        result.session_id = Some(sid);
+        result.tool_health_export = vec![ToolHealthEntry {
+            name: "git".to_string(),
+            total_calls: 1,
+            total_failures: 1,
+            input_validation_failures: 0,
+            failure_rate: 1.0,
+            last_updated_epoch: 7,
+            recent_outcomes: Vec::new(),
+        }];
+
+        let outcome = apply_turn_success_sync(
+            &mut state,
+            Some(&profile),
+            "new question",
+            result,
+            Instant::now(),
+        );
+
+        assert!(!outcome.turn_persisted);
+        assert!(state.tool_health_entries.is_empty());
+        assert!(load_tool_health(&profile).is_empty());
     }
 
     #[tokio::test]

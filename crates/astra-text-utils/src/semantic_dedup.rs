@@ -232,14 +232,34 @@ fn semantic_git_key(args: &Value) -> Option<String> {
             let base_ref = arg_str(args, "base_ref").unwrap_or("");
             let staged = arg_bool(args, "staged").unwrap_or(false);
             let stat_only = arg_bool(args, "stat_only").unwrap_or(false);
-            let path = arg_str(args, "path").unwrap_or("");
+            let mut path_filters: Vec<String> = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(normalize_path)
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    arg_str(args, "path")
+                        .map(normalize_path)
+                        .into_iter()
+                        .collect()
+                });
+            // Pathspec order does not affect diff output. Canonicalizing the
+            // set prevents equivalent multi-file reviews from missing cache
+            // hits while preserving every output-shaping filter.
+            path_filters.sort();
+            path_filters.dedup();
             Some(format!(
-                "git:diff:{}..{}:staged={}:stat_only={}:path={}",
+                "git:diff:{}..{}:staged={}:stat_only={}:paths={}",
                 base_ref,
                 git_ref,
                 staged,
                 stat_only,
-                normalize_path(path)
+                serde_json::to_string(&path_filters).expect("path filters serialize")
             ))
         }
         "log" => {
@@ -318,17 +338,17 @@ fn semantic_bash_git_key(args: &Value) -> Option<String> {
             Some("git:status".to_string())
         }
         ["git", "diff"] | ["git", "diff", "HEAD"] => {
-            Some("git:diff:..HEAD:staged=false:stat_only=false:path=".to_string())
+            Some("git:diff:..HEAD:staged=false:stat_only=false:paths=[]".to_string())
         }
         ["git", "diff", "--stat"] => {
-            Some("git:diff:..HEAD:staged=false:stat_only=true:path=".to_string())
+            Some("git:diff:..HEAD:staged=false:stat_only=true:paths=[]".to_string())
         }
         ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
-            Some("git:diff:..HEAD:staged=true:stat_only=false:path=".to_string())
+            Some("git:diff:..HEAD:staged=true:stat_only=false:paths=[]".to_string())
         }
         ["git", "diff", "--", path] => Some(format!(
-            "git:diff:..HEAD:staged=false:stat_only=false:path={}",
-            normalize_path(path)
+            "git:diff:..HEAD:staged=false:stat_only=false:paths={}",
+            serde_json::to_string(&vec![normalize_path(path)]).expect("path filter serializes")
         )),
         _ => None,
     }
@@ -1038,6 +1058,19 @@ mod tests {
         assert_ne!(
             k1, k2,
             "path-scoped diff must not share a semantic cache key with repo-wide diff"
+        );
+    }
+
+    #[test]
+    fn git_action_diff_multiple_path_filters_differ_from_repo_wide_diff() {
+        let filtered = semantic_call_key(
+            "git",
+            &json!({"action": "diff", "paths": ["src/a.rs", "src/b.rs"]}),
+        );
+        let repository_wide = semantic_call_key("git", &json!({"action": "diff"}));
+        assert_ne!(
+            filtered, repository_wide,
+            "multi-path diff filters must be part of the semantic cache key"
         );
     }
 

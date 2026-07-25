@@ -305,6 +305,63 @@ fn optional_exact_string<'a>(
     Ok(Some(value))
 }
 
+/// Parse the canonical multi-path filter shape without accepting shell-like
+/// whitespace splitting. A file name containing spaces remains one string;
+/// callers that need more than one filter must use the JSON array explicitly.
+fn optional_exact_string_array<'a>(
+    args: &'a Value,
+    field: &str,
+) -> Result<Option<Vec<&'a str>>, GitRequestValidationError> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(GitRequestValidationError::invalid_arguments(format!(
+            "Error: git field `{field}` must be a non-empty array of exact strings"
+        )));
+    };
+    if values.is_empty() {
+        return Err(GitRequestValidationError::invalid_arguments(format!(
+            "Error: git field `{field}` must be a non-empty array of exact strings"
+        )));
+    }
+
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(GitRequestValidationError::invalid_arguments(format!(
+                "Error: git field `{field}` must be a non-empty array of exact strings"
+            )));
+        };
+        if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+            return Err(GitRequestValidationError::invalid_arguments(format!(
+                "Error: git field `{field}` must be a non-empty array of exact strings"
+            )));
+        }
+        parsed.push(value);
+    }
+    Ok(Some(parsed))
+}
+
+/// Resolve and validate the one canonical diff filter shape. This is used by
+/// the executor too, because unit and embedded callers can bypass the tool
+/// registry's structural validation.
+fn diff_path_filters<'a>(args: &'a Value, project_root: &Path) -> Result<Vec<&'a str>, String> {
+    let path = optional_exact_string(args, "path").map_err(|error| error.message)?;
+    let paths = optional_exact_string_array(args, "paths").map_err(|error| error.message)?;
+    if path.is_some() && paths.is_some() {
+        return Err(
+            "Error: git(action=diff) accepts either `path` or `paths`, not both".to_string(),
+        );
+    }
+    let filters = paths.unwrap_or_else(|| path.into_iter().collect());
+    for filter in &filters {
+        reject_path_traversal(filter, project_root)?;
+        validate_diff_path_exists(project_root, filter)?;
+    }
+    Ok(filters)
+}
+
 fn required_exact_string<'a>(
     args: &'a Value,
     field: &str,
@@ -331,8 +388,23 @@ pub fn validate_git_request(
         .map_err(|error| GitRequestValidationError::invalid_arguments(format!("Error: {error}")))?;
 
     let path = optional_exact_string(args, "path")?;
+    let paths = optional_exact_string_array(args, "paths")?;
     let file = optional_exact_string(args, "file")?;
-    for candidate in [path, file].into_iter().flatten() {
+    if path.is_some() && paths.is_some() {
+        return Err(GitRequestValidationError::invalid_arguments(
+            "Error: git(action=diff) accepts either `path` or `paths`, not both",
+        ));
+    }
+    if paths.is_some() && action != crate::git_tool_contract::GitAction::Diff {
+        return Err(GitRequestValidationError::invalid_arguments(
+            "Error: git field `paths` is only valid for git(action=diff)",
+        ));
+    }
+    for candidate in [path, file]
+        .into_iter()
+        .flatten()
+        .chain(paths.iter().flatten().copied())
+    {
         reject_path_traversal(candidate, project_root)
             .map_err(GitRequestValidationError::invalid_arguments)?;
     }
@@ -359,7 +431,7 @@ pub fn validate_git_request(
                     "Error: git(action=diff) accepts either `staged=true` or `ref`, not both",
                 ));
             }
-            if let Some(path) = path {
+            for path in path.into_iter().chain(paths.into_iter().flatten()) {
                 validate_diff_path_exists(project_root, path)
                     .map_err(GitRequestValidationError::missing_path)?;
             }
@@ -1362,18 +1434,13 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
     let base_ref = args.get("base_ref").and_then(Value::as_str);
-    let path_filter = args.get("path").and_then(Value::as_str);
+    let path_filters = match diff_path_filters(args, project_root) {
+        Ok(filters) => filters,
+        Err(error) => return error,
+    };
 
     if staged && git_ref.is_some() {
         return "Error: git(action=diff): use either staged:true or ref, not both".to_string();
-    }
-    if let Some(p) = path_filter {
-        if let Err(e) = reject_path_traversal(p, project_root) {
-            return e;
-        }
-        if let Err(e) = validate_diff_path_exists(project_root, p) {
-            return e;
-        }
     }
 
     let mut parts: Vec<String> = vec!["diff".into()];
@@ -1387,16 +1454,16 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
         parts.push("--cached".into());
     } else if let Some(r) = git_ref {
         parts.push(r.to_string());
-        if path_filter.is_none() {
+        if path_filters.is_empty() {
             parts.push("HEAD".into());
         }
     } else {
         parts.push("HEAD".into());
     }
     parts.extend(["--stat".into(), "--no-color".into()]);
-    if let Some(p) = path_filter {
+    if !path_filters.is_empty() {
         parts.push("--".into());
-        parts.push(p.to_string());
+        parts.extend(path_filters.iter().map(|path| (*path).to_string()));
     }
 
     let cmd_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
@@ -1426,15 +1493,10 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
     let base_ref = args.get("base_ref").and_then(Value::as_str);
-    let path_filter = args.get("path").and_then(Value::as_str);
-    if let Some(p) = path_filter {
-        if let Err(e) = reject_path_traversal(p, project_root) {
-            return e;
-        }
-        if let Err(e) = validate_diff_path_exists(project_root, p) {
-            return e;
-        }
-    }
+    let path_filters = match diff_path_filters(args, project_root) {
+        Ok(filters) => filters,
+        Err(error) => return error,
+    };
 
     // Range diff: base_ref..ref (e.g., HEAD~5..HEAD)
     if let Some(base) = base_ref {
@@ -1443,11 +1505,9 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
             Err(error) => return error,
         };
         let mut cli_args = vec!["diff", &range, "--no-ext-diff", "--no-color"];
-        let path_owned;
-        if let Some(p) = path_filter {
+        if !path_filters.is_empty() {
             cli_args.push("--");
-            path_owned = p.to_string();
-            cli_args.push(&path_owned);
+            cli_args.extend(path_filters.iter().copied());
         }
         return diff_via_git_cli_or_error(project_root, &cli_args, limit);
     }
@@ -1474,35 +1534,36 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
                 );
             }
             let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
-            if let Some(p) = path_filter {
+            if !path_filters.is_empty() {
                 cli_args.push("--");
-                cli_args.push(p);
+                cli_args.extend(path_filters.iter().copied());
             }
             return diff_via_git_cli_or_error(project_root, &cli_args, limit);
         }
-        // With path filter, use CLI for tree-to-tree as well
-        if let Some(p) = path_filter {
-            match diff_via_git_cli_result(
-                project_root,
-                &["diff", ref_str, "--no-ext-diff", "--no-color", "--", p],
-                limit,
-            )
-            .output_or_else(|| diff_tree_to_tree_str(&repo, ref_str, limit))
-            {
-                Ok(result) => return result,
-                Err(error) => return error,
-            }
+        // gix's tree fallback cannot apply pathspec filtering. Preserve the
+        // requested scope by using the CLI result directly whenever filters
+        // are present instead of silently widening the diff.
+        if !path_filters.is_empty() {
+            let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color", "--"];
+            cli_args.extend(path_filters.iter().copied());
+            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
         }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
 
     // If staged, do index-to-HEAD diff
     if staged {
-        let cli_args: Vec<&str> = if let Some(p) = path_filter {
-            vec!["diff", "--cached", "--no-ext-diff", "--no-color", "--", p]
-        } else {
-            vec!["diff", "--cached", "--no-ext-diff", "--no-color"]
-        };
+        let mut cli_args = vec!["diff", "--cached", "--no-ext-diff", "--no-color"];
+        if !path_filters.is_empty() {
+            cli_args.push("--");
+            cli_args.extend(path_filters.iter().copied());
+            let result = diff_via_git_cli_or_error(project_root, &cli_args, limit);
+            return if result == "No changes" {
+                "No staged changes".to_string()
+            } else {
+                result
+            };
+        }
         let result = match diff_via_git_cli_result(project_root, &cli_args, limit)
             .output_or_else(|| diff_index_to_head(&repo, limit))
         {
@@ -1517,11 +1578,12 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
 
     // Default: show full local patch vs HEAD so review flows don't need to fall
     // back to bash just to recover actual diff hunks from summary-only output.
-    let cli_args: Vec<&str> = if let Some(p) = path_filter {
-        vec!["diff", "HEAD", "--no-ext-diff", "--no-color", "--", p]
-    } else {
-        vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
-    };
+    let mut cli_args = vec!["diff", "HEAD", "--no-ext-diff", "--no-color"];
+    if !path_filters.is_empty() {
+        cli_args.push("--");
+        cli_args.extend(path_filters.iter().copied());
+        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
+    }
     match diff_via_git_cli_result(project_root, &cli_args, limit)
         .output_or_else(|| diff_worktree(&repo, limit))
     {
@@ -2949,6 +3011,22 @@ mod tests {
     }
 
     #[test]
+    fn git_request_validation_rejects_ambiguous_single_and_multiple_diff_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("one.rs"), "one\n").unwrap();
+        std::fs::write(dir.path().join("two.rs"), "two\n").unwrap();
+
+        let error = validate_git_request(
+            dir.path(),
+            &json!({"action": "diff", "path": "one.rs", "paths": ["two.rs"]}),
+        )
+        .expect_err("one canonical path field must be selected");
+
+        assert_eq!(error.evidence.kind, astra_core::ErrorKind::ToolInvalidArgs);
+        assert!(error.message.contains("either `path` or `paths`"));
+    }
+
+    #[test]
     fn reject_path_traversal_allows_plain_relative_under_root() {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path();
@@ -3345,6 +3423,59 @@ mod tests {
         assert!(
             !result.starts_with("Error:"),
             "default diff should work: {result}"
+        );
+    }
+
+    #[test]
+    fn git_dispatch_diff_limits_output_to_all_requested_paths() {
+        let dir = init_temp_repo();
+        let root = dir.path();
+        for name in ["first.txt", "second.txt", "excluded.txt"] {
+            std::fs::write(root.join(name), format!("initial {name}\n")).unwrap();
+        }
+        run_git(root, &["add", "first.txt", "second.txt", "excluded.txt"]);
+        run_git(root, &["commit", "-m", "add diff filter fixtures"]);
+        for name in ["first.txt", "second.txt", "excluded.txt"] {
+            std::fs::write(root.join(name), format!("changed {name}\n")).unwrap();
+        }
+
+        let outcome = git_dispatch(
+            root,
+            &json!({"action": "diff", "paths": ["first.txt", "second.txt"]}),
+        );
+        assert!(!outcome.is_error, "{}", outcome.output);
+        let result = outcome.output;
+
+        assert!(result.contains("a/first.txt"), "{result}");
+        assert!(result.contains("a/second.txt"), "{result}");
+        assert!(
+            !result.contains("excluded.txt"),
+            "multi-path diff must not widen to unrequested files: {result}"
+        );
+
+        let stat_outcome = git_dispatch(
+            root,
+            &json!({
+                "action": "diff",
+                "stat_only": true,
+                "paths": ["first.txt", "second.txt"]
+            }),
+        );
+        assert!(!stat_outcome.is_error, "{}", stat_outcome.output);
+        assert!(
+            stat_outcome.output.contains("first.txt"),
+            "{}",
+            stat_outcome.output
+        );
+        assert!(
+            stat_outcome.output.contains("second.txt"),
+            "{}",
+            stat_outcome.output
+        );
+        assert!(
+            !stat_outcome.output.contains("excluded.txt"),
+            "multi-path diff stat must not widen to unrequested files: {}",
+            stat_outcome.output
         );
     }
 

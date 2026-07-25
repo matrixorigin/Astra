@@ -418,6 +418,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 break;
             }
         };
+        let mut terminal_marker_seen = false;
         for event_str in event_blocks {
             let _ = process_sse_event_block(
                 &event_str,
@@ -428,6 +429,10 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 &mut reported_session_id,
             )
             .await;
+            if accum.stream_complete {
+                terminal_marker_seen = true;
+                break;
+            }
         }
 
         // Parallel tool calls often arrive as several adjacent SSE
@@ -437,7 +442,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // requests that are already classified as concurrency-safe, and only
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
-        while pending_is_coalescible_tool_batch(&pending) {
+        while !terminal_marker_seen && pending_is_coalescible_tool_batch(&pending) {
             let next = if let Some(token) = cancel_token {
                 tokio::select! {
                     biased;
@@ -483,8 +488,12 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             &mut reported_session_id,
                         )
                         .await;
+                        if accum.stream_complete {
+                            terminal_marker_seen = true;
+                            break;
+                        }
                     }
-                    if saw_event && !all_events_extended_batch {
+                    if terminal_marker_seen || (saw_event && !all_events_extended_batch) {
                         break;
                     }
                 }
@@ -509,6 +518,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             &mut approval_results,
         )
         .await;
+        if terminal_marker_seen {
+            break;
+        }
     }
 
     // Tombstone on abort (timeout or cancellation).
@@ -561,7 +573,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         }
     };
     let ttft_ms = framer.ttft_ms;
-    if abort.is_none() && !tail.trim().is_empty() {
+    if abort.is_none() && !accum.stream_complete && !tail.trim().is_empty() {
         let _ = process_sse_event_block(
             &tail,
             host,
@@ -624,6 +636,13 @@ async fn process_sse_event_block<H: SseStreamHost>(
     first_sse_frame_seen: &mut bool,
     reported_session_id: &mut Option<String>,
 ) -> bool {
+    // `[DONE]` establishes the only terminal transport boundary.  The
+    // consumer normally stops before this function can be called again, but
+    // retain the guard here so a future caller cannot forward late typed agent
+    // events before the dispatcher gets a chance to ignore them.
+    if accum.stream_complete {
+        return false;
+    }
     if !*first_sse_frame_seen {
         *first_sse_frame_seen = true;
         host.on_first_sse_frame();
@@ -1176,6 +1195,81 @@ mod tests {
         assert!(result.accum.stream_complete);
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn done_marker_terminates_consumption_without_waiting_for_source_eof() {
+        let source = stream::iter(vec![Ok(b"data: [DONE]\n\n".to_vec())])
+            .chain(stream::pending::<Result<Vec<u8>, String>>());
+        let mut stream = source;
+        let mut host = RecordingSseStreamHost::new();
+
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            consume_sse_stream(
+                &mut stream,
+                &mut host,
+                std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+            ),
+        )
+        .await
+        .expect("[DONE] is a terminal transport signal, not a request to await EOF");
+
+        assert!(completed.1.is_none());
+        assert!(completed.0.accum.stream_complete);
+        assert!(host.stream_completed);
+    }
+
+    #[tokio::test]
+    async fn done_marker_flushes_preceding_edge_work_before_returning() {
+        let events = format!(
+            "{}data: [DONE]\n\n",
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"before-done\",\"tool\":\"bash\",\"args\":{\"command\":\"git status --short\"}",
+            )
+        );
+        let source = stream::iter(vec![Ok(events.into_bytes())])
+            .chain(stream::pending::<Result<Vec<u8>, String>>());
+        let mut stream = source;
+        let mut host = RecordingSseStreamHost::new().with_tool_output("bash", "clean");
+
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            consume_sse_stream(
+                &mut stream,
+                &mut host,
+                std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+            ),
+        )
+        .await
+        .expect("[DONE] must flush already-accepted edge work without waiting for EOF");
+
+        assert!(abort.is_none());
+        assert!(result.accum.stream_complete);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].request_id, "before-done");
+    }
+
+    #[tokio::test]
+    async fn done_marker_does_not_forward_later_agent_live_evidence() {
+        let chunks: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(b"data: [DONE]\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"agent_live_gap\",\"run_id\":\"late-run\",\"agent_id\":\"late-agent\",\"dropped_event_count\":1}\n\n".to_vec()),
+        ];
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(result.accum.stream_complete);
+        assert!(host.agent_live_gaps.is_empty());
     }
 
     #[tokio::test]

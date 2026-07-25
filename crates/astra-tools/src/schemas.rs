@@ -1029,7 +1029,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Repository-relative file or directory path. Used by: diff, log, blame, checkout_file, contributors."
+                            "description": "Repository-relative file or directory path. Used by: diff (one filter only), log, blame, checkout_file, contributors. For a diff over more than one path, use `paths`; never concatenate multiple paths into this string."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": "Canonical multi-path filter for git(action=diff) only. Pass one repository-relative path per array item (for example [\"src/a.rs\", \"src/b.rs\"]); mutually exclusive with `path`."
                         },
                         "file": {
                             "type": "string",
@@ -2249,6 +2255,27 @@ mod tests {
         );
         validate_tool_arguments("git", &json!({"action": "diff", "stat_only": true}))
             .expect("advertised stat_only diff must validate");
+    }
+
+    #[test]
+    fn git_schema_exposes_canonical_multi_path_diff_filters() {
+        let schemas = all_tool_schemas();
+        let git = find_schema(&schemas, "git").expect("git schema");
+        assert_eq!(
+            git.pointer("/function/parameters/properties/paths/type")
+                .and_then(Value::as_str),
+            Some("array")
+        );
+        validate_tool_arguments(
+            "git",
+            &json!({
+                "action": "diff",
+                "base_ref": "main",
+                "ref": "HEAD",
+                "paths": ["src/one.rs", "src/two.rs"]
+            }),
+        )
+        .expect("advertised canonical multi-path diff filters must validate");
     }
 
     #[test]
