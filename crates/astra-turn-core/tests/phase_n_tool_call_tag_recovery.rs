@@ -97,6 +97,12 @@ proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
         max_shrink_iters: 4096,
+        // This is an integration test, not a `src/` module. The default
+        // SourceParallel resolver has no lib.rs/main.rs ancestor, so make the
+        // durable counterexample location explicit.
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
         .. ProptestConfig::default()
     })]
 

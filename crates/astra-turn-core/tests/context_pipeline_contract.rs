@@ -416,6 +416,13 @@ mod proptest_reserves {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
             cases: 512,
+            // Integration tests live outside `src/`, so proptest's default
+            // SourceParallel resolver cannot find a crate root. Persist shrunk
+            // counterexamples next to this test instead of silently falling
+            // back after emitting a warning.
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+            )),
             ..Default::default()
         })]
 
