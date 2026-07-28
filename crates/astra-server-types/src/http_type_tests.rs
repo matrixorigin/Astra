@@ -1171,6 +1171,25 @@ fn auth_token_record_to_response() {
 // ── chat_request_into_data ──────────────────────────────────────
 
 #[test]
+fn chat_request_parses_provider_resolved_model_selection() {
+    let request: ChatRequest = serde_json::from_value(json!({
+        "message": "hello",
+        "model_selection": {"offering_id": "offer-provider"},
+        "resolved_model_selection": {
+            "offering_id": "offer-provider",
+            "model_name": "provider-model"
+        }
+    }))
+    .expect("provider wire request should parse");
+
+    let resolved = request
+        .resolved_model_selection
+        .expect("trusted resolution should remain present on the wire request");
+    assert_eq!(resolved.offering_id, "offer-provider");
+    assert_eq!(resolved.model_name, "provider-model");
+}
+
+#[test]
 fn chat_request_into_data_maps_all_fields() {
     let mut ctx = Map::new();
     ctx.insert("tool".into(), json!("calc"));
@@ -1184,6 +1203,10 @@ fn chat_request_into_data_maps_all_fields() {
         agent_id: Some("a1".into()),
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
+        }),
+        resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
+            offering_id: "offer-gpt-4".into(),
+            model_name: "gpt-4".into(),
         }),
         capability_descriptors: None,
         agent_binding: None,
@@ -1247,7 +1270,13 @@ fn chat_request_into_data_maps_all_fields() {
             .map(|selection| selection.offering_id.as_str()),
         Some("offer-gpt-4")
     );
-    assert!(data.resolved_model_selection.is_none());
+    assert_eq!(
+        data.resolved_model_selection.as_ref().map(|selection| (
+            selection.offering_id.as_str(),
+            selection.model_name.as_str()
+        )),
+        Some(("offer-gpt-4", "gpt-4"))
+    );
     assert!(data.admitted_model_execution.is_none());
     assert_eq!(
         data.skill_search,
@@ -1290,6 +1319,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.session_id.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
+    assert!(data.resolved_model_selection.is_none());
     assert!(data.admitted_model_execution.is_none());
     assert!(data.runtime_mcp_bindings.is_empty());
     assert!(data.mcp_binding_ids.is_none());
@@ -1314,6 +1344,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         session_id: None,
         agent_id: None,
         model_selection: None,
+        resolved_model_selection: None,
         capability_descriptors: None,
         agent_binding: None,
         runtime_auth: None,

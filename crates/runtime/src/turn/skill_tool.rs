@@ -19,7 +19,7 @@
 //! | Host | Crate | SkillResolver |
 //! |------|-------|---------------|
 //! | CLI  | astra-cli | Wraps `SkillRegistry` from `skill_instructions.rs` |
-//! | Server | runtime/server | (Future) wraps cloud skill catalog |
+//! | Server | runtime/server | Wraps request-scoped and Agent Binding skill catalogs |
 //!
 //! # Fork (isolated) execution
 //!
@@ -314,9 +314,25 @@ impl PolicyScopedSkillResolver {
     }
 }
 
+#[async_trait::async_trait]
 impl SkillResolver for PolicyScopedSkillResolver {
     fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
         let resolved = self.inner.resolve(name)?;
+        if self.policy.allows(&resolved) {
+            Ok(resolved)
+        } else {
+            Err(crate::skills::SkillError::PermissionDenied(format!(
+                "skill '{}' is not allowed by the active surfacing policy",
+                resolved.name
+            )))
+        }
+    }
+
+    async fn resolve_for_execution(
+        &self,
+        name: &str,
+    ) -> Result<ResolvedSkill, crate::skills::SkillError> {
+        let resolved = self.inner.resolve_for_execution(name).await?;
         if self.policy.allows(&resolved) {
             Ok(resolved)
         } else {
@@ -1707,7 +1723,7 @@ fn execute_skill<'a>(
             }
         }
 
-        match resolver.resolve(skill_name) {
+        match resolver.resolve_for_execution(skill_name).await {
             Ok(skill) => {
                 // Composability gate: nested calls must target composable skills
                 if let Some(ctx) = composition_ctx {

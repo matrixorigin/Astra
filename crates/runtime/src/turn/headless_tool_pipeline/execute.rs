@@ -103,8 +103,7 @@ pub(crate) async fn execute_tool_pure(
                     .to_string(),
                 ),
             };
-            execution.tool_result_fields = result.metadata;
-            execution.result_str = result.output;
+            apply_runtime_tool_result(execution, result);
         }
     }
     if execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
@@ -131,6 +130,18 @@ pub(crate) async fn execute_tool_pure(
     .await;
 }
 
+fn apply_runtime_tool_result(
+    execution: &mut super::HeadlessResolvedExecution,
+    result: astra_tools::ToolResult,
+) {
+    let mut fields = result.metadata.unwrap_or_default();
+    if result.is_error {
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+    }
+    execution.tool_result_fields = (!fields.is_empty()).then_some(fields);
+    execution.result_str = result.output;
+}
+
 fn selected_runtime_provider_tool_missing_edge_result(
     execution: &super::HeadlessResolvedExecution,
     edge_round_present: bool,
@@ -146,6 +157,78 @@ fn selected_runtime_provider_tool_missing_edge_result(
                 | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
         )
     })
+}
+
+#[cfg(test)]
+mod runtime_tool_result_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn execution() -> super::super::HeadlessResolvedExecution {
+        super::super::HeadlessResolvedExecution {
+            id: "call-1".into(),
+            name: "mcp__moi-tools__search_catalog_file_content".into(),
+            args: json!({}),
+            result_str: String::new(),
+            tool_result_fields: None,
+            pending_runtime_completion: None,
+            edge_duration_ms: 0,
+            is_edge_tool: false,
+            early_exit_ms: 0,
+        }
+    }
+
+    #[test]
+    fn runtime_tool_error_flag_reaches_execution_semantics() {
+        let mut execution = execution();
+        apply_runtime_tool_result(
+            &mut execution,
+            astra_tools::ToolResult::error("MCP RPC failed".to_string()),
+        );
+
+        assert_eq!(
+            execution
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("status"))
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert!(execution_result_is_error(
+            &execution.name,
+            &execution.result_str,
+            execution.tool_result_fields.as_ref(),
+        ));
+    }
+
+    #[test]
+    fn runtime_tool_success_metadata_is_preserved() {
+        let mut execution = execution();
+        let mut metadata = Map::new();
+        metadata.insert("request_id".to_string(), json!("request-1"));
+        apply_runtime_tool_result(
+            &mut execution,
+            astra_tools::ToolResult {
+                output: "ok".to_string(),
+                metadata: Some(metadata),
+                is_error: false,
+                exit_semantics: None,
+            },
+        );
+
+        assert_eq!(
+            execution
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("request_id")),
+            Some(&json!("request-1"))
+        );
+        assert!(!execution_result_is_error(
+            &execution.name,
+            &execution.result_str,
+            execution.tool_result_fields.as_ref(),
+        ));
+    }
 }
 
 pub(super) fn execution_result_is_error(

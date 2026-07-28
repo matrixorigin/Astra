@@ -2257,6 +2257,7 @@ async fn ensure_core_schema_while_leased(
             resolved_model_name VARCHAR(255) NULL,
             capability_server_refs_json LONGTEXT NULL,
             runtime_profile VARCHAR(64) NULL,
+            provider_request_fingerprint VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
@@ -2369,6 +2370,10 @@ async fn ensure_core_schema_while_leased(
         (
             "runtime_profile",
             "ALTER TABLE agent_runs ADD COLUMN runtime_profile VARCHAR(64) NULL",
+        ),
+        (
+            "provider_request_fingerprint",
+            "ALTER TABLE agent_runs ADD COLUMN provider_request_fingerprint VARCHAR(64) NULL",
         ),
     ] {
         add_column_if_missing(&pool, &settings.database, "agent_runs", column, ddl).await?;

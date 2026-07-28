@@ -1038,7 +1038,7 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
                 name
             ));
         }
-        context.execute_mcp_tool(name, args, None).await
+        context.execute_mcp_tool(name, args, None, None).await
     }
 }
 

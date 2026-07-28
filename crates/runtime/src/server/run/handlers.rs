@@ -423,10 +423,36 @@ pub(crate) async fn cancel_run_handler(
     headers: HeaderMap,
 ) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    cancel_run_for_user(&state, run_id, user.user_id).await
+}
+
+pub(crate) async fn delete_run_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/chat/runs/{run_id}", &body),
+        )
+        .await?;
+    cancel_run_for_user(&state, run_id, principal.user.user_id).await
+}
+
+async fn cancel_run_for_user(
+    state: &AppState,
+    run_id: String,
+    user_id: String,
+) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     let result = state
         .execution
         .run_lifecycle_service
-        .cancel_run(run_id, user.user_id)
+        .cancel_run(run_id, user_id)
         .await?;
     Ok(Json(CancelRunResponse::from(result)))
 }
@@ -520,7 +546,10 @@ pub(crate) async fn submit_run_user_intent_handler(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
     use async_trait::async_trait;
@@ -610,8 +639,142 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ProviderRequestOnlyAuthService {
+        descriptor: Arc<Mutex<Option<astra_services::ProviderRequestDescriptor>>>,
+    }
+
+    #[async_trait]
+    impl AuthService for ProviderRequestOnlyAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn current_user(
+            &self,
+            _headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "JWT auth must not handle provider cancellation".to_string(),
+                )),
+            ))
+        }
+
+        async fn current_principal_for_request(
+            &self,
+            _headers: &HeaderMap,
+            request: astra_services::ProviderRequestDescriptor,
+        ) -> Result<crate::AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
+            *self.descriptor.lock().expect("descriptor lock") = Some(request);
+            Ok(crate::AuthPrincipal::internal(AuthUserRecord {
+                user_id: "provider-user-1".to_string(),
+                username: "provider-user-1".to_string(),
+                email: String::new(),
+                display_name: None,
+            }))
+        }
+    }
+
     fn test_matrixone() -> astra_core::MatrixOneSettings {
         astra_core::MatrixOneSettings::mock()
+    }
+
+    #[tokio::test]
+    async fn delete_run_accepts_provider_request_principal() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run(
+                "run-provider-cancel",
+                "provider-user-1",
+                "session-provider-cancel",
+            )
+            .await
+            .expect("start provider-owned run");
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let descriptor = Arc::new(Mutex::new(None));
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                    descriptor: Arc::clone(&descriptor),
+                }))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/chat/runs/run-provider-cancel")
+                    .header("authorization", "Bearer provider-token")
+                    .header("x-request-id", "provider-cancel-request")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("body should be readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("cancel response JSON");
+        assert_eq!(payload["run_id"], "run-provider-cancel");
+        assert_eq!(payload["status"], "cancelled");
+        let descriptor = descriptor
+            .lock()
+            .expect("descriptor lock")
+            .clone()
+            .expect("provider request descriptor");
+        assert_eq!(descriptor.method, "DELETE");
+        assert_eq!(descriptor.path, "/chat/runs/run-provider-cancel");
+        assert_eq!(descriptor.route.as_deref(), Some("/chat/runs/{run_id}"));
+        assert_eq!(
+            descriptor.request_id.as_deref(),
+            Some("provider-cancel-request")
+        );
+        assert_eq!(
+            descriptor.body_digest.as_deref(),
+            Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
     }
 
     async fn setup_http_run_db_it() -> astra_core::SharedPool {

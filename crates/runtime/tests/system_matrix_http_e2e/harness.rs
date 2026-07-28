@@ -691,6 +691,7 @@ pub async fn seed_pending_approval(
             resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
+            provider_request_fingerprint: None,
             events: vec![
                 json!({"event_type": "run_started", "data": {}}),
                 json!({

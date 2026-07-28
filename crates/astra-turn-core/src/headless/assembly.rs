@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-use crate::tool::args::shape::tool_call_name;
+use crate::tool::args::shape::{parse_tool_call_arguments, tool_call_name};
 use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
@@ -114,25 +114,12 @@ pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
-    // Support both flat format (name/arguments at top level) and
-    // OpenAI format (function.name / function.arguments nested).
     let name = tool_call_name(tc).unwrap_or("").to_string();
-    let args_raw = if let Some(func) = tc.get("function").and_then(Value::as_object) {
-        func.get("arguments")
-            .cloned()
-            .unwrap_or(Value::Object(Default::default()))
-    } else {
-        tc.get("arguments")
-            .cloned()
-            .unwrap_or(Value::Object(Default::default()))
-    };
-
-    let args = match args_raw {
-        Value::String(s) => {
-            serde_json::from_str::<Value>(&s).unwrap_or_else(|_| Value::Object(Default::default()))
-        }
-        other => other,
-    };
+    // Admission canonicalizes executable calls to a flat object. Legacy
+    // display paths may still pass an OpenAI-shaped call, so consume the same
+    // strict shared parser here. Invalid or conflicting representations never
+    // become an executable empty argument object.
+    let args = parse_tool_call_arguments(tc).unwrap_or(Value::Null);
     (id, name, args)
 }
 

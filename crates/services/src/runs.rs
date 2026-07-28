@@ -958,9 +958,52 @@ pub struct DurableRunRecord {
     pub resolved_model_name: Option<String>,
     pub capability_server_refs_json: Option<String>,
     pub runtime_profile: Option<String>,
+    /// Canonical provider request fingerprint bound atomically to a
+    /// provider-selected idempotency identity. Ordinary runs leave this unset.
+    pub provider_request_fingerprint: Option<String>,
     pub events: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Result of atomically claiming a caller-selected durable run identity.
+///
+/// Provider retries use this operation to ensure exactly one request creates
+/// the run while every concurrent loser observes the immutable session bound
+/// by the winner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableRunStartClaim {
+    Started,
+    Existing {
+        session_id: String,
+        provider_request_fingerprint: Option<String>,
+    },
+    SessionMismatch {
+        bound_session_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunEventDelta {
+    pub status: String,
+    pub events: Vec<serde_json::Value>,
+}
+
+fn existing_durable_run_start_claim(
+    bound_session_id: &str,
+    provider_request_fingerprint: Option<&str>,
+    requested_session_id: Option<&str>,
+) -> DurableRunStartClaim {
+    if requested_session_id.is_some_and(|session_id| session_id != bound_session_id) {
+        DurableRunStartClaim::SessionMismatch {
+            bound_session_id: bound_session_id.to_string(),
+        }
+    } else {
+        DurableRunStartClaim::Existing {
+            session_id: bound_session_id.to_string(),
+            provider_request_fingerprint: provider_request_fingerprint.map(ToString::to_string),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1133,7 +1176,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     capability_server_refs_json, runtime_profile, created_at, updated_at";
+     capability_server_refs_json, runtime_profile, provider_request_fingerprint, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
 const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
@@ -1181,12 +1224,29 @@ pub trait RunStateStore: Send + Sync {
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
 
+    /// Atomically insert a caller-selected run identity or return the session
+    /// already bound to that identity.
+    async fn claim_run_start(
+        &self,
+        record: DurableRunRecord,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String>;
+
     /// Load a run owned by a user.
     async fn load_run(
         &self,
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
+
+    /// Load durable events strictly after an event-index cursor together with
+    /// the current run status. This is the cross-process live-attach primitive.
+    async fn load_run_event_delta(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String>;
 
     async fn load_run_control(
         &self,
@@ -1591,6 +1651,82 @@ impl InMemoryRunStateStore {
         );
         projections.insert(run.run_id.clone(), projection);
     }
+
+    async fn insert_run_record(
+        &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        let mut slots = self.execution_slots.write().await;
+        let mut runs = self.runs.write().await;
+        let run_id = record.run_id.clone();
+        if claim_existing && let Some(existing) = runs.get(&run_id) {
+            return Ok(existing_durable_run_start_claim(
+                &existing.session_id,
+                existing.provider_request_fingerprint.as_deref(),
+                requested_session_id,
+            ));
+        }
+        reconcile_in_memory_execution_slot_for_session(
+            &mut slots,
+            &runs,
+            &record.user_id,
+            &record.session_id,
+            run_requires_session_execution_slot(&record)
+                && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref()),
+        )?;
+        sync_in_memory_execution_slot(
+            &mut slots,
+            &record,
+            &record.status,
+            record.waiting_for.as_deref(),
+        )?;
+        runs.insert(run_id.clone(), record);
+        let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
+            return Err(format!(
+                "inserted run disappeared before projection sync: {run_id}"
+            ));
+        };
+
+        // Evict oldest completed/failed runs when over capacity.
+        let mut evicted_ids = Vec::new();
+        if runs.len() > Self::MAX_RUNS {
+            let mut evictable: Vec<_> = runs
+                .iter()
+                .filter(|(_, r)| durable_run_status_is_terminal(&r.status))
+                .map(|(id, r)| (id.clone(), r.updated_at.clone()))
+                .collect();
+            evictable.sort_by(|a, b| a.1.cmp(&b.1));
+            let to_remove = runs.len() - Self::MAX_RUNS;
+            for (id, _) in evictable.into_iter().take(to_remove) {
+                runs.remove(&id);
+                evicted_ids.push(id);
+            }
+        }
+        for id in &evicted_ids {
+            slots.retain(|_, owner| owner != id);
+        }
+        drop(runs);
+        drop(slots);
+        if !evicted_ids.is_empty() {
+            {
+                let mut projections = self.projections.write().await;
+                for id in &evicted_ids {
+                    projections.remove(id);
+                }
+            }
+            {
+                let mut checkpoints = self.checkpoints.write().await;
+                for id in &evicted_ids {
+                    checkpoints.remove(id);
+                }
+            }
+        }
+        self.sync_projection(&inserted, Some("run_started".to_string()), None)
+            .await;
+        Ok(DurableRunStartClaim::Started)
+    }
 }
 
 impl Default for InMemoryRunStateStore {
@@ -1945,67 +2081,18 @@ fn status_projection_patch_hash(
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
-        let mut slots = self.execution_slots.write().await;
-        let mut runs = self.runs.write().await;
-        let run_id = record.run_id.clone();
-        reconcile_in_memory_execution_slot_for_session(
-            &mut slots,
-            &runs,
-            &record.user_id,
-            &record.session_id,
-            run_requires_session_execution_slot(&record)
-                && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref()),
-        )?;
-        sync_in_memory_execution_slot(
-            &mut slots,
-            &record,
-            &record.status,
-            record.waiting_for.as_deref(),
-        )?;
-        runs.insert(run_id.clone(), record);
-        let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
-            return Err(format!(
-                "inserted run disappeared before projection sync: {run_id}"
-            ));
-        };
+        self.insert_run_record(record, false, None)
+            .await
+            .map(|_| ())
+    }
 
-        // Evict oldest completed/failed runs when over capacity
-        let mut evicted_ids = Vec::new();
-        if runs.len() > Self::MAX_RUNS {
-            let mut evictable: Vec<_> = runs
-                .iter()
-                .filter(|(_, r)| durable_run_status_is_terminal(&r.status))
-                .map(|(id, r)| (id.clone(), r.updated_at.clone()))
-                .collect();
-            evictable.sort_by(|a, b| a.1.cmp(&b.1));
-            let to_remove = runs.len() - Self::MAX_RUNS;
-            for (id, _) in evictable.into_iter().take(to_remove) {
-                runs.remove(&id);
-                evicted_ids.push(id);
-            }
-        }
-        for id in &evicted_ids {
-            slots.retain(|_, owner| owner != id);
-        }
-        drop(runs);
-        drop(slots);
-        if !evicted_ids.is_empty() {
-            {
-                let mut projections = self.projections.write().await;
-                for id in &evicted_ids {
-                    projections.remove(id);
-                }
-            }
-            {
-                let mut checkpoints = self.checkpoints.write().await;
-                for id in &evicted_ids {
-                    checkpoints.remove(id);
-                }
-            }
-        }
-        self.sync_projection(&inserted, Some("run_started".to_string()), None)
-            .await;
-        Ok(())
+    async fn claim_run_start(
+        &self,
+        record: DurableRunRecord,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record(record, true, requested_session_id)
+            .await
     }
 
     async fn load_run(
@@ -2018,6 +2105,36 @@ impl RunStateStore for InMemoryRunStateStore {
             .get(run_id)
             .filter(|run| run.user_id == user_id)
             .cloned())
+    }
+
+    async fn load_run_event_delta(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let runs = self.runs.read().await;
+        let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
+            return Ok(None);
+        };
+        let start = usize::try_from(after_event_idx.saturating_add(1)).unwrap_or(usize::MAX);
+        let events = run
+            .events
+            .iter()
+            .enumerate()
+            .skip(start)
+            .map(|(index, event)| {
+                let mut event = event.clone();
+                if let Some(object) = event.as_object_mut() {
+                    object.insert("index".to_string(), serde_json::json!(index));
+                }
+                event
+            })
+            .collect();
+        Ok(Some(DurableRunEventDelta {
+            status: run.status.clone(),
+            events,
+        }))
     }
 
     async fn update_run_status(
@@ -3910,9 +4027,35 @@ fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 
-#[async_trait]
-impl RunStateStore for DatabaseRunStateStore {
-    async fn insert_run(&self, mut record: DurableRunRecord) -> Result<(), String> {
+impl DatabaseRunStateStore {
+    async fn existing_run_start_claim(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        let existing = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "run identity conflict was reported but the existing run is unavailable: {run_id}"
+                )
+            })?;
+        Ok(existing_durable_run_start_claim(
+            &existing.session_id,
+            existing.provider_request_fingerprint.as_deref(),
+            requested_session_id,
+        ))
+    }
+
+    async fn insert_run_record(
+        &self,
+        mut record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
@@ -3960,6 +4103,81 @@ impl RunStateStore for DatabaseRunStateStore {
             let mut tx = self.pool.get().begin().await.map_err(|source| {
                 db_error("insert_run_begin", &record.run_id, source).to_string()
             })?;
+            let result = sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
+                  model_offering_id, resolved_model_name,
+                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+            )
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(&retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(lease_expires_at)
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .bind(&record.agent_binding_id)
+            .bind(&record.agent_binding_name)
+            .bind(&record.agent_binding_schema_version)
+            .bind(&record.model_offering_id)
+            .bind(&record.resolved_model_name)
+            .bind(&record.capability_server_refs_json)
+            .bind(&record.runtime_profile)
+            .bind(&record.provider_request_fingerprint)
+            .execute(&mut *tx)
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
+                    tx.rollback().await.map_err(|rollback_error| {
+                        db_error(
+                            "insert_run_rollback_existing_claim",
+                            &record.run_id,
+                            rollback_error,
+                        )
+                        .to_string()
+                    })?;
+                    return self
+                        .existing_run_start_claim(
+                            &record.user_id,
+                            &record.run_id,
+                            requested_session_id,
+                        )
+                        .await;
+                }
+                Err(source) => {
+                    tx.rollback().await.map_err(|rollback_error| {
+                        db_error("insert_run_rollback_error", &record.run_id, rollback_error)
+                            .to_string()
+                    })?;
+                    return Err(db_error("insert_run", &record.run_id, source).to_string());
+                }
+            };
             if !self
                 .acquire_session_execution_slot_tx(
                     &mut tx,
@@ -3975,59 +4193,12 @@ impl RunStateStore for DatabaseRunStateStore {
                 })?;
                 return Err("session already has an active run".to_string());
             }
-            let result = sqlx::query(
-                "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
-                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-            )
-            .bind(&record.run_id)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.parent_run_id)
-            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-            .bind(record.depth as i64)
-            .bind(&record.delegation_id)
-            .bind(&record.agent_id)
-            .bind(&record.retry_of)
-            .bind(&retry_scope)
-            .bind(&record.status)
-            .bind(&record.waiting_for)
-            .bind(&self.owner_pod_id)
-            .bind(lease_expires_at)
-            .bind(record.run_generation as i64)
-            .bind(record.last_event_idx)
-            .bind(&record.checkpoint_version)
-            .bind(&record.checkpoint_json)
-            .bind(&record.error_code)
-            .bind(&record.error_message)
-            .bind(record.retry_count as i64)
-            .bind(record.total_prompt_tokens as i64)
-            .bind(record.total_completion_tokens as i64)
-            .bind(record.total_tool_calls as i64)
-            .bind(&record.agent_binding_id)
-            .bind(&record.agent_binding_name)
-            .bind(&record.agent_binding_schema_version)
-            .bind(&record.model_offering_id)
-            .bind(&record.resolved_model_name)
-            .bind(&record.capability_server_refs_json)
-            .bind(&record.runtime_profile)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
             tx.commit().await.map_err(|source| {
                 db_error("insert_run_commit", &record.run_id, source).to_string()
             })?;
             result
         } else {
-            sqlx::query(
+            let insert_sql = if claim_existing {
                 "INSERT INTO agent_runs
                  (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
                   delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
@@ -4036,45 +4207,74 @@ impl RunStateStore for DatabaseRunStateStore {
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
                   model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-                 ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
-            )
-            .bind(&record.run_id)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.parent_run_id)
-            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-            .bind(record.depth as i64)
-            .bind(&record.delegation_id)
-            .bind(&record.agent_id)
-            .bind(&record.retry_of)
-            .bind(&retry_scope)
-            .bind(&record.status)
-            .bind(&record.waiting_for)
-            .bind(&self.owner_pod_id)
-            .bind(lease_expires_at)
-            .bind(record.run_generation as i64)
-            .bind(record.last_event_idx)
-            .bind(&record.checkpoint_version)
-            .bind(&record.checkpoint_json)
-            .bind(&record.error_code)
-            .bind(&record.error_message)
-            .bind(record.retry_count as i64)
-            .bind(record.total_prompt_tokens as i64)
-            .bind(record.total_completion_tokens as i64)
-            .bind(record.total_tool_calls as i64)
-            .bind(&record.agent_binding_id)
-            .bind(&record.agent_binding_name)
-            .bind(&record.agent_binding_schema_version)
-            .bind(&record.model_offering_id)
-            .bind(&record.resolved_model_name)
-            .bind(&record.capability_server_refs_json)
-            .bind(&record.runtime_profile)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))"
+            } else {
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                  agent_binding_id, agent_binding_name, agent_binding_schema_version,
+                  model_offering_id, resolved_model_name,
+                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 ON DUPLICATE KEY UPDATE updated_at = NOW(6)"
+            };
+            let result = sqlx::query(insert_sql)
+                .bind(&record.run_id)
+                .bind(&record.user_id)
+                .bind(&record.session_id)
+                .bind(&record.parent_run_id)
+                .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+                .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+                .bind(record.depth as i64)
+                .bind(&record.delegation_id)
+                .bind(&record.agent_id)
+                .bind(&record.retry_of)
+                .bind(&retry_scope)
+                .bind(&record.status)
+                .bind(&record.waiting_for)
+                .bind(&self.owner_pod_id)
+                .bind(lease_expires_at)
+                .bind(record.run_generation as i64)
+                .bind(record.last_event_idx)
+                .bind(&record.checkpoint_version)
+                .bind(&record.checkpoint_json)
+                .bind(&record.error_code)
+                .bind(&record.error_message)
+                .bind(record.retry_count as i64)
+                .bind(record.total_prompt_tokens as i64)
+                .bind(record.total_completion_tokens as i64)
+                .bind(record.total_tool_calls as i64)
+                .bind(&record.agent_binding_id)
+                .bind(&record.agent_binding_name)
+                .bind(&record.agent_binding_schema_version)
+                .bind(&record.model_offering_id)
+                .bind(&record.resolved_model_name)
+                .bind(&record.capability_server_refs_json)
+                .bind(&record.runtime_profile)
+                .bind(&record.provider_request_fingerprint)
+                .execute(self.pool.get())
+                .await;
+            match result {
+                Ok(result) => result,
+                Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
+                    return self
+                        .existing_run_start_claim(
+                            &record.user_id,
+                            &record.run_id,
+                            requested_session_id,
+                        )
+                        .await;
+                }
+                Err(source) => {
+                    return Err(db_error("insert_run", &record.run_id, source).to_string());
+                }
+            }
         };
         if insert_result.rows_affected() == 0 {
             return Err("session already has an active run".to_string());
@@ -4093,7 +4293,25 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await
         .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(DurableRunStartClaim::Started)
+    }
+}
+
+#[async_trait]
+impl RunStateStore for DatabaseRunStateStore {
+    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+        self.insert_run_record(record, false, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn claim_run_start(
+        &self,
+        record: DurableRunRecord,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record(record, true, requested_session_id)
+            .await
     }
 
     async fn load_run(
@@ -4126,6 +4344,41 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())?;
         Ok(Some(run))
+    }
+
+    async fn load_run_event_delta(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_idx > ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(after_event_idx)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
+        let events = rows
+            .into_iter()
+            .map(|row| decode_run_event_payload(&row, run_id))
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(DurableRunEventDelta {
+            status: run.status,
+            events,
+        }))
     }
 
     async fn load_run_control(
@@ -6484,6 +6737,12 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             "capability_server_refs_json",
         )?,
         runtime_profile: run_row_optional_string(row, operation, table, "runtime_profile")?,
+        provider_request_fingerprint: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "provider_request_fingerprint",
+        )?,
         events: Vec::new(),
         created_at: run_row_datetime_string(row, operation, table, "created_at")?,
         updated_at: run_row_datetime_string(row, operation, table, "updated_at")?,
@@ -6921,8 +7180,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         .is_none()
         && let Some(client_type) = event.get("type").and_then(serde_json::Value::as_str)
     {
-        if is_external_client_event_type(client_type) {
-            return event;
+        let is_external = is_external_client_event_type(client_type);
+        let is_tool_call_end = client_type == "tool_call_end";
+        if is_external {
+            return if is_tool_call_end {
+                project_external_tool_call_end(event)
+            } else {
+                event
+            };
         }
         // Unknown / internal event — drop.
         return serde_json::Value::Null;
@@ -7008,15 +7273,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             if let Some(tool) = data.get("tool").or_else(|| data.get("name")).cloned() {
                 out.insert("tool".to_string(), tool);
             }
-            out.insert(
-                "result".to_string(),
-                data.get("result")
-                    .or_else(|| data.get("output"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::String(String::new())),
-            );
+            let result = data
+                .get("result")
+                .or_else(|| data.get("output"))
+                .cloned()
+                .unwrap_or(serde_json::Value::String(String::new()));
+            out.insert("result".to_string(), result);
             copy_execution_boundary_fields(&mut out, &data);
-            serde_json::Value::Object(out)
+            project_external_tool_call_end(serde_json::Value::Object(out))
         }
         "run_started" => {
             let mut out = serde_json::json!({ "type": "run_started" });
@@ -7297,6 +7561,141 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
     }
 }
 
+const EXTERNAL_TOOL_EVENT_MAX_BYTES: usize = 64 * 1024;
+const EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES: usize = 48 * 1024;
+const EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+
+fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value {
+    let original_event_bytes = encoded_json_len(&event);
+    let original_event_sha256 = sha256_hex(
+        serde_json::to_string(&event)
+            .expect("serializing a serde_json::Value must not fail")
+            .as_bytes(),
+    );
+    let Some(source) = event.as_object() else {
+        return event;
+    };
+
+    let mut out = serde_json::Map::from_iter([(
+        "type".to_string(),
+        serde_json::Value::String("tool_call_end".to_string()),
+    )]);
+    for key in [
+        "call_id",
+        "tool",
+        "workspace",
+        "executor",
+        "transport",
+        "route",
+        "status",
+        "success",
+        "duration_ms",
+        "error_kind",
+        "reason",
+        "blocked",
+    ] {
+        if let Some(value) = source.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(result) = source.get("result").or_else(|| source.get("output")) {
+        let (result, evidence) = project_external_tool_result(result.clone());
+        out.insert("result".to_string(), result);
+        if let Some((original_bytes, content_sha256)) = evidence {
+            out.insert(
+                "result_truncated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            out.insert(
+                "result_bytes".to_string(),
+                serde_json::json!(original_bytes),
+            );
+            out.insert(
+                "result_sha256".to_string(),
+                serde_json::Value::String(content_sha256.clone()),
+            );
+            out.insert(
+                "result_integrity".to_string(),
+                serde_json::json!({
+                    "content_sha256": content_sha256,
+                    "sha256_encoding": "json",
+                }),
+            );
+        }
+    }
+
+    if (source.contains_key("result") && source.contains_key("output"))
+        || source.contains_key("structuredContent")
+    {
+        out.insert(
+            "payload_truncated".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        out.insert(
+            "event_bytes".to_string(),
+            serde_json::json!(original_event_bytes),
+        );
+    }
+
+    let mut projected = serde_json::Value::Object(out);
+    if encoded_json_len(&projected) > EXTERNAL_TOOL_EVENT_MAX_BYTES {
+        let call_id = source
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| truncate_utf8_bytes(value, 1024))
+            .unwrap_or_default();
+        let tool = source
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| truncate_utf8_bytes(value, 1024))
+            .unwrap_or_default();
+        projected = serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": call_id,
+            "tool": tool,
+            "payload_truncated": true,
+            "event_bytes": original_event_bytes,
+            "event_sha256": original_event_sha256,
+        });
+    }
+    assert!(
+        encoded_json_len(&projected) <= EXTERNAL_TOOL_EVENT_MAX_BYTES,
+        "external tool event projection exceeded its hard byte limit"
+    );
+    projected
+}
+
+fn project_external_tool_result(
+    result: serde_json::Value,
+) -> (serde_json::Value, Option<(usize, String)>) {
+    let encoded =
+        serde_json::to_string(&result).expect("serializing a serde_json::Value must not fail");
+    if encoded.len() <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES {
+        return (result, None);
+    }
+
+    let original_bytes = encoded.len();
+    let content_sha256 = sha256_hex(encoded.as_bytes());
+    let preview = truncate_utf8_bytes(&encoded, EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
+    (
+        serde_json::json!({
+            "type": "astra.external_tool_result_summary.v1",
+            "truncated": true,
+            "original_bytes": original_bytes,
+            "content_sha256": content_sha256,
+            "preview": preview,
+        }),
+        Some((original_bytes, content_sha256)),
+    )
+}
+
+fn encoded_json_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value)
+        .expect("serializing a serde_json::Value must not fail")
+        .len()
+}
+
 #[derive(Clone, Debug)]
 pub struct UnconfiguredRunLifecycleService;
 
@@ -7381,6 +7780,7 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     static MATRIXONE_RUN_STORE_BOOTSTRAP: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
@@ -7420,6 +7820,7 @@ mod tests {
             resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
+            provider_request_fingerprint: None,
             events: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -7548,6 +7949,7 @@ mod tests {
                 "resolved_model_name" => Some("model".to_string()),
                 "capability_server_refs_json" => Some("[]".to_string()),
                 "runtime_profile" => Some("default".to_string()),
+                "provider_request_fingerprint" => Some("fingerprint-1".to_string()),
                 "latest_event_type" => Some("text_delta".to_string()),
                 "latest_checkpoint_id" => Some("checkpoint-1".to_string()),
                 "latest_checkpoint_kind" => Some("resume".to_string()),
@@ -7688,6 +8090,68 @@ mod tests {
                     )
                 });
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_start_claim_is_atomic_for_concurrent_provider_retries() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-claim-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-claim-session-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-claim-run-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query(
+            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean provider claim slot");
+
+        let claim = |store: DatabaseRunStateStore| {
+            let user_id = user_id.clone();
+            let session_id = session_id.clone();
+            let run_id = run_id.clone();
+            async move {
+                let mut record = durable_run_record(&run_id);
+                record.user_id = user_id;
+                record.session_id = session_id.clone();
+                store.claim_run_start(record, Some(&session_id)).await
+            }
+        };
+        let (first, second) = tokio::join!(claim(store.clone()), claim(store.clone()));
+        let outcomes = [first.expect("first claim"), second.expect("second claim")];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DurableRunStartClaim::Started)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    **outcome
+                        == DurableRunStartClaim::Existing {
+                            session_id: session_id.clone(),
+                            provider_request_fingerprint: None,
+                        }
+                })
+                .count(),
+            1
+        );
+
+        sqlx::query(
+            "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("remove provider claim slot");
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
 
     #[test]
@@ -7839,6 +8303,10 @@ mod tests {
             record.owner_lease_expires_at.as_deref(),
             Some("2026-06-26 12:02:00")
         );
+        assert_eq!(
+            record.provider_request_fingerprint.as_deref(),
+            Some("fingerprint-1")
+        );
         assert_eq!(record.created_at, "2026-06-26 12:00:00");
         assert_eq!(record.updated_at, "2026-06-26 12:01:00");
 
@@ -7875,6 +8343,7 @@ mod tests {
             "resolved_model_name",
             "capability_server_refs_json",
             "runtime_profile",
+            "provider_request_fingerprint",
             "created_at",
             "updated_at",
         ] {
@@ -8330,6 +8799,108 @@ mod tests {
             run_owner_lease_renewal_interval(Duration::from_secs(300)),
             Duration::from_secs(15),
             "very long leases should not make active-run heartbeat too sparse"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_run_start_claim_is_atomic_for_concurrent_same_session_retries() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let claim = |store: Arc<InMemoryRunStateStore>, barrier: Arc<tokio::sync::Barrier>| async move {
+            let mut record = durable_run_record("provider-task-1");
+            record.session_id = "provider-session-1".to_string();
+            barrier.wait().await;
+            store
+                .claim_run_start(record, Some("provider-session-1"))
+                .await
+        };
+        let (first, second) = tokio::join!(
+            claim(Arc::clone(&store), Arc::clone(&barrier)),
+            claim(Arc::clone(&store), Arc::clone(&barrier)),
+        );
+        let outcomes = [first.expect("first claim"), second.expect("second claim")];
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DurableRunStartClaim::Started)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    **outcome
+                        == DurableRunStartClaim::Existing {
+                            session_id: "provider-session-1".to_string(),
+                            provider_request_fingerprint: None,
+                        }
+                })
+                .count(),
+            1
+        );
+        assert_eq!(store.runs.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_run_start_claim_rejects_concurrent_session_mismatch_atomically() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let claim = |session_id: &'static str,
+                     store: Arc<InMemoryRunStateStore>,
+                     barrier: Arc<tokio::sync::Barrier>| async move {
+            let mut record = durable_run_record("provider-task-2");
+            record.session_id = session_id.to_string();
+            barrier.wait().await;
+            (
+                session_id,
+                store
+                    .claim_run_start(record, Some(session_id))
+                    .await
+                    .expect("run start claim"),
+            )
+        };
+        let (first, second) = tokio::join!(
+            claim(
+                "provider-session-a",
+                Arc::clone(&store),
+                Arc::clone(&barrier)
+            ),
+            claim(
+                "provider-session-b",
+                Arc::clone(&store),
+                Arc::clone(&barrier)
+            ),
+        );
+        let outcomes = [first, second];
+        let winning_session = outcomes
+            .iter()
+            .find_map(|(session_id, outcome)| {
+                (outcome == &DurableRunStartClaim::Started).then_some(*session_id)
+            })
+            .expect("one claim starts the run");
+        let bound_session = outcomes
+            .iter()
+            .find_map(|(_, outcome)| match outcome {
+                DurableRunStartClaim::SessionMismatch { bound_session_id } => {
+                    Some(bound_session_id.as_str())
+                }
+                DurableRunStartClaim::Started | DurableRunStartClaim::Existing { .. } => None,
+            })
+            .expect("one claim rejects the mismatched session");
+
+        assert_eq!(bound_session, winning_session);
+        assert_eq!(
+            store
+                .load_run("u1", "provider-task-2")
+                .await
+                .expect("load claimed run")
+                .expect("claimed run exists")
+                .session_id,
+            winning_session
         );
     }
 
@@ -9750,6 +10321,140 @@ mod tests {
         assert_eq!(version, "phase_checkpoint_v1");
     }
 
+    #[test]
+    fn large_tool_results_are_bounded_on_the_external_client_surface() {
+        let output = "界".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
+        let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
+            .expect("serialize test result")
+            .len();
+
+        let transformed = transform_run_event_for_client(make_event(
+            "tool_result",
+            json!({
+                "tool_call_id": "call-large",
+                "name": "read_catalog_file_pages",
+                "output": output,
+                "success": true,
+            }),
+        ));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["call_id"], "call-large");
+        assert_eq!(transformed["result_truncated"], true);
+        assert_eq!(transformed["result_bytes"], original_bytes);
+        assert!(transformed.get("evidence_ref").is_none());
+        assert_eq!(
+            transformed["result_integrity"]["content_sha256"],
+            transformed["result_sha256"]
+        );
+        assert_eq!(transformed["result_integrity"]["sha256_encoding"], "json");
+        assert_eq!(
+            transformed["result"]["type"],
+            "astra.external_tool_result_summary.v1"
+        );
+        assert_eq!(transformed["result"]["truncated"], true);
+        assert_eq!(transformed["result"]["original_bytes"], original_bytes);
+        let preview = transformed["result"]["preview"]
+            .as_str()
+            .expect("summary preview");
+        assert!(preview.len() <= EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(
+            serde_json::to_vec(&transformed)
+                .expect("serialize transformed event")
+                .len()
+                < 16 * 1024
+        );
+    }
+
+    #[test]
+    fn large_client_shaped_tool_call_end_is_bounded() {
+        let output = "x".repeat(2 * 1024 * 1024);
+        let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
+            .expect("serialize test result")
+            .len();
+
+        let transformed = transform_run_event_for_client(json!({
+            "type": "tool_call_end",
+            "call_id": "call-live-large",
+            "tool": "read_catalog_file_pages",
+            "result": output,
+            "success": true,
+        }));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["call_id"], "call-live-large");
+        assert_eq!(transformed["result_truncated"], true);
+        assert_eq!(transformed["result_bytes"], original_bytes);
+        assert_eq!(
+            transformed["result"]["type"],
+            "astra.external_tool_result_summary.v1"
+        );
+        assert!(
+            serde_json::to_vec(&transformed)
+                .expect("serialize transformed event")
+                .len()
+                < 16 * 1024
+        );
+    }
+
+    #[test]
+    fn large_structured_tool_payload_is_not_duplicated_on_external_surface() {
+        let structured_content = json!({
+            "pages": [{
+                "file_id": "file-1",
+                "page_number": 224,
+                "content": "x".repeat(2 * 1024 * 1024),
+            }]
+        });
+        let transformed = transform_run_event_for_client(json!({
+            "type": "tool_call_end",
+            "call_id": "call-live-structured",
+            "tool": "read_catalog_file_pages",
+            "result": "x".repeat(100_000),
+            "output": structured_content,
+            "structuredContent": structured_content,
+            "success": true,
+        }));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["result_truncated"], true);
+        assert_eq!(transformed["payload_truncated"], true);
+        assert!(transformed["event_bytes"].as_u64().unwrap_or_default() > 4 * 1024 * 1024);
+        assert!(transformed.get("output").is_none());
+        assert!(transformed.get("structuredContent").is_none());
+        assert!(
+            encoded_json_len(&transformed) < 16 * 1024,
+            "projected event was {} bytes",
+            encoded_json_len(&transformed)
+        );
+    }
+
+    #[test]
+    fn adversarial_tool_call_end_extensions_cannot_exceed_external_event_limit() {
+        let transformed = transform_run_event_for_client(json!({
+            "type": "tool_call_end",
+            "call_id": "call-adversarial",
+            "tool": "python",
+            "result": {"ok": true},
+            "success": true,
+            "provider_metadata": "x".repeat(4 * 1024 * 1024),
+            "unknown_extension": {
+                "nested": "y".repeat(4 * 1024 * 1024),
+            },
+        }));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["call_id"], "call-adversarial");
+        assert!(transformed.get("provider_metadata").is_none());
+        assert!(transformed.get("unknown_extension").is_none());
+        assert!(
+            encoded_json_len(&transformed) <= EXTERNAL_TOOL_EVENT_MAX_BYTES,
+            "projected event was {} bytes",
+            encoded_json_len(&transformed)
+        );
+    }
+
     /// Covers all event types that reach the client via transform_run_event_for_client:
     /// type mapping, field preservation, pass-through, drop, and error-surface semantics.
     #[test]
@@ -10651,6 +11356,7 @@ mod tests {
                     resolved_model_name: None,
                     capability_server_refs_json: None,
                     runtime_profile: None,
+                    provider_request_fingerprint: None,
                     events: vec![],
                     created_at: chrono::Utc::now().to_rfc3339(),
                     updated_at: chrono::Utc::now().to_rfc3339(),

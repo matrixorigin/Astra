@@ -298,6 +298,7 @@ mod tests {
             capability_server_refs_json: (depth > 0)
                 .then(|| r#"{"mcp":"mcp-main","skills":"skills-main"}"#.into()),
             runtime_profile: Some("server".into()),
+            provider_request_fingerprint: None,
             events: Vec::new(),
             created_at: format!("2026-07-11T00:00:0{depth}Z"),
             updated_at: format!("2026-07-11T00:01:0{depth}Z"),

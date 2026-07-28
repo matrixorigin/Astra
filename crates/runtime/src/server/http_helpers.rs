@@ -375,4 +375,54 @@ mod tests {
             "client-shaped error should force an immediate failed terminal event: {text}"
         );
     }
+
+    #[tokio::test]
+    async fn streaming_response_bounds_multiple_large_tool_results() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        for index in 1..=2 {
+            let structured_content = serde_json::json!({
+                "pages": [{
+                    "file_id": format!("file-{index}"),
+                    "page_number": 200 + index,
+                    "content": "x".repeat(2 * 1024 * 1024),
+                }]
+            });
+            tx.send(serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": format!("call-{index}"),
+                "tool": "read_catalog_file_pages",
+                "result": "x".repeat(100_000),
+                "output": structured_content,
+                "structuredContent": structured_content,
+                "success": true,
+            }))
+            .await
+            .expect("queue tool result");
+        }
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "index": 3,
+            "data": {}
+        }))
+        .await
+        .expect("queue terminal event");
+        drop(tx);
+
+        let response = sse_streaming_response("session-large".into(), "run-large".into(), rx);
+        let body = body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("bounded SSE body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 SSE body");
+
+        assert!(
+            body.len() < 64 * 1024,
+            "external SSE body was {} bytes",
+            body.len()
+        );
+        assert_eq!(text.matches("\"result_truncated\":true").count(), 2);
+        assert_eq!(text.matches("\"payload_truncated\":true").count(), 2);
+        assert!(!text.contains("structuredContent"));
+        assert!(text.contains("\"type\":\"run_finished\""));
+        assert!(text.contains("\"status\":\"completed\""));
+    }
 }

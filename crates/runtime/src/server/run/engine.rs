@@ -37,11 +37,12 @@ use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
-        DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
-        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
-        RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
-        RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
+        DurableRunEventDelta, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
+        DurableRunListPage, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
+        GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
+        RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
+        RunListCursor, RunStateStore, RuntimeProfileRequest, TurnIntentExecutionPolicy,
+        durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -156,6 +157,7 @@ pub struct RunStartContext {
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
+    pub provider_request_fingerprint: Option<String>,
 }
 
 fn durable_model_identity(
@@ -411,6 +413,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
             data.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
+    if let Some(fingerprint) = context.provider_request_fingerprint.as_ref() {
+        data.insert(
+            "provider_request_fingerprint".to_string(),
+            serde_json::Value::String(fingerprint.clone()),
+        );
+    }
     if let Some(agent_binding_id) = context.agent_binding_id.as_ref() {
         data.insert(
             "agent_binding_id".to_string(),
@@ -636,8 +644,61 @@ impl RunEngine {
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
         retry_of: Option<&str>,
-        mut context: RunStartContext,
+        context: RunStartContext,
     ) -> Result<(), String> {
+        let record = self
+            .build_run_start_record(
+                run_id,
+                user_id,
+                session_id,
+                parent_run_id,
+                delegation_id,
+                agent_id,
+                retry_of,
+                context,
+            )
+            .await?;
+        self.store.insert_run(record).await?;
+        self.project_delegation_run_if_needed(user_id, run_id, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically claim a provider-selected run identity or observe the
+    /// immutable session already bound by a concurrent/retried request.
+    pub async fn claim_run_with_context(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        requested_session_id: Option<&str>,
+        context: RunStartContext,
+    ) -> Result<DurableRunStartClaim, String> {
+        let record = self
+            .build_run_start_record(run_id, user_id, session_id, None, None, None, None, context)
+            .await?;
+        let claim = self
+            .store
+            .claim_run_start(record, requested_session_id)
+            .await?;
+        if claim == DurableRunStartClaim::Started {
+            self.project_delegation_run_if_needed(user_id, run_id, None)
+                .await?;
+        }
+        Ok(claim)
+    }
+
+    async fn build_run_start_record(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+        retry_of: Option<&str>,
+        mut context: RunStartContext,
+    ) -> Result<DurableRunRecord, String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
             let parent = self
@@ -706,6 +767,7 @@ impl RunEngine {
             resolved_model_name,
             capability_server_refs_json,
             runtime_profile,
+            provider_request_fingerprint: context.provider_request_fingerprint,
             events: vec![serde_json::json!({
                 "event_type": "run_started",
                 "data": run_started_data
@@ -713,10 +775,7 @@ impl RunEngine {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(user_id, run_id, None)
-            .await?;
-        Ok(())
+        Ok(record)
     }
 
     /// Persist a status change to the durable store.
@@ -1333,6 +1392,17 @@ impl RunEngine {
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
         self.store.load_run(user_id, run_id).await
+    }
+
+    pub async fn load_run_event_delta(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        self.store
+            .load_run_event_delta(user_id, run_id, after_event_idx)
+            .await
     }
 
     /// Lightweight shared-state check used by durable interaction waiters.
@@ -2573,12 +2643,33 @@ mod tests {
             self.inner.insert_run(record).await
         }
 
+        async fn claim_run_start(
+            &self,
+            record: DurableRunRecord,
+            requested_session_id: Option<&str>,
+        ) -> Result<DurableRunStartClaim, String> {
+            self.inner
+                .claim_run_start(record, requested_session_id)
+                .await
+        }
+
         async fn load_run(
             &self,
             user_id: &str,
             run_id: &str,
         ) -> Result<Option<DurableRunRecord>, String> {
             self.inner.load_run(user_id, run_id).await
+        }
+
+        async fn load_run_event_delta(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            after_event_idx: i64,
+        ) -> Result<Option<DurableRunEventDelta>, String> {
+            self.inner
+                .load_run_event_delta(user_id, run_id, after_event_idx)
+                .await
         }
 
         async fn update_run_status(
@@ -2866,11 +2957,28 @@ mod tests {
             Err("store unavailable".into())
         }
 
+        async fn claim_run_start(
+            &self,
+            _record: DurableRunRecord,
+            _requested_session_id: Option<&str>,
+        ) -> Result<DurableRunStartClaim, String> {
+            Err("store unavailable".into())
+        }
+
         async fn load_run(
             &self,
             _user_id: &str,
             _run_id: &str,
         ) -> Result<Option<DurableRunRecord>, String> {
+            Err("load failed".into())
+        }
+
+        async fn load_run_event_delta(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _after_event_idx: i64,
+        ) -> Result<Option<DurableRunEventDelta>, String> {
             Err("load failed".into())
         }
 
@@ -4988,6 +5096,7 @@ mod tests {
                 resolved_model_name: None,
                 capability_server_refs_json: None,
                 runtime_profile: None,
+                provider_request_fingerprint: None,
                 events: vec![serde_json::json!({"event_type":"run_started","data":{}})],
                 created_at: now.clone(),
                 updated_at: now,

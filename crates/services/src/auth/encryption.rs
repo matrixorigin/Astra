@@ -1,7 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use fernet::Fernet;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::env;
+
+type HmacSha256 = Hmac<Sha256>;
 
 pub(super) fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -10,6 +13,7 @@ pub(super) fn sha256_hex(value: &str) -> String {
 #[derive(Clone)]
 pub struct FernetTokenEncryptor {
     fernet: Fernet,
+    digest_key: [u8; 32],
 }
 
 impl FernetTokenEncryptor {
@@ -31,10 +35,11 @@ impl FernetTokenEncryptor {
     }
 
     pub fn new(secret_key: &str) -> Result<Self, String> {
+        let digest_key: [u8; 32] = Sha256::digest(secret_key.as_bytes()).into();
         let derived_key = derive_fernet_key(secret_key);
         let fernet = Fernet::new(&derived_key)
             .ok_or_else(|| "failed to initialize fernet token encryptor".to_string())?;
-        Ok(Self { fernet })
+        Ok(Self { fernet, digest_key })
     }
 
     pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
@@ -48,11 +53,21 @@ impl FernetTokenEncryptor {
             .map_err(|e| format!("decryption failed: {}", e))?;
         String::from_utf8(bytes).map_err(|e| format!("decrypted data is not valid UTF-8: {}", e))
     }
+
+    /// Produce a stable, server-keyed digest for identity-bearing values that
+    /// must participate in equality checks without being stored in plaintext.
+    pub fn keyed_digest(&self, domain: &str, value: &str) -> String {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts a 32-byte key");
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        format!("{:x}", mac.finalize().into_bytes())
+    }
 }
 
 fn derive_fernet_key(secret_key: &str) -> String {
-    let digest = Sha256::digest(secret_key.as_bytes());
-    URL_SAFE.encode(digest)
+    URL_SAFE.encode(Sha256::digest(secret_key.as_bytes()))
 }
 
 #[cfg(test)]
@@ -102,6 +117,26 @@ mod tests {
             let ciphertext = enc.encrypt(text).unwrap();
             assert_eq!(enc.decrypt(&ciphertext).unwrap(), *text);
         }
+    }
+
+    #[test]
+    fn keyed_digest_is_stable_domain_separated_and_keyed() {
+        let first = make_encryptor("key-one");
+        let same = make_encryptor("key-one");
+        let other = make_encryptor("key-two");
+
+        assert_eq!(
+            first.keyed_digest("provider-header", "workspace-1"),
+            same.keyed_digest("provider-header", "workspace-1")
+        );
+        assert_ne!(
+            first.keyed_digest("provider-header", "workspace-1"),
+            first.keyed_digest("provider-query", "workspace-1")
+        );
+        assert_ne!(
+            first.keyed_digest("provider-header", "workspace-1"),
+            other.keyed_digest("provider-header", "workspace-1")
+        );
     }
 
     #[test]

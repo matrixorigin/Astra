@@ -29,8 +29,9 @@ use super::execution_phase::{
 };
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
-    finalize_turn_trace, publish_introspect_snapshot, record_edge_tool_observability,
+    ControlToolRecovery, MAX_TRACKED_FILE_READS, ToolCallAdmission, extract_file_path_from_tool,
+    finalize_and_render, finalize_turn_trace, publish_introspect_snapshot,
+    record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use crate::turn::inspection_service::InspectionService;
@@ -1065,7 +1066,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 ) -> Result<TurnToolPhaseControl, String> {
     let TurnExecutionPhase {
         llm_wall_start,
-        turn_result,
+        mut turn_result,
     } = phase;
 
     // ── Budget wrapup enforcement (Task #43 hybrid) ───────────────────
@@ -1161,6 +1162,18 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
+    let ToolCallAdmission { admitted, rejected } = host.admit_tool_calls(
+        &turn_result.accum.tool_calls,
+        state.last_finish_reason.as_deref(),
+    );
+    turn_result.accum.tool_calls = admitted;
+    if !turn_result.accum.tool_calls.is_empty() {
+        turn_result.edge_tool_round.extend(
+            host.handle_admitted_tool_calls(state, &turn_result.accum.tool_calls)
+                .await,
+        );
+    }
+
     let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
         turn_index,
         &turn_result.accum.tool_calls,
@@ -1204,6 +1217,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state,
         &turn_result,
         &effective_tool_calls,
+        rejected,
         delegation_intercepted,
         &valid_tool_names,
     )
@@ -1689,16 +1703,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
-    if let Some(tool_name) =
+    if let Some(completion) =
         host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results)
     {
+        if let Some(final_text) = completion.final_text {
+            state.final_text = final_text;
+            state.final_text_streamed = false;
+        }
         tracing::info!(
             target: "astra_runtime::agentic_loop_tool_phase",
-            tool_name,
+            tool_name = completion.tool_name,
             "terminating turn after provider-declared successful tool result"
         );
         state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
+        finalize_and_render(host, state).await;
         refresh_runtime_promotion_signals_from_db(state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }

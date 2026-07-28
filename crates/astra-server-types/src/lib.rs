@@ -106,6 +106,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
     #[serde(default)]
+    pub resolved_model_selection: Option<astra_services::runs::ResolvedModelSelection>,
+    #[serde(default)]
     pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
     pub agent_binding: Option<astra_services::runs::AgentBindingRuntimeRequest>,
@@ -1230,7 +1232,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         agent_id: request.agent_id,
         model: None,
         model_selection: request.model_selection,
-        resolved_model_selection: None,
+        resolved_model_selection: request.resolved_model_selection,
         admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,
         provider_runtime_authorized: false,

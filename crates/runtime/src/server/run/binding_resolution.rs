@@ -247,6 +247,7 @@ pub(crate) fn run_start_context_from_request(
             .as_ref()
             .map(|binding| binding.capability_server_refs.clone()),
         runtime_profile: effective_runtime_profile(request),
+        provider_request_fingerprint: None,
     }
 }
 

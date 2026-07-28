@@ -1150,11 +1150,17 @@ impl RuntimeToolExecutor {
         &self,
         name: &str,
         args: &Value,
+        tool_call_id: Option<&str>,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
     ) -> astra_tools::ToolResult {
         if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
+            let Some(tool_call_id) = tool_call_id else {
+                return astra_tools::ToolResult::error(format!(
+                    "Agent Binding MCP tool '{name}' is missing its trusted tool call identity."
+                ));
+            };
             return match agent_binding_mcp
-                .call_tool_by_mcp_name(name, args, semantic_read_condition)
+                .call_tool_by_mcp_name(name, args, tool_call_id, semantic_read_condition)
                 .await
             {
                 Ok(result) => tool_result_from_mcp_tool_call_result(result),
@@ -3013,7 +3019,7 @@ impl RuntimeToolExecutor {
 }
 
 fn non_empty_identity(value: &str) -> Option<&str> {
-    (!value.is_empty()).then_some(value)
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn dedupe_tool_schema_pool(pool: &mut Vec<Value>) {
@@ -3248,6 +3254,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                 .execute_mcp_tool(
                     &request.tool_name,
                     &request.args,
+                    non_empty_identity(&request.tool_call_id),
                     request.policy.semantic_read_condition.as_ref(),
                 )
                 .await;
@@ -9530,6 +9537,48 @@ esac
         assert_eq!(
             actual.output, expected.output,
             "server-local transport must not maintain a second divergent executor readiness path"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_local_agent_binding_mcp_rejects_blank_tool_call_identity() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate an expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        let mut request = exec.tool_execution_request("mcp__calculator", &json!({"expr": "1+1"}));
+        request.tool_call_id = " \t".to_string();
+
+        let result =
+            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
+                &exec,
+                &request,
+                None,
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("missing its trusted tool call identity"),
+            "blank identity must fail before Agent Binding transport: {}",
+            result.output
         );
     }
 

@@ -130,9 +130,18 @@ pub struct ResolvedSkill {
 }
 
 /// Resolves skill names to instructions.
+#[async_trait]
 pub trait SkillResolver: Send + Sync {
-    /// Resolve a skill by name, loading instructions if needed.
+    /// Resolve locally available metadata and instructions by name.
     fn resolve(&self, name: &str) -> Result<ResolvedSkill, SkillError>;
+
+    /// Load the full instructions when the skill is selected for execution.
+    ///
+    /// Local resolvers use the synchronous resolution result. Remote catalog
+    /// resolvers override this method to fetch the selected skill lazily.
+    async fn resolve_for_execution(&self, name: &str) -> Result<ResolvedSkill, SkillError> {
+        self.resolve(name)
+    }
 
     /// List available skills for schema generation.
     fn available_skills(&self) -> Vec<SkillToolInfo>;

@@ -181,6 +181,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         resolved_model_name: None,
         capability_server_refs_json: None,
         runtime_profile: None,
+        provider_request_fingerprint: None,
         events: vec![json!({"event_type": "run_started", "data": {"source": "joint_e2e"}})],
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),

@@ -37,6 +37,8 @@ const AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION: &str =
 const AGENT_BINDING_SEMANTIC_READ_PREPARE_METHOD: &str = "astra/semantic-read/prepare";
 const AGENT_BINDING_SEMANTIC_READ_COMPONENT: &str = "provider_runtime_descriptor.semantic_read";
 const AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY: &str = "astra.semantic_read_condition";
+const AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE: &str = "astra.agent_binding.effect";
+const AGENT_BINDING_EFFECT_EXTENSION_FIELD: &str = "side_effect_class";
 
 static AGENT_BINDING_MCP_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -122,6 +124,10 @@ fn resolve_agent_binding_mcp_snapshot(
             ProviderClaimTrust::Trusted,
         );
     }
+    trust_policy.provider_extensions.insert(
+        AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE.to_string(),
+        ProviderClaimTrust::Trusted,
+    );
     resolve_mcp_snapshot_with_policy(discovery, aliases, trust_policy)
 }
 
@@ -150,7 +156,102 @@ pub(crate) struct AgentBindingMcpRuntime {
 #[derive(Clone, Debug, PartialEq)]
 struct AgentBindingMcpTool {
     tool: McpTool,
+    side_effect_class: Option<AgentBindingSideEffectClass>,
     metadata: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentBindingSideEffectClass {
+    Read,
+    Write,
+    ExternalEffect,
+}
+
+impl AgentBindingSideEffectClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ExternalEffect => "external_effect",
+        }
+    }
+}
+
+fn parse_agent_binding_side_effect_class(
+    tool_name: &str,
+    value: Option<&Value>,
+) -> Result<Option<AgentBindingSideEffectClass>, AgentBindingMcpRpcError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value == "read" => {
+            Ok(Some(AgentBindingSideEffectClass::Read))
+        }
+        Some(Value::String(value)) if value == "write" => {
+            Ok(Some(AgentBindingSideEffectClass::Write))
+        }
+        Some(Value::String(value)) if value == "external_effect" => {
+            Ok(Some(AgentBindingSideEffectClass::ExternalEffect))
+        }
+        Some(Value::String(value)) => Err(agent_binding_mcp_rpc_error(format!(
+            "Agent Binding MCP tool '{tool_name}' has unsupported side_effect_class '{value}'"
+        ))),
+        Some(_) => Err(agent_binding_mcp_rpc_error(format!(
+            "Agent Binding MCP tool '{tool_name}' side_effect_class must be a string"
+        ))),
+    }
+}
+
+fn apply_agent_binding_side_effect_contract(
+    declaration: &mut astra_turn_types::ProviderToolDeclaration,
+    side_effect_class: AgentBindingSideEffectClass,
+) {
+    let source = || ProviderClaimSource::ProviderExtension {
+        namespace: AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE.to_string(),
+        field: AGENT_BINDING_EFFECT_EXTENSION_FIELD.to_string(),
+    };
+    match side_effect_class {
+        AgentBindingSideEffectClass::Read => {
+            declaration.claims.read_only = Some(ProviderClaim::new(true, source()));
+            declaration.claims.destructive = Some(ProviderClaim::new(false, source()));
+            declaration.claims.idempotent = Some(ProviderClaim::new(true, source()));
+        }
+        AgentBindingSideEffectClass::Write => {
+            declaration.claims.read_only = Some(ProviderClaim::new(false, source()));
+            declaration.claims.idempotent = Some(ProviderClaim::new(false, source()));
+        }
+        AgentBindingSideEffectClass::ExternalEffect => {
+            declaration.claims.read_only = Some(ProviderClaim::new(false, source()));
+            declaration.claims.idempotent = Some(ProviderClaim::new(false, source()));
+            declaration.claims.open_world = Some(ProviderClaim::new(true, source()));
+        }
+    }
+    declaration.extension_fields.insert(
+        AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE.to_string(),
+        json!({
+            (AGENT_BINDING_EFFECT_EXTENSION_FIELD): side_effect_class.as_str(),
+        }),
+    );
+}
+
+fn agent_binding_tools_to_provider_declarations(
+    tools: &[AgentBindingMcpTool],
+) -> Result<Vec<astra_turn_types::ProviderToolDeclaration>, astra_turn_types::ProviderContractError>
+{
+    tools
+        .iter()
+        .map(|tool| {
+            let mut declaration = mcp_tool_to_provider_declaration(&tool.tool)?;
+            if let Some(metadata) = &tool.metadata {
+                declaration
+                    .extension_fields
+                    .insert("astra.agent_binding.metadata".to_string(), metadata.clone());
+            }
+            if let Some(side_effect_class) = tool.side_effect_class {
+                apply_agent_binding_side_effect_contract(&mut declaration, side_effect_class);
+            }
+            Ok(declaration)
+        })
+        .collect()
 }
 
 fn apply_agent_binding_semantic_read_contract(
@@ -976,6 +1077,12 @@ fn parse_agent_binding_mcp_tools(
         {
             normalized.insert("outputSchema".to_string(), output_schema);
         }
+        let tool_name = normalized
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let side_effect_class =
+            parse_agent_binding_side_effect_class(tool_name, normalized.get("side_effect_class"))?;
         let metadata = normalized.get("metadata").cloned();
         let tool =
             serde_json::from_value::<McpTool>(Value::Object(normalized)).map_err(|error| {
@@ -988,7 +1095,11 @@ fn parse_agent_binding_mcp_tools(
                 "Agent Binding MCP tool name must not be empty",
             ));
         }
-        parsed.push(AgentBindingMcpTool { tool, metadata });
+        parsed.push(AgentBindingMcpTool {
+            tool,
+            side_effect_class,
+            metadata,
+        });
     }
     Ok(parsed)
 }
@@ -1026,13 +1137,14 @@ fn agent_binding_tools_to_schemas_checked(
         {
             control_tools.push(descriptor);
         }
-        if crate::turn::tool_completion::stop_after_success_from_metadata(
-            name,
-            tool.metadata.as_ref(),
-        )
-        .map_err(|error| (error.to_string(), error.error_code()))?
+        if let Some(descriptor) =
+            crate::turn::tool_completion::RuntimeStopAfterSuccessToolDescriptor::from_metadata(
+                name,
+                tool.metadata.as_ref(),
+            )
+            .map_err(|error| (error.to_string(), error.error_code()))?
         {
-            stop_after_success_tools.push(name.to_string());
+            stop_after_success_tools.push(descriptor);
         }
         schemas.push(schema);
     }
@@ -1156,8 +1268,14 @@ impl AgentBindingMcpRuntime {
         &self,
         public_name: &str,
         args: &Value,
+        tool_call_id: &str,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
+        if tool_call_id.trim().is_empty() {
+            return Err(agent_binding_mcp_rpc_error(
+                "Agent Binding MCP tool call identity is required",
+            ));
+        }
         let tool_name = self
             .tool_names_by_public_name
             .get(public_name)
@@ -1165,6 +1283,7 @@ impl AgentBindingMcpRuntime {
         let mut params = json!({
             "name": tool_name,
             "arguments": agent_binding_tool_call_arguments(args),
+            "call_id": tool_call_id,
         });
         if let Some(condition) = semantic_read_condition {
             params["_meta"] = json!({
@@ -1369,19 +1488,8 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
     let (_adapter_schemas, control_tools, stop_after_success_tools) =
         agent_binding_tools_to_schemas_checked(&tool_namespace, &tools)
             .map_err(|(error, code)| mcp_error(StatusCode::BAD_GATEWAY, error, code))?;
-    let mut declarations = tools
-        .iter()
-        .map(|tool| {
-            let mut declaration = mcp_tool_to_provider_declaration(&tool.tool)?;
-            if let Some(metadata) = &tool.metadata {
-                declaration
-                    .extension_fields
-                    .insert("astra.agent_binding.metadata".to_string(), metadata.clone());
-            }
-            Ok(declaration)
-        })
-        .collect::<Result<Vec<_>, astra_turn_types::ProviderContractError>>()
-        .map_err(|error| {
+    let mut declarations =
+        agent_binding_tools_to_provider_declarations(&tools).map_err(|error| {
             mcp_error(
                 StatusCode::BAD_GATEWAY,
                 format!("invalid Agent Binding MCP discovery: {error}"),
@@ -1537,6 +1645,102 @@ mod tests {
         assert!(!acknowledged_provider_error.side_effects_maybe());
     }
 
+    #[test]
+    fn agent_binding_side_effect_classes_resolve_into_provider_policy() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [
+                {
+                    "name": "read-data",
+                    "inputSchema": {"type": "object"},
+                    "side_effect_class": "read"
+                },
+                {
+                    "name": "write-file",
+                    "inputSchema": {"type": "object"},
+                    "side_effect_class": "write"
+                },
+                {
+                    "name": "send-message",
+                    "inputSchema": {"type": "object"},
+                    "side_effect_class": "external_effect"
+                }
+            ]
+        }))
+        .expect("valid discovery response");
+        let declarations = agent_binding_tools_to_provider_declarations(&tools)
+            .expect("valid provider declarations");
+        let discovery = ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("provider-1").unwrap(),
+            ProviderBindingRef::new("provider-1").unwrap(),
+            ProviderProtocolId::new("mcp").unwrap(),
+            declarations,
+        )
+        .unwrap();
+        let resolved = resolve_agent_binding_mcp_snapshot("provider", &discovery, false)
+            .expect("side-effect extension must resolve");
+        let by_name = resolved
+            .descriptors
+            .iter()
+            .map(|descriptor| (descriptor.native_tool_name.as_str(), descriptor))
+            .collect::<HashMap<_, _>>();
+
+        let read = by_name["read-data"];
+        assert_eq!(
+            read.semantic_baseline.effect,
+            astra_turn_types::ResolvedToolEffect::ReadOnly
+        );
+        assert_eq!(
+            read.semantic_baseline.idempotency,
+            astra_turn_types::ResolvedToolIdempotency::PureRead
+        );
+        assert_eq!(
+            read.semantic_baseline.concurrency,
+            astra_turn_types::ResolvedConcurrencyBaseline::ParallelReadOnly
+        );
+
+        for name in ["write-file", "send-message"] {
+            let descriptor = by_name[name];
+            assert_eq!(
+                descriptor.semantic_baseline.effect,
+                astra_turn_types::ResolvedToolEffect::Mutating
+            );
+            assert_eq!(
+                descriptor.semantic_baseline.idempotency,
+                astra_turn_types::ResolvedToolIdempotency::NonIdempotent
+            );
+            assert_eq!(
+                descriptor.semantic_baseline.concurrency,
+                astra_turn_types::ResolvedConcurrencyBaseline::Serial
+            );
+        }
+        assert_eq!(
+            by_name["send-message"]
+                .extension_fields
+                .get(AGENT_BINDING_EFFECT_EXTENSION_NAMESPACE)
+                .and_then(|value| value.get(AGENT_BINDING_EFFECT_EXTENSION_FIELD))
+                .and_then(Value::as_str),
+            Some("external_effect")
+        );
+    }
+
+    #[test]
+    fn agent_binding_discovery_rejects_unknown_side_effect_class() {
+        let error = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "unsafe-tool",
+                "inputSchema": {"type": "object"},
+                "side_effect_class": "mutation"
+            }]
+        }))
+        .expect_err("unknown side effect class must fail discovery");
+
+        assert!(
+            error
+                .detail
+                .contains("unsupported side_effect_class 'mutation'")
+        );
+    }
+
     #[tokio::test]
     async fn agent_binding_rpc_deadline_preserves_effect_specific_certainty() {
         use axum::{Router, routing::post};
@@ -1630,8 +1834,10 @@ mod tests {
                 },
                 "metadata": {
                     "stop_after_success": true,
+                    "success_final_template": "{{message}}",
                     "control": {
                         "kind": "moi.control.handoff.v1",
+                        "target": "agent_authoring",
                         "terminal": true,
                         "policy_id": "authoring.handoff.v1",
                         "ui_visibility": "hidden"
@@ -1652,11 +1858,12 @@ mod tests {
 
         assert_eq!(public_name, "mcp__provider__arbitrary-provider-name");
         assert_eq!(descriptor.kind, "moi.control.handoff.v1");
+        assert_eq!(descriptor.target, "agent_authoring");
         assert!(descriptor.terminal);
         assert_eq!(descriptor.policy_id, "authoring.handoff.v1");
         assert_eq!(
             stop_after_success_tools
-                .successful_tool_name(
+                .successful_tool_completion(
                     &[astra_services::session_journal::ToolCallRecord {
                         name: public_name.to_string(),
                         ok: true,
@@ -1665,11 +1872,16 @@ mod tests {
                     }],
                     &[json!({
                         "tool_call_id": "call-1",
-                        "structuredContent": {"output": {"ok": true}}
+                        "structuredContent": {
+                            "output": {"ok": true, "message": "authoring started"}
+                        }
                     })],
                 )
-                .as_deref(),
-            Some(public_name)
+                .map(|completion| (completion.tool_name, completion.final_text)),
+            Some((
+                public_name.to_string(),
+                Some("authoring started".to_string())
+            ))
         );
     }
 
@@ -1862,7 +2074,7 @@ mod tests {
         use axum::{Router, http::HeaderMap, routing::post};
         use std::sync::Mutex;
 
-        let calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let calls_for_handler = calls.clone();
         let app = Router::new().route(
             "/mcp",
@@ -1882,7 +2094,7 @@ mod tests {
                     calls
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push((authorization, method.clone()));
+                        .push((authorization, body.clone()));
 
                     let response = match method.as_str() {
                         "tools/list" => json!({
@@ -1892,6 +2104,7 @@ mod tests {
                                 "tools": [{
                                     "name": "query",
                                     "description": "Query data",
+                                    "side_effect_class": "write",
                                     "inputSchema": {
                                         "type": "object",
                                         "properties": {
@@ -1952,8 +2165,8 @@ mod tests {
         assert_eq!(descriptor.identity.native_tool_id.as_str(), "query");
         assert_eq!(
             descriptor.semantic_baseline.effect,
-            astra_turn_types::ResolvedToolEffect::Unknown,
-            "standard MCP hints are advisory and missing hints must remain conservative"
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            "the trusted Agent Binding side-effect extension must classify writes"
         );
         assert_eq!(
             snapshot
@@ -1970,11 +2183,44 @@ mod tests {
         assert!(invocation_policy.requires_approval());
         assert!(!invocation_policy.parallelizable);
 
+        for invalid_tool_call_id in ["", " \t"] {
+            let missing_identity_error = bundle
+                .agent_binding_mcp
+                .as_ref()
+                .unwrap()
+                .call_tool_by_mcp_name(
+                    "mcp__tools__query",
+                    &json!({"q": "hello"}),
+                    invalid_tool_call_id,
+                    None,
+                )
+                .await
+                .expect_err("a blank tool call identity must fail before transport");
+            assert!(
+                missing_identity_error
+                    .to_string()
+                    .contains("tool call identity is required")
+            );
+        }
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "an invalid business identity must not emit a tools/call request"
+        );
+
         let output = bundle
             .agent_binding_mcp
             .as_ref()
             .unwrap()
-            .call_tool_by_mcp_name("mcp__tools__query", &json!({"q": "hello"}), None)
+            .call_tool_by_mcp_name(
+                "mcp__tools__query",
+                &json!({"q": "hello"}),
+                "model-tool-call-42",
+                None,
+            )
             .await
             .expect("tool call should succeed");
         assert_eq!(output.output, "query-result");
@@ -1991,12 +2237,20 @@ mod tests {
         let calls = calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "Bearer runtime-grant");
+        assert_eq!(calls[0].1["method"], "tools/list");
+        assert_eq!(calls[1].0, "Bearer runtime-grant");
+        assert_eq!(calls[1].1["method"], "tools/call");
+        assert_eq!(calls[1].1["id"], "astra-agent-binding-tools-call");
         assert_eq!(
-            *calls,
-            vec![
-                ("Bearer runtime-grant".to_string(), "tools/list".to_string()),
-                ("Bearer runtime-grant".to_string(), "tools/call".to_string()),
-            ]
+            calls[1].1.pointer("/params/call_id"),
+            Some(&json!("model-tool-call-42")),
+            "the model-authored tool call id must remain exact in the Agent Binding envelope"
+        );
+        assert_ne!(
+            calls[1].1["id"], calls[1].1["params"]["call_id"],
+            "JSON-RPC correlation and the business tool call identity are independent"
         );
         server.abort();
     }
@@ -2118,6 +2372,7 @@ mod tests {
             .call_tool_by_mcp_name(
                 "mcp__tools__query",
                 &json!({"a": 2, "z": 1}),
+                "semantic-read-call",
                 Some(&condition),
             )
             .await

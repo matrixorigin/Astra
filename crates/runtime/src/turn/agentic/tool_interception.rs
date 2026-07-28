@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
-use super::super::agentic_loop::host::{AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult};
+use super::super::agentic_loop::host::{
+    AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult, RejectedToolCall, ToolCallAdmission,
+};
 
 pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
     "task_board",
@@ -24,6 +26,77 @@ pub(crate) struct PreparedToolRound {
     pub(crate) pre_resolved_results: Vec<(String, String)>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
+}
+
+pub(crate) fn admit_tool_calls(
+    tool_calls: &[Value],
+    finish_reason: Option<&str>,
+) -> ToolCallAdmission {
+    let tool_calls = astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
+    let output_was_truncated = matches!(
+        finish_reason,
+        Some("length" | "max_tokens" | "max_output_tokens")
+    );
+    let mut malformed = Vec::new();
+    let mut executable = Vec::new();
+
+    for tool_call in tool_calls.iter() {
+        match astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call) {
+            Ok(canonical) => executable.push(canonical),
+            Err(detail) => {
+                let id = tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let message = if detail == "tool name is missing" {
+                    "Tool name is missing or empty, so the call was not executed. Emit one complete tool name and JSON argument object, then try again.".to_string()
+                } else if output_was_truncated {
+                    format!(
+                        "The {name} tool call was not executed because its JSON arguments were cut off at the model output limit after Astra exhausted the configured output-budget escalation. Shorten the call, split the work, or reuse an existing sandbox script, then try again."
+                    )
+                } else {
+                    format!(
+                        "The {name} tool call was not executed because {detail}. Emit one complete JSON argument object, then try again."
+                    )
+                };
+                let canonical_call = serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": "{}",
+                    },
+                });
+                malformed.push(RejectedToolCall {
+                    id: canonical_call["id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: canonical_call["function"]["name"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    canonical_call,
+                    result: serde_json::json!({
+                        "status": "failed",
+                        "error_kind": "tool_call_arguments_invalid",
+                        "retryable": true,
+                        "error": message,
+                    })
+                    .to_string(),
+                });
+            }
+        }
+    }
+
+    ToolCallAdmission {
+        admitted: executable,
+        rejected: malformed,
+    }
 }
 
 pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
@@ -159,12 +232,8 @@ fn intercept_disallowed_tool_calls(
     let mut blocked = Vec::new();
     let mut remaining = Vec::new();
     for tool_call in tool_calls {
-        let raw_tool_name = tool_call
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str);
-        let Some(tool_name) =
-            raw_tool_name.and_then(astra_turn_core::tool_allowlist::normalize_tool_name)
+        let Some(tool_name) = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
+            .and_then(astra_turn_core::tool_allowlist::normalize_tool_name)
         else {
             let tool_call_id = tool_call
                 .get("id")
@@ -216,14 +285,13 @@ pub(crate) async fn prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
     effective_tool_calls: &[Value],
+    rejected_tool_calls: Vec<RejectedToolCall>,
     delegation_intercepted: bool,
     valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
-    let tool_calls =
-        astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls)
-            .into_owned();
+    let mut tool_calls = effective_tool_calls.to_vec();
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
-        intercept_disallowed_tool_calls(state, &tool_calls);
+        intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
     let (mut pre_resolved_results, post_send_tool_calls, communication_events) =
         intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;
@@ -233,6 +301,33 @@ pub(crate) async fn prepare_intercepted_tool_round(
         short_circuit_meta,
     } = intercept_skill_calls(state, &post_send_tool_calls).await;
 
+    for malformed in rejected_tool_calls {
+        tool_calls.push(malformed.canonical_call);
+        pre_resolved_results.push((malformed.id.clone(), malformed.result.clone()));
+        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+            Some(buffer) => (Some(buffer.current_round()), Some(buffer.offset_ms())),
+            None => (None, None),
+        };
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: malformed.name,
+            ok: false,
+            ms: 0,
+            error: Some("tool-call arguments were incomplete or invalid JSON".to_string()),
+            input_bytes: None,
+            output_bytes: Some(malformed.result.len() as u32),
+            args_preview: None,
+            result_preview: Some(malformed.result.chars().take(500).collect()),
+            file_path: None,
+            args_full: None,
+            result_full: Some(malformed.result),
+            round,
+            start_offset_ms,
+            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        });
+    }
+
     // Build the id→args lookup once. Without it, the per-result `find` below
     // is O(N²) over `tool_calls`, which a model emitting many simultaneous
     // disallowed calls would exercise.
@@ -240,11 +335,15 @@ pub(crate) async fn prepare_intercepted_tool_round(
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
-            let args = tc
-                .get("function")
-                .and_then(|function| function.get("arguments"))
-                .and_then(Value::as_str)?;
-            Some((id, args.chars().take(200).collect::<String>()))
+            let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(tc).ok()?;
+            Some((
+                id,
+                serde_json::to_string(&args)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>(),
+            ))
         })
         .collect();
 
@@ -338,10 +437,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
-            let name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)?;
+            let name = astra_turn_core::tool::args::shape::tool_call_name(tc)?;
             Some((id, name))
         })
         .collect();
@@ -690,11 +786,7 @@ async fn intercept_skill_calls(
             // We still record them in stall.tool_call_records for telemetry.
             let tool_names: Vec<&str> = remaining
                 .iter()
-                .filter_map(|tc| {
-                    tc.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                })
+                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
                 .collect();
             for tc in &remaining {
                 let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
@@ -722,11 +814,8 @@ async fn intercept_skill_calls(
             // so the model can decide whether to retry each one.
             for tc in &remaining {
                 let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                let tool_name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
+                let tool_name =
+                    astra_turn_core::tool::args::shape::tool_call_name(tc).unwrap_or("unknown");
                 let msg = format!(
                     "Deferred: skill was invoked in this turn. Read the skill \
                      instructions above, then decide whether to call `{}` again.",
@@ -991,6 +1080,147 @@ mod tests {
         (parent, child)
     }
 
+    #[test]
+    fn malformed_tool_arguments_become_precise_pre_resolved_error() {
+        let calls = vec![json!({
+            "id": "call-python",
+            "type": "function",
+            "function": {
+                "name": "python",
+                "arguments": "{\"code\":\"from docx import Document"
+            }
+        })];
+
+        let admission = admit_tool_calls(&calls, Some("length"));
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(admission.rejected[0].id, "call-python");
+        assert_eq!(admission.rejected[0].name, "python");
+        let result: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+        assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
+        assert_eq!(result["retryable"], true);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("cut off at the model output limit")
+        );
+    }
+
+    #[test]
+    fn valid_tool_arguments_continue_to_normal_execution() {
+        let calls = vec![json!({
+            "id": "call-bash",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\":\"ls\"}"
+            }
+        })];
+
+        let admission = admit_tool_calls(&calls, Some("length"));
+
+        assert!(admission.rejected.is_empty());
+        assert_eq!(
+            admission.admitted,
+            vec![json!({
+                "id": "call-bash",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"ls\"}"
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn admission_canonicalizes_equivalent_shapes_and_rejects_name_conflicts() {
+        let equivalent = vec![
+            json!({
+                "id": "call-flat",
+                "name": "bash",
+                "arguments": {"command": "ls"}
+            }),
+            json!({
+                "id": "call-nested",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+            }),
+        ];
+        let admitted = admit_tool_calls(&equivalent, None);
+        assert!(admitted.rejected.is_empty());
+        assert_eq!(
+            admitted.admitted[0]["function"],
+            admitted.admitted[1]["function"]
+        );
+
+        let conflicting = vec![json!({
+            "id": "call-conflict",
+            "name": "bash",
+            "arguments": {"command": "ls"},
+            "function": {"name": "python", "arguments": "{\"command\":\"ls\"}"}
+        })];
+        let rejected = admit_tool_calls(&conflicting, None);
+        assert!(rejected.admitted.is_empty());
+        assert_eq!(rejected.rejected.len(), 1);
+        assert!(
+            rejected.rejected[0]
+                .result
+                .contains("top-level and function names conflict")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_are_returned_to_model_without_tool_execution() {
+        let mut state = make_state();
+        state.last_finish_reason = Some("length".to_string());
+        let turn_result = empty_host_turn_result();
+        let calls = vec![json!({
+            "id": "call-python",
+            "type": "function",
+            "function": {
+                "name": "python",
+                "arguments": "{\"code\":\"from docx import Document"
+            }
+        })];
+        let valid_tool_names = HashSet::from(["python".to_string()]);
+        let admission = admit_tool_calls(&calls, state.last_finish_reason.as_deref());
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &admission.admitted,
+            admission.rejected,
+            false,
+            &valid_tool_names,
+        )
+        .await;
+
+        assert_eq!(prepared.tool_calls.len(), 1);
+        assert_eq!(prepared.tool_calls[0]["id"], "call-python");
+        assert_eq!(
+            prepared.tool_calls[0]["function"]["arguments"],
+            serde_json::Value::String("{}".to_string())
+        );
+        assert_eq!(prepared.pre_resolved_results.len(), 1);
+        assert_eq!(prepared.pre_resolved_results[0].0, "call-python");
+        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].1).unwrap();
+        assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("Shorten the call, split the work")
+        );
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        assert_eq!(
+            state.stall.tool_call_records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+    }
+
     fn empty_host_turn_result() -> HostTurnResult {
         HostTurnResult {
             accum: ChatTurnSseAccum::default(),
@@ -1213,6 +1443,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["bash".to_string(), "str_replace".to_string()]),
         )
@@ -1269,6 +1500,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from([
                 "task_board".to_string(),
@@ -1310,6 +1542,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["task_board".to_string(), "bash".to_string()]),
         )
@@ -1352,6 +1585,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["bash".to_string()]),
         )
@@ -1392,6 +1626,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["bash".to_string(), "read_file".to_string()]),
         )
@@ -1436,6 +1671,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["bash".to_string()]),
         )
@@ -1470,6 +1706,7 @@ mod tests {
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
+            Vec::new(),
             false,
             &HashSet::from(["bash".to_string()]),
         )

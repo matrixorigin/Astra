@@ -4261,6 +4261,7 @@ mod tests {
             resolved_model_name: None,
             capability_server_refs_json: None,
             runtime_profile: None,
+            provider_request_fingerprint: None,
             events: Vec::new(),
             created_at: "2026-07-13T00:00:00Z".into(),
             updated_at: "2026-07-13T00:00:00Z".into(),

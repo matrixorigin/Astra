@@ -30,9 +30,9 @@ use crate::server::tool_admission::{
     resolve_tool_admission_for_binding_with_context,
 };
 use crate::server::tool_route_selection::{
-    ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
-    runtime_binding_can_use_client_ledger,
-    should_deliver_edge_bound_tools_via_client_ledger_for_binding,
+    ToolExecutionClass, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
+    routing_decision_for_binding, runtime_binding_can_use_client_ledger,
+    should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_class,
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
@@ -1094,6 +1094,8 @@ pub struct ServerAgenticLoopHost {
         crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     terminal_handoff_window: crate::turn::terminal_control::TerminalHandoffWindow,
     pending_terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
+    pending_tool_call_admission: Option<crate::turn::agentic_loop::host::ToolCallAdmission>,
+    admitted_tool_side_effects_enabled: bool,
     /// Session-scoped cache for dedup of identical read-only tool invocations
     /// within a short window. Gated by concurrency_safety classification.
     tool_result_cache: astra_turn_core::tool_result_dedup::SharedResultCache,
@@ -1729,6 +1731,8 @@ impl ServerAgenticLoopHostBuilder {
             runtime_stop_after_success_tools: Default::default(),
             terminal_handoff_window: Default::default(),
             pending_terminal_control_outcome: None,
+            pending_tool_call_admission: None,
+            admitted_tool_side_effects_enabled: true,
             tool_result_cache: astra_turn_core::tool_result_dedup::new_shared_cache(
                 128,
                 Some(std::time::Duration::from_secs(30)),
@@ -1956,6 +1960,18 @@ fn executor_binding_summary(executor: &ExecutorBinding) -> String {
 }
 
 impl ServerAgenticLoopHost {
+    fn admit_terminal_tool_calls(
+        &mut self,
+        tool_calls: &[Value],
+        finish_reason: Option<&str>,
+    ) -> Vec<Value> {
+        let admission =
+            crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason);
+        let admitted = admission.admitted.clone();
+        self.pending_tool_call_admission = Some(admission);
+        admitted
+    }
+
     fn update_latched_plan_resume_line(summary: &str, plan_hint: Option<&str>) -> String {
         let plan_line = plan_hint
             .map(str::trim)
@@ -3155,12 +3171,20 @@ impl ServerAgenticLoopHost {
             sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
         }
 
+        let admitted_terminal_tool_calls = self.admit_terminal_tool_calls(
+            &tool_calls,
+            if tool_calls.is_empty() {
+                Some("stop")
+            } else {
+                Some("tool_calls")
+            },
+        );
         let terminal_control_outcome =
             crate::turn::terminal_control::evaluate_terminal_control_actions(
                 &mut self.terminal_handoff_window,
                 &self.runtime_control_tools,
                 &full_text,
-                &tool_calls,
+                &admitted_terminal_tool_calls,
             );
         let terminal_handoff_requested = matches!(
             terminal_control_outcome,
@@ -3173,6 +3197,7 @@ impl ServerAgenticLoopHost {
             terminal_control_outcome,
             crate::turn::terminal_control::TerminalControlOutcome::Passthrough
         );
+        self.admitted_tool_side_effects_enabled = !suppress_tool_execution;
         self.record_terminal_control_outcome(&terminal_control_outcome);
 
         if !suppress_source_projection && !reasoning.is_empty() {
@@ -3180,52 +3205,6 @@ impl ServerAgenticLoopHost {
         }
         if !suppress_source_projection && !full_text.is_empty() {
             self.emit_progress_event(json!({ "type": "text_delta", "content": &full_text }));
-        }
-        // Tool_call dedup — two distinct concerns, two distinct scopes:
-        //
-        //   1. Per-round local set (`round_seen`): the ONLY structure used to
-        //      filter/suppress duplicate emits. Scope is this one
-        //      `execute_mock_turn` invocation. Protects against duplicated
-        //      tool_call deltas within a single SSE stream. Fresh HashSet
-        //      every invocation, so LLMs are free to reuse the same tool_call
-        //      id across rounds (e.g. `call_bash_0` in round 2 AND round 3);
-        //      the second one will be emitted just like the first.
-        //
-        //   2. Cross-host shared set (`self.emitted_tool_call_ids`,
-        //      Arc<Mutex<HashSet>>): a WRITE-ONLY log of ids that this host
-        //      (and any host sharing the Arc via `with_shared_dedup_state`)
-        //      has ever emitted during the user-turn. It is NOT consulted to
-        //      suppress per-round new ids. Its purpose is to let sub-run or
-        //      sibling hosts observe what has been emitted elsewhere — the
-        //      consumers of that signal live outside this loop.
-        //
-        // Prior behavior (pre-fix) used the Arc set as a filter, which caused
-        // a regression: round 3's legitimate re-use of a round-2 tool_call id
-        // was silently swallowed. The HashSet's turn-scoped semantics made
-        // any cross-round id repeat disappear, breaking
-        // `interleaved_tool_and_text_rounds_preserve_event_order_and_history`.
-        //
-        // Contract locked by:
-        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
-        //   `interleaved_tool_and_text_rounds_preserve_event_order_and_history`
-        let mut round_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for tc in tool_calls.iter().filter(|_| !suppress_tool_execution) {
-            let key = match tc.get("id").and_then(Value::as_str) {
-                Some(id) if !id.is_empty() => format!("id:{id}"),
-                _ => format!("raw:{tc}"),
-            };
-            // Per-round dedup (same SSE stream): skip if already seen in THIS round.
-            if !round_seen.insert(key.clone()) {
-                continue;
-            }
-            // Record to the cross-host log, but do NOT use it to filter:
-            // per-round new ids always emit. Lock span is kept minimal.
-            {
-                let mut shared =
-                    astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
-                shared.insert(key);
-            }
-            self.emit_progress_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
         // Mock fixtures use upstream OpenAI-native keys (`prompt_tokens` /
         // `completion_tokens` / `prompt_tokens_details.cached_tokens`), plus
@@ -3250,13 +3229,6 @@ impl ServerAgenticLoopHost {
             "output_tokens": u.output_tokens,
             "total_tokens": u.total_tokens(),
         }));
-
-        let edge_tool_round = if suppress_tool_execution {
-            Vec::new()
-        } else {
-            self.maybe_deliver_edge_bound_tools_via_ledger(state, &tool_calls)
-                .await
-        };
 
         let accum = ChatTurnSseAccum {
             full_text: full_text.clone(),
@@ -3329,7 +3301,7 @@ impl ServerAgenticLoopHost {
         Ok(HostTurnResult {
             accum,
             ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
-            edge_tool_round,
+            edge_tool_round: Vec::new(),
             error_kind: None,
         })
     }
@@ -3432,6 +3404,31 @@ impl ServerAgenticLoopHost {
             })
             .collect::<Vec<_>>();
         ensure_tool_call_ids(&object_tool_calls).into_owned()
+    }
+
+    fn emit_admitted_tool_call_events(&mut self, tool_calls: &[Value]) {
+        let mut round_seen = std::collections::HashSet::new();
+        for tool_call in tool_calls {
+            let key = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("id:{id}"))
+                .unwrap_or_else(|| format!("canonical:{tool_call}"));
+            if !round_seen.insert(key.clone()) {
+                continue;
+            }
+            #[cfg(feature = "bridge-e2e-hooks")]
+            {
+                let mut shared =
+                    astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
+                shared.insert(key);
+            }
+            self.emit_progress_event(json!({
+                "type": "tool_call",
+                "tool_call": tool_call,
+            }));
+        }
     }
 
     fn warn_non_object_tool_call(&self, route: &'static str, tool_call: &Value) {
@@ -4304,6 +4301,12 @@ impl ServerAgenticLoopHost {
                 if !admission.visible {
                     return false;
                 }
+                if matches!(
+                    tool_execution_class(name, &registry),
+                    ToolExecutionClass::TurnPipelineIntercept
+                ) {
+                    return true;
+                }
                 match admission.selected_route() {
                     ToolExecutionRouteKind::EdgeBound
                     | ToolExecutionRouteKind::GatewayRelay
@@ -4866,6 +4869,16 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn admit_tool_calls(
+        &mut self,
+        tool_calls: &[Value],
+        finish_reason: Option<&str>,
+    ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
+        self.pending_tool_call_admission.take().unwrap_or_else(|| {
+            crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
+        })
+    }
+
     fn injects_round_guidance(&self) -> bool {
         true // Server injects guidance into the system prompt in execute_turn.
     }
@@ -6073,12 +6086,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
+        let admitted_terminal_tool_calls =
+            self.admit_terminal_tool_calls(&result.tool_calls, result.finish_reason.as_deref());
         let terminal_control_outcome =
             crate::turn::terminal_control::evaluate_terminal_control_actions(
                 &mut self.terminal_handoff_window,
                 &self.runtime_control_tools,
                 &result.full_text,
-                &result.tool_calls,
+                &admitted_terminal_tool_calls,
             );
         let terminal_handoff_requested = matches!(
             terminal_control_outcome,
@@ -6087,7 +6102,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let hold_action_window_projection = self.terminal_handoff_window.is_open();
         let suppress_source_projection =
             terminal_handoff_requested || hold_action_window_projection;
-        let suppress_tool_execution = !matches!(
+        self.admitted_tool_side_effects_enabled = matches!(
             terminal_control_outcome,
             crate::turn::terminal_control::TerminalControlOutcome::Passthrough
         );
@@ -6161,19 +6176,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }));
         }
 
-        // ── 5. Edge tool delivery via ledger (thin-client streaming mode) ─
-        //
-        // Web+Edge/server+edge runs have a runtime executor and must execute
-        // workspace tools through the executor transport. The browser ledger
-        // is only for thin clients that can execute local tools themselves.
-        let edge_tool_round = if suppress_tool_execution {
-            Vec::new()
-        } else {
-            self.maybe_deliver_edge_bound_tools_via_ledger(state, &result.tool_calls)
-                .await
-        };
-
-        // ── 6. Build turn result ────────────────────────────────────────
+        // ── 5. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(observed_ttft_ms(
             first_stream_update_turn_ms,
             first_visible_text_turn_ms,
@@ -6187,9 +6190,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         Ok(HostTurnResult {
             accum,
             ttft_ms,
-            edge_tool_round,
+            edge_tool_round: Vec::new(),
             error_kind: None,
         })
+    }
+
+    async fn handle_admitted_tool_calls(
+        &mut self,
+        state: &AgenticLoopState,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        if !self.admitted_tool_side_effects_enabled {
+            return Vec::new();
+        }
+        self.emit_admitted_tool_call_events(tool_calls);
+        self.maybe_deliver_edge_bound_tools_via_ledger(state, tool_calls)
+            .await
     }
 
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -6339,9 +6355,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &self,
         records: &[astra_services::session_journal::ToolCallRecord],
         results: &[Value],
-    ) -> Option<String> {
+    ) -> Option<crate::turn::agentic_loop::host::RuntimeSuccessfulToolCompletion> {
         self.runtime_stop_after_success_tools
-            .successful_tool_name(records, results)
+            .successful_tool_completion(records, results)
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
@@ -10996,6 +11012,38 @@ mod tests {
     }
 
     #[test]
+    fn visible_turn_tools_keep_turn_pipeline_tools_with_runtime_executor() {
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_server_sandbox_workspace(dir.path())
+        .build();
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                dir.path().to_path_buf(),
+                "u".to_string(),
+                "s".to_string(),
+                None,
+                None,
+            ),
+        ));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
+        assert!(
+            names.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            "Astra-owned turn-pipeline tools must not depend on runtime executor readiness: {names:?}"
+        );
+    }
+
+    #[test]
     fn builder_hides_reflect_without_reflect_service_capability() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -11584,6 +11632,132 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         // Should complete (tool round runs but no more turns to consume)
         assert!(outcome.is_ok() || outcome.is_err());
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test]
+    async fn server_host_strict_admission_blocks_every_pre_execution_side_effect() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "strict-user".to_string(),
+            "strict-session".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_llm_rounds(vec![
+            json!({
+                "tool_calls": [
+                    {
+                        "id": "truncated",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\"echo incomplete"
+                        }
+                    },
+                    {
+                        "id": "conflicting",
+                        "type": "function",
+                        "name": "read_file",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\"echo conflict\"}"
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+            json!({
+                "full_text": "Recovered after strict admission.",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }),
+        ])
+        .build();
+        let mut state = create_test_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "run malformed calls"}));
+
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("strict admission should return retryable tool errors");
+
+        assert_eq!(state.final_text, "Recovered after strict admission.");
+        assert!(host.edge_callback_ledger.lock().await.is_empty());
+        assert!(host.take_emitted_events().iter().all(|event| {
+            !matches!(
+                event.get("type").and_then(Value::as_str),
+                Some(
+                    "tool_call" | "tool_request" | "approval_required" | "approval_batch_required"
+                )
+            )
+        }));
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test]
+    async fn server_host_flat_and_nested_calls_emit_one_identical_canonical_shape() {
+        async fn emitted_call(tool_call: Value) -> Value {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "shape-user".to_string(),
+                "shape-session".to_string(),
+            )
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_test_llm_rounds(vec![
+                json!({
+                    "tool_calls": [tool_call],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                }),
+                json!({
+                    "full_text": "Canonical call handled.",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                }),
+            ])
+            .build();
+            let mut state = create_test_state();
+            state
+                .messages
+                .push(json!({"role": "user", "content": "inspect a file"}));
+
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .expect("canonical call should complete the loop");
+
+            let calls = host
+                .take_emitted_events()
+                .into_iter()
+                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_call"))
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "one admitted call must emit exactly once");
+            calls[0]["tool_call"].clone()
+        }
+
+        let flat = emitted_call(json!({
+            "id": "shape-call",
+            "type": "function",
+            "name": "read_file",
+            "arguments": {"path": "README.md"}
+        }))
+        .await;
+        let nested = emitted_call(json!({
+            "id": "shape-call",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        }))
+        .await;
+
+        assert_eq!(flat, nested);
+        assert_eq!(flat["function"]["name"], "read_file");
+        assert_eq!(flat["function"]["arguments"], "{\"path\":\"README.md\"}");
+        assert!(flat.get("name").is_none());
+        assert!(flat.get("arguments").is_none());
     }
 
     #[tokio::test]
@@ -12187,6 +12361,7 @@ mod tests {
         let metadata = json!({
             "control": {
                 "kind": "moi.control.handoff.v1",
+                "target": "agent_authoring",
                 "terminal": true,
                 "policy_id": "authoring.handoff.v1",
                 "ui_visibility": "hidden"
@@ -12263,6 +12438,88 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn idless_terminal_handoff_uses_one_admission_and_never_reaches_delivery() {
+        let public_name = "mcp__provider__runtime_control";
+        let descriptor =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                public_name,
+                Some(&json!({
+                    "control": {
+                        "kind": "moi.control.handoff.v1",
+                        "target": "agent_authoring",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v1"
+                    }
+                })),
+            )
+            .expect("valid control metadata")
+            .expect("control descriptor");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-idless-handoff".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_llm_rounds(vec![json!({
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "arguments": r#"{"action":"revise_current_agent"}"#
+                }
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+        })])
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "description": "Transfer runtime control",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]),
+        );
+        let mut state = create_test_state();
+        let result = host
+            .run_one_mock_turn_for_test(&mut state)
+            .await
+            .expect("mock terminal turn");
+        assert!(
+            result.edge_tool_round.is_empty(),
+            "terminal control must not produce an ordinary edge-tool result"
+        );
+
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            &result.accum.tool_calls,
+            Some("tool_calls"),
+        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(
+            admission.admitted[0]["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert!(admission.rejected.is_empty());
+        assert!(matches!(
+            host.take_terminal_control_outcome(),
+            Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
+        ));
+
+        let delivered = host
+            .handle_admitted_tool_calls(&state, &admission.admitted)
+            .await;
+        assert!(delivered.is_empty());
+        assert!(host.edge_callback_ledger.lock().await.is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn text_first_control_window_streams_before_provider_completion() {
@@ -12290,6 +12547,7 @@ mod tests {
                 Some(&json!({
                     "control": {
                         "kind": "moi.control.handoff.v1",
+                        "target": "agent_authoring",
                         "terminal": true,
                         "policy_id": "authoring.handoff.v1"
                     }
@@ -12394,6 +12652,7 @@ mod tests {
                 Some(&json!({
                     "control": {
                         "kind": "moi.control.handoff.v1",
+                        "target": "agent_authoring",
                         "terminal": true,
                         "policy_id": "authoring.handoff.v1"
                     }
@@ -12500,6 +12759,7 @@ mod tests {
                 Some(&json!({
                     "control": {
                         "kind": "moi.control.handoff.v1",
+                        "target": "agent_authoring",
                         "terminal": true,
                         "policy_id": "authoring.handoff.v1"
                     }

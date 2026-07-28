@@ -3604,7 +3604,11 @@ async fn collect_llm_stream(
                     {
                         f.insert("name".to_string(), Value::String(name.to_string()));
                         made_progress = true;
-                    } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
+                    } else if let Some(bad_name) = func
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    {
                         astra_core::agent_warn!(
                             "llm",
                             "dropped malformed tool_call with invalid name: {bad_name:?}"

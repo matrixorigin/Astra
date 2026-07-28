@@ -487,6 +487,15 @@ mod tests {
         }
     }
 
+    fn provider_principal() -> AuthPrincipal {
+        let mut principal = edge_principal();
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &mut principal.origin else {
+            unreachable!("edge principal must use provider authorization");
+        };
+        context.edge_agent_id = None;
+        principal
+    }
+
     fn test_state() -> AppState {
         AppState::new(
             ServiceInfo::new("prc-test", "0.0.0-test", ""),
@@ -572,6 +581,45 @@ mod tests {
             value["runtime_auth"]["authorization"],
             "Bearer runtime-grant"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_authorized_chat_wire_preserves_trusted_model_resolution() {
+        let state = test_state();
+        let principal = provider_principal();
+        let request: astra_server_types::ChatRequest = serde_json::from_value(serde_json::json!({
+            "message": "hello",
+            "model_selection": {"offering_id": "model-requested"},
+            "resolved_model_selection": {
+                "offering_id": "model-requested",
+                "model_name": "provider-model"
+            },
+            "runtime_auth": {"authorization": "Bearer runtime-grant"},
+            "capability_descriptors": {
+                "model_gateway": {
+                    "id": "moi-model-gateway",
+                    "type": "model_gateway",
+                    "transport": "http",
+                    "endpoint_url": "http://127.0.0.1/model-gateway",
+                    "protocol": "openai_chat_completions"
+                }
+            }
+        }))
+        .expect("provider chat wire should parse");
+        let mut request = astra_server_types::chat_request_into_data(request);
+
+        inject_effective_runtime_context(&state, &principal, &mut request)
+            .await
+            .expect("provider authorization should accept the supplied runtime context");
+
+        assert!(request.provider_runtime_authorized);
+        assert_eq!(request.provider_workspace_id.as_deref(), Some("ws-1"));
+        let resolved = request
+            .resolved_model_selection
+            .as_ref()
+            .expect("trusted resolution must survive wire mapping and provider injection");
+        assert_eq!(resolved.offering_id, "model-requested");
+        assert_eq!(resolved.model_name, "provider-model");
     }
 
     #[test]

@@ -5,12 +5,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) const TERMINAL_HANDOFF_CONTROL_KIND: &str = "moi.control.handoff.v1";
-const TERMINAL_HANDOFF_TARGET: &str = "agent_authoring";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeControlToolDescriptor {
     pub public_name: String,
     pub kind: String,
+    pub target: String,
+    pub fixed_action: Option<String>,
     pub terminal: bool,
     pub policy_id: String,
     pub ui_visibility: Option<String>,
@@ -60,12 +61,16 @@ impl RuntimeControlToolDescriptor {
                 tool: public_name.to_string(),
             });
         }
+        let target = required_string(control, "target", public_name)?;
+        let fixed_action = optional_string(control, "action", public_name)?;
         let policy_id = required_string(control, "policy_id", public_name)?;
         let ui_visibility = optional_string(control, "ui_visibility", public_name)?;
 
         Ok(Some(Self {
             public_name: public_name.to_string(),
             kind,
+            target,
+            fixed_action,
             terminal,
             policy_id,
             ui_visibility,
@@ -407,47 +412,59 @@ fn terminal_handoff_request(
             Some(tool_call),
         )
     })?;
-    let action = arguments.get("action").ok_or_else(|| {
-        rejection(
-            "terminal_handoff_contract_violation",
-            "terminal handoff action is required",
-            Some(tool_call),
-        )
-    })?;
-    if arguments.len() != 1 {
-        return Err(rejection(
-            "terminal_handoff_contract_violation",
-            "terminal handoff arguments must contain only action",
-            Some(tool_call),
-        ));
-    }
-    let action = action.as_str().ok_or_else(|| {
-        rejection(
-            "terminal_handoff_contract_violation",
-            "terminal handoff action must be a non-empty string",
-            Some(tool_call),
-        )
-    })?;
-    let trimmed_action = action.trim();
-    if trimmed_action.is_empty() {
-        return Err(rejection(
-            "terminal_handoff_contract_violation",
-            "terminal handoff action must be a non-empty string",
-            Some(tool_call),
-        ));
-    }
-    if trimmed_action != action {
-        return Err(rejection(
-            "terminal_handoff_contract_violation",
-            "terminal handoff action must not contain surrounding whitespace",
-            Some(tool_call),
-        ));
-    }
+    let action = if let Some(action) = descriptor.fixed_action.as_deref() {
+        if !arguments.is_empty() {
+            return Err(rejection(
+                "terminal_handoff_contract_violation",
+                "fixed-action terminal handoff arguments must be an empty object",
+                Some(tool_call),
+            ));
+        }
+        action
+    } else {
+        let action = arguments.get("action").ok_or_else(|| {
+            rejection(
+                "terminal_handoff_contract_violation",
+                "terminal handoff action is required",
+                Some(tool_call),
+            )
+        })?;
+        if arguments.len() != 1 {
+            return Err(rejection(
+                "terminal_handoff_contract_violation",
+                "terminal handoff arguments must contain only action",
+                Some(tool_call),
+            ));
+        }
+        let action = action.as_str().ok_or_else(|| {
+            rejection(
+                "terminal_handoff_contract_violation",
+                "terminal handoff action must be a non-empty string",
+                Some(tool_call),
+            )
+        })?;
+        let trimmed_action = action.trim();
+        if trimmed_action.is_empty() {
+            return Err(rejection(
+                "terminal_handoff_contract_violation",
+                "terminal handoff action must be a non-empty string",
+                Some(tool_call),
+            ));
+        }
+        if trimmed_action != action {
+            return Err(rejection(
+                "terminal_handoff_contract_violation",
+                "terminal handoff action must not contain surrounding whitespace",
+                Some(tool_call),
+            ));
+        }
+        action
+    };
 
     Ok(TerminalHandoffRequest {
         handoff_id: format!("handoff_{}", Uuid::now_v7()),
         kind: descriptor.kind.clone(),
-        target: TERMINAL_HANDOFF_TARGET.to_string(),
+        target: descriptor.target.clone(),
         action: action.to_string(),
         terminal: descriptor.terminal,
         tool_call_id: tool_call_id.to_string(),
@@ -501,6 +518,8 @@ mod tests {
         RuntimeControlToolDescriptor {
             public_name: "mcp__provider__handoff".to_string(),
             kind: TERMINAL_HANDOFF_CONTROL_KIND.to_string(),
+            target: "agent_authoring".to_string(),
+            fixed_action: None,
             terminal: true,
             policy_id: "provider.handoff.v1".to_string(),
             ui_visibility: Some("hidden".to_string()),
@@ -541,6 +560,7 @@ mod tests {
         let metadata = json!({
             "control": {
                 "kind": TERMINAL_HANDOFF_CONTROL_KIND,
+                "target": "agent_authoring",
                 "terminal": true,
                 "policy_id": "provider.handoff.v1",
                 "ui_visibility": "hidden",
@@ -555,6 +575,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.kind, TERMINAL_HANDOFF_CONTROL_KIND);
+        assert_eq!(parsed.target, "agent_authoring");
+        assert_eq!(parsed.fixed_action, None);
         assert!(parsed.terminal);
         assert_eq!(parsed.policy_id, "provider.handoff.v1");
     }
@@ -564,6 +586,7 @@ mod tests {
         let metadata = json!({
             "control": {
                 "kind": "moi.control.handoff.v2",
+                "target": "agent_authoring",
                 "terminal": true,
                 "policy_id": "provider.handoff.v2",
             }
@@ -593,6 +616,24 @@ mod tests {
         assert_eq!(request.action, "revise_current_agent");
         assert_eq!(request.target, "agent_authoring");
         assert_eq!(window, TerminalHandoffWindow::Delegated);
+    }
+
+    #[test]
+    fn fixed_action_is_read_from_descriptor_and_requires_empty_arguments() {
+        let mut descriptor = descriptor();
+        descriptor.target = "workflow_authoring".to_string();
+        descriptor.fixed_action = Some("handle_request".to_string());
+        let snapshot = RuntimeControlToolSnapshot::new(vec![descriptor]);
+        let mut window = TerminalHandoffWindow::for_snapshot(&snapshot);
+        let call = terminal_tool_call(Some(json!("call-workflow")), json!("{}"));
+
+        let outcome = evaluate_terminal_control_actions(&mut window, &snapshot, "", &[call]);
+
+        let TerminalControlOutcome::Requested(request) = outcome else {
+            panic!("expected terminal handoff request");
+        };
+        assert_eq!(request.target, "workflow_authoring");
+        assert_eq!(request.action, "handle_request");
     }
 
     #[test]

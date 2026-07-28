@@ -78,6 +78,12 @@ use astra_turn_core::stall::IntentDrift;
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSuccessfulToolCompletion {
+    pub tool_name: String,
+    pub final_text: Option<String>,
+}
+
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
 ///
@@ -152,6 +158,20 @@ pub struct SkillAutoRouteJudgeContext<'a> {
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
 }
 
+#[derive(Clone)]
+pub struct RejectedToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) canonical_call: Value,
+    pub(crate) result: String,
+}
+
+#[derive(Clone)]
+pub struct ToolCallAdmission {
+    pub(crate) admitted: Vec<Value>,
+    pub(crate) rejected: Vec<RejectedToolCall>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnIntentJudgeOutcome {
     Intent(TurnIntent),
@@ -194,6 +214,20 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Admit provider tool calls into the one canonical object used by
+    /// terminal control, ledger publication, interception, and execution.
+    ///
+    /// Hosts that must inspect admitted calls before [`execute_turn`] returns
+    /// may cache that admission and return it here. The default performs the
+    /// shared admission at the ordinary post-turn boundary.
+    fn admit_tool_calls(
+        &mut self,
+        tool_calls: &[Value],
+        finish_reason: Option<&str>,
+    ) -> ToolCallAdmission {
+        crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
+    }
+
     /// Exact process-local recall ledger scope owned by this loop.
     ///
     /// The default covers ordinary CLI and server runs. Hosts whose tool
@@ -231,6 +265,17 @@ pub trait AgenticLoopHost: Send {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
 
+    /// Publish and route tool calls only after the runtime has admitted them
+    /// into the canonical execution shape. Implementations must not inspect
+    /// the provider's raw tool-call JSON for execution side effects.
+    async fn handle_admitted_tool_calls(
+        &mut self,
+        _state: &AgenticLoopState,
+        _tool_calls: &[Value],
+    ) -> Vec<EdgeToolExecResult> {
+        Vec::new()
+    }
+
     /// Optional semantic judge for the current user turn.
     ///
     /// The default implementation returns no semantic intent. Hosts that have
@@ -263,14 +308,14 @@ pub trait AgenticLoopHost: Send {
         None
     }
 
-    /// Returns the public name of a tool that completed this round with the
-    /// provider-declared terminal-success contract. The default keeps CLI and
+    /// Returns the provider-declared terminal completion for a tool that
+    /// completed successfully this round. The default keeps CLI and
     /// non-provider hosts unchanged.
     fn stop_after_successful_tool_round(
         &self,
         _records: &[ToolCallRecord],
         _results: &[Value],
-    ) -> Option<String> {
+    ) -> Option<RuntimeSuccessfulToolCompletion> {
         None
     }
 
@@ -3763,10 +3808,13 @@ pub(crate) mod tests {
         pub(crate) user_intent_context_indices: Vec<usize>,
         pub(crate) user_intent_applied_indices: Vec<usize>,
         pub(crate) cancelled_agent_ids: Vec<String>,
+        pub(crate) admitted_tool_call_batches: Vec<Vec<Value>>,
+        admission_hook_enabled: bool,
         cancel_child_agents_delay: Option<std::time::Duration>,
         recovered_control_tool_results: HashMap<String, ControlToolRecovery>,
         pub(crate) recovered_control_requests: Vec<(String, String, Value, Option<String>)>,
         terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
+        stop_after_success_completion: Option<RuntimeSuccessfulToolCompletion>,
     }
 
     impl MockHost {
@@ -3791,10 +3839,13 @@ pub(crate) mod tests {
                 user_intent_context_indices: Vec::new(),
                 user_intent_applied_indices: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
+                admitted_tool_call_batches: Vec::new(),
+                admission_hook_enabled: false,
                 cancel_child_agents_delay: None,
                 recovered_control_tool_results: HashMap::new(),
                 recovered_control_requests: Vec::new(),
                 terminal_control_outcome: None,
+                stop_after_success_completion: None,
             }
         }
 
@@ -3823,6 +3874,11 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_admission_hook(mut self) -> Self {
+            self.admission_hook_enabled = true;
+            self
+        }
+
         pub(crate) fn with_recovered_control_tool_result(
             mut self,
             tool_call_id: &str,
@@ -3838,6 +3894,18 @@ pub(crate) mod tests {
             outcome: crate::turn::terminal_control::TerminalControlOutcome,
         ) -> Self {
             self.terminal_control_outcome = Some(outcome);
+            self
+        }
+
+        pub(crate) fn with_stop_after_success_completion(
+            mut self,
+            tool_name: &str,
+            final_text: Option<&str>,
+        ) -> Self {
+            self.stop_after_success_completion = Some(RuntimeSuccessfulToolCompletion {
+                tool_name: tool_name.to_string(),
+                final_text: final_text.map(str::to_string),
+            });
             self
         }
 
@@ -3870,10 +3938,51 @@ pub(crate) mod tests {
             Ok(result)
         }
 
+        async fn handle_admitted_tool_calls(
+            &mut self,
+            _state: &AgenticLoopState,
+            tool_calls: &[Value],
+        ) -> Vec<EdgeToolExecResult> {
+            if !self.admission_hook_enabled {
+                return Vec::new();
+            }
+            self.admitted_tool_call_batches.push(tool_calls.to_vec());
+            tool_calls
+                .iter()
+                .filter_map(|tool_call| {
+                    let request_id = tool_call.get("id")?.as_str()?.to_string();
+                    let tool = tool_call
+                        .get("function")?
+                        .get("name")?
+                        .as_str()?
+                        .to_string();
+                    let arguments = tool_call.get("function")?.get("arguments")?.as_str()?;
+                    let args = serde_json::from_str(arguments).ok()?;
+                    Some(EdgeToolExecResult {
+                        request_id,
+                        tool,
+                        args,
+                        output: json!({"ok": true}).to_string(),
+                        tool_result_fields: None,
+                        status: "completed".to_string(),
+                        duration_ms: 0,
+                    })
+                })
+                .collect()
+        }
+
         fn take_terminal_control_outcome(
             &mut self,
         ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
             self.terminal_control_outcome.take()
+        }
+
+        fn stop_after_successful_tool_round(
+            &self,
+            _records: &[ToolCallRecord],
+            _results: &[Value],
+        ) -> Option<RuntimeSuccessfulToolCompletion> {
+            self.stop_after_success_completion.clone()
         }
 
         async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
@@ -4795,6 +4904,98 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn strict_admission_precedes_every_host_tool_side_effect() {
+        let malformed_and_conflicting = server_tool_result(
+            vec![
+                json!({
+                    "id": "call-truncated",
+                    "type": "function",
+                    "function": {
+                        "name": "python",
+                        "arguments": "{\"code\":\"print("
+                    }
+                }),
+                json!({
+                    "id": "call-conflict",
+                    "name": "request_channel_binding",
+                    "arguments": {"channel": "github"},
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"echo should-not-run\"}"
+                    }
+                }),
+            ],
+            Vec::new(),
+            10,
+            5,
+            None,
+        );
+        let mut host = MockHost::new(vec![
+            malformed_and_conflicting,
+            text_result("recovered", 10, 5, None),
+        ])
+        .with_valid_tools(&["python", "bash", "request_channel_binding"])
+        .with_admission_hook();
+        let mut state = make_state();
+        state.last_finish_reason = Some("length".to_string());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("malformed calls should return precise tool errors to the model");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(state.final_text, "recovered");
+        assert!(
+            host.admitted_tool_call_batches.is_empty(),
+            "rejected calls must not reach callback, approval, tool_request, or execution hooks"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_admission_gives_flat_and_nested_calls_one_canonical_execution_shape() {
+        let calls = server_tool_result(
+            vec![
+                json!({
+                    "id": "call-flat",
+                    "name": "bash",
+                    "arguments": {"command": "pwd"}
+                }),
+                json!({
+                    "id": "call-nested",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                }),
+            ],
+            Vec::new(),
+            10,
+            5,
+            None,
+        );
+        let mut host = MockHost::new(vec![calls, text_result("done", 10, 5, None)])
+            .with_valid_tools(&["bash"])
+            .with_admission_hook();
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("canonical calls should execute");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(state.final_text, "done");
+        assert_eq!(host.admitted_tool_call_batches.len(), 1);
+        let admitted = &host.admitted_tool_call_batches[0];
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0]["function"], admitted[1]["function"]);
+        assert!(
+            admitted.iter().all(|call| call.get("name").is_none()),
+            "execution receives only the canonical nested representation"
+        );
+    }
+
+    #[tokio::test]
     async fn budget_exhausted_with_progress_completes_gracefully() {
         let mut host = MockHost::new(vec![]);
         let mut state = make_state();
@@ -5192,6 +5393,31 @@ pub(crate) mod tests {
             vec![1, 1],
             "each created step should have exactly one terminal event: {terminal_counts:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_after_success_template_becomes_rendered_final_text() {
+        let mut host = MockHost::new(vec![edge_tool_result(
+            vec![make_edge_tool(
+                "mcp__moi__read_catalog_file_content",
+                "parsing",
+            )],
+            20,
+            10,
+            Some(50),
+        )])
+        .with_stop_after_success_completion(
+            "mcp__moi__read_catalog_file_content",
+            Some("文件正在解析，工作流执行 ID：syswfe-1"),
+        );
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {outcome:?}");
+        assert_eq!(host.current_turn, 1);
+        assert_eq!(state.final_text, "文件正在解析，工作流执行 ID：syswfe-1");
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text_streamed);
     }
 
     #[tokio::test]
@@ -6972,10 +7198,13 @@ pub(crate) mod tests {
             .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bad"))
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("");
-        assert!(
-            error_msg.contains("Invalid delegation request"),
-            "should contain error: {error_msg}"
+        let error: Value = serde_json::from_str(error_msg)
+            .expect("invalid arguments should emit structured error");
+        assert_eq!(
+            error["error_kind"], "tool_call_arguments_invalid",
+            "should contain strict admission error: {error_msg}"
         );
+        assert_eq!(error["retryable"], true);
     }
 
     #[tokio::test]
