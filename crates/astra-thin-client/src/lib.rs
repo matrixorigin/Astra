@@ -26,7 +26,8 @@ pub use astra_server_types::{
 pub use client::ThinClient;
 pub use device_proof::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
-    ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, device_challenge_proof,
+    ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, canonical_device_proof_message,
+    device_challenge_proof,
 };
 pub use edge::{
     ASTRA_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,

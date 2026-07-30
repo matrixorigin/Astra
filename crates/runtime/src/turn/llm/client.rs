@@ -1918,6 +1918,9 @@ fn strip_internal_schema_extensions(value: &mut Value) {
                     .unwrap_or(contract);
                 object.insert("description".to_string(), Value::String(description));
             }
+            if let Some(action_union) = standard_action_union_schema(object) {
+                object.insert("oneOf".to_string(), Value::Array(action_union));
+            }
             object.retain(|key, _| !key.starts_with("x-astra-"));
             for child in object.values_mut() {
                 strip_internal_schema_extensions(child);
@@ -1930,6 +1933,97 @@ fn strip_internal_schema_extensions(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Convert Astra's internal consolidated-action contract into ordinary JSON
+/// Schema before provider-specific extension stripping.
+///
+/// OpenAI-compatible providers receive a structural discriminated union
+/// instead of having to infer conditional required/allowed fields from prose.
+/// Providers that reject composition keywords run this same conversion and
+/// then remove `oneOf` in `strip_unsupported_schema_fields_inner`, retaining
+/// the deterministic compact description fallback above.
+fn standard_action_union_schema(object: &Map<String, Value>) -> Option<Vec<Value>> {
+    let properties = object.get("properties")?.as_object()?;
+    let actions = properties
+        .get("action")?
+        .get("enum")?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let per_action_required = object
+        .get(astra_tools::schemas::PER_ACTION_REQUIRED_KEY)?
+        .as_object()?;
+    let per_action_allowed = object
+        .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
+        .and_then(Value::as_object);
+    let per_action_any_of = object
+        .get(astra_tools::schemas::PER_ACTION_ANY_OF_REQUIRED_KEY)
+        .and_then(Value::as_object);
+
+    actions
+        .into_iter()
+        .map(|action| {
+            let required_fields = per_action_required
+                .get(action)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            let allowed_fields = match per_action_allowed
+                .and_then(|allowed| allowed.get(action))
+                .and_then(Value::as_array)
+            {
+                Some(fields) => fields
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?,
+                None => properties.keys().map(String::as_str).collect(),
+            };
+
+            let mut branch_properties = Map::new();
+            for field in allowed_fields {
+                branch_properties.insert(field.to_string(), properties.get(field)?.clone());
+            }
+            let action_schema = branch_properties.get_mut("action")?.as_object_mut()?;
+            action_schema.insert("enum".to_string(), json!([action]));
+
+            let mut required = vec!["action"];
+            for field in required_fields {
+                if !required.contains(&field) {
+                    required.push(field);
+                }
+            }
+            let mut branch = json!({
+                "type": "object",
+                "properties": branch_properties,
+                "required": required,
+                "additionalProperties": false,
+            });
+            if let Some(alternatives) = per_action_any_of
+                .and_then(|per_action| per_action.get(action))
+                .and_then(Value::as_array)
+            {
+                let alternatives = alternatives
+                    .iter()
+                    .map(Value::as_array)
+                    .map(|fields| {
+                        fields?
+                            .iter()
+                            .map(Value::as_str)
+                            .collect::<Option<Vec<_>>>()
+                            .map(|required| json!({"required": required}))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                if !alternatives.is_empty() {
+                    branch["anyOf"] = Value::Array(alternatives);
+                }
+            }
+            Some(branch)
+        })
+        .collect()
 }
 
 /// Keys always stripped — Bedrock's strict validator rejects them
@@ -11247,6 +11341,58 @@ mod tests {
             schema["description"],
             "Action contract: start requires action."
         );
+    }
+
+    #[test]
+    fn openai_action_tools_materialize_structural_per_action_contracts() {
+        let tools = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|tool| tool["function"]["name"] == "agent_fanout")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "review in parallel"})],
+            &tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(
+            schema
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with("x-astra-"))
+        );
+        let branches = schema["oneOf"]
+            .as_array()
+            .expect("OpenAI-compatible wire schema must carry action branches");
+        assert_eq!(branches.len(), 4);
+        let start = branches
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["start"]))
+            .expect("start branch");
+        assert_eq!(
+            start["required"],
+            json!(["action", "target_count", "slots"])
+        );
+        assert_eq!(start["additionalProperties"], false);
+        assert!(start["properties"].get("defaults").is_some());
+        assert!(start["properties"].get("slot_index").is_none());
+
+        let stop_slot = branches
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["stop_slot"]))
+            .expect("stop_slot branch");
+        assert_eq!(
+            stop_slot["required"],
+            json!(["action", "group_id", "slot_index"])
+        );
+        assert!(stop_slot["properties"].get("slots").is_none());
     }
 
     // --- Regression: max_completion_tokens bump respects user's ceiling ---

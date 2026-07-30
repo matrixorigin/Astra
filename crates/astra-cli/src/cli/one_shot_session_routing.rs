@@ -78,6 +78,18 @@ impl OneShotSessionRouting {
                         .iter()
                         .cloned(),
                 ),
+                active_conversation:
+                    astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                        astra_services::local_owner_scope().id(),
+                        self.history_source_session_id
+                            .as_deref()
+                            .or(self.server_session_id.as_deref())
+                            .unwrap_or("remote-continuation"),
+                        messages.clone(),
+                        self.resume_metadata.completed_turn_count,
+                        astra_turn_core::active_conversation::ActiveConversationSource::Checkpoint,
+                    )
+                    .ok()?,
                 messages,
             });
         }

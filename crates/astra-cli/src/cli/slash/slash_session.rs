@@ -5060,6 +5060,7 @@ fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &Restore
 
 struct PreparedForkRestore {
     history: Vec<(String, String)>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
@@ -5090,6 +5091,7 @@ struct ForkStateSnapshot {
     last_turn_event: Option<session_journal::JournalEvent>,
     run_id: Option<String>,
     history: Vec<(String, String)>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
@@ -5113,6 +5115,7 @@ impl ForkStateSnapshot {
                 astra_core::history_work::HistoryWorkSite::CliSlashForkRollbackSnapshot,
                 &state.history,
             ),
+            active_conversation: state.active_conversation.clone(),
             recent_tools: state.recent_tools.clone(),
             activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
             csl_manager: state.csl_manager.take(),
@@ -5140,6 +5143,7 @@ impl ForkStateSnapshot {
         state.last_turn_event = self.last_turn_event;
         state.run_id = self.run_id;
         state.history = self.history;
+        state.active_conversation = self.active_conversation;
         state.recent_tools = self.recent_tools;
         state.activated_deferred_tool_names = self.activated_deferred_tool_names;
         state.csl_manager = self.csl_manager;
@@ -5183,22 +5187,33 @@ fn materialize_prepared_fork_restore(
     mgr: astra_turn_core::conversation_log::manager::CslManager,
     mat: Option<astra_turn_core::conversation_log::MaterializedState>,
     restored_journal: session_runtime::RestoredJournalState,
+    session_id: &str,
 ) -> PreparedForkRestore {
+    let has_csl_materialization = mat.is_some();
     let mut history = crate::cli::history_work::clone_pair_history(
         astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
         &restored_journal.session.history,
     );
     let mut recent_tools = restored_journal.session.recent_tools.clone();
     let mut activated_deferred_tool_names = Vec::new();
+    let mut active_conversation = None;
     if let Some(ref materialized) = mat {
-        history = session_continuation::history_pairs_from_messages(
-            &session_continuation::sanitize_continuation_messages(
-                session_continuation::materialize_cli_continuation_messages(
-                    astra_core::history_work::HistoryWorkSite::CliSlashForkCanonicalHistoryClone,
-                    &materialized.messages,
-                ),
+        let canonical_messages = session_continuation::sanitize_continuation_messages(
+            session_continuation::materialize_cli_continuation_messages(
+                astra_core::history_work::HistoryWorkSite::CliSlashForkCanonicalHistoryClone,
+                &materialized.messages,
             ),
         );
+        history = session_continuation::history_pairs_from_messages(&canonical_messages);
+        active_conversation =
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                astra_services::local_owner_scope().id(),
+                session_id,
+                canonical_messages,
+                materialized.last_turn,
+                astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
+            )
+            .ok();
         if !materialized.session_state.recent_tools.is_empty() {
             recent_tools = materialized.session_state.recent_tools.clone();
         }
@@ -5212,9 +5227,10 @@ fn materialize_prepared_fork_restore(
     }
     PreparedForkRestore {
         history,
+        active_conversation,
         recent_tools,
         activated_deferred_tool_names,
-        csl_manager: Some(mgr),
+        csl_manager: has_csl_materialization.then_some(mgr),
         journal_state: restored_journal.session,
         last_turn_event: restored_journal.last_turn_event,
     }
@@ -5228,6 +5244,7 @@ fn prepared_fork_restore_from_restored_journal(
             astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
             &restored_journal.session.history,
         ),
+        active_conversation: None,
         recent_tools: restored_journal.session.recent_tools.clone(),
         activated_deferred_tool_names: Vec::new(),
         csl_manager: None,
@@ -5251,31 +5268,27 @@ async fn prepared_fork_restore_from_journal(
         Default::default(),
     )
     .map_err(|e| format!("initialize CSL state for session {session_id}: {e}"))?;
-    match mgr.load().await {
-        Ok(Some(mat)) => {
-            return Ok(materialize_prepared_fork_restore(
-                mgr,
-                Some(mat),
-                restored_journal,
-            ));
+    let mut prepared = match mgr.load().await {
+        Ok(materialized) => {
+            materialize_prepared_fork_restore(mgr, materialized, restored_journal, session_id)
         }
-        Ok(None) => {}
         Err(e) => {
             return Err(format!("load CSL state for session {session_id}: {e}"));
         }
-    }
+    };
 
-    // Fall back to prompt-facing transcript before journal summary. The
-    // transcript records visible user/assistant/tool stages even when a long
-    // turn did not reach a final journal Turn event, so it is the better resume
-    // source for interrupted or abandoned work.
-    let mut prepared = prepared_fork_restore_from_restored_journal(restored_journal);
-    let canonical_history =
-        session_continuation::load_session_messages_for_continuation(session_id)
-            .map(|messages| session_continuation::history_pairs_from_messages(&messages))
-            .unwrap_or_default();
-    if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
-        prepared.history = canonical_history;
+    // The canonical journal lane is authoritative even when the asynchronous
+    // CSL projection has not caught up yet.
+    if let Some(continuation) =
+        session_continuation::load_session_continuation_for_recovery(session_id)
+    {
+        let canonical_history =
+            session_continuation::history_pairs_from_messages(&continuation.messages);
+        if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
+            prepared.history = canonical_history;
+        }
+        prepared.activated_deferred_tool_names = continuation.activated_deferred_tool_names;
+        prepared.active_conversation = Some(continuation.active_conversation);
     }
     Ok(prepared)
 }
@@ -5307,6 +5320,7 @@ async fn load_prepared_fork_restore(
                 child_mgr,
                 child_mat,
                 restored_journal,
+                new_sid,
             )),
             Err(e) => {
                 tracing::warn!(
@@ -5398,6 +5412,7 @@ async fn apply_prepared_fork_restore(
     state.last_turn_event = restored_child.last_turn_event;
     state.run_id = None;
     state.history = restored_child.history;
+    state.active_conversation = restored_child.active_conversation;
     state.recent_tools = restored_child.recent_tools;
     state.activated_deferred_tool_names = restored_child.activated_deferred_tool_names;
     state.csl_manager = restored_child.csl_manager;
@@ -5506,6 +5521,7 @@ async fn restore_journal_history_if_available(
         state.recent_tools = restored.recent_tools;
     }
     state.activated_deferred_tool_names = restored.activated_deferred_tool_names;
+    state.active_conversation = restored.active_conversation;
     state.csl_manager = restored.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     Ok(())
@@ -5800,6 +5816,7 @@ async fn apply_restored_session(
         state.recent_tools = prepared_history.recent_tools;
     }
     state.csl_manager = prepared_history.csl_manager;
+    state.active_conversation = prepared_history.active_conversation;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
     let fallback_resume_messages;
@@ -8616,6 +8633,7 @@ mod resume_tests {
             };
             let restored_child = PreparedForkRestore {
                 history: child_state.history.clone(),
+                active_conversation: None,
                 recent_tools: child_state.recent_tools.clone(),
                 activated_deferred_tool_names: Vec::new(),
                 csl_manager: None,
@@ -8704,6 +8722,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8771,6 +8790,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8823,6 +8843,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8887,6 +8908,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8941,6 +8963,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8994,6 +9017,7 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,

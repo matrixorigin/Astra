@@ -10,6 +10,7 @@ use astra_services::{
     SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
     build_presigned_artifact_download,
 };
+use astra_thin_client::device_proof::{DeviceProofPurpose, canonical_device_proof_message};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -323,22 +324,6 @@ pub(crate) struct DeviceTrustRequest {
     pub reauthentication_proof: String,
     #[serde(default)]
     pub expected_last_monotonic_id: Option<i64>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DeviceProofPurpose {
-    Hydrate,
-    Trust,
-}
-
-impl DeviceProofPurpose {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hydrate => "hydrate",
-            Self::Trust => "trust",
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -2088,37 +2073,6 @@ fn sha256_raw_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn append_device_proof_field(message: &mut String, value: &str) {
-    message.push_str(&value.len().to_string());
-    message.push(':');
-    message.push_str(value);
-    message.push('\n');
-}
-
-fn device_proof_message(
-    purpose: DeviceProofPurpose,
-    user_id: &str,
-    session_id: &str,
-    device_id: &str,
-    device_fingerprint: &str,
-    challenge_id: &str,
-    challenge_digest: &str,
-) -> Vec<u8> {
-    let mut message = String::from("astra-device-proof-v1\n");
-    for value in [
-        purpose.as_str(),
-        user_id,
-        session_id,
-        device_id,
-        device_fingerprint,
-        challenge_id,
-        challenge_digest,
-    ] {
-        append_device_proof_field(&mut message, value);
-    }
-    message.into_bytes()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn verify_device_proof_signature(
     device_key_hash: &str,
@@ -2137,7 +2091,7 @@ fn verify_device_proof_signature(
     let Ok(mut mac) = HmacSha256::new_from_slice(device_key_hash.as_bytes()) else {
         return false;
     };
-    mac.update(&device_proof_message(
+    mac.update(&canonical_device_proof_message(
         purpose,
         user_id,
         session_id,

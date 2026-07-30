@@ -192,26 +192,42 @@ async fn retire_auth_runtime(state: &mut SessionState) {
     state.unregister_root_mailbox().await;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedAuthTransition {
+    owner_changed: bool,
+    runtime_needs_initialization: bool,
+}
+
 async fn prepare_session_auth_transition(
     profile: Option<&str>,
     account_id: &str,
     state: &mut SessionState,
-) -> Result<(), String> {
+) -> Result<PreparedAuthTransition, String> {
     let credentials = load_credentials();
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
     let owner_changed = target_owner != astra_services::local_owner_scope();
+    let runtime_needs_initialization =
+        state.agent_spawner.is_none() || state.delegation_engine.is_none();
 
-    retire_auth_runtime(state).await;
     if owner_changed {
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
+        retire_auth_runtime(state).await;
         crate::cli::session::session_cleanup::finalize_session(state).await;
         state.reset_for_new_session();
         state.clear_session_id();
+    } else if runtime_needs_initialization {
+        // A same-owner login after `/logout`, or a partially initialized
+        // runtime, is not a session boundary. Retire any incomplete half and
+        // rebuild it after the new credentials have been saved.
+        retire_auth_runtime(state).await;
     }
-    Ok(())
+    Ok(PreparedAuthTransition {
+        owner_changed,
+        runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+    })
 }
 
 async fn initialize_authenticated_runtime(
@@ -232,10 +248,17 @@ pub(crate) async fn do_login_for_session(
     state: &mut SessionState,
 ) -> Result<String, String> {
     let tokens = request_login_tokens(api, username, password).await?;
-    prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    tracing::debug!(
+        owner_changed = transition.owner_changed,
+        runtime_needs_initialization = transition.runtime_needs_initialization,
+        "prepared authenticated session transition"
+    );
     save_profile_auth_tokens(profile, username, &tokens)?;
-    let access_token = tokens.access_token;
-    initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    let access_token = tokens.access_token.clone();
+    if transition.runtime_needs_initialization {
+        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    }
     Ok(access_token)
 }
 
@@ -248,10 +271,17 @@ pub(crate) async fn do_register_for_session(
     state: &mut SessionState,
 ) -> Result<String, String> {
     let tokens = request_register_tokens(api, username, email, password).await?;
-    prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    tracing::debug!(
+        owner_changed = transition.owner_changed,
+        runtime_needs_initialization = transition.runtime_needs_initialization,
+        "prepared authenticated session transition"
+    );
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token;
-    initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    if transition.runtime_needs_initialization {
+        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    }
     Ok(access_token)
 }
 
@@ -372,6 +402,46 @@ mod tests {
             load_credentials().profiles["default"].account_id.as_deref(),
             Some("account-b")
         );
+        assert!(state.delegation_engine.is_some());
+        assert!(state.agent_spawner.is_some());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn same_owner_login_rebuilds_missing_runtime_without_resetting_session() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity_guard =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("account-a"),
+            )
+            .unwrap();
+        let owner = astra_services::local_owner_scope();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("same-owner-session");
+        assert!(state.agent_spawner.is_none());
+        assert!(state.delegation_engine.is_none());
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": "account-a",
+                "access_token": "access-new",
+                "refresh_token": "refresh-new"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let token = do_login_for_session(&api, None, "user-a", "password", &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(token, "access-new");
+        assert_eq!(astra_services::local_owner_scope(), owner);
+        assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
         assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
     }

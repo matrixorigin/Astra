@@ -24,7 +24,9 @@ use std::sync::{
 };
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
-use astra_turn_types::{InferencePurpose, UserIntentDelivery, UserIntentStatus};
+use astra_turn_types::{
+    ConversationCommitV1, InferencePurpose, UserIntentDelivery, UserIntentStatus,
+};
 
 use crate::interaction_contract::{
     InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
@@ -1469,6 +1471,11 @@ pub struct JournalEvent {
     /// Canonical conversation item for a local root or delegated run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_item: Option<JournalTranscriptItem>,
+    /// Canonical conversation delta committed atomically with a completed
+    /// root turn. This is the durability source for prompt continuation;
+    /// CSL and display history are projections of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_commit: Option<ConversationCommitV1>,
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
@@ -3830,6 +3837,7 @@ impl JournalEvent {
             session_lineage: None,
             coordination: None,
             transcript_item: None,
+            conversation_commit: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
@@ -3854,6 +3862,16 @@ impl JournalEvent {
 
     pub fn with_agentic_step(mut self, agentic_step: Option<u32>) -> Self {
         self.agentic_step = agentic_step;
+        self
+    }
+
+    pub fn with_conversation_commit(mut self, commit: ConversationCommitV1) -> Self {
+        // The journal redaction switch is a storage privacy boundary, not
+        // merely formatting for the legacy display fields. Do not introduce a
+        // second raw-content lane when it is enabled.
+        if !journal_content_redact_enabled() {
+            self.conversation_commit = Some(commit);
+        }
         self
     }
 

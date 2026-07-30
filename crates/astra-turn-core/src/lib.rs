@@ -13,6 +13,7 @@
 )]
 
 pub mod action_compensation;
+pub mod active_conversation;
 pub mod activity;
 pub mod agent_live_event;
 

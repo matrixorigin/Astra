@@ -11,6 +11,53 @@ use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, root_run_transcript_events};
 use astra_services::session_journal;
 
+fn prepare_canonical_conversation_commit(
+    state: &SessionState,
+    result: &StreamResult,
+) -> Result<Option<astra_turn_core::active_conversation::PreparedConversationCommit>, String> {
+    if !cfg!(feature = "active-conversation") {
+        return Ok(None);
+    }
+    let Some(session_id) = state.session_id.as_deref() else {
+        return Ok(None);
+    };
+    let owner_id = astra_services::local_owner_scope().id().to_string();
+    let canonical_messages =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            result.final_messages.clone(),
+        )
+        .map_err(|error| format!("validate canonical conversation: {error}"))?;
+    let active = match state.active_conversation.as_ref() {
+        Some(active) => {
+            if active.cursor().owner_id != owner_id {
+                return Err(format!(
+                    "active conversation owner `{}` does not match attached owner `{owner_id}`",
+                    active.cursor().owner_id
+                ));
+            }
+            if active.cursor().session_id != session_id {
+                return Err(format!(
+                    "active conversation session `{}` does not match attached session `{session_id}`",
+                    active.cursor().session_id
+                ));
+            }
+            active.clone()
+        }
+        None => {
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, session_id)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    active
+        .prepare_commit(
+            state.turn,
+            state.config_version_id.clone(),
+            canonical_messages,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &serde_json::Value) {
     match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
         trace_json.clone(),
@@ -638,12 +685,30 @@ pub(crate) fn commit_primary_turn(
     }
 
     if let Some(journal) = state.journal.as_ref() {
+        let prepared_conversation = match prepare_canonical_conversation_commit(state, result) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                issues.record_error("prepare canonical conversation commit", error);
+                let persistence_error = issues.into_summary();
+                state.session_persistence_error = persistence_error.clone();
+                return PrimaryTurnCommit {
+                    outcome: TurnCommitOutcome {
+                        turn_persisted: false,
+                        persistence_error,
+                    },
+                    deferred_sidecars: None,
+                };
+            }
+        };
         // The root transcript is the same user-facing truth as the turn
         // boundary. Append both in one durable batch so a completed turn is
         // immediately visible to Ctrl+O even while derived projections are
         // queued behind slow workspace, CSL, or telemetry work.
-        let (turn_event, turn_observability_events) =
+        let (mut turn_event, turn_observability_events) =
             build_primary_turn_event(state, line, result, turn_start);
+        if let Some(prepared) = prepared_conversation.as_ref() {
+            turn_event = turn_event.with_conversation_commit(prepared.commit.clone());
+        }
         let mut primary_events = vec![turn_event.clone()];
         primary_events.extend(root_run_transcript_events(
             state.session_id.as_deref(),
@@ -653,6 +718,9 @@ pub(crate) fn commit_primary_turn(
 
         turn_persisted = match journal.append_bulk(&primary_events) {
             Ok(()) => {
+                if let Some(prepared) = prepared_conversation {
+                    state.active_conversation = Some(prepared.next);
+                }
                 state.last_turn_event = Some(turn_event.clone());
                 for event in &primary_events {
                     enqueue_ingestion_pub(state, event);
@@ -784,6 +852,33 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == session_journal::JournalEventType::Turn)
+        );
+        let canonical_event = events
+            .iter()
+            .find(|event| event.conversation_commit.is_some())
+            .expect("primary turn must atomically carry its canonical conversation commit");
+        assert_eq!(
+            canonical_event
+                .conversation_commit
+                .as_ref()
+                .unwrap()
+                .cursor
+                .completed_turn,
+            1
+        );
+        assert_eq!(
+            state
+                .active_conversation
+                .as_ref()
+                .expect("live canonical state installs after the journal commit")
+                .cursor()
+                .canonical_root_hash,
+            canonical_event
+                .conversation_commit
+                .as_ref()
+                .unwrap()
+                .cursor
+                .canonical_root_hash
         );
         assert!(
             !events

@@ -24,11 +24,39 @@ impl DeviceProofPurpose {
     }
 }
 
-fn append_field(message: &mut String, value: &str) {
+fn append_device_proof_field(message: &mut String, value: &str) {
     message.push_str(&value.len().to_string());
     message.push(':');
     message.push_str(value);
     message.push('\n');
+}
+
+/// Build the protocol-canonical HMAC message from the server-stored challenge
+/// digest. Both proof generation and verification use this function so the
+/// domain prefix, authority-field order, and framing cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_device_proof_message(
+    purpose: DeviceProofPurpose,
+    user_id: &str,
+    session_id: &str,
+    device_id: &str,
+    device_fingerprint: &str,
+    challenge_id: &str,
+    challenge_digest: &str,
+) -> Vec<u8> {
+    let mut message = String::from("astra-device-proof-v1\n");
+    for value in [
+        purpose.as_str(),
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        challenge_id,
+        challenge_digest,
+    ] {
+        append_device_proof_field(&mut message, value);
+    }
+    message.into_bytes()
 }
 
 /// Produce the one-time proof for a Server-issued device challenge.
@@ -49,21 +77,18 @@ pub fn device_challenge_proof(
 ) -> String {
     let device_key_hash = format!("{:x}", Sha256::digest(device_key.as_bytes()));
     let challenge_digest = format!("{:x}", Sha256::digest(challenge.as_bytes()));
-    let mut message = String::from("astra-device-proof-v1\n");
-    for value in [
-        purpose.as_str(),
+    let message = canonical_device_proof_message(
+        purpose,
         user_id,
         session_id,
         device_id,
         device_fingerprint,
         challenge_id,
         challenge_digest.as_str(),
-    ] {
-        append_field(&mut message, value);
-    }
+    );
     let mut mac = Hmac::<Sha256>::new_from_slice(device_key_hash.as_bytes())
         .expect("SHA-256 hex is a valid HMAC key");
-    mac.update(message.as_bytes());
+    mac.update(&message);
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 

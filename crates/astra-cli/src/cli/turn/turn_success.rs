@@ -224,6 +224,7 @@ struct TurnSuccessLiveSnapshot {
     last_response: Option<String>,
     continuation_anchor: Option<ContinuationAnchor>,
     pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     redo_stack: Vec<(String, String, u32)>,
     history: Vec<(String, String)>,
     recent_tools: Vec<String>,
@@ -260,6 +261,7 @@ impl TurnSuccessLiveSnapshot {
             last_response: state.last_response.clone(),
             continuation_anchor: state.continuation_anchor.clone(),
             pending_followup_suggestion: state.pending_followup_suggestion.clone(),
+            active_conversation: state.active_conversation.clone(),
             redo_stack: state.redo_stack.clone(),
             history: crate::cli::history_work::clone_pair_history(
                 astra_core::history_work::HistoryWorkSite::CliSettlementRollbackSnapshot,
@@ -304,6 +306,7 @@ impl TurnSuccessLiveSnapshot {
         state.last_response = self.last_response;
         state.continuation_anchor = self.continuation_anchor;
         state.pending_followup_suggestion = self.pending_followup_suggestion;
+        state.active_conversation = self.active_conversation;
         state.redo_stack = self.redo_stack;
         state.history = self.history;
         state.recent_tools = self.recent_tools;

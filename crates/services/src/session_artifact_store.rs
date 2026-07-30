@@ -219,14 +219,17 @@ static PROCESS_LOCAL_OWNER_SCOPE: LazyLock<RwLock<OwnerScope>> = LazyLock::new(|
     RwLock::new(OwnerScope::user("local").expect("default local owner id is non-empty"))
 });
 
-/// Install the owner identity for ownerless local-session APIs in this process.
+/// Install the owner identity used by ownerless local-session APIs.
 ///
-/// The CLI resolves this once from its selected profile plus the server-issued
-/// account id before opening journals, caches, or the sync outbox. Server paths
-/// should continue to pass an explicit [`OwnerScope`] instead.
+/// This process-global binding is expected to change during a serialized CLI
+/// account transition. The auth/session lifecycle owns retirement of the old
+/// runtime and session before rebinding; server paths should continue to pass
+/// an explicit [`OwnerScope`] instead.
 pub fn configure_local_owner_scope(owner_scope: OwnerScope) {
     match PROCESS_LOCAL_OWNER_SCOPE.write() {
-        Ok(mut current) => *current = owner_scope,
+        Ok(mut current) => {
+            *current = owner_scope;
+        }
         Err(poisoned) => {
             tracing::warn!(
                 "process local owner scope lock was poisoned; replacing the stored identity"

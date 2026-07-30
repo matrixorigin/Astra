@@ -2088,6 +2088,7 @@ mod tests {
             session_lineage: None,
             coordination: None,
             transcript_item: None,
+            conversation_commit: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,

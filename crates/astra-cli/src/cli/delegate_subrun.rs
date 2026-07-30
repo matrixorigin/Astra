@@ -120,6 +120,7 @@ fn initial_delegate_transcript_identity(
 pub(crate) struct CliDelegateSubRunExecutor {
     api: astra_thin_client::ThinClient,
     token: String,
+    token_provider: Option<super::spawn_subrun::TokenProvider>,
     default_model: Option<String>,
     project_root: PathBuf,
     inherited_permissions: astra_runtime::orchestration::InheritedPermissions,
@@ -157,6 +158,7 @@ impl CliDelegateSubRunExecutor {
         Self {
             api,
             token,
+            token_provider: None,
             default_model,
             project_root,
             inherited_permissions,
@@ -204,6 +206,18 @@ impl CliDelegateSubRunExecutor {
         self.progress_broadcaster = Some(broadcaster);
         self
     }
+
+    pub fn with_token_provider(mut self, provider: super::spawn_subrun::TokenProvider) -> Self {
+        self.token_provider = Some(provider);
+        self
+    }
+
+    fn resolve_token(&self) -> String {
+        self.token_provider
+            .as_ref()
+            .and_then(|provider| provider())
+            .unwrap_or_else(|| self.token.clone())
+    }
 }
 
 /// Build the set of restricted tools from an agent profile's `skill_filter`.
@@ -238,6 +252,10 @@ fn build_restricted_tools(
 #[async_trait]
 impl SubRunExecutor for CliDelegateSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        // Resolve once per child run. Every model and tool boundary inside the
+        // run uses this same credential snapshot; the next child observes a
+        // later parent refresh through the provider.
+        let token = self.resolve_token();
         let profile = &config.agent_profile;
         let started_at = std::time::Instant::now();
         // Profile names are not run identities: fan-out can legitimately run
@@ -270,14 +288,14 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let model_selection = if let Some(selection) = profile.model_selection.as_ref() {
             crate::cli::session::session_runtime::resolve_server_offering_selection(
                 &self.api,
-                &self.token,
+                &token,
                 &selection.offering_id,
             )
             .await?
         } else {
             crate::cli::skill_subrun::resolve_subrun_model_selection(
                 &self.api,
-                &self.token,
+                &token,
                 self.default_model.as_deref(),
             )
             .await?
@@ -318,7 +336,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         );
 
         let executor = edge_tools::ToolExecutor::new(&effective_root)
-            .with_cloud(self.api.api_origin(), &self.token)
+            .with_cloud(self.api.api_origin(), &token)
             .with_memory_attribution_id(config.run_id.clone());
         executor.set_cli_local_provider_schemas(all_schemas.clone());
         if !config.session_id.trim().is_empty() {
@@ -351,7 +369,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         let mut host = SubRunHost {
             api: self.api.clone(),
-            token: self.token.clone(),
+            token: token.clone(),
             model: effective_model.clone(),
             offering_id: model_selection.offering_id,
             project_root: effective_root.clone(),
@@ -582,7 +600,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             last_turn_policy:
                 astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
-            api_token: self.token.clone(),
+            api_token: token,
             delegation_engine: None,
             delegations_this_turn: 0,
             delegation_chain: config.delegation_chain.clone(),
@@ -944,6 +962,31 @@ mod tests {
             astra_runtime::orchestration::PermissionMode::Auto
         );
         assert!(executor.inherited_permissions.is_background);
+    }
+
+    #[test]
+    fn delegate_executor_resolves_a_fresh_token_for_each_child_run() {
+        let inherited_permissions =
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto);
+        let token = std::sync::Arc::new(std::sync::Mutex::new(Some("token-a".to_string())));
+        let provider_token = token.clone();
+        let provider: super::super::spawn_subrun::TokenProvider =
+            std::sync::Arc::new(move || provider_token.lock().unwrap().clone());
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "fallback".to_string(),
+            None,
+            PathBuf::from("."),
+            inherited_permissions,
+            None,
+        )
+        .with_token_provider(provider);
+
+        assert_eq!(executor.resolve_token(), "token-a");
+        *token.lock().unwrap() = Some("token-b".to_string());
+        assert_eq!(executor.resolve_token(), "token-b");
+        *token.lock().unwrap() = None;
+        assert_eq!(executor.resolve_token(), "fallback");
     }
 
     #[test]

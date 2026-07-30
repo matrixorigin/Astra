@@ -10,6 +10,7 @@ pub(crate) struct SessionContinuation {
     pub(crate) completed_turn_count: Option<u32>,
     pub(crate) messages: Vec<Value>,
     pub(crate) activated_deferred_tool_names: Vec<String>,
+    pub(crate) active_conversation: astra_turn_core::active_conversation::ActiveConversation,
 }
 
 pub(crate) fn materialize_cli_continuation_messages(
@@ -40,11 +41,10 @@ pub(crate) fn continuation_activation_names(
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
 ///
-/// CSL preserves full canonical runtime history. The primary session journal
-/// is the durable source of completed turns and provides a fresh
-/// prompt-facing fallback while a CSL projection is delayed or unavailable.
-/// A heavy checkpoint is the final recovery fallback. The TUI transcript is a
-/// display projection and is deliberately never used as model history.
+/// Typed commits in the primary session journal are the durable canonical
+/// source. CSL is an asynchronous continuation projection; a heavy checkpoint
+/// and legacy journal display pairs are explicit compatibility fallbacks. The
+/// TUI transcript is a display projection and is never used as model history.
 pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
     load_session_continuation_for_recovery(session_id).map(|continuation| continuation.messages)
 }
@@ -52,6 +52,33 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
 pub(crate) fn load_session_continuation_for_recovery(
     session_id: &str,
 ) -> Option<SessionContinuation> {
+    match load_journal_canonical_conversation(session_id) {
+        Ok(Some(active_conversation)) => {
+            let messages = active_conversation.materialize();
+            record_session_restore_hydration(&messages);
+            let activated_deferred_tool_names = load_heavy_checkpoint(session_id)
+                .map(|checkpoint| checkpoint.activated_deferred_tool_names)
+                .unwrap_or_default();
+            return Some(SessionContinuation {
+                completed_turn_count: Some(active_conversation.cursor().completed_turn),
+                activated_deferred_tool_names: continuation_activation_names(
+                    &messages,
+                    activated_deferred_tool_names,
+                ),
+                messages,
+                active_conversation,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to replay canonical journal conversation; using an explicitly degraded recovery source"
+            );
+        }
+    }
+
     match load_csl_continuation(session_id) {
         Ok(Some(continuation)) => return Some(continuation),
         Ok(None) => {}
@@ -77,19 +104,7 @@ pub(crate) fn load_session_continuation_for_recovery(
     };
 
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    let heavy =
-        match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                tracing::warn!(
-                    user_id = %user_id,
-                    session_id = %session_id,
-                    error = %error,
-                    "failed to read continuation checkpoint"
-                );
-                None
-            }
-        };
+    let heavy = load_heavy_checkpoint(session_id);
 
     if let Some(messages) = journal_messages {
         record_session_restore_hydration(&messages);
@@ -101,6 +116,12 @@ pub(crate) fn load_session_continuation_for_recovery(
                     checkpoint.activated_deferred_tool_names.iter().cloned()
                 }),
             ),
+            active_conversation: projection_active_conversation(
+                session_id,
+                messages.clone(),
+                0,
+                astra_turn_core::active_conversation::ActiveConversationSource::LegacyDisplayProjection,
+            )?,
             messages,
         });
     }
@@ -138,11 +159,75 @@ pub(crate) fn load_session_continuation_for_recovery(
                         &messages,
                         cp.activated_deferred_tool_names,
                     ),
+                    active_conversation: projection_active_conversation(
+                        session_id,
+                        messages.clone(),
+                        0,
+                        astra_turn_core::active_conversation::ActiveConversationSource::Checkpoint,
+                    )?,
                     messages,
                 })
             }
         }
         _ => None,
+    }
+}
+
+fn projection_active_conversation(
+    session_id: &str,
+    messages: Vec<Value>,
+    completed_turn: u32,
+    source: astra_turn_core::active_conversation::ActiveConversationSource,
+) -> Option<astra_turn_core::active_conversation::ActiveConversation> {
+    astra_turn_core::active_conversation::ActiveConversation::from_projection(
+        astra_services::local_owner_scope().id(),
+        session_id,
+        messages,
+        completed_turn,
+        source,
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "failed to attach recovered canonical conversation"
+        );
+        error
+    })
+    .ok()
+}
+
+fn load_journal_canonical_conversation(
+    session_id: &str,
+) -> Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String> {
+    let commits = astra_services::session_journal::read_journal_append_order(session_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|event| event.conversation_commit)
+        .collect::<Vec<_>>();
+    astra_turn_core::active_conversation::ActiveConversation::replay(
+        astra_services::local_owner_scope().id(),
+        session_id,
+        commits,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn load_heavy_checkpoint(
+    session_id: &str,
+) -> Option<astra_pipeline::step_protocol::HeavyCheckpoint> {
+    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user_id,
+                session_id = %session_id,
+                error = %error,
+                "failed to read continuation checkpoint"
+            );
+            None
+        }
     }
 }
 
@@ -200,6 +285,13 @@ pub(crate) fn load_csl_continuation(
     );
     Ok((!messages.is_empty()).then_some(SessionContinuation {
         completed_turn_count: Some(materialized.last_turn),
+        active_conversation: projection_active_conversation(
+            session_id,
+            messages.clone(),
+            materialized.last_turn,
+            astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
+        )
+        .ok_or_else(|| format!("failed to attach CSL continuation for session {session_id}"))?,
         messages,
         activated_deferred_tool_names,
     }))
@@ -383,6 +475,74 @@ mod tests {
             messages[1],
             json!({"role": "assistant", "content": "the result is durable"})
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn canonical_journal_recovers_typed_tool_history_before_csl_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journal_dir = session_journal::JournalDirGuard::new(temp.path());
+        let session_id = format!("journal-canonical-{}", uuid::Uuid::new_v4());
+        let owner_id = astra_services::local_owner_scope().id().to_string();
+        let first_messages = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "file body"}),
+            json!({"role": "assistant", "content": "first answer"}),
+        ];
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, &session_id)
+                .unwrap();
+        let first = active
+            .prepare_commit(1, None, first_messages.clone())
+            .unwrap();
+        let mut second_messages = first_messages;
+        second_messages.extend([
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "second answer"}),
+        ]);
+        let second = first
+            .next
+            .prepare_commit(2, None, second_messages.clone())
+            .unwrap();
+        let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+        for (turn, commit) in [(1, first.commit), (2, second.commit)] {
+            writer
+                .append(
+                    &session_journal::JournalEvent::turn(
+                        Some(&session_id),
+                        turn,
+                        Some("test-model"),
+                        "display user",
+                        "display assistant",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .with_conversation_commit(commit),
+                )
+                .unwrap();
+        }
+
+        let continuation = super::load_session_continuation_for_recovery(&session_id)
+            .expect("canonical journal should recover without waiting for CSL");
+
+        assert_eq!(continuation.messages, second_messages);
+        assert_eq!(
+            continuation.active_conversation.source(),
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal
+        );
+        assert_eq!(continuation.active_conversation.cursor().completed_turn, 2);
+        assert_eq!(continuation.messages[2]["role"], "tool");
+        assert_eq!(continuation.messages[2]["content"], "file body");
     }
 
     #[test]

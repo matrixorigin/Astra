@@ -29,7 +29,10 @@ struct PlanMirrorRefresh {
 /// mutable `SessionState` crosses this boundary, so a slow disk or server can
 /// never keep the next turn from starting.
 pub(crate) struct TurnPostCommitJob {
+    owner_id: String,
     session_id: Option<String>,
+    attachment_epoch: u64,
+    expected_cursor: Option<astra_turn_types::SessionCursorV1>,
     turn: u32,
     final_messages: Vec<serde_json::Value>,
     csl_state: astra_turn_core::conversation_log::SessionStateCompact,
@@ -46,7 +49,10 @@ pub(crate) struct TurnPostCommitJob {
 /// session identity still matches; stale completions cannot overwrite a later
 /// resume/rebind.
 pub(crate) struct TurnPostCommitCompletion {
+    owner_id: String,
     pub(crate) session_id: Option<String>,
+    attachment_epoch: u64,
+    expected_cursor: Option<astra_turn_types::SessionCursorV1>,
     pub(crate) csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
     plan_mirror: Option<Result<Option<astra_runtime::plan::PlanModeState>, String>>,
     pub(crate) errors: Vec<String>,
@@ -60,6 +66,15 @@ pub(crate) fn prepare_turn_post_commit_job(
     csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
 ) -> TurnPostCommitJob {
+    let expected_cursor = state
+        .active_conversation
+        .as_ref()
+        .map(|conversation| conversation.cursor().clone());
+    let final_messages = state
+        .active_conversation
+        .as_ref()
+        .map(|conversation| conversation.materialize())
+        .unwrap_or(final_messages);
     let csl_state = state
         .csl_manager
         .as_ref()
@@ -92,7 +107,10 @@ pub(crate) fn prepare_turn_post_commit_job(
         .and(state.session_id.as_deref())
         .and_then(build_local_csl_manager);
     TurnPostCommitJob {
+        owner_id: astra_services::local_owner_scope().id().to_string(),
         session_id: state.session_id.clone(),
+        attachment_epoch: state.session_attachment_epoch,
+        expected_cursor,
         turn: state.turn,
         final_messages,
         csl_state,
@@ -157,6 +175,9 @@ pub(crate) async fn execute_turn_post_commit_job(
     job._queue_bytes = None;
     let started = Instant::now();
     let session_id = job.session_id.clone();
+    let owner_id = job.owner_id.clone();
+    let attachment_epoch = job.attachment_epoch;
+    let expected_cursor = job.expected_cursor.clone();
     let turn = job.turn;
     let mut errors = Vec::new();
     let sidecar_started = Instant::now();
@@ -276,7 +297,10 @@ pub(crate) async fn execute_turn_post_commit_job(
         );
     }
     TurnPostCommitCompletion {
+        owner_id,
         session_id,
+        attachment_epoch,
+        expected_cursor,
         csl_manager,
         plan_mirror,
         errors,
@@ -290,10 +314,25 @@ pub(crate) fn apply_turn_post_commit_completion(
     completion: TurnPostCommitCompletion,
     state: &mut SessionState,
 ) -> Vec<String> {
-    if completion.session_id != state.session_id {
+    let current_owner_id = astra_services::local_owner_scope().id().to_string();
+    let current_cursor = state
+        .active_conversation
+        .as_ref()
+        .map(|conversation| conversation.cursor());
+    if completion.owner_id != current_owner_id
+        || completion.session_id != state.session_id
+        || completion.attachment_epoch != state.session_attachment_epoch
+        || completion.expected_cursor.as_ref() != current_cursor
+    {
         tracing::debug!(
+            completed_owner_id = %completion.owner_id,
+            current_owner_id = %current_owner_id,
             completed_session_id = ?completion.session_id,
             current_session_id = ?state.session_id,
+            completed_attachment_epoch = completion.attachment_epoch,
+            current_attachment_epoch = state.session_attachment_epoch,
+            completed_cursor = ?completion.expected_cursor,
+            current_cursor = ?current_cursor,
             "ignored stale deferred turn-post-commit completion"
         );
         return Vec::new();
@@ -340,8 +379,9 @@ pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheck
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_turn_post_commit_completion, build_full_session_state_compact,
-        execute_turn_post_commit_job, extract_csl_fields_from_result, prepare_turn_post_commit_job,
+        TurnPostCommitCompletion, apply_turn_post_commit_completion,
+        build_full_session_state_compact, execute_turn_post_commit_job,
+        extract_csl_fields_from_result, prepare_turn_post_commit_job,
     };
     use crate::cli::session::session_projection::CslCheckpointFields;
     use crate::cli::session::session_state::SessionState;
@@ -422,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn csl_persist_writes_raw_canonical_messages() {
+    async fn csl_projection_uses_the_committed_active_conversation() {
         use astra_turn_core::conversation_log::{
             CslStore, file_store::FileCslStore, manager::CslManager,
         };
@@ -455,6 +495,21 @@ mod tests {
             serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "tool output"}),
             serde_json::json!({"role": "assistant", "content": "ok"}),
         ];
+        let canonical_messages =
+            astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                final_messages.clone(),
+            )
+            .unwrap();
+        state.active_conversation = Some(
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                astra_services::local_owner_scope().id(),
+                &session_id,
+                canonical_messages.clone(),
+                1,
+                astra_turn_core::active_conversation::ActiveConversationSource::Live,
+            )
+            .unwrap(),
+        );
 
         let api = test_api();
         let job = prepare_turn_post_commit_job(
@@ -471,20 +526,10 @@ mod tests {
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
-        assert_eq!(mat.messages.len(), 6);
-        assert_eq!(mat.messages[0]["content"], "old review");
-        assert_eq!(
-            astra_turn_types::user_turn_semantics(&mat.messages[0])
-                .expect("valid semantics")
-                .map(|semantics| semantics.objective_relation),
-            Some(astra_turn_types::ObjectiveRelation::Replace)
-        );
-        assert_eq!(mat.messages[1]["_compact_boundary"], true);
-        assert_eq!(mat.messages[2]["content"], "不要review啊！");
-        assert_eq!(mat.messages[3]["reasoning_content"], "trace");
-        assert_eq!(mat.messages[4]["role"], "tool");
-        assert_eq!(mat.messages[4]["content"], "tool output");
-        assert_eq!(mat.messages[5]["content"], "ok");
+        assert_eq!(mat.messages, canonical_messages);
+        assert_eq!(mat.messages.len(), 2);
+        assert_eq!(mat.messages[0]["content"], "不要review啊！");
+        assert_eq!(mat.messages[1]["content"], "ok");
     }
 
     #[tokio::test]
@@ -543,5 +588,43 @@ mod tests {
             Instant::now(),
         );
         assert!(state.csl_manager.is_some());
+    }
+
+    #[test]
+    fn deferred_completion_cannot_cross_an_attachment_epoch() {
+        let active = astra_turn_core::active_conversation::ActiveConversation::empty(
+            astra_services::local_owner_scope().id(),
+            "session-a",
+        )
+        .unwrap()
+        .prepare_commit(
+            1,
+            None,
+            vec![serde_json::json!({"role": "user", "content": "one"})],
+        )
+        .unwrap()
+        .next;
+        let expected_cursor = active.cursor().clone();
+        let mut state = SessionState {
+            session_id: Some("session-a".to_string()),
+            session_attachment_epoch: 7,
+            active_conversation: Some(active),
+            ..Default::default()
+        };
+        let completion = TurnPostCommitCompletion {
+            owner_id: astra_services::local_owner_scope().id().to_string(),
+            session_id: Some("session-a".to_string()),
+            attachment_epoch: 6,
+            expected_cursor: Some(expected_cursor),
+            csl_manager: None,
+            plan_mirror: None,
+            errors: vec!["stale projection error".to_string()],
+        };
+
+        assert!(apply_turn_post_commit_completion(completion, &mut state).is_empty());
+        assert!(
+            state.session_persistence_error.is_none(),
+            "a stale completion must not mutate the newly attached session"
+        );
     }
 }

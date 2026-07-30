@@ -191,6 +191,15 @@ pub(crate) struct SessionState {
     /// User preference: minimum elapsed seconds before a notification fires.
     /// Synced via `pref_keys::NOTIFICATION_THRESHOLD_SECS`.
     pub notification_threshold_secs: u64,
+    /// Full-fidelity canonical prompt history for the attached session.
+    ///
+    /// This is installed only from a validated recovery source or after the
+    /// primary journal turn has committed. `history` below remains a derived
+    /// display projection and must never be promoted into this field.
+    pub active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
+    /// Monotonic identity of the live session attachment. Deferred work must
+    /// carry and match this epoch before it can update mutable session state.
+    pub session_attachment_epoch: u64,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
@@ -546,6 +555,8 @@ impl Default for SessionState {
             notifications_enabled: true,
             notification_method: crate::cli::notifications::NotificationMethod::Auto,
             notification_threshold_secs: 10,
+            active_conversation: None,
+            session_attachment_epoch: 0,
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
@@ -691,6 +702,14 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    fn advance_session_attachment(&mut self) {
+        self.session_attachment_epoch = self
+            .session_attachment_epoch
+            .checked_add(1)
+            .expect("session attachment epoch exhausted");
+        self.active_conversation = None;
+    }
+
     fn clear_resume_recovery_state(&mut self) {
         self.plan_mode_sync_error = None;
         self.resume_guidance = None;
@@ -709,6 +728,9 @@ impl SessionState {
     /// the session.
     pub fn set_session_id(&mut self, session_id: impl Into<String>) {
         let sid: String = session_id.into();
+        if self.session_id.as_deref() != Some(sid.as_str()) {
+            self.advance_session_attachment();
+        }
         self.task_manager.rebind(&sid);
         self.perm_manager.set_active_session_id(&sid);
         self.session_id = Some(sid);
@@ -717,6 +739,11 @@ impl SessionState {
     /// Clear the current session id. Task manager falls back to an empty
     /// session binding; the next `set_session_id` rebinds.
     pub fn clear_session_id(&mut self) {
+        if self.session_id.is_some() {
+            self.advance_session_attachment();
+        } else {
+            self.active_conversation = None;
+        }
         self.task_manager.rebind("");
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
@@ -738,6 +765,7 @@ impl SessionState {
     /// session boundary; this synchronous reset does not tear down the
     /// asynchronously registered root mailbox.
     pub fn reset_for_new_session(&mut self) {
+        self.advance_session_attachment();
         // A registry generation belongs to exactly one session. Old producers
         // may still be retiring after the bounded rebind deadline; replacing
         // the Arc keeps their late observations isolated from the new model

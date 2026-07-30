@@ -176,7 +176,14 @@ fn build_turn_stream_params<'a>(
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
-        pre_loaded_messages: None,
+        pre_loaded_messages: if cfg!(feature = "active-conversation") {
+            state
+                .active_conversation
+                .as_ref()
+                .map(|conversation| conversation.materialize())
+        } else {
+            None
+        },
         append_system_prompt: prepared.append_system_prompt.clone(),
         session_memory_extractor: state.session_memory_extractor.clone(),
         #[cfg(feature = "harness")]
@@ -374,6 +381,10 @@ mod tests {
 
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
+        let canonical_messages = vec![
+            serde_json::json!({"role": "user", "content": "canonical question"}),
+            serde_json::json!({"role": "assistant", "content": "canonical answer"}),
+        ];
         let mut state = SessionState {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             current_plan_subtask_id: Some("subtask-1".into()),
@@ -387,6 +398,17 @@ mod tests {
                 "consecutive_futile_attempts": 1,
             })),
             runtime_consecutive_context_window_errors: 2,
+            history: vec![("display-only question".into(), "display-only answer".into())],
+            active_conversation: Some(
+                astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                    astra_services::local_owner_scope().id(),
+                    "sess-1",
+                    canonical_messages.clone(),
+                    1,
+                    astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+                )
+                .unwrap(),
+            ),
             ..SessionState::default()
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -449,5 +471,10 @@ mod tests {
         );
         assert!(params.cancel_token.is_some());
         assert!(params.incremental_state.is_some());
+        assert_eq!(
+            params.pre_loaded_messages,
+            Some(canonical_messages),
+            "the model boundary must consume canonical typed history, never the display pairs"
+        );
     }
 }

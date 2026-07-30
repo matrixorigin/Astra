@@ -15,6 +15,7 @@ mod provider_contract;
 mod result_quality;
 mod runtime_scaffolding;
 mod semantic_read_cache;
+mod session_cursor;
 pub mod session_facts;
 mod tool_idempotency;
 mod tool_invocation;
@@ -70,6 +71,11 @@ pub use semantic_read_cache::{
     SemanticReadCacheLookup, SemanticReadCondition, SemanticReadConditionAck,
     SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
     SemanticReadFreshnessUnavailableReason, SemanticReadObservation,
+};
+pub use session_cursor::{
+    CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
+    ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
+    DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

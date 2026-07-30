@@ -2044,7 +2044,7 @@ fn user_runtime_config_path_from_roots(
 
 fn user_runtime_config_path() -> Option<PathBuf> {
     user_runtime_config_path_from_roots(
-        astra_runtime_env::local_state_root_override(),
+        astra_core::local_state::local_state_root_override(),
         dirs::home_dir(),
     )
 }
