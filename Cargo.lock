@@ -267,6 +267,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "sha2",
  "temp-env",
  "tempfile",
  "thiserror 1.0.69",
@@ -632,6 +633,7 @@ name = "astra-test-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astra-credentials",
  "astra-services",
  "astra-turn-types",
  "async-trait",

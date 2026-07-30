@@ -17,7 +17,9 @@ use astra_test_harness::judger::{
 use astra_test_harness::preflight::run_preflight;
 use astra_test_harness::report::{Format, render};
 use astra_test_harness::runner::{RunnerConfig, resolve_models};
-use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
+use astra_test_harness::suite::{
+    ScopedDiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -233,6 +235,49 @@ fn resolve_workspace_astra_bin(ancestor: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+struct RunnerProfileIdentity {
+    profile_name: String,
+    local_owner_scope: astra_services::OwnerScope,
+    artifact_owner_scopes: Vec<astra_services::OwnerScope>,
+}
+
+fn resolve_runner_profile_owner(requested_profile: Option<&str>) -> Result<RunnerProfileIdentity> {
+    let credentials = astra_credentials::CredentialStore::new()
+        .load()
+        .context("load CLI credentials for harness session capture")?;
+    let profile_name = astra_credentials::CredentialStore::resolve_profile_name(
+        requested_profile,
+        credentials.current_profile.as_deref(),
+    );
+    let profile = credentials.profiles.get(&profile_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "credential profile `{profile_name}` is unavailable after preflight; \
+             authenticate that profile before running the harness"
+        )
+    })?;
+    let account_id = profile.account_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "credential profile `{profile_name}` has no server-issued account_id; \
+             log in again before running owner-scoped harness verification"
+        )
+    })?;
+    let local_owner_id = astra_credentials::local_profile_owner_id(&profile_name, Some(account_id))
+        .map_err(anyhow::Error::msg)?;
+    let local_owner_scope =
+        astra_services::OwnerScope::user(local_owner_id).map_err(anyhow::Error::msg)?;
+    let server_owner_scope =
+        astra_services::OwnerScope::user(account_id).map_err(anyhow::Error::msg)?;
+    let mut artifact_owner_scopes = vec![local_owner_scope.clone()];
+    if server_owner_scope != local_owner_scope {
+        artifact_owner_scopes.push(server_owner_scope);
+    }
+    Ok(RunnerProfileIdentity {
+        profile_name,
+        local_owner_scope,
+        artifact_owner_scopes,
+    })
+}
+
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.is_file() {
@@ -377,10 +422,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    let runner_identity = resolve_runner_profile_owner(runner_profile.as_deref())?;
+    astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());
+    runner_profile = Some(runner_identity.profile_name);
+
     let mut runner_cfg =
         RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
+    runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
 
     let judger_cfg = JudgerConfig {
         astra_bin: astra_bin.clone(),
@@ -423,7 +473,8 @@ async fn main() -> Result<()> {
         warn_if_same_family(&args.judger_model, &tested);
     }
 
-    let session_loader = DiskSessionLoader;
+    let session_loader =
+        ScopedDiskSessionLoader::new(runner_identity.artifact_owner_scopes.clone());
     let needs_session_capture = cases
         .iter()
         .any(|case| requires_session_capture(&case.criteria));
@@ -433,7 +484,9 @@ async fn main() -> Result<()> {
         SessionCaptureMode::OnDebugLog
     };
 
-    let digest = AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
+    let digest = AstraCliDigestCollector::new(astra_bin.clone())
+        .with_timeout(args.digest_timeout)
+        .with_profile(runner_profile.clone());
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
         if args.no_digest_on_fail {
             None
@@ -555,7 +608,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_astra_bin;
+    use super::{resolve_runner_profile_owner, resolve_workspace_astra_bin};
     use std::fs;
     use std::time::Duration;
 
@@ -591,5 +644,32 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&release_bin, b"release-newer").unwrap();
         assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
+
+    #[test]
+    fn runner_profile_owner_uses_the_bound_account_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = astra_credentials::set_test_credentials_dir(dir.path().to_path_buf());
+        astra_credentials::CredentialStore::new()
+            .mutate(|credentials| {
+                credentials.current_profile = Some("profile-a".to_string());
+                credentials.profiles.insert(
+                    "profile-a".to_string(),
+                    astra_credentials::Profile {
+                        account_id: Some("account-a".to_string()),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        let identity = resolve_runner_profile_owner(None).unwrap();
+        assert_eq!(identity.profile_name, "profile-a");
+        assert_eq!(
+            identity.local_owner_scope.id(),
+            astra_credentials::local_profile_owner_id("profile-a", Some("account-a")).unwrap()
+        );
+        assert_eq!(identity.artifact_owner_scopes.len(), 2);
+        assert_eq!(identity.artifact_owner_scopes[1].id(), "account-a");
     }
 }

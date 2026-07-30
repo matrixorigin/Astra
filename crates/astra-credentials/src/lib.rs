@@ -70,6 +70,34 @@ impl std::fmt::Debug for Profile {
     }
 }
 
+/// Derive the stable local artifact owner for one CLI credential profile.
+///
+/// The server-issued account id is part of the namespace so two profiles with
+/// the same display name cannot share local session state after an account
+/// transition. `None` is reserved for authentication bootstrap before the
+/// server has issued an account identity.
+pub fn local_profile_owner_id(
+    profile_name: &str,
+    account_id: Option<&str>,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let profile_name = profile_name.trim();
+    if profile_name.is_empty() {
+        return Err("CLI profile name must not be empty".to_string());
+    }
+    let account_id = account_id.map(str::trim);
+    if account_id.is_some_and(str::is_empty) {
+        return Err("CLI profile account_id must not be empty".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-cli-local-owner-v1\0profile\0");
+    hasher.update(profile_name.as_bytes());
+    hasher.update(b"\0account\0");
+    hasher.update(account_id.unwrap_or("anonymous").as_bytes());
+    Ok(format!("cli-profile-v1:{:x}", hasher.finalize()))
+}
+
 pub struct CredentialStore {
     path: PathBuf,
 }
@@ -416,6 +444,25 @@ mod tests {
 
     fn store_in(dir: &TempDir) -> CredentialStore {
         CredentialStore::with_path(dir.path().join("credentials.json"))
+    }
+
+    #[test]
+    fn local_profile_owner_identity_is_stable_and_account_bound() {
+        let first = local_profile_owner_id("profile-a", Some("account-1")).unwrap();
+        assert_eq!(
+            first,
+            local_profile_owner_id("profile-a", Some("account-1")).unwrap()
+        );
+        assert_ne!(
+            first,
+            local_profile_owner_id("profile-a", Some("account-2")).unwrap()
+        );
+        assert_ne!(
+            first,
+            local_profile_owner_id("profile-b", Some("account-1")).unwrap()
+        );
+        assert!(local_profile_owner_id(" ", Some("account-1")).is_err());
+        assert!(local_profile_owner_id("profile-a", Some(" ")).is_err());
     }
 
     fn default_path_without_test_override() -> PathBuf {

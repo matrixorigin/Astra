@@ -48,6 +48,7 @@ pub trait DigestCollector: Send + Sync {
 pub struct AstraCliDigestCollector {
     pub astra_bin: PathBuf,
     pub timeout_seconds: u64,
+    pub profile: Option<String>,
 }
 
 impl AstraCliDigestCollector {
@@ -59,6 +60,7 @@ impl AstraCliDigestCollector {
             // this when tokio's cargo-warmed target/debug isn't
             // cached; use `with_timeout` there.
             timeout_seconds: 15,
+            profile: None,
         }
     }
 
@@ -68,12 +70,22 @@ impl AstraCliDigestCollector {
         self.timeout_seconds = secs;
         self
     }
+
+    /// Bind digest lookup to the same credential profile that produced the
+    /// session journal.
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
+    }
 }
 
 #[async_trait]
 impl DigestCollector for AstraCliDigestCollector {
     async fn collect(&self, session_id: &str) -> Result<DigestArtifact, String> {
         let mut cmd = Command::new(&self.astra_bin);
+        if let Some(profile) = &self.profile {
+            cmd.arg("--profile").arg(profile);
+        }
         cmd.arg("journal")
             .arg("digest")
             .arg("--format")
@@ -194,6 +206,35 @@ mod tests {
     fn with_timeout_overrides_default() {
         let c = AstraCliDigestCollector::new("/nonexistent/astra").with_timeout(42);
         assert_eq!(c.timeout_seconds, 42);
+    }
+
+    #[tokio::test]
+    async fn digest_subprocess_uses_the_session_credential_profile() {
+        use crate::test_support::write_executable_shim;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let args_path = tmp.path().join("args");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"turns\":1}}'\n",
+                args_path.display()
+            ),
+        )
+        .expect("write shim");
+
+        AstraCliDigestCollector::new(shim)
+            .with_profile(Some("profile-a".to_string()))
+            .collect("session-a")
+            .await
+            .expect("digest");
+
+        let args = std::fs::read_to_string(args_path).expect("read args");
+        assert!(
+            args.starts_with("--profile\nprofile-a\njournal\ndigest\n"),
+            "{args}"
+        );
+        assert!(args.ends_with("session-a\n"), "{args}");
     }
 
     #[tokio::test]

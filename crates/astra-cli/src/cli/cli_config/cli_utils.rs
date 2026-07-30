@@ -5,12 +5,13 @@ use crossterm::{
     style::Stylize,
     terminal,
 };
-use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
-pub(crate) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
+pub(crate) use astra_credentials::{
+    CredentialStore, CredentialsFile, Profile, local_profile_owner_id,
+};
 
 pub(crate) fn credential_store() -> CredentialStore {
     CredentialStore::new()
@@ -103,23 +104,6 @@ pub(crate) enum CliProfileIdentityAdmission {
 
 static CLI_PROFILE_IDENTITY: LazyLock<RwLock<Option<CliProfileIdentity>>> =
     LazyLock::new(|| RwLock::new(None));
-
-fn local_profile_owner_id(profile_name: &str, account_id: Option<&str>) -> Result<String, String> {
-    let profile_name = profile_name.trim();
-    if profile_name.is_empty() {
-        return Err("CLI profile name must not be empty".to_string());
-    }
-    let account_id = account_id.map(str::trim);
-    if account_id.is_some_and(str::is_empty) {
-        return Err("CLI profile account_id must not be empty".to_string());
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"astra-cli-local-owner-v1\0profile\0");
-    hasher.update(profile_name.as_bytes());
-    hasher.update(b"\0account\0");
-    hasher.update(account_id.unwrap_or("anonymous").as_bytes());
-    Ok(format!("cli-profile-v1:{:x}", hasher.finalize()))
-}
 
 pub(crate) fn cli_profile_owner_scope(
     profile_name: &str,

@@ -138,6 +138,10 @@ pub struct RunnerConfig {
     /// subprocesses. Set by preflight auto-register to isolate
     /// harness credentials from the user's active profile.
     pub profile: Option<String>,
+    /// Authorized namespaces containing artifacts for this run. A remote run
+    /// normally has a profile-scoped CLI journal and account-scoped server
+    /// step events.
+    pub artifact_owner_scopes: Vec<astra_services::OwnerScope>,
 }
 
 impl RunnerConfig {
@@ -147,6 +151,7 @@ impl RunnerConfig {
             fallback_models: Vec::new(),
             working_dir: None,
             profile: None,
+            artifact_owner_scopes: Vec::new(),
         }
     }
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {

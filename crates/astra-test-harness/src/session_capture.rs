@@ -278,7 +278,7 @@ fn embedded_json(value: Option<&serde_json::Value>) -> Option<serde_json::Value>
 /// Legacy flat session directory (`~/.astra/sessions/`).
 ///
 /// Newer Astra versions place artifacts below an owner-scoped `v1/` layout;
-/// use [`session_artifact_paths`] for production reads. This stays public for
+/// use [`load_session_for_owners`] for production reads. This stays public for
 /// tests and for callers that intentionally inspect legacy fixtures.
 pub fn default_sessions_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
@@ -293,20 +293,31 @@ pub fn default_sessions_dir() -> PathBuf {
 /// The journal writer owns this layout decision. Reusing its public path API
 /// keeps the harness in lock-step with storage migrations instead of copying a
 /// directory convention that will eventually drift again.
-fn session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
-    let scoped_journal = astra_services::session_journal::journal_file_path(session_id);
-    let scoped_steps = scoped_journal
-        .parent()
-        .expect("session journal path always has a parent")
-        .join(session_id)
-        .join("step_events.jsonl");
+fn session_artifact_paths_for_owners(
+    session_id: &str,
+    owner_scopes: &[astra_services::OwnerScope],
+) -> Vec<PathBuf> {
+    if astra_services::session_journal::validate_session_id(session_id).is_err() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::with_capacity(owner_scopes.len().saturating_mul(2) + 2);
+    for owner_scope in owner_scopes {
+        let Ok(scoped_journal) =
+            astra_services::session_journal::journal_file_path_for_owner(owner_scope, session_id)
+        else {
+            continue;
+        };
+        let scoped_steps = scoped_journal
+            .parent()
+            .expect("session journal path always has a parent")
+            .join(session_id)
+            .join("step_events.jsonl");
+        candidates.push(scoped_journal);
+        candidates.push(scoped_steps);
+    }
     let legacy_dir = default_sessions_dir();
-    let candidates = [
-        scoped_journal,
-        scoped_steps,
-        legacy_dir.join(format!("{session_id}.jsonl")),
-        legacy_dir.join(session_id).join("step_events.jsonl"),
-    ];
+    candidates.push(legacy_dir.join(format!("{session_id}.jsonl")));
+    candidates.push(legacy_dir.join(session_id).join("step_events.jsonl"));
     let mut unique = Vec::with_capacity(candidates.len());
     for path in candidates {
         if !unique.contains(&path) {
@@ -353,7 +364,19 @@ fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
 /// preferred for backward-compatible user-facing hints); the actual
 /// events are the union.
 pub fn load_session(session_id: &str) -> Option<SessionCapture> {
-    let mut captures = session_artifact_paths(session_id)
+    load_session_for_owners(session_id, &[astra_services::local_owner_scope()])
+}
+
+/// Load complementary artifacts from an explicit, authorized set of owners.
+///
+/// Local CLI journals are profile-scoped while server-produced step events are
+/// account-scoped. Callers that cross that process boundary must supply both
+/// identities rather than scanning every owner directory for a matching id.
+pub fn load_session_for_owners(
+    session_id: &str,
+    owner_scopes: &[astra_services::OwnerScope],
+) -> Option<SessionCapture> {
+    let mut captures = session_artifact_paths_for_owners(session_id, owner_scopes)
         .into_iter()
         .filter(|path| path.is_file())
         .filter_map(|path| load_session_from_path(session_id, &path));
@@ -733,6 +756,57 @@ mod tests {
     }
 
     #[test]
+    fn explicit_owner_set_merges_profile_journal_and_account_step_events() {
+        let dir = tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
+        let profile_owner = astra_services::OwnerScope::user("profile-owner").unwrap();
+        let account_owner = astra_services::OwnerScope::user("account-owner").unwrap();
+        let session_id = "explicit-owner-namespace-test";
+
+        let journal = astra_services::session_journal::journal_file_path_for_owner(
+            &profile_owner,
+            session_id,
+        )
+        .unwrap();
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(
+            &journal,
+            r#"{"type":"session_start","session_id":"explicit-owner-namespace-test"}"#,
+        )
+        .unwrap();
+
+        let account_journal = astra_services::session_journal::journal_file_path_for_owner(
+            &account_owner,
+            session_id,
+        )
+        .unwrap();
+        let steps = account_journal
+            .parent()
+            .unwrap()
+            .join(session_id)
+            .join("step_events.jsonl");
+        std::fs::create_dir_all(steps.parent().unwrap()).unwrap();
+        std::fs::write(
+            &steps,
+            r#"{"schema_version":1,"artifact_kind":"step_event","payload":{"event_type":"StepStarted"}}"#,
+        )
+        .unwrap();
+
+        let profile_only =
+            super::load_session_for_owners(session_id, std::slice::from_ref(&profile_owner))
+                .unwrap();
+        assert_eq!(profile_only.count_events("StepStarted"), 0);
+
+        let owners = [profile_owner, account_owner];
+        let capture = super::load_session_for_owners(session_id, &owners).unwrap();
+        assert_eq!(capture.count_events("session_start"), 1);
+        assert_eq!(capture.count_events("StepStarted"), 1);
+        let stats = super::load_step_event_stats_for_owners(session_id, &owners).unwrap();
+        assert_eq!(stats.turn_rounds, 1);
+        assert!(super::load_session_for_owners("../escape", &owners).is_none());
+    }
+
+    #[test]
     fn complete_turn_tool_records_drive_contract_evidence() {
         let capture = SessionCapture {
             session_id: "fanout-session".into(),
@@ -881,9 +955,18 @@ pub const DEFAULT_MAX_STEP_EVENTS_BYTES: u64 = 64 * 1024 * 1024;
 /// turn rounds and cache hit counts. Returns `None` if the file doesn't
 /// exist, is unreadable, or exceeds the size cap.
 pub fn load_step_event_stats(session_id: &str) -> Option<StepEventStats> {
+    load_step_event_stats_for_owners(session_id, &[astra_services::local_owner_scope()])
+}
+
+/// Load step-event counters from the explicit owner namespaces participating
+/// in one CLI-to-server run.
+pub fn load_step_event_stats_for_owners(
+    session_id: &str,
+    owner_scopes: &[astra_services::OwnerScope],
+) -> Option<StepEventStats> {
     let mut stats = StepEventStats::default();
     let mut found = false;
-    for path in session_artifact_paths(session_id)
+    for path in session_artifact_paths_for_owners(session_id, owner_scopes)
         .into_iter()
         .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("step_events.jsonl"))
     {
