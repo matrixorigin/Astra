@@ -74,6 +74,110 @@ const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX idx_schema_table_contract_component (component, contract_version, table_name)
 )";
+const AGENT_RUNS_TABLE: &str = "agent_runs";
+const AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE: &str = "agent_runs_model_authority_v1_shadow";
+const AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE: &str = "agent_runs_pre_model_authority_v1";
+const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(128) NOT NULL,
+    session_id VARCHAR(64) NOT NULL,
+    parent_run_id VARCHAR(64) NULL,
+    root_run_id VARCHAR(64) NOT NULL,
+    ancestor_path VARCHAR(2048) NOT NULL,
+    depth INT NOT NULL DEFAULT 0,
+    delegation_id VARCHAR(64) NULL,
+    agent_id VARCHAR(255) NULL,
+    retry_of VARCHAR(64) NULL,
+    retry_scope VARCHAR(16) NOT NULL DEFAULT 'node',
+    status VARCHAR(32) NOT NULL,
+    execution_mode VARCHAR(32) NOT NULL DEFAULT 'web_agent',
+    trigger_type VARCHAR(64) NULL,
+    trigger_event_id VARCHAR(128) NULL,
+    waiting_for VARCHAR(64) NULL,
+    owner_pod_id VARCHAR(128) NULL,
+    owner_lease_expires_at DATETIME(6) NULL,
+    run_generation BIGINT NOT NULL DEFAULT 0,
+    last_event_idx BIGINT NOT NULL DEFAULT -1,
+    checkpoint_version VARCHAR(32) NULL,
+    checkpoint_json LONGTEXT NULL,
+    error_code VARCHAR(128) NULL,
+    error_message TEXT NULL,
+    retry_count INT NOT NULL DEFAULT 0,
+    total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    total_completion_tokens BIGINT NOT NULL DEFAULT 0,
+    total_tool_calls BIGINT NOT NULL DEFAULT 0,
+    request_id VARCHAR(64) NULL,
+    trace_id VARCHAR(64) NULL,
+    agent_binding_id VARCHAR(64) NULL,
+    agent_binding_name VARCHAR(255) NULL,
+    agent_binding_schema_version VARCHAR(32) NULL,
+    model_offering_id VARCHAR(64) NULL,
+    resolved_model_name VARCHAR(255) NULL,
+    capability_server_refs_json LONGTEXT NULL,
+    runtime_profile VARCHAR(64) NULL,
+    provider_request_fingerprint VARCHAR(64) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
+    PRIMARY KEY (user_id, run_id),
+    INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id),
+    INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at),
+    INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
+    INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
+    INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
+    INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_binding (agent_binding_id, created_at),
+    INDEX idx_agent_runs_model_offering (model_offering_id, created_at)
+)";
+const AGENT_RUNS_MODEL_AUTHORITY_COLUMNS: &[&str] = &[
+    "model_offering_id",
+    "resolved_model_name",
+    "provider_request_fingerprint",
+];
+const AGENT_RUNS_LEGACY_MODEL_COLUMNS: &[&str] = &[
+    "selected_model_json",
+    "selected_model_name",
+    "selected_model_gateway",
+];
+const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
+    "run_id",
+    "user_id",
+    "session_id",
+    "parent_run_id",
+    "root_run_id",
+    "ancestor_path",
+    "depth",
+    "delegation_id",
+    "agent_id",
+    "retry_of",
+    "retry_scope",
+    "status",
+    "execution_mode",
+    "trigger_type",
+    "trigger_event_id",
+    "waiting_for",
+    "owner_pod_id",
+    "owner_lease_expires_at",
+    "run_generation",
+    "last_event_idx",
+    "checkpoint_version",
+    "checkpoint_json",
+    "error_code",
+    "error_message",
+    "retry_count",
+    "total_prompt_tokens",
+    "total_completion_tokens",
+    "total_tool_calls",
+    "request_id",
+    "trace_id",
+    "agent_binding_id",
+    "agent_binding_name",
+    "agent_binding_schema_version",
+    "capability_server_refs_json",
+    "runtime_profile",
+    "created_at",
+    "updated_at",
+];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreSchemaTableSpec {
     pub name: String,
@@ -1416,6 +1520,274 @@ async fn table_exists(
     .map(|row| row.is_some())
 }
 
+fn agent_runs_requires_model_authority_rebuild(
+    columns: &BTreeSet<String>,
+) -> Result<bool, sqlx::Error> {
+    if columns.is_empty() {
+        return Ok(false);
+    }
+
+    let missing_preserved = AGENT_RUNS_PRESERVED_COLUMNS
+        .iter()
+        .filter(|column| !columns.contains(**column))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_preserved.is_empty() {
+        return Err(sqlx::Error::Protocol(format!(
+            "agent_runs cannot migrate to the model-authority schema because preserved columns are missing: {}",
+            missing_preserved.join(", ")
+        )));
+    }
+
+    let current_complete = AGENT_RUNS_MODEL_AUTHORITY_COLUMNS
+        .iter()
+        .all(|column| columns.contains(*column));
+    let legacy_present = AGENT_RUNS_LEGACY_MODEL_COLUMNS
+        .iter()
+        .any(|column| columns.contains(*column));
+    if current_complete {
+        return Ok(legacy_present);
+    }
+
+    let legacy_complete = AGENT_RUNS_LEGACY_MODEL_COLUMNS
+        .iter()
+        .all(|column| columns.contains(*column));
+    if legacy_complete {
+        return Ok(true);
+    }
+
+    let missing_current = AGENT_RUNS_MODEL_AUTHORITY_COLUMNS
+        .iter()
+        .filter(|column| !columns.contains(**column))
+        .copied()
+        .collect::<Vec<_>>();
+    let missing_legacy = AGENT_RUNS_LEGACY_MODEL_COLUMNS
+        .iter()
+        .filter(|column| !columns.contains(**column))
+        .copied()
+        .collect::<Vec<_>>();
+    Err(sqlx::Error::Protocol(format!(
+        "agent_runs has an unsupported partial model-authority schema; missing current columns: {}; missing legacy columns: {}",
+        missing_current.join(", "),
+        missing_legacy.join(", ")
+    )))
+}
+
+fn agent_runs_shadow_create_sql() -> Result<String, sqlx::Error> {
+    let canonical_prefix = format!("CREATE TABLE IF NOT EXISTS {AGENT_RUNS_TABLE}");
+    if !AGENT_RUNS_CREATE_SQL.starts_with(&canonical_prefix) {
+        return Err(sqlx::Error::Protocol(
+            "agent_runs canonical DDL has an unexpected prefix".to_string(),
+        ));
+    }
+    Ok(AGENT_RUNS_CREATE_SQL.replacen(
+        &canonical_prefix,
+        &format!(
+            "CREATE TABLE {}",
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE)
+        ),
+        1,
+    ))
+}
+
+fn quoted_column_list(columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|column| crate::snapshot_sql::quote_mysql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn agent_runs_model_authority_copy_sql(columns: &BTreeSet<String>) -> String {
+    let mut target_columns = AGENT_RUNS_PRESERVED_COLUMNS.to_vec();
+    target_columns.extend(AGENT_RUNS_MODEL_AUTHORITY_COLUMNS);
+
+    let mut select_expressions = AGENT_RUNS_PRESERVED_COLUMNS
+        .iter()
+        .map(|column| crate::snapshot_sql::quote_mysql_identifier(column))
+        .collect::<Vec<_>>();
+    select_expressions.push(if columns.contains("model_offering_id") {
+        "`model_offering_id`".to_string()
+    } else {
+        "NULL".to_string()
+    });
+    select_expressions.push(
+        match (
+            columns.contains("resolved_model_name"),
+            columns.contains("selected_model_name"),
+        ) {
+            (true, true) => "COALESCE(`resolved_model_name`, `selected_model_name`)".to_string(),
+            (true, false) => "`resolved_model_name`".to_string(),
+            (false, true) => "`selected_model_name`".to_string(),
+            (false, false) => "NULL".to_string(),
+        },
+    );
+    select_expressions.push(if columns.contains("provider_request_fingerprint") {
+        "`provider_request_fingerprint`".to_string()
+    } else {
+        "NULL".to_string()
+    });
+
+    format!(
+        "INSERT INTO {} ({}) SELECT {} FROM {}",
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
+        quoted_column_list(&target_columns),
+        select_expressions.join(", "),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
+    )
+}
+
+async fn table_row_count(pool: &sqlx::Pool<MySql>, table: &str) -> Result<i64, sqlx::Error> {
+    validate_schema_identifier(table, "matrixone table")?;
+    query(&format!(
+        "SELECT COUNT(*) AS row_count FROM {}",
+        crate::snapshot_sql::quote_mysql_identifier(table)
+    ))
+    .fetch_one(pool)
+    .await?
+    .try_get("row_count")
+}
+
+async fn agent_runs_missing_shadow_keys(pool: &sqlx::Pool<MySql>) -> Result<i64, sqlx::Error> {
+    query(&format!(
+        "SELECT COUNT(*) AS missing_count FROM {} AS source \
+         LEFT JOIN {} AS shadow \
+           ON shadow.user_id = source.user_id AND shadow.run_id = source.run_id \
+         WHERE shadow.run_id IS NULL",
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
+    ))
+    .fetch_one(pool)
+    .await?
+    .try_get("missing_count")
+}
+
+async fn migrate_agent_runs_model_authority_if_needed(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    let columns = existing_table_columns(pool, database, AGENT_RUNS_TABLE).await?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+
+    let shadow_exists =
+        table_exists(pool, database, AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE).await?;
+    let archive_exists =
+        table_exists(pool, database, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
+    let requires_rebuild = agent_runs_requires_model_authority_rebuild(&columns)?;
+
+    if archive_exists {
+        if requires_rebuild || shadow_exists {
+            return Err(sqlx::Error::Protocol(format!(
+                "agent_runs model-authority migration is in an inconsistent state: canonical_requires_rebuild={requires_rebuild}, shadow_exists={shadow_exists}, archive_exists=true"
+            )));
+        }
+        let canonical_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
+        let archive_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
+        if canonical_rows != archive_rows {
+            return Err(sqlx::Error::Protocol(format!(
+                "agent_runs model-authority migration archive row count mismatch: canonical={canonical_rows}, archive={archive_rows}"
+            )));
+        }
+        query(&format!(
+            "DROP TABLE {}",
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE)
+        ))
+        .execute(pool)
+        .await?;
+        tracing::info!(
+            table = AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE,
+            rows = canonical_rows,
+            "removed verified agent_runs migration archive after interrupted cleanup"
+        );
+        return Ok(());
+    }
+
+    if !requires_rebuild {
+        if shadow_exists {
+            return Err(sqlx::Error::Protocol(format!(
+                "unexpected {} exists while agent_runs already has the canonical model-authority schema",
+                AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE
+            )));
+        }
+        return Ok(());
+    }
+
+    let primary_key = existing_index_columns(pool, database, AGENT_RUNS_TABLE, "PRIMARY").await?;
+    if primary_key != ["user_id", "run_id"] {
+        return Err(sqlx::Error::Protocol(format!(
+            "agent_runs model-authority migration requires primary key (user_id, run_id), found ({})",
+            primary_key.join(", ")
+        )));
+    }
+
+    if shadow_exists {
+        query(&format!(
+            "DROP TABLE {}",
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE)
+        ))
+        .execute(pool)
+        .await?;
+        tracing::info!(
+            table = AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE,
+            "removed incomplete agent_runs migration shadow before retry"
+        );
+    }
+
+    query(&agent_runs_shadow_create_sql()?)
+        .execute(pool)
+        .await?;
+    query(&agent_runs_model_authority_copy_sql(&columns))
+        .execute(pool)
+        .await?;
+
+    let source_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
+    let shadow_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE).await?;
+    let missing_keys = agent_runs_missing_shadow_keys(pool).await?;
+    if source_rows != shadow_rows || missing_keys != 0 {
+        return Err(sqlx::Error::Protocol(format!(
+            "agent_runs model-authority migration verification failed: source_rows={source_rows}, shadow_rows={shadow_rows}, missing_keys={missing_keys}"
+        )));
+    }
+
+    query(&format!(
+        "RENAME TABLE {} TO {}, {} TO {}",
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
+    ))
+    .execute(pool)
+    .await?;
+
+    let migrated_columns = existing_table_columns(pool, database, AGENT_RUNS_TABLE).await?;
+    if agent_runs_requires_model_authority_rebuild(&migrated_columns)? {
+        return Err(sqlx::Error::Protocol(
+            "agent_runs still requires model-authority migration after table swap".to_string(),
+        ));
+    }
+    let migrated_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
+    let archive_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
+    if migrated_rows != source_rows || archive_rows != source_rows {
+        return Err(sqlx::Error::Protocol(format!(
+            "agent_runs model-authority migration post-swap row count mismatch: source={source_rows}, migrated={migrated_rows}, archive={archive_rows}"
+        )));
+    }
+
+    query(&format!(
+        "DROP TABLE {}",
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE)
+    ))
+    .execute(pool)
+    .await?;
+    tracing::info!(
+        rows = migrated_rows,
+        "migrated legacy agent_runs to the model-authority schema"
+    );
+    Ok(())
+}
+
 async fn fail_if_obsolete_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2218,62 +2590,10 @@ async fn ensure_core_schema_while_leased(
     crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
-    core_schema_create!(pool, "agent_runs",
-        "CREATE TABLE IF NOT EXISTS agent_runs (
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            parent_run_id VARCHAR(64) NULL,
-            root_run_id VARCHAR(64) NOT NULL,
-            ancestor_path VARCHAR(2048) NOT NULL,
-            depth INT NOT NULL DEFAULT 0,
-            delegation_id VARCHAR(64) NULL,
-            agent_id VARCHAR(255) NULL,
-            retry_of VARCHAR(64) NULL,
-            retry_scope VARCHAR(16) NOT NULL DEFAULT 'node',
-            status VARCHAR(32) NOT NULL,
-            execution_mode VARCHAR(32) NOT NULL DEFAULT 'web_agent',
-            trigger_type VARCHAR(64) NULL,
-            trigger_event_id VARCHAR(128) NULL,
-            waiting_for VARCHAR(64) NULL,
-            owner_pod_id VARCHAR(128) NULL,
-            owner_lease_expires_at DATETIME(6) NULL,
-            run_generation BIGINT NOT NULL DEFAULT 0,
-            last_event_idx BIGINT NOT NULL DEFAULT -1,
-            checkpoint_version VARCHAR(32) NULL,
-            checkpoint_json LONGTEXT NULL,
-            error_code VARCHAR(128) NULL,
-            error_message TEXT NULL,
-            retry_count INT NOT NULL DEFAULT 0,
-            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
-            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
-            total_tool_calls BIGINT NOT NULL DEFAULT 0,
-            request_id VARCHAR(64) NULL,
-            trace_id VARCHAR(64) NULL,
-            agent_binding_id VARCHAR(64) NULL,
-            agent_binding_name VARCHAR(255) NULL,
-            agent_binding_schema_version VARCHAR(32) NULL,
-            model_offering_id VARCHAR(64) NULL,
-            resolved_model_name VARCHAR(255) NULL,
-            capability_server_refs_json LONGTEXT NULL,
-            runtime_profile VARCHAR(64) NULL,
-            provider_request_fingerprint VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
-            PRIMARY KEY (user_id, run_id),
-            INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id),
-            INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at),
-            INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
-            INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
-            INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
-            INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
-            INDEX idx_agent_runs_binding (agent_binding_id, created_at),
-            INDEX idx_agent_runs_model_offering (model_offering_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    migrate_agent_runs_model_authority_if_needed(&pool, &settings.database).await?;
+    core_schema_create!(pool, "agent_runs", AGENT_RUNS_CREATE_SQL)
+        .execute(&pool)
+        .await?;
     ensure_primary_key_shape(
         &pool,
         &settings.database,
@@ -7382,6 +7702,67 @@ mod tests {
             TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
             &[("identity_key", 71)]
         );
+    }
+
+    fn agent_runs_columns(extra: &[&str]) -> BTreeSet<String> {
+        AGENT_RUNS_PRESERVED_COLUMNS
+            .iter()
+            .chain(extra)
+            .map(|column| (*column).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn agent_runs_model_authority_shape_rebuilds_only_supported_legacy_states() {
+        let current = agent_runs_columns(AGENT_RUNS_MODEL_AUTHORITY_COLUMNS);
+        assert!(!agent_runs_requires_model_authority_rebuild(&current).unwrap());
+
+        let legacy = agent_runs_columns(AGENT_RUNS_LEGACY_MODEL_COLUMNS);
+        assert!(agent_runs_requires_model_authority_rebuild(&legacy).unwrap());
+
+        let partially_upgraded = agent_runs_columns(&[
+            "selected_model_json",
+            "selected_model_name",
+            "selected_model_gateway",
+            "model_offering_id",
+        ]);
+        assert!(agent_runs_requires_model_authority_rebuild(&partially_upgraded).unwrap());
+
+        let unsupported = agent_runs_columns(&["selected_model_name"]);
+        let error = agent_runs_requires_model_authority_rebuild(&unsupported)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported partial model-authority schema"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn agent_runs_shadow_ddl_reuses_the_canonical_schema() {
+        let shadow = agent_runs_shadow_create_sql().unwrap();
+
+        assert!(shadow.starts_with(&format!(
+            "CREATE TABLE `{AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE}`"
+        )));
+        assert!(shadow.contains("PRIMARY KEY (user_id, run_id)"));
+        assert!(shadow.contains("model_offering_id VARCHAR(64) NULL"));
+        assert!(shadow.contains("provider_request_fingerprint VARCHAR(64) NULL"));
+        assert!(!shadow.contains("CREATE TABLE IF NOT EXISTS agent_runs"));
+    }
+
+    #[test]
+    fn agent_runs_copy_sql_maps_legacy_model_identity_explicitly() {
+        let legacy = agent_runs_columns(AGENT_RUNS_LEGACY_MODEL_COLUMNS);
+        let sql = agent_runs_model_authority_copy_sql(&legacy);
+
+        assert!(!sql.contains("SELECT *"));
+        assert!(sql.contains("`model_offering_id`"));
+        assert!(sql.contains("`resolved_model_name`"));
+        assert!(sql.contains("`provider_request_fingerprint`"));
+        assert!(sql.contains("NULL, `selected_model_name`, NULL"));
+        assert!(!sql.contains("`selected_model_json`"));
+        assert!(!sql.contains("`selected_model_gateway`"));
     }
 
     #[test]
